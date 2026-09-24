@@ -166,12 +166,20 @@ impl InstanceLayout {
             .sum()
     }
 
-    fn find(&self, s: InstanceSemantic) -> Option<&InstanceAttribute> {
-        self.attributes.iter().find(|a| a.semantic == s)
+    const fn find(&self, s: InstanceSemantic) -> Option<&InstanceAttribute> {
+        let mut i = 0;
+        while i < self.attributes.len() {
+            if same_semantic(self.attributes[i].semantic, s) {
+                return Some(&self.attributes[i]);
+            }
+            i += 1;
+        }
+        None
     }
 
-    /// Where position/scale live for culling (GPU and CPU).
-    pub fn cull_source(&self) -> CullSource {
+    /// Where position/scale live for culling (GPU and CPU). A `const fn`, so each
+    /// [`InstanceData`] type's answer is computed once at compile time.
+    pub const fn cull_source(&self) -> CullSource {
         if let Some(m) = self.find(InstanceSemantic::ModelMatrix) {
             return CullSource::Matrix { offset: m.offset };
         }
@@ -188,7 +196,7 @@ impl InstanceLayout {
             (Some(s), _) if matches!(s.format, VertexFormat::Float32x3 | VertexFormat::Float32x4) => {
                 Some((s.offset, ScaleKind::Vector))
             }
-            (None, Some(s)) if s.format == VertexFormat::Float32 => Some((s.offset, ScaleKind::Uniform)),
+            (None, Some(s)) if matches!(s.format, VertexFormat::Float32) => Some((s.offset, ScaleKind::Uniform)),
             (None, None) => None,
             // Scale present but not f32: bounds unknown.
             _ => return CullSource::None,
@@ -201,28 +209,63 @@ impl InstanceLayout {
 
     /// Decode (world position, max scale) from one instance's bytes using [`Self::cull_source`].
     pub fn decode_bounds(&self, bytes: &[u8]) -> Option<(Vec3, f32)> {
-        let f = |o: u32| -> f32 {
-            let o = o as usize;
-            f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
-        };
-        let v3 = |o: u32| Vec3::new(f(o), f(o + 4), f(o + 8));
-        match self.cull_source() {
-            CullSource::Matrix { offset } => {
-                let t = v3(offset + 48);
-                let s = crate::culling::stretch_bound(v3(offset), v3(offset + 16), v3(offset + 32));
-                Some((t, s))
-            }
-            CullSource::TranslationScale { translation, scale } => {
-                let s = match scale {
-                    None => 1.0,
-                    Some((o, ScaleKind::Uniform)) => f(o).abs(),
-                    Some((o, ScaleKind::Vector)) => v3(o).abs().max_element(),
-                };
-                Some((v3(translation), s))
-            }
-            CullSource::None => None,
-        }
+        decode_bounds_with(self.cull_source(), bytes)
     }
+}
+
+/// `a == b` usable in `const fn`.
+const fn same_semantic(a: InstanceSemantic, b: InstanceSemantic) -> bool {
+    use InstanceSemantic::*;
+    match (a, b) {
+        (Custom(x), Custom(y)) => x == y,
+        (ModelMatrix, ModelMatrix)
+        | (Translation, Translation)
+        | (Rotation, Rotation)
+        | (Scale, Scale)
+        | (UniformScale, UniformScale)
+        | (Color, Color)
+        | (UvRect, UvRect)
+        | (TextureLayer, TextureLayer) => true,
+        _ => false,
+    }
+}
+
+/// Decode (position, max scale) with a known [`CullSource`]. With a constant `cull` (see
+/// [`InstanceData::bounds`]) this inlines to a few loads at fixed offsets.
+#[inline(always)]
+fn decode_bounds_with(cull: CullSource, bytes: &[u8]) -> Option<(Vec3, f32)> {
+    #[inline(always)]
+    fn f(bytes: &[u8], o: u32) -> f32 {
+        let o = o as usize;
+        f32::from_ne_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+    }
+    #[inline(always)]
+    fn v3(bytes: &[u8], o: u32) -> Vec3 {
+        Vec3::new(f(bytes, o), f(bytes, o + 4), f(bytes, o + 8))
+    }
+    match cull {
+        CullSource::Matrix { offset } => {
+            let t = v3(bytes, offset + 48);
+            let s = crate::culling::stretch_bound(v3(bytes, offset), v3(bytes, offset + 16), v3(bytes, offset + 32));
+            Some((t, s))
+        }
+        CullSource::TranslationScale { translation, scale } => {
+            let s = match scale {
+                None => 1.0,
+                Some((o, ScaleKind::Uniform)) => f(bytes, o).abs(),
+                Some((o, ScaleKind::Vector)) => v3(bytes, o).abs().max_element(),
+            };
+            Some((v3(bytes, translation), s))
+        }
+        CullSource::None => None,
+    }
+}
+
+/// `T::LAYOUT.cull_source()` evaluated at compile time.
+struct CullOf<T>(std::marker::PhantomData<T>);
+
+impl<T: InstanceData> CullOf<T> {
+    const SOURCE: CullSource = T::LAYOUT.cull_source();
 }
 
 /// WGSL type a vertex format is presented as in the shader.
@@ -253,10 +296,19 @@ pub trait InstanceData: bytemuck::Pod + Send + Sync + 'static {
     /// Memory layout (`const LAYOUT: &'static InstanceLayout = &InstanceLayout { .. };`).
     const LAYOUT: &'static InstanceLayout;
 
-    /// World position and max scale for CPU bounds. Default decodes via the layout.
+    /// World position and max scale for CPU bounds. The default decodes the attributes named
+    /// by [`InstanceLayout::cull_source`] (resolved at compile time, so this is a few loads).
+    #[inline]
     fn bounds(&self) -> Option<(Vec3, f32)> {
-        Self::LAYOUT.decode_bounds(bytemuck::bytes_of(self))
+        decode_bounds_with(CullOf::<Self>::SOURCE, bytemuck::bytes_of(self))
     }
+}
+
+/// Bounds of a column-major model matrix: translation and [`crate::max_axis_scale`].
+#[inline(always)]
+fn matrix_bounds(m: &[[f32; 4]; 4]) -> Option<(Vec3, f32)> {
+    let c = |i: usize| Vec3::new(m[i][0], m[i][1], m[i][2]);
+    Some((c(3), crate::culling::stretch_bound(c(0), c(1), c(2))))
 }
 
 /// Full model matrix (64 B). The format used internally for ECS batching.
@@ -290,6 +342,11 @@ impl InstanceData for InstanceTransform {
             0,
         )],
     };
+
+    #[inline]
+    fn bounds(&self) -> Option<(Vec3, f32)> {
+        matrix_bounds(&self.model)
+    }
 }
 
 /// Model matrix + linear RGBA tint (80 B).
@@ -321,6 +378,11 @@ impl InstanceData for InstanceTransformColor {
             InstanceAttribute::new(InstanceSemantic::Color, VertexFormat::Float32x4, 64),
         ],
     };
+
+    #[inline]
+    fn bounds(&self) -> Option<(Vec3, f32)> {
+        matrix_bounds(&self.model)
+    }
 }
 
 /// Compact position + uniform scale + rotation (32 B, half of [`InstanceTransform`]).
@@ -356,6 +418,11 @@ impl InstanceData for InstanceCompact {
             InstanceAttribute::new(InstanceSemantic::Rotation, VertexFormat::Float32x4, 16),
         ],
     };
+
+    #[inline]
+    fn bounds(&self) -> Option<(Vec3, f32)> {
+        Some((Vec3::from_array(self.translation), self.scale.abs()))
+    }
 }
 
 /// Bandwidth-optimized instance: f32 position/scale, snorm16 quaternion, unorm8 sRGB-free
@@ -405,6 +472,11 @@ impl InstanceData for InstancePacked {
             InstanceAttribute::new(InstanceSemantic::TextureLayer, VertexFormat::Uint32, 28),
         ],
     };
+
+    #[inline]
+    fn bounds(&self) -> Option<(Vec3, f32)> {
+        Some((Vec3::from_array(self.translation), self.scale.abs()))
+    }
 }
 
 /// Upload strategy hint for an [`InstanceBuffer`].
@@ -419,15 +491,149 @@ pub enum BufferUsage {
     Stream,
 }
 
+/// Instances per CPU culling block: the CPU path keeps one bounding box per block of an
+/// [`InstanceBuffer`] and draws only the blocks in view.
+pub(crate) const CULL_BLOCK: usize = 4096;
+
+/// Stale blocks at or above which a refresh runs on all rayon workers (native).
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_BLOCKS: usize = 16;
+
+/// Per-block CPU culling bounds: (position AABB, max instance scale) per [`CULL_BLOCK`]
+/// instances. Edits only flag their block; bounds are recomputed lazily when CPU culling asks
+/// ([`InstanceBuffers`] on GPU culling paths never pay for them), exactly, and only for the
+/// flagged blocks — so a sparse edit or a `swap_remove` costs one block, not the buffer.
+struct BlockBounds {
+    blocks: Vec<(Aabb, f32)>,
+    /// One bit per block: edited since its bounds were computed.
+    stale: Vec<u64>,
+    any_stale: bool,
+    /// Union of all blocks as of the last refresh.
+    total: (Aabb, f32),
+    /// Instances visited by the last refresh.
+    scanned: usize,
+}
+
+impl Default for BlockBounds {
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            stale: Vec::new(),
+            any_stale: false,
+            total: (Aabb::EMPTY, 0.0),
+            scanned: 0,
+        }
+    }
+}
+
+impl BlockBounds {
+    #[inline]
+    fn mark(&mut self, range: Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        let (first, last) = (range.start / CULL_BLOCK, (range.end - 1) / CULL_BLOCK);
+        if self.stale.len() <= last / 64 {
+            self.stale.resize(last / 64 + 1, 0);
+        }
+        for b in first..=last {
+            self.stale[b / 64] |= 1 << (b % 64);
+        }
+        self.any_stale = true;
+    }
+
+    /// The buffer shrank to `len`: drop whole blocks past it and re-tighten the new last one.
+    fn truncate(&mut self, len: usize) {
+        self.blocks.truncate(len.div_ceil(CULL_BLOCK));
+        if len > 0 {
+            self.mark(len - 1..len);
+        }
+    }
+
+    fn is_stale(stale: &[u64], b: usize) -> bool {
+        stale.get(b / 64).is_some_and(|w| w & (1 << (b % 64)) != 0)
+    }
+
+    /// Recompute the stale blocks of `data`; returns the union of all blocks.
+    fn refresh<T: InstanceData>(&mut self, data: &[T]) -> (Aabb, f32) {
+        self.scanned = 0;
+        let n = data.len().div_ceil(CULL_BLOCK);
+        if self.blocks.len() != n {
+            // Blocks added since the last refresh were flagged when their instances were.
+            self.blocks.resize(n, (Aabb::EMPTY, 0.0));
+        }
+        if !self.any_stale {
+            return self.total;
+        }
+        let Self { blocks, stale, .. } = self;
+        let stale_blocks = (0..n).filter(|&b| Self::is_stale(stale, b)).count();
+        let rescan = |b: usize, out: &mut (Aabb, f32), chunk: &[T]| {
+            if Self::is_stale(stale, b) {
+                *out = scan(chunk);
+                chunk.len()
+            } else {
+                0
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let scanned = if stale_blocks >= PARALLEL_BLOCKS {
+            use rayon::prelude::*;
+            blocks
+                .par_iter_mut()
+                .zip(data.par_chunks(CULL_BLOCK))
+                .enumerate()
+                .map(|(b, (out, chunk))| rescan(b, out, chunk))
+                .sum()
+        } else {
+            let mut n = 0;
+            for (b, (out, chunk)) in blocks.iter_mut().zip(data.chunks(CULL_BLOCK)).enumerate() {
+                n += rescan(b, out, chunk);
+            }
+            n
+        };
+        #[cfg(target_arch = "wasm32")]
+        let scanned = {
+            let _ = stale_blocks;
+            let mut n = 0;
+            for (b, (out, chunk)) in blocks.iter_mut().zip(data.chunks(CULL_BLOCK)).enumerate() {
+                n += rescan(b, out, chunk);
+            }
+            n
+        };
+        self.scanned = scanned;
+        self.stale.fill(0);
+        self.any_stale = false;
+        let mut total = (Aabb::EMPTY, 0.0f32);
+        for (aabb, s) in &self.blocks {
+            total.0.union(aabb);
+            total.1 = total.1.max(*s);
+        }
+        self.total = total;
+        total
+    }
+}
+
+/// Exact (position AABB, max scale) of `chunk`; instances without bounds are skipped.
+#[inline]
+fn scan<T: InstanceData>(chunk: &[T]) -> (Aabb, f32) {
+    let mut aabb = Aabb::EMPTY;
+    let mut scale = 0.0f32;
+    for v in chunk {
+        if let Some((p, s)) = v.bounds() {
+            aabb.grow(p);
+            scale = scale.max(s);
+        }
+    }
+    (aabb, scale)
+}
+
 /// User-owned CPU instance array with dirty-range tracking. Register it in
 /// [`InstanceBuffers`] and reference it from an [`InstancedMesh`].
 pub struct InstanceBuffer<T: InstanceData> {
     data: Vec<T>,
     dirty: DirtyRanges,
     usage: BufferUsage,
-    bounds: Aabb,
-    max_scale: f32,
-    bounds_exact: bool,
+    bounds: BlockBounds,
     user_bounds: Option<Aabb>,
 }
 
@@ -442,17 +648,21 @@ impl<T: InstanceData> InstanceBuffer<T> {
     }
     /// Take ownership of existing data (all of it is dirty).
     pub fn from_vec(data: Vec<T>, usage: BufferUsage) -> Self {
-        let mut dirty = DirtyRanges::with_merge_gap(16);
-        dirty.mark(0..data.len());
-        Self {
+        let mut buffer = Self {
             data,
-            dirty,
+            dirty: DirtyRanges::with_merge_gap(16),
             usage,
-            bounds: Aabb::EMPTY,
-            max_scale: 0.0,
-            bounds_exact: false,
+            bounds: BlockBounds::default(),
             user_bounds: None,
-        }
+        };
+        buffer.touch(0..buffer.data.len());
+        buffer
+    }
+    /// Record an edit of `range` (upload + bounds).
+    #[inline]
+    fn touch(&mut self, range: Range<usize>) {
+        self.dirty.mark(range.clone());
+        self.bounds.mark(range);
     }
     /// Number of instances.
     pub fn len(&self) -> usize {
@@ -477,81 +687,91 @@ impl<T: InstanceData> InstanceBuffer<T> {
     /// Overwrite instance `i` (1 instance worth of upload).
     pub fn set(&mut self, i: usize, value: T) {
         self.data[i] = value;
-        self.dirty.mark_one(i);
+        self.touch(i..i + 1);
     }
     /// Mutable access to instance `i` (marks it dirty).
     pub fn get_mut(&mut self, i: usize) -> &mut T {
-        self.dirty.mark_one(i);
+        self.touch(i..i + 1);
         &mut self.data[i]
     }
     /// Mutable access to a range (marks it dirty).
     pub fn range_mut(&mut self, range: Range<usize>) -> &mut [T] {
-        self.dirty.mark(range.clone());
+        self.touch(range.clone());
         &mut self.data[range]
     }
     /// Mutable access to everything (marks all dirty).
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        self.dirty.mark(0..self.data.len());
-        self.bounds_exact = false;
+        self.touch(0..self.data.len());
         &mut self.data
     }
     /// Append one instance.
     pub fn push(&mut self, value: T) {
         let i = self.data.len();
         self.data.push(value);
-        self.dirty.mark_one(i);
+        self.touch(i..i + 1);
     }
     /// Append many.
     pub fn extend_from_slice(&mut self, values: &[T]) {
         let start = self.data.len();
         self.data.extend_from_slice(values);
-        self.dirty.mark(start..self.data.len());
+        self.touch(start..self.data.len());
     }
-    /// Shorten (no upload needed; bounds are recomputed lazily).
+    /// Shorten (no upload needed).
     pub fn truncate(&mut self, len: usize) {
         if len < self.data.len() {
             self.data.truncate(len);
             self.dirty.clamp(len);
-            self.bounds_exact = false;
-            self.bounds = Aabb::EMPTY;
+            self.bounds.truncate(len);
         }
     }
     /// Remove all instances (keeps capacity).
     pub fn clear(&mut self) {
         self.truncate(0);
     }
-    /// Swap-remove instance `i` (moves the last instance into `i`: 1 instance of upload).
+    /// Swap-remove instance `i` (moves the last instance into `i`: 1 instance of upload, and
+    /// on CPU-culled paths one block of bounds recomputation).
     pub fn swap_remove(&mut self, i: usize) -> T {
         let last = self.data.len() - 1;
         let v = self.data.swap_remove(i);
         self.dirty.clamp(last);
         if i < last {
-            self.dirty.mark_one(i);
+            self.touch(i..i + 1);
         }
-        self.bounds_exact = false;
+        // The last block only lost an instance: its bounds stay a valid (conservative) box
+        // until it is edited again or dropped.
+        self.bounds.blocks.truncate(last.div_ceil(CULL_BLOCK));
         v
     }
     /// Replace all contents.
     pub fn replace(&mut self, data: Vec<T>) {
         self.data = data;
         self.dirty.clear();
-        self.dirty.mark(0..self.data.len());
-        self.bounds = Aabb::EMPTY;
-        self.bounds_exact = false;
+        self.touch(0..self.data.len());
     }
-    /// Override the automatic bounds used for CPU buffer-level culling (skips per-instance
-    /// bound tracking). `bounds` is a world-space box containing every instance's *position*;
-    /// the renderer grows it by the mesh's bounding radius at scale 1, so include any extra
-    /// extent of instances scaled above 1. `None` returns to automatic bounds, recomputed from
-    /// all instances on the next frame (edits made meanwhile were not tracked).
+    /// Override the automatic bounds used for CPU culling with one box for the whole buffer.
+    /// `bounds` is a world-space box containing every instance's *position*; the renderer
+    /// grows it by the mesh's bounding radius at scale 1, so include any extra extent of
+    /// instances scaled above 1. `None` returns to automatic (per-block) bounds; edits made
+    /// meanwhile are still tracked.
     pub fn set_bounds(&mut self, bounds: Option<Aabb>) {
         self.user_bounds = bounds;
-        self.bounds_exact = false;
     }
     /// Pending dirty ranges (instance units).
     pub fn dirty_ranges(&self) -> &[Range<usize>] {
         self.dirty.ranges()
     }
+}
+
+/// CPU culling bounds of an instance buffer.
+pub(crate) enum CullBounds<'a> {
+    /// [`InstanceBuffer::set_bounds`] override: one box for the whole buffer, scale 1.
+    User(Aabb),
+    /// Automatic: the union of all blocks, and one entry per [`CULL_BLOCK`] instances.
+    /// Empty boxes mean "unknown" (no decodable positions).
+    Blocks {
+        total: (Aabb, f32),
+        blocks: &'a [(Aabb, f32)],
+    },
 }
 
 /// Type-erased access used by the renderer.
@@ -562,21 +782,14 @@ pub(crate) trait ErasedInstanceBuffer: Send + Sync {
     fn usage(&self) -> BufferUsage;
     fn dirty(&self) -> &DirtyRanges;
     fn clear_dirty(&mut self);
-    /// Update and return world-space position bounds + max instance scale.
-    fn refresh_bounds(&mut self) -> (Aabb, f32);
+    /// Bring the CPU culling bounds up to date (recomputing only blocks edited since the
+    /// last call) and return them.
+    fn cull_bounds(&mut self) -> CullBounds<'_>;
+    /// Instances visited by the last bounds refresh.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn bounds_scanned(&self) -> usize;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
-}
-
-impl<T: InstanceData> InstanceBuffer<T> {
-    fn grow_bounds(&mut self, range: Range<usize>) {
-        for v in &self.data[range] {
-            if let Some((p, s)) = v.bounds() {
-                self.bounds.grow(p);
-                self.max_scale = self.max_scale.max(s);
-            }
-        }
-    }
 }
 
 impl<T: InstanceData> ErasedInstanceBuffer for InstanceBuffer<T> {
@@ -598,28 +811,18 @@ impl<T: InstanceData> ErasedInstanceBuffer for InstanceBuffer<T> {
     fn clear_dirty(&mut self) {
         self.dirty.clear();
     }
-    fn refresh_bounds(&mut self) -> (Aabb, f32) {
+    fn cull_bounds(&mut self) -> CullBounds<'_> {
         if let Some(b) = self.user_bounds {
-            // Dirty ranges are cleared after every upload, so edits made while overridden
-            // never reach the automatic bounds: they must be recomputed when it is lifted.
-            self.bounds_exact = false;
-            return (b, 1.0);
+            return CullBounds::User(b);
         }
-        let len = self.data.len();
-        // Exact recompute when most of the buffer changed (we touch it all for upload anyway)
-        // or after shrinking; otherwise grow conservatively over the dirty ranges only.
-        if !self.bounds_exact || self.dirty.total() * 2 > len {
-            self.bounds = Aabb::EMPTY;
-            self.max_scale = 0.0;
-            self.grow_bounds(0..len);
-            self.bounds_exact = true;
-        } else if !self.dirty.is_empty() {
-            for i in 0..self.dirty.ranges().len() {
-                let r = self.dirty.ranges()[i].clone();
-                self.grow_bounds(r);
-            }
+        let total = self.bounds.refresh(&self.data);
+        CullBounds::Blocks {
+            total,
+            blocks: &self.bounds.blocks,
         }
-        (self.bounds, self.max_scale)
+    }
+    fn bounds_scanned(&self) -> usize {
+        self.bounds.scanned
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -722,6 +925,13 @@ mod tests {
         assert_eq!(c.bounds(), Some((Vec3::new(-1.0, 0.0, 5.0), 2.5)));
     }
 
+    fn totals(b: &mut dyn ErasedInstanceBuffer) -> (Aabb, f32) {
+        match b.cull_bounds() {
+            CullBounds::User(aabb) => (aabb, 1.0),
+            CullBounds::Blocks { total, .. } => total,
+        }
+    }
+
     #[test]
     fn dirty_tracking_and_bounds() {
         let mut b = InstanceBuffer::from_vec(
@@ -731,28 +941,188 @@ mod tests {
             BufferUsage::Dynamic,
         );
         assert_eq!(b.dirty_ranges(), &[0..100]);
-        let (aabb, s) = b.refresh_bounds();
+        let (aabb, s) = totals(&mut b);
         assert_eq!((aabb.min, aabb.max, s), (Vec3::ZERO, Vec3::splat(99.0), 1.0));
         b.clear_dirty();
         b.set(5, InstanceCompact::new(Vec3::splat(500.0), Quat::IDENTITY, 3.0));
         assert_eq!(b.dirty_ranges(), &[5..6]);
-        let (aabb, s) = b.refresh_bounds();
+        let (aabb, s) = totals(&mut b);
         assert_eq!((aabb.max, s), (Vec3::splat(500.0), 3.0));
         b.clear_dirty();
         b.swap_remove(0);
         assert_eq!(b.dirty_ranges(), &[0..1]);
         assert_eq!(b.len(), 99);
+        // Bounds are exact per block: overwriting the far instance shrinks them again.
+        b.set(5, InstanceCompact::new(Vec3::splat(5.0), Quat::IDENTITY, 1.0));
+        let (aabb, s) = totals(&mut b);
+        assert_eq!((aabb.min, aabb.max, s), (Vec3::splat(1.0), Vec3::splat(99.0), 1.0));
+    }
+
+    /// Regression: a single `swap_remove` / `truncate` invalidated the bounds, so the next
+    /// frame rescanned every instance (through a per-instance layout search): ~7 ms per frame
+    /// for one removal from a 1M buffer, even on GPU paths that never read the bounds. Only
+    /// edited blocks are recomputed now, and only when CPU culling asks for them.
+    #[test]
+    fn bounds_refresh_only_edited_blocks() {
+        let n = 100_000;
+        let mut b = InstanceBuffer::from_vec(
+            (0..n)
+                .map(|i| InstanceCompact::new(Vec3::new(i as f32, 0.0, 0.0), Quat::IDENTITY, 1.0))
+                .collect(),
+            BufferUsage::Dynamic,
+        );
+        let scanned = |b: &mut InstanceBuffer<InstanceCompact>| {
+            let _ = b.cull_bounds();
+            b.bounds_scanned()
+        };
+        assert_eq!(scanned(&mut b), n, "first refresh scans everything");
+        assert_eq!(scanned(&mut b), 0, "nothing changed");
+        b.set(50_000, InstanceCompact::new(Vec3::ZERO, Quat::IDENTITY, 1.0));
+        assert_eq!(scanned(&mut b), CULL_BLOCK);
+        b.swap_remove(10);
+        assert_eq!(scanned(&mut b), CULL_BLOCK, "the block that received the last instance");
+        for _ in 0..100 {
+            b.swap_remove(0);
+        }
+        assert_eq!(scanned(&mut b), CULL_BLOCK);
+        b.truncate(10_000);
+        assert!(scanned(&mut b) <= CULL_BLOCK);
+        b.as_mut_slice();
+        assert_eq!(scanned(&mut b), 10_000);
+        // Edits keep being tracked without anybody asking for bounds (GPU culling paths).
+        for i in 0..10 {
+            b.set(i * 1000, InstanceCompact::new(Vec3::splat(-7.0), Quat::IDENTITY, 2.0));
+        }
+        let (aabb, s) = totals(&mut b);
+        assert_eq!((aabb.min, s), (Vec3::splat(-7.0), 2.0));
+        assert_eq!(b.bounds_scanned(), 10_000, "the three blocks that were edited");
+    }
+
+    /// Every instance lies in its block's box, and the boxes are exact after any edit mix.
+    #[test]
+    fn block_bounds_contain_their_instances() {
+        let mut seed = 7u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32 * 200.0 - 100.0
+        };
+        let mut b = InstanceBuffer::<InstanceTransform>::new(BufferUsage::Dynamic);
+        for _ in 0..3 * CULL_BLOCK + 17 {
+            b.push(InstanceTransform::from_trs(
+                Vec3::new(rnd(), rnd(), rnd()),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ));
+        }
+        for round in 0..6 {
+            let _ = b.cull_bounds();
+            for k in 0..50 {
+                let i = (rnd().abs() * 100.0) as usize % b.len();
+                match (round + k) % 4 {
+                    0 => b.set(
+                        i,
+                        InstanceTransform::from_trs(Vec3::splat(rnd()), Quat::IDENTITY, Vec3::splat(2.0)),
+                    ),
+                    1 => {
+                        b.swap_remove(i);
+                    }
+                    2 => b.push(InstanceTransform::from_trs(
+                        Vec3::splat(rnd()),
+                        Quat::IDENTITY,
+                        Vec3::ONE,
+                    )),
+                    _ => b.get_mut(i).model[3][1] = rnd(),
+                }
+            }
+            if round == 3 {
+                b.truncate(2 * CULL_BLOCK + 5);
+            }
+            let data: Vec<_> = b.as_slice().to_vec();
+            let CullBounds::Blocks { total, blocks } = b.cull_bounds() else {
+                unreachable!()
+            };
+            assert_eq!(blocks.len(), data.len().div_ceil(CULL_BLOCK));
+            for (k, chunk) in data.chunks(CULL_BLOCK).enumerate() {
+                let (aabb, s) = scan(chunk);
+                // Conservative, and exact except where only removals happened.
+                let (got, gs) = blocks[k];
+                assert!(
+                    got.min.cmple(aabb.min).all() && got.max.cmpge(aabb.max).all(),
+                    "block {k}"
+                );
+                assert!(gs >= s);
+            }
+            for (aabb, _) in blocks {
+                assert!(total.0.min.cmple(aabb.min).all() && total.0.max.cmpge(aabb.max).all());
+            }
+        }
     }
 
     #[test]
-    fn lifting_user_bounds_recomputes_from_all_instances() {
+    fn builtin_bounds_match_the_layout_decoder() {
+        const _: () = assert!(matches!(
+            InstanceCompact::LAYOUT.cull_source(),
+            CullSource::TranslationScale {
+                translation: 0,
+                scale: Some((12, ScaleKind::Uniform))
+            }
+        ));
+        let m = Mat4::from_cols_array(&std::array::from_fn(|i| i as f32 * 0.37 - 2.0));
+        let t = InstanceTransform::from_mat4(m);
+        let tc = InstanceTransformColor::new(m, glam::Vec4::ONE);
+        let c = InstanceCompact::new(Vec3::new(1.0, -2.0, 3.0), Quat::IDENTITY, -1.5);
+        let p = InstancePacked::new(Vec3::new(4.0, 5.0, 6.0), Quat::IDENTITY, 0.5, glam::Vec4::ONE, 3);
+        assert_eq!(
+            t.bounds(),
+            InstanceTransform::LAYOUT.decode_bounds(bytemuck::bytes_of(&t))
+        );
+        assert_eq!(
+            tc.bounds(),
+            InstanceTransformColor::LAYOUT.decode_bounds(bytemuck::bytes_of(&tc))
+        );
+        assert_eq!(
+            c.bounds(),
+            InstanceCompact::LAYOUT.decode_bounds(bytemuck::bytes_of(&c))
+        );
+        assert_eq!(p.bounds(), InstancePacked::LAYOUT.decode_bounds(bytemuck::bytes_of(&p)));
+        assert_eq!(c.bounds(), Some((Vec3::new(1.0, -2.0, 3.0), 1.5)));
+
+        /// A user type relying on the default `bounds` (vector scale at a non-zero offset).
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Custom {
+            color: [f32; 4],
+            scale: [f32; 3],
+            pos: [f32; 3],
+        }
+        impl InstanceData for Custom {
+            const LAYOUT: &'static InstanceLayout = &InstanceLayout {
+                name: "Custom",
+                stride: 40,
+                attributes: &[
+                    InstanceAttribute::new(InstanceSemantic::Color, VertexFormat::Float32x4, 0),
+                    InstanceAttribute::new(InstanceSemantic::Scale, VertexFormat::Float32x3, 16),
+                    InstanceAttribute::new(InstanceSemantic::Translation, VertexFormat::Float32x3, 28),
+                ],
+            };
+        }
+        let u = Custom {
+            color: [0.0; 4],
+            scale: [1.0, -4.0, 2.0],
+            pos: [7.0, 8.0, 9.0],
+        };
+        assert_eq!(u.bounds(), Some((Vec3::new(7.0, 8.0, 9.0), 4.0)));
+    }
+
+    #[test]
+    fn user_bounds_override_and_lifting() {
         let mut b = InstanceBuffer::from_vec(
             (0..100)
                 .map(|i| InstanceCompact::new(Vec3::new(i as f32 * 0.01, 0.0, 0.0), Quat::IDENTITY, 1.0))
                 .collect(),
             BufferUsage::Dynamic,
         );
-        b.refresh_bounds();
+        let _ = b.cull_bounds();
         b.clear_dirty();
         let user = Aabb::new(Vec3::splat(-1e5), Vec3::splat(1e5));
         b.set_bounds(Some(user));
@@ -763,11 +1133,11 @@ mod tests {
                     InstanceCompact::new(Vec3::new(1000.0, 0.0, 0.0), Quat::IDENTITY, 2.0),
                 );
             }
-            assert_eq!(b.refresh_bounds(), (user, 1.0));
+            assert_eq!(totals(&mut b), (user, 1.0));
             b.clear_dirty();
         }
         b.set_bounds(None);
-        let (aabb, s) = b.refresh_bounds();
+        let (aabb, s) = totals(&mut b);
         assert_eq!(
             (aabb.min, aabb.max, s),
             (Vec3::new(1000.0, 0.0, 0.0), Vec3::new(1000.0, 0.0, 0.0), 2.0)

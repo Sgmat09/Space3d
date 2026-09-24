@@ -10,10 +10,16 @@ const MAX_RANGES: usize = 64;
 ///
 /// Adjacent (or overlapping) ranges are merged on insert; ranges separated by at most
 /// `merge_gap` clean elements are merged too, trading a few redundant bytes for fewer copies.
+/// At most 64 ranges are kept: once the set is saturated, a new range is folded
+/// into its nearest neighbour in O(1) when it is no farther from it than the set's average
+/// spacing (strided and scattered edits), and only otherwise pays for merging the closest
+/// pair of ranges.
 #[derive(Clone, Debug, Default)]
 pub struct DirtyRanges {
     ranges: Vec<Range<usize>>,
     merge_gap: usize,
+    /// Scratch for [`Self::subtract`] (kept to avoid per-frame allocation).
+    spare: Vec<Range<usize>>,
 }
 
 impl DirtyRanges {
@@ -22,6 +28,16 @@ impl DirtyRanges {
         Self {
             ranges: Vec::new(),
             merge_gap,
+            spare: Vec::new(),
+        }
+    }
+
+    /// Average distance between range starts once saturated: folding a new range into a
+    /// neighbour at most this far away wastes no more than merging a typical pair would.
+    fn typical_spacing(&self) -> usize {
+        match (self.ranges.first(), self.ranges.last()) {
+            (Some(a), Some(b)) => (b.end - a.start) / self.ranges.len(),
+            _ => 0,
         }
     }
 
@@ -31,20 +47,25 @@ impl DirtyRanges {
             return;
         }
         let gap = self.merge_gap;
+        let saturated = self.ranges.len() >= MAX_RANGES;
+        let typical = if saturated { self.typical_spacing() } else { 0 };
         // Fast path: appending after (or touching) the last range — the common case for
         // sequential writes and pushes.
-        if let Some(last) = self.ranges.last_mut() {
-            if range.start >= last.start {
-                if range.start <= last.end + gap {
-                    last.end = last.end.max(range.end);
-                    return;
-                }
-                self.ranges.push(range);
-                self.collapse_if_fragmented();
+        let Some(last) = self.ranges.last_mut() else {
+            self.ranges.push(range);
+            return;
+        };
+        if range.start >= last.start {
+            if range.start <= last.end + gap {
+                last.end = last.end.max(range.end);
                 return;
             }
-        } else {
+            if saturated && range.start - last.end <= typical {
+                last.end = range.end;
+                return;
+            }
             self.ranges.push(range);
+            self.collapse_if_fragmented();
             return;
         }
         // General path: find first range whose (end + gap) >= start.
@@ -55,6 +76,22 @@ impl DirtyRanges {
             new.start = new.start.min(self.ranges[last].start);
             new.end = new.end.max(self.ranges[last].end);
             last += 1;
+        }
+        if saturated && last == first {
+            // Would add a range: widen the nearer neighbour instead when it is close enough.
+            // (`first < len` here: a range past the last one takes the append path above.)
+            let right = self.ranges[first].start - new.end;
+            let left = first
+                .checked_sub(1)
+                .map_or(usize::MAX, |l| new.start - self.ranges[l].end);
+            if left.min(right) <= typical {
+                if left <= right {
+                    self.ranges[first - 1].end = new.end;
+                } else {
+                    self.ranges[first].start = new.start;
+                }
+                return;
+            }
         }
         self.ranges.splice(first..last, std::iter::once(new));
         self.collapse_if_fragmented();
@@ -87,6 +124,40 @@ impl DirtyRanges {
     /// Forget everything (after an upload).
     pub fn clear(&mut self) {
         self.ranges.clear();
+    }
+
+    /// Remove every element covered by `remove` (sorted, non-overlapping), keeping the rest
+    /// dirty — e.g. after uploading only part of the dirty data.
+    pub(crate) fn subtract(&mut self, remove: &[Range<usize>]) {
+        if remove.is_empty() || self.ranges.is_empty() {
+            return;
+        }
+        self.spare.clear();
+        let mut j = 0;
+        for r in &self.ranges {
+            // Skip removals that end before this range.
+            while j < remove.len() && remove[j].end <= r.start {
+                j += 1;
+            }
+            let mut start = r.start;
+            let mut k = j;
+            while start < r.end {
+                match remove.get(k) {
+                    Some(rm) if rm.start < r.end => {
+                        if rm.start > start {
+                            self.spare.push(start..rm.start);
+                        }
+                        start = start.max(rm.end);
+                        k += 1;
+                    }
+                    _ => {
+                        self.spare.push(start..r.end);
+                        break;
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut self.ranges, &mut self.spare);
     }
 
     /// No dirty elements.
@@ -157,10 +228,80 @@ mod tests {
         for i in 0..MAX_RANGES {
             d.mark_one(i * 1000);
         }
-        // One extra range right next to an existing one: only that pair merges.
-        d.mark_one(5003);
+        // A far-away range is not folded into its neighbour: the closest pair merges instead.
+        d.mark_one(1_000_000);
         assert_eq!(d.ranges().len(), MAX_RANGES);
-        assert_eq!(d.total(), MAX_RANGES + 3);
-        assert_eq!(d.bounds(), Some(0..(MAX_RANGES - 1) * 1000 + 1));
+        assert_eq!(d.total(), MAX_RANGES + 1000);
+        assert_eq!(d.ranges().last(), Some(&(1_000_000..1_000_001)));
+        assert_eq!(d.ranges()[0], 0..1001);
+    }
+
+    fn check_invariants(d: &DirtyRanges, marked: &[usize]) {
+        assert!(d.ranges().len() <= MAX_RANGES);
+        for w in d.ranges().windows(2) {
+            assert!(w[0].end < w[1].start, "sorted and disjoint: {:?}", d.ranges());
+        }
+        for &m in marked {
+            assert!(d.ranges().iter().any(|r| r.contains(&m)), "{m} lost");
+        }
+    }
+
+    /// Regression: once 64 ranges existed, every further scattered mark scanned all gaps and
+    /// shifted the vector (O(MAX_RANGES) per mark). Strided marks now extend the last range in
+    /// O(1) and coalesce the same way.
+    #[test]
+    fn saturated_strided_marks_are_constant_time_and_cover_everything() {
+        for descending in [false, true] {
+            let mut d = DirtyRanges::with_merge_gap(16);
+            let mut marked = Vec::new();
+            let idx: Vec<usize> = (0..50_000).map(|k| k * 20).collect();
+            let order: Vec<usize> = if descending {
+                idx.iter().rev().copied().collect()
+            } else {
+                idx.clone()
+            };
+            let t = std::time::Instant::now();
+            for &i in &order {
+                d.mark_one(i);
+                marked.push(i);
+            }
+            let elapsed = t.elapsed();
+            check_invariants(&d, &marked);
+            // Nearly everything is dirty either way; the caller then uploads it in one copy.
+            assert!(d.total() > 990_000, "{descending}: {}", d.total());
+            // Generous bound (debug build, loaded machine): the old O(64) path took ~2.5 ms in
+            // release and far longer in debug.
+            assert!(elapsed.as_millis() < 250, "{descending}: {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn saturated_random_marks_stay_valid() {
+        let mut d = DirtyRanges::with_merge_gap(16);
+        let mut seed = 12345u64;
+        let mut marked = Vec::new();
+        for _ in 0..5000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let i = (seed >> 33) as usize % 1_000_000;
+            d.mark(i..i + 1 + (seed as usize % 4));
+            marked.push(i);
+            check_invariants(&d, &marked[marked.len().saturating_sub(64)..]);
+        }
+        check_invariants(&d, &marked);
+    }
+
+    #[test]
+    fn subtract_keeps_the_uncovered_parts() {
+        let mut d = DirtyRanges::default();
+        d.mark(0..10);
+        d.mark(20..30);
+        d.mark(40..50);
+        d.subtract(&[2..4, 8..22, 25..26, 45..100]);
+        assert_eq!(d.ranges(), &[0..2, 4..8, 22..25, 26..30, 40..45]);
+        d.subtract(&[0..1000]);
+        assert!(d.is_empty());
+        d.mark(5..6);
+        d.subtract(&[]);
+        assert_eq!(d.ranges(), &[5..6]);
     }
 }

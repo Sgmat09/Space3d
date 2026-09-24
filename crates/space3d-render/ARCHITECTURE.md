@@ -11,7 +11,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | `renderer.rs` | `Renderer`: instance/adapter/device/queue, capability detection, surfaces, offscreen target, asset upload, `capture()` |
 | `frame.rs` | per-frame extract → batch → cull → upload → encode; `RenderSettings`; material interning |
 | `instance.rs` | `InstanceData` trait, `InstanceLayout`/semantics, built-in formats, `InstanceBuffer<T>`, `InstanceBuffers`, `InstancedMesh` |
-| `gpu.rs` | `Uploader` (StagingBelt), `GrowBuffer`, `TrackedBuffer` (shadow-diffed uploads), parallel staging copies |
+| `gpu.rs` | `Uploader` (staging ring), `GrowBuffer`, `TrackedBuffer` (shadow-diffed uploads), parallel staging copies |
 | `arena.rs` | mesh arena: shared vertex/index buffers, first-fit range allocator, GPU-side growth |
 | `assets.rs` | `RenderAssets`: handle allocation without a GPU, pending uploads, textures/render targets |
 | `texture.rs` | `write_texture` uploads (block-aware pitch), GPU mip generation, sampler cache |
@@ -26,13 +26,14 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 ```
  Stage::Render  (render_system → Renderer::render_frame)
  ───────────────────────────────────────────────────────────────────────────────────────────
- RenderAssets.pending ──► upload_assets_into ──► mesh arena (belt / mapped_at_creation)
+ RenderAssets.pending ──► upload_assets_into ──► mesh arena (staging ring)
                                               └► textures (write_texture + GPU mip blit)
 
  World ──┬─ lights (DirectionalLight ≤4, PointLight ≤16) ─────────────► GpuView (per camera)
          ├─ cameras (Camera3d + GlobalTransform, sorted by order) ─────► views + frustums
          ├─ ECS: (GlobalTransform, Mesh3d, Material, Visibility?)
-         │      intern Material → id ; key = class|material|mesh ; sort
+         │      intern Material → id (cached) ; key = class|material|mesh
+         │      bucket by key (order reused while the key sequence is unchanged)
          │      write matrices into `ecs` TrackedBuffer (diff vs shadow) ─► ECS sources
          └─ InstancedMesh ─► InstanceBuffers[handle]
                 sync dirty ranges ─► per-buffer GrowBuffer ───────────────► explicit sources
@@ -40,18 +41,21 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  sources sorted by (blend, pipeline class, layout, material, mesh, buffer)
 
  for each view:
-   CpuDirect:  ECS → per-instance sphere test; all visible → draw from `ecs`
+   CpuDirect:  ECS → per-instance sphere test (one pass, rayon for large batches);
+                     all visible → draw from `ecs`
                      partial → visible matrices into `cpu_visible` (diffed)
-               explicit → buffer-level AABB test → draw whole buffer or skip
+               explicit → per-block AABB test (4096 instances, bounds refreshed lazily
+                          for edited blocks) → one draw per visible run of blocks
    Gpu*:       each cullable source → CullJob + output region in `cull_out`
                                     + DrawIndexedIndirectArgs template
                jobs grouped per source buffer → one mark + one scatter dispatch each
 
- flush TrackedBuffers (only changed bytes) ─► StagingBelt ─► copy_buffer_to_buffer
+ flush TrackedBuffers (only changed bytes) ─► staging ring ─► copy_buffer_to_buffer
+   (CpuDirect: `ecs` uploads only ranges drawn from it; the rest stays pending)
  encoder: [uploads] → copy templates→args → clear counts
           → compute(mark → scan → scatter [+compact])
           → per view: [copy own render target → feedback texture] → render pass
-          → submit → present → belt.recall → poll(Poll)
+          → submit → present → staging recall → poll(Poll)
 ```
 
 Everything above happens in **one command encoder and one submit per frame**.
@@ -59,11 +63,17 @@ Everything above happens in **one command encoder and one submit per frame**.
 ## Instancing
 
 ### Path 1 — automatic ECS batching
-Entities with `Mesh3d + Material + GlobalTransform` are gathered into `EcsItem`s (key + matrix),
-sorted by `(pipeline class, material id, mesh)` and written contiguously into the persistent
-`ecs` instance buffer (`InstanceTransform`, 64 B). Each run of equal keys becomes one *source*
+Entities with `Mesh3d + Material + GlobalTransform` are gathered in query order into compact
+arrays (batch key, matrix, mesh), grouped by key `(pipeline class, material id, mesh)` — a
+counting sort that keeps query order within a key, so the result equals a stable sort — and
+written contiguously into the persistent `ecs` instance buffer (`InstanceTransform`, 64 B).
+The grouping depends only on the key sequence, so it is reused as long as that sequence is
+unchanged (static scenes, or only transforms moving); hecs has no change detection, so the
+per-entity extraction and matrix diff still run every frame. Each run of equal keys becomes one *source*
 → one instanced draw. Materials are plain values; `MaterialTable` interns equal materials
-(hash of their bit patterns) into a stable id with a slot in the material uniform buffer
+(hash of their bit patterns; the previous entity's material and a 64-slot direct-mapped cache
+answer almost every lookup with one key comparison, so the map is only probed on misses) into
+a stable id with a slot in the material uniform buffer
 (`size_of::<GpuMaterial>()` rounded up to the device's `min_uniform_buffer_offset_alignment`:
 256 B on desktop/WebGPU, 64 B on iOS and many mobile GPUs), so 1000 entities with
 equal-but-separate `Material` values still produce one draw.
@@ -100,9 +110,14 @@ records a dirty range. Usage hints:
 * `Dynamic` — dirty ranges only; GPU buffer grows 1.5×.
 * `Stream` — rewritten each frame; uploaded whole every frame without range bookkeeping.
 
-Bounds for CPU buffer-level culling are grown incrementally over dirty ranges and recomputed
-exactly only when >50 % changed, after shrinking, or after a `set_bounds` override is lifted
-(edits made while overridden are not tracked).
+CPU culling bounds are kept per block of 4096 instances (position AABB + max instance scale).
+Edits only flag their block; the CPU path recomputes the flagged blocks exactly, in parallel on
+native, when it needs them — GPU culling paths never compute bounds at all. Removals
+(`swap_remove`, `truncate`) keep the remaining boxes, which stay conservative, so removing one
+instance costs one block, not a rescan. The built-in formats read position/scale fields
+directly; other layouts decode them at offsets resolved at compile time
+(`InstanceLayout::cull_source` is a `const fn`). `set_bounds` overrides the automatic bounds
+with one box for the whole buffer; edits made meanwhile are still tracked.
 
 ### Draw paths and GPU-driven culling
 
@@ -114,7 +129,7 @@ lowered at runtime via `RenderSettings::draw_path`; reported in `RenderStats::dr
 | `GpuMultiDrawCount` | compute + `INDIRECT_EXECUTION` + `INDIRECT_FIRST_INSTANCE` + `MULTI_DRAW_INDIRECT_COUNT` (Vulkan, DX12) | compute | cull → compact non-empty args per run → `multi_draw_indexed_indirect_count` |
 | `GpuMultiDraw` | compute + indirect + `INDIRECT_FIRST_INSTANCE` (Metal, WebGPU w/ feature) | compute | `multi_draw_indexed_indirect` per run |
 | `GpuIndirect` | compute + indirect | compute | `draw_indexed_indirect` per batch; vertex buffer rebound at the batch's region (no `first_instance` needed) |
-| `CpuDirect` | none (WebGL2, GLES, downlevel) | CPU spheres/AABBs | `draw_indexed` per batch |
+| `CpuDirect` | none (WebGL2, GLES, downlevel) | CPU spheres (ECS) / per-block AABBs (explicit) | `draw_indexed` per batch (explicit: per visible run of blocks) |
 
 GPU paths additionally require `DownlevelFlags::BASE_VERTEX`; devices without it (WebGL2,
 GLES 3.0/3.1) always use `CpuDirect` (see Mesh arena).
@@ -157,22 +172,35 @@ Transparent materials (`alpha_blend`) sort after opaque batches (no per-instance
 
 ## CPU → GPU transfer
 
-### Staging: `Uploader` = `wgpu::util::StagingBelt`
-All buffer uploads go through a StagingBelt (4 MiB chunks): data is copied **directly into
-mapped staging memory** and a `copy_buffer_to_buffer` is recorded in the frame encoder. Chunks
-are recycled only after the GPU finished with them (`finish` before submit, `recall` after), so
-it is a frame-in-flight-aware ring: no write-after-read hazards, and no staging allocation in the
-steady state. (`queue.write_buffer_with` was rejected: it allocates a fresh staging buffer per
-call in wgpu-core.) Copies ≥ 1 MiB are split across rayon workers on native
+### Staging: `Uploader` (staging ring)
+All buffer uploads go through a ring of equally sized 4 MiB `MAP_WRITE | COPY_SRC` chunks: data
+is copied **directly into mapped staging memory** and a `copy_buffer_to_buffer` is recorded in
+the frame encoder. Chunks are unmapped before submit (`finish`), re-mapped after it (`recall`)
+and reused only once the map callback reports the GPU is done with them, so it is a
+frame-in-flight-aware ring: no write-after-read hazards, and no staging allocation in the
+steady state. Writes larger than a chunk are split into chunk-sized pieces (recorded in order,
+so ordering against other commands is unchanged). Every chunk is therefore interchangeable,
+and idle chunks beyond twice the busiest frame of the last 128–256 recalls are released: the
+ring follows the actual upload volume. (`wgpu::util::StagingBelt` was replaced because it never
+frees a chunk and creates one of exactly the request size whenever a write is larger than every
+chunk it has, so a growing upload leaked one mapped chunk per frame. `queue.write_buffer_with`
+was rejected: it allocates a fresh staging buffer per call in wgpu-core and runs before the
+encoder's copies.) Copies ≥ 1 MiB are split across rayon workers on native
 (`copy_to_staging`, disjoint `WriteOnly` sub-slices).
 
 ### Change detection
 * **User buffers** — explicit dirty ranges (`DirtyRanges`: sorted, merged when adjacent or within
-  16 instances; above 64 ranges the closest pair is merged). >50 % dirty → one full copy.
+  16 instances; at most 64 ranges — once saturated, a new range within the set's average
+  spacing of a neighbour is folded into it in O(1), otherwise the closest pair is merged).
+  >50 % dirty → one full copy.
 * **Renderer-owned buffers** (`TrackedBuffer`: ECS instances, per-view visible instances, view
   uniforms, materials, cull jobs/params, args templates, draw meta) keep a CPU shadow; writes are
   compared with it and only differing byte ranges are uploaded. Result: an unchanged scene with a
   still camera uploads **0 bytes** per frame; moving one ECS entity uploads one 64-byte matrix.
+  On `CpuDirect` the `ecs` buffer is only read by fully visible batches, so only its dirty
+  ranges inside those batches are uploaded; the rest stays pending (the shadow is always
+  current) until a batch is drawn from it again. Culled and partially visible batches (drawn
+  from `cpu_visible`) upload nothing to `ecs`.
 
 ### Persistent buffers and growth
 `GrowBuffer` never reallocates per frame: capacity grows 1.5× (256-byte aligned) or exactly for
@@ -184,9 +212,12 @@ All meshes live in one vertex buffer (36-byte interleaved vertex: position, norm
 unorm8 color) and one `u32` index buffer, sub-allocated first-fit with free-range coalescing.
 Each buffer grows (2×, at least by what is missing) only when *it* is short, and never beyond
 the device's `max_buffer_size`; a mesh that cannot fit is logged, keeps its CPU data and is not
-drawn. The regrown buffer is created `mapped_at_creation`: meshes landing in the fresh region
-are written straight into the mapping, old contents are copied GPU→GPU. Updates of same-sized
-meshes are written in place; removals free their ranges for reuse.
+drawn. Old contents are copied GPU→GPU into the regrown buffer, then mesh data is written
+through the staging ring like any other upload. (The regrown buffers are deliberately not
+`mapped_at_creation`: without `MAP_WRITE`, wgpu backs such a mapping with a hidden staging
+buffer of the full new size, zero-filled on the CPU and copied whole, and on WebGPU copies the
+whole mapped range through wasm memory.) Updates of same-sized meshes are written in place;
+removals free their ranges for reuse.
 
 Draws select their mesh with `first_index` + `base_vertex` (indices are stored unrebased).
 WebGL2 and GLES < 3.2 lack `DownlevelFlags::BASE_VERTEX`; wgpu does not validate it and its GL
@@ -226,7 +257,7 @@ frame's content, like a video feedback loop.
 
 | buffer | usage | lifetime | written by |
 |---|---|---|---|
-| mesh arena vertex/index | VERTEX / INDEX | persistent, grows 2× | belt or mapped-at-creation on upload |
+| mesh arena vertex/index | VERTEX / INDEX | persistent, grows 2× | staging ring on upload |
 | `ecs` instances | VERTEX (+STORAGE) | persistent, 1.5× | shadow diff each frame |
 | explicit instance buffers | VERTEX (+STORAGE) | per `InstanceBufferHandle`; freed on `remove` | dirty ranges |
 | `cpu_visible` | VERTEX | persistent | shadow diff (CPU path, partially visible batches) |
@@ -236,7 +267,7 @@ frame's content, like a video feedback loop.
 | `cull_out`, args (+ compaction records), compacted args, counts | STORAGE+VERTEX / STORAGE+INDIRECT | persistent, 1.5× | GPU only (compute, copy, clear) |
 | run meta (multi-draw-count runs) | STORAGE | persistent | shadow diff |
 | render-target feedback copies | TEXTURE_BINDING+COPY_DST | while a view samples its own target (+60 frames) | GPU copy before the pass |
-| staging chunks | MAP_WRITE+COPY_SRC | recycled ring (StagingBelt) | CPU |
+| staging chunks (4 MiB) | MAP_WRITE+COPY_SRC | recycled ring; idle chunks beyond 2× the recent per-frame peak are freed | CPU |
 | capture readback | MAP_READ | per capture | GPU copy |
 
 Every `GrowBuffer` (1.5× growth) is clamped to the device's `max_buffer_size`; callers keep the
@@ -244,16 +275,18 @@ requested size itself within it (explicit instance buffers over the limit are lo
 drawn).
 
 ## No allocation in our code in the steady state
-All per-frame scratch (`items`, `sources`, `cameras`, `views`, `draws`, `jobs`, `dispatches`)
-lives in `FrameState` and is cleared, not dropped. Asset and instance registries are moved out
+All per-frame scratch (ECS keys/matrices/order, `sources`, `cameras`, `views`, `draws`, `jobs`,
+`dispatches`, culling masks) lives in `FrameState` and is cleared, not dropped. Asset and instance registries are moved out
 of the resource map with `mem::take`, and `render_system` borrows the `Renderer` with
 `Resources::scope`, which moves its existing Box out and back (no re-boxing). Large staging
-copies are split with a rayon parallel iterator, whose `join`-based jobs live on the stack
-(`scope.spawn` would box every task). `RenderStats::cpu_reallocations` counts scratch growth
+copies, block-bounds refreshes and large CPU culling batches are split with rayon parallel
+iterators, whose `join`-based jobs live on the stack (`scope.spawn` would box every task). `RenderStats::cpu_reallocations` counts scratch growth
 and is asserted to be 0 on steady frames in
 `tests/instancing.rs::static_buffer_and_static_scene_upload_nothing_after_first_frame`.
-wgpu's own per-frame bookkeeping (encoders, passes, submission, staging-belt recall) allocates
-and is outside this guarantee.
+wgpu's own per-frame bookkeeping (encoders, passes, submission, the boxed `map_async` callbacks
+of the staging recall) allocates and is outside this guarantee: a counting-allocator probe
+attributes every remaining steady-state allocation to wgpu/naga (46–101 per frame depending on
+path and scene).
 
 ## RenderStats
 `draw_calls`, `indirect_draw_calls`, `multi_draw_calls`, `batches`, `instances`,
@@ -266,8 +299,12 @@ and is outside this guarantee.
 Headless renderers draw primary cameras into an offscreen `Rgba8UnormSrgb` target.
 `Renderer::capture()` copies it into a `MAP_READ` buffer with rows padded to
 `COPY_BYTES_PER_ROW_ALIGNMENT`, maps it via `map_buffer_on_submit` and returns a
-`space3d_tasks::Task` (native: waits on a rayon worker; web: resolved by the browser/WebGL poll)
-that strips the padding into `ImageData`. Windowed renderers re-record the last frame's primary
+`space3d_tasks::Task` that strips the padding into `ImageData` (native: resolved by a background
+task that polls the device without blocking, every millisecond, and by each frame's own poll;
+web: by the browser/WebGL poll). It never waits inside `device.poll`: a blocking poll holds
+wgpu's device-wide snatch lock for the whole GPU wait, which stalled `queue.present` and buffer
+destruction on the main thread (`capture_blocking` waits on the calling thread for its own
+submission only). Windowed renderers re-record the last frame's primary
 views into the offscreen target before copying (surface textures are not readable), at the
 size those views were prepared for. `resize`/`set_msaa_samples` reallocate the headless target
 lazily at the next frame, so a capture in between still returns the last rendered frame.

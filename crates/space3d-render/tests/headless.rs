@@ -62,6 +62,89 @@ fn capture_task_resolves() {
     assert!(img.pixels.chunks(4).all(|p| p == CLEAR));
 }
 
+/// Regression: `capture()` waited for the GPU inside a blocking `device.poll` on a worker
+/// thread. wgpu holds its device-wide snatch lock for the whole wait, so everything on the
+/// main thread that takes it exclusively — `queue.present`, buffer/texture destruction —
+/// stalled until the GPU had finished all outstanding work. A capture in flight must not
+/// hold the device.
+#[test]
+fn capture_in_flight_does_not_stall_the_main_thread() {
+    use std::time::{Duration, Instant};
+    let Some(mut app) = headless_app(512, 512) else { return };
+    let mesh = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_mesh(MeshData::sphere(0.5, 32, 16));
+    let h = app
+        .resources
+        .expect_mut::<InstanceBuffers>()
+        .insert(InstanceBuffer::<InstanceCompact>::new(BufferUsage::Dynamic));
+    app.world.spawn((InstancedMesh {
+        mesh,
+        material: Material::default(),
+        instances: h,
+    },));
+    spawn_camera(&mut app, 4.0);
+    let wait = |app: &App| {
+        let _ = app
+            .resources
+            .expect::<Renderer>()
+            .device()
+            .poll(wgpu::PollType::wait_indefinitely());
+    };
+    // Grow the (overlapping, vertex-heavy) instance count until one frame keeps the GPU busy
+    // long enough to tell a stall from noise.
+    let mut gpu = Duration::ZERO;
+    let mut n = 0usize;
+    while gpu < Duration::from_millis(40) && n < 2_000_000 {
+        let add = (n * 3).max(8192);
+        let buf = app
+            .resources
+            .expect_mut::<InstanceBuffers>()
+            .get_mut::<InstanceCompact>(h)
+            .unwrap();
+        for i in n..n + add {
+            let a = i as f32 * 0.618;
+            buf.push(InstanceCompact::new(
+                Vec3::new(a.sin(), a.cos(), 0.0) * 0.5,
+                Quat::IDENTITY,
+                1.0,
+            ));
+        }
+        n += add;
+        app.step_ticks(1);
+        wait(&app);
+        let t = Instant::now();
+        app.run_stage(Stage::Render);
+        wait(&app);
+        gpu = t.elapsed();
+    }
+    if gpu < Duration::from_millis(40) {
+        eprintln!("skipping: GPU too fast to observe a stall ({gpu:?} per frame)");
+        return;
+    }
+
+    app.run_stage(Stage::Render);
+    let task = app.resources.expect_mut::<Renderer>().capture();
+    std::thread::sleep(Duration::from_millis(2)); // the capture is being waited for now
+    let device = app.resources.expect::<Renderer>().device().clone();
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 256,
+        usage: wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let t = Instant::now();
+    buffer.destroy(); // takes the snatch lock exclusively, like `queue.present`
+    let stalled = t.elapsed();
+    let img = task.block().expect("task").expect("capture");
+    assert_eq!((img.width, img.height), (512, 512));
+    assert!(
+        stalled < gpu / 4,
+        "destroying a buffer took {stalled:?} while a capture was in flight (GPU frame {gpu:?})"
+    );
+}
+
 #[test]
 fn msaa_and_resize() {
     let Some(mut app) = headless_app(32, 32) else { return };

@@ -4,10 +4,15 @@
 //! `base_vertex` / `first_index`, which is also what makes multi-draw-indirect possible.
 //! Sub-allocation is first-fit over a sorted free list with coalescing. When a buffer is full
 //! it grows (2x, never beyond the device's `max_buffer_size`) with a GPU→GPU copy of the old
-//! contents; data for the new region is written straight into the new buffer's
-//! `mapped_at_creation` memory. Vertex and index buffers grow independently.
+//! contents; mesh data is then written through the staging ring like any other upload. Vertex
+//! and index buffers grow independently.
+//!
+//! The new buffers are deliberately *not* `mapped_at_creation`: they lack `MAP_WRITE`, so wgpu
+//! would back the mapping with a hidden staging buffer of the full new size (zero-filled on the
+//! CPU and copied whole on unmap), and on WebGPU it copies the whole mapped range into wasm
+//! memory and back. Staging only the written meshes costs a fraction of that.
 
-use crate::gpu::{Uploader, copy_to_staging};
+use crate::gpu::Uploader;
 use bytemuck::{Pod, Zeroable};
 use space3d_core::MeshData;
 use std::ops::Range;
@@ -217,18 +222,15 @@ impl MeshArena {
     }
 
     /// Replace the GPU buffer(s) whose allocator capacity changed since `old_*` (or that do
-    /// not exist yet). Old contents are copied GPU→GPU; `writes` landing in a fresh region
-    /// (at/after `old_*`) are written directly into `mapped_at_creation` memory (no staging
-    /// copy). Returns the thresholds to pass to [`Self::write`]: the old capacity of each
-    /// replaced buffer, `u32::MAX` for a kept one.
+    /// not exist yet), copying the old contents GPU→GPU. Record this before the frame's
+    /// [`Self::write`]s so they land after the copy.
     pub fn realloc_gpu(
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         (old_v, old_i): (u32, u32),
-        writes: &[ArenaWrite<'_>],
         up: &mut Uploader,
-    ) -> (u32, u32) {
+    ) {
         let new_v = self.vertices.capacity();
         let new_i = self.indices.capacity();
         let grow_v = self.vertex.is_none() || new_v != old_v;
@@ -238,7 +240,7 @@ impl MeshArena {
                 label: Some(label),
                 size,
                 usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: true,
+                mapped_at_creation: false,
             })
         };
         if grow_v {
@@ -247,18 +249,6 @@ impl MeshArena {
                 new_v as u64 * VERTEX_SIZE,
                 wgpu::BufferUsages::VERTEX,
             );
-            {
-                let mut map = vb.get_mapped_range_mut(..).expect("arena map");
-                for w in writes {
-                    if w.alloc.base_vertex >= old_v && !w.vertices.is_empty() {
-                        let o = (w.alloc.base_vertex as u64 * VERTEX_SIZE) as usize;
-                        let bytes: &[u8] = bytemuck::cast_slice(w.vertices);
-                        copy_to_staging(map.slice(o..o + bytes.len()), bytes);
-                        up.bytes += bytes.len() as u64;
-                    }
-                }
-            }
-            vb.unmap();
             if let Some(old) = &self.vertex
                 && old_v > 0
             {
@@ -273,18 +263,6 @@ impl MeshArena {
                 new_i as u64 * INDEX_SIZE,
                 wgpu::BufferUsages::INDEX,
             );
-            {
-                let mut map = ib.get_mapped_range_mut(..).expect("arena map");
-                for w in writes {
-                    if w.alloc.first_index >= old_i && !w.indices.is_empty() {
-                        let o = (w.alloc.first_index as u64 * INDEX_SIZE) as usize;
-                        let bytes: &[u8] = bytemuck::cast_slice(w.indices);
-                        copy_to_staging(map.slice(o..o + bytes.len()), bytes);
-                        up.bytes += bytes.len() as u64;
-                    }
-                }
-            }
-            ib.unmap();
             if let Some(old) = &self.index
                 && old_i > 0
             {
@@ -296,38 +274,80 @@ impl MeshArena {
         if grow_v || grow_i {
             self.generation = self.generation.wrapping_add(1);
         }
-        (
-            if grow_v { old_v } else { u32::MAX },
-            if grow_i { old_i } else { u32::MAX },
-        )
     }
 
-    /// Upload writes that were not satisfied by a growth mapping (`fresh_*` = old capacities
-    /// at the time of growth, or `u32::MAX` if no growth happened this frame) via staging.
-    pub fn write(
+    /// Upload the vertices and indices of `items` (`get` yields an item's write, `None` for
+    /// items without a placement) through the staging ring. Meshes whose ranges follow each
+    /// other — the usual case, since new meshes fill free space first-fit in order — share one
+    /// staging copy per buffer instead of costing two copies each.
+    pub fn write_all<T>(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        w: &ArenaWrite<'_>,
-        fresh_v: u32,
-        fresh_i: u32,
+        items: &[T],
+        get: impl for<'x> Fn(&'x T) -> Option<ArenaWrite<'x>>,
         up: &mut Uploader,
     ) {
-        if w.alloc.base_vertex < fresh_v && !w.vertices.is_empty() {
-            up.write(
-                encoder,
-                self.vertex.as_ref().expect("arena"),
+        if let Some(vb) = &self.vertex {
+            write_runs(encoder, vb, items, &get, Side::Vertices, up);
+        }
+        if let Some(ib) = &self.index {
+            write_runs(encoder, ib, items, &get, Side::Indices, up);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Vertices,
+    Indices,
+}
+
+impl Side {
+    /// Byte offset in the side's buffer and the bytes of `w` for this side.
+    fn of<'x>(self, w: &ArenaWrite<'x>) -> (u64, &'x [u8]) {
+        match self {
+            Side::Vertices => (
                 w.alloc.base_vertex as u64 * VERTEX_SIZE,
                 bytemuck::cast_slice(w.vertices),
-            );
+            ),
+            Side::Indices => (w.alloc.first_index as u64 * INDEX_SIZE, bytemuck::cast_slice(w.indices)),
         }
-        if w.alloc.first_index < fresh_i && !w.indices.is_empty() {
-            up.write(
-                encoder,
-                self.index.as_ref().expect("arena"),
-                w.alloc.first_index as u64 * INDEX_SIZE,
-                bytemuck::cast_slice(w.indices),
-            );
+    }
+}
+
+/// One staging write per run of back-to-back ranges of `side` (see [`MeshArena::write_all`]).
+fn write_runs<T>(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::Buffer,
+    items: &[T],
+    get: &impl for<'x> Fn(&'x T) -> Option<ArenaWrite<'x>>,
+    side: Side,
+    up: &mut Uploader,
+) {
+    let span = |t: &T| {
+        get(t)
+            .map(|w| side.of(&w))
+            .filter(|(_, bytes)| !bytes.is_empty())
+            .map(|(at, bytes)| (at, bytes.len() as u64))
+    };
+    let mut i = 0;
+    while i < items.len() {
+        let Some((start, len)) = span(&items[i]) else {
+            i += 1;
+            continue;
+        };
+        let mut end = start + len;
+        let mut j = i + 1;
+        while let Some((at, len)) = items.get(j).and_then(span) {
+            if at != end {
+                break;
+            }
+            end += len;
+            j += 1;
         }
+        let parts = items[i..j].iter().filter_map(get).map(|w| side.of(&w).1);
+        up.write_parts(encoder, target, start, (end - start) as usize, parts);
+        i = j;
     }
 }
 

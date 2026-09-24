@@ -622,3 +622,149 @@ fn sheared_transforms_are_not_culled_while_visible() {
         }
     }
 }
+
+/// Regression: the CPU path culled an explicit buffer only as a whole (one box around every
+/// instance), so a buffer spanning the world drew all its instances whenever any part of it
+/// was on screen. Blocks of instances are culled individually now, and each visible run of
+/// blocks is one draw.
+#[test]
+fn cpu_path_culls_explicit_buffers_per_block() {
+    let Some(mut app) = headless_app(96, 64) else { return };
+    set_path(&mut app, DrawPath::CpuDirect);
+    let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.4));
+    // Two 10 km rows starting at x = 0: instances 0.. and n/2.. are both next to the camera.
+    let n = 100_000usize;
+    let data = (0..n)
+        .map(|i| {
+            let k = i % (n / 2);
+            let y = if i < n / 2 { 0.5 } else { -0.5 };
+            InstanceCompact::new(
+                Vec3::new(k as f32 * 0.2 - 1.0, y, 0.0),
+                Quat::from_rotation_z(i as f32),
+                1.0,
+            )
+        })
+        .collect();
+    let h = app
+        .resources
+        .expect_mut::<InstanceBuffers>()
+        .insert(InstanceBuffer::from_vec(data, BufferUsage::Dynamic));
+    app.world.spawn((InstancedMesh {
+        mesh,
+        material: Material::unlit(Vec4::ONE),
+        instances: h,
+    },));
+    spawn_camera(&mut app, 6.0);
+    let culled = render_to_image(&mut app).expect("capture");
+    let s = stats(&app);
+    assert_eq!(s.instances, n as u64);
+    assert!(
+        s.instances_drawn > 0 && s.instances_drawn <= 4 * 4096,
+        "only the blocks near the camera: {s:?}"
+    );
+    assert_eq!(s.culled + s.instances_drawn, n as u64);
+    assert_eq!(s.draw_calls, 2, "one run at the start of each row: {s:?}");
+    assert!(count_rgb(&culled, [255, 255, 255]) > 100);
+
+    app.resources.expect_mut::<RenderSettings>().frustum_culling = false;
+    let full = render_to_image(&mut app).expect("capture");
+    assert_eq!(stats(&app).instances_drawn, n as u64);
+    assert_eq!(
+        diff_fraction(&culled, &full, 0),
+        0.0,
+        "culling must not change the image"
+    );
+}
+
+/// Regression: on the CPU path every changed ECS matrix was uploaded, although culled batches
+/// draw nothing and partially visible ones draw from a separate buffer. Now only batches drawn
+/// straight from the ECS buffer upload; the others keep their changes pending until they are.
+#[test]
+fn cpu_path_uploads_ecs_matrices_only_for_drawn_batches() {
+    let build = |app: &mut App| {
+        set_path(app, DrawPath::CpuDirect);
+        let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.3));
+        let mut entities = Vec::new();
+        // Batch A (red) in front of the camera, batch B (green) behind it.
+        for (z, color) in [
+            (0.0, Vec4::new(1.0, 0.0, 0.0, 1.0)),
+            (16.0, Vec4::new(0.0, 1.0, 0.0, 1.0)),
+        ] {
+            for i in 0..100 {
+                let p = Vec3::new((i % 10) as f32 * 0.5 - 2.25, (i / 10) as f32 * 0.4 - 1.8, z);
+                entities.push(app.world.spawn((
+                    Transform::from_xyz(p.x, p.y, p.z),
+                    Mesh3d(mesh),
+                    Material::unlit(color),
+                )));
+            }
+        }
+        let cam = app.world.spawn((
+            Transform::from_xyz(0.0, 0.0, 8.0),
+            Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 1.0, 1.0)),
+        ));
+        (entities, cam)
+    };
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let (entities, cam) = build(&mut app);
+    render_to_image(&mut app).expect("capture");
+    for frame in 0..3 {
+        for &e in &entities {
+            app.world.get::<&mut Transform>(e).unwrap().translation.y += 0.01;
+        }
+        render_to_image(&mut app).expect("capture");
+        let s = stats(&app);
+        assert_eq!((s.instances_drawn, s.culled), (100, 100), "{s:?}");
+        assert_eq!(s.instance_bytes_uploaded, 100 * 64, "frame {frame}: only batch A");
+    }
+    // Turn around: B's pending matrices are uploaded now, A's are not needed.
+    *app.world.get::<&mut Transform>(cam).unwrap() =
+        Transform::from_xyz(0.0, 0.0, 8.0).looking_at(Vec3::new(0.0, 0.0, 20.0), Vec3::Y);
+    let img = render_to_image(&mut app).expect("capture");
+    assert_eq!(stats(&app).instance_bytes_uploaded, 100 * 64);
+    assert!(count_rgb(&img, [0, 255, 0]) > 200, "batch B visible");
+
+    // Identical to a scene built in its final state.
+    let Some(mut fresh) = headless_app(64, 64) else { return };
+    let (fresh_entities, fresh_cam) = build(&mut fresh);
+    for (&e, &f) in entities.iter().zip(&fresh_entities) {
+        *fresh.world.get::<&mut Transform>(f).unwrap() = *app.world.get::<&Transform>(e).unwrap();
+    }
+    *fresh.world.get::<&mut Transform>(fresh_cam).unwrap() = *app.world.get::<&Transform>(cam).unwrap();
+    let expected = render_to_image(&mut fresh).expect("capture");
+    assert_eq!(diff_fraction(&img, &expected, 0), 0.0);
+}
+
+/// A partially visible ECS batch large enough to be culled on all threads renders exactly like
+/// the unculled scene, and a still frame afterwards uploads nothing.
+#[test]
+fn large_partially_visible_ecs_batch_renders_like_unculled() {
+    let Some(mut app) = headless_app(96, 64) else { return };
+    set_path(&mut app, DrawPath::CpuDirect);
+    let mesh = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_mesh(MeshData::cube(0.12));
+    let n = 20_000;
+    for i in 0..n {
+        let p = Vec3::new((i % 200) as f32 * 0.15 - 4.0, (i / 200) as f32 * 0.15 - 7.5, 0.0);
+        app.world.spawn((
+            Transform::from_xyz(p.x, p.y, p.z),
+            Mesh3d(mesh),
+            Material::unlit(Vec4::new(1.0, 1.0, 0.0, 1.0)),
+        ));
+    }
+    spawn_camera(&mut app, 8.0);
+    let culled = render_to_image(&mut app).expect("capture");
+    let s = stats(&app);
+    assert!(s.instances_drawn > 1000 && s.instances_drawn < n as u64 / 2, "{s:?}");
+    assert_eq!(s.culled + s.instances_drawn, n as u64);
+    assert_eq!(s.draw_calls, 1);
+    app.resources.expect_mut::<RenderSettings>().frustum_culling = false;
+    let full = render_to_image(&mut app).expect("capture");
+    assert_eq!(diff_fraction(&culled, &full, 0), 0.0);
+    app.resources.expect_mut::<RenderSettings>().frustum_culling = true;
+    render_to_image(&mut app).expect("capture");
+    render_to_image(&mut app).expect("capture");
+    assert_eq!(stats(&app).instance_bytes_uploaded, 0, "{:?}", stats(&app));
+}

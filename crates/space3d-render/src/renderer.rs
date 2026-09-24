@@ -779,23 +779,25 @@ impl Renderer {
                 break; // At the device limit: what is left does not fit.
             }
         }
-        let mut fresh = (u32::MAX, u32::MAX);
         if arena.vertex.is_none()
             || arena.index.is_none()
             || (arena.vertices.capacity(), arena.indices.capacity()) != old
         {
-            let writes: Vec<_> = scratch
-                .iter()
-                .filter_map(|(_, a, v, i, _)| {
-                    a.map(|alloc| crate::arena::ArenaWrite {
-                        alloc,
-                        vertices: v,
-                        indices: i,
-                    })
-                })
-                .collect();
-            fresh = arena.realloc_gpu(&self.device, encoder, old, &writes, &mut self.uploader);
+            // Recorded before the writes below, so they land after the old contents' copy.
+            arena.realloc_gpu(&self.device, encoder, old, &mut self.uploader);
         }
+        arena.write_all(
+            encoder,
+            scratch,
+            |(_, alloc, v, i, _)| {
+                alloc.map(|alloc| crate::arena::ArenaWrite {
+                    alloc,
+                    vertices: v,
+                    indices: i,
+                })
+            },
+            &mut self.uploader,
+        );
         for (h, alloc, v, i, data) in scratch.drain(..) {
             let Some(entry) = assets.meshes.get_mut(h.raw()) else {
                 continue;
@@ -811,17 +813,6 @@ impl Renderer {
                 entry.cpu = Some(data);
                 continue;
             };
-            assets.arena.write(
-                encoder,
-                &crate::arena::ArenaWrite {
-                    alloc,
-                    vertices: &v,
-                    indices: &i,
-                },
-                fresh.0,
-                fresh.1,
-                &mut self.uploader,
-            );
             entry.gpu = Some(crate::assets::GpuMesh {
                 alloc,
                 sphere: entry.sphere,
@@ -835,7 +826,39 @@ impl Renderer {
     /// Headless: copies the offscreen target. Windowed: re-renders the last frame's primary
     /// views into the offscreen target first (surface textures are not readable).
     /// Poll the returned task from a system, `.block()` it in tests, or `.wait().await` it.
+    ///
+    /// Never blocks: on native a background task resolves it with non-blocking device polls
+    /// (each frame's own poll resolves it too). A blocking `device.poll` would hold wgpu's
+    /// device-wide snatch lock for the whole GPU wait, stalling `queue.present` and buffer
+    /// destruction on the main thread until the GPU caught up.
     pub fn capture(&mut self) -> Task<Result<ImageData, RenderError>> {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let (readback, mut rx, _) = self.submit_capture();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let device = self.device.clone();
+            space3d_tasks::spawn(async move {
+                let mapped = loop {
+                    let _ = device.poll(wgpu::PollType::Poll);
+                    match rx.try_recv() {
+                        Ok(Some(r)) => break Ok(r),
+                        Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+                        Err(_) => break Err(()),
+                    }
+                };
+                readback.read(mapped)
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // The browser (WebGPU) or the per-frame device poll (WebGL) resolves the mapping.
+            space3d_tasks::spawn(async move { readback.read(rx.await.map_err(|_| ())) })
+        }
+    }
+
+    /// Record and submit the copy of the offscreen target into a `MAP_READ` buffer; returns
+    /// the readback, the mapping result channel and the submission.
+    fn submit_capture(&mut self) -> (CaptureReadback, MapReceiver, wgpu::SubmissionIndex) {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d capture"),
         });
@@ -876,65 +899,79 @@ impl Renderer {
         encoder.map_buffer_on_submit(&buffer, wgpu::MapMode::Read, .., move |r| {
             let _ = tx.send(r);
         });
-        self.queue.submit([encoder.finish()]);
-
-        let read =
-            move |buffer: wgpu::Buffer, ok: Result<(), wgpu::BufferAsyncError>| -> Result<ImageData, RenderError> {
-                ok.map_err(|e| RenderError::Capture(e.to_string()))?;
-                let view = buffer
-                    .slice(..)
-                    .get_mapped_range()
-                    .map_err(|e| RenderError::Capture(format!("{e:?}")))?;
-                let row = w as usize * 4;
-                let mut pixels = Vec::with_capacity(row * h as usize);
-                for y in 0..h as usize {
-                    let start = y * padded as usize;
-                    pixels.extend_from_slice(&view[start..start + row]);
-                }
-                drop(view);
-                buffer.unmap();
-                Ok(ImageData {
-                    width: w,
-                    height: h,
-                    pixels,
-                })
-            };
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let device = self.device.clone();
-            space3d_tasks::spawn_compute(move || {
-                // Off the main thread: wait for the GPU, which fires the map callback.
-                let _ = device.poll(wgpu::PollType::wait_indefinitely());
-                match futures::executor::block_on(rx) {
-                    Ok(r) => read(buffer, r),
-                    Err(_) => Err(RenderError::Capture("map callback dropped".into())),
-                }
-            })
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // The browser (WebGPU) or the per-frame device poll (WebGL) resolves the mapping.
-            space3d_tasks::spawn(async move {
-                match rx.await {
-                    Ok(r) => read(buffer, r),
-                    Err(_) => Err(RenderError::Capture("map callback dropped".into())),
-                }
-            })
-        }
+        let submission = self.queue.submit([encoder.finish()]);
+        let readback = CaptureReadback {
+            buffer,
+            size: (w, h),
+            padded,
+        };
+        (readback, rx, submission)
     }
 
-    /// [`Self::capture`] and wait for the result (tests/tools only; never from a system).
+    /// [`Self::capture`] and wait for the result on the calling thread (tests/tools only;
+    /// never from a system).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn capture_blocking(&mut self) -> Result<ImageData, RenderError> {
-        self.capture()
-            .block()
-            .unwrap_or_else(|| Err(RenderError::Capture("capture task cancelled".into())))
+        let (readback, mut rx, submission) = self.submit_capture();
+        let mapped = loop {
+            match rx.try_recv() {
+                Ok(Some(r)) => break Ok(r),
+                Ok(None) => {}
+                Err(_) => break Err(()),
+            }
+            let waited = self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission.clone()),
+                timeout: None,
+            });
+            if waited.is_err() {
+                // Device lost: the callback has fired with an error by now, or never will.
+                break rx.try_recv().ok().flatten().ok_or(());
+            }
+        };
+        readback.read(mapped)
     }
 
     /// Non-blocking device poll: fires pending map callbacks (captures, staging recycling).
     pub fn poll(&self) {
         let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+}
+
+/// Receives the result of a capture buffer's mapping.
+type MapReceiver = futures::channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>;
+
+/// A submitted capture copy: `MAP_READ` buffer with rows padded to `padded` bytes.
+struct CaptureReadback {
+    buffer: wgpu::Buffer,
+    size: (u32, u32),
+    padded: u64,
+}
+
+impl CaptureReadback {
+    /// Strip the row padding of the mapped buffer (`Err(())`: the callback was dropped).
+    fn read(self, mapped: Result<Result<(), wgpu::BufferAsyncError>, ()>) -> Result<ImageData, RenderError> {
+        mapped
+            .map_err(|()| RenderError::Capture("map callback dropped".into()))?
+            .map_err(|e| RenderError::Capture(e.to_string()))?;
+        let (w, h) = self.size;
+        let view = self
+            .buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| RenderError::Capture(format!("{e:?}")))?;
+        let row = w as usize * 4;
+        let mut pixels = Vec::with_capacity(row * h as usize);
+        for y in 0..h as usize {
+            let start = y * self.padded as usize;
+            pixels.extend_from_slice(&view[start..start + row]);
+        }
+        drop(view);
+        self.buffer.unmap();
+        Ok(ImageData {
+            width: w,
+            height: h,
+            pixels,
+        })
     }
 }
 

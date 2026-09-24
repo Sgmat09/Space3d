@@ -1,28 +1,68 @@
 //! Persistent GPU buffers and the CPU→GPU upload path.
 //!
-//! * [`Uploader`] wraps a [`wgpu::util::StagingBelt`]: a ring of mapped staging chunks that are
-//!   only reused once the GPU has consumed them (frame-in-flight safe, no write-after-read
-//!   hazards, no per-frame staging allocations in the steady state). Data is written straight
-//!   into mapped staging memory; large copies are split across rayon workers on native.
+//! * [`Uploader`] is a staging ring: equally sized mapped chunks that are only reused once the
+//!   GPU has consumed them (frame-in-flight safe, no write-after-read hazards, no per-frame
+//!   staging allocations in the steady state). Data is written straight into mapped staging
+//!   memory; large copies are split across rayon workers on native.
 //! * [`GrowBuffer`] is a persistent GPU buffer with amortized growth (1.5x, 256-byte aligned).
 //! * [`TrackedBuffer`] adds a CPU shadow copy; writes are diffed against it so only changed
 //!   byte ranges are uploaded (e.g. unchanged camera → 0 bytes).
 
 use crate::dirty::DirtyRanges;
-use wgpu::util::StagingBelt;
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Copies at or above this size are parallelized (native only).
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_COPY_THRESHOLD: usize = 1 << 20;
+
+/// Size of every staging chunk. Larger writes are split into pieces of at most this size, so
+/// all chunks are interchangeable: any idle chunk serves any request, and the ring follows the
+/// per-frame upload volume instead of keeping one chunk per record-sized write forever (which
+/// `wgpu::util::StagingBelt` does: it never frees a chunk, and a write larger than every
+/// existing chunk creates a new one of exactly that size).
+pub(crate) const STAGING_CHUNK: u64 = 4 << 20;
+
+/// Frames per window of the peak-usage tracker: idle chunks beyond twice the busiest frame of
+/// the last one to two windows are released.
+const TRIM_WINDOW: u32 = 128;
 
 /// Round `v` up to a multiple of `align` (power of two).
 pub(crate) fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
-/// Per-frame upload context: staging belt + counters.
+/// Chunk states, written by the `map_async` callback.
+const MAPPING: u8 = 0;
+const MAPPED: u8 = 1;
+const MAP_FAILED: u8 = 2;
+
+/// One `MAP_WRITE | COPY_SRC` staging buffer of [`STAGING_CHUNK`] bytes.
+struct Chunk {
+    buffer: wgpu::Buffer,
+    /// Bytes handed out since the chunk was (re)mapped.
+    offset: u64,
+    /// Set by the `map_async` callback once the GPU is done with the chunk.
+    state: Arc<AtomicU8>,
+}
+
+/// Per-frame upload context: staging ring + counters.
+///
+/// Chunks move `free` → `active` (mapped, being filled) → `closed` (unmapped at
+/// [`Self::finish`], read by the submitted copies) → `in_flight` (re-mapping after
+/// [`Self::recall`]) → `free` once the GPU finished with them.
 pub(crate) struct Uploader {
-    belt: StagingBelt,
+    device: wgpu::Device,
+    active: Vec<Chunk>,
+    closed: Vec<Chunk>,
+    in_flight: Vec<Chunk>,
+    free: Vec<Chunk>,
+    /// Chunks taken into `active` since the last `recall`.
+    used_this_frame: u32,
+    /// Most chunks one frame used: in the current window, in the previous one.
+    peak: [u32; 2],
+    window_frames: u32,
     /// Bytes written this frame.
     pub bytes: u64,
     /// Instance bytes written this frame.
@@ -34,9 +74,14 @@ pub(crate) struct Uploader {
 impl Uploader {
     pub fn new(device: &wgpu::Device) -> Self {
         Self {
-            // 4 MiB chunks: large enough for typical per-frame traffic, bigger writes get a
-            // dedicated chunk that is recycled like any other.
-            belt: StagingBelt::new(device.clone(), 4 << 20),
+            device: device.clone(),
+            active: Vec::new(),
+            closed: Vec::new(),
+            in_flight: Vec::new(),
+            free: Vec::new(),
+            used_this_frame: 0,
+            peak: [0; 2],
+            window_frames: 0,
             bytes: 0,
             instance_bytes: 0,
             reallocations: 0,
@@ -51,27 +96,152 @@ impl Uploader {
 
     /// Copy `data` into `target` at `offset` through staging memory. `offset` and the length
     /// are padded to 4 bytes by the caller's layout (all our element sizes are multiples of 4).
+    /// Writes larger than a chunk are split; the copies are recorded in order, so ordering
+    /// against other commands in `encoder` is the same as for one copy.
     pub fn write(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Buffer, offset: u64, data: &[u8]) {
-        let Some(size) = wgpu::BufferSize::new(data.len() as u64) else {
-            return;
-        };
+        self.write_parts(encoder, target, offset, data.len(), [data]);
+    }
+
+    /// Like [`Self::write`] for `parts` (together `total` bytes) that go back to back from
+    /// `offset`: one staging allocation and one copy per chunk-sized piece instead of one per
+    /// part. Many small copies are costly on the GPU side (Metal tracks every blit's overlaps).
+    pub fn write_parts<'a>(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Buffer,
+        offset: u64,
+        total: usize,
+        parts: impl IntoIterator<Item = &'a [u8]>,
+    ) {
+        debug_assert!(offset.is_multiple_of(4) && total.is_multiple_of(4), "unaligned upload");
+        let mut parts = parts.into_iter();
+        let mut cur: &[u8] = &[];
+        let mut done = 0;
+        while done < total {
+            let (chunk, at, size) = self.allocate((total - done) as u64);
+            let size = size as usize;
+            let buffer = &self.active[chunk].buffer;
+            encoder.copy_buffer_to_buffer(buffer, at, target, offset + done as u64, size as u64);
+            let mut view = buffer
+                .slice(at..at + size as u64)
+                .get_mapped_range_mut()
+                .expect("staging chunk is mapped");
+            let mut filled = 0;
+            while filled < size {
+                if cur.is_empty() {
+                    cur = parts.next().expect("write_parts: parts shorter than `total`");
+                    continue;
+                }
+                let n = cur.len().min(size - filled);
+                copy_to_staging(view.slice(filled..filled + n), &cur[..n]);
+                cur = &cur[n..];
+                filled += n;
+            }
+            done += size;
+        }
         debug_assert!(
-            offset.is_multiple_of(4) && data.len().is_multiple_of(4),
-            "unaligned upload"
+            cur.is_empty() && parts.all(|p| p.is_empty()),
+            "write_parts: parts longer than `total`"
         );
-        let mut view = self.belt.write_buffer(encoder, target, offset, size);
-        copy_to_staging(view.slice(..), data);
-        self.bytes += data.len() as u64;
+        self.bytes += total as u64;
+    }
+
+    /// Reserve up to `want` (multiple of 4) bytes: `(index into active, offset, size)`. A
+    /// write that does not fit whole takes what is left of an active chunk (if that is not a
+    /// sliver) and continues in the next one, so large uploads pack chunks densely.
+    fn allocate(&mut self, want: u64) -> (usize, u64, u64) {
+        /// Smallest remainder of a chunk worth starting a split write in.
+        const MIN_PIECE: u64 = 256 << 10;
+        let mut best = None;
+        for (i, c) in self.active.iter().enumerate() {
+            let at = align_up(c.offset, wgpu::MAP_ALIGNMENT);
+            let room = STAGING_CHUNK - at.min(STAGING_CHUNK);
+            if room >= want {
+                best = Some((i, at, want));
+                break;
+            }
+            if room >= MIN_PIECE && best.is_none() {
+                best = Some((i, at, room));
+            }
+        }
+        if let Some((i, at, size)) = best {
+            self.active[i].offset = at + size;
+            return (i, at, size);
+        }
+        let size = want.min(STAGING_CHUNK);
+        self.collect_returned();
+        let mut chunk = self.free.pop().unwrap_or_else(|| Chunk {
+            buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("space3d staging"),
+                size: STAGING_CHUNK,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                // MAP_WRITE buffers are mapped directly (no hidden staging copy).
+                mapped_at_creation: true,
+            }),
+            offset: 0,
+            state: Arc::new(AtomicU8::new(MAPPED)),
+        });
+        chunk.offset = size;
+        self.active.push(chunk);
+        self.used_this_frame += 1;
+        (self.active.len() - 1, 0, size)
+    }
+
+    /// Move chunks the GPU has finished with (mapped again) to `free`.
+    fn collect_returned(&mut self) {
+        let mut i = 0;
+        while i < self.in_flight.len() {
+            match self.in_flight[i].state.load(Ordering::Acquire) {
+                MAPPED => {
+                    let mut c = self.in_flight.swap_remove(i);
+                    c.offset = 0;
+                    self.free.push(c);
+                }
+                // Mapping failed (device lost): drop the chunk.
+                MAP_FAILED => drop(self.in_flight.swap_remove(i)),
+                _ => i += 1,
+            }
+        }
     }
 
     /// Close staging chunks before submission.
     pub fn finish(&mut self) {
-        self.belt.finish();
+        for c in self.active.drain(..) {
+            c.buffer.unmap();
+            self.closed.push(c);
+        }
     }
 
-    /// Recycle chunks after submission (they return once the GPU is done with them).
+    /// After submission: re-map the chunks just submitted (they come back once the GPU is
+    /// done with them) and release idle chunks beyond twice the recent per-frame peak.
     pub fn recall(&mut self) {
-        self.belt.recall();
+        for c in self.closed.drain(..) {
+            c.state.store(MAPPING, Ordering::Relaxed);
+            let state = c.state.clone();
+            c.buffer.slice(..).map_async(wgpu::MapMode::Write, move |r| {
+                state.store(if r.is_ok() { MAPPED } else { MAP_FAILED }, Ordering::Release);
+            });
+            self.in_flight.push(c);
+        }
+        self.collect_returned();
+
+        let used = std::mem::take(&mut self.used_this_frame);
+        self.peak[0] = self.peak[0].max(used);
+        self.window_frames += 1;
+        if self.window_frames >= TRIM_WINDOW {
+            self.peak = [0, self.peak[0]];
+            self.window_frames = 0;
+        }
+        // Dropping a chunk frees it (it is idle: not referenced by any submission). One spare
+        // stays, so an occasional small edit after a quiet period does not create a chunk.
+        let keep = (2 * self.peak[0].max(self.peak[1]) as usize).max(1);
+        self.free.truncate(keep);
+    }
+
+    /// Staging chunks currently allocated (in any state).
+    #[cfg(test)]
+    pub fn resident_chunks(&self) -> usize {
+        self.active.len() + self.closed.len() + self.in_flight.len() + self.free.len()
     }
 }
 
@@ -242,8 +412,48 @@ impl TrackedBuffer {
         }
     }
 
-    /// Upload changed ranges (or everything after reallocation). Returns bytes uploaded.
-    pub fn flush(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, up: &mut Uploader) -> u64 {
+    /// Write `count` elements (yielded by `items`) contiguously from `offset`, like one
+    /// [`Self::write_at`] per element but reserving once and marking each run of changed
+    /// elements with a single dirty range (instead of one mark per element).
+    pub fn write_all<'a, T: bytemuck::Pod>(
+        &mut self,
+        offset: usize,
+        count: usize,
+        items: impl IntoIterator<Item = &'a T>,
+        cpu_reallocs: &mut u32,
+    ) {
+        let size = std::mem::size_of::<T>();
+        let end = offset + count * size;
+        self.reserve_to(end, cpu_reallocs);
+        let Self { shadow, dirty, .. } = self;
+        let dst = &mut shadow[offset..end];
+        let mut run: Option<usize> = None;
+        let mut written = 0;
+        for (k, (item, d)) in items.into_iter().zip(dst.chunks_exact_mut(size)).enumerate() {
+            let src = bytemuck::bytes_of(item);
+            if d != src {
+                d.copy_from_slice(src);
+                run.get_or_insert(k);
+            } else if let Some(s) = run.take() {
+                dirty.mark(offset + s * size..offset + k * size);
+            }
+            written = k + 1;
+        }
+        debug_assert_eq!(written, count, "write_all: item count mismatch");
+        if let Some(s) = run {
+            dirty.mark(offset + s * size..offset + written * size);
+        }
+        self.len = self.len.max(end);
+    }
+
+    /// Ensure capacity; after a reallocation the whole shadow is uploaded. Returns the buffer
+    /// when only dirty ranges remain to be uploaded, `None` when everything was.
+    fn prepare_flush(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        up: &mut Uploader,
+    ) -> Option<wgpu::Buffer> {
         let len = self.len.next_multiple_of(4);
         if len > self.shadow.len() {
             self.shadow.resize(len, 0);
@@ -251,7 +461,6 @@ impl TrackedBuffer {
         if self.gpu.ensure(device, len as u64, false, up) {
             self.stale = true;
         }
-        let before = up.bytes;
         let buffer = self.gpu.get().clone();
         if self.stale {
             // Upload the whole shadow up to capacity-relevant length.
@@ -259,7 +468,16 @@ impl TrackedBuffer {
             self.shadow.resize(full, 0);
             up.write(encoder, &buffer, 0, &self.shadow[..full]);
             self.stale = false;
-        } else {
+            self.dirty.clear();
+            return None;
+        }
+        Some(buffer)
+    }
+
+    /// Upload changed ranges (or everything after reallocation). Returns bytes uploaded.
+    pub fn flush(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, up: &mut Uploader) -> u64 {
+        let before = up.bytes;
+        if let Some(buffer) = self.prepare_flush(device, encoder, up) {
             for r in self.dirty.ranges() {
                 let start = r.start & !3;
                 let end = r.end.next_multiple_of(4).min(self.shadow.len());
@@ -267,9 +485,45 @@ impl TrackedBuffer {
                     up.write(encoder, &buffer, start as u64, &self.shadow[start..end]);
                 }
             }
+            self.dirty.clear();
         }
-        self.dirty.clear();
         up.bytes - before
+    }
+
+    /// Like [`Self::flush`], but upload only the dirty bytes inside `needed` (sorted,
+    /// non-overlapping, 4-byte aligned byte ranges). Dirty bytes outside stay pending — the
+    /// shadow keeps their current value — until a later flush needs them. Returns bytes uploaded.
+    pub fn flush_needed(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        up: &mut Uploader,
+        needed: &[Range<usize>],
+    ) -> u64 {
+        let before = up.bytes;
+        if let Some(buffer) = self.prepare_flush(device, encoder, up) {
+            let mut j = 0;
+            for r in self.dirty.ranges() {
+                let (start, end) = (r.start & !3, r.end.next_multiple_of(4).min(self.shadow.len()));
+                while j < needed.len() && needed[j].end <= start {
+                    j += 1;
+                }
+                for n in needed[j..].iter().take_while(|n| n.start < end) {
+                    let (a, b) = (start.max(n.start), end.min(n.end));
+                    if a < b {
+                        up.write(encoder, &buffer, a as u64, &self.shadow[a..b]);
+                    }
+                }
+            }
+            self.dirty.subtract(needed);
+        }
+        up.bytes - before
+    }
+
+    /// Byte ranges written but not uploaded yet (tests).
+    #[cfg(test)]
+    pub fn pending(&self) -> &[Range<usize>] {
+        self.dirty.ranges()
     }
 
     pub fn buffer(&self) -> &wgpu::Buffer {
@@ -278,6 +532,7 @@ impl TrackedBuffer {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -295,6 +550,154 @@ mod tests {
         }))
         .ok()?;
         Some(device)
+    }
+
+    fn device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    /// One "frame": the given writes into `target`, submit, recycle, wait for the GPU.
+    fn frame(device: &wgpu::Device, queue: &wgpu::Queue, up: &mut Uploader, target: &wgpu::Buffer, writes: &[&[u8]]) {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut offset = 0;
+        for w in writes {
+            up.write(&mut encoder, target, offset, w);
+            offset += w.len() as u64;
+        }
+        up.finish();
+        queue.submit([encoder.finish()]);
+        up.recall();
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    }
+
+    /// Regression: `StagingBelt` never frees a chunk and creates a new one of exactly the
+    /// request size whenever a write is larger than every chunk it has, so an upload that grows
+    /// a little each frame (a growing particle `Stream` buffer, a reallocated ECS buffer)
+    /// leaked one ever-larger mapped chunk per frame. Every chunk now has the same size, large
+    /// writes are split, and the ring stays proportional to one frame's traffic.
+    #[test]
+    fn growing_uploads_do_not_accumulate_staging_memory() {
+        let Some((device, queue)) = device_queue() else { return };
+        let mut up = Uploader::new(&device);
+        let max = 4 * STAGING_CHUNK as usize;
+        let target = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: max as u64 + 256,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let data = vec![7u8; max];
+        let mut peak = 0;
+        for i in 0..64 {
+            let n = (STAGING_CHUNK as usize + (64 << 10) + i * (192 << 10)).min(max);
+            frame(&device, &queue, &mut up, &target, &[&[1u8; 256], &data[..n]]);
+            peak = peak.max(up.resident_chunks());
+        }
+        // A frame needs at most 5 chunks; frames in flight, spares for the next frame and
+        // one-frame latency of the returns fit well within 16. The belt reached 64+.
+        assert!(peak <= 16, "resident staging chunks: {peak}");
+    }
+
+    /// A one-off burst (e.g. a big asset upload) is released once it is no longer the recent
+    /// peak.
+    #[test]
+    fn idle_staging_chunks_are_released_after_a_burst() {
+        let Some((device, queue)) = device_queue() else { return };
+        let mut up = Uploader::new(&device);
+        let big = vec![3u8; 10 * STAGING_CHUNK as usize];
+        let target = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: big.len() as u64,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        frame(&device, &queue, &mut up, &target, &[&big]);
+        assert!(up.resident_chunks() >= 10);
+        for _ in 0..2 * TRIM_WINDOW + 2 {
+            frame(&device, &queue, &mut up, &target, &[&[1u8; 64]]);
+        }
+        assert!(up.resident_chunks() <= 3, "{}", up.resident_chunks());
+    }
+
+    /// Writes split across chunks land intact and in order, and so do concatenated parts
+    /// (of any length, empty ones included) that straddle chunk boundaries.
+    #[test]
+    fn split_writes_arrive_intact() {
+        let Some((device, queue)) = device_queue() else { return };
+        let mut up = Uploader::new(&device);
+        let n = 2 * STAGING_CHUNK as usize + 1036;
+        let data: Vec<u8> = (0..n).map(|i| (i * 7 + i / 4096) as u8).collect();
+        let size = 2 * (n as u64 + 8);
+        let target = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        up.write(&mut encoder, &target, 0, &[9u8; 8]);
+        up.write(&mut encoder, &target, 8, &data);
+        let k = STAGING_CHUNK as usize + 501;
+        let parts: [&[u8]; 5] = [&[5u8; 8], &data[..101], &[], &data[101..k], &data[k..]];
+        up.write_parts(&mut encoder, &target, n as u64 + 8, n + 8, parts);
+        encoder.copy_buffer_to_buffer(&target, 0, &readback, 0, size);
+        up.finish();
+        queue.submit([encoder.finish()]);
+        up.recall();
+        readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let view = readback.slice(..).get_mapped_range().expect("mapped");
+        assert_eq!(&view[..8], &[9u8; 8]);
+        assert!(view[8..n + 8] == data[..], "split upload corrupted");
+        assert_eq!(&view[n + 8..n + 16], &[5u8; 8]);
+        assert!(view[n + 16..] == data[..], "concatenated upload corrupted");
+        assert_eq!(up.bytes, size);
+    }
+
+    #[test]
+    fn needed_flush_keeps_the_rest_pending() {
+        let Some((device, queue)) = device_queue() else { return };
+        let mut up = Uploader::new(&device);
+        let mut t = TrackedBuffer::new("test", wgpu::BufferUsages::VERTEX);
+        let mut r = 0;
+        t.begin();
+        t.write_all(0, 8, [[1u32; 16]; 8].iter(), &mut r);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        assert_eq!(
+            t.flush(&device, &mut encoder, &mut up),
+            8 * 64,
+            "first flush uploads all"
+        );
+        // Change elements 1, 2 and 6: two runs, one dirty range each.
+        t.begin();
+        let mut v = [[1u32; 16]; 8];
+        v[1][0] = 2;
+        v[2][3] = 2;
+        v[6][15] = 2;
+        t.write_all(0, 8, v.iter(), &mut r);
+        assert_eq!(t.pending(), &[64..192, 384..448]);
+        // Only element 2's range is needed now: 64 bytes go up, the rest stays pending.
+        let n = t.flush_needed(&device, &mut encoder, &mut up, &[128..256]);
+        assert_eq!(n, 64);
+        assert_eq!(t.pending(), &[64..128, 384..448]);
+        assert_eq!(t.flush(&device, &mut encoder, &mut up), 128);
+        assert!(t.pending().is_empty());
+        up.finish();
+        queue.submit([encoder.finish()]);
+        up.recall();
+        assert_eq!(r, 1, "one shadow allocation");
     }
 
     /// Regression: 1.5x growth ignored `max_buffer_size`, so a buffer whose contents fit the

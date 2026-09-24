@@ -49,7 +49,7 @@ pub struct RenderStats {
     /// Instances issued to the GPU. On GPU paths this is the upper bound (pre-cull count)
     /// because the visible count only exists on the GPU.
     pub instances_drawn: u64,
-    /// Instances rejected by CPU frustum culling (whole buffers count all their instances).
+    /// Instances rejected by CPU frustum culling (explicit buffers count whole culled blocks).
     pub culled: u64,
     /// Triangles issued (`instances_drawn * mesh triangles`).
     pub triangles: u64,

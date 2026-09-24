@@ -8,13 +8,13 @@ use crate::assets::{GpuMesh, RenderAssets};
 use crate::components::{
     AmbientLight, Camera3d, DirectionalLight, Material, Mesh3d, PointLight, RenderTarget, Visibility,
 };
-#[cfg(test)]
-use crate::culling::Sphere;
-use crate::culling::{Aabb, Frustum};
+use crate::culling::{Aabb, Frustum, Sphere};
 use crate::gpu::{GrowBuffer, TrackedBuffer, align_up};
 use crate::handles::FastMap;
 use crate::handles::{MeshHandle, TextureHandle};
-use crate::instance::{BufferUsage, CullSource, ErasedInstanceBuffer, InstanceBuffers, InstancedMesh, ScaleKind};
+use crate::instance::{
+    BufferUsage, CULL_BLOCK, CullBounds, CullSource, ErasedInstanceBuffer, InstanceBuffers, InstancedMesh, ScaleKind,
+};
 use crate::pipeline::{
     CLASS_BLEND, CLASS_DOUBLE_SIDED, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuMaterial,
     GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, OFFSCREEN_FORMAT, PipelineKey,
@@ -84,14 +84,111 @@ pub(crate) struct DrawCmd {
     kind: DrawKind,
 }
 
-#[derive(Clone, Copy)]
-struct EcsItem {
-    key: u64,
-    seq: u32,
-    mesh: MeshHandle,
-    material: u32,
-    class: u8,
-    matrix: [f32; 16],
+/// Scratch of [`order_by_key`].
+#[derive(Default)]
+struct KeyBuckets {
+    map: FastMap<u64, u32>,
+    /// Direct-mapped `(key, bucket)` cache in front of `map` (`u32::MAX` = empty).
+    cache: Vec<(u64, u32)>,
+    /// Per bucket: its key, then its item count, then its write cursor.
+    keys: Vec<u64>,
+    counts: Vec<u32>,
+    /// Bucket of each item.
+    of: Vec<u32>,
+    /// Buckets sorted by key.
+    sorted: Vec<u32>,
+}
+
+/// Group item indices by key: `order` lists the items by ascending key and, within a key, in
+/// their original order — exactly a sort by `(key, index)`, but a counting sort: O(items +
+/// keys · log keys), no element moves. `runs` gets `(key, start, count)` per key.
+fn order_by_key(keys: &[u64], order: &mut Vec<u32>, runs: &mut Vec<(u64, u32, u32)>, s: &mut KeyBuckets) {
+    const CACHE: usize = 256;
+    s.map.clear();
+    s.keys.clear();
+    s.counts.clear();
+    s.of.clear();
+    s.cache.clear();
+    s.cache.resize(CACHE, (0, u32::MAX));
+    let mut last = None;
+    for &k in keys {
+        let b = match last {
+            Some((lk, lb)) if lk == k => lb,
+            _ => {
+                let slot = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - CACHE.trailing_zeros())) as usize;
+                let b = match s.cache[slot] {
+                    (ck, cb) if cb != u32::MAX && ck == k => cb,
+                    _ => {
+                        let next = s.keys.len() as u32;
+                        let b = *s.map.entry(k).or_insert(next);
+                        if b == next {
+                            s.keys.push(k);
+                            s.counts.push(0);
+                        }
+                        s.cache[slot] = (k, b);
+                        b
+                    }
+                };
+                last = Some((k, b));
+                b
+            }
+        };
+        s.counts[b as usize] += 1;
+        s.of.push(b);
+    }
+    s.sorted.clear();
+    s.sorted.extend(0..s.keys.len() as u32);
+    let bucket_keys = &s.keys;
+    s.sorted.sort_unstable_by_key(|&b| bucket_keys[b as usize]);
+    runs.clear();
+    let mut at = 0u32;
+    for &b in &s.sorted {
+        let count = s.counts[b as usize];
+        runs.push((s.keys[b as usize], at, count));
+        s.counts[b as usize] = at;
+        at += count;
+    }
+    order.clear();
+    order.resize(keys.len(), 0);
+    for (i, &b) in s.of.iter().enumerate() {
+        let cursor = &mut s.counts[b as usize];
+        order[*cursor as usize] = i as u32;
+        *cursor += 1;
+    }
+}
+
+/// ECS batches at or above this many instances are frustum-tested on all rayon workers.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_CULL: usize = 16_384;
+
+/// Frustum-test one ECS batch (`order` indexes `matrices`), one bit per instance in `mask`;
+/// returns the number visible.
+fn cull_mask(matrices: &[[f32; 16]], order: &[u32], sphere: Sphere, frustum: &Frustum, mask: &mut Vec<u64>) -> usize {
+    mask.clear();
+    mask.resize(order.len().div_ceil(64), 0);
+    let word = |w: &mut u64, items: &[u32]| {
+        let mut bits = 0u64;
+        for (k, &i) in items.iter().enumerate() {
+            let m = Mat4::from_cols_array(&matrices[i as usize]);
+            bits |= (frustum.intersects_sphere(&sphere.transformed(&m)) as u64) << k;
+        }
+        *w = bits;
+        bits.count_ones() as usize
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    if order.len() >= PARALLEL_CULL {
+        use rayon::prelude::*;
+        return mask
+            .par_iter_mut()
+            .zip(order.par_chunks(64))
+            .with_min_len(16)
+            .map(|(w, items)| word(w, items))
+            .sum();
+    }
+    mask.iter_mut()
+        .zip(order.chunks(64))
+        .map(|(w, items)| word(w, items))
+        .sum()
 }
 
 #[derive(Clone, Copy)]
@@ -107,7 +204,6 @@ struct Source {
     count: u32,
     stride: u32,
     cull: CullSource,
-    bounds: Option<(Aabb, f32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -181,7 +277,6 @@ pub(crate) struct GpuInstances {
     buf: GrowBuffer,
     synced: u64,
     len: u32,
-    bounds: (Aabb, f32),
     /// The buffer exceeds the device's `max_buffer_size` (logged once, not drawn).
     too_large: bool,
 }
@@ -230,6 +325,16 @@ impl MaterialKey {
             texture: m.base_color_texture,
         }
     }
+
+    /// Slot in [`MaterialTable`]'s direct-mapped cache (a cheap multiplicative hash).
+    fn cache_slot(&self) -> usize {
+        let t = self.texture.map_or(0, |t| t.index() ^ t.generation().rotate_left(16));
+        let mut h = (self.flags as u32 ^ t).wrapping_mul(0x9E37_79B1);
+        for w in self.words {
+            h = (h.rotate_left(5) ^ w).wrapping_mul(0x9E37_79B1);
+        }
+        (h >> (32 - MATERIAL_CACHE.trailing_zeros())) as usize
+    }
 }
 
 struct MatEntry {
@@ -239,15 +344,50 @@ struct MatEntry {
     live: bool,
 }
 
+/// Slots of the direct-mapped cache in front of the material map (a power of two).
+const MATERIAL_CACHE: usize = 64;
+
+#[derive(Clone, Copy)]
+struct CachedMaterial {
+    key: MaterialKey,
+    id: u32,
+    class: u8,
+    /// Frame whose `last_used` this entry already refreshed.
+    frame: u64,
+}
+
 /// Interns equal materials to one id / uniform slot so they batch together.
-#[derive(Default)]
+///
+/// Every ECS entity carries its `Material` by value, so interning runs once per entity per
+/// frame. The last material seen and a small direct-mapped cache answer almost all of those
+/// with one key comparison (neighbouring entities mostly share materials, and a scene rarely
+/// uses more materials at once than the cache has slots); only misses hash and probe the map.
 pub(crate) struct MaterialTable {
     map: FastMap<MaterialKey, u32>,
     entries: Vec<MatEntry>,
     free: Vec<u32>,
+    cache: [Option<CachedMaterial>; MATERIAL_CACHE],
+    last: Option<CachedMaterial>,
+    /// Interns that missed the cache (tests).
+    misses: u64,
+}
+
+impl Default for MaterialTable {
+    fn default() -> Self {
+        Self {
+            map: FastMap::default(),
+            entries: Vec::new(),
+            free: Vec::new(),
+            cache: [None; MATERIAL_CACHE],
+            last: None,
+            misses: 0,
+        }
+    }
 }
 
 impl MaterialTable {
+    /// Material id and pipeline class of `m`, allocating a uniform slot for new materials.
+    #[inline]
     fn intern(
         &mut self,
         m: &Material,
@@ -257,6 +397,53 @@ impl MaterialTable {
         cpu_reallocs: &mut u32,
     ) -> (u32, u8) {
         let key = MaterialKey::new(m);
+        match &self.last {
+            Some(l) if l.frame == frame && l.key == key => (l.id, l.class),
+            _ => self.intern_cached(m, key, frame, buf, stride, cpu_reallocs),
+        }
+    }
+
+    /// [`Self::intern`] when the material differs from the previous one (kept out of line so
+    /// the per-entity fast path stays small).
+    #[inline(never)]
+    fn intern_cached(
+        &mut self,
+        m: &Material,
+        key: MaterialKey,
+        frame: u64,
+        buf: &mut TrackedBuffer,
+        stride: usize,
+        cpu_reallocs: &mut u32,
+    ) -> (u32, u8) {
+        let slot = key.cache_slot();
+        if let Some(c) = &mut self.cache[slot]
+            && c.key == key
+        {
+            if c.frame != frame {
+                c.frame = frame;
+                self.entries[c.id as usize].last_used = frame;
+            }
+            self.last = Some(*c);
+            return (c.id, c.class);
+        }
+        self.misses += 1;
+        let (id, class) = self.intern_slow(m, key, frame, buf, stride, cpu_reallocs);
+        let c = CachedMaterial { key, id, class, frame };
+        self.cache[slot] = Some(c);
+        self.last = Some(c);
+        (id, class)
+    }
+
+    #[cold]
+    fn intern_slow(
+        &mut self,
+        m: &Material,
+        key: MaterialKey,
+        frame: u64,
+        buf: &mut TrackedBuffer,
+        stride: usize,
+        cpu_reallocs: &mut u32,
+    ) -> (u32, u8) {
         if let Some(&id) = self.map.get(&key) {
             let e = &mut self.entries[id as usize];
             e.last_used = frame;
@@ -305,12 +492,19 @@ impl MaterialTable {
         if !frame.is_multiple_of(256) {
             return;
         }
+        let mut freed = false;
         for (i, e) in self.entries.iter_mut().enumerate() {
             if e.live && e.last_used + MAX_IDLE < frame {
                 e.live = false;
                 self.map.remove(&e.key);
                 self.free.push(i as u32);
+                freed = true;
             }
+        }
+        if freed {
+            // Freed ids get reused for other materials: forget every cached key → id.
+            self.cache = [None; MATERIAL_CACHE];
+            self.last = None;
         }
     }
 
@@ -355,7 +549,20 @@ pub(crate) struct FrameState {
     cull_bgs: FastMap<SourceBuffer, (wgpu::BindGroup, [u32; 5])>,
     compact_bg: Option<(wgpu::BindGroup, [u32; 5])>,
     arena_buffers: Option<(wgpu::Buffer, wgpu::Buffer)>,
-    items: Vec<EcsItem>,
+    /// Visible ECS entities in query order: batch key (class | material | mesh), matrix, mesh.
+    ecs_keys: Vec<u64>,
+    ecs_matrices: Vec<[f32; 16]>,
+    ecs_meshes: Vec<MeshHandle>,
+    /// Last frame's `ecs_keys`: while the key sequence is unchanged, so is the batch order.
+    ecs_prev_keys: Vec<u64>,
+    /// Batch order (indices into the `ecs_*` vectors) and `(key, start, count)` per batch.
+    ecs_order: Vec<u32>,
+    ecs_runs: Vec<(u64, u32, u32)>,
+    ecs_buckets: KeyBuckets,
+    /// Byte ranges of `ecs` drawn from directly this frame (CPU path upload filter).
+    ecs_needed: Vec<Range<usize>>,
+    /// Per-instance visibility bits of the batch being CPU-culled.
+    cull_mask: Vec<u64>,
     sources: Vec<Source>,
     cameras: Vec<CameraItem>,
     views: Vec<ViewData>,
@@ -381,6 +588,9 @@ pub(crate) struct FrameState {
     /// Largest `base_vertex` passed to a direct draw since the last `prepare`.
     #[cfg(test)]
     pub(crate) max_direct_base_vertex: i32,
+    /// Times the ECS batch order was rebuilt.
+    #[cfg(test)]
+    pub(crate) ecs_reorders: u64,
 }
 
 fn strided(size: usize, align: usize) -> usize {
@@ -430,7 +640,15 @@ impl FrameState {
             cull_bgs: FastMap::default(),
             compact_bg: None,
             arena_buffers: None,
-            items: Vec::new(),
+            ecs_keys: Vec::new(),
+            ecs_matrices: Vec::new(),
+            ecs_meshes: Vec::new(),
+            ecs_prev_keys: Vec::new(),
+            ecs_order: Vec::new(),
+            ecs_runs: Vec::new(),
+            ecs_buckets: KeyBuckets::default(),
+            ecs_needed: Vec::new(),
+            cull_mask: Vec::new(),
             sources: Vec::new(),
             cameras: Vec::new(),
             views: Vec::new(),
@@ -451,6 +669,8 @@ impl FrameState {
             max_buffer_size: caps.max_buffer_size,
             #[cfg(test)]
             max_direct_base_vertex: 0,
+            #[cfg(test)]
+            ecs_reorders: 0,
         }
     }
 
@@ -465,9 +685,18 @@ impl FrameState {
     }
 
     /// Capacity snapshot of scratch vectors (to count CPU reallocations).
-    fn capacities(&self) -> [usize; 8] {
+    fn capacities(&self) -> [usize; 17] {
         [
-            self.items.capacity(),
+            self.ecs_keys.capacity(),
+            self.ecs_prev_keys.capacity(),
+            self.ecs_matrices.capacity(),
+            self.ecs_meshes.capacity(),
+            self.ecs_buckets.of.capacity(),
+            self.ecs_buckets.sorted.capacity(),
+            self.ecs_order.capacity(),
+            self.ecs_runs.capacity(),
+            self.ecs_needed.capacity(),
+            self.cull_mask.capacity(),
             self.sources.capacity(),
             self.cameras.capacity(),
             self.views.capacity(),
@@ -590,7 +819,7 @@ impl Renderer {
         if let Some(t) = surface_tex {
             self.queue.present(t);
         }
-        // Non-blocking: fires staging-belt recycling and capture callbacks.
+        // Non-blocking: fires staging-chunk recycling and capture callbacks.
         let _ = self.device.poll(wgpu::PollType::Poll);
 
         self.stats.bytes_uploaded = self.uploader.bytes;
@@ -706,13 +935,27 @@ impl Renderer {
             f.material_bgs
                 .retain(|t, _| t.is_none_or(|h| assets.contains_texture(h)));
         }
-        f.items.clear();
-        let mut seq = 0u32;
+        // Extract visible entities in query order.
+        f.ecs_keys.clear();
+        f.ecs_matrices.clear();
+        f.ecs_meshes.clear();
+        let mut last_mesh: Option<(MeshHandle, bool)> = None;
         for (gt, mesh, mat, vis) in world
             .query::<(&GlobalTransform, &Mesh3d, &Material, Option<&Visibility>)>()
             .iter()
         {
-            if vis == Some(&Visibility::Hidden) || !assets.is_mesh_uploaded(mesh.0) {
+            if vis == Some(&Visibility::Hidden) {
+                continue;
+            }
+            let uploaded = match last_mesh {
+                Some((m, uploaded)) if m == mesh.0 => uploaded,
+                _ => {
+                    let uploaded = assets.is_mesh_uploaded(mesh.0);
+                    last_mesh = Some((mesh.0, uploaded));
+                    uploaded
+                }
+            };
+            if !uploaded {
                 continue;
             }
             let (material, class) = f.materials.intern(
@@ -722,50 +965,55 @@ impl Renderer {
                 material_stride,
                 &mut cpu_reallocs,
             );
-            f.items.push(EcsItem {
-                key: (class as u64) << 56 | (material as u64) << 32 | mesh.0.index() as u64,
-                seq,
-                mesh: mesh.0,
-                material,
-                class,
-                matrix: gt.0.to_cols_array(),
-            });
-            seq += 1;
+            f.ecs_keys
+                .push((class as u64) << 56 | (material as u64) << 32 | mesh.0.index() as u64);
+            f.ecs_matrices.push(gt.0.to_cols_array());
+            f.ecs_meshes.push(mesh.0);
         }
-        f.items.sort_unstable_by_key(|i| (i.key, i.seq));
+        // Batches: by key, in query (spawn) order within a key. The order depends only on the
+        // key sequence, so while that is unchanged (a static scene, or only transforms
+        // moving) last frame's order is reused as is.
+        if f.ecs_keys != f.ecs_prev_keys || f.ecs_order.len() != f.ecs_keys.len() {
+            order_by_key(&f.ecs_keys, &mut f.ecs_order, &mut f.ecs_runs, &mut f.ecs_buckets);
+            f.ecs_prev_keys.clone_from(&f.ecs_keys);
+            #[cfg(test)]
+            {
+                f.ecs_reorders += 1;
+            }
+        }
         // GPU culling reads the whole ECS buffer through one storage binding.
-        let ecs_cull = if (f.items.len() as u64) * 64 <= f.max_storage_binding {
+        let ecs_cull = if (f.ecs_keys.len() as u64) * 64 <= f.max_storage_binding {
             CullSource::Matrix { offset: 0 }
         } else {
             CullSource::None
         };
-        f.sources.clear();
+        // Matrices in batch order, diffed against last frame's.
         f.ecs.begin();
-        let mut i = 0;
-        while i < f.items.len() {
-            let key = f.items[i].key;
-            let start = i;
-            while i < f.items.len() && f.items[i].key == key {
-                f.ecs.push(bytemuck::cast_slice(&f.items[i].matrix), &mut cpu_reallocs);
-                i += 1;
-            }
-            let it = f.items[start];
-            let Some((mesh, triangles)) = assets.gpu_mesh(it.mesh) else {
+        let (order, matrices) = (&f.ecs_order, &f.ecs_matrices);
+        f.ecs.write_all(
+            0,
+            order.len(),
+            order.iter().map(|&i| &matrices[i as usize]),
+            &mut cpu_reallocs,
+        );
+        f.sources.clear();
+        for &(key, first, count) in &f.ecs_runs {
+            let Some((mesh, triangles)) = assets.gpu_mesh(f.ecs_meshes[f.ecs_order[first as usize] as usize]) else {
                 continue;
             };
+            let class = (key >> 56) as u8;
             f.sources.push(Source {
-                blend: it.class & CLASS_BLEND != 0,
-                class: it.class,
+                blend: class & CLASS_BLEND != 0,
+                class,
                 layout: 0,
-                material: it.material,
+                material: (key >> 32) as u32 & 0x00FF_FFFF,
                 mesh,
                 triangles,
                 buffer: SourceBuffer::Ecs,
-                first: start as u32,
-                count: (i - start) as u32,
+                first,
+                count,
                 stride: 64,
                 cull: ecs_cull,
-                bounds: None,
             });
         }
 
@@ -795,7 +1043,6 @@ impl Renderer {
                     buf: GrowBuffer::new("space3d instance buffer", U::VERTEX | U::COPY_DST | s),
                     synced: 0,
                     len: 0,
-                    bounds: (Aabb::EMPTY, 0.0),
                     too_large: false,
                 });
             }
@@ -847,7 +1094,6 @@ impl Renderer {
                 count: g.len,
                 stride: layout.stride,
                 cull,
-                bounds: Some(g.bounds),
             });
         }
         f.sources.sort_unstable_by_key(|s| {
@@ -1058,72 +1304,108 @@ impl Renderer {
 
                 // CPU path (or buffers the GPU culler cannot decode).
                 run = None;
+                let mut visible = 0u32;
                 match s.buffer {
                     SourceBuffer::Ecs => {
                         let range = s.first as usize..(s.first + s.count) as usize;
-                        let visible = if culling {
-                            f.items[range.clone()]
-                                .iter()
-                                .filter(|it| {
-                                    frustum.intersects_sphere(
-                                        &s.mesh.sphere.transformed(&Mat4::from_cols_array(&it.matrix)),
-                                    )
-                                })
-                                .count()
+                        let order = &f.ecs_order[range];
+                        visible = if culling {
+                            cull_mask(&f.ecs_matrices, order, s.mesh.sphere, &frustum, &mut f.cull_mask) as u32
                         } else {
-                            s.count as usize
+                            s.count
                         };
-                        stats.culled += (s.count as usize - visible) as u64;
-                        if visible == 0 {
-                            continue;
-                        }
-                        let (vb, vb_offset) = if visible == s.count as usize {
-                            (VertexSource::Ecs, s.first as u64 * 64)
-                        } else {
+                        if visible == s.count {
+                            f.draws.push(DrawCmd {
+                                vb: VertexSource::Ecs,
+                                vb_offset: s.first as u64 * 64,
+                                kind: DrawKind::Direct { instances: visible },
+                                ..base_cmd
+                            });
+                        } else if visible > 0 {
+                            // Partially visible: copy the visible matrices (diffed) into
+                            // `cpu_visible`, in batch order.
                             let at = f.cpu_visible.len();
-                            for it in &f.items[range] {
-                                let m = Mat4::from_cols_array(&it.matrix);
-                                if frustum.intersects_sphere(&s.mesh.sphere.transformed(&m)) {
-                                    f.cpu_visible.push(bytemuck::cast_slice(&it.matrix), &mut cpu_reallocs);
-                                }
-                            }
-                            (VertexSource::CpuVisible, at as u64)
-                        };
-                        f.draws.push(DrawCmd {
-                            vb,
-                            vb_offset,
-                            kind: DrawKind::Direct {
-                                instances: visible as u32,
-                            },
-                            ..base_cmd
-                        });
-                        stats.instances_drawn += visible as u64;
-                        stats.triangles += visible as u64 * tris;
+                            let (mask, matrices) = (&f.cull_mask, &f.ecs_matrices);
+                            f.cpu_visible.write_all(
+                                at,
+                                visible as usize,
+                                order
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(k, _)| mask[k / 64] >> (k % 64) & 1 != 0)
+                                    .map(|(_, &i)| &matrices[i as usize]),
+                                &mut cpu_reallocs,
+                            );
+                            f.draws.push(DrawCmd {
+                                vb: VertexSource::CpuVisible,
+                                vb_offset: at as u64,
+                                kind: DrawKind::Direct { instances: visible },
+                                ..base_cmd
+                            });
+                        }
                     }
                     SourceBuffer::Explicit(slot) => {
-                        let visible = !culling
-                            || match s.bounds {
-                                Some((aabb, scale)) if !aabb.is_empty() => {
-                                    let r = (s.mesh.sphere.center.length() + s.mesh.sphere.radius) * scale;
-                                    frustum.intersects_aabb(&aabb.inflated(r))
+                        // Visible runs of culling blocks become one draw each, offset into
+                        // the instance buffer (no `first_instance` needed).
+                        let mut draw = |f: &mut FrameState, start: usize, end: usize| {
+                            let end = end.min(s.count as usize);
+                            f.draws.push(DrawCmd {
+                                vb: VertexSource::Explicit(slot),
+                                vb_offset: (start * s.stride as usize) as u64,
+                                kind: DrawKind::Direct {
+                                    instances: (end - start) as u32,
+                                },
+                                ..base_cmd
+                            });
+                            visible += (end - start) as u32;
+                        };
+                        // Bounds are brought up to date here, lazily: only CPU culling reads
+                        // them, and only blocks edited since the last refresh are recomputed.
+                        let bounds = if culling {
+                            let generation = f.explicit[slot as usize].as_ref().map_or(0, |g| g.generation);
+                            buffers
+                                .buffers
+                                .get_mut(crate::handles::RawHandle {
+                                    index: slot,
+                                    generation,
+                                })
+                                .map(|ib| ib.cull_bounds())
+                        } else {
+                            None
+                        };
+                        let r = s.mesh.sphere.center.length() + s.mesh.sphere.radius;
+                        // Empty boxes: no decodable positions, never culled.
+                        let seen = |aabb: &Aabb, scale: f32| {
+                            aabb.is_empty() || frustum.intersects_aabb(&aabb.inflated(r * scale))
+                        };
+                        match bounds {
+                            Some(CullBounds::User(aabb)) => {
+                                if seen(&aabb, 1.0) {
+                                    draw(f, 0, s.count as usize);
                                 }
-                                // Unknown bounds: never cull.
-                                _ => true,
-                            };
-                        if !visible {
-                            stats.culled += s.count as u64;
-                            continue;
+                            }
+                            Some(CullBounds::Blocks { total, blocks }) => {
+                                if seen(&total.0, total.1) {
+                                    let mut start = None;
+                                    for (b, (aabb, scale)) in blocks.iter().enumerate() {
+                                        if seen(aabb, *scale) {
+                                            start.get_or_insert(b);
+                                        } else if let Some(a) = start.take() {
+                                            draw(f, a * CULL_BLOCK, b * CULL_BLOCK);
+                                        }
+                                    }
+                                    if let Some(a) = start {
+                                        draw(f, a * CULL_BLOCK, s.count as usize);
+                                    }
+                                }
+                            }
+                            None => draw(f, 0, s.count as usize),
                         }
-                        f.draws.push(DrawCmd {
-                            vb: VertexSource::Explicit(slot),
-                            vb_offset: 0,
-                            kind: DrawKind::Direct { instances: s.count },
-                            ..base_cmd
-                        });
-                        stats.instances_drawn += s.count as u64;
-                        stats.triangles += s.count as u64 * tris;
                     }
                 }
+                stats.culled += (s.count - visible) as u64;
+                stats.instances_drawn += visible as u64;
+                stats.triangles += visible as u64 * tris;
             }
 
             // Group this view's culling jobs by source buffer: one dispatch per buffer.
@@ -1251,7 +1533,29 @@ impl Renderer {
         f.compact_params
             .ensure_len(std::mem::size_of::<GpuCompactParams>(), &mut cpu_reallocs);
         let inst_before = up.bytes;
-        f.ecs.flush(device, encoder, up);
+        if gpu {
+            f.ecs.flush(device, encoder, up);
+        } else {
+            // Only batches drawn straight from `ecs` read it on the CPU path: culled and
+            // partially visible ones (drawn from `cpu_visible`) keep their changes pending
+            // until they are drawn from it.
+            f.ecs_needed.clear();
+            for d in &f.draws {
+                if let (VertexSource::Ecs, DrawKind::Direct { instances }) = (d.vb, d.kind) {
+                    let start = d.vb_offset as usize;
+                    f.ecs_needed.push(start..start + instances as usize * 64);
+                }
+            }
+            f.ecs_needed.sort_unstable_by_key(|r| r.start);
+            f.ecs_needed.dedup_by(|next, kept| {
+                let overlaps = next.start <= kept.end;
+                if overlaps {
+                    kept.end = kept.end.max(next.end);
+                }
+                overlaps
+            });
+            f.ecs.flush_needed(device, encoder, up, &f.ecs_needed);
+        }
         f.cpu_visible.flush(device, encoder, up);
         up.instance_bytes += up.bytes - inst_before;
         f.views_buf.flush(device, encoder, up);
@@ -1893,7 +2197,8 @@ fn sync_instances(
     }
     up.instance_bytes += up.bytes - before;
     g.len = len as u32;
-    g.bounds = ib.refresh_bounds();
+    // CPU culling bounds are refreshed lazily by the CPU path (`cull_bounds`): GPU culling
+    // paths never pay for them.
     ib.clear_dirty();
 }
 
@@ -2283,7 +2588,7 @@ mod tests {
     }
 
     /// Meshes uploaded before an arena growth, meshes whose placement straddles the old
-    /// capacity (written through the staging belt after the GPU copy), and in-place /
+    /// capacity (written through the staging ring after the GPU copy), and in-place /
     /// resizing `update_mesh` all render exactly like a fresh single-upload app — with and
     /// without `BASE_VERTEX`, on CpuDirect and the best GPU path.
     #[test]
@@ -2377,6 +2682,189 @@ mod tests {
                 assert_eq!(differing_px(&img, &reference), 0, "{ctx}: resizing update");
             }
             assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+        }
+    }
+
+    /// `order_by_key` is exactly a sort by (key, index).
+    #[test]
+    fn counting_sort_matches_a_key_index_sort() {
+        let mut seed = 99u64;
+        let mut scratch = KeyBuckets::default();
+        let (mut order, mut runs) = (Vec::new(), Vec::new());
+        for distinct in [1u64, 3, 40, 1000, 5000] {
+            let keys: Vec<u64> = (0..5000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    ((seed >> 20) % distinct) << 32 | (seed >> 60)
+                })
+                .collect();
+            order_by_key(&keys, &mut order, &mut runs, &mut scratch);
+            let mut reference: Vec<u32> = (0..keys.len() as u32).collect();
+            reference.sort_by_key(|&i| (keys[i as usize], i));
+            assert_eq!(order, reference, "{distinct} keys");
+            let mut at = 0;
+            for &(key, first, count) in &runs {
+                assert_eq!(first, at);
+                assert!(
+                    order[at as usize..(at + count) as usize]
+                        .iter()
+                        .all(|&i| keys[i as usize] == key)
+                );
+                at += count;
+            }
+            assert_eq!(at as usize, keys.len());
+        }
+    }
+
+    /// Regression: every frame re-sorted all ECS items (96-byte elements, O(n log n)) even when
+    /// nothing changed — ~55 ms per frame for a static 1M-entity scene with interleaved
+    /// meshes/materials. The order now depends only on the key sequence and is reused while
+    /// that is unchanged; moving entities never reorders.
+    #[test]
+    fn static_ecs_scenes_reuse_the_batch_order() {
+        use crate::{Camera3d, Mesh3d};
+        use space3d_core::{MeshData, Transform};
+        let Some(mut app) = headless_app(64, 64) else { return };
+        let meshes: Vec<_> = (0..3)
+            .map(|k| {
+                app.resources
+                    .expect_mut::<RenderAssets>()
+                    .add_mesh(MeshData::cube(0.1 + 0.05 * k as f32))
+            })
+            .collect();
+        let materials: Vec<_> = (0..4).map(|k| Material::srgb(0.2 * k as f32, 0.6, 0.3)).collect();
+        let mut entities = Vec::new();
+        for i in 0..600 {
+            let p = Vec3::new((i % 30) as f32 * 0.3 - 4.5, (i / 30) as f32 * 0.3 - 3.0, 0.0);
+            entities.push(app.world.spawn((
+                Transform::from_xyz(p.x, p.y, p.z),
+                Mesh3d(meshes[i % 3]),
+                materials[(i / 3) % 4].clone(),
+            )));
+        }
+        app.world
+            .spawn((Transform::from_xyz(0.0, 0.0, 10.0), Camera3d::default()));
+        let reorders = |app: &space3d_core::App| app.resources.expect::<Renderer>().frame.ecs_reorders;
+        app.step_ticks(1);
+        assert_eq!(reorders(&app), 1);
+        assert_eq!(app.resources.expect::<crate::RenderStats>().batches, 12);
+        let misses = app.resources.expect::<Renderer>().frame.materials.misses;
+        for frame in 0..4 {
+            for (k, &e) in entities.iter().enumerate().step_by(7) {
+                app.world.get::<&mut Transform>(e).unwrap().translation.z = (frame + k) as f32 * 0.01;
+            }
+            app.step_ticks(1);
+        }
+        assert_eq!(reorders(&app), 1, "moving entities keeps the batch order");
+        assert_eq!(
+            app.resources.expect::<Renderer>().frame.materials.misses,
+            misses,
+            "4 materials interleaved: every intern hits the cache"
+        );
+        // Changing one entity's material reorders once, and the result renders like a
+        // freshly built scene.
+        *app.world.get::<&mut Material>(entities[5]).unwrap() = materials[0].clone();
+        let img = crate::render_to_image(&mut app).expect("capture");
+        assert_eq!(reorders(&app), 2);
+        crate::render_to_image(&mut app).expect("capture");
+        assert_eq!(reorders(&app), 2);
+
+        let Some(mut fresh) = headless_app(64, 64) else { return };
+        let fresh_meshes: Vec<_> = (0..3)
+            .map(|k| {
+                fresh
+                    .resources
+                    .expect_mut::<RenderAssets>()
+                    .add_mesh(MeshData::cube(0.1 + 0.05 * k as f32))
+            })
+            .collect();
+        for &e in &entities {
+            let t = *app.world.get::<&Transform>(e).unwrap();
+            let m = app.world.get::<&Mesh3d>(e).unwrap().0;
+            let k = meshes.iter().position(|&x| x == m).unwrap();
+            let mat = Material::clone(&app.world.get::<&Material>(e).unwrap());
+            fresh.world.spawn((t, Mesh3d(fresh_meshes[k]), mat));
+        }
+        fresh
+            .world
+            .spawn((Transform::from_xyz(0.0, 0.0, 10.0), Camera3d::default()));
+        let expected = crate::render_to_image(&mut fresh).expect("capture");
+        assert_eq!(differing_px(&img, &expected), 0);
+    }
+
+    /// Regression: interning hashed every entity's material; the cache must also never map a
+    /// key to an id that the garbage collector freed and handed to another material.
+    #[test]
+    fn material_cache_survives_id_reuse() {
+        let mut t = MaterialTable::default();
+        let mut buf = TrackedBuffer::new("test", wgpu::BufferUsages::UNIFORM);
+        let mut r = 0;
+        let a = Material::srgb(1.0, 0.0, 0.0);
+        let b = Material::srgb(0.0, 1.0, 0.0);
+        let (ia, _) = t.intern(&a, 1, &mut buf, 256, &mut r);
+        for frame in 2..10 {
+            assert_eq!(t.intern(&a, frame, &mut buf, 256, &mut r).0, ia);
+        }
+        assert_eq!(t.misses, 1, "only the first intern misses");
+        // `a` idle long enough to be collected; `b` takes over its id.
+        t.gc(1024);
+        let (ib, _) = t.intern(&b, 1024, &mut buf, 256, &mut r);
+        assert_eq!(ib, ia, "freed id reused");
+        let (ia2, _) = t.intern(&a, 1025, &mut buf, 256, &mut r);
+        assert_ne!(ia2, ib, "a stale cache entry must not map `a` to `b`'s id");
+        assert!(t.entries[ia2 as usize].key == MaterialKey::new(&a));
+        assert!(t.entries[ib as usize].key == MaterialKey::new(&b));
+    }
+
+    /// Regression: explicit-buffer bounds were recomputed every frame after a single
+    /// `swap_remove` — a full scan through a per-instance layout search — on every path,
+    /// although only CPU culling reads them. GPU paths now never compute them; the CPU path
+    /// recomputes only the edited block.
+    #[test]
+    fn explicit_bounds_are_computed_only_for_cpu_culling() {
+        use crate::{BufferUsage, Camera3d, InstanceBuffer, InstanceCompact, InstancedMesh};
+        use space3d_core::{MeshData, Transform};
+        let Some(mut app) = headless_app(32, 32) else { return };
+        let best = app.resources.expect::<Renderer>().capabilities().best_draw_path;
+        let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.1));
+        let n = 50_000;
+        let data = (0..n)
+            .map(|i| InstanceCompact::new(Vec3::new(i as f32 * 0.01, 0.0, 0.0), glam::Quat::IDENTITY, 1.0))
+            .collect();
+        let h = app
+            .resources
+            .expect_mut::<InstanceBuffers>()
+            .insert(InstanceBuffer::from_vec(data, BufferUsage::Dynamic));
+        app.world.spawn((InstancedMesh {
+            mesh,
+            material: Material::default(),
+            instances: h,
+        },));
+        app.world
+            .spawn((Transform::from_xyz(0.0, 0.0, 20.0), Camera3d::default()));
+        let step = |app: &mut space3d_core::App, frame: usize| {
+            let buffers = app.resources.expect_mut::<InstanceBuffers>();
+            let b = buffers.get_mut::<InstanceCompact>(h).unwrap();
+            let v = b.swap_remove(frame * 997 % b.len());
+            b.push(v);
+            app.step_ticks(1);
+            assert_eq!(app.resources.expect::<crate::RenderStats>().views, 1);
+            let buffers = app.resources.expect::<InstanceBuffers>();
+            buffers.buffers.get(h.raw()).unwrap().bounds_scanned()
+        };
+        if best != DrawPath::CpuDirect {
+            set_path(&mut app, best);
+            for frame in 0..5 {
+                assert_eq!(step(&mut app, frame), 0, "{best:?} frame {frame}");
+            }
+        }
+        set_path(&mut app, DrawPath::CpuDirect);
+        assert_eq!(step(&mut app, 5), n, "first CPU-culled frame computes every block");
+        for frame in 6..10 {
+            assert!(
+                step(&mut app, frame) <= 2 * crate::instance::CULL_BLOCK,
+                "frame {frame}"
+            );
         }
     }
 
