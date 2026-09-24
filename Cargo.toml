@@ -37,7 +37,7 @@ hecs = "0.11.1"
 glam = { version = "0.33.9", features = ["bytemuck", "serde"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 smallvec = "1.16.1"
-ahash = "0.8.12"
+ahash = { version = "0.8.12", default-features = false, features = ["std"] }
 parking_lot = "0.12.5"
 rayon = "1.12.0"
 crossbeam-channel = "0.5.17"
