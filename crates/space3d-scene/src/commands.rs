@@ -6,7 +6,7 @@ use space3d_core::hecs::Entity;
 use space3d_core::{Events, SystemCtx, Transform};
 use space3d_tasks::{Task, TaskState, spawn_compute};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Handle for one queued load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -50,7 +50,7 @@ pub struct SceneCommands {
     done: HashMap<SceneLoadId, Result<Vec<Entity>, SceneError>>,
 }
 
-fn read_path(path: &PathBuf) -> Result<Vec<u8>, SceneError> {
+fn read_path(path: &Path) -> Result<Vec<u8>, SceneError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         std::fs::read(path).map_err(|e| SceneError::Io(format!("{}: {e}", path.display())))
