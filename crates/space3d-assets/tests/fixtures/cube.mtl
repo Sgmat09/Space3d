@@ -1,0 +1,9 @@
+# test material library
+newmtl Checker
+Kd 1.0 1.0 1.0
+Ns 30
+map_Kd checker.png
+
+newmtl Blue
+Kd 0.0 0.0 1.0
+d 0.5

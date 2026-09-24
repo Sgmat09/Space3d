@@ -1,10 +1,50 @@
 [package]
 name = "space3d-assets"
-description = "Space3d assets"
+description = "Space3d assets: asset server, handles, image/glTF/OBJ loading, hot reload, texture & mesh editing ops"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["hot-reload"]
+## Watch the filesystem asset root and reload changed assets (native only; no-op on wasm).
+hot-reload = ["dep:notify"]
+
 [dependencies]
 space3d-core.workspace = true
+space3d-tasks.workspace = true
+glam.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+# Same versions as [workspace.dependencies], but with default features trimmed so the crate
+# builds for wasm32-unknown-unknown (tobj's default `ahash` pulls getrandom; image's default
+# `avif`/`rayon` are heavy and native-only in practice).
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "tga", "gif", "hdr", "ico", "webp", "qoi", "pnm", "dds", "tiff"] }
+gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }
+tobj = { version = "4.0.5", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["fs"] }
+rayon.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["rayon"] }
+notify = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["Window", "WorkerGlobalScope", "Response"] }
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "texture_ops"
+harness = false
