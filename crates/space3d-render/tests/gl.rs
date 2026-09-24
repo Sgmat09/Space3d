@@ -17,7 +17,8 @@
 //! ```
 //!
 //! (`WGPU_BACKEND=gl ... -- --test-threads=1` runs every other test on GL the same way; ANGLE on
-//! macOS crashes when several GL contexts render from different threads at once.)
+//! macOS crashes when several GL contexts render from different threads at once. ANGLE samples
+//! ETC2 textures as black, so `tests/textures.rs` skips ETC2 there.)
 
 mod common;
 use common::*;

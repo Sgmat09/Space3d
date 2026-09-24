@@ -316,7 +316,9 @@ impl GrowBuffer {
         } else {
             align_up(size.max(self.capacity + self.capacity / 2), 256)
         };
-        let capacity = wanted.min(device.limits().max_buffer_size & !255).max(size);
+        let max = device.limits().max_buffer_size;
+        debug_assert!(size <= max, "{}: {size} B exceed max_buffer_size ({max} B)", self.label);
+        let capacity = wanted.min(max & !255).max(size);
         self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(self.label),
             size: capacity,

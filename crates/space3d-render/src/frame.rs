@@ -604,6 +604,10 @@ pub(crate) struct FrameState {
     ecs_buckets: KeyBuckets,
     /// Byte ranges of `ecs` drawn from directly this frame (CPU path upload filter).
     ecs_needed: Vec<Range<usize>>,
+    /// Last frame's ECS matrices exceeded `max_buffer_size` (the overflow is logged once).
+    ecs_overflow: bool,
+    /// Last frame's partially visible ECS matrices did not all fit `cpu_visible` (logged once).
+    visible_overflow: bool,
     /// Per-instance visibility bits of the batch being CPU-culled.
     cull_mask: Vec<u64>,
     sources: Vec<Source>,
@@ -698,6 +702,8 @@ impl FrameState {
             ecs_runs: Vec::new(),
             ecs_buckets: KeyBuckets::default(),
             ecs_needed: Vec::new(),
+            ecs_overflow: false,
+            visible_overflow: false,
             cull_mask: Vec::new(),
             sources: Vec::new(),
             cameras: Vec::new(),
@@ -1132,19 +1138,43 @@ impl Renderer {
                 f.ecs_reorders += 1;
             }
         }
-        // GPU culling reads the whole ECS buffer through one storage binding.
-        let ecs_cull = if (f.ecs_keys.len() as u64) * 64 <= f.max_storage_binding {
-            CullSource::Matrix { offset: 0 }
-        } else {
-            CullSource::None
-        };
+        // The `ecs` buffer cannot exceed the device's `max_buffer_size` (creating it would fail
+        // validation and lose every frame): the matrices past it, in batch order, are not
+        // drawn — the batch crossing the limit is cut — and the overflow is logged once.
+        let ecs_len = f
+            .ecs_order
+            .len()
+            .min(usize::try_from(f.max_buffer_size / 64).unwrap_or(usize::MAX));
+        let overflow = ecs_len < f.ecs_order.len();
+        if overflow && !f.ecs_overflow {
+            tracing::error!(
+                entities = f.ecs_order.len(),
+                drawn = ecs_len,
+                max_buffer_size = f.max_buffer_size,
+                "ECS instance data exceeds the device's max_buffer_size; entities past it are not \
+                 drawn (use InstanceBuffers for this many instances)"
+            );
+        }
+        f.ecs_overflow = overflow;
         // Matrices in batch order, diffed against last frame's.
         f.ecs.begin();
-        f.ecs.write_gather(0, &f.ecs_order, &f.ecs_matrices, &mut cpu_reallocs);
+        f.ecs
+            .write_gather(0, &f.ecs_order[..ecs_len], &f.ecs_matrices, &mut cpu_reallocs);
         f.sources.clear();
         for &(key, first, count) in &f.ecs_runs {
+            if first as usize >= ecs_len {
+                continue;
+            }
+            let count = count.min(ecs_len as u32 - first);
             let Some((mesh, triangles)) = assets.gpu_mesh(f.ecs_meshes[f.ecs_order[first as usize] as usize]) else {
                 continue;
+            };
+            // GPU culling reads the ECS buffer through one storage binding (from offset 0): a
+            // batch ending past it is culled on the CPU instead.
+            let cull = if (first as u64 + count as u64) * 64 <= f.max_storage_binding {
+                CullSource::Matrix { offset: 0 }
+            } else {
+                CullSource::None
             };
             let class = (key >> 56) as u8;
             f.sources.push(Source {
@@ -1159,7 +1189,7 @@ impl Renderer {
                 first,
                 count,
                 stride: 64,
-                cull: ecs_cull,
+                cull,
             });
         }
 
@@ -1273,6 +1303,7 @@ impl Renderer {
         f.wg_total = 0;
         f.scan = None;
         let mut out_cursor = 0u64;
+        let mut visible_overflow = false;
 
         for ci in 0..f.cameras.len() {
             let cam = f.cameras[ci];
@@ -1452,6 +1483,16 @@ impl Renderer {
                         } else {
                             s.count
                         };
+                        // `cpu_visible` holds every view's partially visible batches and
+                        // cannot exceed `max_buffer_size`: a batch that no longer fits is
+                        // drawn whole from `ecs` (unculled, so the image is the same).
+                        if visible < s.count
+                            && visible > 0
+                            && f.cpu_visible.len() as u64 + visible as u64 * 64 > f.max_buffer_size
+                        {
+                            visible_overflow = true;
+                            visible = s.count;
+                        }
                         if visible == s.count {
                             f.draws.push(DrawCmd {
                                 vb: VertexSource::Ecs,
@@ -1659,6 +1700,15 @@ impl Renderer {
             f.cull_params.write_at(off, bytemuck::bytes_of(&p), &mut cpu_reallocs);
             f.scan = Some((off as u32, wg));
         }
+
+        if visible_overflow && !f.visible_overflow {
+            tracing::warn!(
+                max_buffer_size = f.max_buffer_size,
+                "the partially visible ECS instances of all views exceed the device's \
+                 max_buffer_size; the batches past it are drawn unculled"
+            );
+        }
+        f.visible_overflow = visible_overflow;
 
         // ---- upload ------------------------------------------------------------------
         // Bindings cover one full element even when empty.
@@ -2508,6 +2558,230 @@ mod tests {
             "only the first explicit buffer of view 1 is GPU-culled"
         );
         assert!(app.resources.expect::<crate::RenderStats>().compute_dispatches > 0);
+    }
+
+    /// Headless app on a device created with these limits, so wgpu's own validation fails past
+    /// them (not only the renderer's copy of the limits). `None` without an adapter.
+    fn limited_app(w: u32, h: u32, max_buffer: u64, max_binding: u64) -> Option<space3d_core::App> {
+        crate::renderer::TEST_LIMITS.set(Some((max_buffer, max_binding)));
+        let app = headless_app(w, h);
+        crate::renderer::TEST_LIMITS.set(None);
+        let app = app?;
+        let caps = app.resources.expect::<Renderer>().capabilities();
+        assert_eq!(caps.max_buffer_size, max_buffer);
+        // GL (WebGL2 level) has no storage buffers: a binding limit of 0.
+        assert!(caps.max_storage_binding <= max_binding);
+        Some(app)
+    }
+
+    fn paths_up_to(best: DrawPath) -> impl Iterator<Item = DrawPath> {
+        [
+            DrawPath::CpuDirect,
+            DrawPath::GpuIndirect,
+            DrawPath::GpuMultiDraw,
+            DrawPath::GpuMultiDrawCount,
+        ]
+        .into_iter()
+        .filter(move |p| *p <= best)
+    }
+
+    fn count_px(img: &space3d_core::ImageData, rgb: [u8; 3]) -> usize {
+        img.pixels.chunks(4).filter(|p| p[..3] == rgb).count()
+    }
+
+    /// `n` unlit cubes of edge 0.04 in a grid `side` wide, from `(x0, -3)` spanning 4 × 6 units.
+    fn spawn_grid(app: &mut space3d_core::App, mesh: MeshHandle, n: usize, side: usize, x0: f32, rgb: [f32; 3]) {
+        use crate::Mesh3d;
+        use space3d_core::Transform;
+        let material = Material::unlit(glam::Vec4::new(rgb[0], rgb[1], rgb[2], 1.0));
+        for i in 0..n {
+            let x = x0 + (i % side) as f32 * 4.0 / side as f32;
+            let y = (i / side) as f32 * 6.0 / (n.div_ceil(side)) as f32 - 3.0;
+            app.world
+                .spawn((Transform::from_xyz(x, y, 0.0), Mesh3d(mesh), material.clone()));
+        }
+    }
+
+    /// Regression: the `ecs` instance buffer grew to whatever the scene needed. Past the
+    /// device's `max_buffer_size` creating it failed validation and every frame was lost,
+    /// unrelated objects included (a panic in debug builds). The matrices past the limit, in
+    /// batch order, are now not drawn (logged once): the frame equals the scene without them.
+    #[test]
+    fn ecs_instances_past_max_buffer_size_are_cut_not_fatal() {
+        use crate::{Camera3d, RenderStats};
+        use space3d_core::{MeshData, Transform};
+        // 4 MiB (one staging chunk): 65 536 matrices.
+        const MAX: u64 = crate::gpu::STAGING_CHUNK;
+        const FIT: usize = (MAX / 64) as usize;
+        const RED: usize = 60_000;
+        // A red grid on the left and a green one on the right, whose last rows do not fit.
+        let build = |green: usize| {
+            let mut app = limited_app(96, 64, MAX, MAX)?;
+            let mesh = app
+                .resources
+                .expect_mut::<RenderAssets>()
+                .add_mesh(MeshData::cube(0.04));
+            spawn_grid(&mut app, mesh, RED, 250, -5.0, [1.0, 0.0, 0.0]);
+            // Rows of 100: the reference keeps only the rows that fit (`green` < 10 000).
+            for i in 0..green {
+                let x = 1.0 + (i % 100) as f32 * 0.04;
+                let y = (i / 100) as f32 * 0.06 - 3.0;
+                app.world.spawn((
+                    Transform::from_xyz(x, y, 0.0),
+                    crate::Mesh3d(mesh),
+                    Material::unlit(glam::Vec4::new(0.0, 1.0, 0.0, 1.0)),
+                ));
+            }
+            app.world.spawn((
+                Transform::from_xyz(0.0, 0.0, 8.0),
+                Camera3d::default().with_clear_color(glam::Vec4::new(0.0, 0.0, 0.0, 1.0)),
+            ));
+            Some(app)
+        };
+        let Some(probe) = limited_app(8, 8, MAX, MAX) else {
+            return;
+        };
+        let best = probe.resources.expect::<Renderer>().capabilities().best_draw_path;
+        drop(probe);
+        for path in paths_up_to(best) {
+            let mut app = build(10_000).expect("adapter");
+            set_path(&mut app, path);
+            // Two frames: the first allocates, the second diffs against the shadow.
+            crate::render_to_image(&mut app).expect("capture");
+            let cut = crate::render_to_image(&mut app).expect("capture");
+            let r = app.resources.expect::<Renderer>();
+            assert_eq!(r.gpu_error_count(), 0, "{path:?}");
+            assert!(r.frame.ecs_overflow, "{path:?}");
+            assert!(r.frame.ecs.gpu.capacity() <= MAX, "{path:?}");
+            assert_eq!(app.resources.expect::<RenderStats>().instances, FIT as u64, "{path:?}");
+
+            let mut app = build(FIT - RED).expect("adapter");
+            set_path(&mut app, path);
+            let reference = crate::render_to_image(&mut app).expect("capture");
+            assert!(
+                !app.resources.expect::<Renderer>().frame.ecs_overflow,
+                "exactly at the limit"
+            );
+            let d = differing_px(&cut, &reference);
+            assert_eq!(
+                d, 0,
+                "{path:?}: differs from the scene without the cut entities in {d} px"
+            );
+            assert!(count_px(&cut, [255, 0, 0]) > 500, "{path:?}: red grid");
+            assert!(count_px(&cut, [0, 255, 0]) > 200, "{path:?}: green rows that fit");
+        }
+    }
+
+    /// Regression: `cpu_visible` collects the partially visible ECS matrices of every view, so
+    /// with several views it outgrew `max_buffer_size` even though the `ecs` buffer fit, and
+    /// every frame was lost. A batch that no longer fits is now drawn whole from `ecs`
+    /// (unculled): the image is unchanged.
+    #[test]
+    fn partially_visible_ecs_past_max_buffer_size_is_drawn_unculled() {
+        use crate::{Camera3d, RenderTarget};
+        use space3d_core::{MeshData, Transform};
+        const MAX: u64 = crate::gpu::STAGING_CHUNK;
+        // 50 000 matrices (3.2 MB) fit; two render-target views each partially see about two
+        // thirds of them (2.1 MB each), the primary view about 90 %. A 1 MiB storage binding
+        // keeps the batch on CPU culling on every path.
+        let build = |app: &mut space3d_core::App| {
+            let mesh = app
+                .resources
+                .expect_mut::<RenderAssets>()
+                .add_mesh(MeshData::cube(0.04));
+            spawn_grid(app, mesh, 50_000, 250, -6.0, [1.0, 0.5, 0.0]);
+            for (order, x) in [(-2, -1.5), (-1, 1.5)] {
+                let rt = app.resources.expect_mut::<RenderAssets>().add_render_target(64, 64);
+                app.world.spawn((
+                    Transform::from_xyz(x, 0.0, 7.0),
+                    Camera3d {
+                        order,
+                        target: RenderTarget::Texture(rt),
+                        ..Default::default()
+                    },
+                ));
+            }
+            app.world.spawn((
+                Transform::from_xyz(1.0, 0.0, 7.0),
+                Camera3d::default().with_clear_color(glam::Vec4::new(0.0, 0.0, 0.0, 1.0)),
+            ));
+        };
+        let Some(mut reference) = headless_app(96, 64) else {
+            return;
+        };
+        build(&mut reference);
+        set_path(&mut reference, DrawPath::CpuDirect);
+        let expected = crate::render_to_image(&mut reference).expect("capture");
+        assert!(!reference.resources.expect::<Renderer>().frame.visible_overflow);
+        assert!(count_px(&expected, [255, 188, 0]) > 500, "the grid is visible");
+        let best = reference.resources.expect::<Renderer>().capabilities().best_draw_path;
+        drop(reference);
+        for path in paths_up_to(best) {
+            let mut app = limited_app(96, 64, MAX, 1 << 20).expect("adapter");
+            build(&mut app);
+            set_path(&mut app, path);
+            crate::render_to_image(&mut app).expect("capture");
+            let img = crate::render_to_image(&mut app).expect("capture");
+            let r = app.resources.expect::<Renderer>();
+            assert_eq!(r.gpu_error_count(), 0, "{path:?}");
+            let f = &r.frame;
+            assert!(f.visible_overflow, "{path:?}");
+            assert!(f.cpu_visible.len() > 0, "{path:?}: the first view still culls");
+            assert!(f.cpu_visible.gpu.capacity() <= MAX, "{path:?}");
+            let d = differing_px(&expected, &img);
+            assert_eq!(d, 0, "{path:?} differs in {d} px");
+        }
+    }
+
+    /// GPU culling binds the `ecs` buffer from offset 0 up to the storage-binding limit, so ECS
+    /// batches that end inside it keep GPU culling when the whole buffer is larger (before,
+    /// ECS data past the limit moved every ECS batch to CPU culling).
+    #[test]
+    fn ecs_batches_inside_the_storage_binding_keep_gpu_culling() {
+        use crate::Camera3d;
+        use space3d_core::{MeshData, Transform};
+        const BINDING: u64 = 32 << 10;
+        let build = |app: &mut space3d_core::App| {
+            let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.1));
+            // 200 matrices (12.8 KB) first, then 1000 (64 KB, past the binding).
+            spawn_grid(app, mesh, 200, 20, -5.0, [1.0, 0.0, 0.0]);
+            spawn_grid(app, mesh, 1000, 40, 1.0, [0.0, 0.0, 1.0]);
+            app.world.spawn((
+                Transform::from_xyz(-1.0, 0.0, 6.0),
+                Camera3d::default().with_clear_color(glam::Vec4::new(0.0, 0.0, 0.0, 1.0)),
+            ));
+        };
+        let Some(mut app) = limited_app(96, 64, 256 << 20, BINDING) else {
+            return;
+        };
+        build(&mut app);
+        let best = app.resources.expect::<Renderer>().capabilities().best_draw_path;
+        if best == DrawPath::CpuDirect {
+            return;
+        }
+        set_path(&mut app, DrawPath::CpuDirect);
+        let cpu = crate::render_to_image(&mut app).expect("capture");
+        for path in paths_up_to(best).skip(1) {
+            set_path(&mut app, path);
+            let img = crate::render_to_image(&mut app).expect("capture");
+            let d = differing_px(&cpu, &img);
+            assert_eq!(d, 0, "{path:?} differs from CpuDirect in {d} px");
+            let r = app.resources.expect::<Renderer>();
+            assert_eq!(r.gpu_error_count(), 0, "{path:?}");
+            let f = &r.frame;
+            let ecs: Vec<_> = f.sources.iter().filter(|s| s.buffer == SourceBuffer::Ecs).collect();
+            assert_eq!(ecs.len(), 2);
+            for s in ecs {
+                let inside = (s.first + s.count) as u64 * 64 <= BINDING;
+                assert_eq!(s.cull != CullSource::None, inside, "{path:?}: batch at {}", s.first);
+            }
+            assert_eq!(
+                f.jobs.iter().filter(|(b, _)| *b == SourceBuffer::Ecs).count(),
+                1,
+                "{path:?}: the first batch is GPU-culled"
+            );
+        }
+        assert!(count_px(&cpu, [255, 0, 0]) > 50 && count_px(&cpu, [0, 0, 255]) > 50);
     }
 
     /// `compact.wgsl` (GpuMultiDrawCount) keeps the non-empty draws of each run in order. Run

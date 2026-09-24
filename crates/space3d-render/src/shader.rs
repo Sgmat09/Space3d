@@ -16,8 +16,9 @@
 /// `uv`, `color`), the generated `InstanceInput` with its accessors (`instance_model`,
 /// `instance_color`, …, and `instance_customN(inst) -> vec4<f32>` for every
 /// [`crate::InstanceSemantic::Custom`] attribute `N` of the instance layout, zero-padded — slots
-/// 0–3 always exist and return zero when the layout lacks them — plus the raw field
-/// `inst.customN` in the attribute's own type), `VsOut`
+/// 0–3 always exist and return zero when the layout lacks them, and `Unorm8x4Bgra` is
+/// swizzled to RGBA — plus the raw field `inst.customN` in the attribute's own type, as fetched
+/// (memory order, B G R A, for `Unorm8x4Bgra`)), `VsOut`
 /// (`clip`, `world_pos`, `normal`, `uv`, `color`, `layer`, and `custom: vec4<f32>`, an extra
 /// interpolated varying for passing data from `vertex_hook` to `fragment_hook`), the `view`
 /// and `material` uniforms, `sample_base(uv, layer)` and the helpers `srgb_to_linear`,

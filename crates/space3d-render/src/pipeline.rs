@@ -196,15 +196,17 @@ pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
             model = Some(i);
             continue;
         }
+        let (_, swizzle) = attribute_format(a.format);
         if let InstanceSemantic::Custom(n) = a.semantic {
+            // The raw field is in fetch order (memory order for BGRA formats); the accessor
+            // applies the swizzle like the built-in semantics.
             s += &format!("    @location({loc}) custom{n}: {ty},\n");
             loc += 1;
-            custom.push((n, ty));
+            custom.push((n, ty, swizzle));
             continue;
         }
         s += &format!("    @location({loc}) a{i}: {ty},\n");
         loc += 1;
-        let (_, swizzle) = attribute_format(a.format);
         let e = format!("inst.a{i}{swizzle}");
         match a.semantic {
             InstanceSemantic::Translation => t = Some((e, ty)),
@@ -274,14 +276,14 @@ pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
     );
     // Custom attributes for custom shaders: declared slots, and slots 0..4 as zero otherwise.
     for n in 0..CUSTOM_ACCESSORS {
-        if !custom.iter().any(|(c, _)| *c == n) {
+        if !custom.iter().any(|(c, ..)| *c == n) {
             s += &format!(
                 "\nfn instance_custom{n}(inst: InstanceInput) -> vec4<f32> {{\n    return vec4<f32>(0.0);\n}}\n"
             );
         }
     }
-    for (n, ty) in custom {
-        let e = custom_vec4(&format!("inst.custom{n}"), ty);
+    for (n, ty, swizzle) in custom {
+        let e = custom_vec4(&format!("inst.custom{n}{swizzle}"), ty);
         s += &format!("\nfn instance_custom{n}(inst: InstanceInput) -> vec4<f32> {{\n    return {e};\n}}\n");
     }
     s
@@ -995,24 +997,40 @@ mod tests {
 
     /// Regression: `Unorm8x4Bgra` reached wgpu's GL backend, which cannot express it (WebGL2 /
     /// GLES: INVALID_VALUE and garbage colors; ANGLE: a crash). It is now fetched as `Unorm8x4`
-    /// and swizzled in the generated shader.
+    /// and swizzled in the generated shader — for `Custom(n)` attributes too (their
+    /// `instance_customN` accessor used to return the fetched BGRA bytes with red and blue
+    /// swapped).
     #[test]
     fn bgra_instance_colors_are_emulated() {
         const LAYOUT: &InstanceLayout = &InstanceLayout {
             name: "Bgra",
-            stride: 16,
+            stride: 20,
             attributes: &[
                 InstanceAttribute::new(InstanceSemantic::Translation, F::Float32x3, 0),
                 InstanceAttribute::new(InstanceSemantic::Color, F::Unorm8x4Bgra, 12),
+                InstanceAttribute::new(InstanceSemantic::Custom(1), F::Unorm8x4Bgra, 16),
             ],
         };
         LAYOUT.validate().expect("valid layout");
         let attrs = instance_attributes(LAYOUT);
         assert!(attrs.iter().all(|a| a.format != F::Unorm8x4Bgra));
         assert_eq!(attrs[1].format, F::Unorm8x4);
+        assert_eq!(attrs[2].format, F::Unorm8x4);
         let src = instance_wgsl(LAYOUT);
         assert!(src.contains("return inst.a1.zyxw;"), "{src}");
+        assert!(src.contains("@location(6) custom1: vec4<f32>"), "{src}");
+        assert!(
+            src.contains("fn instance_custom1(inst: InstanceInput) -> vec4<f32> {\n    return inst.custom1.zyxw;"),
+            "{src}"
+        );
+        let custom = CustomShader::new(
+            "c1",
+            "fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> { return c; }\n\
+             fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {\n\
+             \x20   var o = out;\n    o.custom = instance_custom1(inst) + inst.custom1;\n    return o;\n}\n",
+        );
         validate(&forward_shader(LAYOUT, false, false, None));
+        validate(&forward_shader(LAYOUT, false, false, Some(&custom)));
     }
 
     /// Exact `(format, offset, location)` of every built-in layout: a wrong offset or format

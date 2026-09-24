@@ -52,8 +52,9 @@ pub enum InstanceSemantic {
     /// Texture-array layer (atlas index / animation frame) as `Uint32` or `Float32`.
     TextureLayer,
     /// User data for [custom shaders](crate::CustomShader): the generated `InstanceInput` has a
-    /// field `customN` (the attribute's own WGSL type) and `instance_customN(inst)` returns it
-    /// as a zero-padded `vec4<f32>`. Ignored by the built-in shader.
+    /// field `customN` (the attribute's own WGSL type, as fetched: B G R A for `Unorm8x4Bgra`)
+    /// and `instance_customN(inst)` returns it as a zero-padded `vec4<f32>` (RGBA for
+    /// `Unorm8x4Bgra`). Ignored by the built-in shader.
     Custom(u8),
 }
 

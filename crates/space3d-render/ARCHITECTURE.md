@@ -188,11 +188,13 @@ GPU culling (`shaders/cull.wgsl`):
 * `GpuMultiDrawCount` adds `compact.wgsl`: one workgroup per run moves the run's non-empty
   args to its front **in their original order** (block counts + prefix sum) and stores the
   count, so `multi_draw_indexed_indirect_count` skips fully culled batches.
-* Explicit buffers or an ECS batch larger than `max_storage_buffer_binding_size`, and output
-  regions that would end past that binding in `cull_out` (which accumulates every view's
-  regions) fall back to CPU culling + direct draws for that view, even on GPU paths. So do
-  layouts whose position cannot be decoded (see above), which on the CPU path are culled per
-  block only with user bounds.
+* Explicit buffers larger than `max_storage_buffer_binding_size`, ECS batches that end past
+  it in the `ecs` buffer (bound from offset 0, so the batches before them keep GPU culling:
+  `frame::tests::ecs_batches_inside_the_storage_binding_keep_gpu_culling`), and output regions
+  that would end past that binding in `cull_out` (which accumulates every view's regions) fall
+  back to CPU culling + direct draws for that view, even on GPU paths. So do layouts whose
+  position cannot be decoded (see above), which on the CPU path are culled per block only with
+  user bounds.
 
 Batches are drawn in the order `(blend, class, instance layout, custom shader + texture kind,
 material, mesh)`: transparent materials (`alpha_blend`) after opaque ones (no per-instance
@@ -208,9 +210,10 @@ A `CustomShader` is WGSL spliced into the built-in forward shader, registered wi
 stage) and/or `fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32>` (end of the fragment
 stage, `color` = lit linear color); a missing hook is the identity. Everything the template
 declares is in scope: the generated `InstanceInput` and its accessors — including
-`instance_customN(inst)` (the `Custom(N)` attribute as a zero-padded `vec4<f32>`; slots 0–3
-always exist and are zero when the layout lacks them, so a shader using them works with every
-layout) and the raw `inst.customN` — the
+`instance_customN(inst)` (the `Custom(N)` attribute as a zero-padded `vec4<f32>`, swizzled to
+RGBA for `Unorm8x4Bgra`; slots 0–3 always exist and are zero when the layout lacks them, so a
+shader using them works with every layout) and the raw `inst.customN` (as fetched: memory
+order, B G R A, for `Unorm8x4Bgra`) — the
 `view`/`material` uniforms, `sample_base`, the color helpers, and in custom pipelines an extra
 interpolated varying `VsOut.custom: vec4<f32>` to pass data from the vertex to the fragment
 hook. This is how per-instance custom data is consumed: `tests/custom_shader.rs` renders a
@@ -258,7 +261,7 @@ of a 3.2 MB buffer — in `tests/instancing.rs::parallel_staging_copies_deliver_
   >50 % dirty → one full copy
   (`tests/instancing.rs::more_than_half_dirty_uploads_the_whole_buffer`).
 * **Renderer-owned buffers** (`TrackedBuffer`: ECS instances, per-view visible instances, view
-  uniforms, materials, cull jobs/params, args templates, draw meta) keep a CPU shadow; writes are
+  uniforms, materials, cull jobs/params, args templates, run meta) keep a CPU shadow; writes are
   compared with it and only differing byte ranges are uploaded. Result: an unchanged scene with a
   still camera uploads **0 bytes** per frame; moving one ECS entity uploads one 64-byte matrix.
   On `CpuDirect` the `ecs` buffer is only read by fully visible batches, so only its dirty
@@ -315,7 +318,8 @@ red/blue pattern averages to the sRGB-correct purple), full BC1/BC7/ETC2/ASTC mi
 power-of-two and odd sizes (each format the adapter supports), the unaligned-size refusal,
 and atlas sampling through `UvRect`. (Forced onto ANGLE's GL backend on macOS — GLES 3.0,
 which must report ETC2 — ETC2 textures upload without error but sample black: a driver
-limitation outside what wgpu or the renderer can detect. The other checks pass there.)
+limitation outside what wgpu or the renderer can detect, so the test skips ETC2 on ANGLE. The
+other checks pass there.)
 
 Render-target textures (`RenderAssets::add_render_target`, resized with
 `resize_render_target`) get their own depth buffer and can be sampled by materials. A texture
@@ -335,7 +339,7 @@ frame's content, like a video feedback loop.
 | `cpu_visible` | VERTEX | persistent | shadow diff (CPU path, partially visible batches) |
 | view uniforms | UNIFORM, dynamic offset per camera | persistent | shadow diff |
 | material uniforms | UNIFORM, dynamic offset per material | persistent | on intern only |
-| cull params / jobs / templates / draw meta | UNIFORM / STORAGE / COPY_SRC | persistent | shadow diff |
+| cull params / jobs / templates | UNIFORM / STORAGE / COPY_SRC | persistent | shadow diff |
 | `cull_out`, args (+ compaction records), compacted args, counts | STORAGE+VERTEX / STORAGE+INDIRECT (args also COPY_SRC for the stats readback) | persistent, 1.5× | GPU only (compute, copy, clear) |
 | run meta (multi-draw-count runs) | STORAGE | persistent | shadow diff |
 | render-target feedback copies | TEXTURE_BINDING+COPY_DST | while a view samples its own target (+60 frames) | GPU copy before the pass |
@@ -344,8 +348,14 @@ frame's content, like a video feedback loop.
 | culling-stats readback (3) | MAP_READ | persistent ring, 1.5× (all idle slots grow together) | GPU copy of the indirect args |
 
 Every `GrowBuffer` (1.5× growth) is clamped to the device's `max_buffer_size`; callers keep the
-requested size itself within it (explicit instance buffers over the limit are logged and not
-drawn).
+requested size itself within it (a larger buffer fails validation, which loses the whole frame):
+explicit instance buffers over the limit are logged and not drawn; ECS matrices past it (more
+than `max_buffer_size / 64` entities — 4 194 304 at WebGPU's default 256 MiB) are not drawn, in
+batch order, the batch crossing the limit cut and the overflow logged once; and a partially
+visible ECS batch that no longer fits `cpu_visible` (which accumulates every view's) is drawn
+whole from `ecs`, unculled (`frame::tests::ecs_instances_past_max_buffer_size_are_cut_not_fatal`,
+`partially_visible_ecs_past_max_buffer_size_is_drawn_unculled`; both run on a device created
+with those limits, so wgpu validates them).
 
 ## Allocation in the steady state
 **Renderer code allocates nothing per frame.** All per-frame scratch (ECS keys/rows/matrices/
@@ -504,5 +514,7 @@ dynamic objects belong in `InstanceBuffer`s. Allocation counts are in [Allocatio
 * Transparent instances are not depth-sorted within a batch.
 * ECS extraction interns materials and checks meshes serially (the matrix gather and diff are
   parallel); instance layouts whose position is not f32/f16 are not culled per instance.
+* ECS entities past `max_buffer_size / 64` (4 194 304 on WebGPU/WebGL2 defaults) are not drawn;
+  that many objects belong in `InstanceBuffer`s.
 * Custom shaders are hooks inside the forward shader: they cannot declare bindings or replace
   the lighting model's inputs, and culling ignores vertex displacement.

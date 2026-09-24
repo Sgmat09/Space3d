@@ -109,6 +109,71 @@ fn custom_attributes_drive_a_custom_shader() {
     }
 }
 
+/// Position + a BGRA-ordered color for the custom shader (`Custom(1)`, `Unorm8x4Bgra`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BgraTagged {
+    translation: [f32; 3],
+    bgra: [u8; 4],
+}
+
+impl InstanceData for BgraTagged {
+    const LAYOUT: &'static InstanceLayout = &InstanceLayout {
+        name: "BgraTagged",
+        stride: 16,
+        attributes: &[
+            InstanceAttribute::new(InstanceSemantic::Translation, wgpu::VertexFormat::Float32x3, 0),
+            InstanceAttribute::new(InstanceSemantic::Custom(1), wgpu::VertexFormat::Unorm8x4Bgra, 12),
+        ],
+    };
+}
+
+/// Regression: `Unorm8x4Bgra` attributes are fetched as `Unorm8x4` (GL cannot fetch BGRA) and
+/// swizzled back in the generated shader, but `instance_customN` skipped the swizzle, so a
+/// custom shader saw red and blue swapped. Bytes `[0, 0, 255, 255]` in BGRA order are red.
+#[test]
+fn bgra_custom_attributes_reach_custom_shaders_as_rgba() {
+    let Some(mut app) = headless_app(32, 32) else { return };
+    let (mesh, shader) = {
+        let a = app.resources.expect_mut::<RenderAssets>();
+        let shader = a.add_shader(CustomShader::new(
+            "bgra",
+            r"
+fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {
+    var o = out;
+    o.custom = instance_custom1(inst);
+    return o;
+}
+fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {
+    return in.custom;
+}",
+        ));
+        (a.add_mesh(MeshData::cube(1.0)), shader)
+    };
+    let buf = InstanceBuffer::from_vec(
+        vec![BgraTagged {
+            translation: [0.0; 3],
+            bgra: [0, 0, 255, 255],
+        }],
+        BufferUsage::Static,
+    );
+    let instances = app.resources.expect_mut::<InstanceBuffers>().insert(buf);
+    app.world.spawn((InstancedMesh {
+        mesh,
+        material: Material::unlit(Vec4::ONE).with_shader(shader),
+        instances,
+    },));
+    spawn_camera(&mut app, 3.0);
+    for path in paths_up_to(best_path(&app)) {
+        set_path(&mut app, path);
+        let img = render_to_image(&mut app).expect("capture");
+        assert_eq!(img.get(16, 16), [255, 0, 0, 255], "{path:?}: BGRA red");
+        let r = app.resources.expect::<Renderer>();
+        assert_eq!(r.shader_error(shader), None);
+        assert_eq!(r.gpu_error_count(), 0);
+    }
+}
+
 /// The same custom shader works for ECS entities (their `InstanceTransform` layout has no
 /// custom attributes: `instance_customN` returns zero).
 #[test]

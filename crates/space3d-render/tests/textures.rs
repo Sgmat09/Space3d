@@ -142,11 +142,17 @@ fn compressed_cases() -> Vec<(wgpu::TextureFormat, Vec<u8>)> {
 
 /// Full mip chains of compressed formats upload (block-aligned physical extents for the small
 /// mips, including sizes that are not powers of two) and sample the encoded color at mip 0 and
-/// at the smallest mips. Formats the adapter lacks are skipped.
+/// at the smallest mips. Formats the adapter lacks are skipped, and so is ETC2 on ANGLE (see
+/// below).
 #[test]
 fn compressed_textures_upload_full_mip_chains() {
     let Some(app) = headless_app(8, 8) else { return };
     let renderer = app.resources.expect::<Renderer>();
+    let adapter = &renderer.capabilities().adapter;
+    // ANGLE's GLES 3.0 (e.g. `WGPU_BACKEND=gl` with `--features wgpu/angle` on macOS, see
+    // `tests/gl.rs`) must report ETC2, and uploads it without error, but samples it as black:
+    // a driver limitation the renderer cannot detect (ARCHITECTURE.md, Textures).
+    let angle = adapter.backend == wgpu::Backend::Gl && adapter.name.contains("ANGLE");
     let cases: Vec<_> = compressed_cases()
         .into_iter()
         .filter(|(f, _)| {
@@ -154,7 +160,11 @@ fn compressed_textures_upload_full_mip_chains() {
             if !ok {
                 eprintln!("skipping {f:?}: not supported by this adapter");
             }
-            ok
+            let etc2_on_angle = angle && f.required_features() == wgpu::Features::TEXTURE_COMPRESSION_ETC2;
+            if ok && etc2_on_angle {
+                eprintln!("skipping {f:?}: ANGLE samples ETC2 as black");
+            }
+            ok && !etc2_on_angle
         })
         .collect();
     drop(app);

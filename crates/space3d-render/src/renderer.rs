@@ -313,6 +313,15 @@ impl std::fmt::Debug for Renderer {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `(max_buffer_size, max_storage_buffer_binding_size)` requested instead of the adapter's
+    /// limits (when lower) by renderers created on this thread, so tests run against a device that really
+    /// enforces smaller limits (wgpu validation fails past them) — see
+    /// `frame::tests::limited_app`.
+    pub(crate) static TEST_LIMITS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Route wgpu errors that no error scope captured through `tracing` instead of wgpu's default
 /// handler, which panics. With `panic` (debug builds and tests) the error still panics after
 /// being logged so bugs surface immediately; release builds log and keep running — skipping a
@@ -418,11 +427,19 @@ impl Renderer {
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::TEXTURE_COMPRESSION_ASTC
             | wgpu::Features::TEXTURE_COMPRESSION_ETC2;
+        #[cfg_attr(not(test), expect(unused_mut))]
+        let mut required_limits = adapter.limits();
+        #[cfg(test)]
+        if let Some((buffer, binding)) = TEST_LIMITS.get() {
+            required_limits.max_buffer_size = buffer.min(required_limits.max_buffer_size);
+            required_limits.max_storage_buffer_binding_size =
+                binding.min(required_limits.max_storage_buffer_binding_size);
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("space3d device"),
                 required_features: adapter.features() & wanted,
-                required_limits: adapter.limits(),
+                required_limits,
                 ..Default::default()
             })
             .await
