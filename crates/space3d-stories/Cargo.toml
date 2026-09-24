@@ -1,6 +1,6 @@
 [package]
 name = "space3d-stories"
-description = "Space3d stories"
+description = "Space3d storybook: isolated, parameterized, screenshot-able stories"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,4 @@ license.workspace = true
 
 [dependencies]
 space3d-core.workspace = true
+serde.workspace = true
