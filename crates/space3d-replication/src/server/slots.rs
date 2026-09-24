@@ -57,6 +57,8 @@ pub(crate) struct Slot {
     pub(crate) interest_hint: Option<([f32; 3], f32)>,
     /// Last client report.
     pub(crate) report: Option<crate::protocol::control::ClientReport>,
+    /// Byte-rate window of `stats`.
+    pub(crate) rates: crate::stats::RateWindow,
     /// Whether the link uses datagram semantics (seq/acks).
     pub(crate) datagram: bool,
 }
@@ -94,6 +96,7 @@ impl Slot {
             view_delay_q8: 0,
             interest_hint: None,
             report: None,
+            rates: Default::default(),
             datagram: false,
         }
     }

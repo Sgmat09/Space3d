@@ -238,6 +238,8 @@ pub(crate) fn client_send(ctx: &mut SystemCtx) {
     let Some(mut conn) = net.conn.take() else { return };
     send_frame(net, &mut conn, now, fps);
     net.conn = Some(conn);
+    let NetClient { rates, stats, .. } = net;
+    rates.update(stats, now);
 }
 
 fn send_frame(net: &mut NetClient, conn: &mut Connection, now: Duration, fps: f32) {

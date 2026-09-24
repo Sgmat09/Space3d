@@ -41,6 +41,41 @@ pub struct NetStats {
     pub budget_utilization: f32,
 }
 
+/// Turns the cumulative byte counters of a [`NetStats`] into the 1 s window rates
+/// (`bytes_in_per_sec`, `bytes_out_per_sec`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RateWindow {
+    start: Option<Duration>,
+    bytes_in: u64,
+    bytes_out: u64,
+}
+
+impl RateWindow {
+    /// Call regularly with the current time; updates the rates once a second.
+    pub fn update(&mut self, stats: &mut NetStats, now: Duration) {
+        let Some(start) = self.start else {
+            *self = Self {
+                start: Some(now),
+                bytes_in: stats.bytes_in,
+                bytes_out: stats.bytes_out,
+            };
+            return;
+        };
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= Duration::from_secs(1) {
+            let secs = elapsed.as_secs_f64();
+            let rate = |d: u64| (d as f64 / secs).round().min(f64::from(u32::MAX)) as u32;
+            stats.bytes_in_per_sec = rate(stats.bytes_in.saturating_sub(self.bytes_in));
+            stats.bytes_out_per_sec = rate(stats.bytes_out.saturating_sub(self.bytes_out));
+            *self = Self {
+                start: Some(now),
+                bytes_in: stats.bytes_in,
+                bytes_out: stats.bytes_out,
+            };
+        }
+    }
+}
+
 /// Cumulative per-room counters (server). The server crate converts deltas into Prometheus
 /// metrics once per second; counters never reset during the room's lifetime.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,4 +112,22 @@ pub struct RoomNetStats {
     pub resumes: u64,
     /// Clients kicked.
     pub kicks: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_window_reports_per_second() {
+        let mut stats = NetStats::default();
+        let mut w = RateWindow::default();
+        w.update(&mut stats, Duration::from_millis(100));
+        stats.bytes_in += 3000;
+        stats.bytes_out += 500;
+        w.update(&mut stats, Duration::from_millis(600));
+        assert_eq!(stats.bytes_in_per_sec, 0);
+        w.update(&mut stats, Duration::from_millis(2100));
+        assert_eq!((stats.bytes_in_per_sec, stats.bytes_out_per_sec), (1500, 250));
+    }
 }

@@ -249,6 +249,7 @@ fn send_client(
     let hz = slots.tick_hz.max(1.0);
     let slot = slots.get_mut(client)?;
     let (_, tx) = slot.link.clone()?;
+    slot.rates.update(&mut slot.stats, now);
     let caps = tx.caps();
     let backlog = tx.backlog_bytes();
     let mut kick = None;

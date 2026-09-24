@@ -331,6 +331,7 @@ pub struct NetClient {
     pub(crate) report_at: Duration,
     pub(crate) report_rollbacks: u64,
     pub(crate) report_resims: u64,
+    pub(crate) rates: crate::stats::RateWindow,
 }
 
 impl std::fmt::Debug for NetClient {
@@ -372,6 +373,7 @@ impl NetClient {
             report_at: Duration::ZERO,
             report_rollbacks: 0,
             report_resims: 0,
+            rates: Default::default(),
         }
     }
 
