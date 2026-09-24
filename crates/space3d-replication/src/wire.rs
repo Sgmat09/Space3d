@@ -151,6 +151,11 @@ impl Writer {
         self.varu64(u64::from(v));
     }
 
+    /// Unsigned LEB128 (≤ 3 bytes).
+    pub fn varu16(&mut self, v: u16) {
+        self.varu64(u64::from(v));
+    }
+
     /// Zigzag + LEB128.
     pub fn vari64(&mut self, v: i64) {
         self.varu64(((v << 1) ^ (v >> 63)) as u64);
@@ -254,7 +259,8 @@ impl<'a> Reader<'a> {
         self.array().map(f32::from_le_bytes)
     }
 
-    /// Unsigned LEB128 (rejects encodings longer than 10 bytes).
+    /// Unsigned LEB128. Rejects encodings longer than 10 bytes and non-canonical (over-long)
+    /// encodings such as `0x80 0x00`, so every value has exactly one wire form.
     pub fn varu64(&mut self) -> Result<u64, DecodeError> {
         let mut out = 0u64;
         for i in 0..10 {
@@ -265,10 +271,18 @@ impl<'a> Reader<'a> {
             }
             out |= chunk << (7 * i);
             if b & 0x80 == 0 {
+                if b == 0 && i > 0 {
+                    return Err(DecodeError::VarintOverflow);
+                }
                 return Ok(out);
             }
         }
         Err(DecodeError::VarintOverflow)
+    }
+
+    /// Unsigned LEB128 that must fit in `u16`.
+    pub fn varu16(&mut self) -> Result<u16, DecodeError> {
+        u16::try_from(self.varu64()?).map_err(|_| DecodeError::VarintOverflow)
     }
 
     /// Unsigned LEB128 that must fit in `u32`.
@@ -305,8 +319,22 @@ impl<'a> Reader<'a> {
     /// Length-prefixed (≤ `max`) postcard value.
     pub fn postcard<T: DeserializeOwned>(&mut self, max: usize) -> Result<T, DecodeError> {
         let bytes = self.bytes(max)?;
-        postcard::from_bytes(bytes).map_err(|e| DecodeError::Postcard(e.to_string()))
+        postcard_exact(bytes)
     }
+}
+
+/// Decode a postcard value that must use **all** of `bytes` (trailing garbage is rejected).
+pub fn postcard_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
+    match postcard::take_from_bytes::<T>(bytes) {
+        Ok((v, [])) => Ok(v),
+        Ok(_) => Err(DecodeError::Invalid("trailing bytes")),
+        Err(e) => Err(DecodeError::Postcard(e.to_string())),
+    }
+}
+
+/// Postcard-encode a value (plain data types never fail; a failure is reported as [`EncodeError`]).
+pub fn to_postcard<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, EncodeError> {
+    postcard::to_stdvec(value).map_err(|e| EncodeError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -336,6 +364,12 @@ mod tests {
     fn hostile_input_is_rejected() {
         assert_eq!(Reader::new(&[0xff; 11]).varu64(), Err(DecodeError::VarintOverflow));
         assert_eq!(Reader::new(&[0x80]).varu64(), Err(DecodeError::Eof));
+        assert_eq!(Reader::new(&[0x80, 0x00]).varu64(), Err(DecodeError::VarintOverflow));
+        assert_eq!(Reader::new(&[0xff, 0xff, 0x03]).varu16(), Ok(u16::MAX));
+        assert_eq!(
+            Reader::new(&[0xff, 0xff, 0x04]).varu16(),
+            Err(DecodeError::VarintOverflow)
+        );
         let mut w = Writer::new();
         w.varu32(1_000_000);
         assert_eq!(
@@ -345,5 +379,48 @@ mod tests {
                 max: 1024
             })
         );
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_varu64_roundtrip(v in any::<u64>()) {
+            let mut w = Writer::new();
+            w.varu64(v);
+            prop_assert!(w.len() <= 10);
+            let mut r = Reader::new(w.as_slice());
+            prop_assert_eq!(r.varu64().unwrap(), v);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn prop_zigzag_roundtrip(a in any::<i32>(), b in any::<i64>()) {
+            let mut w = Writer::new();
+            w.vari32(a);
+            w.vari64(b);
+            let mut r = Reader::new(w.as_slice());
+            prop_assert_eq!(r.vari32().unwrap(), a);
+            prop_assert_eq!(r.vari64().unwrap(), b);
+        }
+
+        #[test]
+        fn prop_small_magnitudes_are_short(a in -63i32..=63) {
+            let mut w = Writer::new();
+            w.vari32(a);
+            prop_assert_eq!(w.len(), 1);
+        }
+
+        #[test]
+        fn prop_reader_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
+            let mut r = Reader::new(&bytes);
+            let _ = r.varu64();
+            let _ = r.vari32();
+            let _ = r.bytes(16);
+            let _ = r.str(16);
+            let _ = r.postcard::<(u32, String)>(32);
+            let _ = r.u64();
+            let _ = postcard_exact::<Vec<u16>>(&bytes);
+        }
     }
 }

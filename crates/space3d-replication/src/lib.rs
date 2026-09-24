@@ -117,8 +117,32 @@ impl Plugin for ReplicationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ReplicationRegistry>();
         app.init_resource::<SimSchedule>();
-        todo!("register built-in components according to the flags")
+        if self.transform {
+            app.replicate_with::<space3d_core::Transform>(
+                "core.transform",
+                ComponentRule::new(quant::TransformCodec::default()).predict_and_interpolate(),
+            );
+        }
+        if self.name {
+            app.replicate::<space3d_core::Name>("core.name");
+        }
+        if self.parent {
+            app.replicate_with::<space3d_core::Parent>(
+                "core.parent",
+                ComponentRule::mapped(
+                    |p: &space3d_core::Parent, ctx: &mapping::EncodeCtx<'_>| ctx.net_id(p.0),
+                    |id: Option<NetId>, ctx: &mut mapping::DecodeCtx<'_>| ctx.entity(id?).map(space3d_core::Parent),
+                ),
+            );
+        }
+        app.add_system_named(space3d_core::Stage::Startup, "replication::freeze", freeze_registry);
     }
+}
+
+/// Freeze the registry (idempotent). Runs at the first `Startup`; the replication plugins also
+/// call it before first use.
+pub fn freeze_registry(ctx: &mut SystemCtx) {
+    ctx.resources.init::<ReplicationRegistry>().freeze();
 }
 
 /// Registration API used by a game's shared protocol plugin. Every method is order
@@ -178,7 +202,16 @@ impl AppReplicationExt for App {
     }
 
     fn add_message<M: NetMessage>(&mut self, name: &'static str, config: MessageConfig) -> &mut Self {
-        todo!("register in ReplicationRegistry and add Events<FromServer<M>> / Events<FromClient<M>>")
+        self.resources
+            .init::<ReplicationRegistry>()
+            .register_message::<M>(name, config);
+        if matches!(config.direction, Direction::ServerToClient | Direction::Both) {
+            self.add_event::<FromServer<M>>();
+        }
+        if matches!(config.direction, Direction::ClientToServer | Direction::Both) {
+            self.add_event::<FromClient<M>>();
+        }
+        self
     }
 
     fn add_sim_system(&mut self, name: &'static str, system: impl FnMut(&mut SystemCtx) + Send + 'static) -> &mut Self {

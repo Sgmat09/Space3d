@@ -81,5 +81,73 @@ impl SimSchedule {
 /// `fixed_delta` readers stay deterministic while the client dilates `TickRate`), runs every
 /// sim system in order, then restores `fixed_delta`. Used by both drivers.
 pub fn run_sim(ctx: &mut SystemCtx, time: SimTime) {
-    todo!()
+    ctx.resources.insert(time);
+    let saved = ctx
+        .resources
+        .get_mut::<space3d_core::Time>()
+        .map(|t| std::mem::replace(&mut t.fixed_delta, time.dt));
+    if ctx.resources.contains::<SimSchedule>() {
+        let world = &mut *ctx.world;
+        ctx.resources.scope::<SimSchedule, _>(|resources, schedule| {
+            let mut inner = SystemCtx { world, resources };
+            for (name, system) in schedule.systems.get_mut().iter_mut() {
+                let _span = tracing::trace_span!("sim_system", name = *name).entered();
+                system(&mut inner);
+            }
+        });
+    }
+    if let Some(saved) = saved
+        && let Some(t) = ctx.resources.get_mut::<space3d_core::Time>()
+    {
+        t.fixed_delta = saved;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use space3d_core::{App, Time};
+
+    #[test]
+    fn run_sim_pins_fixed_delta_and_runs_in_order() {
+        let mut app = App::new().with_tickrate(63.0);
+        let mut sched = SimSchedule::default();
+        sched.add("a", |ctx| {
+            let dt = ctx.resources.expect::<Time>().fixed_delta;
+            let st = *ctx.resources.expect::<SimTime>();
+            ctx.resources
+                .init::<Vec<(char, Duration, Tick)>>()
+                .push(('a', dt, st.tick));
+        });
+        sched.add("b", |ctx| {
+            ctx.resources
+                .init::<Vec<(char, Duration, Tick)>>()
+                .push(('b', Duration::ZERO, Tick(0)))
+        });
+        assert_eq!(sched.names(), vec!["a", "b"]);
+        app.insert_resource(sched);
+        let mut ctx = SystemCtx {
+            world: &mut app.world,
+            resources: &mut app.resources,
+        };
+        let nominal = Duration::from_secs_f64(1.0 / 60.0);
+        run_sim(
+            &mut ctx,
+            SimTime {
+                tick: Tick(9),
+                dt: nominal,
+                role: SimRole::Client,
+                resimulating: false,
+            },
+        );
+        let log = app.resources.expect::<Vec<(char, Duration, Tick)>>().clone();
+        assert_eq!(log[0], ('a', nominal, Tick(9)));
+        assert_eq!(log[1].0, 'b');
+        // Restored afterwards.
+        assert_eq!(
+            app.resources.expect::<Time>().fixed_delta,
+            Duration::from_secs_f64(1.0 / 63.0)
+        );
+        assert_eq!(app.resources.expect::<SimTime>().tick, Tick(9));
+    }
 }

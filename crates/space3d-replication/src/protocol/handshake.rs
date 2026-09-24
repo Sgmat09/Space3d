@@ -89,7 +89,34 @@ impl Hello {
     /// Structural checks shared by gateway and harness: magic, protocol version, string and
     /// ticket lengths. Does **not** authenticate.
     pub fn validate(&self) -> Result<(), RejectCode> {
-        todo!()
+        if self.magic != super::MAGIC || self.protocol != super::PROTOCOL_VERSION {
+            return Err(RejectCode::VersionMismatch);
+        }
+        if self.game_id.is_empty() || self.game_id.len() > MAX_GAME_ID || self.game_version.len() > MAX_GAME_VERSION {
+            return Err(RejectCode::Malformed);
+        }
+        match &self.auth {
+            HelloAuth::Ticket(t) if t.is_empty() || t.len() > MAX_TICKET => Err(RejectCode::Malformed),
+            HelloAuth::Resume(b) if b.len() != ResumeToken::LEN => Err(RejectCode::Malformed),
+            HelloAuth::Dev { name } if name.trim().is_empty() || name.len() > MAX_DEV_NAME => {
+                Err(RejectCode::Malformed)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A Hello for this build with the given credentials (`client_time_us` from the caller's clock).
+    pub fn new(game_id: &str, game_version: &str, schema_hash: u64, auth: HelloAuth, caps: ClientCaps) -> Self {
+        Self {
+            magic: super::MAGIC,
+            protocol: super::PROTOCOL_VERSION,
+            game_id: game_id.to_owned(),
+            game_version: game_version.to_owned(),
+            schema_hash,
+            auth,
+            caps,
+            client_time_us: 0,
+        }
     }
 }
 
@@ -261,4 +288,128 @@ pub struct Disconnect {
     pub message: String,
     /// Whether the client may try `HelloAuth::Resume`.
     pub resume_allowed: bool,
+}
+
+impl Reject {
+    /// A reject with a (truncated) message.
+    pub fn new(code: RejectCode, message: &str) -> Self {
+        Self {
+            code,
+            message: truncate(message, MAX_REASON),
+            retry_after_ms: None,
+        }
+    }
+}
+
+impl Disconnect {
+    /// A disconnect with a (truncated) message.
+    pub fn new(code: DisconnectCode, message: &str, resume_allowed: bool) -> Self {
+        Self {
+            code,
+            message: truncate(message, MAX_REASON),
+            resume_allowed,
+        }
+    }
+}
+
+/// Truncate to at most `max` bytes on a char boundary.
+pub(crate) fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Packet, PacketKind, decode_packet, encode_handshake};
+
+    fn hello(auth: HelloAuth) -> Hello {
+        Hello::new("arena", "1.0.0", 42, auth, ClientCaps::default())
+    }
+
+    #[test]
+    fn hello_validation() {
+        assert_eq!(hello(HelloAuth::Dev { name: "al".into() }).validate(), Ok(()));
+        let mut h = hello(HelloAuth::Dev { name: "al".into() });
+        h.magic = *b"XXXX";
+        assert_eq!(h.validate(), Err(RejectCode::VersionMismatch));
+        let mut h = hello(HelloAuth::Dev { name: "al".into() });
+        h.protocol += 1;
+        assert_eq!(h.validate(), Err(RejectCode::VersionMismatch));
+        assert_eq!(
+            hello(HelloAuth::Ticket("x".repeat(MAX_TICKET + 1))).validate(),
+            Err(RejectCode::Malformed)
+        );
+        assert_eq!(
+            hello(HelloAuth::Resume(vec![0; 3])).validate(),
+            Err(RejectCode::Malformed)
+        );
+        assert_eq!(
+            hello(HelloAuth::Dev { name: " ".into() }).validate(),
+            Err(RejectCode::Malformed)
+        );
+        let mut h = hello(HelloAuth::Ticket("t".into()));
+        h.game_id = "g".repeat(MAX_GAME_ID + 1);
+        assert_eq!(h.validate(), Err(RejectCode::Malformed));
+    }
+
+    #[test]
+    fn resume_token_is_30_bytes_and_roundtrips() {
+        let t = ResumeToken {
+            room: RoomId(7),
+            client: NetClientId(3),
+            epoch: 9,
+            secret: [5; 16],
+        };
+        let b = t.encode();
+        assert_eq!(b.len(), 30);
+        assert_eq!(ResumeToken::decode(&b), Ok(t));
+        assert!(ResumeToken::decode(&b[..29]).is_err());
+    }
+
+    #[test]
+    fn handshake_packets_roundtrip() {
+        let h = hello(HelloAuth::Ticket("s3.join.k1.abc.def".into()));
+        let bytes = encode_handshake(PacketKind::Hello, &h);
+        assert_eq!(bytes[0], PacketKind::Hello as u8);
+        match decode_packet(&bytes, &Default::default()).unwrap() {
+            Packet::Hello(back) => assert_eq!(back, h),
+            other => panic!("{other:?}"),
+        }
+        let r = Reject::new(RejectCode::RoomFull, &"x".repeat(500));
+        assert_eq!(r.message.len(), MAX_REASON);
+        let bytes = encode_handshake(PacketKind::Reject, &r);
+        assert_eq!(decode_packet(&bytes, &Default::default()).unwrap(), Packet::Reject(r));
+        let d = Disconnect::new(DisconnectCode::SlowConsumer, "slow", true);
+        let bytes = encode_handshake(PacketKind::Disconnect, &d);
+        assert_eq!(
+            decode_packet(&bytes, &Default::default()).unwrap(),
+            Packet::Disconnect(d)
+        );
+        // Flags on a handshake packet and trailing garbage are rejected.
+        let mut bad = encode_handshake(
+            PacketKind::Disconnect,
+            &Disconnect::new(DisconnectCode::Leave, "", false),
+        );
+        bad[0] |= 0x08;
+        assert!(decode_packet(&bad, &Default::default()).is_err());
+        let mut bad = encode_handshake(
+            PacketKind::Disconnect,
+            &Disconnect::new(DisconnectCode::Leave, "", false),
+        );
+        bad.push(0);
+        assert!(decode_packet(&bad, &Default::default()).is_err());
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        assert_eq!(truncate("héllo", 2), "h");
+        assert_eq!(truncate("abc", 5), "abc");
+    }
 }

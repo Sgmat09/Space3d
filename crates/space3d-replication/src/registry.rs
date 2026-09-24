@@ -10,12 +10,12 @@
 //! `space3d_scene::ComponentRegistry` is deliberately *not* used on the wire (it goes through
 //! `serde_json::Value`); it is used for room checkpoints (see the server crate).
 
-use crate::PlayerId;
 use crate::input::NetInput;
 use crate::mapping::{DecodeCtx, EncodeCtx};
 use crate::messages::NetMessage;
 use crate::transport::Lane;
 use crate::wire::{DecodeError, Reader, Writer};
+use crate::{PlayerId, Tick};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use space3d_core::glam::{Quat, Vec3};
@@ -57,7 +57,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> NetCodec<T> for Po
 
     fn decode(&self, r: &mut Reader<'_>, _ctx: &mut DecodeCtx<'_>) -> Result<T, DecodeError> {
         let rest = r.raw(r.remaining())?;
-        postcard::from_bytes(rest).map_err(|e| DecodeError::Postcard(e.to_string()))
+        crate::wire::postcard_exact(rest)
     }
 
     fn schema_id(&self) -> String {
@@ -81,15 +81,19 @@ where
     R: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     fn encode(&self, value: &T, w: &mut Writer, ctx: &EncodeCtx<'_>) {
-        todo!()
+        let wire = (self.to_wire)(value, ctx);
+        let bytes = postcard::to_stdvec(&wire).expect("postcard encode");
+        w.raw(&bytes);
     }
 
     fn decode(&self, r: &mut Reader<'_>, ctx: &mut DecodeCtx<'_>) -> Result<T, DecodeError> {
-        todo!()
+        let rest = r.raw(r.remaining())?;
+        let wire: R = crate::wire::postcard_exact(rest)?;
+        (self.from_wire)(wire, ctx).ok_or(DecodeError::Unresolved)
     }
 
     fn schema_id(&self) -> String {
-        format!("mapped:{}", std::any::type_name::<R>())
+        format!("mapped:{}", short_type_name::<R>())
     }
 }
 
@@ -151,11 +155,17 @@ impl Interpolate for f32 {
     fn interpolate(a: &Self, b: &Self, t: f32) -> Self {
         a + (b - a) * t
     }
+    fn extrapolate(prev: &Self, last: &Self, t: f32) -> Option<Self> {
+        Some(last + (last - prev) * t)
+    }
 }
 
 impl Interpolate for Vec3 {
     fn interpolate(a: &Self, b: &Self, t: f32) -> Self {
         a.lerp(*b, t)
+    }
+    fn extrapolate(prev: &Self, last: &Self, t: f32) -> Option<Self> {
+        Some(*last + (*last - *prev) * t)
     }
 }
 
@@ -173,13 +183,24 @@ impl Interpolate for Transform {
             scale: a.scale.lerp(b.scale, t),
         }
     }
+    /// Continues the translation linearly; rotation and scale hold.
+    fn extrapolate(prev: &Self, last: &Self, t: f32) -> Option<Self> {
+        Some(Transform {
+            translation: last.translation + (last.translation - prev.translation) * t,
+            ..*last
+        })
+    }
 }
+
+/// Extrapolation function (`prev`, `last`, intervals past `last`).
+pub type ExtrapolateFn<T> = fn(&T, &T, f32) -> Option<T>;
 
 /// Per-component replication rule (builder).
 pub struct ComponentRule<T> {
     pub(crate) codec: Box<dyn NetCodec<T>>,
     pub(crate) mode: ClientMode,
     pub(crate) interpolate: Option<fn(&T, &T, f32) -> T>,
+    pub(crate) extrapolate: Option<ExtrapolateFn<T>>,
     pub(crate) audience: Audience,
     pub(crate) send: SendRule,
     pub(crate) priority: f32,
@@ -195,6 +216,7 @@ impl<T: Component + Clone> ComponentRule<T> {
             codec: Box::new(codec),
             mode: ClientMode::Apply,
             interpolate: None,
+            extrapolate: None,
             audience: Audience::All,
             send: SendRule::OnChange,
             priority: 1.0,
@@ -232,6 +254,7 @@ impl<T: Component + Clone> ComponentRule<T> {
     {
         self.mode = ClientMode::Interpolate;
         self.interpolate = Some(T::interpolate);
+        self.extrapolate = Some(T::extrapolate);
         self
     }
 
@@ -252,6 +275,7 @@ impl<T: Component + Clone> ComponentRule<T> {
     {
         self.mode = ClientMode::PredictAndInterpolate;
         self.interpolate = Some(T::interpolate);
+        self.extrapolate = Some(T::extrapolate);
         self.quantize_authoritative = true;
         self
     }
@@ -385,25 +409,551 @@ pub struct ComponentInfo {
     pub schema_id: String,
 }
 
-/// Type-erased registered component (encode/decode/insert/remove/compare/interpolate
-/// operations). The replication builder defines the erased operation set.
+impl ClientMode {
+    /// Predicted on the controlling client.
+    pub fn is_predicted(self) -> bool {
+        matches!(self, ClientMode::Predict | ClientMode::PredictAndInterpolate)
+    }
+
+    /// Interpolated on non-predicting clients.
+    pub fn is_interpolated(self) -> bool {
+        matches!(self, ClientMode::Interpolate | ClientMode::PredictAndInterpolate)
+    }
+}
+
+impl Audience {
+    fn schema_str(&self) -> &'static str {
+        match self {
+            Audience::All => "all",
+            Audience::Owner => "owner",
+            Audience::ExceptOwner => "except_owner",
+            Audience::Team => "team",
+            Audience::Custom(_) => "custom",
+        }
+    }
+}
+
+/// Short, stable-enough type name for schema ids (path segments stripped).
+fn short_type_name<T: ?Sized>() -> String {
+    let full = std::any::type_name::<T>();
+    let mut out = String::with_capacity(full.len());
+    let mut seg = String::new();
+    for c in full.chars() {
+        if c.is_alphanumeric() || c == '_' || c == ':' {
+            seg.push(c);
+        } else {
+            out.push_str(seg.rsplit("::").next().unwrap_or(""));
+            seg.clear();
+            out.push(c);
+        }
+    }
+    out.push_str(seg.rsplit("::").next().unwrap_or(""));
+    out
+}
+
+/// Client-side interpolation buffer of component `T` (lives on the entity).
+#[cfg(feature = "client")]
+pub(crate) struct InterpBuffer<T: Clone>(pub crate::client::interpolation::SnapshotBuffer<T>);
+
+/// Client-side queue of `Delayed` values of component `T` (lives on the entity).
+#[cfg(feature = "client")]
+pub(crate) struct DelayedQueue<T>(pub std::collections::VecDeque<(Tick, T)>);
+
+/// Type-erased operations of one registered component.
+pub(crate) trait ComponentOps: Send + Sync + 'static {
+    fn contains(&self, world: &World, e: Entity) -> bool;
+    /// Encode the entity's value (`false` if the entity lacks the component).
+    fn encode(&self, world: &World, e: Entity, w: &mut Writer, ctx: &EncodeCtx<'_>) -> bool;
+    /// Decode `bytes` (all of them) and insert / overwrite the component.
+    fn apply(&self, world: &mut World, e: Entity, bytes: &[u8], ctx: &mut DecodeCtx<'_>) -> Result<(), DecodeError>;
+    /// Decode only (validation, comparisons).
+    fn check(&self, bytes: &[u8], ctx: &mut DecodeCtx<'_>) -> Result<(), DecodeError>;
+    /// Remove the component (and any client buffers).
+    fn remove(&self, world: &mut World, e: Entity);
+    /// Round the value through the codec and write it back; the encoding of the written-back
+    /// value is left in `out`. `false` if absent or not decodable (value untouched).
+    fn quantize(
+        &self,
+        world: &mut World,
+        e: Entity,
+        enc: &EncodeCtx<'_>,
+        dec: &mut DecodeCtx<'_>,
+        out: &mut Writer,
+    ) -> bool;
+    /// Misprediction test between two encodings (`rollback_when` or byte inequality).
+    fn differs(&self, a: &[u8], b: &[u8], ctx: &mut DecodeCtx<'_>) -> bool;
+    #[cfg(feature = "client")]
+    fn push_sample(
+        &self,
+        world: &mut World,
+        e: Entity,
+        tick: Tick,
+        bytes: &[u8],
+        ctx: &mut DecodeCtx<'_>,
+        send_interval: u8,
+    ) -> Result<(), DecodeError>;
+    #[cfg(feature = "client")]
+    fn interpolate_all(&self, world: &mut World, render_tick: f64, max_extrapolate_ticks: f64);
+    #[cfg(feature = "client")]
+    fn newest_sample(&self, world: &World, e: Entity, w: &mut Writer, ctx: &EncodeCtx<'_>) -> Option<Tick>;
+    #[cfg(feature = "client")]
+    fn push_delayed(
+        &self,
+        world: &mut World,
+        e: Entity,
+        tick: Tick,
+        bytes: &[u8],
+        ctx: &mut DecodeCtx<'_>,
+    ) -> Result<(), DecodeError>;
+    #[cfg(feature = "client")]
+    fn release_delayed_all(&self, world: &mut World, render_tick: f64);
+    #[cfg(feature = "client")]
+    fn clear_buffers(&self, world: &mut World, e: Entity);
+}
+
+struct TypedComponent<T: Component + Clone> {
+    rule: ComponentRule<T>,
+}
+
+impl<T: Component + Clone> TypedComponent<T> {
+    fn decode(&self, bytes: &[u8], ctx: &mut DecodeCtx<'_>) -> Result<T, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let v = self.rule.codec.decode(&mut r, ctx)?;
+        if ctx.has_unresolved() {
+            return Err(DecodeError::Unresolved);
+        }
+        Ok(v)
+    }
+}
+
+impl<T: Component + Clone> ComponentOps for TypedComponent<T> {
+    fn contains(&self, world: &World, e: Entity) -> bool {
+        world.satisfies::<&T>(e)
+    }
+
+    fn encode(&self, world: &World, e: Entity, w: &mut Writer, ctx: &EncodeCtx<'_>) -> bool {
+        match world.get::<&T>(e) {
+            Ok(v) => {
+                self.rule.codec.encode(&v, w, ctx);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn apply(&self, world: &mut World, e: Entity, bytes: &[u8], ctx: &mut DecodeCtx<'_>) -> Result<(), DecodeError> {
+        let v = self.decode(bytes, ctx)?;
+        if let Ok(mut slot) = world.get::<&mut T>(e) {
+            *slot = v;
+            return Ok(());
+        }
+        world
+            .insert_one(e, v)
+            .map_err(|_| DecodeError::Invalid("entity despawned"))
+    }
+
+    fn check(&self, bytes: &[u8], ctx: &mut DecodeCtx<'_>) -> Result<(), DecodeError> {
+        self.decode(bytes, ctx).map(|_| ())
+    }
+
+    fn remove(&self, world: &mut World, e: Entity) {
+        let _ = world.remove_one::<T>(e);
+        #[cfg(feature = "client")]
+        self.clear_buffers(world, e);
+    }
+
+    fn quantize(
+        &self,
+        world: &mut World,
+        e: Entity,
+        enc: &EncodeCtx<'_>,
+        dec: &mut DecodeCtx<'_>,
+        out: &mut Writer,
+    ) -> bool {
+        let Ok(mut slot) = world.get::<&mut T>(e) else {
+            return false;
+        };
+        out.clear();
+        self.rule.codec.encode(&slot, out, enc);
+        dec.reset();
+        let mut r = Reader::new(out.as_slice());
+        let Ok(v) = self.rule.codec.decode(&mut r, dec) else {
+            return false;
+        };
+        if dec.has_unresolved() {
+            return false;
+        }
+        out.clear();
+        self.rule.codec.encode(&v, out, enc);
+        *slot = v;
+        true
+    }
+
+    fn differs(&self, a: &[u8], b: &[u8], ctx: &mut DecodeCtx<'_>) -> bool {
+        match self.rule.rollback_when {
+            None => a != b,
+            Some(f) => {
+                ctx.reset();
+                let va = self.decode(a, ctx);
+                ctx.reset();
+                let vb = self.decode(b, ctx);
+                match (va, vb) {
+                    (Ok(va), Ok(vb)) => f(&va, &vb),
+                    _ => a != b,
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "client")]
+    fn push_sample(
+        &self,
+        world: &mut World,
+        e: Entity,
+        tick: Tick,
+        bytes: &[u8],
+        ctx: &mut DecodeCtx<'_>,
+        send_interval: u8,
+    ) -> Result<(), DecodeError> {
+        let v = self.decode(bytes, ctx)?;
+        if let Ok(mut buf) = world.get::<&mut InterpBuffer<T>>(e) {
+            buf.0.push(tick, v, send_interval);
+            return Ok(());
+        }
+        let mut buf = crate::client::interpolation::SnapshotBuffer::default();
+        buf.push(tick, v.clone(), send_interval);
+        let has_value = world.satisfies::<&T>(e);
+        let res = if has_value {
+            world.insert_one(e, InterpBuffer(buf))
+        } else {
+            world.insert(e, (InterpBuffer(buf), v))
+        };
+        res.map_err(|_| DecodeError::Invalid("entity despawned"))
+    }
+
+    #[cfg(feature = "client")]
+    fn interpolate_all(&self, world: &mut World, render_tick: f64, max_extrapolate_ticks: f64) {
+        let Some(lerp) = self.rule.interpolate else {
+            return;
+        };
+        let extrapolate = self.rule.extrapolate;
+        for (buf, value) in world
+            .query_mut::<(&mut InterpBuffer<T>, &mut T)>()
+            .without::<&crate::Predicted>()
+        {
+            if let Some(v) = buf.0.sample_with(render_tick, lerp, extrapolate, max_extrapolate_ticks) {
+                *value = v;
+            }
+            // Keep one sample before the render tick for the next lerp.
+            buf.0.prune(Tick(render_tick.max(0.0).floor() as u32));
+        }
+    }
+
+    #[cfg(feature = "client")]
+    fn newest_sample(&self, world: &World, e: Entity, w: &mut Writer, ctx: &EncodeCtx<'_>) -> Option<Tick> {
+        if let Ok(buf) = world.get::<&InterpBuffer<T>>(e)
+            && let Some((tick, v)) = buf.0.newest()
+        {
+            self.rule.codec.encode(v, w, ctx);
+            return Some(*tick);
+        }
+        if let Ok(q) = world.get::<&DelayedQueue<T>>(e)
+            && let Some((tick, v)) = q.0.back()
+        {
+            self.rule.codec.encode(v, w, ctx);
+            return Some(*tick);
+        }
+        None
+    }
+
+    #[cfg(feature = "client")]
+    fn push_delayed(
+        &self,
+        world: &mut World,
+        e: Entity,
+        tick: Tick,
+        bytes: &[u8],
+        ctx: &mut DecodeCtx<'_>,
+    ) -> Result<(), DecodeError> {
+        let v = self.decode(bytes, ctx)?;
+        if let Ok(mut q) = world.get::<&mut DelayedQueue<T>>(e) {
+            if q.0.back().is_none_or(|(t, _)| *t < tick) {
+                q.0.push_back((tick, v));
+                while q.0.len() > 64 {
+                    q.0.pop_front();
+                }
+            }
+            return Ok(());
+        }
+        let has_value = world.satisfies::<&T>(e);
+        let q = DelayedQueue(std::collections::VecDeque::from([(tick, v.clone())]));
+        let res = if has_value {
+            world.insert_one(e, q)
+        } else {
+            // First value: show it immediately (the entity would be incomplete otherwise).
+            world.insert(e, (q, v))
+        };
+        res.map_err(|_| DecodeError::Invalid("entity despawned"))
+    }
+
+    #[cfg(feature = "client")]
+    fn release_delayed_all(&self, world: &mut World, render_tick: f64) {
+        for (q, value) in world.query_mut::<(&mut DelayedQueue<T>, &mut T)>() {
+            while let Some((tick, _)) = q.0.front() {
+                if f64::from(tick.0) > render_tick {
+                    break;
+                }
+                let (_, v) = q.0.pop_front().expect("front");
+                *value = v;
+            }
+        }
+    }
+
+    #[cfg(feature = "client")]
+    fn clear_buffers(&self, world: &mut World, e: Entity) {
+        let _ = world.remove_one::<InterpBuffer<T>>(e);
+        let _ = world.remove_one::<DelayedQueue<T>>(e);
+    }
+}
+
+/// Type-erased registered component.
 pub(crate) struct ComponentEntry {
     pub(crate) name: &'static str,
     pub(crate) type_id: TypeId,
     pub(crate) kind: Option<ComponentKind>,
+    pub(crate) mode: ClientMode,
+    pub(crate) audience: Audience,
+    pub(crate) send: SendRule,
+    pub(crate) priority: f32,
+    pub(crate) quantize_authoritative: bool,
+    pub(crate) schema_id: String,
+    pub(crate) ops: Box<dyn ComponentOps>,
+}
+
+impl ComponentEntry {
+    /// Kind bit in presence masks (after freeze).
+    pub(crate) fn bit(&self) -> u64 {
+        1u64 << self.kind.expect("registry frozen").0
+    }
+}
+
+/// Type-erased decoded input value.
+pub(crate) type InputValue = Box<dyn std::any::Any + Send + Sync>;
+
+/// Type-erased operations on the registered input type.
+pub(crate) trait InputOps: Send + Sync + 'static {
+    /// Decode (exact) and sanitize. `Ok((value, true))` when sanitize passed; `Ok((neutral, false))`
+    /// when sanitize rejected it (strike).
+    fn decode(&self, bytes: &[u8]) -> Result<(InputValue, bool), DecodeError>;
+    fn neutral(&self) -> InputValue;
+    fn repeat(&self, v: &InputValue) -> InputValue;
+    fn clone_value(&self, v: &InputValue) -> InputValue;
+    fn encode(&self, v: &InputValue) -> Vec<u8>;
+    /// Insert/overwrite `PlayerInput<I>` on `e`.
+    fn write(&self, world: &mut World, e: Entity, v: &InputValue);
+    /// Client: sample the next input (`InputSampler<I>` resource, or `Default`).
+    #[cfg(feature = "client")]
+    fn sample(&self, ctx: &mut space3d_core::SystemCtx) -> InputValue;
+}
+
+struct TypedInput<I>(std::marker::PhantomData<fn() -> I>);
+
+impl<I: NetInput> InputOps for TypedInput<I> {
+    fn decode(&self, bytes: &[u8]) -> Result<(InputValue, bool), DecodeError> {
+        let mut v: I = crate::wire::postcard_exact(bytes)?;
+        match v.sanitize() {
+            Ok(()) => Ok((Box::new(v), true)),
+            Err(_) => Ok((Box::new(I::neutral()), false)),
+        }
+    }
+
+    fn neutral(&self) -> InputValue {
+        Box::new(I::neutral())
+    }
+
+    fn repeat(&self, v: &InputValue) -> InputValue {
+        match v.downcast_ref::<I>() {
+            Some(i) => Box::new(i.repeat()),
+            None => self.neutral(),
+        }
+    }
+
+    fn clone_value(&self, v: &InputValue) -> InputValue {
+        match v.downcast_ref::<I>() {
+            Some(i) => Box::new(i.clone()),
+            None => self.neutral(),
+        }
+    }
+
+    fn encode(&self, v: &InputValue) -> Vec<u8> {
+        let i = v.downcast_ref::<I>().cloned().unwrap_or_default();
+        postcard::to_stdvec(&i).expect("postcard encode")
+    }
+
+    fn write(&self, world: &mut World, e: Entity, v: &InputValue) {
+        let i = v.downcast_ref::<I>().cloned().unwrap_or_else(I::neutral);
+        if let Ok(mut slot) = world.get::<&mut crate::PlayerInput<I>>(e) {
+            slot.0 = i;
+            return;
+        }
+        let _ = world.insert_one(e, crate::PlayerInput(i));
+    }
+
+    #[cfg(feature = "client")]
+    fn sample(&self, ctx: &mut space3d_core::SystemCtx) -> InputValue {
+        if !ctx.resources.contains::<crate::InputSampler<I>>() {
+            return Box::new(I::default());
+        }
+        let world = &mut *ctx.world;
+        let mut i = ctx.resources.scope::<crate::InputSampler<I>, _>(|res, sampler| {
+            let mut inner = space3d_core::SystemCtx { world, resources: res };
+            sampler.sample(&mut inner)
+        });
+        // The server sanitizes too; doing it here keeps prediction identical.
+        if i.sanitize().is_err() {
+            i = I::neutral();
+        }
+        Box::new(i)
+    }
+}
+
+/// Registered input type.
+pub(crate) struct InputEntry {
+    pub(crate) name: &'static str,
+    pub(crate) type_id: TypeId,
+    pub(crate) ops: Box<dyn InputOps>,
+}
+
+/// Why an inbound message was refused (strike).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MessageReject {
+    Decode(DecodeError),
+    Invalid(&'static str),
+}
+
+/// Type-erased operations of one message type.
+pub(crate) trait MessageOps: Send + Sync + 'static {
+    /// Server: decode, validate, push `Events<FromClient<M>>`.
+    fn deliver_from_client(
+        &self,
+        resources: &mut space3d_core::Resources,
+        bytes: &[u8],
+        client: crate::NetClientId,
+        player: PlayerId,
+        tick: Tick,
+    ) -> Result<(), MessageReject>;
+    /// Client: decode, push `Events<FromServer<M>>`.
+    fn deliver_from_server(
+        &self,
+        resources: &mut space3d_core::Resources,
+        bytes: &[u8],
+        tick: Tick,
+    ) -> Result<(), DecodeError>;
+}
+
+struct TypedMessage<M>(std::marker::PhantomData<fn() -> M>);
+
+impl<M: NetMessage> MessageOps for TypedMessage<M> {
+    fn deliver_from_client(
+        &self,
+        resources: &mut space3d_core::Resources,
+        bytes: &[u8],
+        client: crate::NetClientId,
+        player: PlayerId,
+        tick: Tick,
+    ) -> Result<(), MessageReject> {
+        let message: M = crate::wire::postcard_exact(bytes).map_err(MessageReject::Decode)?;
+        message.validate().map_err(|e| MessageReject::Invalid(e.0))?;
+        resources
+            .init::<space3d_core::Events<crate::FromClient<M>>>()
+            .send(crate::FromClient {
+                client,
+                player,
+                tick,
+                message,
+            });
+        Ok(())
+    }
+
+    fn deliver_from_server(
+        &self,
+        resources: &mut space3d_core::Resources,
+        bytes: &[u8],
+        tick: Tick,
+    ) -> Result<(), DecodeError> {
+        let message: M = crate::wire::postcard_exact(bytes)?;
+        resources
+            .init::<space3d_core::Events<crate::FromServer<M>>>()
+            .send(crate::FromServer { tick, message });
+        Ok(())
+    }
+}
+
+/// Registered message type.
+pub(crate) struct MessageEntry {
+    pub(crate) name: &'static str,
+    pub(crate) type_id: TypeId,
+    pub(crate) config: MessageConfig,
+    pub(crate) kind: u16,
+    pub(crate) ops: Box<dyn MessageOps>,
+}
+
+impl MessageEntry {
+    /// Whether clients may send it.
+    pub(crate) fn client_may_send(&self) -> bool {
+        matches!(self.config.direction, Direction::ClientToServer | Direction::Both)
+    }
+
+    /// Whether the server may send it.
+    pub(crate) fn server_may_send(&self) -> bool {
+        matches!(self.config.direction, Direction::ServerToClient | Direction::Both)
+    }
 }
 
 /// The network schema (resource). See the module docs.
 #[derive(Default)]
 pub struct ReplicationRegistry {
     components: Vec<ComponentEntry>,
-    input: Option<(&'static str, TypeId)>,
-    messages: Vec<(&'static str, TypeId, MessageConfig)>,
+    input: Option<InputEntry>,
+    messages: Vec<MessageEntry>,
     frozen: bool,
     schema_hash: u64,
 }
 
+impl std::fmt::Debug for ReplicationRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationRegistry")
+            .field(
+                "components",
+                &self.components.iter().map(|c| c.name).collect::<Vec<_>>(),
+            )
+            .field("input", &self.input_name())
+            .field("messages", &self.messages.iter().map(|m| m.name).collect::<Vec<_>>())
+            .field("frozen", &self.frozen)
+            .finish()
+    }
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a 64 over `bytes`, continuing from `h`.
+pub(crate) fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
 impl ReplicationRegistry {
+    fn assert_open(&self, what: &str, name: &str) {
+        assert!(
+            !self.frozen,
+            "ReplicationRegistry: cannot register {what} {name:?} after the registry froze (first Startup)"
+        );
+    }
+
     /// Register a component. Panics if frozen, if `name` or `T` is already registered, or
     /// beyond [`MAX_COMPONENTS`].
     pub fn register_component<T: Component + Clone>(
@@ -411,17 +961,75 @@ impl ReplicationRegistry {
         name: &'static str,
         rule: ComponentRule<T>,
     ) -> &mut Self {
-        todo!()
+        self.assert_open("component", name);
+        assert!(
+            !self.components.iter().any(|c| c.name == name),
+            "ReplicationRegistry: component name {name:?} registered twice"
+        );
+        assert!(
+            !self.components.iter().any(|c| c.type_id == TypeId::of::<T>()),
+            "ReplicationRegistry: component type {} registered twice",
+            std::any::type_name::<T>()
+        );
+        assert!(
+            self.components.len() < MAX_COMPONENTS,
+            "ReplicationRegistry: at most {MAX_COMPONENTS} replicated components"
+        );
+        assert!(
+            !rule.mode.is_interpolated() || rule.interpolate.is_some(),
+            "ReplicationRegistry: {name:?} is interpolated without an interpolation function"
+        );
+        self.components.push(ComponentEntry {
+            name,
+            type_id: TypeId::of::<T>(),
+            kind: None,
+            mode: rule.mode,
+            audience: rule.audience,
+            send: rule.send,
+            priority: rule.priority,
+            quantize_authoritative: rule.quantize_authoritative,
+            schema_id: rule.codec.schema_id(),
+            ops: Box::new(TypedComponent { rule }),
+        });
+        self
     }
 
     /// Register the input type (exactly one per game). Panics if frozen or already set.
     pub fn register_input<I: NetInput>(&mut self, name: &'static str) -> &mut Self {
-        todo!()
+        self.assert_open("input", name);
+        assert!(
+            self.input.is_none(),
+            "ReplicationRegistry: the input type is already registered as {:?}",
+            self.input_name()
+        );
+        self.input = Some(InputEntry {
+            name,
+            type_id: TypeId::of::<I>(),
+            ops: Box::new(TypedInput::<I>(std::marker::PhantomData)),
+        });
+        self
     }
 
     /// Register a message type. Panics if frozen or duplicated.
     pub fn register_message<M: NetMessage>(&mut self, name: &'static str, config: MessageConfig) -> &mut Self {
-        todo!()
+        self.assert_open("message", name);
+        assert!(
+            !self
+                .messages
+                .iter()
+                .any(|m| m.name == name || m.type_id == TypeId::of::<M>()),
+            "ReplicationRegistry: message {name:?} ({}) registered twice",
+            std::any::type_name::<M>()
+        );
+        assert!(self.messages.len() < usize::from(u16::MAX), "too many message types");
+        self.messages.push(MessageEntry {
+            name,
+            type_id: TypeId::of::<M>(),
+            config,
+            kind: 0,
+            ops: Box::new(TypedMessage::<M>(std::marker::PhantomData)),
+        });
+        self
     }
 
     /// Assign kinds by sorted name and compute the schema hash (FNV-1a 64 over
@@ -429,7 +1037,45 @@ impl ReplicationRegistry {
     /// each message `name|lane|direction`). Idempotent. Called by the replication plugins at
     /// the first `Startup`.
     pub fn freeze(&mut self) {
-        todo!()
+        if self.frozen {
+            return;
+        }
+        self.components.sort_by(|a, b| a.name.cmp(b.name));
+        for (i, c) in self.components.iter_mut().enumerate() {
+            c.kind = Some(ComponentKind(i as u16));
+        }
+        self.messages.sort_by(|a, b| a.name.cmp(b.name));
+        for (i, m) in self.messages.iter_mut().enumerate() {
+            m.kind = i as u16;
+        }
+        self.frozen = true;
+        let mut h = fnv1a(FNV_OFFSET, &crate::protocol::PROTOCOL_VERSION.to_le_bytes());
+        for line in self.schema_lines() {
+            h = fnv1a(h, line.as_bytes());
+            h = fnv1a(h, b"\n");
+        }
+        self.schema_hash = h;
+    }
+
+    fn schema_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for c in &self.components {
+            out.push(format!(
+                "component|{}|{}|{:?}|{}",
+                c.name,
+                c.schema_id,
+                c.mode,
+                c.audience.schema_str()
+            ));
+        }
+        out.push(format!("input|{}", self.input_name().unwrap_or("")));
+        for m in &self.messages {
+            out.push(format!(
+                "message|{}|{:?}|{:?}",
+                m.name, m.config.lane, m.config.direction
+            ));
+        }
+        out
     }
 
     /// Whether [`Self::freeze`] ran.
@@ -445,7 +1091,14 @@ impl ReplicationRegistry {
 
     /// Human-readable schema lines (admin `GET /admin/v1/schema`, mismatch debugging).
     pub fn manifest(&self) -> Vec<String> {
-        todo!()
+        let mut out = vec![format!("protocol|{}", crate::protocol::PROTOCOL_VERSION)];
+        out.extend(self.schema_lines());
+        if self.frozen {
+            out.push(format!("schema_hash|{:016x}", self.schema_hash));
+        } else {
+            out.push("schema_hash|<not frozen>".into());
+        }
+        out
     }
 
     /// Number of registered components.
@@ -455,21 +1108,236 @@ impl ReplicationRegistry {
 
     /// Kind of component type `T` (after freeze).
     pub fn kind_of<T: 'static>(&self) -> Option<ComponentKind> {
-        todo!()
+        self.components
+            .iter()
+            .find(|c| c.type_id == TypeId::of::<T>())
+            .and_then(|c| c.kind)
     }
 
     /// Kind by registered name (after freeze).
     pub fn kind_by_name(&self, name: &str) -> Option<ComponentKind> {
-        todo!()
+        self.components.iter().find(|c| c.name == name).and_then(|c| c.kind)
     }
 
     /// Description of a registered component.
     pub fn component_info(&self, kind: ComponentKind) -> Option<ComponentInfo> {
-        todo!()
+        let c = self.components.get(usize::from(kind.0))?;
+        Some(ComponentInfo {
+            name: c.name,
+            kind: c.kind?,
+            mode: c.mode,
+            audience: c.audience,
+            send: c.send,
+            priority: c.priority,
+            schema_id: c.schema_id.clone(),
+        })
     }
 
     /// Registered input name, if any.
     pub fn input_name(&self) -> Option<&'static str> {
-        self.input.map(|(n, _)| n)
+        self.input.as_ref().map(|i| i.name)
+    }
+
+    /// Registered message names in kind order (after freeze).
+    pub fn message_names(&self) -> Vec<&'static str> {
+        self.messages.iter().map(|m| m.name).collect()
+    }
+
+    /// Kind + config of message type `M` (after freeze).
+    pub fn message_kind<M: 'static>(&self) -> Option<(u16, MessageConfig)> {
+        if !self.frozen {
+            return None;
+        }
+        self.messages
+            .iter()
+            .find(|m| m.type_id == TypeId::of::<M>())
+            .map(|m| (m.kind, m.config))
+    }
+
+    pub(crate) fn components(&self) -> &[ComponentEntry] {
+        &self.components
+    }
+
+    pub(crate) fn component(&self, kind: u16) -> Option<&ComponentEntry> {
+        self.components.get(usize::from(kind))
+    }
+
+    pub(crate) fn input(&self) -> Option<&InputEntry> {
+        self.input.as_ref()
+    }
+
+    pub(crate) fn message(&self, kind: u16) -> Option<&MessageEntry> {
+        self.messages.get(usize::from(kind))
+    }
+
+    /// Mask of all registered kinds with a predicted client mode.
+    pub(crate) fn predicted_mask(&self) -> u64 {
+        self.components
+            .iter()
+            .filter(|c| c.mode.is_predicted())
+            .fold(0, |m, c| m | c.bit())
+    }
+
+    /// Mask of all kinds interpolated on non-predicting clients.
+    pub(crate) fn interpolated_mask(&self) -> u64 {
+        self.components
+            .iter()
+            .filter(|c| c.mode.is_interpolated())
+            .fold(0, |m, c| m | c.bit())
+    }
+
+    /// Mask of all kinds with authoritative quantization.
+    pub(crate) fn quantized_mask(&self) -> u64 {
+        self.components
+            .iter()
+            .filter(|c| c.quantize_authoritative)
+            .fold(0, |m, c| m | c.bit())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mapping::{EntityMap, NetIdMap};
+    use serde::Deserialize;
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct Health(u16);
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct Ammo(u8);
+    #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct Move {
+        x: i8,
+    }
+    impl NetInput for Move {}
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct Chat(String);
+    impl NetMessage for Chat {}
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Target(Entity);
+
+    fn build(order: bool) -> ReplicationRegistry {
+        let mut r = ReplicationRegistry::default();
+        if order {
+            r.register_component::<Health>("t.health", ComponentRule::serde());
+            r.register_component::<Ammo>("t.ammo", ComponentRule::serde().audience(Audience::Owner));
+        } else {
+            r.register_component::<Ammo>("t.ammo", ComponentRule::serde().audience(Audience::Owner));
+            r.register_component::<Health>("t.health", ComponentRule::serde());
+        }
+        r.register_input::<Move>("t.move");
+        r.register_message::<Chat>("t.chat", MessageConfig::reliable(Direction::Both));
+        r.freeze();
+        r
+    }
+
+    #[test]
+    fn schema_hash_is_order_independent() {
+        let a = build(true);
+        let b = build(false);
+        assert_eq!(a.schema_hash(), b.schema_hash());
+        assert_eq!(a.kind_by_name("t.ammo"), Some(ComponentKind(0)));
+        assert_eq!(a.kind_of::<Health>(), Some(ComponentKind(1)));
+        assert_eq!(b.kind_of::<Health>(), Some(ComponentKind(1)));
+        assert_eq!(a.message_kind::<Chat>().map(|m| m.0), Some(0));
+        assert!(a.manifest().iter().any(|l| l.starts_with("schema_hash|")));
+    }
+
+    #[test]
+    fn schema_hash_changes_with_the_schema() {
+        let a = build(true);
+        let mut c = ReplicationRegistry::default();
+        c.register_component::<Health>("t.health", ComponentRule::serde());
+        c.register_component::<Ammo>("t.ammo", ComponentRule::serde()); // audience differs
+        c.register_input::<Move>("t.move");
+        c.register_message::<Chat>("t.chat", MessageConfig::reliable(Direction::Both));
+        c.freeze();
+        assert_ne!(a.schema_hash(), c.schema_hash());
+    }
+
+    #[test]
+    #[should_panic(expected = "registered twice")]
+    fn duplicate_name_panics() {
+        let mut r = ReplicationRegistry::default();
+        r.register_component::<Health>("x", ComponentRule::serde());
+        r.register_component::<Ammo>("x", ComponentRule::serde());
+    }
+
+    #[test]
+    #[should_panic(expected = "registered twice")]
+    fn duplicate_type_panics() {
+        let mut r = ReplicationRegistry::default();
+        r.register_component::<Health>("x", ComponentRule::serde());
+        r.register_component::<Health>("y", ComponentRule::serde());
+    }
+
+    #[test]
+    #[should_panic(expected = "after the registry froze")]
+    fn late_registration_panics() {
+        let mut r = build(true);
+        r.register_component::<Target>("late", ComponentRule::mapped(|_, _| 0u32, |_, _| None));
+    }
+
+    #[test]
+    fn erased_component_ops() {
+        let r = build(true);
+        let mut world = World::new();
+        let e = world.spawn((Health(7),));
+        let ids = NetIdMap::default();
+        let h = r.component(r.kind_of::<Health>().unwrap().0).unwrap();
+        let mut w = Writer::new();
+        assert!(h.ops.encode(&world, e, &mut w, &EncodeCtx::new(&ids)));
+        let bytes = w.into_vec();
+        let other = world.spawn(());
+        let map = EntityMap::default();
+        h.ops
+            .apply(&mut world, other, &bytes, &mut DecodeCtx::new(&map))
+            .unwrap();
+        assert_eq!(*world.get::<&Health>(other).unwrap(), Health(7));
+        assert!(h.ops.contains(&world, other));
+        h.ops.remove(&mut world, other);
+        assert!(!h.ops.contains(&world, other));
+        assert!(h.ops.differs(&bytes, &[8], &mut DecodeCtx::empty()));
+        // Input ops.
+        let input = r.input().unwrap();
+        let (v, ok) = input.ops.decode(&postcard::to_stdvec(&Move { x: 3 }).unwrap()).unwrap();
+        assert!(ok);
+        input.ops.write(&mut world, e, &v);
+        assert_eq!(world.get::<&crate::PlayerInput<Move>>(e).unwrap().0, Move { x: 3 });
+        assert!(input.ops.decode(&[0x01, 0x02, 0x03]).is_err());
+    }
+
+    #[test]
+    fn mapped_codec_resolves_through_maps() {
+        let mut r = ReplicationRegistry::default();
+        r.register_component::<Target>(
+            "t.target",
+            ComponentRule::mapped(
+                |t: &Target, ctx: &EncodeCtx<'_>| ctx.net_id(t.0).map(|n| n.0),
+                |id: Option<u32>, ctx: &mut DecodeCtx<'_>| ctx.entity(crate::NetId(id?)).map(Target),
+            ),
+        );
+        r.freeze();
+        let mut world = World::new();
+        let target = world.spawn(());
+        let holder = world.spawn((Target(target),));
+        let mut ids = NetIdMap::default();
+        let nid = ids.allocate(target);
+        let c = r.component(0).unwrap();
+        let mut w = Writer::new();
+        c.ops.encode(&world, holder, &mut w, &EncodeCtx::new(&ids));
+        let bytes = w.into_vec();
+        // Client that does not know the target yet: unresolved.
+        let mut cw = World::new();
+        let ch = cw.spawn(());
+        let mut map = EntityMap::default();
+        assert_eq!(
+            c.ops.apply(&mut cw, ch, &bytes, &mut DecodeCtx::new(&map)),
+            Err(DecodeError::Unresolved)
+        );
+        let ct = cw.spawn(());
+        map.insert(nid, ct);
+        c.ops.apply(&mut cw, ch, &bytes, &mut DecodeCtx::new(&map)).unwrap();
+        assert_eq!(cw.get::<&Target>(ch).unwrap().0, ct);
     }
 }
