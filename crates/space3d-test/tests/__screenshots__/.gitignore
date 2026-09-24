@@ -1,0 +1,3 @@
+# space3d-test failure artifacts
+*.actual.png
+*.diff.png

@@ -6,6 +6,25 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["engine"]
+## Built-in engine storybook (`engine_storybook()`), including a physics story.
+engine = ["dep:space3d-physics"]
+
 [dependencies]
 space3d-core.workspace = true
+space3d-render.workspace = true
+space3d-test.workspace = true
+space3d-physics = { workspace = true, optional = true }
 serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+web-time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[example]]
+name = "gallery"
+required-features = ["engine"]
