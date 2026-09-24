@@ -41,6 +41,10 @@ fn main() {
             _ => {}
         }
     }
+    if max_frames.is_some() {
+        // Scripted smoke run: don't steal focus from whatever the developer is doing.
+        space3d_platform::set_background_mode(true);
+    }
 
     let mut app = App::new();
     app.add_plugin(PlatformPlugin {

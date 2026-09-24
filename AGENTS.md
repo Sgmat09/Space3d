@@ -19,7 +19,12 @@ Rust cross-platform game engine (desktop, web/wasm, Android, iOS). Cargo workspa
 6. **Testable.** Unit tests next to code, integration tests in `tests/`. GPU tests must skip
    (not fail) when no adapter is available. Visual output is verified with golden screenshots
    via `space3d-test`.
-7. `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+7. **Never steal focus.** Windowed runs from tests, scripts, CI or agents must not take the
+   developer's focus. The platform runner's background mode (`space3d_platform::background`)
+   is on automatically when `CI`, `CLAUDECODE`, `SPACE3D_EXIT_AFTER_FRAMES`/`_SECS` is set, or
+   via `SPACE3D_BACKGROUND=1` / `set_background_mode(true)`. Prefer headless runs
+   (`SPACE3D_HEADLESS=1`, `RenderPlugin::headless`) whenever a window isn't needed.
+8. `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
    must pass.
 
 ## Crate map
