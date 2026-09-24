@@ -347,6 +347,44 @@ pub(crate) struct TrackedBuffer {
     dirty: DirtyRanges,
     /// Set when the GPU copy must be fully rewritten (after reallocation).
     stale: bool,
+    /// Changed runs per chunk of a parallel [`Self::write_gather`] (reused scratch).
+    #[cfg(not(target_arch = "wasm32"))]
+    chunk_runs: Vec<ChunkRuns>,
+}
+
+/// Elements per task of a parallel [`TrackedBuffer::write_gather`].
+#[cfg(not(target_arch = "wasm32"))]
+const GATHER_CHUNK: usize = 2048;
+/// [`TrackedBuffer::write_gather`] of at least this many elements runs on all rayon workers.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_GATHER_WRITE: usize = 32_768;
+
+/// Up to four changed element runs of one chunk (a fifth extends the last one).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Default)]
+struct ChunkRuns {
+    n: u8,
+    runs: [(u32, u32); 4],
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ChunkRuns {
+    fn add(&mut self, k: u32) {
+        match self.n {
+            0 => {}
+            n if self.runs[n as usize - 1].1 == k => {
+                self.runs[n as usize - 1].1 = k + 1;
+                return;
+            }
+            4 => {
+                self.runs[3].1 = k + 1;
+                return;
+            }
+            _ => {}
+        }
+        self.runs[self.n as usize] = (k, k + 1);
+        self.n += 1;
+    }
 }
 
 impl TrackedBuffer {
@@ -357,6 +395,8 @@ impl TrackedBuffer {
             len: 0,
             dirty: DirtyRanges::with_merge_gap(64),
             stale: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            chunk_runs: Vec::new(),
         }
     }
 
@@ -444,6 +484,64 @@ impl TrackedBuffer {
             dirty.mark(offset + s * size..offset + written * size);
         }
         self.len = self.len.max(end);
+    }
+
+    /// [`Self::write_all`] of `items[order[k]]` for every `k`. Large gathers (native) diff and
+    /// copy chunks of elements on all rayon workers; each chunk reports up to four changed
+    /// runs (more are merged into the last), so dirty ranges stay exact for sparse changes.
+    pub fn write_gather<T: bytemuck::Pod + Sync>(
+        &mut self,
+        offset: usize,
+        order: &[u32],
+        items: &[T],
+        cpu_reallocs: &mut u32,
+    ) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if order.len() >= PARALLEL_GATHER_WRITE {
+            use rayon::prelude::*;
+            let size = std::mem::size_of::<T>();
+            let end = offset + order.len() * size;
+            self.reserve_to(end, cpu_reallocs);
+            let chunks = order.len().div_ceil(GATHER_CHUNK);
+            if self.chunk_runs.capacity() < chunks {
+                *cpu_reallocs += 1;
+            }
+            self.chunk_runs.clear();
+            self.chunk_runs.resize(chunks, ChunkRuns::default());
+            let Self {
+                shadow,
+                dirty,
+                chunk_runs,
+                ..
+            } = self;
+            shadow[offset..end]
+                .par_chunks_mut(GATHER_CHUNK * size)
+                .zip(order.par_chunks(GATHER_CHUNK))
+                .zip(chunk_runs.par_iter_mut())
+                .for_each(|((dst, order), runs)| {
+                    for (k, (d, &i)) in dst.chunks_exact_mut(size).zip(order).enumerate() {
+                        let src = bytemuck::bytes_of(&items[i as usize]);
+                        if d != src {
+                            d.copy_from_slice(src);
+                            runs.add(k as u32);
+                        }
+                    }
+                });
+            for (c, r) in chunk_runs.iter().enumerate() {
+                for &(a, b) in &r.runs[..r.n as usize] {
+                    let base = offset + c * GATHER_CHUNK * size;
+                    dirty.mark(base + a as usize * size..base + b as usize * size);
+                }
+            }
+            self.len = self.len.max(end);
+            return;
+        }
+        self.write_all(
+            offset,
+            order.len(),
+            order.iter().map(|&i| &items[i as usize]),
+            cpu_reallocs,
+        );
     }
 
     /// Ensure capacity; after a reallocation the whole shadow is uploaded. Returns the buffer
@@ -560,6 +658,65 @@ mod tests {
             ..Default::default()
         }))
         .ok()
+    }
+
+    /// The parallel gather write matches the serial one: same shadow, same dirty ranges while
+    /// changes are sparse (≤ 4 runs per chunk), and dirty ranges that still cover every
+    /// changed element when they are dense.
+    #[test]
+    fn parallel_gather_writes_match_serial_writes() {
+        let n = 100_000usize;
+        let mut seed = 7u64;
+        let mut rand = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize
+        };
+        let order: Vec<u32> = (0..n as u32).rev().collect();
+        let mut items: Vec<[f32; 4]> = (0..n).map(|i| [i as f32; 4]).collect();
+        let usage = wgpu::BufferUsages::VERTEX;
+        let (mut serial, mut parallel) = (TrackedBuffer::new("s", usage), TrackedBuffer::new("p", usage));
+        let mut r = 0;
+        for changes in [0usize, 10, 40, 3000, 60_000] {
+            for _ in 0..changes {
+                items[rand() % n][1] += 1.0;
+            }
+            serial.dirty.clear();
+            parallel.dirty.clear();
+            serial.begin();
+            parallel.begin();
+            serial.write_all(0, n, order.iter().map(|&i| &items[i as usize]), &mut r);
+            parallel.write_gather(0, &order, &items, &mut r);
+            assert_eq!(serial.shadow, parallel.shadow, "{changes} changes");
+            assert_eq!(serial.len(), parallel.len());
+            if changes <= 40 {
+                assert_eq!(serial.pending(), parallel.pending(), "{changes} sparse changes");
+            } else {
+                let covered = |ranges: &[Range<usize>], x: usize| ranges.iter().any(|q| q.contains(&x));
+                for q in serial.pending() {
+                    assert!(covered(parallel.pending(), q.start) && covered(parallel.pending(), q.end - 1));
+                }
+            }
+        }
+    }
+
+    /// The rayon split of large staging copies (disjoint chunks, a shorter last one) writes
+    /// every byte to its own offset; checked without a GPU through `WriteOnly::from_mut`.
+    #[test]
+    fn parallel_staging_copies_are_exact() {
+        for len in [
+            PARALLEL_COPY_THRESHOLD - 4,
+            PARALLEL_COPY_THRESHOLD,
+            3_200_000,
+            (5 << 20) + 12,
+        ] {
+            let src: Vec<u8> = (0..len).map(|i| (i * 7 + i / 4093) as u8).collect();
+            let mut dst = vec![0u8; len];
+            copy_to_staging(wgpu::WriteOnly::from_mut(&mut dst[..]), &src);
+            let first_bad = dst.iter().zip(&src).position(|(a, b)| a != b);
+            assert_eq!(first_bad, None, "len {len}");
+        }
     }
 
     /// One "frame": the given writes into `target`, submit, recycle, wait for the GPU.

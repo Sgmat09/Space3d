@@ -7,9 +7,11 @@
 
 use crate::arena::{ArenaAlloc, MeshArena};
 use crate::culling::{Aabb, Sphere};
-use crate::handles::{MeshHandle, SlotMap, TextureHandle};
+use crate::handles::{MeshHandle, ShaderHandle, SlotMap, TextureHandle};
+use crate::shader::CustomShader;
 use glam::Vec3;
 use space3d_core::{ImageData, MeshData};
+use std::sync::Arc;
 
 /// Texture sampling filter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -145,11 +147,18 @@ pub(crate) struct TextureEntry {
     pub sampler: SamplerSettings,
 }
 
-/// Resource holding all meshes and textures (CPU registration + GPU storage).
+/// A registered [`CustomShader`]; `version` is bumped by every update (pipelines are rebuilt).
+pub(crate) struct ShaderEntry {
+    pub shader: Arc<CustomShader>,
+    pub version: u32,
+}
+
+/// Resource holding all meshes, textures and custom shaders (CPU registration + GPU storage).
 #[derive(Default)]
 pub struct RenderAssets {
     pub(crate) meshes: SlotMap<MeshEntry>,
     pub(crate) textures: SlotMap<TextureEntry>,
+    pub(crate) shaders: SlotMap<ShaderEntry>,
     pub(crate) pending_meshes: Vec<MeshHandle>,
     pub(crate) pending_textures: Vec<TextureHandle>,
     pub(crate) freed_allocs: Vec<ArenaAlloc>,
@@ -339,6 +348,38 @@ impl RenderAssets {
     /// Number of live textures.
     pub fn texture_count(&self) -> usize {
         self.textures.len()
+    }
+
+    /// Register a [`CustomShader`] for materials ([`crate::Material::with_shader`]). Its
+    /// pipelines are built on first use.
+    pub fn add_shader(&mut self, shader: CustomShader) -> ShaderHandle {
+        ShaderHandle::from_raw(self.shaders.insert(ShaderEntry {
+            shader: Arc::new(shader),
+            version: 0,
+        }))
+    }
+
+    /// Replace a custom shader's source (hot reload): its pipelines are rebuilt on next use.
+    /// Returns false for stale handles.
+    pub fn update_shader(&mut self, handle: ShaderHandle, shader: CustomShader) -> bool {
+        let Some(e) = self.shaders.get_mut(handle.raw()) else {
+            return false;
+        };
+        if *e.shader != shader {
+            e.shader = Arc::new(shader);
+            e.version = e.version.wrapping_add(1);
+        }
+        true
+    }
+
+    /// Remove a custom shader; materials still referencing it draw with the built-in shader.
+    pub fn remove_shader(&mut self, handle: ShaderHandle) -> bool {
+        self.shaders.remove(handle.raw()).is_some()
+    }
+
+    /// Whether the handle refers to a live custom shader.
+    pub fn contains_shader(&self, handle: ShaderHandle) -> bool {
+        self.shaders.get(handle.raw()).is_some()
     }
 
     /// Anything waiting for upload.

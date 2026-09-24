@@ -172,6 +172,20 @@ pub(crate) fn create_gpu_texture(
     }
 }
 
+/// A block-compressed texture's mip 0 must be a whole number of blocks (smaller mips may be
+/// partial blocks). wgpu rejects anything else in `create_texture` — a validation error that
+/// the default error handler turns into a panic — so such sources are refused up front.
+pub(crate) fn check_block_alignment(format: wgpu::TextureFormat, width: u32, height: u32) -> Result<(), String> {
+    let (bw, bh) = format.block_dimensions();
+    if width.is_multiple_of(bw) && height.is_multiple_of(bh) {
+        Ok(())
+    } else {
+        Err(format!(
+            "texture {width}x{height} is not a multiple of {format:?}'s {bw}x{bh} blocks"
+        ))
+    }
+}
+
 fn upload_source(
     adapter: &wgpu::Adapter,
     device: &wgpu::Device,
@@ -190,6 +204,7 @@ fn upload_source(
     if src.width == 0 || src.height == 0 || src.layers == 0 {
         return Err("texture has zero size".into());
     }
+    check_block_alignment(format, src.width, src.height)?;
     let limits = device.limits();
     if src.width > limits.max_texture_dimension_2d || src.height > limits.max_texture_dimension_2d {
         return Err(format!("texture {}x{} exceeds device limit", src.width, src.height));
@@ -436,6 +451,21 @@ mod tests {
         // 4x4 blocks of 16 bytes; a 2x2 mip still occupies one block.
         assert_eq!(mip_layout(bc, 64, 64, 0), Some((256, 16, 64, 64)));
         assert_eq!(mip_layout(bc, 64, 64, 5), Some((16, 1, 4, 4)));
+    }
+
+    #[test]
+    fn compressed_sizes_must_be_whole_blocks() {
+        use wgpu::TextureFormat as F;
+        assert!(check_block_alignment(F::Bc1RgbaUnormSrgb, 30, 30).is_err());
+        assert!(check_block_alignment(F::Bc7RgbaUnormSrgb, 64, 6).is_err());
+        assert!(check_block_alignment(F::Bc7RgbaUnormSrgb, 12, 64).is_ok());
+        let astc = F::Astc {
+            block: wgpu::AstcBlock::B6x5,
+            channel: wgpu::AstcChannel::UnormSrgb,
+        };
+        assert!(check_block_alignment(astc, 12, 10).is_ok());
+        assert!(check_block_alignment(astc, 10, 12).is_err());
+        assert!(check_block_alignment(F::Rgba8UnormSrgb, 30, 7).is_ok());
     }
 
     /// Regression: on GL, square arrays of 6k layers became cube maps and sampled black.

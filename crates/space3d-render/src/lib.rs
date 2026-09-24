@@ -11,6 +11,8 @@
 //! * **GPU-driven culling** — compute-shader frustum culling writing indirect args, drawn with
 //!   `multi_draw_indexed_indirect[_count]` where supported; CPU culling + direct draws on
 //!   WebGL2/downlevel ([`DrawPath`]).
+//! * **Custom shaders** — [`CustomShader`] WGSL hooks per [`Material`], with access to custom
+//!   per-instance attributes ([`InstanceSemantic::Custom`]).
 //! * **Headless capture** — [`Renderer::capture`] / [`render_to_image`].
 //!
 //! ```no_run
@@ -35,7 +37,9 @@ mod gpu;
 mod handles;
 mod instance;
 mod pipeline;
+mod readback;
 mod renderer;
+mod shader;
 mod stats;
 mod texture;
 
@@ -47,13 +51,14 @@ pub use components::{
 pub use culling::{Aabb, Frustum, Sphere, max_axis_scale};
 pub use dirty::DirtyRanges;
 pub use frame::RenderSettings;
-pub use handles::{InstanceBufferHandle, MeshHandle, TextureHandle};
+pub use handles::{InstanceBufferHandle, MeshHandle, ShaderHandle, TextureHandle};
 pub use instance::{
-    BufferUsage, CullSource, InstanceAttribute, InstanceBuffer, InstanceBuffers, InstanceCompact, InstanceData,
-    InstanceLayout, InstancePacked, InstanceSemantic, InstanceTransform, InstanceTransformColor, InstancedMesh,
-    ScaleKind,
+    BufferUsage, CullFloat, CullSource, InstanceAttribute, InstanceBuffer, InstanceBuffers, InstanceCompact,
+    InstanceData, InstanceHalf, InstanceLayout, InstancePacked, InstanceSemantic, InstanceTransform,
+    InstanceTransformColor, InstancedMesh, MAX_INSTANCE_LOCATIONS, ScaleKind, f16_to_f32, f32_to_f16,
 };
 pub use renderer::{DisplayHandle, RenderCapabilities, RenderError, Renderer, RendererConfig};
+pub use shader::CustomShader;
 pub use stats::{DrawPath, RenderStats};
 
 pub use glam;
@@ -154,9 +159,9 @@ pub fn render_to_image(app: &mut App) -> Option<ImageData> {
 /// Common imports.
 pub mod prelude {
     pub use crate::{
-        AmbientLight, BufferUsage, Camera3d, DirectionalLight, DrawPath, InstanceBuffer, InstanceBuffers,
-        InstanceCompact, InstanceData, InstanceTransform, InstanceTransformColor, InstancedMesh, Material, Mesh3d,
-        MeshHandle, PointLight, Projection, RenderAssets, RenderPlugin, RenderSettings, RenderStats, RenderTarget,
-        Renderer, TextureHandle, Visibility, render_to_image,
+        AmbientLight, BufferUsage, Camera3d, CustomShader, DirectionalLight, DrawPath, InstanceBuffer, InstanceBuffers,
+        InstanceCompact, InstanceData, InstanceHalf, InstanceTransform, InstanceTransformColor, InstancedMesh,
+        Material, Mesh3d, MeshHandle, PointLight, Projection, RenderAssets, RenderPlugin, RenderSettings, RenderStats,
+        RenderTarget, Renderer, ShaderHandle, TextureHandle, Visibility, render_to_image,
     };
 }

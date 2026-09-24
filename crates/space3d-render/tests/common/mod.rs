@@ -53,6 +53,19 @@ pub fn best_path(app: &App) -> DrawPath {
     app.resources.expect::<Renderer>().capabilities().best_draw_path
 }
 
+/// Every draw path the adapter supports, `CpuDirect` first.
+pub fn paths_up_to(best: DrawPath) -> Vec<DrawPath> {
+    [
+        DrawPath::CpuDirect,
+        DrawPath::GpuIndirect,
+        DrawPath::GpuMultiDraw,
+        DrawPath::GpuMultiDrawCount,
+    ]
+    .into_iter()
+    .filter(|p| *p <= best)
+    .collect()
+}
+
 /// Fraction of pixels whose max channel difference exceeds `tol`.
 pub fn diff_fraction(a: &ImageData, b: &ImageData, tol: u8) -> f64 {
     assert_eq!((a.width, a.height), (b.width, b.height));

@@ -32,13 +32,18 @@ use wgpu::VertexFormat;
 pub enum InstanceSemantic {
     /// Column-major model matrix: four consecutive `Float32x4` columns starting at `offset`.
     ModelMatrix,
-    /// World translation (`xyz` of a 3/4-component float format).
+    /// World translation (`xyz` of a 3/4-component float format). GPU/CPU culling decodes
+    /// `Float32x3`, `Float32x4` and `Float16x4`.
     Translation,
+    /// World translation in `xyz` and uniform scale in `w` of one 4-component float attribute
+    /// (`Float32x4`, `Float16x4`): the compact encoding of `Translation` + `UniformScale`
+    /// (see [`InstanceHalf`]).
+    TranslationScale,
     /// Rotation quaternion `xyzw` (`Float32x4`, `Float16x4`, `Snorm16x4`, `Snorm8x4`); normalized in-shader.
     Rotation,
-    /// Non-uniform scale (`xyz`).
+    /// Non-uniform scale (`xyz`; culling decodes `Float32x3/x4` and `Float16x4`).
     Scale,
-    /// Uniform scale (`Float32` / first component).
+    /// Uniform scale (`Float32` / `Float16` / first component of a float vector).
     UniformScale,
     /// Linear RGBA tint multiplied with the material color.
     Color,
@@ -46,7 +51,9 @@ pub enum InstanceSemantic {
     UvRect,
     /// Texture-array layer (atlas index / animation frame) as `Uint32` or `Float32`.
     TextureLayer,
-    /// Free slot for custom pipelines; ignored by the built-in shader.
+    /// User data for [custom shaders](crate::CustomShader): the generated `InstanceInput` has a
+    /// field `customN` (the attribute's own WGSL type) and `instance_customN(inst)` returns it
+    /// as a zero-padded `vec4<f32>`. Ignored by the built-in shader.
     Custom(u8),
 }
 
@@ -75,6 +82,15 @@ impl InstanceAttribute {
 }
 
 /// Static description of an [`InstanceData`] type's memory layout.
+///
+/// Culling reads the position (and scale) straight from instance memory, so it needs them in
+/// a float format it can decode: a `ModelMatrix`, or a `Translation`/`TranslationScale` in
+/// `Float32x3`/`Float32x4`/`Float16x4` with an optional `f32`/`f16` scale (see
+/// [`Self::cull_source`]). Other position formats (snorm, integer) render correctly but are
+/// not culled per instance: the renderer logs a warning when it first sees such a layout, and
+/// the CPU path culls them per block only if [`InstanceData::bounds`] is overridden or
+/// [`InstanceBuffer::set_bounds`] is used. `Custom(n)` attributes are bound for
+/// [custom shaders](crate::CustomShader) and ignored by the built-in shader.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct InstanceLayout {
     /// Debug name (also used in shader labels).
@@ -85,37 +101,140 @@ pub struct InstanceLayout {
     pub attributes: &'static [InstanceAttribute],
 }
 
-/// How culling code can find an instance's position/scale in raw memory (f32 formats only).
+/// How culling code can find an instance's position/scale in raw memory. Positions and scales
+/// in `f32` and `f16` formats are decodable (on the GPU and the CPU).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CullSource {
-    /// Translation = column 3, scale = [`crate::max_axis_scale`] of columns 0..2.
+    /// Translation = column 3, scale = [`crate::max_axis_scale`] of columns 0..2 (f32).
     Matrix {
         /// Byte offset of the first matrix column.
         offset: u32,
     },
-    /// Translation (f32 xyz) plus optional scale.
+    /// Translation (xyz) plus optional scale.
     TranslationScale {
         /// Byte offset of the translation.
         translation: u32,
-        /// Byte offset and encoding of the scale, if any.
-        scale: Option<(u32, ScaleKind)>,
+        /// Encoding of the translation components.
+        format: CullFloat,
+        /// Byte offset, kind and encoding of the scale, if any.
+        scale: Option<(u32, ScaleKind, CullFloat)>,
     },
-    /// Position not decodable; the whole buffer is drawn without per-instance culling.
+    /// Position not decodable by the renderer (e.g. snorm/integer translations). Such buffers
+    /// are never culled per instance on the GPU; the CPU path culls them per block of
+    /// instances only if [`InstanceData::bounds`] is overridden (or with
+    /// [`InstanceBuffer::set_bounds`]), otherwise they are always drawn whole.
     None,
+}
+
+/// Float encoding of a culled position/scale component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CullFloat {
+    /// IEEE 754 binary32.
+    F32,
+    /// IEEE 754 binary16 (`Float16*` vertex formats).
+    F16,
 }
 
 /// Scale encoding for [`CullSource::TranslationScale`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScaleKind {
-    /// Single f32.
+    /// Single component (the first one of the attribute).
     Uniform,
-    /// f32 xyz.
+    /// xyz; the largest absolute component bounds the instance.
     Vector,
 }
 
+/// Encoding of a float vertex format usable for culling (`None`: not decodable).
+const fn cull_float(format: VertexFormat, min_components: u32) -> Option<CullFloat> {
+    use VertexFormat::*;
+    let (float, components) = match format {
+        Float32 => (CullFloat::F32, 1),
+        Float32x2 => (CullFloat::F32, 2),
+        Float32x3 => (CullFloat::F32, 3),
+        Float32x4 => (CullFloat::F32, 4),
+        Float16 => (CullFloat::F16, 1),
+        Float16x2 => (CullFloat::F16, 2),
+        Float16x4 => (CullFloat::F16, 4),
+        _ => return None,
+    };
+    if components >= min_components {
+        Some(float)
+    } else {
+        None
+    }
+}
+
+/// Convert an `f32` to IEEE 754 binary16 bits (round to nearest, ties to even; overflow
+/// saturates to infinity, NaN stays NaN). For filling `Float16*` instance attributes.
+pub const fn f32_to_f16(value: f32) -> u16 {
+    let x = value.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xff) as i32;
+    let man = x & 0x007f_ffff;
+    if exp == 0xff {
+        // Inf / NaN (keep NaN quiet and non-zero).
+        return sign | 0x7c00 | if man != 0 { 0x0200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        // Subnormal half (or zero): shift the implicit-1 mantissa into place and round.
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let round = (rem > mid || (rem == mid && (half & 1) != 0)) as u32;
+        return sign | (half + round) as u16;
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    let round = (rem > 0x1000 || (rem == 0x1000 && (half & 1) != 0)) as u32;
+    // A carry out of the mantissa correctly increments the exponent (up to infinity).
+    sign | (half + round) as u16
+}
+
+/// Convert IEEE 754 binary16 bits to `f32` (exact).
+pub const fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let man = (bits & 0x03ff) as u32;
+    let x = if exp == 0 {
+        if man == 0 {
+            sign
+        } else {
+            // Subnormal: normalize.
+            let mut e = 127 - 15 + 1;
+            let mut m = man;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | ((e as u32) << 23) | ((m & 0x03ff) << 13)
+        }
+    } else if exp == 0x1f {
+        sign | 0x7f80_0000 | (man << 13)
+    } else {
+        sign | ((exp + 127 - 15) << 23) | (man << 13)
+    };
+    f32::from_bits(x)
+}
+
+/// Shader locations available to instance attributes: WebGPU guarantees 16 vertex attributes
+/// and the mesh vertex uses 4.
+pub const MAX_INSTANCE_LOCATIONS: u32 = 12;
+
 impl InstanceLayout {
-    /// Check that attributes fit the stride and use formats the built-in shader understands.
+    /// Check that attributes fit the stride, are aligned like WebGPU requires (offset a
+    /// multiple of `min(4, format size)`), appear at most once per semantic, fit the
+    /// [`MAX_INSTANCE_LOCATIONS`] and use formats the built-in shader understands.
     pub fn validate(&self) -> Result<(), String> {
+        use InstanceSemantic as S;
         if self.stride == 0 || !self.stride.is_multiple_of(4) {
             return Err(format!(
                 "{}: stride {} must be a non-zero multiple of 4",
@@ -123,8 +242,8 @@ impl InstanceLayout {
             ));
         }
         let mut transform = false;
-        for a in self.attributes {
-            let size = if a.semantic == InstanceSemantic::ModelMatrix {
+        for (i, a) in self.attributes.iter().enumerate() {
+            let size = if a.semantic == S::ModelMatrix {
                 if a.format != VertexFormat::Float32x4 {
                     return Err(format!("{}: ModelMatrix must use Float32x4 columns", self.name));
                 }
@@ -132,22 +251,49 @@ impl InstanceLayout {
             } else {
                 a.format.size() as u32
             };
-            if a.offset + size > self.stride || !a.offset.is_multiple_of(4) {
+            let align = size.min(4);
+            if a.offset + size > self.stride || !a.offset.is_multiple_of(align) {
                 return Err(format!(
-                    "{}: attribute {:?} out of bounds/unaligned",
+                    "{}: attribute {:?} out of bounds or not {align}-byte aligned",
                     self.name, a.semantic
                 ));
             }
             if wgsl_type(a.format).is_none() {
                 return Err(format!("{}: unsupported vertex format {:?}", self.name, a.format));
             }
-            transform |= matches!(
-                a.semantic,
-                InstanceSemantic::ModelMatrix | InstanceSemantic::Translation
-            );
+            if self.attributes[..i]
+                .iter()
+                .any(|b| same_semantic(a.semantic, b.semantic))
+            {
+                return Err(format!("{}: {:?} appears more than once", self.name, a.semantic));
+            }
+            if a.semantic == S::TranslationScale && wgsl_type(a.format) != Some("vec4<f32>") {
+                return Err(format!(
+                    "{}: TranslationScale needs a 4-component float format (Float32x4, Float16x4)",
+                    self.name
+                ));
+            }
+            transform |= matches!(a.semantic, S::ModelMatrix | S::Translation | S::TranslationScale);
         }
         if !transform {
-            return Err(format!("{}: needs a ModelMatrix or Translation attribute", self.name));
+            return Err(format!(
+                "{}: needs a ModelMatrix, Translation or TranslationScale attribute",
+                self.name
+            ));
+        }
+        let has = |s| self.attributes.iter().any(|a| same_semantic(a.semantic, s));
+        if has(S::TranslationScale) && (has(S::Translation) || has(S::Scale) || has(S::UniformScale)) {
+            return Err(format!(
+                "{}: TranslationScale already carries translation and scale",
+                self.name
+            ));
+        }
+        if self.location_count() > MAX_INSTANCE_LOCATIONS {
+            return Err(format!(
+                "{}: {} shader locations, at most {MAX_INSTANCE_LOCATIONS}",
+                self.name,
+                self.location_count()
+            ));
         }
         Ok(())
     }
@@ -183,26 +329,45 @@ impl InstanceLayout {
         if let Some(m) = self.find(InstanceSemantic::ModelMatrix) {
             return CullSource::Matrix { offset: m.offset };
         }
+        if let Some(ts) = self.find(InstanceSemantic::TranslationScale) {
+            // xyz + w in one attribute: the scale is the fourth component.
+            return match cull_float(ts.format, 4) {
+                Some(CullFloat::F32) => CullSource::TranslationScale {
+                    translation: ts.offset,
+                    format: CullFloat::F32,
+                    scale: Some((ts.offset + 12, ScaleKind::Uniform, CullFloat::F32)),
+                },
+                Some(CullFloat::F16) => CullSource::TranslationScale {
+                    translation: ts.offset,
+                    format: CullFloat::F16,
+                    scale: Some((ts.offset + 6, ScaleKind::Uniform, CullFloat::F16)),
+                },
+                None => CullSource::None,
+            };
+        }
         let Some(t) = self.find(InstanceSemantic::Translation) else {
             return CullSource::None;
         };
-        if !matches!(t.format, VertexFormat::Float32x3 | VertexFormat::Float32x4) {
+        let Some(format) = cull_float(t.format, 3) else {
             return CullSource::None;
-        }
+        };
         let scale = match (
             self.find(InstanceSemantic::Scale),
             self.find(InstanceSemantic::UniformScale),
         ) {
-            (Some(s), _) if matches!(s.format, VertexFormat::Float32x3 | VertexFormat::Float32x4) => {
-                Some((s.offset, ScaleKind::Vector))
-            }
-            (None, Some(s)) if matches!(s.format, VertexFormat::Float32) => Some((s.offset, ScaleKind::Uniform)),
+            (Some(s), _) => match cull_float(s.format, 3) {
+                Some(f) => Some((s.offset, ScaleKind::Vector, f)),
+                None => return CullSource::None,
+            },
+            (None, Some(s)) => match cull_float(s.format, 1) {
+                Some(f) => Some((s.offset, ScaleKind::Uniform, f)),
+                None => return CullSource::None,
+            },
             (None, None) => None,
-            // Scale present but not f32: bounds unknown.
-            _ => return CullSource::None,
         };
         CullSource::TranslationScale {
             translation: t.offset,
+            format,
             scale,
         }
     }
@@ -220,6 +385,7 @@ const fn same_semantic(a: InstanceSemantic, b: InstanceSemantic) -> bool {
         (Custom(x), Custom(y)) => x == y,
         (ModelMatrix, ModelMatrix)
         | (Translation, Translation)
+        | (TranslationScale, TranslationScale)
         | (Rotation, Rotation)
         | (Scale, Scale)
         | (UniformScale, UniformScale)
@@ -240,22 +406,34 @@ fn decode_bounds_with(cull: CullSource, bytes: &[u8]) -> Option<(Vec3, f32)> {
         f32::from_ne_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
     }
     #[inline(always)]
-    fn v3(bytes: &[u8], o: u32) -> Vec3 {
-        Vec3::new(f(bytes, o), f(bytes, o + 4), f(bytes, o + 8))
+    fn h(bytes: &[u8], o: u32) -> f32 {
+        let o = o as usize;
+        f16_to_f32(u16::from_ne_bytes([bytes[o], bytes[o + 1]]))
+    }
+    #[inline(always)]
+    fn v3(bytes: &[u8], o: u32, format: CullFloat) -> Vec3 {
+        match format {
+            CullFloat::F32 => Vec3::new(f(bytes, o), f(bytes, o + 4), f(bytes, o + 8)),
+            CullFloat::F16 => Vec3::new(h(bytes, o), h(bytes, o + 2), h(bytes, o + 4)),
+        }
     }
     match cull {
         CullSource::Matrix { offset } => {
-            let t = v3(bytes, offset + 48);
-            let s = crate::culling::stretch_bound(v3(bytes, offset), v3(bytes, offset + 16), v3(bytes, offset + 32));
-            Some((t, s))
+            let c = |i: u32| v3(bytes, offset + 16 * i, CullFloat::F32);
+            Some((c(3), crate::culling::stretch_bound(c(0), c(1), c(2))))
         }
-        CullSource::TranslationScale { translation, scale } => {
+        CullSource::TranslationScale {
+            translation,
+            format,
+            scale,
+        } => {
             let s = match scale {
                 None => 1.0,
-                Some((o, ScaleKind::Uniform)) => f(bytes, o).abs(),
-                Some((o, ScaleKind::Vector)) => v3(bytes, o).abs().max_element(),
+                Some((o, ScaleKind::Uniform, CullFloat::F32)) => f(bytes, o).abs(),
+                Some((o, ScaleKind::Uniform, CullFloat::F16)) => h(bytes, o).abs(),
+                Some((o, ScaleKind::Vector, sf)) => v3(bytes, o, sf).abs().max_element(),
             };
-            Some((v3(bytes, translation), s))
+            Some((v3(bytes, translation, format), s))
         }
         CullSource::None => None,
     }
@@ -445,15 +623,11 @@ pub struct InstancePacked {
 impl InstancePacked {
     /// Pack from full-precision values.
     pub fn new(translation: Vec3, rotation: Quat, scale: f32, color: glam::Vec4, layer: u32) -> Self {
-        let q = rotation
-            .normalize()
-            .to_array()
-            .map(|c| (c.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16);
         let c = color.to_array().map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
         Self {
             translation: translation.to_array(),
             scale,
-            rotation: q,
+            rotation: snorm16_quat(rotation),
             color: c,
             layer,
         }
@@ -477,6 +651,70 @@ impl InstanceData for InstancePacked {
     fn bounds(&self) -> Option<(Vec3, f32)> {
         Some((Vec3::from_array(self.translation), self.scale.abs()))
     }
+}
+
+/// Half-precision instance (16 B, half of [`InstanceCompact`]): translation + uniform scale as
+/// `f16` (one `Float16x4`, [`InstanceSemantic::TranslationScale`]) and a snorm16 quaternion.
+/// Culled per instance on the GPU and per block on the CPU like the f32 formats.
+///
+/// `f16` has an 11-bit significand: positions are exact to 1/1024 of their magnitude's power
+/// of two — steps of 2⁻¹⁰ below 1, 1/64 between 16 and 32, 0.5 between 512 and 1024, 32
+/// between 32768 and 65504 (the largest finite value). Use it for bounded worlds (particles,
+/// foliage, crowds within a few hundred units of the origin, or of a camera-relative origin
+/// you rebase by rewriting the buffer), not for large open worlds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct InstanceHalf {
+    /// World translation `xyz` and uniform scale `w`, as IEEE binary16 bits ([`f32_to_f16`]).
+    pub translation_scale: [u16; 4],
+    /// Rotation quaternion `xyzw` as snorm16.
+    pub rotation: [i16; 4],
+}
+
+impl InstanceHalf {
+    /// Pack from full-precision values (rounded to the nearest `f16`).
+    pub fn new(translation: Vec3, rotation: Quat, scale: f32) -> Self {
+        let [x, y, z] = translation.to_array();
+        Self {
+            translation_scale: [x, y, z, scale].map(f32_to_f16),
+            rotation: snorm16_quat(rotation),
+        }
+    }
+
+    /// Decoded translation.
+    pub fn translation(&self) -> Vec3 {
+        let [x, y, z, _] = self.translation_scale.map(f16_to_f32);
+        Vec3::new(x, y, z)
+    }
+
+    /// Decoded uniform scale.
+    pub fn scale(&self) -> f32 {
+        f16_to_f32(self.translation_scale[3])
+    }
+}
+
+impl InstanceData for InstanceHalf {
+    const LAYOUT: &'static InstanceLayout = &InstanceLayout {
+        name: "InstanceHalf",
+        stride: 16,
+        attributes: &[
+            InstanceAttribute::new(InstanceSemantic::TranslationScale, VertexFormat::Float16x4, 0),
+            InstanceAttribute::new(InstanceSemantic::Rotation, VertexFormat::Snorm16x4, 8),
+        ],
+    };
+
+    #[inline]
+    fn bounds(&self) -> Option<(Vec3, f32)> {
+        Some((self.translation(), self.scale().abs()))
+    }
+}
+
+/// Normalized quaternion as snorm16 components.
+fn snorm16_quat(rotation: Quat) -> [i16; 4] {
+    rotation
+        .normalize()
+        .to_array()
+        .map(|c| (c.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
 }
 
 /// Upload strategy hint for an [`InstanceBuffer`].
@@ -903,12 +1141,168 @@ mod tests {
             InstanceTransformColor::LAYOUT,
             InstanceCompact::LAYOUT,
             InstancePacked::LAYOUT,
+            InstanceHalf::LAYOUT,
         ] {
             l.validate().unwrap();
             assert_ne!(l.cull_source(), CullSource::None, "{}", l.name);
         }
         assert_eq!(std::mem::size_of::<InstancePacked>(), 32);
+        assert_eq!(std::mem::size_of::<InstanceHalf>(), 16);
         assert_eq!(InstanceTransformColor::LAYOUT.location_count(), 5);
+    }
+
+    /// Test layout (the attribute list is leaked to get the `'static` borrow).
+    fn layout(attributes: &[InstanceAttribute], stride: u32) -> InstanceLayout {
+        InstanceLayout {
+            name: "test",
+            stride,
+            attributes: Vec::leak(attributes.to_vec()),
+        }
+    }
+
+    #[test]
+    fn invalid_layouts_are_rejected() {
+        use InstanceSemantic as S;
+        use VertexFormat as F;
+        let a = InstanceAttribute::new;
+        let err = |attrs: &[InstanceAttribute], stride| layout(attrs, stride).validate().unwrap_err();
+        assert!(err(&[a(S::Translation, F::Float32x3, 2)], 16).contains("aligned"));
+        assert!(err(&[a(S::Translation, F::Float32x3, 8)], 16).contains("out of bounds"));
+        assert!(err(&[a(S::Color, F::Float32x4, 0)], 16).contains("needs a ModelMatrix"));
+        assert!(
+            err(
+                &[a(S::Translation, F::Float32x3, 0), a(S::Translation, F::Float32x3, 12)],
+                24
+            )
+            .contains("more than once")
+        );
+        assert!(
+            err(
+                &[
+                    a(S::TranslationScale, F::Float16x4, 0),
+                    a(S::UniformScale, F::Float32, 8)
+                ],
+                12
+            )
+            .contains("already carries")
+        );
+        assert!(err(&[a(S::TranslationScale, F::Float32x3, 0)], 12).contains("4-component"));
+        const MANY: &[InstanceAttribute] = &[
+            InstanceAttribute::new(InstanceSemantic::ModelMatrix, VertexFormat::Float32x4, 0),
+            InstanceAttribute::new(InstanceSemantic::Custom(0), VertexFormat::Float32x4, 64),
+            InstanceAttribute::new(InstanceSemantic::Custom(1), VertexFormat::Float32x4, 80),
+            InstanceAttribute::new(InstanceSemantic::Custom(2), VertexFormat::Float32x4, 96),
+            InstanceAttribute::new(InstanceSemantic::Custom(3), VertexFormat::Float32x4, 112),
+            InstanceAttribute::new(InstanceSemantic::Custom(4), VertexFormat::Float32x4, 128),
+            InstanceAttribute::new(InstanceSemantic::Custom(5), VertexFormat::Float32x4, 144),
+            InstanceAttribute::new(InstanceSemantic::Custom(6), VertexFormat::Float32x4, 160),
+            InstanceAttribute::new(InstanceSemantic::Custom(7), VertexFormat::Float32x4, 176),
+            InstanceAttribute::new(InstanceSemantic::Custom(8), VertexFormat::Float32x4, 192),
+        ];
+        assert!(err(MANY, 208).contains("at most 12"));
+        layout(&MANY[..9], 208).validate().expect("12 locations fit");
+        // Two-byte formats only need 2-byte alignment (as in WebGPU).
+        layout(
+            &[a(S::Translation, F::Float16x4, 0), a(S::UniformScale, F::Float16, 6)],
+            8,
+        )
+        .validate()
+        .expect("f16 scale at offset 6");
+    }
+
+    #[test]
+    fn f16_conversion_round_trips() {
+        for v in [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.5,
+            0.5,
+            1000.0,
+            65504.0,
+            -65504.0,
+            6.1035156e-5,
+            5.9604645e-8,
+        ] {
+            assert_eq!(f16_to_f32(f32_to_f16(v)), v, "{v}");
+        }
+        assert_eq!(f32_to_f16(1.0), 0x3c00);
+        assert_eq!(f32_to_f16(-2.0), 0xc000);
+        assert_eq!(f32_to_f16(65520.0), 0x7c00, "rounds to infinity");
+        assert_eq!(f32_to_f16(1e10), 0x7c00);
+        assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
+        assert_eq!(f16_to_f32(f32_to_f16(1000.3)), 1000.5, "0.5 steps at 1000");
+        assert_eq!(f16_to_f32(f32_to_f16(1.0 + 1.0 / 4096.0)), 1.0, "ties to even");
+        assert_eq!(f16_to_f32(f32_to_f16(1e-9)), 0.0);
+        // Every f16 value survives f16 -> f32 -> f16.
+        for bits in 0..=u16::MAX {
+            let v = f16_to_f32(bits);
+            if !v.is_nan() {
+                assert_eq!(f32_to_f16(v), bits, "{bits:#06x}");
+            }
+        }
+    }
+
+    /// f16 positions and scales are decodable for culling (they used to disable it entirely).
+    #[test]
+    fn f16_layouts_are_cullable() {
+        use InstanceSemantic as S;
+        use VertexFormat as F;
+        let a = InstanceAttribute::new;
+        assert_eq!(
+            InstanceHalf::LAYOUT.cull_source(),
+            CullSource::TranslationScale {
+                translation: 0,
+                format: CullFloat::F16,
+                scale: Some((6, ScaleKind::Uniform, CullFloat::F16)),
+            }
+        );
+        let split = layout(
+            &[
+                a(S::Rotation, F::Snorm16x4, 0),
+                a(S::Translation, F::Float16x4, 8),
+                a(S::UniformScale, F::Float16, 14),
+            ],
+            16,
+        );
+        assert_eq!(
+            split.cull_source(),
+            CullSource::TranslationScale {
+                translation: 8,
+                format: CullFloat::F16,
+                scale: Some((14, ScaleKind::Uniform, CullFloat::F16)),
+            }
+        );
+        let vector = layout(&[a(S::Translation, F::Float32x3, 0), a(S::Scale, F::Float16x4, 12)], 20);
+        assert_eq!(
+            vector.cull_source(),
+            CullSource::TranslationScale {
+                translation: 0,
+                format: CullFloat::F32,
+                scale: Some((12, ScaleKind::Vector, CullFloat::F16)),
+            }
+        );
+        // Not decodable: snorm translation, 2-component f16 translation.
+        assert_eq!(
+            layout(&[a(S::Translation, F::Snorm16x4, 0)], 8).cull_source(),
+            CullSource::None
+        );
+        assert_eq!(
+            layout(&[a(S::Translation, F::Float16x2, 0)], 4).cull_source(),
+            CullSource::None
+        );
+
+        let h = InstanceHalf::new(Vec3::new(1.5, -2.25, 300.0), Quat::from_rotation_z(1.0), 0.75);
+        assert_eq!(h.bounds(), Some((Vec3::new(1.5, -2.25, 300.0), 0.75)));
+        assert_eq!(h.bounds(), InstanceHalf::LAYOUT.decode_bounds(bytemuck::bytes_of(&h)));
+        let mut bytes = [0u8; 16];
+        bytes[8..14].copy_from_slice(bytemuck::cast_slice(&[
+            f32_to_f16(4.0),
+            f32_to_f16(-5.0),
+            f32_to_f16(6.0),
+        ]));
+        bytes[14..16].copy_from_slice(&f32_to_f16(-2.0).to_ne_bytes());
+        assert_eq!(split.decode_bounds(&bytes), Some((Vec3::new(4.0, -5.0, 6.0), 2.0)));
     }
 
     #[test]
@@ -1064,7 +1458,8 @@ mod tests {
             InstanceCompact::LAYOUT.cull_source(),
             CullSource::TranslationScale {
                 translation: 0,
-                scale: Some((12, ScaleKind::Uniform))
+                format: CullFloat::F32,
+                scale: Some((12, ScaleKind::Uniform, CullFloat::F32))
             }
         ));
         let m = Mat4::from_cols_array(&std::array::from_fn(|i| i as f32 * 0.37 - 2.0));

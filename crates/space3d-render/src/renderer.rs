@@ -658,6 +658,12 @@ impl Renderer {
         format_supported(&self.adapter, &self.device, format)
     }
 
+    /// Build error of the current version of a [`crate::CustomShader`], once a draw has used it
+    /// (its draws then use the built-in shader). `None` while it builds fine or is unused.
+    pub fn shader_error(&self, shader: crate::ShaderHandle) -> Option<&str> {
+        self.pipelines.custom_error(shader)
+    }
+
     /// Number of wgpu errors that reached the uncaptured-error handler so far. Release builds
     /// log these instead of panicking; tests and tools can assert that it stays 0.
     pub fn gpu_error_count(&self) -> u64 {

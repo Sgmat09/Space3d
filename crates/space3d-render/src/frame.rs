@@ -11,14 +11,16 @@ use crate::components::{
 use crate::culling::{Aabb, Frustum, Sphere};
 use crate::gpu::{GrowBuffer, TrackedBuffer, align_up};
 use crate::handles::FastMap;
-use crate::handles::{MeshHandle, TextureHandle};
+use crate::handles::{MeshHandle, ShaderHandle, TextureHandle};
 use crate::instance::{
-    BufferUsage, CULL_BLOCK, CullBounds, CullSource, ErasedInstanceBuffer, InstanceBuffers, InstancedMesh, ScaleKind,
+    BufferUsage, CULL_BLOCK, CullBounds, CullFloat, CullSource, ErasedInstanceBuffer, InstanceBuffers, InstancedMesh,
+    ScaleKind,
 };
 use crate::pipeline::{
     CLASS_BLEND, CLASS_DOUBLE_SIDED, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuMaterial,
     GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, OFFSCREEN_FORMAT, PipelineKey,
 };
+use crate::readback::CullReadback;
 use crate::renderer::{RenderCapabilities, Renderer};
 use crate::stats::DrawPath;
 use bytemuck::Zeroable;
@@ -76,6 +78,8 @@ pub(crate) struct DrawCmd {
     layout: u16,
     class: u8,
     material: u32,
+    /// Custom shader of the material and its source version (resolved in `prepare`).
+    shader: Option<(ShaderHandle, u32)>,
     first_index: u32,
     index_count: u32,
     base_vertex: i32,
@@ -83,6 +87,10 @@ pub(crate) struct DrawCmd {
     vb_offset: u64,
     kind: DrawKind,
 }
+
+/// What selects a draw's forward pipeline besides the pass's target format and samples:
+/// (instance layout, class, layered texture, custom shader and its version).
+type PipelineState = (u16, u8, bool, Option<(ShaderHandle, u32)>);
 
 /// Scratch of [`order_by_key`].
 #[derive(Default)]
@@ -161,6 +169,27 @@ fn order_by_key(keys: &[u64], order: &mut Vec<u32>, runs: &mut Vec<(u64, u32, u3
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CULL: usize = 16_384;
 
+/// Extracted ECS entities at or above this count (per archetype) gather their matrices on all
+/// rayon workers.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_GATHER: usize = 32_768;
+
+/// `dst[k] = transforms[rows[k]]` as column arrays (a strided 64-byte copy per entity).
+fn gather_matrices(transforms: &[GlobalTransform], rows: &[u32], dst: &mut [[f32; 16]]) {
+    debug_assert_eq!(rows.len(), dst.len());
+    let copy = |(d, &r): (&mut [f32; 16], &u32)| *d = transforms[r as usize].0.to_cols_array();
+    #[cfg(not(target_arch = "wasm32"))]
+    if rows.len() >= PARALLEL_GATHER {
+        use rayon::prelude::*;
+        dst.par_iter_mut()
+            .zip(rows.par_iter())
+            .with_min_len(4096)
+            .for_each(copy);
+        return;
+    }
+    dst.iter_mut().zip(rows).for_each(copy);
+}
+
 /// Frustum-test one ECS batch (`order` indexes `matrices`), one bit per instance in `mask`;
 /// returns the number visible.
 fn cull_mask(matrices: &[[f32; 16]], order: &[u32], sphere: Sphere, frustum: &Frustum, mask: &mut Vec<u64>) -> usize {
@@ -191,11 +220,14 @@ fn cull_mask(matrices: &[[f32; 16]], order: &[u32], sphere: Sphere, frustum: &Fr
         .sum()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Source {
     blend: bool,
     class: u8,
     layout: u16,
+    /// Rest of the pipeline key besides class and layout: custom shader and texture kind of
+    /// the material (see [`pipeline_rank`]).
+    pipeline: u64,
     material: u32,
     mesh: GpuMesh,
     triangles: u32,
@@ -313,6 +345,7 @@ struct MaterialKey {
     words: [u32; 9],
     flags: u8,
     texture: Option<TextureHandle>,
+    shader: Option<ShaderHandle>,
 }
 
 impl MaterialKey {
@@ -323,13 +356,17 @@ impl MaterialKey {
             words: [b.x, b.y, b.z, b.w, m.metallic, m.roughness, e.x, e.y, e.z].map(f32::to_bits),
             flags: (m.unlit as u8) | (m.double_sided as u8) << 1 | (m.alpha_blend as u8) << 2,
             texture: m.base_color_texture,
+            shader: m.shader,
         }
     }
 
     /// Slot in [`MaterialTable`]'s direct-mapped cache (a cheap multiplicative hash).
     fn cache_slot(&self) -> usize {
         let t = self.texture.map_or(0, |t| t.index() ^ t.generation().rotate_left(16));
-        let mut h = (self.flags as u32 ^ t).wrapping_mul(0x9E37_79B1);
+        let sh = self
+            .shader
+            .map_or(0, |s| (s.index() + 1) ^ s.generation().rotate_left(16));
+        let mut h = (self.flags as u32 ^ t ^ sh.rotate_left(8)).wrapping_mul(0x9E37_79B1);
         for w in self.words {
             h = (h.rotate_left(5) ^ w).wrapping_mul(0x9E37_79B1);
         }
@@ -511,6 +548,10 @@ impl MaterialTable {
     fn texture(&self, id: u32) -> Option<TextureHandle> {
         self.entries.get(id as usize).and_then(|e| e.key.texture)
     }
+
+    fn shader(&self, id: u32) -> Option<ShaderHandle> {
+        self.entries.get(id as usize).and_then(|e| e.key.shader)
+    }
 }
 
 /// Pending mesh uploads: handle, arena placement (once allocated), converted vertices and
@@ -553,6 +594,8 @@ pub(crate) struct FrameState {
     ecs_keys: Vec<u64>,
     ecs_matrices: Vec<[f32; 16]>,
     ecs_meshes: Vec<MeshHandle>,
+    /// Row of each extracted entity in its archetype (gather source of `ecs_matrices`).
+    ecs_rows: Vec<u32>,
     /// Last frame's `ecs_keys`: while the key sequence is unchanged, so is the batch order.
     ecs_prev_keys: Vec<u64>,
     /// Batch order (indices into the `ecs_*` vectors) and `(key, start, count)` per batch.
@@ -575,6 +618,11 @@ pub(crate) struct FrameState {
     feedback: FastMap<TextureHandle, Feedback>,
     args_count: u32,
     run_count: u32,
+    /// Instances and (pre-cull) triangles of this frame's GPU-culled batches.
+    gpu_submitted: u64,
+    gpu_triangles: u64,
+    /// Readback of GPU-culled visible counts for `RenderStats` (1–3 frames of latency).
+    readback: CullReadback,
     /// Workgroup records of all culling jobs this frame.
     wg_total: u32,
     /// Primary target size the current `views` were prepared for (windowed capture).
@@ -630,7 +678,8 @@ impl FrameState {
             run_meta: TrackedBuffer::new("space3d run meta", s),
             compact_params: TrackedBuffer::new("space3d compact params", U::UNIFORM),
             cull_out: GrowBuffer::new("space3d culled instances", U::VERTEX | s),
-            args: GrowBuffer::new("space3d indirect args", U::INDIRECT | U::COPY_DST | s),
+            // COPY_SRC: the culling-stats readback copies the visible counts out.
+            args: GrowBuffer::new("space3d indirect args", U::INDIRECT | U::COPY_DST | U::COPY_SRC | s),
             compact_args: GrowBuffer::new("space3d compacted args", U::INDIRECT | s),
             counts: GrowBuffer::new("space3d draw counts", U::INDIRECT | U::COPY_DST | s),
             explicit: Vec::new(),
@@ -643,6 +692,7 @@ impl FrameState {
             ecs_keys: Vec::new(),
             ecs_matrices: Vec::new(),
             ecs_meshes: Vec::new(),
+            ecs_rows: Vec::new(),
             ecs_prev_keys: Vec::new(),
             ecs_order: Vec::new(),
             ecs_runs: Vec::new(),
@@ -660,6 +710,9 @@ impl FrameState {
             feedback: FastMap::default(),
             args_count: 0,
             run_count: 0,
+            gpu_submitted: 0,
+            gpu_triangles: 0,
+            readback: CullReadback::default(),
             wg_total: 0,
             last_primary_size: (0, 0),
             path: DrawPath::CpuDirect,
@@ -685,9 +738,10 @@ impl FrameState {
     }
 
     /// Capacity snapshot of scratch vectors (to count CPU reallocations).
-    fn capacities(&self) -> [usize; 17] {
+    fn capacities(&self) -> [usize; 18] {
         [
             self.ecs_keys.capacity(),
+            self.ecs_rows.capacity(),
             self.ecs_prev_keys.capacity(),
             self.ecs_matrices.capacity(),
             self.ecs_meshes.capacity(),
@@ -715,23 +769,92 @@ fn instance_sphere(mesh: &Sphere, cull: CullSource, bytes: &[u8]) -> Option<Sphe
         let o = o as usize;
         f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
     };
+    let h = |o: u32| -> f32 {
+        let o = o as usize;
+        crate::instance::f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]))
+    };
+    let v = |o: u32, format: CullFloat| match format {
+        CullFloat::F32 => Vec3::new(f(o), f(o + 4), f(o + 8)),
+        CullFloat::F16 => Vec3::new(h(o), h(o + 2), h(o + 4)),
+    };
     match cull {
         CullSource::Matrix { offset } => {
             let m = Mat4::from_cols_array(&std::array::from_fn(|i| f(offset + i as u32 * 4)));
             Some(mesh.transformed(&m))
         }
-        CullSource::TranslationScale { translation, scale } => {
+        CullSource::TranslationScale {
+            translation,
+            format,
+            scale,
+        } => {
             let s = match scale {
                 None => 1.0,
-                Some((o, ScaleKind::Uniform)) => f(o).abs(),
-                Some((o, ScaleKind::Vector)) => f(o).abs().max(f(o + 4).abs()).max(f(o + 8).abs()),
+                Some((o, ScaleKind::Uniform, CullFloat::F32)) => f(o).abs(),
+                Some((o, ScaleKind::Uniform, CullFloat::F16)) => h(o).abs(),
+                Some((o, ScaleKind::Vector, sf)) => v(o, sf).abs().max_element(),
             };
             Some(Sphere {
-                center: Vec3::new(f(translation), f(translation + 4), f(translation + 8)),
+                center: v(translation, format),
                 radius: (mesh.center.length() + mesh.radius) * s,
             })
         }
         CullSource::None => None,
+    }
+}
+
+/// The part of a material's pipeline key that is not its class: its custom shader (slot + 1,
+/// 0 for none) and whether its texture is an array (`texture_2d_array` pipeline variant).
+fn pipeline_rank(materials: &MaterialTable, assets: &RenderAssets, material: u32) -> u64 {
+    let shader = materials.shader(material).map_or(0, |h| h.index() as u64 + 1);
+    let layered = materials
+        .texture(material)
+        .and_then(|h| assets.textures.get(h.raw()))
+        .and_then(|e| e.gpu.as_ref())
+        .is_some_and(|g| g.layered);
+    shader << 1 | layered as u64
+}
+
+/// Draw order of batches: opaque before blended, then pipeline (class, instance layout,
+/// shader/texture kind), then material, then mesh — so each pipeline is bound once per view
+/// and each material once per pipeline, and multi-draw runs (equal pipeline and material) are
+/// contiguous whatever the spawn order. Buffer and first instance make the order total.
+fn source_sort_key(s: &Source) -> (bool, u8, u16, u64, u32, u32, SourceBuffer, u32) {
+    (
+        s.blend,
+        s.class,
+        s.layout,
+        s.pipeline,
+        s.material,
+        s.mesh.alloc.first_index,
+        s.buffer,
+        s.first,
+    )
+}
+
+/// `(kind, t_off, s_off, s_kind)` of a [`GpuCullJob`] (see `Job` in cull.wgsl): translation
+/// offset in words, scale offset in bytes (f16 scales may sit in the upper half of a word).
+fn cull_job_encoding(cull: CullSource) -> (u32, u32, u32, u32) {
+    match cull {
+        CullSource::Matrix { offset } => (0, offset / 4, 0, 0),
+        CullSource::TranslationScale {
+            translation,
+            format,
+            scale,
+        } => {
+            let kind = match format {
+                CullFloat::F32 => 1,
+                CullFloat::F16 => 2,
+            };
+            let (s_off, s_kind) = match scale {
+                None => (0, 0),
+                Some((o, ScaleKind::Uniform, CullFloat::F32)) => (o, 1),
+                Some((o, ScaleKind::Vector, CullFloat::F32)) => (o, 2),
+                Some((o, ScaleKind::Uniform, CullFloat::F16)) => (o, 3),
+                Some((o, ScaleKind::Vector, CullFloat::F16)) => (o, 4),
+            };
+            (kind, translation / 4, s_off, s_kind)
+        }
+        CullSource::None => unreachable!("not GPU-culled"),
     }
 }
 
@@ -746,6 +869,8 @@ impl Renderer {
     pub fn render_frame(&mut self, world: &World, resources: &mut Resources) {
         self.frame_index += 1;
         self.ensure_offscreen();
+        // GPU-culling counts of earlier frames whose copies the GPU has finished.
+        self.frame.readback.collect();
         let settings = resources.get::<RenderSettings>().cloned().unwrap_or_default();
         let ambient = resources.get::<AmbientLight>().copied().unwrap_or_default();
         let best = self.caps.best_draw_path;
@@ -776,6 +901,7 @@ impl Renderer {
         }
         self.prepare(world, &assets, &mut buffers, ambient, &settings, &mut encoder);
         self.encode_compute(&mut encoder);
+        self.apply_gpu_cull_counts();
 
         // Acquire the surface only when something presents.
         let mut surface_tex = None;
@@ -934,42 +1060,67 @@ impl Renderer {
             // Drop bind groups of removed textures (they keep the GPU texture alive).
             f.material_bgs
                 .retain(|t, _| t.is_none_or(|h| assets.contains_texture(h)));
+            // Pipelines of removed custom shaders.
+            pipelines.retain_custom(|h| assets.contains_shader(h));
         }
-        // Extract visible entities in query order.
+        // Extract visible entities in query order: archetype by archetype (the order hecs
+        // queries use), so component columns are plain slices. Keys (material interning)
+        // are computed serially; the matrices of the kept rows are gathered afterwards, on all
+        // workers for large archetypes.
         f.ecs_keys.clear();
-        f.ecs_matrices.clear();
         f.ecs_meshes.clear();
+        f.ecs_rows.clear();
         let mut last_mesh: Option<(MeshHandle, bool)> = None;
-        for (gt, mesh, mat, vis) in world
-            .query::<(&GlobalTransform, &Mesh3d, &Material, Option<&Visibility>)>()
-            .iter()
-        {
-            if vis == Some(&Visibility::Hidden) {
+        let mut kept = 0usize;
+        for arch in world.archetypes() {
+            if arch.is_empty() || !(arch.has::<GlobalTransform>() && arch.has::<Mesh3d>() && arch.has::<Material>()) {
                 continue;
             }
-            let uploaded = match last_mesh {
-                Some((m, uploaded)) if m == mesh.0 => uploaded,
-                _ => {
-                    let uploaded = assets.is_mesh_uploaded(mesh.0);
-                    last_mesh = Some((mesh.0, uploaded));
-                    uploaded
-                }
+            let (Some(transforms), Some(meshes), Some(materials)) = (
+                arch.get::<&GlobalTransform>(),
+                arch.get::<&Mesh3d>(),
+                arch.get::<&Material>(),
+            ) else {
+                continue;
             };
-            if !uploaded {
-                continue;
+            let visibility = arch.get::<&Visibility>();
+            let first = kept;
+            for (row, (mesh, mat)) in meshes.iter().zip(materials.iter()).enumerate() {
+                if visibility.as_ref().is_some_and(|v| v[row] == Visibility::Hidden) {
+                    continue;
+                }
+                let uploaded = match last_mesh {
+                    Some((m, uploaded)) if m == mesh.0 => uploaded,
+                    _ => {
+                        let uploaded = assets.is_mesh_uploaded(mesh.0);
+                        last_mesh = Some((mesh.0, uploaded));
+                        uploaded
+                    }
+                };
+                if !uploaded {
+                    continue;
+                }
+                let (material, class) = f.materials.intern(
+                    mat,
+                    frame_index,
+                    &mut f.materials_buf,
+                    material_stride,
+                    &mut cpu_reallocs,
+                );
+                f.ecs_keys
+                    .push((class as u64) << 56 | (material as u64) << 32 | mesh.0.index() as u64);
+                f.ecs_meshes.push(mesh.0);
+                f.ecs_rows.push(row as u32);
+                kept += 1;
             }
-            let (material, class) = f.materials.intern(
-                mat,
-                frame_index,
-                &mut f.materials_buf,
-                material_stride,
-                &mut cpu_reallocs,
-            );
-            f.ecs_keys
-                .push((class as u64) << 56 | (material as u64) << 32 | mesh.0.index() as u64);
-            f.ecs_matrices.push(gt.0.to_cols_array());
-            f.ecs_meshes.push(mesh.0);
+            // `ecs_matrices` is only resized, never cleared: an unchanged entity count costs
+            // no zero-fill, and every element up to `kept` is overwritten here.
+            if f.ecs_matrices.len() < kept {
+                f.ecs_matrices.resize(kept, [0.0; 16]);
+            }
+            gather_matrices(&transforms, &f.ecs_rows[first..kept], &mut f.ecs_matrices[first..kept]);
         }
+        f.ecs_matrices.truncate(kept);
         // Batches: by key, in query (spawn) order within a key. The order depends only on the
         // key sequence, so while that is unchanged (a static scene, or only transforms
         // moving) last frame's order is reused as is.
@@ -989,13 +1140,7 @@ impl Renderer {
         };
         // Matrices in batch order, diffed against last frame's.
         f.ecs.begin();
-        let (order, matrices) = (&f.ecs_order, &f.ecs_matrices);
-        f.ecs.write_all(
-            0,
-            order.len(),
-            order.iter().map(|&i| &matrices[i as usize]),
-            &mut cpu_reallocs,
-        );
+        f.ecs.write_gather(0, &f.ecs_order, &f.ecs_matrices, &mut cpu_reallocs);
         f.sources.clear();
         for &(key, first, count) in &f.ecs_runs {
             let Some((mesh, triangles)) = assets.gpu_mesh(f.ecs_meshes[f.ecs_order[first as usize] as usize]) else {
@@ -1006,6 +1151,7 @@ impl Renderer {
                 blend: class & CLASS_BLEND != 0,
                 class,
                 layout: 0,
+                pipeline: 0,
                 material: (key >> 32) as u32 & 0x00FF_FFFF,
                 mesh,
                 triangles,
@@ -1086,6 +1232,7 @@ impl Renderer {
                 blend: class & CLASS_BLEND != 0,
                 class,
                 layout: layout_id,
+                pipeline: 0,
                 material,
                 mesh,
                 triangles,
@@ -1096,17 +1243,10 @@ impl Renderer {
                 cull,
             });
         }
-        f.sources.sort_unstable_by_key(|s| {
-            (
-                s.blend,
-                s.class,
-                s.layout,
-                s.material,
-                s.mesh.alloc.first_index,
-                s.buffer,
-                s.first,
-            )
-        });
+        for s in &mut f.sources {
+            s.pipeline = pipeline_rank(&f.materials, assets, s.material);
+        }
+        f.sources.sort_unstable_by_key(source_sort_key);
         stats.batches = f.sources.len() as u32;
 
         // ---- views -------------------------------------------------------------------
@@ -1128,6 +1268,8 @@ impl Renderer {
         f.compact_params.begin();
         f.args_count = 0;
         f.run_count = 0;
+        f.gpu_submitted = 0;
+        f.gpu_triangles = 0;
         f.wg_total = 0;
         f.scan = None;
         let mut out_cursor = 0u64;
@@ -1193,6 +1335,7 @@ impl Renderer {
                     layout: s.layout,
                     class: s.class,
                     material: s.material,
+                    shader: None,
                     first_index: alloc.first_index,
                     index_count: alloc.index_count,
                     base_vertex: alloc.base_vertex as i32,
@@ -1270,15 +1413,7 @@ impl Renderer {
                             ..base_cmd
                         });
                     }
-                    let (kind, t_off, s_off, s_kind) = match s.cull {
-                        CullSource::Matrix { offset } => (0, offset / 4, 0, 0),
-                        CullSource::TranslationScale { translation, scale } => match scale {
-                            None => (1, translation / 4, 0, 0),
-                            Some((o, ScaleKind::Uniform)) => (1, translation / 4, o / 4, 1),
-                            Some((o, ScaleKind::Vector)) => (1, translation / 4, o / 4, 2),
-                        },
-                        CullSource::None => unreachable!(),
-                    };
+                    let (kind, t_off, s_off, s_kind) = cull_job_encoding(s.cull);
                     let sp = s.mesh.sphere;
                     f.jobs.push((
                         s.buffer,
@@ -1297,8 +1432,11 @@ impl Renderer {
                             pad: [0; 2],
                         },
                     ));
+                    // Upper bound until the readback of the visible count (see `render_frame`).
                     stats.instances_drawn += s.count as u64;
                     stats.triangles += s.count as u64 * tris;
+                    f.gpu_submitted += s.count as u64;
+                    f.gpu_triangles += s.count as u64 * tris;
                     continue;
                 }
 
@@ -1594,6 +1732,13 @@ impl Renderer {
         }
         let mgen = f.materials_buf.gpu.generation;
         for d in 0..f.draws.len() {
+            // Custom shaders: resolve the current source version (stale handles: built-in).
+            if let Some(h) = f.materials.shader(f.draws[d].material) {
+                f.draws[d].shader = assets.shaders.get(h.raw()).map(|e| {
+                    pipelines.sync_custom(h, e.version, &e.shader);
+                    (h, e.version)
+                });
+            }
             let tex = f.materials.texture(f.draws[d].material);
             let (view, sampler, version, layered) = match tex.and_then(|h| assets.textures.get(h.raw())) {
                 Some(e) => match &e.gpu {
@@ -1863,6 +2008,33 @@ impl Renderer {
                 self.stats.compute_dispatches += 1;
             }
         }
+        drop(pass);
+        // Visible counts for `RenderStats`, read back without waiting (see `readback.rs`).
+        self.uploader.reallocations += f.readback.record(
+            &self.device,
+            encoder,
+            f.args.get(),
+            f.args_count,
+            f.gpu_submitted,
+            self.frame_index,
+        );
+    }
+
+    /// Replace the upper bounds of GPU-culled batches in the stats with the newest read-back
+    /// visible counts (of an earlier frame).
+    fn apply_gpu_cull_counts(&mut self) {
+        let f = &mut self.frame;
+        if f.gpu_submitted == 0 {
+            f.readback.clear_latest();
+            return;
+        }
+        if let Some(c) = f.readback.latest() {
+            let s = &mut self.stats;
+            s.instances_drawn = s.instances_drawn - f.gpu_submitted + c.visible;
+            s.culled += c.submitted.saturating_sub(c.visible);
+            s.triangles = s.triangles - f.gpu_triangles + c.triangles;
+            s.gpu_counts_frame = Some(c.frame);
+        }
     }
 
     /// Record render passes for the prepared views. With `primary_to_offscreen`, only primary
@@ -2034,7 +2206,7 @@ impl Renderer {
             ViewTarget::Texture { handle, .. } if view.feedback => Some(*handle),
             _ => None,
         };
-        let mut last_pipeline: Option<(u16, u8, bool)> = None;
+        let mut last_pipeline: Option<PipelineState> = None;
         let mut last_material = u32::MAX;
         let mut layered = false;
         let mut last_vb: Option<(VertexSource, u64)> = None;
@@ -2063,10 +2235,11 @@ impl Renderer {
                     continue;
                 };
                 pass.set_bind_group(1, bg, &[cmd.material * material_stride]);
+                self.stats.material_switches += 1;
                 last_material = cmd.material;
                 layered = l;
             }
-            if last_pipeline != Some((cmd.layout, cmd.class, layered)) {
+            if last_pipeline != Some((cmd.layout, cmd.class, layered, cmd.shader)) {
                 let key = PipelineKey {
                     layout: cmd.layout,
                     class: cmd.class,
@@ -2074,9 +2247,11 @@ impl Renderer {
                     samples,
                     manual_srgb,
                     layered,
+                    shader: cmd.shader,
                 };
                 pass.set_pipeline(self.pipelines.forward(&self.device, key));
-                last_pipeline = Some((cmd.layout, cmd.class, layered));
+                self.stats.pipeline_switches += 1;
+                last_pipeline = Some((cmd.layout, cmd.class, layered, cmd.shader));
             }
             let (first_vertex, base_vertex) = direct_vertex_base(cmd.base_vertex, direct, base_vertex_supported);
             if slot0 != Some(first_vertex) {
@@ -2144,9 +2319,10 @@ impl Renderer {
         if (self.offscreen.width, self.offscreen.height, self.offscreen.samples) != (w, h, samples) {
             self.offscreen = crate::renderer::Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
         }
-        let draw_calls = self.stats.draw_calls;
+        // Re-recorded passes are not new draws: keep the frame's pass counters.
+        let stats = self.stats.clone();
         self.encode_views(encoder, None, true);
-        self.stats.draw_calls = draw_calls;
+        self.stats = stats;
     }
 }
 
@@ -2685,6 +2861,63 @@ mod tests {
         }
     }
 
+    /// Batches sort opaque → blended, then by pipeline (class, layout, shader/texture kind),
+    /// material and mesh: an interleaved spawn order groups every material's meshes together.
+    #[test]
+    fn sources_sort_pipeline_then_material_then_mesh() {
+        let source = |blend: bool, layout: u16, pipeline: u64, material: u32, first_index: u32| Source {
+            blend,
+            class: if blend { CLASS_BLEND } else { 0 },
+            layout,
+            pipeline,
+            material,
+            mesh: GpuMesh {
+                alloc: ArenaAlloc {
+                    base_vertex: 0,
+                    vertex_count: 0,
+                    first_index,
+                    index_count: 36,
+                },
+                sphere: Sphere {
+                    center: Vec3::ZERO,
+                    radius: 1.0,
+                },
+            },
+            triangles: 12,
+            buffer: SourceBuffer::Ecs,
+            first: first_index,
+            count: 1,
+            stride: 64,
+            cull: CullSource::Matrix { offset: 0 },
+        };
+        let mut sources = [
+            source(true, 0, 0, 0, 0),   // blended: last
+            source(false, 0, 0, 1, 36), // (mesh B, material 1)
+            source(false, 0, 0, 0, 36), // (mesh B, material 0)
+            source(false, 0, 2, 0, 0),  // custom shader: after the built-in pipeline
+            source(false, 0, 0, 1, 0),  // (mesh A, material 1)
+            source(false, 1, 0, 0, 0),  // another instance layout: after layout 0
+            source(false, 0, 0, 0, 0),  // (mesh A, material 0)
+        ];
+        sources.sort_unstable_by_key(source_sort_key);
+        let order: Vec<_> = sources
+            .iter()
+            .map(|s| (s.blend, s.layout, s.pipeline, s.material, s.mesh.alloc.first_index))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (false, 0, 0, 0, 0),
+                (false, 0, 0, 0, 36),
+                (false, 0, 0, 1, 0),
+                (false, 0, 0, 1, 36),
+                (false, 0, 2, 0, 0),
+                (false, 1, 0, 0, 0),
+                (true, 0, 0, 0, 0),
+            ]
+        );
+    }
+
     /// `order_by_key` is exactly a sort by (key, index).
     #[test]
     fn counting_sort_matches_a_key_index_sort() {
@@ -2720,6 +2953,40 @@ mod tests {
     /// nothing changed — ~55 ms per frame for a static 1M-entity scene with interleaved
     /// meshes/materials. The order now depends only on the key sequence and is reused while
     /// that is unchanged; moving entities never reorders.
+    /// Updating a custom shader drops the pipelines of its old version; removing it drops all
+    /// of its cached state (checked every 256 frames), so an editor that creates and removes
+    /// shaders does not accumulate pipelines.
+    #[test]
+    fn removed_custom_shaders_release_their_pipelines() {
+        use crate::{Camera3d, CustomShader, Mesh3d};
+        use space3d_core::{MeshData, Transform};
+        let Some(mut app) = headless_app(16, 16) else { return };
+        let shader = "fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> { return c.bgra; }";
+        let (mesh, h) = {
+            let a = app.resources.expect_mut::<RenderAssets>();
+            (
+                a.add_mesh(MeshData::cube(1.0)),
+                a.add_shader(CustomShader::new("a", shader)),
+            )
+        };
+        app.world
+            .spawn((Transform::default(), Mesh3d(mesh), Material::default().with_shader(h)));
+        app.world
+            .spawn((Transform::from_xyz(0.0, 0.0, 3.0), Camera3d::default()));
+        let counts = |app: &space3d_core::App| app.resources.expect::<Renderer>().pipelines.custom_counts();
+        app.step_ticks(1);
+        assert_eq!(counts(&app), (1, 1));
+        let v2 = format!("{shader}\nfn my_unused() {{}}");
+        app.resources
+            .expect_mut::<RenderAssets>()
+            .update_shader(h, CustomShader::new("a", v2));
+        app.step_ticks(1);
+        assert_eq!(counts(&app), (1, 1), "the old version's pipeline is dropped");
+        app.resources.expect_mut::<RenderAssets>().remove_shader(h);
+        app.step_ticks(256);
+        assert_eq!(counts(&app), (0, 0));
+    }
+
     #[test]
     fn static_ecs_scenes_reuse_the_batch_order() {
         use crate::{Camera3d, Mesh3d};

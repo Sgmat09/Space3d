@@ -1,6 +1,6 @@
 //! ECS components and resources understood by the renderer.
 
-use crate::handles::{MeshHandle, TextureHandle};
+use crate::handles::{MeshHandle, ShaderHandle, TextureHandle};
 use glam::{Mat4, Vec3, Vec4};
 
 /// Renders the entity's mesh with its [`Material`] at its `GlobalTransform`.
@@ -59,6 +59,9 @@ pub struct Material {
     pub double_sided: bool,
     /// Alpha blending (drawn after opaque geometry, no depth writes).
     pub alpha_blend: bool,
+    /// Custom WGSL hooks ([`crate::CustomShader`], registered with
+    /// [`crate::RenderAssets::add_shader`]); `None` uses the built-in shader only.
+    pub shader: Option<ShaderHandle>,
 }
 
 impl Default for Material {
@@ -72,6 +75,7 @@ impl Default for Material {
             unlit: false,
             double_sided: false,
             alpha_blend: false,
+            shader: None,
         }
     }
 }
@@ -110,6 +114,11 @@ impl Material {
     /// Set emissive radiance (linear).
     pub fn with_emissive(mut self, emissive: Vec3) -> Self {
         self.emissive = emissive;
+        self
+    }
+    /// Draw with a [`crate::CustomShader`] (its hooks run inside the built-in shader).
+    pub fn with_shader(mut self, shader: ShaderHandle) -> Self {
+        self.shader = Some(shader);
         self
     }
 }

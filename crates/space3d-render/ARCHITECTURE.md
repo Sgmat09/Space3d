@@ -15,7 +15,9 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | `arena.rs` | mesh arena: shared vertex/index buffers, first-fit range allocator, GPU-side growth |
 | `assets.rs` | `RenderAssets`: handle allocation without a GPU, pending uploads, textures/render targets |
 | `texture.rs` | `write_texture` uploads (block-aware pitch), GPU mip generation, sampler cache |
-| `pipeline.rs` | GPU uniform layouts, WGSL generation per instance layout, pipeline cache |
+| `pipeline.rs` | GPU uniform layouts, WGSL generation per instance layout (+ custom shader hooks), pipeline cache |
+| `shader.rs` | `CustomShader`: user WGSL hooks spliced into the forward shader |
+| `readback.rs` | non-blocking readback of GPU-culled visible counts for `RenderStats` |
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
 | `dirty.rs` | `DirtyRanges`: sorted, coalescing range set |
 | `stats.rs` | `RenderStats`, `DrawPath` |
@@ -31,14 +33,15 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 
  World ──┬─ lights (DirectionalLight ≤4, PointLight ≤16) ─────────────► GpuView (per camera)
          ├─ cameras (Camera3d + GlobalTransform, sorted by order) ─────► views + frustums
-         ├─ ECS: (GlobalTransform, Mesh3d, Material, Visibility?)
-         │      intern Material → id (cached) ; key = class|material|mesh
+         ├─ ECS: (GlobalTransform, Mesh3d, Material, Visibility?) — archetype columns
+         │      intern Material → id (cached) ; key = class|material|mesh   (serial)
+         │      gather matrices of kept rows                    (rayon ≥ 32k per archetype)
          │      bucket by key (order reused while the key sequence is unchanged)
-         │      write matrices into `ecs` TrackedBuffer (diff vs shadow) ─► ECS sources
+         │      diff matrices into `ecs` TrackedBuffer shadow   (rayon ≥ 32k) ─► ECS sources
          └─ InstancedMesh ─► InstanceBuffers[handle]
                 sync dirty ranges ─► per-buffer GrowBuffer ───────────────► explicit sources
 
- sources sorted by (blend, pipeline class, layout, material, mesh, buffer)
+ sources sorted by (blend, class, layout, shader + texture kind, material, mesh, buffer)
 
  for each view:
    CpuDirect:  ECS → per-instance sphere test (one pass, rayon for large batches);
@@ -53,9 +56,10 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  flush TrackedBuffers (only changed bytes) ─► staging ring ─► copy_buffer_to_buffer
    (CpuDirect: `ecs` uploads only ranges drawn from it; the rest stays pending)
  encoder: [uploads] → copy templates→args → clear counts
-          → compute(mark → scan → scatter [+compact])
+          → compute(mark → scan → scatter [+compact]) → copy args → stats readback ring
           → per view: [copy own render target → feedback texture] → render pass
           → submit → present → staging recall → poll(Poll)
+ next frames: read the mapped args copy (visible counts) into RenderStats
 ```
 
 Everything above happens in **one command encoder and one submit per frame**.
@@ -63,13 +67,20 @@ Everything above happens in **one command encoder and one submit per frame**.
 ## Instancing
 
 ### Path 1 — automatic ECS batching
-Entities with `Mesh3d + Material + GlobalTransform` are gathered in query order into compact
-arrays (batch key, matrix, mesh), grouped by key `(pipeline class, material id, mesh)` — a
-counting sort that keeps query order within a key, so the result equals a stable sort — and
-written contiguously into the persistent `ecs` instance buffer (`InstanceTransform`, 64 B).
+Entities with `Mesh3d + Material + GlobalTransform` are extracted archetype by archetype (the
+order hecs queries use), reading the component columns as slices: a serial pass interns each
+material and records the batch key, mesh and row of every visible entity; the matrices of the
+kept rows are then gathered into a compact array, split across rayon workers for archetypes
+of 32 768 entities or more. The entities are grouped by key `(pipeline class, material id,
+mesh)` — a counting sort that keeps query order within a key, so the result equals a stable
+sort — and their matrices written contiguously into the persistent `ecs` instance buffer
+(`InstanceTransform`, 64 B). That write diffs against the CPU shadow; at 32 768 entities or
+more it runs on all workers in chunks of 2048, each reporting up to four changed runs (more
+are merged into the last), so sparse changes still upload exactly the changed matrices.
 The grouping depends only on the key sequence, so it is reused as long as that sequence is
 unchanged (static scenes, or only transforms moving); hecs has no change detection, so the
-per-entity extraction and matrix diff still run every frame. Each run of equal keys becomes one *source*
+per-entity extraction and matrix diff still run every frame (see Performance: about 7 ms of
+render-stage CPU for a static 1M-entity scene, 8.4 ms when all of them move). Each run of equal keys becomes one *source*
 → one instanced draw. Materials are plain values; `MaterialTable` interns equal materials
 (hash of their bit patterns; the previous entity's material and a 64-slot direct-mapped cache
 answer almost every lookup with one key comparison, so the map is only probed on misses) into
@@ -87,20 +98,28 @@ a `const LAYOUT: &'static InstanceLayout` listing attributes and their *semantic
 |---|---|
 | `ModelMatrix` | 4×`Float32x4` columns |
 | `Translation`, `Rotation` (quat, any float/snorm format), `Scale`, `UniformScale` | TRS → model matrix |
+| `TranslationScale` | `xyz` translation + `w` uniform scale in one 4-component float attribute |
 | `Color` | linear tint × material color |
 | `UvRect` | atlas rect (`uv * zw + xy`) |
 | `TextureLayer` | texture-array layer (atlas page / animation frame) |
-| `Custom(n)` | reserved for custom pipelines (ignored by the built-in shader) |
+| `Custom(n)` | bound as `inst.customN`; read by [custom shaders](#custom-shaders) via `instance_customN(inst)`, ignored by the built-in shader |
 
 `pipeline.rs` generates the `InstanceInput` struct and accessor functions for each layout and
 splices them into `forward.wgsl` (`instance_model`, `instance_color`, `instance_uv_rect`,
-`instance_layer`). Pipelines are cached by `(layout, class, format, samples, manual_srgb,
-layered)` (`layered`: the material texture is an array, see Textures). `Unorm8x4Bgra`
+`instance_layer`, `instance_custom0..3` plus one per declared `Custom(n)`). `validate()`
+enforces WebGPU's rules (offset aligned to `min(4, format size)`, each semantic once) and at
+most 12 instance shader locations (16 vertex attributes, 4 used by the mesh). Pipelines are
+cached by `(layout, class, format, samples, manual_srgb, layered, custom shader + version)`
+(`layered`: the material texture is an array, see Textures). `Unorm8x4Bgra`
 attributes are fetched as `Unorm8x4` and swizzled in the generated shader: wgpu's GL backend
 passes `GL_BGRA` as the component count, which WebGL2/GLES reject.
 Built-ins: `InstanceTransform` (64 B), `InstanceTransformColor` (80 B), `InstanceCompact`
 (32 B: pos + uniform scale + f32 quat), `InstancePacked` (32 B: pos + scale + snorm16 quat +
-unorm8 color + layer — 2.5× smaller than matrix + color).
+unorm8 color + layer — 2.5× smaller than matrix + color), `InstanceHalf` (16 B: f16 pos +
+uniform scale as one `Float16x4` `TranslationScale`, snorm16 quat). f16 has an 11-bit
+significand — steps of 1/64 at 16–32 units, 0.5 at 512–1024, 32 near the 65 504 maximum — so
+`InstanceHalf` suits bounded or camera-relative scenes, not large worlds. `f32_to_f16` /
+`f16_to_f32` convert (round to nearest even).
 
 `InstanceBuffer<T>` is user-owned CPU data registered in the `InstanceBuffers` resource. Every
 mutating accessor (`set`, `get_mut`, `range_mut`, `push`, `swap_remove`, `as_mut_slice`, …)
@@ -116,8 +135,14 @@ native, when it needs them — GPU culling paths never compute bounds at all. Re
 (`swap_remove`, `truncate`) keep the remaining boxes, which stay conservative, so removing one
 instance costs one block, not a rescan. The built-in formats read position/scale fields
 directly; other layouts decode them at offsets resolved at compile time
-(`InstanceLayout::cull_source` is a `const fn`). `set_bounds` overrides the automatic bounds
-with one box for the whole buffer; edits made meanwhile are still tracked.
+(`InstanceLayout::cull_source` is a `const fn`): a model matrix, or a translation in
+`Float32x3/x4` or `Float16x4` with an optional `f32`/`f16` uniform or vector scale (the GPU
+culler decodes f16 by hand, so no `SHADER_F16` feature is needed). Positions in other formats
+(snorm, integer) cannot be decoded: such layouts render but are never culled per instance —
+the renderer logs a warning the first time it sees one — and the CPU path culls them per
+block only if the type overrides `InstanceData::bounds` (otherwise they are always drawn).
+`set_bounds` overrides the automatic bounds with one box for the whole buffer; edits made
+meanwhile are still tracked.
 
 ### Draw paths and GPU-driven culling
 
@@ -137,8 +162,8 @@ GLES 3.0/3.1) always use `CpuDirect` (see Mesh arena).
 GPU culling (`shaders/cull.wgsl`):
 
 * A **job** per (view, source): source word offset, count, stride, how to decode position/scale
-  (`CullSource::Matrix` or `TranslationScale`, f32 only), mesh bounding sphere, output region,
-  indirect-args index. Jobs of the same source buffer share one dispatch; each workgroup finds
+  (`CullSource::Matrix`, or `TranslationScale` in f32 or f16), mesh bounding sphere, output
+  region, indirect-args index. Jobs of the same source buffer share one dispatch; each workgroup finds
   its job by binary search over `wg_start`, so a dispatch covers any number of batches.
 * **Order-preserving compaction** in three dispatches, so GPU paths draw visible instances in
   exactly the CPU path's order (alpha blending and equal-depth surfaces are deterministic):
@@ -163,12 +188,48 @@ GPU culling (`shaders/cull.wgsl`):
 * `GpuMultiDrawCount` adds `compact.wgsl`: one workgroup per run moves the run's non-empty
   args to its front **in their original order** (block counts + prefix sum) and stores the
   count, so `multi_draw_indexed_indirect_count` skips fully culled batches.
-* Layouts whose position is not f32, explicit buffers or an ECS batch larger than
-  `max_storage_buffer_binding_size`, and output regions that would end past that binding in
-  `cull_out` (which accumulates every view's regions) fall back to CPU culling + direct draws
-  for that view, even on GPU paths.
+* Explicit buffers or an ECS batch larger than `max_storage_buffer_binding_size`, and output
+  regions that would end past that binding in `cull_out` (which accumulates every view's
+  regions) fall back to CPU culling + direct draws for that view, even on GPU paths. So do
+  layouts whose position cannot be decoded (see above), which on the CPU path are culled per
+  block only with user bounds.
 
-Transparent materials (`alpha_blend`) sort after opaque batches (no per-instance depth sort).
+Batches are drawn in the order `(blend, class, instance layout, custom shader + texture kind,
+material, mesh)`: transparent materials (`alpha_blend`) after opaque ones (no per-instance
+depth sort), and within each, every pipeline is set once per view and every material once per
+pipeline, whatever the spawn order; runs of one material's meshes are contiguous, so
+multi-draw paths merge them. `RenderStats::pipeline_switches` / `material_switches` count the
+binds (`tests/instancing.rs::batches_are_ordered_by_pipeline_then_material_then_mesh`).
+
+## Custom shaders
+A `CustomShader` is WGSL spliced into the built-in forward shader, registered with
+`RenderAssets::add_shader` and selected per material with `Material::with_shader`. It defines
+`vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut` (end of the vertex
+stage) and/or `fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32>` (end of the fragment
+stage, `color` = lit linear color); a missing hook is the identity. Everything the template
+declares is in scope: the generated `InstanceInput` and its accessors — including
+`instance_customN(inst)` (the `Custom(N)` attribute as a zero-padded `vec4<f32>`; slots 0–3
+always exist and are zero when the layout lacks them, so a shader using them works with every
+layout) and the raw `inst.customN` — the
+`view`/`material` uniforms, `sample_base`, the color helpers, and in custom pipelines an extra
+interpolated varying `VsOut.custom: vec4<f32>` to pass data from the vertex to the fragment
+hook. This is how per-instance custom data is consumed: `tests/custom_shader.rs` renders a
+user `InstanceData` whose `Custom(0)`/`Custom(3)` attributes set each instance's color, on
+every draw path (GPU culling copies whole instances, custom bytes included).
+
+Each (instance layout, sRGB mode, texture kind, shader version) gets its own module and
+pipelines, cached like the built-in ones; the material's shader is part of its identity and
+of the batch order. `update_shader` (hot reload) bumps a version that drops the old
+pipelines; `remove_shader` reverts its materials to the built-in shader, and the pipelines of
+removed shaders are released at the next 256-frame sweep. A shader that does not compile is
+validated with naga first (the portable capability set) and its pipeline is created inside a
+validation error scope, so the error never reaches the uncaptured-error handler: it is logged
+once, reported by `Renderer::shader_error`, and the draws fall back to the built-in shader.
+(Native backends resolve the error scope immediately; in the browser its result arrives
+asynchronously and is not waited for, so there naga's validation is the check.)
+Custom shaders cannot declare their own bindings, and culling still uses the instance's
+position and scale (a vertex hook that moves geometry far outside the mesh bounds can be culled
+while visible).
 
 ## CPU → GPU transfer
 
@@ -186,13 +247,16 @@ frees a chunk and creates one of exactly the request size whenever a write is la
 chunk it has, so a growing upload leaked one mapped chunk per frame. `queue.write_buffer_with`
 was rejected: it allocates a fresh staging buffer per call in wgpu-core and runs before the
 encoder's copies.) Copies ≥ 1 MiB are split across rayon workers on native
-(`copy_to_staging`, disjoint `WriteOnly` sub-slices).
+(`copy_to_staging`, disjoint `WriteOnly` sub-slices; checked byte for byte without a GPU in
+`gpu::tests::parallel_staging_copies_are_exact` and pixel for pixel — one instance per pixel
+of a 3.2 MB buffer — in `tests/instancing.rs::parallel_staging_copies_deliver_every_instance`).
 
 ### Change detection
 * **User buffers** — explicit dirty ranges (`DirtyRanges`: sorted, merged when adjacent or within
   16 instances; at most 64 ranges — once saturated, a new range within the set's average
   spacing of a neighbour is folded into it in O(1), otherwise the closest pair is merged).
-  >50 % dirty → one full copy.
+  >50 % dirty → one full copy
+  (`tests/instancing.rs::more_than_half_dirty_uploads_the_whole_buffer`).
 * **Renderer-owned buffers** (`TrackedBuffer`: ECS instances, per-view visible instances, view
   uniforms, materials, cull jobs/params, args templates, draw meta) keep a CPU shadow; writes are
   compared with it and only differing byte ranges are uploaded. Result: an unchanged scene with a
@@ -204,7 +268,8 @@ encoder's copies.) Copies ≥ 1 MiB are split across rayon workers on native
 
 ### Persistent buffers and growth
 `GrowBuffer` never reallocates per frame: capacity grows 1.5× (256-byte aligned) or exactly for
-`Static` data; reallocation bumps a generation so dependent bind groups are rebuilt, and tracked
+`Static` data (pushing one instance per frame for 1000 frames reallocates a `Dynamic` buffer
+at most 20 times: `tests/instancing.rs::growing_dynamic_buffers_reallocate_logarithmically`); reallocation bumps a generation so dependent bind groups are rebuilt, and tracked
 buffers re-upload their shadow. wgpu zero-initializes new buffers, which the shadow diff relies on.
 
 ### Mesh arena
@@ -233,7 +298,9 @@ Indirect args carry the base themselves and are only used where the flag exists.
 `Renderer::supports_texture_format`). Materials sample through a filterable-float binding, so
 only formats that are filterable float on the device are accepted (`FLOAT32_FILTERABLE` is
 requested when available); integer, depth and unsupported formats log an error and sample
-white. Single-layer textures (images, render targets, the white fallback) are bound as `D2`
+white, and so do block-compressed textures whose size is not a whole number of blocks (wgpu
+would reject them with a validation panic; smaller mips may be partial blocks and are
+uploaded with their block-aligned physical extent). Single-layer textures (images, render targets, the white fallback) are bound as `D2`
 views and sampled as `texture_2d`; multi-layer textures as `D2Array` / `texture_2d_array`
 with the layer chosen per instance. The two kinds use separate material bind group layouts
 and pipeline variants: wgpu's GL backend binds a texture with the target implied by its layer
@@ -243,7 +310,12 @@ unused extra layer. Missing mips of formats the device can render to are generat
 with a linear blit per level and layer (sRGB-correct): the source is a view of the previous
 level of the texture's own kind (all layers for arrays, layer picked by the draw's vertex
 range), since GL cannot sample one layer of an array through a `D2` view. Otherwise only the
-provided mips are uploaded.
+provided mips are uploaded. `tests/textures.rs` checks generated mips (a minified one-texel
+red/blue pattern averages to the sRGB-correct purple), full BC1/BC7/ETC2/ASTC mip chains at
+power-of-two and odd sizes (each format the adapter supports), the unaligned-size refusal,
+and atlas sampling through `UvRect`. (Forced onto ANGLE's GL backend on macOS — GLES 3.0,
+which must report ETC2 — ETC2 textures upload without error but sample black: a driver
+limitation outside what wgpu or the renderer can detect. The other checks pass there.)
 
 Render-target textures (`RenderAssets::add_render_target`, resized with
 `resize_render_target`) get their own depth buffer and can be sampled by materials. A texture
@@ -264,36 +336,73 @@ frame's content, like a video feedback loop.
 | view uniforms | UNIFORM, dynamic offset per camera | persistent | shadow diff |
 | material uniforms | UNIFORM, dynamic offset per material | persistent | on intern only |
 | cull params / jobs / templates / draw meta | UNIFORM / STORAGE / COPY_SRC | persistent | shadow diff |
-| `cull_out`, args (+ compaction records), compacted args, counts | STORAGE+VERTEX / STORAGE+INDIRECT | persistent, 1.5× | GPU only (compute, copy, clear) |
+| `cull_out`, args (+ compaction records), compacted args, counts | STORAGE+VERTEX / STORAGE+INDIRECT (args also COPY_SRC for the stats readback) | persistent, 1.5× | GPU only (compute, copy, clear) |
 | run meta (multi-draw-count runs) | STORAGE | persistent | shadow diff |
 | render-target feedback copies | TEXTURE_BINDING+COPY_DST | while a view samples its own target (+60 frames) | GPU copy before the pass |
 | staging chunks (4 MiB) | MAP_WRITE+COPY_SRC | recycled ring; idle chunks beyond 2× the recent per-frame peak are freed | CPU |
 | capture readback | MAP_READ | per capture | GPU copy |
+| culling-stats readback (3) | MAP_READ | persistent ring, 1.5× (all idle slots grow together) | GPU copy of the indirect args |
 
 Every `GrowBuffer` (1.5× growth) is clamped to the device's `max_buffer_size`; callers keep the
 requested size itself within it (explicit instance buffers over the limit are logged and not
 drawn).
 
-## No allocation in our code in the steady state
-All per-frame scratch (ECS keys/matrices/order, `sources`, `cameras`, `views`, `draws`, `jobs`,
-`dispatches`, culling masks) lives in `FrameState` and is cleared, not dropped. Asset and instance registries are moved out
-of the resource map with `mem::take`, and `render_system` borrows the `Renderer` with
-`Resources::scope`, which moves its existing Box out and back (no re-boxing). Large staging
-copies, block-bounds refreshes and large CPU culling batches are split with rayon parallel
-iterators, whose `join`-based jobs live on the stack (`scope.spawn` would box every task). `RenderStats::cpu_reallocations` counts scratch growth
-and is asserted to be 0 on steady frames in
-`tests/instancing.rs::static_buffer_and_static_scene_upload_nothing_after_first_frame`.
-wgpu's own per-frame bookkeeping (encoders, passes, submission, the boxed `map_async` callbacks
-of the staging recall) allocates and is outside this guarantee: a counting-allocator probe
-attributes every remaining steady-state allocation to wgpu/naga (46–101 per frame depending on
-path and scene).
+## Allocation in the steady state
+**Renderer code allocates nothing per frame.** All per-frame scratch (ECS keys/rows/matrices/
+order, `sources`, `cameras`, `views`, `draws`, `jobs`, `dispatches`, culling masks, the
+parallel diff's per-chunk runs) lives in `FrameState` or its buffers and is cleared, not
+dropped. Asset and instance registries are moved out of the resource map with `mem::take`, and
+`render_system` borrows the `Renderer` with `Resources::scope`, which moves its existing Box
+out and back (no re-boxing). Large staging copies, ECS gathers and diffs, block-bounds
+refreshes and large CPU culling batches use rayon parallel iterators, whose `join`-based jobs
+live on the stack (`scope.spawn` would box every task). `RenderStats::cpu_reallocations`
+counts scratch growth and is asserted to be 0 on steady frames
+(`tests/instancing.rs::static_buffer_and_static_scene_upload_nothing_after_first_frame`,
+`tests/alloc.rs`).
+
+**wgpu's per-frame bookkeeping does allocate**, and it is the whole remainder: command
+encoder, passes (their command lists grow from empty each frame), `set_*`/`dispatch` calls in
+wgpu-hal's Metal backend, indirect-draw validation, submission, and the boxed callbacks the
+renderer hands to wgpu (staging-ring recall, culling-stats readback). Measured with a
+counting global allocator on Apple M4 Max / Metal, wgpu 30.0.1, release build, 100k
+instances at 256×256 (30 warm-up + 120 measured frames; min–max per frame):
+
+| scene | `CpuDirect` | `GpuIndirect` / `GpuMultiDraw` |
+|---|---|---|
+| explicit buffer, full rewrite / 1000 sparse edits / `Stream` | 56–57 | 104–105 |
+| ECS, all 100k moving | 56–57 | 107–111 |
+| ECS, static | 46–47 | 98–99 |
+
+Backtraces of one traced frame per case put every allocation inside a wgpu, wgpu-hal or naga
+call, except rayon's injector queue (crossbeam-deque), which allocates one block per 63 jobs
+submitted from outside the pool — about once every 15–60 frames. The culling-stats readback
+accounts for 7–8 of the GPU paths' allocations. No bytes stay allocated across frames.
+
+`tests/alloc.rs` pins this: a scene with 40k moving ECS entities (two materials, one
+textured), a 100k-instance dynamic buffer rewritten every frame, an f16 buffer and a custom
+shader allocates 82–86 times per frame on `CpuDirect` and 191–195 on the GPU paths on Metal
+(test profile; 4 batches, 3 pipeline binds and, on GPU paths, 7 compute dispatches —
+wgpu-hal's Metal backend allocates in every dispatch and pipeline bind). The test fails above 95 / 215 (Metal;
+twice that on other backends, whose wgpu-hal code differs), if the second half of 120 frames
+allocates more on average than the first, or if 256 KiB or more stays allocated.
 
 ## RenderStats
 `draw_calls`, `indirect_draw_calls`, `multi_draw_calls`, `batches`, `instances`,
-`instances_drawn`, `culled` (CPU-visible count; GPU culling results stay on the GPU),
-`triangles`, `bytes_uploaded`, `instance_bytes_uploaded`, `buffer_reallocations`,
-`cpu_reallocations`, `compute_dispatches`, `draw_path`, `gpu_culling`, `meshes_uploaded`,
+`instances_drawn`, `culled`, `triangles`, `gpu_counts_frame`, `bytes_uploaded`,
+`instance_bytes_uploaded`, `buffer_reallocations`, `cpu_reallocations`, `compute_dispatches`,
+`pipeline_switches`, `material_switches`, `draw_path`, `gpu_culling`, `meshes_uploaded`,
 `textures_uploaded`, `views`, `frame`.
+
+Visible counts of GPU-culled batches exist only in the indirect args. Every GPU-culling frame
+copies its args (20 B per culled batch) into one of three `MAP_READ` buffers, mapped when the
+frame's submission completes (`map_buffer_on_submit`); a later frame sums a mapped copy
+(`readback.rs`). Nothing waits for the GPU, so `instances_drawn`, `culled` and `triangles` of
+GPU-culled batches are those of an earlier frame, named by `gpu_counts_frame`: normally the
+previous one (1 frame of latency; `tests/instancing.rs::gpu_culling_stats_are_read_back`), 2–3
+when the GPU runs behind, and a frame is not read back at all while all three buffers are in
+flight. Until the first copy is read (e.g. the first GPU-culling frame) those batches count as
+fully drawn and `gpu_counts_frame` is `None`; CPU-culled batches always report the current
+frame.
 
 ## Headless capture and determinism
 Headless renderers draw primary cameras into an offscreen `Rgba8UnormSrgb` target.
@@ -351,6 +460,39 @@ scenes on wgpu's GL backend and compares them with the default backend; it skips
 adapter (on macOS, use ANGLE — ES 3.0, WebGL2's level — as described in the file). Unit tests
 also force `caps.base_vertex = false` on the default backend.
 
+## Performance
+Latest measurements (2026-09-24, working tree of the `render-fixes` branch; Apple M4 Max,
+Metal; release builds). The machine was shared with other builds throughout (load average
+20–80), so absolute times vary by up to 2× between runs; A/B comparisons were run
+interleaved, and the numbers below are medians of the quieter runs.
+
+Criterion (`cargo bench -p space3d-render --bench instancing`, `CpuDirect`, camera looking
+away, each iteration waits for the GPU; load ≈ 20):
+
+| bench | median | throughput |
+|---|---|---|
+| `extract_upload/explicit/100k` (rewrite all, 3.2 MB) | 0.67 ms | 150 M instances/s |
+| `extract_upload/explicit/1000k` (rewrite all, 32 MB) | 1.96 ms | 510 M instances/s |
+| `extract_upload/ecs/100k` (all moving, incl. transform propagation) | 2.27 ms | 44 M entities/s |
+| `extract_upload/ecs_static_mixed/100k` (4 meshes × 8 materials interleaved) | 2.22 ms | 45 M entities/s |
+| `mesh_arena/upload_1000` (145k vertices, 728k indices) | 1.92 ms | 520 k meshes/s |
+
+Render-stage CPU time at 1M instances, 1280×720 (median of 40 frames, counting-allocator
+probe; "before" is the same probe built from the previous commit, run interleaved):
+
+| scene | path | before | now |
+|---|---|---|---|
+| ECS, 1M moving entities | `GpuMultiDraw` | 10.6–10.7 ms | 8.4–8.6 ms |
+| ECS, 1M moving entities | `CpuDirect` | 13.4–15.1 ms | 11.3–11.5 ms |
+| ECS, 1M static entities | `GpuMultiDraw` | 8.7–8.8 ms | 7.1 ms |
+| explicit `InstanceCompact`, 1M rewritten (32 MB) | `GpuMultiDraw` / `CpuDirect` | — | 0.8 / 1.2 ms (+ 5 ms GPU wait) |
+
+The explicit path meets a 60 Hz budget at 1M instances with room to spare. In a profile of 1M
+moving ECS entities (`GpuMultiDraw`, taken under load) the render stage's main thread spent
+about 35 % in the 64 MB staging copy, 27 % in the serial per-entity key pass (material
+interning, visibility and mesh checks) and 38 % in the parallel matrix gather and diff, so 1M+
+dynamic objects belong in `InstanceBuffer`s. Allocation counts are in [Allocation in the steady state](#allocation-in-the-steady-state).
+
 ## Known limitations
 * No shadows, IBL or post-processing; lighting is metallic/roughness Blinn-Phong with Schlick
   Fresnel, 4 directional + 16 point lights.
@@ -358,6 +500,9 @@ also force `caps.base_vertex = false` on the default backend.
   to once per second), so the window can stay blank briefly.
 * Layer indices past a texture array's last layer sample the unused padding layer on GL for
   square arrays of 6k layers (other backends clamp to the last layer).
-* GPU-culled visible counts are not read back (stats report pre-cull counts on GPU paths).
+* GPU-culled visible counts in `RenderStats` lag by 1–3 frames (read back without blocking).
 * Transparent instances are not depth-sorted within a batch.
-* `InstanceSemantic::Custom` attributes need a custom pipeline, which is not exposed yet.
+* ECS extraction interns materials and checks meshes serially (the matrix gather and diff are
+  parallel); instance layouts whose position is not f32/f16 are not culled per instance.
+* Custom shaders are hooks inside the forward shader: they cannot declare bindings or replace
+  the lighting model's inputs, and culling ignores vertex displacement.

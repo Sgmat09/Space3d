@@ -1,0 +1,120 @@
+//! Custom shaders: user WGSL hooks spliced into the built-in forward shader.
+
+/// User WGSL spliced into the built-in forward shader, selected per material with
+/// [`crate::Material::with_shader`] (register it with [`crate::RenderAssets::add_shader`]).
+///
+/// The source defines one or both hooks (a missing one is the identity):
+///
+/// ```wgsl
+/// // End of the vertex stage: adjust any output (position, uv, color, `out.custom`).
+/// fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut
+/// // End of the fragment stage: `color` is the lit linear color (alpha = base alpha).
+/// fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32>
+/// ```
+///
+/// Everything the built-in shader declares is in scope: `VertexInput` (`position`, `normal`,
+/// `uv`, `color`), the generated `InstanceInput` with its accessors (`instance_model`,
+/// `instance_color`, …, and `instance_customN(inst) -> vec4<f32>` for every
+/// [`crate::InstanceSemantic::Custom`] attribute `N` of the instance layout, zero-padded — slots
+/// 0–3 always exist and return zero when the layout lacks them — plus the raw field
+/// `inst.customN` in the attribute's own type), `VsOut`
+/// (`clip`, `world_pos`, `normal`, `uv`, `color`, `layer`, and `custom: vec4<f32>`, an extra
+/// interpolated varying for passing data from `vertex_hook` to `fragment_hook`), the `view`
+/// and `material` uniforms, `sample_base(uv, layer)` and the helpers `srgb_to_linear`,
+/// `linear_to_srgb`, `quat_to_mat3`, `trs`. Custom shaders cannot declare their own bindings.
+/// Prefix your own helper functions (e.g. `my_`) to avoid clashes with the template.
+///
+/// The same material/shader works with every instance layout and on every draw path; GPU
+/// culling uses the instance's position and scale, so a `vertex_hook` that moves vertices far
+/// beyond the mesh bounds can be culled while (partly) visible.
+///
+/// A shader that fails to compile for a layout is reported once through `tracing` and by
+/// [`crate::Renderer::shader_error`]; its draws fall back to the built-in shader instead of
+/// failing the frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomShader {
+    /// Debug name (shader labels, error messages).
+    pub name: String,
+    /// WGSL defining `vertex_hook` and/or `fragment_hook` (and any helpers they use).
+    pub wgsl: String,
+}
+
+impl CustomShader {
+    /// A named custom shader.
+    pub fn new(name: impl Into<String>, wgsl: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            wgsl: wgsl.into(),
+        }
+    }
+
+    /// Declares `vertex_hook`.
+    pub(crate) fn has_vertex_hook(&self) -> bool {
+        declares(&self.wgsl, "vertex_hook")
+    }
+
+    /// Declares `fragment_hook`.
+    pub(crate) fn has_fragment_hook(&self) -> bool {
+        declares(&self.wgsl, "fragment_hook")
+    }
+}
+
+/// Whether `src` contains `fn <name>` followed by `(` (whitespace allowed around the name).
+fn declares(src: &str, name: &str) -> bool {
+    src.match_indices("fn").any(|(i, _)| {
+        let before_ok = src[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let rest = src[i + 2..].trim_start();
+        before_ok
+            && src[i + 2..].starts_with(char::is_whitespace)
+            && rest.strip_prefix(name).is_some_and(|r| r.trim_start().starts_with('('))
+    })
+}
+
+pub(crate) const DEFAULT_VERTEX_HOOK: &str =
+    "fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {\n    return out;\n}\n";
+pub(crate) const DEFAULT_FRAGMENT_HOOK: &str =
+    "fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {\n    return color;\n}\n";
+
+/// WGSL replacing the template's HOOKS marker: the custom source (if any) plus identity
+/// functions for the hooks it does not declare.
+pub(crate) fn hooks_wgsl(shader: Option<&CustomShader>) -> String {
+    let mut s = String::new();
+    if let Some(c) = shader {
+        s += &c.wgsl;
+        s += "\n";
+    }
+    if !shader.is_some_and(CustomShader::has_vertex_hook) {
+        s += DEFAULT_VERTEX_HOOK;
+    }
+    if !shader.is_some_and(CustomShader::has_fragment_hook) {
+        s += DEFAULT_FRAGMENT_HOOK;
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_detection() {
+        let s = CustomShader::new(
+            "t",
+            "fn fragment_hook (in: VsOut, c: vec4<f32>) -> vec4<f32> { return c; }",
+        );
+        assert!(s.has_fragment_hook() && !s.has_vertex_hook());
+        let s = CustomShader::new("t", "fn my_vertex_hook(x: f32) -> f32 { return x; }\nfn vertex_hook(");
+        assert!(s.has_vertex_hook());
+        assert!(!CustomShader::new("t", "fn my_vertex_hook(x: f32) {}").has_vertex_hook());
+        assert!(!CustomShader::new("t", "// vertex_hook").has_vertex_hook());
+        let h = hooks_wgsl(Some(&CustomShader::new("t", "fn vertex_hook(v: VertexInput) {}")));
+        assert!(h.contains("fn fragment_hook") && h.matches("fn vertex_hook").count() == 1);
+        assert_eq!(
+            hooks_wgsl(None),
+            format!("{DEFAULT_VERTEX_HOOK}{DEFAULT_FRAGMENT_HOOK}")
+        );
+    }
+}

@@ -31,10 +31,10 @@ struct Job {
     src_word: u32,          // first word of instance 0 in `src`
     count: u32,             // instances
     stride_words: u32,
-    kind: u32,              // 0: model matrix, 1: translation (+ optional scale)
+    kind: u32,              // 0: model matrix, 1: f32 translation, 2: f16 translation (+ scale)
     t_off: u32,             // matrix / translation offset in words
-    s_off: u32,             // scale offset in words
-    s_kind: u32,            // 0: none, 1: uniform f32, 2: vec3
+    s_off: u32,             // scale offset in bytes (f16 scales may start mid-word)
+    s_kind: u32,            // 0: none, 1: uniform f32, 2: vec3 f32, 3: uniform f16, 4: vec3 f16
     dst_word: u32,          // first word of the output region
     draw: u32,              // index into indirect args
     wg_start: u32,          // first workgroup record of this job (frame-global)
@@ -55,6 +55,56 @@ var<workgroup> sums: array<u32, 64>;
 
 fn load3(o: u32) -> vec3<f32> {
     return vec3<f32>(bitcast<f32>(src[o]), bitcast<f32>(src[o + 1u]), bitcast<f32>(src[o + 2u]));
+}
+
+/// IEEE binary16 bits (low 16 bits of `h`) to f32. Decoded by hand: `unpack2x16float` needs
+/// `DownlevelFlags::SHADER_F16_IN_F32`, which e.g. llvmpipe lacks.
+fn half_to_f32(h: u32) -> f32 {
+    let e = (h >> 10u) & 0x1fu;
+    let m = h & 0x3ffu;
+    var v: f32;
+    if (e == 0u) {
+        v = f32(m) * 5.9604645e-8; // subnormal: m * 2^-24
+    } else if (e == 31u) {
+        v = bitcast<f32>(0x7f800000u | (m << 13u)); // inf / NaN
+    } else {
+        v = bitcast<f32>(((e + 112u) << 23u) | (m << 13u));
+    }
+    return select(v, -v, (h & 0x8000u) != 0u);
+}
+
+/// The two f16 values of a word (x = low half: little-endian memory order).
+fn unpack_halves(w: u32) -> vec2<f32> {
+    return vec2<f32>(half_to_f32(w & 0xffffu), half_to_f32(w >> 16u));
+}
+
+/// Three f16 values from two words.
+fn load3_half(o: u32) -> vec3<f32> {
+    return vec3<f32>(unpack_halves(src[o]), half_to_f32(src[o + 1u] & 0xffffu));
+}
+
+/// Instance scale for culling (`s_off` is in bytes from the instance's first word `base`).
+fn instance_scale(job: Job, base: u32) -> f32 {
+    let w = base + job.s_off / 4u;
+    var s = 1.0;
+    switch job.s_kind {
+        case 1u: {
+            s = bitcast<f32>(src[w]);
+        }
+        case 2u: {
+            let v = abs(load3(w));
+            s = max(v.x, max(v.y, v.z));
+        }
+        case 3u: {
+            s = half_to_f32(select(src[w] & 0xffffu, src[w] >> 16u, (job.s_off & 2u) != 0u));
+        }
+        case 4u: {
+            let v = abs(load3_half(w));
+            s = max(v.x, max(v.y, v.z));
+        }
+        default: {}
+    }
+    return abs(s);
 }
 
 /// Index of the last job of this dispatch with `wg_start <= g`.
@@ -94,15 +144,13 @@ fn is_visible(job: Job, base: u32) -> bool {
         center = t + c0 * job.sphere.x + c1 * job.sphere.y + c2 * job.sphere.z;
         radius = job.sphere.w * sqrt(s2);
     } else {
-        var s = 1.0;
-        if (job.s_kind == 1u) {
-            s = abs(bitcast<f32>(src[base + job.s_off]));
-        } else if (job.s_kind == 2u) {
-            let sv = abs(load3(base + job.s_off));
-            s = max(sv.x, max(sv.y, sv.z));
-        }
+        let s = instance_scale(job, base);
         // Rotation is not decoded here: grow the sphere to cover any orientation.
-        center = load3(base + job.t_off);
+        if (job.kind == 2u) {
+            center = load3_half(base + job.t_off);
+        } else {
+            center = load3(base + job.t_off);
+        }
         radius = (length(job.sphere.xyz) + job.sphere.w) * s;
     }
     var visible = true;

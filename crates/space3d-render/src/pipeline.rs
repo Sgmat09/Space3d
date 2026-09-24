@@ -1,10 +1,12 @@
 //! Shader generation, GPU uniform layouts and the pipeline cache.
 
 use crate::arena::{VERTEX_ATTRIBUTES, VERTEX_SIZE};
-use crate::handles::FastMap;
+use crate::handles::{FastMap, ShaderHandle};
 use crate::instance::{InstanceLayout, InstanceSemantic, wgsl_type};
+use crate::shader::{CustomShader, hooks_wgsl};
 use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Depth buffer format used by every pass.
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -106,7 +108,12 @@ pub(crate) struct PipelineKey {
     /// The material texture is a multi-layer array (`texture_2d_array`); otherwise it is bound
     /// as `texture_2d` (see [`Pipelines::material_bgl`]).
     pub layered: bool,
+    /// Custom shader and its source version (see [`Pipelines::sync_custom`]).
+    pub shader: Option<(ShaderHandle, u32)>,
 }
+
+/// Shader module cache key: (layout, manual sRGB, layered texture, custom shader).
+type ModuleKey = (u16, bool, bool, Option<(ShaderHandle, u32)>);
 
 const FORWARD_TEMPLATE: &str = include_str!("shaders/forward.wgsl");
 const CULL_SHADER: &str = include_str!("shaders/cull.wgsl");
@@ -152,17 +159,34 @@ fn to_vec3(expr: &str, ty: &str) -> String {
     }
 }
 
+/// Zero-padded `vec4<f32>` of a custom attribute value of WGSL type `ty`.
+fn custom_vec4(expr: &str, ty: &str) -> String {
+    match ty {
+        "vec4<f32>" => expr.to_string(),
+        "vec3<f32>" => format!("vec4<f32>({expr}, 0.0)"),
+        "vec2<f32>" => format!("vec4<f32>({expr}, 0.0, 0.0)"),
+        "f32" => format!("vec4<f32>({expr}, 0.0, 0.0, 0.0)"),
+        "u32" | "i32" => format!("vec4<f32>(f32({expr}), 0.0, 0.0, 0.0)"),
+        t if t.starts_with("vec2<") => format!("vec4<f32>(vec2<f32>({expr}), 0.0, 0.0)"),
+        t if t.starts_with("vec3<") => format!("vec4<f32>(vec3<f32>({expr}), 0.0)"),
+        _ => format!("vec4<f32>({expr})"),
+    }
+}
+
+/// Custom slots that always get an accessor (zero when the layout lacks them), so one custom
+/// shader compiles for every layout.
+const CUSTOM_ACCESSORS: u8 = 4;
+
 /// Generate the `InstanceInput` struct + accessor functions for a layout. Instance attributes
-/// start at shader location 4 (0..3 are the mesh vertex).
+/// start at shader location 4 (0..3 are the mesh vertex), in attribute order (see
+/// [`instance_attributes`]).
 pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
     let mut s = String::from("struct InstanceInput {\n");
     let mut loc = 4;
     let mut model = None;
     let (mut t, mut r, mut sc, mut us, mut color, mut rect, mut layer) = (None, None, None, None, None, None, None);
+    let mut custom = Vec::new();
     for (i, a) in layout.attributes.iter().enumerate() {
-        if matches!(a.semantic, InstanceSemantic::Custom(_)) {
-            continue;
-        }
         let ty = wgsl_type(a.format).unwrap_or("vec4<f32>");
         if a.semantic == InstanceSemantic::ModelMatrix {
             for c in 0..4 {
@@ -172,18 +196,28 @@ pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
             model = Some(i);
             continue;
         }
+        if let InstanceSemantic::Custom(n) = a.semantic {
+            s += &format!("    @location({loc}) custom{n}: {ty},\n");
+            loc += 1;
+            custom.push((n, ty));
+            continue;
+        }
         s += &format!("    @location({loc}) a{i}: {ty},\n");
         loc += 1;
         let (_, swizzle) = attribute_format(a.format);
-        let field = (format!("inst.a{i}{swizzle}"), ty);
+        let e = format!("inst.a{i}{swizzle}");
         match a.semantic {
-            InstanceSemantic::Translation => t = Some(field),
-            InstanceSemantic::Rotation => r = Some(field),
-            InstanceSemantic::Scale => sc = Some(field),
-            InstanceSemantic::UniformScale => us = Some(field),
-            InstanceSemantic::Color => color = Some(field),
-            InstanceSemantic::UvRect => rect = Some(field),
-            InstanceSemantic::TextureLayer => layer = Some(field),
+            InstanceSemantic::Translation => t = Some((e, ty)),
+            InstanceSemantic::TranslationScale => {
+                t = Some((format!("{e}.xyz"), "vec3<f32>"));
+                us = Some((format!("{e}.w"), "f32"));
+            }
+            InstanceSemantic::Rotation => r = Some((e, ty)),
+            InstanceSemantic::Scale => sc = Some((e, ty)),
+            InstanceSemantic::UniformScale => us = Some((e, ty)),
+            InstanceSemantic::Color => color = Some((e, ty)),
+            InstanceSemantic::UvRect => rect = Some((e, ty)),
+            InstanceSemantic::TextureLayer => layer = Some((e, ty)),
             InstanceSemantic::ModelMatrix | InstanceSemantic::Custom(_) => {}
         }
     }
@@ -238,6 +272,18 @@ pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
             _ => format!("i32({e}.x)"),
         })
     );
+    // Custom attributes for custom shaders: declared slots, and slots 0..4 as zero otherwise.
+    for n in 0..CUSTOM_ACCESSORS {
+        if !custom.iter().any(|(c, _)| *c == n) {
+            s += &format!(
+                "\nfn instance_custom{n}(inst: InstanceInput) -> vec4<f32> {{\n    return vec4<f32>(0.0);\n}}\n"
+            );
+        }
+    }
+    for (n, ty) in custom {
+        let e = custom_vec4(&format!("inst.custom{n}"), ty);
+        s += &format!("\nfn instance_custom{n}(inst: InstanceInput) -> vec4<f32> {{\n    return {e};\n}}\n");
+    }
     s
 }
 
@@ -256,12 +302,36 @@ fn texture_wgsl(layered: bool) -> &'static str {
     }
 }
 
-/// Full forward shader source for a layout and material texture kind.
-pub(crate) fn forward_shader(layout: &InstanceLayout, manual_srgb: bool, layered: bool) -> String {
+/// Full forward shader source for a layout, material texture kind and custom shader.
+pub(crate) fn forward_shader(
+    layout: &InstanceLayout,
+    manual_srgb: bool,
+    layered: bool,
+    custom: Option<&CustomShader>,
+) -> String {
+    let varyings = if custom.is_some() {
+        "    @location(5) custom: vec4<f32>,"
+    } else {
+        ""
+    };
+    // The user's code is spliced in last, so markers inside it are left alone.
     FORWARD_TEMPLATE
         .replace("//#CONSTS", &format!("const MANUAL_SRGB: bool = {manual_srgb};"))
         .replace("//#TEXTURE", texture_wgsl(layered))
         .replace("//#INSTANCE", &instance_wgsl(layout))
+        .replace("//#VARYINGS", varyings)
+        .replace("//#HOOKS", &hooks_wgsl(custom))
+}
+
+/// Parse and validate WGSL with naga (the portable subset: no optional capabilities), with a
+/// readable error message.
+pub(crate) fn validate_wgsl(src: &str) -> Result<(), String> {
+    use wgpu::naga;
+    let module = naga::front::wgsl::parse_str(src).map_err(|e| e.emit_to_string(src))?;
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&module)
+        .map_err(|e| e.emit_to_string(src))?;
+    Ok(())
 }
 
 /// Vertex format handed to wgpu for an instance attribute format, and the swizzle the shader
@@ -276,13 +346,13 @@ pub(crate) fn attribute_format(format: wgpu::VertexFormat) -> (wgpu::VertexForma
     }
 }
 
-/// Instance vertex attributes (shader locations from 4).
+/// Instance vertex attributes (shader locations from 4, in attribute order; `Custom` ones
+/// included so custom shaders can read them).
 pub(crate) fn instance_attributes(layout: &InstanceLayout) -> Vec<wgpu::VertexAttribute> {
     let mut out = Vec::new();
     let mut loc = 4;
     for a in layout.attributes {
         match a.semantic {
-            InstanceSemantic::Custom(_) => {}
             InstanceSemantic::ModelMatrix => {
                 for c in 0..4 {
                     out.push(wgpu::VertexAttribute {
@@ -363,8 +433,12 @@ pub(crate) struct Pipelines {
     /// Material layouts: `[single-layer (texture_2d), array (texture_2d_array)]`.
     material_bgls: [wgpu::BindGroupLayout; 2],
     layouts_by_texture: [wgpu::PipelineLayout; 2],
-    shaders: FastMap<(u16, bool, bool), wgpu::ShaderModule>,
+    shaders: FastMap<ModuleKey, wgpu::ShaderModule>,
     forward: FastMap<PipelineKey, wgpu::RenderPipeline>,
+    /// Sources of the custom shaders drawn so far: (version, source).
+    custom: FastMap<ShaderHandle, (u32, Arc<CustomShader>)>,
+    /// First build error of a custom shader version.
+    custom_errors: FastMap<ShaderHandle, (u32, String)>,
     /// Registered instance layouts; index = layout id.
     pub layouts: Vec<&'static InstanceLayout>,
     pub cull: Option<CullPipelines>,
@@ -555,6 +629,8 @@ impl Pipelines {
             layouts_by_texture,
             shaders: FastMap::default(),
             forward: FastMap::default(),
+            custom: FastMap::default(),
+            custom_errors: FastMap::default(),
             layouts: vec![<crate::instance::InstanceTransform as crate::instance::InstanceData>::LAYOUT],
             cull,
             blits,
@@ -577,86 +653,189 @@ impl Pipelines {
         {
             return i as u16;
         }
+        if layout.cull_source() == crate::instance::CullSource::None {
+            tracing::warn!(
+                layout = layout.name,
+                "instance positions are not in a float format the culler decodes (f32/f16): \
+                 these instances are never culled on the GPU, and on the CPU only per block if \
+                 `InstanceData::bounds` is overridden or `InstanceBuffer::set_bounds` is used"
+            );
+        }
         self.layouts.push(layout);
         (self.layouts.len() - 1) as u16
     }
 
-    /// Get or build the forward pipeline for `key`.
+    /// Make `source` (version `version`) the current code of custom shader `handle`. A new
+    /// version drops the pipelines, modules and error of the old one.
+    pub fn sync_custom(&mut self, handle: ShaderHandle, version: u32, source: &Arc<CustomShader>) {
+        match self.custom.get(&handle) {
+            Some((v, _)) if *v == version => return,
+            Some(_) => {
+                self.forward.retain(|k, _| k.shader.is_none_or(|(h, _)| h != handle));
+                self.shaders.retain(|k, _| k.3.is_none_or(|(h, _)| h != handle));
+                self.custom_errors.remove(&handle);
+            }
+            None => {}
+        }
+        self.custom.insert(handle, (version, source.clone()));
+    }
+
+    /// Forget custom shaders for which `live` is false (removed from `RenderAssets`): their
+    /// sources, errors, modules and pipelines.
+    pub fn retain_custom(&mut self, live: impl Fn(ShaderHandle) -> bool) {
+        if self.custom.keys().all(|&h| live(h)) {
+            return;
+        }
+        self.custom.retain(|&h, _| live(h));
+        self.custom_errors.retain(|&h, _| live(h));
+        self.forward.retain(|k, _| k.shader.is_none_or(|(h, _)| live(h)));
+        self.shaders.retain(|k, _| k.3.is_none_or(|(h, _)| live(h)));
+    }
+
+    /// Custom shaders with cached state, and forward pipelines built for custom shaders.
+    #[cfg(test)]
+    pub fn custom_counts(&self) -> (usize, usize) {
+        (
+            self.custom.len(),
+            self.forward.keys().filter(|k| k.shader.is_some()).count(),
+        )
+    }
+
+    /// Error of the current version of a custom shader, if it failed to build.
+    pub fn custom_error(&self, handle: ShaderHandle) -> Option<&str> {
+        let (version, e) = self.custom_errors.get(&handle)?;
+        (self.custom.get(&handle).map(|(v, _)| *v) == Some(*version)).then_some(e.as_str())
+    }
+
+    /// Get or build the forward pipeline for `key`. A custom shader that fails to build (or is
+    /// unknown) is reported once and replaced by the built-in pipeline for that key.
     pub fn forward(&mut self, device: &wgpu::Device, key: PipelineKey) -> &wgpu::RenderPipeline {
         if !self.forward.contains_key(&key) {
-            let layout = self.layouts[key.layout as usize];
-            let module = self
-                .shaders
-                .entry((key.layout, key.manual_srgb, key.layered))
-                .or_insert_with(|| {
-                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some(layout.name),
-                        source: wgpu::ShaderSource::Wgsl(Cow::Owned(forward_shader(
-                            layout,
-                            key.manual_srgb,
-                            key.layered,
-                        ))),
-                    })
-                });
-            let inst_attrs = instance_attributes(layout);
-            let blend = key.class & CLASS_BLEND != 0;
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(layout.name),
-                layout: Some(&self.layouts_by_texture[key.layered as usize]),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[
-                        Some(wgpu::VertexBufferLayout {
-                            array_stride: VERTEX_SIZE,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &VERTEX_ATTRIBUTES,
-                        }),
-                        Some(wgpu::VertexBufferLayout {
-                            array_stride: layout.stride as u64,
-                            step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: &inst_attrs,
-                        }),
-                    ],
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: if key.class & CLASS_DOUBLE_SIDED != 0 {
-                        None
-                    } else {
-                        Some(wgpu::Face::Back)
-                    },
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(!blend),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: key.samples,
-                    ..Default::default()
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: key.format,
-                        blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
+            let pipeline = match key.shader {
+                None => self.build_forward(device, key, None).expect("built-in shader builds"),
+                Some((handle, version)) => {
+                    let source = self
+                        .custom
+                        .get(&handle)
+                        .filter(|(v, _)| *v == version)
+                        .map(|(_, s)| s.clone());
+                    let built = match &source {
+                        Some(s) => self.build_forward(device, key, Some(s)),
+                        None => Err("shader not registered".to_string()),
+                    };
+                    match built {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let layout = self.layouts[key.layout as usize].name;
+                            let name = source.as_ref().map_or("?", |s| s.name.as_str());
+                            tracing::error!(
+                                shader = name,
+                                layout,
+                                "custom shader failed to build; drawing with the built-in shader:\n{e}"
+                            );
+                            self.custom_errors.entry(handle).or_insert((version, e));
+                            self.forward(device, PipelineKey { shader: None, ..key }).clone()
+                        }
+                    }
+                }
+            };
             self.forward.insert(key, pipeline);
         }
         &self.forward[&key]
+    }
+
+    /// Build a forward pipeline. Custom shaders are validated with naga first and built inside
+    /// a validation error scope, so their errors never reach the uncaptured-error handler.
+    fn build_forward(
+        &mut self,
+        device: &wgpu::Device,
+        key: PipelineKey,
+        custom: Option<&Arc<CustomShader>>,
+    ) -> Result<wgpu::RenderPipeline, String> {
+        let layout = self.layouts[key.layout as usize];
+        let module_key = (key.layout, key.manual_srgb, key.layered, key.shader);
+        let scope = custom.map(|_| device.push_error_scope(wgpu::ErrorFilter::Validation));
+        let module = match self.shaders.get(&module_key) {
+            Some(m) => m.clone(),
+            None => {
+                let source = forward_shader(layout, key.manual_srgb, key.layered, custom.map(|c| &**c));
+                if custom.is_some() {
+                    validate_wgsl(&source)?;
+                }
+                let label = custom.map_or(layout.name, |c| c.name.as_str());
+                let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(label),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
+                });
+                self.shaders.insert(module_key, m.clone());
+                m
+            }
+        };
+        let inst_attrs = instance_attributes(layout);
+        let blend = key.class & CLASS_BLEND != 0;
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(layout.name),
+            layout: Some(&self.layouts_by_texture[key.layered as usize]),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: VERTEX_SIZE,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &VERTEX_ATTRIBUTES,
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: layout.stride as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &inst_attrs,
+                    }),
+                ],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: if key.class & CLASS_DOUBLE_SIDED != 0 {
+                    None
+                } else {
+                    Some(wgpu::Face::Back)
+                },
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(!blend),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: key.samples,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: key.format,
+                    blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        // Native backends resolve the scope immediately; on the web the result arrives later
+        // (and naga has already validated the code).
+        if let Some(scope) = scope
+            && let Some(Some(e)) = futures::FutureExt::now_or_never(scope.pop())
+        {
+            self.shaders.remove(&module_key);
+            return Err(e.to_string());
+        }
+        Ok(pipeline)
     }
 
     /// Mip-generation pipeline for a color format, sampling a single-layer (`D2`) or an array
@@ -700,33 +879,106 @@ impl Pipelines {
 mod tests {
     use super::*;
     use crate::instance::*;
+    use wgpu::VertexFormat as F;
 
     fn validate(src: &str) {
-        let module =
-            wgpu::naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(src)));
-        let mut v = wgpu::naga::valid::Validator::new(
-            wgpu::naga::valid::ValidationFlags::all(),
-            wgpu::naga::valid::Capabilities::empty(),
-        );
-        v.validate(&module).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+        validate_wgsl(src).unwrap_or_else(|e| panic!("{e}\n{src}"));
     }
+
+    /// Atlas + texture layer + custom data: every semantic the built-in layouts leave out.
+    const ATLAS: &InstanceLayout = &InstanceLayout {
+        name: "Atlas",
+        stride: 64,
+        attributes: &[
+            InstanceAttribute::new(InstanceSemantic::Translation, F::Float32x3, 0),
+            InstanceAttribute::new(InstanceSemantic::UniformScale, F::Float32, 12),
+            InstanceAttribute::new(InstanceSemantic::UvRect, F::Float32x4, 16),
+            InstanceAttribute::new(InstanceSemantic::Custom(0), F::Float32x4, 32),
+            InstanceAttribute::new(InstanceSemantic::TextureLayer, F::Uint32, 48),
+            InstanceAttribute::new(InstanceSemantic::Custom(7), F::Uint32x2, 52),
+            InstanceAttribute::new(InstanceSemantic::Scale, F::Float16x2, 60),
+        ],
+    };
+
+    /// f16 position with a separate f16 uniform scale in the upper half of a word.
+    const HALF_SPLIT: &InstanceLayout = &InstanceLayout {
+        name: "HalfSplit",
+        stride: 16,
+        attributes: &[
+            InstanceAttribute::new(InstanceSemantic::Translation, F::Float16x4, 0),
+            InstanceAttribute::new(InstanceSemantic::UniformScale, F::Float16, 6),
+            InstanceAttribute::new(InstanceSemantic::Rotation, F::Snorm16x4, 8),
+        ],
+    };
 
     #[test]
     fn generated_shaders_validate() {
+        let custom = CustomShader::new(
+            "tint",
+            "fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {\n\
+             \x20   var o = out;\n    o.custom = instance_custom0(inst) + instance_custom3(inst);\n    return o;\n}\n\
+             fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {\n    return in.custom * color;\n}\n",
+        );
+        let only_fragment = CustomShader::new(
+            "f",
+            "fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> { return c.bgra; }",
+        );
         for l in [
             InstanceTransform::LAYOUT,
             InstanceTransformColor::LAYOUT,
             InstanceCompact::LAYOUT,
             InstancePacked::LAYOUT,
+            InstanceHalf::LAYOUT,
+            ATLAS,
+            HALF_SPLIT,
         ] {
+            l.validate().unwrap();
             for (manual_srgb, layered) in [(false, false), (true, false), (false, true), (true, true)] {
-                validate(&forward_shader(l, manual_srgb, layered));
+                for c in [None, Some(&custom), Some(&only_fragment)] {
+                    validate(&forward_shader(l, manual_srgb, layered, c));
+                }
             }
         }
         validate(CULL_SHADER);
         validate(COMPACT_SHADER);
         validate(&blit_shader(false));
         validate(&blit_shader(true));
+        // A broken custom shader is rejected with a message, not a panic.
+        let broken = CustomShader::new(
+            "broken",
+            "fn fragment_hook(in: VsOut) -> f32 { return undefined_thing; }",
+        );
+        let e = validate_wgsl(&forward_shader(ATLAS, false, false, Some(&broken))).unwrap_err();
+        assert!(e.contains("undefined_thing") || e.contains("fragment_hook"), "{e}");
+    }
+
+    /// The generated accessors read the attributes the layout declares.
+    #[test]
+    fn generated_accessors_use_the_declared_attributes() {
+        let src = instance_wgsl(ATLAS);
+        for line in [
+            "@location(4) a0: vec3<f32>",
+            "@location(5) a1: f32",
+            "@location(6) a2: vec4<f32>",
+            "@location(7) custom0: vec4<f32>",
+            "@location(8) a4: u32",
+            "@location(9) custom7: vec2<u32>",
+            "@location(10) a6: vec2<f32>",
+            "return inst.a2;",
+            "return i32(inst.a4);",
+            "fn instance_custom0(inst: InstanceInput) -> vec4<f32> {\n    return inst.custom0;",
+            "return vec4<f32>(vec2<f32>(inst.custom7), 0.0, 0.0);",
+            "fn instance_custom3(inst: InstanceInput) -> vec4<f32> {\n    return vec4<f32>(0.0);",
+            "trs(inst.a0, mat3x3<f32>",
+            "vec3<f32>(inst.a6, 0.0))",
+        ] {
+            assert!(src.contains(line), "missing `{line}` in\n{src}");
+        }
+        let half = instance_wgsl(InstanceHalf::LAYOUT);
+        assert!(
+            half.contains("return trs(inst.a0.xyz, quat_to_mat3(inst.a1), vec3<f32>(inst.a0.w));"),
+            "{half}"
+        );
     }
 
     #[test]
@@ -750,24 +1002,63 @@ mod tests {
             name: "Bgra",
             stride: 16,
             attributes: &[
-                InstanceAttribute::new(InstanceSemantic::Translation, wgpu::VertexFormat::Float32x3, 0),
-                InstanceAttribute::new(InstanceSemantic::Color, wgpu::VertexFormat::Unorm8x4Bgra, 12),
+                InstanceAttribute::new(InstanceSemantic::Translation, F::Float32x3, 0),
+                InstanceAttribute::new(InstanceSemantic::Color, F::Unorm8x4Bgra, 12),
             ],
         };
         LAYOUT.validate().expect("valid layout");
         let attrs = instance_attributes(LAYOUT);
-        assert!(attrs.iter().all(|a| a.format != wgpu::VertexFormat::Unorm8x4Bgra));
-        assert_eq!(attrs[1].format, wgpu::VertexFormat::Unorm8x4);
+        assert!(attrs.iter().all(|a| a.format != F::Unorm8x4Bgra));
+        assert_eq!(attrs[1].format, F::Unorm8x4);
         let src = instance_wgsl(LAYOUT);
         assert!(src.contains("return inst.a1.zyxw;"), "{src}");
-        validate(&forward_shader(LAYOUT, false, false));
+        validate(&forward_shader(LAYOUT, false, false, None));
     }
 
+    /// Exact `(format, offset, location)` of every built-in layout: a wrong offset or format
+    /// (e.g. a tint read from the matrix) would still validate and render something.
     #[test]
-    fn instance_attributes_cover_locations() {
-        let a = instance_attributes(InstancePacked::LAYOUT);
-        assert_eq!(a.len(), 5);
-        assert_eq!(a.last().unwrap().shader_location, 8);
-        assert_eq!(instance_attributes(InstanceTransformColor::LAYOUT).len(), 5);
+    fn instance_attributes_match_the_structs() {
+        let tuples = |l: &InstanceLayout| {
+            instance_attributes(l)
+                .iter()
+                .map(|a| (a.format, a.offset, a.shader_location))
+                .collect::<Vec<_>>()
+        };
+        let matrix = |extra: &[(F, u64, u32)]| {
+            let mut v: Vec<_> = (0..4).map(|c| (F::Float32x4, c * 16, 4 + c as u32)).collect();
+            v.extend_from_slice(extra);
+            v
+        };
+        assert_eq!(tuples(InstanceTransform::LAYOUT), matrix(&[]));
+        assert_eq!(tuples(InstanceTransformColor::LAYOUT), matrix(&[(F::Float32x4, 64, 8)]));
+        assert_eq!(
+            tuples(InstanceCompact::LAYOUT),
+            [(F::Float32x3, 0, 4), (F::Float32, 12, 5), (F::Float32x4, 16, 6)]
+        );
+        assert_eq!(
+            tuples(InstancePacked::LAYOUT),
+            [
+                (F::Float32x3, 0, 4),
+                (F::Float32, 12, 5),
+                (F::Snorm16x4, 16, 6),
+                (F::Unorm8x4, 24, 7),
+                (F::Uint32, 28, 8)
+            ]
+        );
+        assert_eq!(
+            tuples(InstanceHalf::LAYOUT),
+            [(F::Float16x4, 0, 4), (F::Snorm16x4, 8, 5)]
+        );
+        // Custom attributes get locations too (custom shaders read them).
+        assert_eq!(tuples(ATLAS)[3], (F::Float32x4, 32, 7));
+        assert_eq!(tuples(ATLAS).len(), 7);
+        // Byte offsets inside the Rust structs.
+        assert_eq!(std::mem::offset_of!(InstanceTransformColor, color), 64);
+        assert_eq!(std::mem::offset_of!(InstanceCompact, rotation), 16);
+        assert_eq!(std::mem::offset_of!(InstancePacked, rotation), 16);
+        assert_eq!(std::mem::offset_of!(InstancePacked, color), 24);
+        assert_eq!(std::mem::offset_of!(InstancePacked, layer), 28);
+        assert_eq!(std::mem::offset_of!(InstanceHalf, rotation), 8);
     }
 }

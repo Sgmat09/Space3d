@@ -4,7 +4,9 @@
 // The INSTANCE marker below is replaced by the renderer with an `InstanceInput` struct and
 // accessor functions generated from the instance layout (see `pipeline.rs`); the CONSTS
 // marker with per-pipeline constants; the TEXTURE marker with the material texture binding
-// (`texture_2d` for single-layer textures, `texture_2d_array` for arrays) and `sample_base`.
+// (`texture_2d` for single-layer textures, `texture_2d_array` for arrays) and `sample_base`;
+// the VARYINGS marker with extra `VsOut` fields and the HOOKS marker with `vertex_hook` /
+// `fragment_hook` — identity functions, or a material's `CustomShader`.
 // Single-layer textures are never bound as arrays: wgpu's GL backend binds them with the
 // TEXTURE_2D target, which a `sampler2DArray` reads as black on WebGL2/GLES.
 
@@ -59,6 +61,7 @@ struct VsOut {
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
     @location(4) @interpolate(flat) layer: i32,
+//#VARYINGS
 }
 
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
@@ -103,6 +106,8 @@ fn trs(t: vec3<f32>, r: mat3x3<f32>, s: vec3<f32>) -> mat4x4<f32> {
     );
 }
 
+//#HOOKS
+
 @vertex
 fn vs_main(v: VertexInput, inst: InstanceInput) -> VsOut {
     let model = instance_model(inst);
@@ -124,7 +129,7 @@ fn vs_main(v: VertexInput, inst: InstanceInput) -> VsOut {
     out.uv = v.uv * rect.zw + rect.xy;
     out.color = vec4<f32>(srgb_to_linear(v.color.rgb), v.color.a) * instance_color(inst);
     out.layer = instance_layer(inst);
-    return out;
+    return vertex_hook(v, inst, out);
 }
 
 fn fresnel_schlick(f0: vec3<f32>, cos_theta: f32) -> vec3<f32> {
@@ -182,8 +187,9 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         }
         rgb = acc + material.emissive.rgb;
     }
+    var color = fragment_hook(in, vec4<f32>(rgb, base.a));
     if (MANUAL_SRGB) {
-        rgb = linear_to_srgb(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)));
+        color = vec4<f32>(linear_to_srgb(clamp(color.rgb, vec3<f32>(0.0), vec3<f32>(1.0))), color.a);
     }
-    return vec4<f32>(rgb, base.a);
+    return color;
 }
