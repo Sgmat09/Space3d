@@ -1,6 +1,6 @@
+use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
-use std::any::{Any, TypeId, type_name};
 
 /// Type-keyed singleton storage (one value per type).
 #[derive(Default)]
