@@ -257,9 +257,62 @@ impl PlayerService {
         match_id: Option<MatchId>,
         params: BTreeMap<String, String>,
     ) -> Option<(fleet::ServerRecord, RoomSpec)> {
+        let allocated = {
+            let mut fleet = self.fleet.lock();
+            self.allocate_room_in(&mut fleet, region, mode, max_players, seats, teams, match_id, params)
+        };
+        let (server, spec) = allocated?;
+        self.prepare_room(&server, &spec);
+        Some((server, spec))
+    }
+
+    /// Quick play: the fullest open room of `mode` with a free seat, else a fresh one (capacity
+    /// and params from the queue with that mode). Finding and allocating happen under one
+    /// fleet lock, so concurrent quick plays fill one new room instead of each opening their
+    /// own.
+    pub fn quick_play_room(&self, region: &str, mode: &str) -> Option<(fleet::ServerRecord, RoomSpec)> {
+        let now = self.now_ms();
+        let reserve = self.ticket_reserve_ms();
+        let (found, fresh) = {
+            let mut fleet = self.fleet.lock();
+            match fleet.open_room(mode, 1, now, reserve) {
+                Some(open) => (open, false),
+                None => {
+                    let params = self
+                        .config
+                        .matchmaking
+                        .queues
+                        .iter()
+                        .find(|q| q.mode == mode)
+                        .map(|q| q.params.clone())
+                        .unwrap_or_default();
+                    let capacity = self.mode_capacity(mode);
+                    let room =
+                        self.allocate_room_in(&mut fleet, region, mode, capacity, 1, Vec::new(), None, params)?;
+                    (room, true)
+                }
+            }
+        };
+        if fresh {
+            self.prepare_room(&found.0, &found.1);
+        }
+        Some(found)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_room_in(
+        &self,
+        fleet: &mut fleet::FleetRegistry,
+        region: &str,
+        mode: &str,
+        max_players: u16,
+        seats: u32,
+        teams: Vec<Vec<PlayerId>>,
+        match_id: Option<MatchId>,
+        params: BTreeMap<String, String>,
+    ) -> Option<(fleet::ServerRecord, RoomSpec)> {
         let now = self.now_ms();
         let game_id = params.get("game_id").cloned().unwrap_or_default();
-        let mut fleet = self.fleet.lock();
         let server = fleet.allocate(region, &game_id, 0, seats, now, self.ticket_reserve_ms())?;
         let spec = RoomSpec {
             room_id: random_room_id(),
@@ -273,12 +326,15 @@ impl PlayerService {
             params,
         };
         fleet.note_room(&spec, &server.registration.server_id, now);
-        drop(fleet);
+        Some((server, spec))
+    }
+
+    /// Pre-warm a freshly allocated room on its game server (the ticket alone also creates it).
+    fn prepare_room(&self, server: &fleet::ServerRecord, spec: &RoomSpec) {
         self.send_fleet(
             &server.registration.server_id,
             FleetDown::PrepareRoom { spec: spec.clone() },
         );
-        Some((server, spec))
     }
 }
 

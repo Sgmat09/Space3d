@@ -186,6 +186,18 @@ impl<G: GameDefinition> ServerMain<G> {
     /// Parse CLI args (`--config <path>` / `SPACE3D_CONFIG`, `--role`, `--check-config`,
     /// `--print-default-config`) and load the TOML file with the `SPACE3D__A__B` env overlay.
     pub fn from_env(game: G) -> Result<Self, ServerError> {
+        Self::from_env_layered(game, None)
+    }
+
+    /// [`Self::from_env`] with game-supplied config defaults (TOML) layered **under** the
+    /// config file and the env overlay: built-in defaults ← `defaults` ← `--config` file ←
+    /// `SPACE3D__*` env ← `--role`. A game binary can ship settings that work out of the box
+    /// (e.g. an all-in-one loopback dev server) while deployments still override everything.
+    pub fn from_env_with_defaults(game: G, defaults: &str) -> Result<Self, ServerError> {
+        Self::from_env_layered(game, Some(defaults))
+    }
+
+    fn from_env_layered(game: G, defaults: Option<&str>) -> Result<Self, ServerError> {
         use clap::Parser;
         // `server healthcheck [--ready] [--url ...]` (container probes) works for game binaries too.
         let args: Vec<String> = std::env::args().collect();
@@ -196,7 +208,8 @@ impl<G: GameDefinition> ServerMain<G> {
                 .position(|a| a == "--url")
                 .and_then(|i| args.get(i + 1).cloned())
                 .unwrap_or_else(|| {
-                    let admin = ServerConfig::load(
+                    let admin = ServerConfig::load_layered(
+                        defaults,
                         std::env::var_os("SPACE3D_CONFIG").map(PathBuf::from).as_deref(),
                         std::env::vars(),
                     )
@@ -208,9 +221,15 @@ impl<G: GameDefinition> ServerMain<G> {
         let cli = Cli::parse();
         if cli.print_default_config {
             print!("{}", ServerConfig::example_toml());
+            if let Some(defaults) = defaults {
+                println!("\n# ---- built into this binary (applied under --config / env) ----");
+                for line in defaults.lines() {
+                    println!("# {line}");
+                }
+            }
             std::process::exit(0);
         }
-        let mut config = ServerConfig::load(cli.config.as_deref(), std::env::vars())?;
+        let mut config = ServerConfig::load_layered(defaults, cli.config.as_deref(), std::env::vars())?;
         if let Some(role) = cli.role.as_deref() {
             config.role = parse_role(role)?;
             config.validate()?;

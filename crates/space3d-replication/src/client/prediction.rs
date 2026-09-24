@@ -86,8 +86,13 @@ impl InputHistory {
         self.entries.back().map(|(t, b, _)| (*t, b.as_slice()))
     }
 
-    fn get(&self, tick: Tick) -> Option<&(Tick, Vec<u8>, Box<dyn std::any::Any + Send + Sync>)> {
-        let i = self.entries.binary_search_by_key(&tick, |(t, _, _)| *t).ok()?;
+    /// Newest entry at or before `tick`.
+    fn at_or_before(&self, tick: Tick) -> Option<&(Tick, Vec<u8>, Box<dyn std::any::Any + Send + Sync>)> {
+        let i = match self.entries.binary_search_by_key(&tick, |(t, _, _)| *t) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
         self.entries.get(i)
     }
 
@@ -257,10 +262,11 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
 fn resync(p: &mut PredictionState, to: Tick) {
     tracing::debug!(?p.next_tick, ?to, "prediction resync");
     // Ticks skipped by a forward jump get the server's repeated input (they are "missing"
-    // on the server, which the pacer answers with a speed-up, never another jump).
+    // on the server, which the pacer answers with a speed-up, never another jump). The input
+    // history is kept: the rebuild below replays the recorded ticks and repeats the last input
+    // over the skipped ones, exactly like the server, instead of snapping.
     p.next_tick = Some(to);
     p.feedback_after = Some(to);
-    p.inputs.entries.clear();
     p.scale = 1.0;
     // Rebuild from the newest confirmed state.
     let newest = p.confirmed.values().map(|c| c.tick).max();
@@ -388,6 +394,31 @@ pub(crate) fn client_tick(ctx: &mut SystemCtx) {
     });
 }
 
+/// Newest confirmed tick over the predicted entities, and whether the recorded prediction for
+/// that tick already equals the confirmed values of every predicted entity.
+fn newest_confirmation(world: &World, registry: &ReplicationRegistry, net: &NetClient) -> Option<(Tick, bool)> {
+    let predicted = predicted_entities(world);
+    let newest = predicted
+        .iter()
+        .filter_map(|(_, id)| net.prediction.confirmed.get(id).map(|c| c.tick))
+        .max()?;
+    let matches = net.prediction.compares(newest)
+        && predicted.iter().all(|(e, id)| {
+            let Some(c) = net.prediction.confirmed.get(id) else {
+                return true;
+            };
+            c.tick == newest
+                && c.comps.iter().all(|(kind, bytes)| {
+                    let (Some(h), Some(entry)) = (history_bytes(world, *e, newest, *kind), registry.component(*kind))
+                    else {
+                        return false;
+                    };
+                    !entry.ops.differs(&h, bytes, &mut DecodeCtx::new(&net.map))
+                })
+        });
+    Some((newest, matches))
+}
+
 fn rollback_and_replay(
     world: &mut World,
     res: &mut space3d_core::Resources,
@@ -396,6 +427,15 @@ fn rollback_and_replay(
     next: Tick,
     dt: Duration,
 ) {
+    // Only the newest confirmed values are kept, so the replay starts from their tick: a
+    // mismatch at an older tick (several snapshots arriving together after a stall) is
+    // superseded by the newest one, and if our prediction for the newest confirmed tick was
+    // right there is nothing to correct.
+    let from = match newest_confirmation(world, registry, res.expect::<NetClient>()) {
+        Some((_, true)) => return,
+        Some((newest, false)) => newest.max(from),
+        None => from,
+    };
     let before = visual(world);
     let replay = {
         let net = res.expect_mut::<NetClient>();
@@ -419,8 +459,10 @@ fn rollback_and_replay(
         }
         let last = next.0.saturating_sub(1);
         let n = last.saturating_sub(from.0);
-        let have_inputs =
-            registry.input().is_none() || (from.0 + 1..=last).all(|t| net.prediction.inputs.get(Tick(t)).is_some());
+        // Ticks without a recorded input (skipped by a resync) replay the last earlier input
+        // repeated, as the server did for them; only a replay that starts before the oldest
+        // recorded input cannot be reconstructed.
+        let have_inputs = registry.input().is_none() || net.prediction.inputs.at_or_before(Tick(from.0 + 1)).is_some();
         let max = u32::from(net.config.prediction.max_rollback_ticks);
         (n > 0 && n <= max && have_inputs).then_some((from.0 + 1, last))
     };
@@ -441,8 +483,9 @@ fn rollback_and_replay(
             let tick = Tick(t);
             let value = {
                 let net = res.expect::<NetClient>();
-                match (registry.input(), net.prediction.inputs.get(tick)) {
-                    (Some(input), Some((_, _, v))) => Some(input.ops.clone_value(v)),
+                match (registry.input(), net.prediction.inputs.at_or_before(tick)) {
+                    (Some(input), Some((at, _, v))) if *at == tick => Some(input.ops.clone_value(v)),
+                    (Some(input), Some((_, _, v))) => Some(input.ops.repeat(v)),
                     _ => None,
                 }
             };

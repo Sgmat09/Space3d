@@ -242,8 +242,86 @@ pub struct LoadTestReport {
     pub disconnects: std::collections::BTreeMap<String, u32>,
     /// Server tick p99 (ms) from `/metrics`.
     pub server_tick_p99_ms: Option<f64>,
+    /// Server-side view from the `/metrics` scrapes before and after the run.
+    #[serde(default)]
+    pub server: Option<ServerSample>,
     /// All SLOs met.
     pub slo_passed: bool,
+}
+
+/// What the server's `/metrics` showed over the run (deltas between two scrapes; all rooms
+/// on the scraped process).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerSample {
+    /// Seconds between the scrapes.
+    pub secs: f64,
+    /// Room ticks run (all rooms).
+    pub ticks: u64,
+    /// Mean room tick duration (ms).
+    pub tick_mean_ms: Option<f64>,
+    /// Room tick p50 upper bound (ms, histogram bucket).
+    pub tick_p50_ms: Option<f64>,
+    /// Room tick p99 upper bound (ms, histogram bucket).
+    pub tick_p99_ms: Option<f64>,
+    /// Ticks skipped because a room fell behind.
+    pub ticks_skipped: u64,
+    /// Rooms running at the end.
+    pub rooms_running: u64,
+    /// Replication bytes sent per second (all clients).
+    pub bytes_out_per_sec: f64,
+    /// Replication bytes received per second (all clients).
+    pub bytes_in_per_sec: f64,
+}
+
+/// Sum of the samples of metric `name` whose label set contains every `label=value` pair of
+/// `labels` (Prometheus text; `None` if no line matched).
+pub fn metric_value(text: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    let mut total = None;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(name) else { continue };
+        let (label_part, value) = match rest.strip_prefix('{') {
+            Some(r) => match r.split_once('}') {
+                Some((l, v)) => (l, v),
+                None => continue,
+            },
+            None if rest.starts_with(' ') => ("", rest),
+            None => continue,
+        };
+        let matches = labels
+            .iter()
+            .all(|(k, v)| label_part.split(',').any(|kv| kv == format!("{k}=\"{v}\"")));
+        if !matches {
+            continue;
+        }
+        if let Ok(v) = value.trim().parse::<f64>() {
+            *total.get_or_insert(0.0) += v;
+        }
+    }
+    total
+}
+
+fn server_sample(before: &str, after: &str, secs: f64) -> ServerSample {
+    let delta = |name: &str, labels: &[(&str, &str)]| {
+        let a = metric_value(after, name, labels).unwrap_or(0.0);
+        let b = metric_value(before, name, labels).unwrap_or(0.0);
+        (a - b).max(0.0)
+    };
+    let hb = parse_histogram(before, "space3d_tick_seconds");
+    let ha = parse_histogram(after, "space3d_tick_seconds");
+    let ticks = delta("space3d_tick_seconds_count", &[]);
+    let sum = delta("space3d_tick_seconds_sum", &[]);
+    let per_sec = |v: f64| if secs > 0.0 { v / secs } else { 0.0 };
+    ServerSample {
+        secs,
+        ticks: ticks as u64,
+        tick_mean_ms: (ticks > 0.0).then(|| sum / ticks * 1000.0),
+        tick_p50_ms: histogram_quantile(&hb, &ha, 0.5).map(|s| s * 1000.0),
+        tick_p99_ms: histogram_quantile(&hb, &ha, 0.99).map(|s| s * 1000.0),
+        ticks_skipped: delta("space3d_ticks_skipped_total", &[]) as u64,
+        rooms_running: metric_value(after, "space3d_rooms", &[("phase", "running")]).unwrap_or(0.0) as u64,
+        bytes_out_per_sec: per_sec(delta("space3d_bytes_total", &[("dir", "out")])),
+        bytes_in_per_sec: per_sec(delta("space3d_bytes_total", &[("dir", "in")])),
+    }
 }
 
 // ---- per-bot state -----------------------------------------------------------------------------
@@ -654,10 +732,9 @@ pub fn histogram_quantile(before: &[(f64, u64)], after: &[(f64, u64)], q: f64) -
     delta.iter().find(|(_, n)| *n >= rank.max(1)).map(|(le, _)| *le)
 }
 
-fn scrape(http: &Http, url: &str) -> Option<Vec<(f64, u64)>> {
+fn scrape(http: &Http, url: &str) -> Option<(String, Instant)> {
     let res = http.get(url).block()?.ok()?;
-    res.is_success()
-        .then(|| parse_histogram(&res.text(), "space3d_tick_seconds"))
+    res.is_success().then(|| (res.text(), Instant::now()))
 }
 
 fn percentiles(mut v: Vec<f64>) -> (f64, f64) {
@@ -670,7 +747,8 @@ fn percentiles(mut v: Vec<f64>) -> (f64, f64) {
 }
 
 /// Aggregate per-bot results and evaluate the SLOs.
-fn report(config: &LoadTestConfig, results: &[BotResult], tick_p99_ms: Option<f64>) -> LoadTestReport {
+fn report(config: &LoadTestConfig, results: &[BotResult], server: Option<ServerSample>) -> LoadTestReport {
+    let tick_p99_ms = server.as_ref().and_then(|s| s.tick_p99_ms);
     let attempted = results.iter().filter(|r| r.attempted).count();
     let connected: Vec<&BotResult> = results.iter().filter(|r| r.connected).collect();
     let per_sec = |bytes: u64, secs: f64| if secs > 0.0 { bytes as f64 / secs } else { 0.0 };
@@ -711,6 +789,7 @@ fn report(config: &LoadTestConfig, results: &[BotResult], tick_p99_ms: Option<f6
         },
         disconnects,
         server_tick_p99_ms: tick_p99_ms,
+        server,
         slo_passed: false,
     };
     let slo = &config.slo;
@@ -778,11 +857,11 @@ where
         );
     }
     let after = config.metrics_url.as_deref().and_then(|u| scrape(&http, u));
-    let tick_p99_ms = match (&before, &after) {
-        (Some(b), Some(a)) => histogram_quantile(b, a, 0.99).map(|s| s * 1000.0),
+    let server = match (&before, &after) {
+        (Some((b, tb)), Some((a, ta))) => Some(server_sample(b, a, ta.duration_since(*tb).as_secs_f64())),
         _ => None,
     };
-    let rep = report(&config, &results, tick_p99_ms);
+    let rep = report(&config, &results, server);
     tracing::info!(
         connected = rep.connected,
         attempted = rep.attempted,
@@ -814,6 +893,35 @@ mod tests {
         assert_eq!(histogram_quantile(&b, &a, 0.5), Some(0.001));
         assert_eq!(histogram_quantile(&b, &a, 0.99), Some(0.004));
         assert_eq!(histogram_quantile(&b, &b, 0.99), None);
+    }
+
+    #[test]
+    fn server_sample_from_two_scrapes() {
+        let before = "space3d_tick_seconds_bucket{le=\"0.001\"} 10\n\
+            space3d_tick_seconds_bucket{le=\"+Inf\"} 10\n\
+            space3d_tick_seconds_sum 0.005\n\
+            space3d_tick_seconds_count 10\n\
+            space3d_bytes_total{dir=\"out\",channel=\"all\"} 1000\n\
+            space3d_bytes_total{dir=\"in\",channel=\"all\"} 50\n\
+            space3d_ticks_skipped_total 1\n";
+        let after = "space3d_tick_seconds_bucket{le=\"0.001\"} 110\n\
+            space3d_tick_seconds_bucket{le=\"+Inf\"} 110\n\
+            space3d_tick_seconds_sum 0.055\n\
+            space3d_tick_seconds_count 110\n\
+            space3d_bytes_total{dir=\"out\",channel=\"all\"} 21000\n\
+            space3d_bytes_total{dir=\"in\",channel=\"all\"} 2050\n\
+            space3d_ticks_skipped_total 1\n\
+            space3d_rooms{phase=\"running\"} 3\n\
+            space3d_rooms{phase=\"closed\"} 1\n";
+        assert_eq!(metric_value(after, "space3d_rooms", &[]), Some(4.0));
+        assert_eq!(metric_value(after, "space3d_rooms", &[("phase", "running")]), Some(3.0));
+        assert_eq!(metric_value(after, "space3d_nope", &[]), None);
+        let s = server_sample(before, after, 2.0);
+        assert_eq!(s.ticks, 100);
+        assert!((s.tick_mean_ms.unwrap() - 0.5).abs() < 1e-9);
+        assert_eq!(s.tick_p99_ms, Some(1.0));
+        assert_eq!((s.ticks_skipped, s.rooms_running), (0, 3));
+        assert_eq!((s.bytes_out_per_sec, s.bytes_in_per_sec), (10_000.0, 1_000.0));
     }
 
     #[test]
@@ -889,7 +997,13 @@ mod tests {
             metrics_url: Some("http://x/metrics".into()),
             ..config.clone()
         };
-        assert!(!report(&slow, &[good.clone(), good.clone()], Some(9.0)).slo_passed);
-        assert!(report(&slow, &[good.clone(), good], Some(2.0)).slo_passed);
+        let tick = |ms: f64| {
+            Some(ServerSample {
+                tick_p99_ms: Some(ms),
+                ..Default::default()
+            })
+        };
+        assert!(!report(&slow, &[good.clone(), good.clone()], tick(9.0)).slo_passed);
+        assert!(report(&slow, &[good.clone(), good], tick(2.0)).slo_passed);
     }
 }

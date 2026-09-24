@@ -115,9 +115,22 @@ impl ChangeCache {
         //    so parents spawned before their children get the smaller id and arrive first.
         let mut fresh: Vec<Entity> = entities.iter().copied().filter(|e| ids.net_id(*e).is_none()).collect();
         fresh.sort_unstable_by_key(|e| (e.id(), e.to_bits()));
+        // Entities mapped before their first collect (checkpoint restore pre-assigns the
+        // `NetId`s it captured) are adopted: they need records like fresh ones.
+        let mut adopted: Vec<NetId> = entities
+            .iter()
+            .filter_map(|e| ids.net_id(*e))
+            .filter(|id| !self.index.contains_key(id))
+            .collect();
+        adopted.sort_unstable();
+        let unsorted = match (adopted.first(), self.records.last()) {
+            (Some(first), Some(last)) => *first < last.net_id,
+            _ => false,
+        };
         let new_ids: Vec<NetId> = fresh.into_iter().map(|e| ids.allocate(e)).collect();
-        // 2. Records (new ids are the largest, so appending keeps `records` sorted).
-        for id in new_ids {
+        // 2. Records (new ids are the largest, so appending keeps `records` sorted; adopted ids
+        //    are older than every allocated one and only need a re-sort when records exist).
+        for id in adopted.into_iter().chain(new_ids) {
             let entity = ids.entity(id).expect("just allocated");
             self.index.insert(id, self.records.len());
             self.records.push(EntityRecord {
@@ -139,6 +152,10 @@ impl ChangeCache {
                 interest_radius: None,
                 seen: 0,
             });
+        }
+        if unsorted {
+            self.records.sort_unstable_by_key(|r| r.net_id);
+            self.reindex();
         }
         let ctx = EncodeCtx::new(ids);
         for &e in &entities {
@@ -226,15 +243,17 @@ impl ChangeCache {
             keep
         });
         if self.records.len() != before {
-            self.index.clear();
-            for (i, r) in self.records.iter().enumerate() {
-                self.index.insert(r.net_id, i);
-            }
+            self.reindex();
         }
         for (id, entity, pos) in gone {
             ids.remove(entity);
             self.grid.update(id.0, pos, None);
             self.tombstones.push((id, tick));
+        }
+        // Pre-mapped (restored) entities that were despawned before their first collect.
+        if ids.len() != self.records.len() {
+            let index = &self.index;
+            ids.retain(|id| index.contains_key(&id));
         }
         // 4. Hierarchy roots.
         for i in 0..self.records.len() {
@@ -247,6 +266,13 @@ impl ChangeCache {
                 cur = self.records[pi].parent;
             }
             self.records[i].root = root;
+        }
+    }
+
+    fn reindex(&mut self) {
+        self.index.clear();
+        for (i, r) in self.records.iter().enumerate() {
+            self.index.insert(r.net_id, i);
         }
     }
 
@@ -375,6 +401,35 @@ mod tests {
         cache.collect(Tick(10), &mut world, &reg, &mut ids);
         assert!(ids.net_id(c).unwrap() > bid);
         assert!(cache.records.windows(2).all(|w| w[0].net_id < w[1].net_id));
+    }
+
+    #[test]
+    fn premapped_entities_get_records() {
+        // Checkpoint restore maps entities to their captured ids before the first collect.
+        let reg = registry();
+        let mut world = World::new();
+        let mut ids = NetIdMap::default();
+        let mut cache = ChangeCache::default();
+        let live = world.spawn((Replicated, Hp(1)));
+        let gone = world.spawn((Replicated, Hp(2)));
+        let late = world.spawn((Replicated, Hp(3)));
+        ids.insert(NetId(7), live);
+        ids.insert(NetId(3), gone);
+        ids.set_next_id(9);
+        world.despawn(gone).unwrap();
+        cache.collect(Tick(2), &mut world, &reg, &mut ids);
+        let ids_of: Vec<NetId> = cache.records.iter().map(|r| r.net_id).collect();
+        assert_eq!(ids_of, vec![NetId(7), NetId(9)], "adopted + fresh, sorted");
+        assert_eq!(ids.net_id(late), Some(NetId(9)));
+        assert_eq!(ids.entity(NetId(3)), None, "dead pre-mapped entity forgotten");
+        assert_eq!(cache.get(NetId(7)).unwrap().comp(1).unwrap().changed_tick, Tick(2));
+        // Adopting below existing records keeps `records` sorted and indexed.
+        let older = world.spawn((Replicated, Hp(4)));
+        ids.insert(NetId(5), older);
+        cache.collect(Tick(4), &mut world, &reg, &mut ids);
+        let ids_of: Vec<NetId> = cache.records.iter().map(|r| r.net_id).collect();
+        assert_eq!(ids_of, vec![NetId(5), NetId(7), NetId(9)]);
+        assert_eq!(cache.get(NetId(5)).unwrap().entity, older);
     }
 
     #[test]

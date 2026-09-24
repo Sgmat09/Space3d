@@ -9,7 +9,9 @@ use super::NetServer;
 use crate::mapping::{DecodeCtx, EncodeCtx, NetIdMap};
 use crate::registry::ReplicationRegistry;
 use crate::wire::{DecodeError, EncodeError, Writer};
-use crate::{ControlledBy, InterestSource, NetId, NetPriority, NetRelevance, NetTeam, Owner, Replicated, Tick};
+use crate::{
+    ControlledBy, InterestSource, NetId, NetPriority, NetRelevance, NetTeam, Owner, Replicated, Simulated, Tick,
+};
 use serde::{Deserialize, Serialize};
 use space3d_core::{App, Entity, World};
 
@@ -43,6 +45,9 @@ pub const META_PRIORITY: &str = "net.priority";
 pub const META_RELEVANCE: &str = "net.relevance";
 /// See [`META_CONTROLLED_BY`].
 pub const META_INTEREST: &str = "net.interest_source";
+/// See [`META_CONTROLLED_BY`] (the `Simulated` marker; no payload). Restored entities keep
+/// being advanced by the room's sim systems.
+pub const META_SIMULATED: &str = "net.simulated";
 
 fn meta<T: serde::Serialize + Copy + Send + Sync + 'static>(
     world: &World,
@@ -65,6 +70,7 @@ fn restore_meta(world: &mut World, e: Entity, name: &str, bytes: &[u8]) -> Resul
         META_PRIORITY => world.insert_one(e, p::<NetPriority>(bytes)?),
         META_RELEVANCE => world.insert_one(e, p::<NetRelevance>(bytes)?),
         META_INTEREST => world.insert_one(e, p::<InterestSource>(bytes)?),
+        META_SIMULATED => world.insert_one(e, Simulated),
         _ => return Ok(false),
     };
     res.map_err(|_| DecodeError::Invalid("entity vanished during restore"))?;
@@ -113,6 +119,9 @@ pub fn capture(app: &App) -> Result<FullState, EncodeError> {
         meta::<NetPriority>(world, e, META_PRIORITY, &mut comps)?;
         meta::<NetRelevance>(world, e, META_RELEVANCE, &mut comps)?;
         meta::<InterestSource>(world, e, META_INTEREST, &mut comps)?;
+        if world.satisfies::<&Simulated>(e) {
+            comps.push((META_SIMULATED.to_owned(), Vec::new()));
+        }
         out.push((id, comps));
     }
     Ok(FullState {
@@ -198,9 +207,13 @@ mod tests {
         let parent = a
             .world
             .spawn((Replicated, Transform::from_xyz(1.0, 2.0, 3.0), Name("p".into())));
-        let child = a
-            .world
-            .spawn((Replicated, Parent(parent), Hp(9), ControlledBy(crate::PlayerId(5))));
+        let child = a.world.spawn((
+            Replicated,
+            Simulated,
+            Parent(parent),
+            Hp(9),
+            ControlledBy(crate::PlayerId(5)),
+        ));
         a.step_ticks(4);
         let state = capture(&a).unwrap();
         assert_eq!(state.entities.len(), 2);
@@ -219,6 +232,8 @@ mod tests {
         assert_eq!(b.world.get::<&Parent>(ce).unwrap().0, pe);
         assert_eq!(*b.world.get::<&Hp>(ce).unwrap(), Hp(9));
         assert_eq!(b.world.get::<&ControlledBy>(ce).unwrap().0, crate::PlayerId(5));
+        assert!(b.world.satisfies::<&Simulated>(ce), "sim marker restored");
+        assert!(!b.world.satisfies::<&Simulated>(pe));
         assert_eq!(b.world.get::<&Transform>(pe).unwrap().translation.y, 2.0);
         let _ = child;
         // New ids continue after the restored ones; schema mismatch is refused.

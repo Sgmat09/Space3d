@@ -84,6 +84,18 @@ impl NetIdMap {
     pub fn is_empty(&self) -> bool {
         self.to_net.is_empty()
     }
+
+    /// Keep only the ids for which `keep` returns true.
+    pub fn retain(&mut self, mut keep: impl FnMut(NetId) -> bool) {
+        let to_net = &mut self.to_net;
+        self.to_entity.retain(|id, e| {
+            let k = keep(*id);
+            if !k {
+                to_net.remove(e);
+            }
+            k
+        });
+    }
 }
 
 /// Client-side bidirectional map (resource owned by `NetClient`).

@@ -638,6 +638,91 @@ fn client_stall_resyncs_and_recovers() {
     converged(&mut h, a, 60);
 }
 
+/// Snapshots queued behind a downstream stall arrive together, all disagreeing with the
+/// prediction (the server moved the pawn during the stall). The client keeps only the newest
+/// confirmation, so it replays from that tick exactly once: no snap, no second correction, and
+/// every tick it predicts afterwards equals the server's.
+#[test]
+fn snapshot_burst_after_a_stall_replays_from_the_newest_confirmation() {
+    let mut config = HarnessConfig {
+        seed: 47,
+        link: link(30),
+        ..Default::default()
+    };
+    config.client.prediction.smoothing_half_life = Duration::ZERO;
+    let mut h = with_rules(config);
+    let a = walker(&mut h, "alice", |t| Move {
+        x: [1, 0, -1, 0][(t.0 / 20 % 4) as usize],
+        z: 1,
+    });
+    connect(&mut h, a);
+    h.step_ticks(120);
+    let server_pawn = pawn(h.server(), h.player(a)).unwrap();
+    let mut mis_r = EventReader::default();
+    let _ = read::<Mispredicted>(h.client(a), &mut mis_r);
+    // ~20 ticks of snapshots pile up behind a 330 ms downstream stall.
+    h.set_link(
+        a,
+        LinkProfile {
+            down: LinkConditions {
+                latency: Duration::from_millis(330),
+                ..LinkConditions::perfect()
+            },
+            ..link(30)
+        },
+    );
+    let mut client_pos = std::collections::BTreeMap::new();
+    let mut server_pos = std::collections::BTreeMap::new();
+    let mut record = |h: &NetHarness| {
+        let predicted = h.client_net(a).predicted_tick().unwrap().0 - 1;
+        let ce = controlled(h.client(a)).unwrap();
+        client_pos.insert(predicted, h.client(a).world.get::<&Transform>(ce).unwrap().translation);
+        server_pos.insert(
+            h.server_net().tick().0,
+            h.server().world.get::<&Transform>(server_pawn).unwrap().translation,
+        );
+    };
+    for i in 0..3 {
+        if i == 1 {
+            h.server_mut()
+                .world
+                .get::<&mut Transform>(server_pawn)
+                .unwrap()
+                .translation
+                .x += 2.0;
+        }
+        h.step();
+        record(&h);
+    }
+    h.set_link(a, link(30));
+    let mut events = Vec::new();
+    let mut first_fix = None;
+    for _ in 0..180 {
+        h.step();
+        let got = read::<Mispredicted>(h.client(a), &mut mis_r);
+        if !got.is_empty() && first_fix.is_none() {
+            first_fix = Some(h.client_net(a).predicted_tick().unwrap().0 - 1);
+        }
+        events.extend(got);
+        record(&h);
+    }
+    assert!(!events.is_empty(), "the teleport was corrected");
+    assert!(events.iter().all(|m| m.replayed > 0), "no snap: {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "one correction from the newest confirmation: {events:?}"
+    );
+    let fixed = first_fix.unwrap();
+    let mut compared = 0;
+    for (t, c) in client_pos.range(fixed..) {
+        let Some(s) = server_pos.get(t) else { continue };
+        assert!((*c - *s).abs().max_element() < 1e-6, "tick {t}: client {c} server {s}");
+        compared += 1;
+    }
+    assert!(compared > 100, "compared {compared} ticks");
+}
+
 /// CI smoke load: 50 walking bots in one room for 10 s on broadband links. Everyone stays
 /// connected and converged, every client's downstream stays within its budget and inputs
 /// arrive on time. (Bytes and counts, not timing.)

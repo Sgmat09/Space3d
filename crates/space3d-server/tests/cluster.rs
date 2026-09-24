@@ -126,24 +126,15 @@ fn matchmaking_play_and_results_flow_to_the_player_service() {
     assert!(settled, "room-written player data persisted");
 }
 
-// Replication gap (owned by `space3d-replication`, reported): `full_state::restore` pre-maps the
-// restored entities' `NetId`s, and `server::change::ChangeCache::collect` only creates records
-// for entities *without* a `NetId`, so restored entities are never sent to (re)joining clients.
-// The server-side halves below always run; the client-visibility checks are `#[ignore]`d until
-// that lands (`cargo test -p space3d-server --test cluster -- --ignored`).
+// Restored rooms: `full_state::restore` pre-maps the captured `NetId`s and the change cache
+// adopts those entities on its first collect, so (re)joining clients receive the restored state.
 
 #[test]
 fn room_crash_is_contained_and_players_rejoin_restored_state() {
-    room_crash_scenario(false);
+    room_crash_scenario();
 }
 
-#[test]
-#[ignore = "blocked on space3d-replication: restored entities are not collected"]
-fn room_crash_restored_state_reaches_clients() {
-    room_crash_scenario(true);
-}
-
-fn room_crash_scenario(check_clients: bool) {
+fn room_crash_scenario() {
     let mut c = cluster(1);
     let alice = c.guest("alice");
     let bob = c.guest("bob");
@@ -180,9 +171,6 @@ fn room_crash_scenario(check_clients: bool) {
     });
     assert!(ok, "players back in the rebuilt room");
     assert_eq!(pawns(c.room(room).unwrap()), 2, "rejoin re-used the restored pawns");
-    if !check_clients {
-        return;
-    }
     let synced = c.run_until(300, |c| {
         healths(c.client(ca)) == vec![42, 100] && healths(c.client(cb)) == vec![42, 100]
     });
@@ -191,16 +179,10 @@ fn room_crash_scenario(check_clients: bool) {
 
 #[test]
 fn game_server_loss_restores_the_room_on_another_server() {
-    server_loss_scenario(false);
+    server_loss_scenario();
 }
 
-#[test]
-#[ignore = "blocked on space3d-replication: restored entities are not collected"]
-fn game_server_loss_restored_state_reaches_clients() {
-    server_loss_scenario(true);
-}
-
-fn server_loss_scenario(check_clients: bool) {
+fn server_loss_scenario() {
     let mut c = cluster(2);
     let alice = c.guest("alice");
     let bob = c.guest("bob");
@@ -255,9 +237,6 @@ fn server_loss_scenario(check_clients: bool) {
     let restored = c.room(room).unwrap();
     assert_eq!(pawns(restored), 2);
     assert_eq!(pawn_health(restored, player(&alice)), Some(7));
-    if !check_clients {
-        return;
-    }
     let synced = c.run_until(300, |c| {
         healths(c.client(ca)) == vec![7, 100] && healths(c.client(cb)) == vec![7, 100]
     });
@@ -375,4 +354,28 @@ fn network_partition_resumes_the_same_slot_through_the_gatekeeper() {
     assert!(c.client_net(cb).is_connected(), "bob unaffected");
     assert_eq!(pawns(c.room(room).unwrap()), 2, "same slot and pawn, no duplicate");
     assert!(c.run_until(120, |c| remote_count(c.client(ca)) == 2));
+}
+
+#[test]
+fn concurrent_quick_plays_fill_one_room() {
+    use space3d_replication::api::QuickPlayRequest;
+    let mut c = cluster(1);
+    let players: Vec<SessionTokens> = (0..8).map(|i| c.guest(&format!("q{i}"))).collect();
+    // All eight requests are in flight at once: finding an open room and allocating a new one
+    // happen under one fleet lock, so they share one room (capacity 16) instead of racing
+    // into several.
+    let tasks: Vec<_> = players
+        .iter()
+        .map(|t| {
+            c.api(t).quick_play(&QuickPlayRequest {
+                mode: "ffa".into(),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let rooms: std::collections::BTreeSet<RoomId> = tasks
+        .into_iter()
+        .map(|t| t.block().unwrap().expect("quick play").room_id)
+        .collect();
+    assert_eq!(rooms.len(), 1, "{rooms:?}");
 }

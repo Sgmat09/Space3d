@@ -758,7 +758,7 @@ pub(crate) trait InputOps: Send + Sync + 'static {
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     fn decode(&self, bytes: &[u8]) -> Result<(InputValue, bool), DecodeError>;
     fn neutral(&self) -> InputValue;
-    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "server", feature = "client")), allow(dead_code))]
     fn repeat(&self, v: &InputValue) -> InputValue;
     fn clone_value(&self, v: &InputValue) -> InputValue;
     #[cfg_attr(not(feature = "client"), allow(dead_code))]

@@ -395,37 +395,13 @@ async fn quick_play(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, bo
     }
     let account = account_of(&svc, who.player()).await?;
     let extra = serde_json::json!({ "rating": account.rating });
-    let now = svc.now_ms();
-    let reserve = svc.config.player_service.join_ticket_ttl.as_millis() as i64;
-    let open = svc.fleet.lock().open_room(&req.mode, 1, now, reserve);
-    let (server, spec) = match open {
-        Some(found) => found,
-        None => {
-            let capacity = svc.mode_capacity(&req.mode);
-            let params = svc
-                .config
-                .matchmaking
-                .queues
-                .iter()
-                .find(|q| q.mode == req.mode)
-                .map(|q| q.params.clone())
-                .unwrap_or_default();
-            svc.allocate_room(
-                &best_region(&req.region_pings),
-                &req.mode,
-                capacity,
-                1,
-                Vec::new(),
-                None,
-                params,
-            )
-            .ok_or_else(|| {
-                let mut e = api_err(503, "no_capacity", "no game server available");
-                e.1.retry_after_ms = Some(5_000);
-                e
-            })?
-        }
-    };
+    let (server, spec) = svc
+        .quick_play_room(&best_region(&req.region_pings), &req.mode)
+        .ok_or_else(|| {
+            let mut e = api_err(503, "no_capacity", "no game server available");
+            e.1.retry_after_ms = Some(5_000);
+            e
+        })?;
     Ok(Json(svc.issue_ticket(
         account.id,
         &account.display_name,

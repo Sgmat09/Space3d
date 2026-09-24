@@ -509,18 +509,35 @@ impl ServerConfig {
     /// Load `path` (if any) and overlay `env` (`(name, value)` pairs, usually `std::env::vars()`),
     /// then expand `${VAR}` / `{server_id}` and validate.
     pub fn load(path: Option<&Path>, env: impl IntoIterator<Item = (String, String)>) -> Result<Self, ConfigError> {
+        Self::load_layered(None, path, env)
+    }
+
+    /// Like [`Self::load`] with a game-supplied TOML layer **under** the file: defaults ←
+    /// `defaults` ← file ← env. Tables merge key by key (a file only needs the keys it
+    /// changes); arrays and scalars replace. Lets a game binary ship working dev settings
+    /// (`ServerMain::from_env_with_defaults`).
+    pub fn load_layered(
+        defaults: Option<&str>,
+        path: Option<&Path>,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, ConfigError> {
         let env: Vec<(String, String)> = env.into_iter().collect();
-        let mut table = match path {
-            Some(path) => {
-                let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
-                    path: path.to_path_buf(),
-                    message: e.to_string(),
-                })?;
-                text.parse::<toml::Table>()
-                    .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?
-            }
+        let mut table = match defaults {
+            Some(text) => text
+                .parse::<toml::Table>()
+                .map_err(|e| ConfigError::Parse(format!("built-in defaults: {e}")))?,
             None => toml::Table::new(),
         };
+        if let Some(path) = path {
+            let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
+                path: path.to_path_buf(),
+                message: e.to_string(),
+            })?;
+            let file = text
+                .parse::<toml::Table>()
+                .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
+            merge_tables(&mut table, file);
+        }
         overlay_env(&mut table, env.iter().cloned());
         let lookup: BTreeMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         expand_env_table(&mut table, &|name| lookup.get(name).map(|v| (*v).to_owned()));
@@ -756,6 +773,18 @@ pub fn expand_env(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
     out
 }
 
+/// Merge `top` into `base`: nested tables merge key by key, everything else replaces.
+pub fn merge_tables(base: &mut toml::Table, top: toml::Table) {
+    for (key, value) in top {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(t)) => merge_tables(b, t),
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
 /// Apply `SPACE3D__A__B=value` overrides to a parsed TOML table.
 ///
 /// Segments are lower-cased and nested tables are created as needed. The value is parsed as a
@@ -964,6 +993,29 @@ mod tests {
         assert_eq!(parse_bytes("1024").unwrap(), 1024);
         assert!(parse_bytes("lots").is_err());
         assert!(parse_bytes("99999999999999999999GiB").is_err());
+    }
+
+    #[test]
+    fn layered_defaults_merge_under_file_and_env() {
+        let defaults = "role = \"all-in-one\"\n[game]\nbind = \"127.0.0.1:7000\"\nallow_dev_auth = true\n\
+                        [limits]\nmax_connections_per_ip = 64\n";
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("server.toml");
+        std::fs::write(&file, "[game]\ntick_hz = 30.0\n").unwrap();
+        let cfg = ServerConfig::load_layered(
+            Some(defaults),
+            Some(&file),
+            env(&[("SPACE3D__LIMITS__MAX_CONNECTIONS_PER_IP", "128")]),
+        )
+        .unwrap();
+        // Defaults survive where the file is silent (tables merge key by key).
+        assert_eq!(cfg.game.bind, "127.0.0.1:7000".parse().unwrap());
+        assert!(cfg.game.allow_dev_auth);
+        assert_eq!(cfg.game.tick_hz, 30.0, "file over defaults");
+        assert_eq!(cfg.limits.max_connections_per_ip, 128, "env over defaults");
+        let plain = ServerConfig::load_layered(Some(defaults), None, Vec::new()).unwrap();
+        assert_eq!(plain.game.tick_hz, 60.0);
+        assert!(ServerConfig::load_layered(Some("[game"), None, Vec::new()).is_err());
     }
 
     #[test]

@@ -47,15 +47,23 @@ pub struct ServerRecord {
     pub state: ServerState,
     /// Seats reserved by unexpired tickets.
     pub reserved: u32,
+    /// Players present in its rooms per `PlayerJoined` / `PlayerLeft` (ahead of the next
+    /// heartbeat's count, which lags by up to one heartbeat interval).
+    pub present: u32,
 }
 
 impl ServerRecord {
+    /// Players on the server: the newer of the heartbeat count and the presence events.
+    pub fn players(&self) -> u32 {
+        self.heartbeat.players.max(self.present)
+    }
+
     /// Free player seats.
     pub fn free_seats(&self) -> u32 {
         self.registration
             .capacity
             .max_players
-            .saturating_sub(self.heartbeat.players)
+            .saturating_sub(self.players())
             .saturating_sub(self.reserved)
     }
 
@@ -153,12 +161,27 @@ impl FleetRegistry {
     fn recount_reserved(&mut self) {
         for s in self.servers.values_mut() {
             s.reserved = 0;
+            s.present = 0;
         }
         for r in &self.reservations {
             if let Some(s) = self.servers.get_mut(&r.server) {
                 s.reserved += r.seats;
             }
         }
+        for room in self.presence.values() {
+            if let Some(s) = self.rooms.get(room).and_then(|e| self.servers.get_mut(&e.server)) {
+                s.present += 1;
+            }
+        }
+    }
+
+    /// Players present per room (presence events; see [`ServerRecord::present`]).
+    fn present_per_room(&self) -> BTreeMap<RoomId, u32> {
+        let mut n = BTreeMap::new();
+        for room in self.presence.values() {
+            *n.entry(*room).or_insert(0) += 1;
+        }
+        n
     }
 
     /// Feed a message from server `server_id` (the connection's registered id) at `now_ms`.
@@ -181,6 +204,7 @@ impl FleetRegistry {
                         last_seen_ms: now_ms,
                         state: ServerState::Ready,
                         reserved: 0,
+                        present: 0,
                     },
                 );
                 self.recount_reserved();
@@ -233,6 +257,7 @@ impl FleetRegistry {
                 if let Some(rec) = self.servers.get_mut(server_id) {
                     rec.heartbeat = hb;
                 }
+                self.recount_reserved();
                 Vec::new()
             }
             FleetUp::RoomOpened { room_id, spec } => {
@@ -255,24 +280,33 @@ impl FleetRegistry {
                 Vec::new()
             }
             FleetUp::PlayerJoined { room_id, player } => {
-                self.presence.insert(player, room_id);
-                if let Some(i) = self
+                // A rejoin (resume / new link) is not a new seat.
+                let fresh = self.presence.insert(player, room_id) != Some(room_id);
+                // The seat moves from the reservation to presence (the room's own reservation
+                // first, then a server-wide one).
+                let i = self
                     .reservations
                     .iter()
-                    .position(|r| r.server == server_id && (r.room.is_none() || r.room == Some(room_id)))
-                {
+                    .position(|r| r.server == server_id && r.room == Some(room_id))
+                    .or_else(|| {
+                        self.reservations
+                            .iter()
+                            .position(|r| r.server == server_id && r.room.is_none())
+                    });
+                if let Some(i) = i.filter(|_| fresh) {
                     let r = &mut self.reservations[i];
                     r.seats = r.seats.saturating_sub(1);
                     if r.seats == 0 {
                         self.reservations.remove(i);
                     }
-                    self.recount_reserved();
                 }
+                self.recount_reserved();
                 Vec::new()
             }
             FleetUp::PlayerLeft { room_id, player } => {
                 if self.presence.get(&player) == Some(&room_id) {
                     self.presence.remove(&player);
+                    self.recount_reserved();
                 }
                 Vec::new()
             }
@@ -367,7 +401,7 @@ impl FleetRegistry {
         };
         let score = |s: &ServerRecord| {
             let cap = s.registration.capacity.max_players.max(1) as f64;
-            (s.heartbeat.players + s.reserved) as f64 / cap + s.heartbeat.tick_p99_us as f64 / TICK_BUDGET_US
+            (s.players() + s.reserved) as f64 / cap + s.heartbeat.tick_p99_us as f64 / TICK_BUDGET_US
         };
         let pick = |any: bool| {
             self.servers
@@ -390,6 +424,16 @@ impl FleetRegistry {
     /// Record a room the player service created (tickets carry the spec; the server reports
     /// it with `RoomOpened` once built).
     pub fn note_room(&mut self, spec: &RoomSpec, server: &str, now_ms: i64) {
+        // The seats `allocate` just reserved server-wide belong to this room: bind them, so
+        // quick play counts them against the room's capacity.
+        if let Some(r) = self
+            .reservations
+            .iter_mut()
+            .rev()
+            .find(|r| r.server == server && r.room.is_none())
+        {
+            r.room = Some(spec.room_id);
+        }
         self.rooms.insert(
             spec.room_id,
             RoomEntry {
@@ -418,6 +462,7 @@ impl FleetRegistry {
                 .map(|r| r.seats)
                 .sum()
         };
+        let present = self.present_per_room();
         let best = self
             .rooms
             .iter()
@@ -427,10 +472,13 @@ impl FleetRegistry {
                 if e.orphaned || spec.mode != mode || !server.allocatable() {
                     return None;
                 }
-                let (players, joinable) = e
+                let (reported, joinable) = e
                     .status
                     .as_ref()
                     .map_or((0, true), |s| (u32::from(s.players), s.joinable));
+                // Presence events are ahead of the 1 Hz room status; reservations of players
+                // who already joined are released on their `PlayerJoined`.
+                let players = reported.max(present.get(id).copied().unwrap_or(0));
                 let used = players + reserved_in(*id);
                 (joinable && used + seats <= u32::from(spec.max_players)).then_some((used, *id))
             })
@@ -583,6 +631,55 @@ mod tests {
             100,
         );
         assert!(f.allocate("us", "", 0, 1, 100, 1).unwrap().registration.region != "us");
+    }
+
+    #[test]
+    fn quick_play_never_oversubscribes_a_room_between_heartbeats() {
+        let mut f = FleetRegistry::new(10_000, 60_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        // `allocate_room`: a server-wide reservation for the first player, bound to the room.
+        f.allocate("eu", "", 0, 1, 0, 60_000).unwrap();
+        f.note_room(&spec(9, "ffa", 3), "gs-1", 0);
+        assert!(f.open_room("ffa", 1, 0, 60_000).is_some(), "2nd seat");
+        assert!(f.open_room("ffa", 1, 0, 60_000).is_some(), "3rd seat");
+        assert!(
+            f.open_room("ffa", 1, 0, 60_000).is_none(),
+            "the first ticket's seat counts"
+        );
+        // Everyone joins before the next heartbeat: seats move from reservations to presence.
+        for p in 1..=3 {
+            f.on_message(
+                "gs-1",
+                FleetUp::PlayerJoined {
+                    room_id: RoomId(9),
+                    player: PlayerId(p),
+                },
+                10,
+            );
+        }
+        assert_eq!(f.server("gs-1").unwrap().reserved, 0);
+        assert_eq!(f.server("gs-1").unwrap().present, 3);
+        assert_eq!(f.server("gs-1").unwrap().free_seats(), 97);
+        assert!(f.open_room("ffa", 1, 10, 60_000).is_none(), "full per presence");
+        // A resume of a present player is not a new seat; a leave frees one.
+        f.on_message(
+            "gs-1",
+            FleetUp::PlayerJoined {
+                room_id: RoomId(9),
+                player: PlayerId(2),
+            },
+            20,
+        );
+        assert_eq!(f.server("gs-1").unwrap().present, 3);
+        f.on_message(
+            "gs-1",
+            FleetUp::PlayerLeft {
+                room_id: RoomId(9),
+                player: PlayerId(3),
+            },
+            30,
+        );
+        assert!(f.open_room("ffa", 1, 30, 60_000).is_some());
     }
 
     #[test]
