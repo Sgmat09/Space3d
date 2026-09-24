@@ -2563,6 +2563,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "multiplayer_arena"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "space3d-core",
+ "space3d-net",
+ "space3d-platform",
+ "space3d-render",
+ "space3d-replication",
+ "space3d-server",
+ "space3d-tasks",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "web-sys",
+]
+
+[[package]]
 name = "naga"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

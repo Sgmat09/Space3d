@@ -1,0 +1,52 @@
+# multiplayer_arena: built-in dev defaults of the `server` binary (see
+# `crates/space3d-server/deploy/server.example.toml` for every key). Applied UNDER
+# `--config <file>` / `SPACE3D_CONFIG` and the `SPACE3D__SECTION__KEY=value` env overlay, so a
+# deployment overrides whatever it needs. As shipped: one process (player service + game
+# server), loopback only, dev auth on, the PUBLIC dev signing key (env = "dev").
+
+role = "all-in-one"
+server_id = "arena-dev"
+region = "local"
+
+[log]
+filter = "info"
+
+[game]
+bind = "127.0.0.1:7777"
+public_url = "ws://127.0.0.1:7777/play"
+tick_hz = 60.0
+send_interval = 2           # snapshots at 30 Hz
+allow_dev_auth = true       # `client --server ws://127.0.0.1:7777/play` without the player service
+drain_timeout = "3s"        # SIGTERM → notice, final checkpoint, disconnect, exit
+empty_room_ttl = "30s"
+
+[limits]
+# Every local test client comes from 127.0.0.1: allow many per IP (keep the defaults, 8 and
+# 20/min, on a public server).
+max_connections_per_ip = 512
+handshakes_per_ip_per_min = 2400
+
+[player_service]
+bind = "127.0.0.1:7777"     # same listener as /play: equal binds share one HTTP server
+db_path = "target/multiplayer_arena/players.db"
+http_rps_per_ip = 1000
+login_attempts_per_min = 2400
+
+[admin]
+bind = "127.0.0.1:9090"     # /metrics, /healthz, /readyz, /admin/v1/* (open on loopback without tokens)
+
+[persistence]
+data_dir = "target/multiplayer_arena"
+checkpoint_interval = "5s"
+checkpoint_store = "player-service"
+
+# Quick play (`POST /v1/play/quick {mode = "arena"}`) fills open arena rooms of 16 before
+# opening a new one; room capacity is teams × team_size of the queue with that mode.
+[[matchmaking.queues]]
+name = "arena"
+mode = "arena"
+teams = 1
+team_size = 16
+min_players = 1
+max_wait = "5s"
+backfill = true

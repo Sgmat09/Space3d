@@ -1,6 +1,6 @@
 # Space3d dedicated game server, player service and replication
 
-**Status:** final spec. The skeleton crates are committed and compile, and the contract is frozen (§18).
+**Status:** implemented. Both crates, the examples and the acceptance tests are in the tree; §18.3–§18.4 record what changed during implementation and integration. The operator's guide (quickstart, Docker, config reference, admin API, scaling, measured numbers) is [`docs/server.md`](../server.md).
 **Crates:** `crates/space3d-replication` is shared and wasm32-clean. `crates/space3d-server` is native only.
 **Prerequisite:** the `space3d-net` hardening is already implemented (§17.1).
 **Basis:** synthesized from three competing designs. The scores and rationale are in the appendix.
@@ -119,7 +119,7 @@
 
 `crates/space3d-server/src/config.rs` holds `ServerConfig`. `deploy/server.example.toml` is the commented reference and is also printed by `--print-default-config`.
 
-**Load order:** defaults ← file (`--config` / `SPACE3D_CONFIG`) ← env `SPACE3D__SECTION__KEY=value` (split on `__`, lowercased, value parsed as a TOML scalar, else a string) ← CLI flags.
+**Load order:** defaults ← the game binary's built-in TOML (`ServerMain::from_env_with_defaults`, optional) ← file (`--config` / `SPACE3D_CONFIG`) ← env `SPACE3D__SECTION__KEY=value` (split on `__`, lowercased, value parsed as a TOML value, else a string) ← CLI flags. Tables merge key by key; arrays (`[[matchmaking.queues]]`) replace.
 
 **Parsing:**
 - `${VAR}` expands in strings, and `{server_id}` expands in `game.public_url`.
@@ -276,8 +276,9 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
-### 3.3 Example game (after both builders land their P1)
+### 3.3 Example games
 
+- `examples/multiplayer_arena` is the minimal template (integration pass): one crate whose library holds the shared protocol (`CubesProtocol`: `CubeColor`, `CubeInput`, the `drive` sim system), the server rules (`CubesRules`), a deterministic `Wander` bot, WASD `controls` (feature `client`, through `space3d_platform::ActionMap`) and, native only, `server::CubesGame` + `DEV_CONFIG`. Binaries: `server` (`ServerMain::from_env_with_defaults`; all-in-one on loopback with no arguments), `client` (native + web; `--ps` guest login → quick play → ticket, or `--server` dev auth; `--headless --bot`; rejoin through the player service after a failed session; feature `client`, so `--no-default-features` builds a server without GPU dependencies) and `loadtest`.
 - `examples/arena-shared` (protocol, components, input, sim systems; no render dependencies) and `examples/arena-client` (native and web) are owned by the replication builder.
 - `examples/arena-server` and the arena load-test binary are owned by the server builder.
 
@@ -660,6 +661,8 @@ app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Ticket { url, tic
 
 **When a snapshot for S arrives:** for each `Predicted` entity, compare the confirmed bytes with `history[S]` (or apply `rollback_when`). On a difference, set `rollback_from = min(rollback_from, S)`.
 
+**Replay start (integration pass):** only the newest confirmed values are kept, so the replay always starts from the newest confirmed tick, whatever older tick first disagreed. When several snapshots arrive together after a stall, an older mismatch is superseded by the newest confirmation; if the prediction for that newest tick was right, nothing is replayed at all. (Starting at the oldest mismatch wrote the newest values and then re-applied the inputs in between: a wrong state and a second correction, or a snap when the span exceeded `max_rollback_ticks`.) Ticks with no recorded input (skipped by a forward resync) replay the last earlier input `repeat()`ed, exactly as the server filled them, and a resync keeps the input history, so a resync no longer forces a snap.
+
 **Snaps:** when a rollback cannot be replayed (longer than `max_rollback_ticks`, or inputs missing after a resync), the confirmed values are written and the recorded history before the current predicted tick T is dropped; confirmations older than T then only update the confirmed values, so one snap is followed by at most one ordinary replay. While the prediction lead itself exceeds `max_rollback_ticks` every correction snaps, so keep it above the expected lead (default 32 ticks ≈ 530 ms).
 
 **Visuals:** `PredictionError` decays with `smoothing_half_life` (60 ms), and errors above `snap_distance` (2 m) snap instead. It is applied to the rendered transform only and never simulated.
@@ -752,6 +755,7 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
 
 - **`FleetUp`:** `Register(ServerRegistration{token, server_id, region, public_url, game_id, build, protocol, schema_hash, capacity})`, `Heartbeat{seq, players, tick_p99_us, draining, rooms: Vec<RoomStatus>}`, `RoomOpened`, `RoomClosed`, `PlayerJoined`, `PlayerLeft`, `MatchResult{op_id}`, `PlayerDataWrite{op_id}`, `SubmitScore{op_id}`, `FetchPlayerData`.
 - **`FleetDown`:** `Registered{lease_ttl_ms, bans}`, `PrepareRoom{spec}`, `CloseRoom`, `Kick`, `Ban`, `Unban`, `Broadcast`, `Drain`, `Ack{op_id}`, `PlayerData`.
+- **Seats (integration pass):** a room's used seats are `max(reported players, presence) + reservations bound to the room`, and a server's are `max(heartbeat players, presence) + reservations`. `PlayerJoined`/`PlayerLeft` presence is immediate while room status and heartbeats lag by up to 2 s, and a join releases its reservation, so counting only the heartbeat oversubscribed rooms during quick-play bursts (`Reject(RoomFull)`). `allocate_room` binds the seat it reserves to the new room; a resume of a present player is not a new seat.
 - **Leases:** the heartbeat runs every 2 s and the lease lasts 10 s. When a lease expires the server is marked `Dead` and its rooms are orphaned (eligible for rejoin and restore).
 - **Allocation** filters on region, `game_id`, `schema_hash`, `Ready`, not draining, and enough free seats. It picks the lowest `players/capacity + tick_p99/budget` and reserves seats for the ticket TTL.
 
@@ -781,7 +785,7 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
 | player data written by rooms | `RoomControl::write_player_data` → outbox → `FleetUp::PlayerDataWrite{op_id}` → PS | at-least-once, idempotent |
 | results / scores | `RoomControl::end_match` / `submit_score` → outbox | same |
 | player data read by rooms | `RoomControl::load_player_data` → `FleetUp::FetchPlayerData` → `Events<PlayerDataLoaded>` | async; the slot plays meanwhile (small data such as rating travels in the ticket) |
-| room checkpoints | `Checkpoint{version, room_id, spec, state: FullState, server_only, game_blob, saved_ms}` → `CheckpointStore` (`player-service` default, `local`, `none`) | every 10 s, on phase change, drain, request; serialization via `AsyncQueue::compute_then`; ≤ 1 upload in flight per room |
+| room checkpoints (`FullState` keeps `NetId`s and the room-side markers `ControlledBy`, `Owner`, `NetTeam`, `NetPriority`, `NetRelevance`, `InterestSource`, `Simulated`) | `Checkpoint{version, room_id, spec, state: FullState, server_only, game_blob, saved_ms}` → `CheckpointStore` (`player-service` default, `local`, `none`) | every 10 s, on phase change, drain, request; serialization via `AsyncQueue::compute_then`; ≤ 1 upload in flight per room |
 
 **Failure matrix:**
 
@@ -901,7 +905,8 @@ assert_eq!(h.wire_digest(), run_again_with_same_seed());            // byte-leve
 | net (done) | 17 KiB → 1009 on server and client; slow consumer → 1008; accept hook; bounded inbox |
 | e2e sockets | all-in-one on port 0: PS login → quick play → 3 WS clients see each other; drain writes checkpoints and closes with 1001 (`pump_until` style, 5 s deadline) |
 | wasm | `cargo check -p space3d-replication --target wasm32-unknown-unknown` (default features and `--no-default-features --features client`) |
-| load | CI smoke: 50 bots in process for 600 ticks, asserting bytes and allocations (not timing). Nightly: `loadtest` with 200 clients over real sockets and SLO gates |
+| load | CI smoke: 50 bots in process for 600 ticks, asserting bytes and allocations (not timing). Nightly: `loadtest` with 200 clients over real sockets and SLO gates (`examples/multiplayer_arena/tests/load.rs`, `#[ignore]`) |
+| acceptance (integration pass) | `crates/space3d-server/tests/acceptance.rs`: 4 clients through guest login → quick play → ticket on a 100 ms RTT, ±20 ms jitter, 5 % loss stream link converge (remote p95 0, final 1 mm), predict exactly after reconciliation whenever the server had their inputs, resume the same slot after a 3 s blackout, stay under bandwidth budgets (4 movers ≈ 1.7 KB/s down; 300 NPCs held to a 12 KiB/s budget); separate player-service and game-server Apps over localhost with ticket → connect and single-use tickets. `examples/multiplayer_arena/tests/processes.rs`: the shipped binaries over localhost. Numbers: `docs/server.md` §7 |
 
 ### 15.4 Bots and load test
 
@@ -1005,7 +1010,16 @@ All changes are additive; the §18.1 contract is unchanged.
 - **Fleet registry:** a `Register` from a known `server_id` orphans that server's reported rooms until its next heartbeat lists them again. A restarted pod with a stable id therefore leaves its lost rooms eligible for rejoin and restore, while a link blip is healed by the next heartbeat. Orphaned rooms are never forgotten because a heartbeat omits them.
 - **`services.rs`:** the client refreshes tokens automatically when the access token expires within 30 s. A rejected refresh ends the local session. Beyond the listed calls it also offers `register`, `update_profile`, `get_data`/`put_data`, `poll_lobby`, `lobby_action`, `leaderboard_me`, `status`, `set_session`, and `OnlineError::{status, code, retry_after_ms, is_retryable}`.
 - **`loadtest`:** `LoadTestConfig::{from_args, try_from_args}` (clap) plus `parse_histogram` and `histogram_quantile`, which compute the tick p99 from `/metrics` scrapes taken before and after the run.
-- **Open replication item:** `full_state::restore` pre-maps `NetId`s, but `server::change` only creates records for entities that have no `NetId`. Restored entities are therefore never sent to joining clients. The server-side restore paths are tested; the client-visibility assertions are `#[ignore]`d in `crates/space3d-server/tests/cluster.rs` (`*_restored_state_reaches_clients`) until this is fixed.
+- **Restored state reaches clients (resolved in the integration pass):** `full_state::restore` pre-maps `NetId`s; `server::change` now adopts pre-mapped entities on its first collect (records re-sorted by `NetId`, pre-mapped entities despawned before that collect are forgotten). The crash and server-loss tests in `tests/cluster.rs` check what clients see and are no longer ignored.
+
+### 18.4 Integration notes
+
+All additive to the §18.1 contract.
+
+- **Replication:** `ChangeCache::collect` adopts restored entities (above); `NetIdMap::retain`; `full_state` checkpoints the `Simulated` marker (`META_SIMULATED`), so a restored room keeps simulating its pawns; client replay starts from the newest confirmation and fills resync gaps with repeated inputs (§9.3). New scenario: `snapshot_burst_after_a_stall_replays_from_the_newest_confirmation`.
+- **Server:** `ServerConfig::load_layered` + `config::merge_tables`, `ServerMain::from_env_with_defaults` (game-supplied defaults under file and env; `--print-default-config` shows them); fleet seat counting with presence and room-bound reservations (§11.2), `ServerRecord::{present, players()}`; `PlayerService::quick_play_room` finds an open room or allocates one under a single fleet lock (concurrent quick plays used to open a room each); the load-test report gained `server: Option<ServerSample>` (tick mean / p50 / p99, ticks, skipped ticks, rooms, server bytes/s from two `/metrics` scrapes) and `loadtest::metric_value`; the Dockerfile takes `CARGO_ARGS` (package / features).
+- **Examples and tests:** `examples/multiplayer_arena` (§3.3); `crates/space3d-server/tests/acceptance.rs` (§15.3).
+- **Still deferred:** predicted spawns, rayon packet building above 32 clients, the datagram `loss` stat, `select_nth_unstable` priority selection, Postgres, QUIC, Kubernetes manifests. The fleet link closes without a WebSocket close frame when a game server exits (the player service logs a warning; the lease handles it).
 
 ---
 
