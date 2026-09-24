@@ -1,0 +1,10 @@
+[package]
+name = "space3d-net"
+description = "Space3d net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+space3d-core.workspace = true

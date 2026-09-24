@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.DS_Store
+/dist
+/pkg
+*.sqlite3
+tests/__screenshots__/**/*.actual.png
+tests/__screenshots__/**/*.diff.png

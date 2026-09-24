@@ -1,0 +1,23 @@
+[package]
+name = "space3d-core"
+description = "Space3d core: app, plugins, ECS, fixed tickrate scheduler, events, resources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hecs.workspace = true
+glam.workspace = true
+ahash.workspace = true
+web-time.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "schedule"
+harness = false

@@ -1,0 +1,10 @@
+[package]
+name = "space3d-editor"
+description = "Space3d editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+space3d-core.workspace = true

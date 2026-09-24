@@ -1,0 +1,8 @@
+[package]
+name = "hello_cube"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+space3d.workspace = true

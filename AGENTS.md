@@ -1,0 +1,44 @@
+# Space3d — contributor & agent guide
+
+Rust cross-platform game engine (desktop, web/wasm, Android, iOS). Cargo workspace, edition 2024, Rust 1.98.1.
+
+## Rules
+1. **Latest stable versions only.** Every dependency is pinned to its newest stable release
+   (no alpha/beta/rc). Before adding a crate, check `cargo search --limit 1 <crate>` /
+   crates.io `max_stable_version`. Prefer `[workspace.dependencies]` entries in the root
+   `Cargo.toml` via `foo.workspace = true`.
+2. **Never block the frame.** I/O goes through `space3d_tasks::{spawn, AsyncQueue}`; CPU work
+   through `spawn_compute`. Systems poll `Task::poll()` — never `.block()` in engine code.
+3. **Everything is a `Plugin`.** Each crate exposes `XxxPlugin: space3d_core::Plugin`.
+   Systems are `FnMut(&mut SystemCtx)` registered on a `Stage`.
+4. **Deterministic simulation** runs in `Stage::FixedUpdate` at `TickRate` (default 60 Hz).
+   Tests drive time with `App::step_ticks(n)` — never wall-clock.
+5. **Cross-platform.** All runtime crates must `cargo check --target wasm32-unknown-unknown`.
+   Native-only pieces are gated with `#[cfg(not(target_arch = "wasm32"))]` and provide a web
+   fallback or a clear `Unsupported` error.
+6. **Testable.** Unit tests next to code, integration tests in `tests/`. GPU tests must skip
+   (not fail) when no adapter is available. Visual output is verified with golden screenshots
+   via `space3d-test`.
+7. `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+   must pass.
+
+## Crate map
+| crate | role |
+|---|---|
+| `space3d-core` | App, Plugin, ECS (hecs), Resources, Events, Stage schedule, fixed tickrate, Transform |
+| `space3d-tasks` | async runtime bridge (tokio native / wasm-bindgen-futures web), `Task`, `AsyncQueue` |
+| `space3d-render` | wgpu renderer, meshes, materials, camera, lights, instancing, headless capture |
+| `space3d-assets` | asset server, handles, image/glTF/OBJ loading, hot reload, texture & mesh editing ops |
+| `space3d-net` | HTTP client/server, WebSocket client/server, native + web |
+| `space3d-db` | SQLite (rusqlite, native), KV + save slots + migrations, web fallback |
+| `space3d-github` | GitHub REST: releases, issues (crash reports), CI templates |
+| `space3d-audio` | kira-based audio, spatial emitters |
+| `space3d-physics` | rigid bodies, colliders, raycasts |
+| `space3d-scene` | scene/prefab serialization (RON), save/load |
+| `space3d-platform` | winit runner: desktop, web, Android, iOS; input |
+| `space3d-ui` | egui integration, debug overlay, profiler |
+| `space3d-editor` | scene inspector, texture editor, model editor |
+| `space3d-stories` | storybook: registry + viewer + batch screenshotting |
+| `space3d-test` | test harness: headless app, input simulation, golden screenshot diffing |
+| `space3d-cli` | `space3d` binary: new/run/build/test/stories/snapshot/publish |
+| `space3d` | facade + prelude |

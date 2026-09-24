@@ -1,0 +1,20 @@
+[package]
+name = "space3d-tasks"
+description = "Non-blocking async tasks for Space3d: spawn futures, poll results from systems"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+space3d-core.workspace = true
+futures.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+rayon.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures.workspace = true
