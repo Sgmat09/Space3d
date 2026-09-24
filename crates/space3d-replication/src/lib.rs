@@ -10,7 +10,7 @@
 //! locally controlled entities are predicted and reconciled by rollback + replay of the shared
 //! [`sim::SimSchedule`]; remote entities are interpolated from a jitter buffer.
 //!
-//! Transports are pluggable ([`transport::ClientTransport`] / [`transport::ServerLink`]):
+//! Transports are pluggable ([`transport::ClientTransport`] / [`transport::LinkTx`]):
 //! WebSocket for every client today (browser compatible), an in-memory network with a
 //! deterministic conditioner for tests, and a datagram transport later.
 //!
