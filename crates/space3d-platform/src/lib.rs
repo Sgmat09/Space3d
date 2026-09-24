@@ -22,6 +22,7 @@
 //! app.run();
 //! ```
 
+pub mod background;
 mod input;
 pub mod mobile;
 mod runner;
@@ -29,6 +30,7 @@ mod runner;
 mod web;
 mod window;
 
+pub use background::{background_mode, set_background_mode};
 pub use input::{
     ActionMap, ActionState, ActionValue, Binding, ButtonState, Gamepad, GamepadAxis, GamepadButton, Input, InputPlugin,
     KeyCode, MouseButton, Touch, TouchPhase,

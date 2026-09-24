@@ -50,7 +50,19 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
         };
         EventLoop::builder().with_android_app(android_app).build()
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        let mut builder = EventLoop::builder();
+        if crate::background::background_mode() {
+            // Never come to front / take focus: no Dock icon, no activation on launch.
+            builder
+                .with_activation_policy(ActivationPolicy::Accessory)
+                .with_activate_ignoring_other_apps(false);
+        }
+        builder.build()
+    }
+    #[cfg(not(any(target_os = "android", target_os = "macos")))]
     {
         EventLoop::new()
     }
@@ -126,6 +138,9 @@ impl WinitRunner {
             .with_title(s.title.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(s.width as f64, s.height as f64))
             .with_resizable(s.resizable);
+        if crate::background::background_mode() {
+            attrs = attrs.with_active(false);
+        }
         #[cfg(target_arch = "wasm32")]
         {
             attrs = crate::web::window_attributes(attrs, s.canvas_id.as_deref());
