@@ -2,9 +2,10 @@
 //!
 //! Batches never rebind vertex/index buffers — a draw selects its mesh purely through
 //! `base_vertex` / `first_index`, which is also what makes multi-draw-indirect possible.
-//! Sub-allocation is first-fit over a sorted free list with coalescing. When the arena is
-//! full it grows (2x) with a GPU→GPU copy of the old contents; data for the new region is
-//! written straight into the new buffer's `mapped_at_creation` memory.
+//! Sub-allocation is first-fit over a sorted free list with coalescing. When a buffer is full
+//! it grows (2x, never beyond the device's `max_buffer_size`) with a GPU→GPU copy of the old
+//! contents; data for the new region is written straight into the new buffer's
+//! `mapped_at_creation` memory. Vertex and index buffers grow independently.
 
 use crate::gpu::{Uploader, copy_to_staging};
 use bytemuck::{Pod, Zeroable};
@@ -143,13 +144,34 @@ pub(crate) struct MeshArena {
     pub generation: u32,
 }
 
+/// Which buffers of the arena lacked space for an allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Short {
+    pub vertices: bool,
+    pub indices: bool,
+}
+
+/// Grow `a` so that `extra` more elements fit in its fresh tail (2x amortized, at least
+/// `min`), clamped to `max` elements. Allocators without capacity get `min` even for 0.
+fn grow_side(a: &mut RangeAllocator, extra: u32, min: u32, max: u32) {
+    let old = a.capacity();
+    if extra == 0 && old > 0 {
+        return;
+    }
+    let want = (old as u64 + extra as u64)
+        .max(old as u64 * 2)
+        .max(min as u64)
+        .next_multiple_of(64);
+    a.grow(want.min(max as u64) as u32);
+}
+
 impl MeshArena {
-    /// Allocate space; `None` if the arena must grow first.
-    pub fn alloc(&mut self, vertex_count: u32, index_count: u32) -> Option<ArenaAlloc> {
+    /// Allocate space; `Err` says which buffer(s) must grow first.
+    pub fn try_alloc(&mut self, vertex_count: u32, index_count: u32) -> Result<ArenaAlloc, Short> {
         let v = self.vertices.alloc(vertex_count);
         let i = self.indices.alloc(index_count);
         match (v, i) {
-            (Some(base_vertex), Some(first_index)) => Some(ArenaAlloc {
+            (Some(base_vertex), Some(first_index)) => Ok(ArenaAlloc {
                 base_vertex,
                 vertex_count,
                 first_index,
@@ -162,7 +184,10 @@ impl MeshArena {
                 if let Some(i) = i {
                     self.indices.free(i..i + index_count);
                 }
-                None
+                Err(Short {
+                    vertices: v.is_none(),
+                    indices: i.is_none(),
+                })
             }
         }
     }
@@ -172,23 +197,30 @@ impl MeshArena {
         self.indices.free(a.first_index..a.first_index + a.index_count);
     }
 
-    /// Grow allocator capacities so `extra_*` more elements fit (2x amortized). CPU-only;
-    /// follow with [`Self::realloc_gpu`]. Returns the previous capacities.
-    pub fn grow_capacity(&mut self, extra_vertices: u32, extra_indices: u32) -> (u32, u32) {
-        let old_v = self.vertices.capacity();
-        let old_i = self.indices.capacity();
-        let need_v = self.vertices.used() + extra_vertices;
-        let need_i = self.indices.used() + extra_indices;
-        let new_v = need_v.max(old_v * 2).max(4096).next_multiple_of(64);
-        let new_i = need_i.max(old_i * 2).max(8192).next_multiple_of(64);
-        self.vertices.grow(new_v.max(old_v + extra_vertices));
-        self.indices.grow(new_i.max(old_i + extra_indices));
-        (old_v, old_i)
+    /// Grow allocator capacities so `extra_*` more elements fit (2x amortized). Only a side
+    /// with a non-zero request grows (plus any side that has no capacity yet), and neither
+    /// grows beyond `max_buffer_size` bytes — a request that does not fit even then is left
+    /// short, and the caller's next allocation attempt fails. CPU-only; follow with
+    /// [`Self::realloc_gpu`]. Returns the previous capacities.
+    pub fn grow_capacity(&mut self, extra_vertices: u32, extra_indices: u32, max_buffer_size: u64) -> (u32, u32) {
+        let old = (self.vertices.capacity(), self.indices.capacity());
+        let (max_v, max_i) = Self::max_capacity(max_buffer_size);
+        grow_side(&mut self.vertices, extra_vertices, 4096, max_v);
+        grow_side(&mut self.indices, extra_indices, 8192, max_i);
+        old
     }
 
-    /// Replace the GPU buffers with ones matching the allocator capacities. Old contents are
-    /// copied GPU→GPU; `writes` landing in the fresh region (at/after `old_*`) are written
-    /// directly into `mapped_at_creation` memory (no staging copy).
+    /// Largest vertex and index capacities whose buffers stay within `max_buffer_size`.
+    pub fn max_capacity(max_buffer_size: u64) -> (u32, u32) {
+        let max = |size: u64| ((max_buffer_size / size).min(u32::MAX as u64) as u32) & !63;
+        (max(VERTEX_SIZE), max(INDEX_SIZE))
+    }
+
+    /// Replace the GPU buffer(s) whose allocator capacity changed since `old_*` (or that do
+    /// not exist yet). Old contents are copied GPU→GPU; `writes` landing in a fresh region
+    /// (at/after `old_*`) are written directly into `mapped_at_creation` memory (no staging
+    /// copy). Returns the thresholds to pass to [`Self::write`]: the old capacity of each
+    /// replaced buffer, `u32::MAX` for a kept one.
     pub fn realloc_gpu(
         &mut self,
         device: &wgpu::Device,
@@ -196,9 +228,11 @@ impl MeshArena {
         (old_v, old_i): (u32, u32),
         writes: &[ArenaWrite<'_>],
         up: &mut Uploader,
-    ) {
+    ) -> (u32, u32) {
         let new_v = self.vertices.capacity();
         let new_i = self.indices.capacity();
+        let grow_v = self.vertex.is_none() || new_v != old_v;
+        let grow_i = self.index.is_none() || new_i != old_i;
         let make = |label, size: u64, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -207,48 +241,65 @@ impl MeshArena {
                 mapped_at_creation: true,
             })
         };
-        let vb = make(
-            "space3d mesh arena vertices",
-            new_v as u64 * VERTEX_SIZE,
-            wgpu::BufferUsages::VERTEX,
-        );
-        let ib = make(
-            "space3d mesh arena indices",
-            new_i as u64 * INDEX_SIZE,
-            wgpu::BufferUsages::INDEX,
-        );
-        up.reallocations += 2;
-        {
-            let mut vmap = vb.get_mapped_range_mut(..).expect("arena map");
-            let mut imap = ib.get_mapped_range_mut(..).expect("arena map");
-            for w in writes {
-                if w.alloc.base_vertex >= old_v && !w.vertices.is_empty() {
-                    let o = (w.alloc.base_vertex as u64 * VERTEX_SIZE) as usize;
-                    let bytes: &[u8] = bytemuck::cast_slice(w.vertices);
-                    copy_to_staging(vmap.slice(o..o + bytes.len()), bytes);
-                    up.bytes += bytes.len() as u64;
-                }
-                if w.alloc.first_index >= old_i && !w.indices.is_empty() {
-                    let o = (w.alloc.first_index as u64 * INDEX_SIZE) as usize;
-                    let bytes: &[u8] = bytemuck::cast_slice(w.indices);
-                    copy_to_staging(imap.slice(o..o + bytes.len()), bytes);
-                    up.bytes += bytes.len() as u64;
+        if grow_v {
+            let vb = make(
+                "space3d mesh arena vertices",
+                new_v as u64 * VERTEX_SIZE,
+                wgpu::BufferUsages::VERTEX,
+            );
+            {
+                let mut map = vb.get_mapped_range_mut(..).expect("arena map");
+                for w in writes {
+                    if w.alloc.base_vertex >= old_v && !w.vertices.is_empty() {
+                        let o = (w.alloc.base_vertex as u64 * VERTEX_SIZE) as usize;
+                        let bytes: &[u8] = bytemuck::cast_slice(w.vertices);
+                        copy_to_staging(map.slice(o..o + bytes.len()), bytes);
+                        up.bytes += bytes.len() as u64;
+                    }
                 }
             }
-        }
-        vb.unmap();
-        ib.unmap();
-        if let (Some(old_vb), Some(old_ib)) = (&self.vertex, &self.index) {
-            if old_v > 0 {
-                encoder.copy_buffer_to_buffer(old_vb, 0, &vb, 0, old_v as u64 * VERTEX_SIZE);
+            vb.unmap();
+            if let Some(old) = &self.vertex
+                && old_v > 0
+            {
+                encoder.copy_buffer_to_buffer(old, 0, &vb, 0, old_v as u64 * VERTEX_SIZE);
             }
-            if old_i > 0 {
-                encoder.copy_buffer_to_buffer(old_ib, 0, &ib, 0, old_i as u64 * INDEX_SIZE);
-            }
+            self.vertex = Some(vb);
+            up.reallocations += 1;
         }
-        self.vertex = Some(vb);
-        self.index = Some(ib);
-        self.generation = self.generation.wrapping_add(1);
+        if grow_i {
+            let ib = make(
+                "space3d mesh arena indices",
+                new_i as u64 * INDEX_SIZE,
+                wgpu::BufferUsages::INDEX,
+            );
+            {
+                let mut map = ib.get_mapped_range_mut(..).expect("arena map");
+                for w in writes {
+                    if w.alloc.first_index >= old_i && !w.indices.is_empty() {
+                        let o = (w.alloc.first_index as u64 * INDEX_SIZE) as usize;
+                        let bytes: &[u8] = bytemuck::cast_slice(w.indices);
+                        copy_to_staging(map.slice(o..o + bytes.len()), bytes);
+                        up.bytes += bytes.len() as u64;
+                    }
+                }
+            }
+            ib.unmap();
+            if let Some(old) = &self.index
+                && old_i > 0
+            {
+                encoder.copy_buffer_to_buffer(old, 0, &ib, 0, old_i as u64 * INDEX_SIZE);
+            }
+            self.index = Some(ib);
+            up.reallocations += 1;
+        }
+        if grow_v || grow_i {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        (
+            if grow_v { old_v } else { u32::MAX },
+            if grow_i { old_i } else { u32::MAX },
+        )
     }
 
     /// Upload writes that were not satisfied by a growth mapping (`fresh_*` = old capacities
@@ -302,6 +353,40 @@ mod tests {
         assert_eq!(a.alloc(1), None);
         a.grow(150);
         assert_eq!(a.alloc(50), Some(100));
+    }
+
+    #[test]
+    fn growth_is_per_buffer_and_clamped_to_the_device_limit() {
+        let mut a = MeshArena::default();
+        let max = 36 * 16_384; // 16384 vertices / 147456 indices
+        assert_eq!(a.grow_capacity(0, 0, max), (0, 0));
+        assert_eq!(
+            (a.vertices.capacity(), a.indices.capacity()),
+            (4096, 8192),
+            "initial sizes"
+        );
+        // Only the index buffer is short: the vertex buffer keeps its capacity.
+        let x = a.try_alloc(100, 9000).unwrap_err();
+        assert_eq!((x.vertices, x.indices), (false, true));
+        a.grow_capacity(0, 9000, max);
+        assert_eq!(a.vertices.capacity(), 4096);
+        assert_eq!(a.indices.capacity(), 17_216);
+        assert!(a.try_alloc(100, 9000).is_ok());
+        // Doubling stops at the limit instead of producing an oversized buffer.
+        a.grow_capacity(8000, 0, max);
+        assert_eq!(a.vertices.capacity(), 12_096);
+        a.grow_capacity(8000, 0, max);
+        assert_eq!(a.vertices.capacity(), 16_384);
+        assert!(a.vertices.capacity() as u64 * VERTEX_SIZE <= max);
+        a.grow_capacity(8000, 0, max);
+        assert_eq!(a.vertices.capacity(), 16_384, "cannot grow further");
+        assert_eq!(
+            a.try_alloc(20_000, 0).unwrap_err(),
+            Short {
+                vertices: true,
+                indices: false
+            }
+        );
     }
 
     #[test]

@@ -365,3 +365,260 @@ fn replacing_an_instance_buffer_in_a_reused_slot_uses_the_new_data() {
     let img = render_to_image(&mut app).expect("capture");
     assert_eq!(img.get(16, 16), [255, 255, 255, 255]);
 }
+
+fn gpu_paths_up_to(best: DrawPath) -> Vec<DrawPath> {
+    [
+        DrawPath::CpuDirect,
+        DrawPath::GpuIndirect,
+        DrawPath::GpuMultiDraw,
+        DrawPath::GpuMultiDrawCount,
+    ]
+    .into_iter()
+    .filter(|p| *p <= best)
+    .collect()
+}
+
+/// Tiny deterministic PRNG for test scenes.
+fn lcg(seed: &mut u32) -> f32 {
+    *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (*seed >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// Regression: GPU culling compacted visible instances (and draws) with atomics, so their order
+/// changed from dispatch to dispatch and overlapping alpha-blended instances flickered. The
+/// compaction is now order-preserving: every path renders identical bytes frame after frame,
+/// and GPU paths draw in exactly the CPU path's order.
+#[test]
+fn blended_instances_render_deterministically_on_every_path() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let best = best_path(&app);
+    let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(1.0));
+    let mut seed = 12_345;
+    let mut buf = InstanceBuffer::new(BufferUsage::Static);
+    for i in 0..5000 {
+        // 79 workgroups (scan lanes own blocks of several), a few culled instances between.
+        let x = if i % 97 == 0 { 500.0 } else { 0.0 };
+        let c = Vec4::new(lcg(&mut seed), lcg(&mut seed), lcg(&mut seed), 0.35);
+        buf.push(InstanceTransformColor::new(
+            Mat4::from_translation(Vec3::new(x, 0.0, 0.0)),
+            c,
+        ));
+    }
+    let instances = app.resources.expect_mut::<InstanceBuffers>().insert(buf);
+    let blend = Material {
+        alpha_blend: true,
+        double_sided: true,
+        ..Material::unlit(Vec4::ONE)
+    };
+    app.world.spawn((InstancedMesh {
+        mesh,
+        material: blend.clone(),
+        instances,
+    },));
+    // Plain ECS entities with a blended material take the same GPU path.
+    let small = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.4));
+    for i in 0..300 {
+        let m = Material {
+            base_color: Vec4::new(lcg(&mut seed), lcg(&mut seed), lcg(&mut seed), 0.4),
+            ..blend.clone()
+        };
+        // Two materials alternate so ECS batches form several runs.
+        let m = if i % 2 == 0 {
+            m
+        } else {
+            Material {
+                base_color: Vec4::new(0.2, 0.9, 0.3, 0.3),
+                ..m
+            }
+        };
+        app.world.spawn((
+            Transform::from_xyz(lcg(&mut seed) * 0.5, lcg(&mut seed) * 0.5, 0.6)
+                .with_rotation(Quat::from_rotation_z(lcg(&mut seed) * 6.0)),
+            Mesh3d(if i % 3 == 0 { small } else { mesh }),
+            m,
+        ));
+    }
+    spawn_camera(&mut app, 4.0);
+
+    let mut reference: Option<ImageData> = None;
+    for path in gpu_paths_up_to(best) {
+        set_path(&mut app, path);
+        let first = render_to_image(&mut app).expect("capture");
+        for frame in 1..8 {
+            let img = render_to_image(&mut app).expect("capture");
+            let differing = first
+                .pixels
+                .chunks(4)
+                .zip(img.pixels.chunks(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "{path:?}: frame {frame} differs from frame 0 in {differing} px"
+            );
+        }
+        match &reference {
+            None => reference = Some(first),
+            Some(cpu) => {
+                let d = cpu
+                    .pixels
+                    .chunks(4)
+                    .zip(first.pixels.chunks(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(
+                    d, 0,
+                    "{path:?} draws in a different order than CpuDirect ({d} px differ)"
+                );
+            }
+        }
+    }
+    let img = reference.expect("CpuDirect ran");
+    assert!(img.pixels.chunks(4).filter(|p| *p != CLEAR).count() > 500);
+}
+
+/// Regression: `set_bounds(Some)` → edits → `set_bounds(None)` kept a stale automatic AABB that
+/// no longer contained any instance, so the CPU path culled the whole buffer.
+#[test]
+fn clearing_user_bounds_recomputes_automatic_bounds() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    set_path(&mut app, DrawPath::CpuDirect);
+    let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.2));
+    let data = (0..100)
+        .map(|i| InstanceCompact::new(Vec3::new(i as f32 * 0.01, 0.0, 0.0), Quat::IDENTITY, 1.0))
+        .collect();
+    let h = app
+        .resources
+        .expect_mut::<InstanceBuffers>()
+        .insert(InstanceBuffer::from_vec(data, BufferUsage::Dynamic));
+    app.world.spawn((InstancedMesh {
+        mesh,
+        material: Material::unlit(Vec4::ONE),
+        instances: h,
+    },));
+    let cam = spawn_camera(&mut app, 10.0);
+    render_to_image(&mut app).expect("capture");
+    app.resources
+        .expect_mut::<InstanceBuffers>()
+        .get_mut::<InstanceCompact>(h)
+        .unwrap()
+        .set_bounds(Some(Aabb::new(Vec3::splat(-1e5), Vec3::splat(1e5))));
+    // Move everything to x = 1000, 10 instances (< 50 %) per frame.
+    for round in 0..10 {
+        let buf = app
+            .resources
+            .expect_mut::<InstanceBuffers>()
+            .get_mut::<InstanceCompact>(h)
+            .unwrap();
+        for i in round * 10..round * 10 + 10 {
+            buf.set(
+                i,
+                InstanceCompact::new(Vec3::new(1000.0 + i as f32 * 0.01, 0.0, 0.0), Quat::IDENTITY, 1.0),
+            );
+        }
+        render_to_image(&mut app).expect("capture");
+    }
+    app.resources
+        .expect_mut::<InstanceBuffers>()
+        .get_mut::<InstanceCompact>(h)
+        .unwrap()
+        .set_bounds(None);
+    app.world.get::<&mut Transform>(cam).unwrap().translation.x = 1000.5;
+    let img = render_to_image(&mut app).expect("capture");
+    let s = stats(&app);
+    assert_eq!((s.instances_drawn, s.culled), (100, 0), "{s:?}");
+    assert_eq!(img.get(32, 32), [255, 255, 255, 255]);
+}
+
+/// Thin quad in the XY plane along (1,1,0)/√2 (half-length `l`, half-width `w`), facing +Z.
+fn diagonal_quad(l: f32, w: f32) -> MeshData {
+    let a = Vec3::new(1.0, 1.0, 0.0).normalize();
+    let p = Vec3::new(-1.0, 1.0, 0.0).normalize();
+    let v = [-a * l - p * w, a * l - p * w, a * l + p * w, -a * l + p * w];
+    MeshData {
+        positions: v.iter().map(|x| x.to_array()).collect(),
+        normals: vec![[0.0, 0.0, 1.0]; 4],
+        uvs: vec![[0.0, 0.0]; 4],
+        colors: vec![],
+        indices: vec![0, 1, 2, 0, 2, 3],
+    }
+}
+
+/// Regression: the bounding-sphere scale used the longest matrix column, which underestimates
+/// sheared matrices (non-uniform parent scale × rotated child), so geometry crossing the frustum
+/// edge was culled on every path.
+#[test]
+fn sheared_transforms_are_not_culled_while_visible() {
+    let Some(mut app) = headless_app(256, 256) else { return };
+    let best = best_path(&app);
+    let quad = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_mesh(diagonal_quad(1.0, 0.1));
+    let material = Material {
+        double_sided: true,
+        ..Material::unlit(Vec4::ONE)
+    };
+    // Parent scale (1, 4, 1) × child rotation 45° maps the quad's long axis to (0, 4, 0): the
+    // quad reaches y = -4.75, inside the ortho frustum (bottom -5), although the longest column
+    // (2.92) says the sphere ends below it.
+    let py = -8.75;
+    let parent = app
+        .world
+        .spawn((Transform::from_xyz(-2.0, py, 0.0).with_scale(Vec3::new(1.0, 4.0, 1.0)),));
+    app.world.spawn((
+        Transform::default().with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4)),
+        Parent(parent),
+        Mesh3d(quad),
+        material.clone(),
+    ));
+    // The same sheared matrix through an explicit InstanceTransform buffer.
+    let m = Mat4::from_translation(Vec3::new(2.0, py, 0.0))
+        * Mat4::from_scale(Vec3::new(1.0, 4.0, 1.0))
+        * Mat4::from_rotation_z(std::f32::consts::FRAC_PI_4);
+    let h = app
+        .resources
+        .expect_mut::<InstanceBuffers>()
+        .insert(InstanceBuffer::from_vec(
+            vec![InstanceTransform::from_mat4(m)],
+            BufferUsage::Dynamic,
+        ));
+    app.world.spawn((InstancedMesh {
+        mesh: quad,
+        material,
+        instances: h,
+    },));
+    app.world.spawn((
+        Transform::from_xyz(0.0, 0.0, 5.0),
+        Camera3d {
+            projection: Projection::Orthographic {
+                height: 10.0,
+                near: 0.1,
+                far: 100.0,
+            },
+            ..Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 1.0, 1.0))
+        },
+    ));
+    for path in gpu_paths_up_to(best) {
+        set_path(&mut app, path);
+        app.resources.expect_mut::<RenderSettings>().frustum_culling = false;
+        let unculled = render_to_image(&mut app).expect("capture");
+        app.resources.expect_mut::<RenderSettings>().frustum_culling = true;
+        let culled = render_to_image(&mut app).expect("capture");
+        let lit = |img: &ImageData, x0: u32, x1: u32| {
+            (x0..x1)
+                .flat_map(|x| (0..256).map(move |y| (x, y)))
+                .filter(|&(x, y)| img.get(x, y) != CLEAR)
+                .count()
+        };
+        for (name, x0, x1) in [("ecs", 0, 128), ("explicit", 128, 256)] {
+            let expected = lit(&unculled, x0, x1);
+            assert!(expected > 10, "{path:?} {name}: quad tip visible without culling");
+            assert_eq!(
+                lit(&culled, x0, x1),
+                expected,
+                "{path:?} {name}: visible geometry culled"
+            );
+        }
+    }
+}

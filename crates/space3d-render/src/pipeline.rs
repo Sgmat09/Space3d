@@ -58,6 +58,9 @@ pub(crate) struct GpuCullParams {
     pub job_count: u32,
     pub total_workgroups: u32,
     pub workgroups_x: u32,
+    /// First word of the per-workgroup compaction records in the args buffer.
+    pub wg_word: u32,
+    pub pad: [u32; 3],
 }
 
 /// Matches `Job` in cull.wgsl.
@@ -82,9 +85,10 @@ pub(crate) struct GpuCullJob {
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 pub(crate) struct GpuCompactParams {
-    pub draw_start: u32,
-    pub draw_count: u32,
-    pub pad: [u32; 2],
+    pub run_start: u32,
+    pub run_count: u32,
+    pub workgroups_x: u32,
+    pub pad: u32,
 }
 
 /// Pipeline "class" bits that come from the material.
@@ -285,10 +289,13 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// Compute pipelines for GPU culling (only built when compute is available).
+/// Compute pipelines for GPU culling (only built when compute is available). The three cull
+/// passes share `bgl`; see `shaders/cull.wgsl`.
 pub(crate) struct CullPipelines {
     pub bgl: wgpu::BindGroupLayout,
-    pub pipeline: wgpu::ComputePipeline,
+    pub mark: wgpu::ComputePipeline,
+    pub scan: wgpu::ComputePipeline,
+    pub scatter: wgpu::ComputePipeline,
     pub compact_bgl: wgpu::BindGroupLayout,
     pub compact: wgpu::ComputePipeline,
 }
@@ -379,14 +386,17 @@ impl Pipelines {
                 bind_group_layouts: &[Some(&bgl)],
                 immediate_size: 0,
             });
-            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("space3d cull"),
-                layout: Some(&pl),
-                module: &module,
-                entry_point: Some("cull"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+            let entry = |name: &'static str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(name),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some(name),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            };
+            let (mark, scan, scatter) = (entry("cull_mark"), entry("cull_scan"), entry("cull_scatter"));
             let compact_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("space3d compact"),
                 entries: &[
@@ -421,7 +431,9 @@ impl Pipelines {
             });
             CullPipelines {
                 bgl,
-                pipeline,
+                mark,
+                scan,
+                scatter,
                 compact_bgl,
                 compact,
             }
@@ -635,7 +647,8 @@ mod tests {
             64 + 16 * 3 + 32 * (MAX_DIR_LIGHTS + MAX_POINT_LIGHTS)
         );
         assert_eq!(std::mem::size_of::<GpuMaterial>(), 48);
-        assert_eq!(std::mem::size_of::<GpuCullParams>(), 112);
+        assert_eq!(std::mem::size_of::<GpuCullParams>(), 128);
+        assert_eq!(std::mem::size_of::<GpuCompactParams>(), 16);
         assert_eq!(std::mem::size_of::<GpuCullJob>(), 64);
     }
 

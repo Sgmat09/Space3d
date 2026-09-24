@@ -60,13 +60,52 @@ pub(crate) fn mip_layout(
     Some((bytes_per_row, blocks_h, blocks_w * bw, blocks_h * bh))
 }
 
-/// Whether the device can sample this format.
-pub(crate) fn format_supported(device: &wgpu::Device, format: wgpu::TextureFormat) -> bool {
-    device.features().contains(format.required_features())
+/// Format capabilities wgpu-core validates against. It uses the WebGPU-guaranteed set, or the
+/// adapter-specific set on downlevel backends (GLES/WebGL2); the intersection is valid in both.
+fn format_features(
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> wgpu::TextureFormatFeatures {
+    let guaranteed = format.guaranteed_format_features(device.features());
+    let specific = adapter.get_texture_format_features(format);
+    wgpu::TextureFormatFeatures {
+        allowed_usages: guaranteed.allowed_usages & specific.allowed_usages,
+        flags: guaranteed.flags & specific.flags,
+    }
+}
+
+/// Whether materials can use this format: the device has its features, it can be uploaded and
+/// sampled, and it is filterable float — the material binding is `texture_2d_array<f32>` with a
+/// filtering sampler, so integer, depth and (without `FLOAT32_FILTERABLE`) 32-bit float formats
+/// would fail bind-group validation.
+pub(crate) fn format_supported(adapter: &wgpu::Adapter, device: &wgpu::Device, format: wgpu::TextureFormat) -> bool {
+    use wgpu::TextureUsages as U;
+    if !device.features().contains(format.required_features()) {
+        return false;
+    }
+    let filterable_float = match format.sample_type(None, Some(device.features())) {
+        Some(wgpu::TextureSampleType::Float { filterable }) => filterable,
+        _ => false,
+    };
+    let features = format_features(adapter, device, format);
+    filterable_float
+        && features.allowed_usages.contains(U::TEXTURE_BINDING | U::COPY_DST)
+        && features.flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE)
+}
+
+/// Whether mips of a [`format_supported`] format can be generated with the linear blit: it
+/// must also be renderable (e.g. `Rgba16Float` is not on GLES without half-float support).
+fn mip_renderable(adapter: &wgpu::Adapter, device: &wgpu::Device, format: wgpu::TextureFormat) -> bool {
+    !format.is_compressed()
+        && format_features(adapter, device, format)
+            .allowed_usages
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
 }
 
 /// Create the GPU texture for an entry. Returns bytes uploaded.
 pub(crate) fn create_gpu_texture(
+    adapter: &wgpu::Adapter,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
@@ -122,7 +161,7 @@ pub(crate) fn create_gpu_texture(
     let Some(src) = entry.source.take() else {
         return Ok(0);
     };
-    let result = upload_source(device, queue, encoder, pipelines, &src, sampler);
+    let result = upload_source(adapter, device, queue, encoder, pipelines, &src, sampler);
     match result {
         Ok((gpu, bytes)) => {
             entry.gpu = Some(gpu);
@@ -134,6 +173,7 @@ pub(crate) fn create_gpu_texture(
 }
 
 fn upload_source(
+    adapter: &wgpu::Adapter,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
@@ -142,8 +182,10 @@ fn upload_source(
     sampler: wgpu::Sampler,
 ) -> Result<(GpuTexture, u64), String> {
     let format = src.format;
-    if !format_supported(device, format) {
-        return Err(format!("texture format {format:?} not supported by this device"));
+    if !format_supported(adapter, device, format) {
+        return Err(format!(
+            "texture format {format:?} cannot be sampled by materials on this device"
+        ));
     }
     if src.width == 0 || src.height == 0 || src.layers == 0 {
         return Err("texture has zero size".into());
@@ -154,16 +196,7 @@ fn upload_source(
     }
     let provided_mips = src.mip_level_count.max(1);
     let full = src.full_mip_count();
-    let renderable = !format.is_compressed()
-        && matches!(
-            format,
-            wgpu::TextureFormat::Rgba8UnormSrgb
-                | wgpu::TextureFormat::Rgba8Unorm
-                | wgpu::TextureFormat::Bgra8UnormSrgb
-                | wgpu::TextureFormat::Bgra8Unorm
-                | wgpu::TextureFormat::Rgba16Float
-        );
-    let generate = src.generate_mipmaps && renderable && provided_mips < full;
+    let generate = src.generate_mipmaps && provided_mips < full && mip_renderable(adapter, device, format);
     let mip_count = if generate { full } else { provided_mips.min(full) };
 
     let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;

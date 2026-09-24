@@ -70,7 +70,8 @@ impl Sphere {
             radius: aabb.half_extents().length(),
         }
     }
-    /// Transform by an affine matrix (radius scaled by the largest axis scale).
+    /// Transform by an affine matrix (radius scaled by [`max_axis_scale`], so the result
+    /// encloses the transformed sphere even for sheared matrices).
     pub fn transformed(&self, m: &Mat4) -> Sphere {
         Sphere {
             center: m.transform_point3(self.center),
@@ -79,13 +80,26 @@ impl Sphere {
     }
 }
 
-/// Largest column length of the upper 3x3 (conservative scale for bounding spheres).
+/// Upper bound of the largest factor by which the upper 3x3 of `m` stretches a vector (its
+/// spectral norm): a conservative scale for bounding-sphere radii.
+///
+/// The longest column is only enough for rotation × scale matrices. Hierarchies produce shear
+/// (non-uniform parent scale × rotated child), which stretches some directions more than any
+/// column, so this uses the Gershgorin bound on `AᵀA`: `max_i |cᵢ|² + Σ_{j≠i} |cᵢ·cⱼ|`. It
+/// equals the longest column when the columns are orthogonal. `shaders/cull.wgsl` computes the
+/// same expression so CPU and GPU culling agree.
 pub fn max_axis_scale(m: &Mat4) -> f32 {
-    m.x_axis
-        .truncate()
-        .length_squared()
-        .max(m.y_axis.truncate().length_squared())
-        .max(m.z_axis.truncate().length_squared())
+    stretch_bound(m.x_axis.truncate(), m.y_axis.truncate(), m.z_axis.truncate())
+}
+
+/// [`max_axis_scale`] from the three basis columns.
+pub(crate) fn stretch_bound(c0: Vec3, c1: Vec3, c2: Vec3) -> f32 {
+    let d01 = c0.dot(c1).abs();
+    let d02 = c0.dot(c2).abs();
+    let d12 = c1.dot(c2).abs();
+    (c0.length_squared() + d01 + d02)
+        .max(c1.length_squared() + d01 + d12)
+        .max(c2.length_squared() + d02 + d12)
         .sqrt()
 }
 
@@ -179,6 +193,63 @@ mod tests {
         assert!(f.intersects_aabb(&Aabb::new(Vec3::splat(-1.0), Vec3::splat(1.0))));
         assert!(!f.intersects_aabb(&Aabb::new(Vec3::new(50.0, 0.0, 0.0), Vec3::new(51.0, 1.0, 1.0))));
         assert!(!f.intersects_aabb(&Aabb::EMPTY));
+    }
+
+    /// Largest stretch of the 3x3 part, by brute force over directions.
+    fn spectral_norm(m: &Mat4) -> f32 {
+        let mut best = 0.0f32;
+        for i in 0..400 {
+            for j in 0..200 {
+                let (th, ph) = (
+                    i as f32 / 400.0 * std::f32::consts::TAU,
+                    j as f32 / 200.0 * std::f32::consts::PI,
+                );
+                let v = Vec3::new(ph.sin() * th.cos(), ph.sin() * th.sin(), ph.cos());
+                best = best.max(m.transform_vector3(v).length());
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn sheared_matrices_get_a_conservative_radius() {
+        // Parent scale (1, 4, 1) × child rotated 45° about Z: columns are 2.92 long but the
+        // matrix maps (1, 1, 0)/√2 to (0, 4, 0).
+        let m = Mat4::from_scale(Vec3::new(1.0, 4.0, 1.0)) * Mat4::from_rotation_z(std::f32::consts::FRAC_PI_4);
+        assert!((m.x_axis.truncate().length() - 2.9155).abs() < 1e-3);
+        assert!((max_axis_scale(&m) - 4.0).abs() < 1e-4);
+        // The quad from the regression scene: 3.75 below the ortho frustum's bottom plane, its
+        // tip reaches 0.25 into the view.
+        let proj = glam::camera::rh::proj::directx::orthographic(-5.0, 5.0, -5.0, 5.0, 0.1, 100.0);
+        let view = glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
+        let f = Frustum::from_view_proj(&(proj * view));
+        let world = Mat4::from_translation(Vec3::new(0.0, -8.75, 0.0)) * m;
+        let local = Sphere {
+            center: Vec3::ZERO,
+            radius: 1.01,
+        };
+        assert!(f.intersects_sphere(&local.transformed(&world)));
+        // Always an upper bound, and exact for rotation × scale.
+        let mut seed = 7u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * 4.0 - 2.0
+        };
+        for _ in 0..50 {
+            let a = Mat4::from_cols(
+                glam::Vec4::new(rnd(), rnd(), rnd(), 0.0),
+                glam::Vec4::new(rnd(), rnd(), rnd(), 0.0),
+                glam::Vec4::new(rnd(), rnd(), rnd(), 0.0),
+                glam::Vec4::W,
+            );
+            assert!(max_axis_scale(&a) >= spectral_norm(&a) * 0.9999, "{a:?}");
+            let trs = Mat4::from_scale_rotation_translation(
+                Vec3::new(rnd(), rnd(), rnd()),
+                glam::Quat::from_euler(glam::EulerRot::XYZ, rnd(), rnd(), rnd()),
+                Vec3::ZERO,
+            );
+            assert!((max_axis_scale(&trs) - spectral_norm(&trs)).abs() < 1e-2 * max_axis_scale(&trs));
+        }
     }
 
     #[test]

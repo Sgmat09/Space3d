@@ -122,6 +122,7 @@ struct CameraItem {
 pub(crate) enum ViewTarget {
     Primary,
     Texture {
+        handle: TextureHandle,
         color: wgpu::TextureView,
         depth: wgpu::TextureView,
     },
@@ -135,17 +136,44 @@ pub(crate) struct ViewData {
     size: (u32, u32),
     view_offset: u32,
     draws: Range<usize>,
+    /// Some draw of this view samples the view's own render target. A texture cannot be a
+    /// color attachment and a sampled resource in the same pass, so such draws sample a copy
+    /// of the target taken just before the pass (its previous content) instead.
+    feedback: bool,
+}
+
+/// Copy of a render target sampled by materials drawn into that same target.
+struct Feedback {
+    /// `TextureEntry::version` of the render target it was created for.
+    version: u32,
+    size: (u32, u32),
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// Material bind group sampling `view` (and the materials buffer generation it binds).
+    bind_group: Option<(wgpu::BindGroup, u32)>,
+    last_used: u64,
 }
 
 struct Dispatch {
     buffer: SourceBuffer,
+    params: GpuCullParams,
     params_offset: u32,
     wg: (u32, u32),
 }
 
 struct CompactDispatch {
     params_offset: u32,
-    draw_count: u32,
+    wg: (u32, u32),
+}
+
+/// Workgroup grid for `n` workgroups within the 65535-per-dimension limit.
+fn dispatch_dims(n: u32) -> (u32, u32) {
+    const MAX_DIM: u32 = 65535;
+    if n <= MAX_DIM {
+        (n, 1)
+    } else {
+        (MAX_DIM, n.div_ceil(MAX_DIM))
+    }
 }
 
 pub(crate) struct GpuInstances {
@@ -154,6 +182,35 @@ pub(crate) struct GpuInstances {
     synced: u64,
     len: u32,
     bounds: (Aabb, f32),
+    /// The buffer exceeds the device's `max_buffer_size` (logged once, not drawn).
+    too_large: bool,
+}
+
+/// What to do after trying to acquire the next surface texture.
+pub(crate) enum SurfaceAcquire {
+    Present(wgpu::SurfaceTexture),
+    /// The configuration is outdated (resize, display change): reconfigure, skip this frame.
+    Reconfigure,
+    /// The surface is gone: it must be recreated from the window with `Instance::create_surface`.
+    /// Reconfiguring it would fail validation.
+    Recreate,
+    /// Timeout, occluded or a (captured) validation error: skip presenting this frame.
+    Skip,
+}
+
+impl SurfaceAcquire {
+    pub(crate) fn from_current(t: wgpu::CurrentSurfaceTexture) -> Self {
+        use wgpu::CurrentSurfaceTexture as C;
+        match t {
+            C::Success(t) | C::Suboptimal(t) => Self::Present(t),
+            C::Outdated => Self::Reconfigure,
+            C::Lost => Self::Recreate,
+            other => {
+                tracing::debug!(?other, "skipping present");
+                Self::Skip
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -262,7 +319,15 @@ impl MaterialTable {
     }
 }
 
-type MeshScratch = Vec<(MeshHandle, Option<ArenaAlloc>, Vec<Vertex>, Vec<u32>)>;
+/// Pending mesh uploads: handle, arena placement (once allocated), converted vertices and
+/// indices, and the CPU data (restored to the entry if the mesh does not fit the arena).
+type MeshScratch = Vec<(
+    MeshHandle,
+    Option<ArenaAlloc>,
+    Vec<Vertex>,
+    Vec<u32>,
+    space3d_core::MeshData,
+)>;
 
 /// All persistent per-frame GPU buffers, caches and reusable scratch memory.
 pub(crate) struct FrameState {
@@ -274,7 +339,8 @@ pub(crate) struct FrameState {
     cull_params: TrackedBuffer,
     cull_jobs: TrackedBuffer,
     templates: TrackedBuffer,
-    draw_meta: TrackedBuffer,
+    /// `(first args index, draw count)` per multi-draw-count run (compaction input).
+    run_meta: TrackedBuffer,
     compact_params: TrackedBuffer,
     cull_out: GrowBuffer,
     args: GrowBuffer,
@@ -295,12 +361,21 @@ pub(crate) struct FrameState {
     jobs: Vec<(SourceBuffer, GpuCullJob)>,
     dispatches: Vec<Dispatch>,
     compacts: Vec<CompactDispatch>,
+    /// Params offset and grid of the per-job prefix-sum dispatch (`cull_scan`).
+    scan: Option<(u32, (u32, u32))>,
+    feedback: FastMap<TextureHandle, Feedback>,
     args_count: u32,
     run_count: u32,
+    /// Workgroup records of all culling jobs this frame.
+    wg_total: u32,
+    /// Primary target size the current `views` were prepared for (windowed capture).
+    last_primary_size: (u32, u32),
     path: DrawPath,
     storage: bool,
     uniform_align: usize,
+    /// Largest storage binding, a multiple of 4 and at most `max_buffer_size`.
     max_storage_binding: u64,
+    max_buffer_size: u64,
 }
 
 fn strided(size: usize, align: usize) -> usize {
@@ -337,7 +412,7 @@ impl FrameState {
             cull_params: TrackedBuffer::new("space3d cull params", U::UNIFORM),
             cull_jobs: TrackedBuffer::new("space3d cull jobs", s),
             templates: TrackedBuffer::new("space3d indirect templates", U::COPY_SRC),
-            draw_meta: TrackedBuffer::new("space3d draw meta", s),
+            run_meta: TrackedBuffer::new("space3d run meta", s),
             compact_params: TrackedBuffer::new("space3d compact params", U::UNIFORM),
             cull_out: GrowBuffer::new("space3d culled instances", U::VERTEX | s),
             args: GrowBuffer::new("space3d indirect args", U::INDIRECT | U::COPY_DST | s),
@@ -358,12 +433,17 @@ impl FrameState {
             jobs: Vec::new(),
             dispatches: Vec::new(),
             compacts: Vec::new(),
+            scan: None,
+            feedback: FastMap::default(),
             args_count: 0,
             run_count: 0,
+            wg_total: 0,
+            last_primary_size: (0, 0),
             path: DrawPath::CpuDirect,
             storage,
             uniform_align: device.limits().min_uniform_buffer_offset_alignment as usize,
             max_storage_binding: caps.max_storage_binding,
+            max_buffer_size: caps.max_buffer_size,
         }
     }
 
@@ -429,6 +509,7 @@ impl Renderer {
     /// `Stage::Render` system of [`crate::RenderPlugin`].
     pub fn render_frame(&mut self, world: &World, resources: &mut Resources) {
         self.frame_index += 1;
+        self.ensure_offscreen();
         let settings = resources.get::<RenderSettings>().cloned().unwrap_or_default();
         let ambient = resources.get::<AmbientLight>().copied().unwrap_or_default();
         let best = self.caps.best_draw_path;
@@ -463,14 +544,16 @@ impl Renderer {
         // Acquire the surface only when something presents.
         let mut surface_tex = None;
         if let Some(s) = &self.surface {
-            match s.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                    surface_tex = Some(t)
+            match SurfaceAcquire::from_current(s.surface.get_current_texture()) {
+                SurfaceAcquire::Present(t) => surface_tex = Some(t),
+                SurfaceAcquire::Reconfigure => s.surface.configure(&self.device, &s.config),
+                SurfaceAcquire::Recreate => {
+                    // `has_surface()` turns false: the platform layer attaches a new surface
+                    // with `set_surface`. Until then frames render offscreen.
+                    tracing::warn!("presentation surface lost; dropping it until a new one is attached");
+                    self.surface = None;
                 }
-                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                    s.surface.configure(&self.device, &s.config);
-                }
-                other => tracing::debug!(?other, "skipping present"),
+                SurfaceAcquire::Skip => {}
             }
         }
         let surface_view = surface_tex.as_ref().map(|t| {
@@ -515,7 +598,7 @@ impl Renderer {
     fn primary_size(&self) -> (u32, u32) {
         match &self.surface {
             Some(s) => (s.config.width, s.config.height),
-            None => (self.offscreen.width, self.offscreen.height),
+            None => (self.config.width, self.config.height),
         }
     }
 
@@ -530,6 +613,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let primary_size = self.primary_size();
+        self.frame.last_primary_size = primary_size;
         let frame_index = self.frame_index;
         let Renderer {
             device,
@@ -629,6 +713,12 @@ impl Renderer {
             seq += 1;
         }
         f.items.sort_unstable_by_key(|i| (i.key, i.seq));
+        // GPU culling reads the whole ECS buffer through one storage binding.
+        let ecs_cull = if (f.items.len() as u64) * 64 <= f.max_storage_binding {
+            CullSource::Matrix { offset: 0 }
+        } else {
+            CullSource::None
+        };
         f.sources.clear();
         f.ecs.begin();
         let mut i = 0;
@@ -654,7 +744,7 @@ impl Renderer {
                 first: start as u32,
                 count: (i - start) as u32,
                 stride: 64,
-                cull: CullSource::Matrix { offset: 0 },
+                cull: ecs_cull,
                 bounds: None,
             });
         }
@@ -686,9 +776,25 @@ impl Renderer {
                     synced: 0,
                     len: 0,
                     bounds: (Aabb::EMPTY, 0.0),
+                    too_large: false,
                 });
             }
             let g = f.explicit[slot].as_mut().expect("just ensured");
+            let bytes = ib.len() as u64 * ib.layout().stride as u64;
+            if bytes > f.max_buffer_size {
+                // Creating the GPU buffer would fail validation: skip the buffer (its dirty
+                // ranges stay pending) until it shrinks.
+                if !g.too_large {
+                    tracing::error!(
+                        bytes,
+                        max = f.max_buffer_size,
+                        "instance buffer exceeds the device's max_buffer_size; not drawn"
+                    );
+                }
+                g.too_large = true;
+                continue;
+            }
+            g.too_large = false;
             if g.synced != frame_index {
                 sync_instances(device, encoder, up, g, ib.as_mut());
                 g.synced = frame_index;
@@ -748,10 +854,12 @@ impl Renderer {
         f.cull_params.begin();
         f.cull_jobs.begin();
         f.templates.begin();
-        f.draw_meta.begin();
+        f.run_meta.begin();
         f.compact_params.begin();
         f.args_count = 0;
         f.run_count = 0;
+        f.wg_total = 0;
+        f.scan = None;
         let mut out_cursor = 0u64;
 
         for ci in 0..f.cameras.len() {
@@ -770,6 +878,7 @@ impl Renderer {
                     };
                     (
                         ViewTarget::Texture {
+                            handle: h,
                             color: color.clone(),
                             depth: depth.clone(),
                         },
@@ -798,7 +907,7 @@ impl Renderer {
 
             let draws_start = f.draws.len();
             let jobs_start = f.jobs.len();
-            let args_start = f.args_count;
+            let runs_start = f.run_count;
             // Current multi-draw run: (layout, class, material, run_base, draw cmd index, first args).
             let mut run: Option<(u16, u8, u32, u64, usize, u32)> = None;
 
@@ -822,12 +931,21 @@ impl Renderer {
                     kind: DrawKind::Direct { instances: 0 },
                 };
 
-                if gpu && s.cull != CullSource::None {
+                // GPU culling writes the visible instances into this view's region of
+                // `cull_out`, which is bound as one storage binding: a region that would end
+                // past it falls back to CPU culling for this view.
+                let run_key = (s.layout, s.class, s.material);
+                let same_run = multi && matches!(run, Some((l, c, m, ..)) if (l, c, m) == run_key);
+                let region_start = if multi && !same_run {
+                    align_up(out_cursor, 256)
+                } else {
+                    out_cursor
+                };
+                let fits = region_start + s.count as u64 * s.stride as u64 <= f.max_storage_binding;
+                if gpu && s.cull != CullSource::None && fits {
                     // GPU culling: reserve an output region, emit a job and an indirect draw.
-                    let run_key = (s.layout, s.class, s.material);
-                    let same_run = multi && matches!(run, Some((l, c, m, ..)) if (l, c, m) == run_key);
                     if multi && !same_run {
-                        out_cursor = align_up(out_cursor, 256);
+                        out_cursor = region_start;
                         let cmd_index = f.draws.len();
                         let kind = if path == DrawPath::GpuMultiDrawCount {
                             DrawKind::MultiCount {
@@ -866,19 +984,14 @@ impl Renderer {
                         first_instance,
                     };
                     f.templates.push(template.as_bytes(), &mut cpu_reallocs);
-                    let (run_index, run_first) = match run {
-                        Some((.., cmd, first)) if multi => {
-                            match &mut f.draws[cmd].kind {
-                                DrawKind::Multi { count, .. } => *count += 1,
-                                DrawKind::MultiCount { count, .. } => *count += 1,
-                                _ => {}
-                            }
-                            (f.run_count - 1, first)
+                    if let Some((.., cmd, _)) = run
+                        && multi
+                    {
+                        match &mut f.draws[cmd].kind {
+                            DrawKind::Multi { count, .. } | DrawKind::MultiCount { count, .. } => *count += 1,
+                            _ => {}
                         }
-                        _ => (0, draw),
-                    };
-                    f.draw_meta
-                        .push(bytemuck::cast_slice(&[run_index, run_first]), &mut cpu_reallocs);
+                    }
                     if !multi {
                         f.draws.push(DrawCmd {
                             vb: VertexSource::CullOut,
@@ -1005,50 +1118,66 @@ impl Renderer {
                     let mut n = 0u32;
                     while j < f.jobs.len() && f.jobs[j].0 == buffer {
                         let job = &mut f.jobs[j].1;
-                        job.wg_start = wg;
+                        // Frame-global record index: jobs of all dispatches share the records.
+                        job.wg_start = f.wg_total + wg;
                         wg += job.count.div_ceil(WORKGROUP);
                         f.cull_jobs.push(bytemuck::bytes_of(job), &mut cpu_reallocs);
                         n += 1;
                         j += 1;
                     }
-                    let max_dim = 65535;
-                    let wgs = if wg <= max_dim {
-                        (wg, 1)
-                    } else {
-                        (max_dim, wg.div_ceil(max_dim))
-                    };
+                    f.wg_total += wg;
+                    let wgs = dispatch_dims(wg);
+                    // Written after all views, once the record offset (`wg_word`) is known.
                     let params = GpuCullParams {
                         planes,
                         job_start,
                         job_count: n,
                         total_workgroups: wg,
                         workgroups_x: wgs.0,
+                        wg_word: 0,
+                        pad: [0; 3],
                     };
-                    let params_offset = f.dispatches.len() * params_stride;
-                    f.cull_params
-                        .write_at(params_offset, bytemuck::bytes_of(&params), &mut cpu_reallocs);
                     f.dispatches.push(Dispatch {
                         buffer,
-                        params_offset: params_offset as u32,
+                        params,
+                        params_offset: 0,
                         wg: wgs,
                     });
                 }
-                if path == DrawPath::GpuMultiDrawCount {
+                if path == DrawPath::GpuMultiDrawCount && f.run_count > runs_start {
+                    for d in &f.draws[draws_start..] {
+                        if let DrawKind::MultiCount { args_first, count, run } = d.kind {
+                            f.run_meta.write_at(
+                                run as usize * 8,
+                                bytemuck::cast_slice(&[args_first, count]),
+                                &mut cpu_reallocs,
+                            );
+                        }
+                    }
+                    let runs = f.run_count - runs_start;
+                    let wg = dispatch_dims(runs);
                     let p = GpuCompactParams {
-                        draw_start: args_start,
-                        draw_count: f.args_count - args_start,
-                        pad: [0; 2],
+                        run_start: runs_start,
+                        run_count: runs,
+                        workgroups_x: wg.0,
+                        pad: 0,
                     };
                     let off = f.compacts.len() * f.uniform_align.max(16);
                     f.compact_params
                         .write_at(off, bytemuck::bytes_of(&p), &mut cpu_reallocs);
                     f.compacts.push(CompactDispatch {
                         params_offset: off as u32,
-                        draw_count: p.draw_count,
+                        wg,
                     });
                 }
             }
 
+            let feedback = match &target {
+                ViewTarget::Texture { handle, .. } => f.draws[draws_start..]
+                    .iter()
+                    .any(|d| f.materials.texture(d.material) == Some(*handle)),
+                ViewTarget::Primary => false,
+            };
             f.views.push(ViewData {
                 target,
                 clear: cam.camera.clear_color,
@@ -1056,9 +1185,36 @@ impl Renderer {
                 size,
                 view_offset: view_offset as u32,
                 draws: draws_start..f.draws.len(),
+                feedback,
             });
         }
         stats.views = f.views.len() as u32;
+
+        // Cull params: the per-workgroup compaction records follow the indirect args.
+        let wg_word = align_up(f.args_count as u64 * 5, 4) as u32;
+        for (i, d) in f.dispatches.iter_mut().enumerate() {
+            d.params.wg_word = wg_word;
+            d.params_offset = (i * params_stride) as u32;
+            f.cull_params
+                .write_at(i * params_stride, bytemuck::bytes_of(&d.params), &mut cpu_reallocs);
+        }
+        let job_total = (f.cull_jobs.len() / std::mem::size_of::<GpuCullJob>()) as u32;
+        if job_total > 0 {
+            // One prefix-sum workgroup per job, over the jobs of every view.
+            let wg = dispatch_dims(job_total);
+            let p = GpuCullParams {
+                planes: [[0.0; 4]; 6],
+                job_start: 0,
+                job_count: job_total,
+                total_workgroups: job_total,
+                workgroups_x: wg.0,
+                wg_word,
+                pad: [0; 3],
+            };
+            let off = f.dispatches.len() * params_stride;
+            f.cull_params.write_at(off, bytemuck::bytes_of(&p), &mut cpu_reallocs);
+            f.scan = Some((off as u32, wg));
+        }
 
         // ---- upload ------------------------------------------------------------------
         // Bindings cover one full element even when empty.
@@ -1080,11 +1236,17 @@ impl Renderer {
             f.cull_params.flush(device, encoder, up);
             f.cull_jobs.flush(device, encoder, up);
             f.templates.flush(device, encoder, up);
-            f.draw_meta.flush(device, encoder, up);
+            f.run_meta.ensure_len(8, &mut cpu_reallocs);
+            f.run_meta.flush(device, encoder, up);
             f.compact_params.flush(device, encoder, up);
             f.cull_out.ensure(device, out_cursor, false, up);
             let args_bytes = f.args_count as u64 * ARGS_SIZE;
-            f.args.ensure(device, args_bytes, false, up);
+            let records = wg_word as u64 * 4 + f.wg_total as u64 * 16;
+            debug_assert!(
+                records <= f.max_storage_binding,
+                "cull records exceed the storage binding"
+            );
+            f.args.ensure(device, records, false, up);
             f.compact_args.ensure(device, args_bytes, false, up);
             f.counts.ensure(device, f.run_count as u64 * 4, false, up);
         }
@@ -1138,6 +1300,89 @@ impl Renderer {
                 f.material_bgs.insert(tex, (bg, mgen, version));
             }
         }
+        // Views sampling their own render target bind a copy of it (see `ViewData::feedback`).
+        for v in 0..f.views.len() {
+            let ViewTarget::Texture { handle, .. } = f.views[v].target else {
+                continue;
+            };
+            if !f.views[v].feedback {
+                continue;
+            }
+            let Some(e) = assets.textures.get(handle.raw()) else {
+                continue;
+            };
+            let Some(g) = &e.gpu else {
+                continue;
+            };
+            let size = (e.width, e.height);
+            let fb = match f.feedback.entry(handle) {
+                std::collections::hash_map::Entry::Occupied(o)
+                    if o.get().version == e.version && o.get().size == size =>
+                {
+                    o.into_mut()
+                }
+                entry => {
+                    let texture = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("space3d render target feedback"),
+                        size: wgpu::Extent3d {
+                            width: size.0,
+                            height: size.1,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: OFFSCREEN_FORMAT,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                        dimension: Some(wgpu::TextureViewDimension::D2Array),
+                        ..Default::default()
+                    });
+                    let fresh = Feedback {
+                        version: e.version,
+                        size,
+                        texture,
+                        view,
+                        bind_group: None,
+                        last_used: frame_index,
+                    };
+                    match entry {
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            o.insert(fresh);
+                            o.into_mut()
+                        }
+                        std::collections::hash_map::Entry::Vacant(v) => v.insert(fresh),
+                    }
+                }
+            };
+            fb.last_used = frame_index;
+            if fb.bind_group.as_ref().is_none_or(|(_, gen_)| *gen_ != mgen) {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("space3d material (render target feedback)"),
+                    layout: &pipelines.material_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform_binding(f.materials_buf.buffer(), std::mem::size_of::<GpuMaterial>()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&fb.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&g.sampler),
+                        },
+                    ],
+                });
+                fb.bind_group = Some((bg, mgen));
+            }
+        }
+        // Free copies of targets that stopped sampling themselves (or were removed).
+        f.feedback.retain(|_, fb| fb.last_used + 60 > frame_index);
+
         if gpu && let Some(cull) = &pipelines.cull {
             for d in 0..f.dispatches.len() {
                 let buffer = f.dispatches[d].buffer;
@@ -1187,7 +1432,7 @@ impl Renderer {
             if !f.compacts.is_empty() {
                 let gens = [
                     f.compact_params.gpu.generation,
-                    f.draw_meta.gpu.generation,
+                    f.run_meta.gpu.generation,
                     f.args.generation,
                     f.counts.generation,
                     f.compact_args.generation,
@@ -1207,7 +1452,7 @@ impl Renderer {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
-                                resource: binding(f.draw_meta.buffer(), max),
+                                resource: binding(f.run_meta.buffer(), max),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
@@ -1237,7 +1482,8 @@ impl Renderer {
         stats.cpu_reallocations += cpu_reallocs;
     }
 
-    /// Reset indirect args from templates, then run culling (+ draw compaction).
+    /// Reset indirect args from templates, then run culling (mark → scan → scatter, see
+    /// `shaders/cull.wgsl`) and, for `GpuMultiDrawCount`, draw compaction.
     fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let f = &mut self.frame;
         if !f.path.gpu_culling() || f.dispatches.is_empty() {
@@ -1255,7 +1501,23 @@ impl Renderer {
             label: Some("space3d cull"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&cull.pipeline);
+        // Each dispatch is its own usage scope, so wgpu orders the passes' storage accesses.
+        pass.set_pipeline(&cull.mark);
+        for d in &f.dispatches {
+            let (bg, _) = &f.cull_bgs[&d.buffer];
+            pass.set_bind_group(0, bg, &[d.params_offset]);
+            pass.dispatch_workgroups(d.wg.0, d.wg.1, 1);
+            self.stats.compute_dispatches += 1;
+        }
+        if let Some((offset, wg)) = f.scan {
+            // The scan only touches jobs and args, which every cull bind group shares.
+            let (bg, _) = &f.cull_bgs[&f.dispatches[0].buffer];
+            pass.set_pipeline(&cull.scan);
+            pass.set_bind_group(0, bg, &[offset]);
+            pass.dispatch_workgroups(wg.0, wg.1, 1);
+            self.stats.compute_dispatches += 1;
+        }
+        pass.set_pipeline(&cull.scatter);
         for d in &f.dispatches {
             let (bg, _) = &f.cull_bgs[&d.buffer];
             pass.set_bind_group(0, bg, &[d.params_offset]);
@@ -1268,7 +1530,7 @@ impl Renderer {
             pass.set_pipeline(&cull.compact);
             for c in &f.compacts {
                 pass.set_bind_group(0, bg, &[c.params_offset]);
-                pass.dispatch_workgroups(c.draw_count.div_ceil(WORKGROUP).max(1), 1, 1);
+                pass.dispatch_workgroups(c.wg.0, c.wg.1, 1);
                 self.stats.compute_dispatches += 1;
             }
         }
@@ -1325,7 +1587,22 @@ impl Renderer {
                         None => (target, None, a.depth_view.clone(), a.format, 1, false),
                     }
                 }
-                (ViewTarget::Texture { color, depth }, _) => {
+                (ViewTarget::Texture { handle, color, depth }, _) => {
+                    if view.feedback
+                        && let Some(fb) = self.frame.feedback.get(handle)
+                    {
+                        // Snapshot the target before this pass draws into it; the view's
+                        // materials sample the snapshot.
+                        encoder.copy_texture_to_texture(
+                            color.texture().as_image_copy(),
+                            fb.texture.as_image_copy(),
+                            wgpu::Extent3d {
+                                width: fb.size.0,
+                                height: fb.size.1,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
                     (color.clone(), None, depth.clone(), OFFSCREEN_FORMAT, 1, false)
                 }
             };
@@ -1423,6 +1700,11 @@ impl Renderer {
         pass.set_vertex_buffer(0, vb.slice(..));
         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
         let material_stride = f.material_stride() as u32;
+        // The render target this pass draws into must not be sampled by it.
+        let own_target = match &view.target {
+            ViewTarget::Texture { handle, .. } if view.feedback => Some(*handle),
+            _ => None,
+        };
         let mut last_pipeline: Option<(u16, u8)> = None;
         let mut last_material = u32::MAX;
         let mut last_vb: Option<(VertexSource, u64)> = None;
@@ -1440,7 +1722,15 @@ impl Renderer {
             }
             if cmd.material != last_material {
                 let tex = f.materials.texture(cmd.material);
-                let Some((bg, ..)) = f.material_bgs.get(&tex) else {
+                let bg = match tex {
+                    Some(t) if Some(t) == own_target => f
+                        .feedback
+                        .get(&t)
+                        .and_then(|fb| fb.bind_group.as_ref())
+                        .map(|(bg, _)| bg),
+                    _ => f.material_bgs.get(&tex).map(|(bg, ..)| bg),
+                };
+                let Some(bg) = bg else {
                     continue;
                 };
                 pass.set_bind_group(1, bg, &[cmd.material * material_stride]);
@@ -1489,12 +1779,15 @@ impl Renderer {
         }
     }
 
-    /// Re-record the last frame's primary views into the offscreen target (for capture).
+    /// Re-record the last frame's primary views into the offscreen target (for capture). The
+    /// target gets the size those views were prepared for (their projection and viewports),
+    /// even if the window was resized since.
     pub(crate) fn encode_primary_to_offscreen(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        let (w, h) = self.primary_size();
-        if (self.offscreen.width, self.offscreen.height) != (w, h) {
-            self.offscreen =
-                crate::renderer::Attachments::new(&self.device, w, h, self.offscreen.samples, OFFSCREEN_FORMAT, true);
+        let (w, h) = self.frame.last_primary_size;
+        let (w, h) = (w.max(1), h.max(1));
+        let samples = self.config.msaa_samples;
+        if (self.offscreen.width, self.offscreen.height, self.offscreen.samples) != (w, h, samples) {
+            self.offscreen = crate::renderer::Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
         }
         let draw_calls = self.stats.draw_calls;
         self.encode_views(encoder, None, true);
@@ -1542,6 +1835,7 @@ fn sync_instances(
 mod tests {
     use super::*;
     use crate::instance::{InstanceCompact, InstanceData};
+    use crate::pipeline::GpuCompactParams;
 
     #[test]
     fn material_keys_intern() {
@@ -1549,6 +1843,228 @@ mod tests {
         let b = MaterialKey::new(&Material::default());
         let c = MaterialKey::new(&Material::srgb(1.0, 0.0, 0.0));
         assert!(a == b && a != c);
+    }
+
+    #[test]
+    fn surface_lost_is_recreated_not_reconfigured() {
+        use wgpu::CurrentSurfaceTexture as C;
+        assert!(matches!(
+            SurfaceAcquire::from_current(C::Lost),
+            SurfaceAcquire::Recreate
+        ));
+        assert!(matches!(
+            SurfaceAcquire::from_current(C::Outdated),
+            SurfaceAcquire::Reconfigure
+        ));
+        assert!(matches!(SurfaceAcquire::from_current(C::Timeout), SurfaceAcquire::Skip));
+        assert!(matches!(
+            SurfaceAcquire::from_current(C::Occluded),
+            SurfaceAcquire::Skip
+        ));
+    }
+
+    fn headless_app(w: u32, h: u32) -> Option<space3d_core::App> {
+        let mut app = space3d_core::App::new();
+        app.add_plugin(crate::RenderPlugin::default());
+        match pollster::block_on(Renderer::new_headless(w, h)) {
+            Ok(r) => {
+                app.insert_resource(r);
+                Some(app)
+            }
+            Err(e) => {
+                eprintln!("skipping GPU test: no adapter available ({e})");
+                None
+            }
+        }
+    }
+
+    fn set_path(app: &mut space3d_core::App, path: DrawPath) {
+        app.resources.expect_mut::<RenderSettings>().draw_path = Some(path);
+    }
+
+    fn differing_px(a: &space3d_core::ImageData, b: &space3d_core::ImageData) -> usize {
+        a.pixels
+            .chunks(4)
+            .zip(b.pixels.chunks(4))
+            .filter(|(p, q)| p.iter().zip(q.iter()).any(|(x, y)| x.abs_diff(*y) > 2))
+            .count()
+    }
+
+    /// Regression: `cull_out` accumulates every GPU-culled source of every view but is bound as
+    /// one storage binding; regions past `max_storage_buffer_binding_size` (128 MiB on many
+    /// mobile GPUs and WebGPU) were silently dropped while the draws still counted them, and
+    /// the ECS source was never checked. Such sources now fall back to CPU culling.
+    #[test]
+    fn sources_past_the_storage_binding_limit_fall_back_to_cpu_culling() {
+        use crate::{Camera3d, InstanceBuffer, InstanceTransform, InstancedMesh, Mesh3d};
+        use space3d_core::{MeshData, Transform};
+        let Some(mut app) = headless_app(96, 64) else { return };
+        let best = app.resources.expect::<Renderer>().capabilities().best_draw_path;
+        if best == DrawPath::CpuDirect {
+            return;
+        }
+        let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.3));
+        // ECS: 1000 matrices = 64000 B.
+        for i in 0..1000 {
+            let p = Vec3::new((i % 40) as f32 * 0.25 - 5.0, (i / 40) as f32 * 0.25 - 3.0, 0.0);
+            app.world.spawn((
+                Transform::from_xyz(p.x, p.y, p.z),
+                Mesh3d(mesh),
+                Material::srgb(0.9, 0.4, 0.1),
+            ));
+        }
+        // Two explicit buffers of 400 × 64 B = 25600 B each.
+        for (k, y) in [(0, 1.0), (1, -1.5)] {
+            let data = (0..400)
+                .map(|i| {
+                    InstanceTransform::from_trs(
+                        Vec3::new((i % 40) as f32 * 0.25 + 0.5, y + (i / 40) as f32 * 0.2, -1.0),
+                        glam::Quat::from_rotation_y(i as f32),
+                        Vec3::ONE,
+                    )
+                })
+                .collect();
+            let instances = app
+                .resources
+                .expect_mut::<InstanceBuffers>()
+                .insert(InstanceBuffer::from_vec(data, crate::BufferUsage::Static));
+            app.world.spawn((InstancedMesh {
+                mesh,
+                material: Material::srgb(0.2, 0.5 + 0.3 * k as f32, 0.9),
+                instances,
+            },));
+        }
+        // Two views of the same scene (left and right half).
+        for (x, order) in [(0.0, 0), (0.5, 1)] {
+            app.world.spawn((
+                Transform::from_xyz(0.0, 0.0, 12.0),
+                Camera3d {
+                    viewport: Some([x, 0.0, 0.5, 1.0]),
+                    order,
+                    ..Camera3d::default().with_clear_color(glam::Vec4::new(0.0, 0.0, 1.0, 1.0))
+                },
+            ));
+        }
+        set_path(&mut app, DrawPath::CpuDirect);
+        let cpu = crate::render_to_image(&mut app).expect("capture");
+        // Only 32 KiB per storage binding: each explicit buffer fits on its own, the ECS
+        // batch does not, and neither does the sum of all regions across the two views.
+        app.resources.expect_mut::<Renderer>().frame.max_storage_binding = 32 << 10;
+        set_path(&mut app, best);
+        let limited = crate::render_to_image(&mut app).expect("capture");
+        let d = differing_px(&cpu, &limited);
+        assert_eq!(d, 0, "{best:?} with a 32 KiB binding differs in {d} px");
+        let f = &app.resources.expect::<Renderer>().frame;
+        assert_eq!(
+            f.jobs.len(),
+            1,
+            "only the first explicit buffer of view 1 is GPU-culled"
+        );
+        assert!(app.resources.expect::<crate::RenderStats>().compute_dispatches > 0);
+    }
+
+    /// `compact.wgsl` (GpuMultiDrawCount) keeps the non-empty draws of each run in order. Run
+    /// directly so it is covered on adapters without MULTI_DRAW_INDIRECT_COUNT (e.g. Metal).
+    #[test]
+    fn draw_compaction_is_order_preserving() {
+        use wgpu::util::DeviceExt;
+        let Ok(r) = pollster::block_on(Renderer::new_headless(8, 8)) else {
+            return;
+        };
+        let Some(cull) = &r.pipelines.cull else { return };
+        let device = &r.device;
+        // Two runs: 150 draws (every third empty) and 7 draws (all empty but one).
+        let runs: [[u32; 2]; 2] = [[0, 150], [150, 7]];
+        let mut args_in = Vec::new();
+        for d in 0..157u32 {
+            let instances = if d < 150 {
+                if d % 3 == 0 { 0 } else { d }
+            } else if d == 153 {
+                5
+            } else {
+                0
+            };
+            args_in.extend_from_slice(&[1000 + d, instances, d, d * 2, d * 3]);
+        }
+        let params = GpuCompactParams {
+            run_start: 0,
+            run_count: 2,
+            workgroups_x: 2,
+            pad: 0,
+        };
+        use wgpu::BufferUsages as U;
+        let init = |label, contents: &[u8], usage| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage,
+            })
+        };
+        let params_buf = init("params", bytemuck::bytes_of(&params), U::UNIFORM);
+        let runs_buf = init("runs", bytemuck::cast_slice(&runs), U::STORAGE);
+        let args_buf = init("args", bytemuck::cast_slice(&args_in), U::STORAGE);
+        let counts = init("counts", &[0xff; 8], U::STORAGE | U::COPY_SRC);
+        let out = init("out", &vec![0xff; args_in.len() * 4], U::STORAGE | U::COPY_SRC);
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &cull.compact_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_binding(&params_buf, 16),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: runs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: args_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: counts.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out.as_entire_binding(),
+                },
+            ],
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 8 + out.size(),
+            usage: U::MAP_READ | U::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&cull.compact);
+            pass.set_bind_group(0, &bg, &[0]);
+            pass.dispatch_workgroups(2, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&counts, 0, &readback, 0, 8);
+        encoder.copy_buffer_to_buffer(&out, 0, &readback, 8, out.size());
+        r.queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let words: Vec<u32> = bytemuck::cast_slice(&readback.slice(..).get_mapped_range().expect("mapped")).to_vec();
+        let (counts, out) = words.split_at(2);
+        for (r, [first, n]) in runs.iter().enumerate() {
+            let expected: Vec<u32> = (*first..first + n)
+                .filter(|d| args_in[*d as usize * 5 + 1] != 0)
+                .collect();
+            assert_eq!(counts[r], expected.len() as u32, "run {r}");
+            for (slot, d) in expected.iter().enumerate() {
+                let o = (*first as usize + slot) * 5;
+                assert_eq!(
+                    &out[o..o + 5],
+                    &args_in[*d as usize * 5..*d as usize * 5 + 5],
+                    "run {r} slot {slot}"
+                );
+            }
+        }
     }
 
     #[test]

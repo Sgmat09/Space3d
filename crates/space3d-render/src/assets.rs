@@ -274,11 +274,17 @@ impl RenderAssets {
         h
     }
 
-    /// Replace a texture's contents (re-uploaded next frame).
+    /// Replace a sampled texture's contents (re-uploaded next frame). Returns false for stale
+    /// handles and for render targets, whose contents come from their camera — resize those
+    /// with [`Self::resize_render_target`].
     pub fn update_texture(&mut self, handle: TextureHandle, source: TextureSource) -> bool {
         let Some(e) = self.textures.get_mut(handle.raw()) else {
             return false;
         };
+        if e.render_target {
+            tracing::warn!(texture = ?handle, "update_texture on a render target is ignored; use resize_render_target");
+            return false;
+        }
         e.width = source.width;
         e.height = source.height;
         e.sampler = source.sampler;
@@ -287,9 +293,30 @@ impl RenderAssets {
         true
     }
 
-    /// Replace an image texture.
+    /// Replace an image texture (see [`Self::update_texture`]).
     pub fn update_image(&mut self, handle: TextureHandle, image: ImageData) -> bool {
         self.update_texture(handle, TextureSource::from_image(image))
+    }
+
+    /// Resize a render target created with [`Self::add_render_target`]. Its color and depth
+    /// textures are recreated (contents cleared) on the next frame; until then cameras targeting
+    /// it are skipped and materials sample white. Returns false for stale handles and for
+    /// textures that are not render targets.
+    pub fn resize_render_target(&mut self, handle: TextureHandle, width: u32, height: u32) -> bool {
+        let Some(e) = self.textures.get_mut(handle.raw()) else {
+            return false;
+        };
+        if !e.render_target {
+            return false;
+        }
+        let (width, height) = (width.max(1), height.max(1));
+        if (e.width, e.height) != (width, height) {
+            e.width = width;
+            e.height = height;
+            e.gpu = None;
+            self.pending_textures.push(handle);
+        }
+        true
     }
 
     /// Remove a texture.

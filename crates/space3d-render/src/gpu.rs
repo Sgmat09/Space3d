@@ -82,29 +82,29 @@ pub(crate) fn copy_to_staging(mut dst: wgpu::WriteOnly<'_, [u8]>, src: &[u8]) {
     if src.len() >= PARALLEL_COPY_THRESHOLD {
         /// Raw pointer into the mapped range, handed to exactly one worker.
         struct SendPtr(std::ptr::NonNull<u8>);
-        // SAFETY: each pointer addresses a disjoint sub-range of `dst`, which stays borrowed
-        // (and therefore mapped and valid for writes) until `rayon::scope` returns.
+        // SAFETY: each task writes a disjoint sub-range of `dst`, which stays borrowed (and
+        // therefore mapped and valid for writes) until `for_each` returns.
         unsafe impl Send for SendPtr {}
         // SAFETY: only used to derive the per-task pointers above; never dereferenced shared.
         unsafe impl Sync for SendPtr {}
 
+        use rayon::prelude::*;
         let threads = rayon::current_num_threads().clamp(1, 8);
         let chunk = src.len().div_ceil(threads).next_multiple_of(4096);
         let base = SendPtr(dst.as_raw_element_ptr());
         let base = &base;
-        rayon::scope(|s| {
-            for (i, part) in src.chunks(chunk).enumerate() {
-                // SAFETY: `i * chunk + part.len() <= dst.len()` because `src.len() == dst.len()`.
-                let ptr = SendPtr(unsafe { base.0.add(i * chunk) });
-                s.spawn(move |_| {
-                    let ptr = ptr;
-                    // SAFETY: see `SendPtr`; the range is exclusively owned by this task.
-                    let mut w = unsafe {
-                        wgpu::WriteOnly::<[u8]>::new(std::ptr::NonNull::slice_from_raw_parts(ptr.0, part.len()))
-                    };
-                    w.copy_from_slice(part);
-                });
-            }
+        // A parallel iterator splits with `join` (stack-allocated jobs), unlike `scope.spawn`,
+        // which boxes every task: no heap allocation per frame.
+        src.par_chunks(chunk).enumerate().for_each(|(i, part)| {
+            // SAFETY: `i * chunk + part.len() <= dst.len()` because `src.len() == dst.len()`;
+            // the range is exclusively owned by this task and stays mapped (see `SendPtr`).
+            let mut w = unsafe {
+                wgpu::WriteOnly::<[u8]>::new(std::ptr::NonNull::slice_from_raw_parts(
+                    base.0.add(i * chunk),
+                    part.len(),
+                ))
+            };
+            w.copy_from_slice(part);
         });
         return;
     }
@@ -133,17 +133,20 @@ impl GrowBuffer {
     }
 
     /// Ensure at least `size` bytes. Returns true if (re)allocated (contents lost).
-    /// `exact` sizes the buffer tightly (static data), otherwise it grows 1.5x.
+    /// `exact` sizes the buffer tightly (static data), otherwise it grows 1.5x — but never
+    /// beyond the device's `max_buffer_size`. Callers keep `size` itself within that limit
+    /// (a larger buffer cannot exist and would fail validation).
     pub fn ensure(&mut self, device: &wgpu::Device, size: u64, exact: bool, up: &mut Uploader) -> bool {
         let size = align_up(size.max(16), 16);
         if self.buffer.is_some() && size <= self.capacity {
             return false;
         }
-        let capacity = if exact {
+        let wanted = if exact {
             align_up(size, 256)
         } else {
             align_up(size.max(self.capacity + self.capacity / 2), 256)
         };
+        let capacity = wanted.min(device.limits().max_buffer_size & !255).max(size);
         self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(self.label),
             size: capacity,
@@ -271,5 +274,39 @@ impl TrackedBuffer {
 
     pub fn buffer(&self) -> &wgpu::Buffer {
         self.gpu.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device limited to 1 MiB buffers (skips without an adapter).
+    fn small_device() -> Option<wgpu::Device> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        let limits = wgpu::Limits {
+            max_buffer_size: 1 << 20,
+            ..adapter.limits()
+        };
+        let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: limits,
+            ..Default::default()
+        }))
+        .ok()?;
+        Some(device)
+    }
+
+    /// Regression: 1.5x growth ignored `max_buffer_size`, so a buffer whose contents fit the
+    /// limit could still request more and fail validation (a panic by default).
+    #[test]
+    fn growth_is_clamped_to_max_buffer_size() {
+        let Some(device) = small_device() else { return };
+        let mut up = Uploader::new(&device);
+        let mut b = GrowBuffer::new("test", wgpu::BufferUsages::VERTEX);
+        assert!(b.ensure(&device, 700_000, false, &mut up));
+        assert!(b.ensure(&device, 800_000, false, &mut up));
+        assert_eq!(b.capacity(), 1 << 20, "1.5x would be 1.05 MB");
+        assert!(!b.ensure(&device, 1 << 20, false, &mut up));
     }
 }

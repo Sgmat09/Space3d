@@ -86,7 +86,7 @@ pub struct InstanceLayout {
 /// How culling code can find an instance's position/scale in raw memory (f32 formats only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CullSource {
-    /// Translation = column 3, scale = longest of columns 0..2.
+    /// Translation = column 3, scale = [`crate::max_axis_scale`] of columns 0..2.
     Matrix {
         /// Byte offset of the first matrix column.
         offset: u32,
@@ -206,15 +206,8 @@ impl InstanceLayout {
         let v3 = |o: u32| Vec3::new(f(o), f(o + 4), f(o + 8));
         match self.cull_source() {
             CullSource::Matrix { offset } => {
-                let c0 = v3(offset);
-                let c1 = v3(offset + 16);
-                let c2 = v3(offset + 32);
                 let t = v3(offset + 48);
-                let s = c0
-                    .length_squared()
-                    .max(c1.length_squared())
-                    .max(c2.length_squared())
-                    .sqrt();
+                let s = crate::culling::stretch_bound(v3(offset), v3(offset + 16), v3(offset + 32));
                 Some((t, s))
             }
             CullSource::TranslationScale { translation, scale } => {
@@ -544,9 +537,14 @@ impl<T: InstanceData> InstanceBuffer<T> {
         self.bounds = Aabb::EMPTY;
         self.bounds_exact = false;
     }
-    /// Override automatic bounds (skips per-instance bound tracking on the CPU).
+    /// Override the automatic bounds used for CPU buffer-level culling (skips per-instance
+    /// bound tracking). `bounds` is a world-space box containing every instance's *position*;
+    /// the renderer grows it by the mesh's bounding radius at scale 1, so include any extra
+    /// extent of instances scaled above 1. `None` returns to automatic bounds, recomputed from
+    /// all instances on the next frame (edits made meanwhile were not tracked).
     pub fn set_bounds(&mut self, bounds: Option<Aabb>) {
         self.user_bounds = bounds;
+        self.bounds_exact = false;
     }
     /// Pending dirty ranges (instance units).
     pub fn dirty_ranges(&self) -> &[Range<usize>] {
@@ -600,6 +598,9 @@ impl<T: InstanceData> ErasedInstanceBuffer for InstanceBuffer<T> {
     }
     fn refresh_bounds(&mut self) -> (Aabb, f32) {
         if let Some(b) = self.user_bounds {
+            // Dirty ranges are cleared after every upload, so edits made while overridden
+            // never reach the automatic bounds: they must be recomputed when it is lifted.
+            self.bounds_exact = false;
             return (b, 1.0);
         }
         let len = self.data.len();
@@ -739,6 +740,36 @@ mod tests {
         b.swap_remove(0);
         assert_eq!(b.dirty_ranges(), &[0..1]);
         assert_eq!(b.len(), 99);
+    }
+
+    #[test]
+    fn lifting_user_bounds_recomputes_from_all_instances() {
+        let mut b = InstanceBuffer::from_vec(
+            (0..100)
+                .map(|i| InstanceCompact::new(Vec3::new(i as f32 * 0.01, 0.0, 0.0), Quat::IDENTITY, 1.0))
+                .collect(),
+            BufferUsage::Dynamic,
+        );
+        b.refresh_bounds();
+        b.clear_dirty();
+        let user = Aabb::new(Vec3::splat(-1e5), Vec3::splat(1e5));
+        b.set_bounds(Some(user));
+        for round in 0..10 {
+            for i in round * 10..round * 10 + 10 {
+                b.set(
+                    i,
+                    InstanceCompact::new(Vec3::new(1000.0, 0.0, 0.0), Quat::IDENTITY, 2.0),
+                );
+            }
+            assert_eq!(b.refresh_bounds(), (user, 1.0));
+            b.clear_dirty();
+        }
+        b.set_bounds(None);
+        let (aabb, s) = b.refresh_bounds();
+        assert_eq!(
+            (aabb.min, aabb.max, s),
+            (Vec3::new(1000.0, 0.0, 0.0), Vec3::new(1000.0, 0.0, 0.0), 2.0)
+        );
     }
 
     #[test]

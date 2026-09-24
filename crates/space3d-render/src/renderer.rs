@@ -8,6 +8,8 @@ use crate::stats::{DrawPath, RenderStats};
 use crate::texture::{SamplerCache, create_gpu_texture, format_supported, white_texture};
 use space3d_core::ImageData;
 use space3d_tasks::Task;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Renderer errors.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +82,8 @@ pub struct RenderCapabilities {
     pub max_msaa: u32,
     /// Largest storage binding (bounds GPU-culled buffers).
     pub max_storage_binding: u64,
+    /// Largest buffer the device can create (bounds the mesh arena and instance buffers).
+    pub max_buffer_size: u64,
 }
 
 impl RenderCapabilities {
@@ -121,7 +125,9 @@ impl RenderCapabilities {
             ),
             best_draw_path,
             max_msaa: if msaa4 { 4 } else { 1 },
-            max_storage_binding: limits.max_storage_buffer_binding_size,
+            // Storage bindings must be a multiple of 4 bytes and never exceed the buffer.
+            max_storage_binding: limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) & !3,
+            max_buffer_size: limits.max_buffer_size,
         }
     }
 }
@@ -230,6 +236,8 @@ pub struct Renderer {
     pub(crate) frame: FrameState,
     pub(crate) stats: RenderStats,
     pub(crate) frame_index: u64,
+    /// Uncaptured wgpu errors so far (see [`install_error_handler`]).
+    pub(crate) gpu_errors: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -241,6 +249,30 @@ impl std::fmt::Debug for Renderer {
             .field("draw_path", &self.caps.best_draw_path)
             .finish_non_exhaustive()
     }
+}
+
+/// Route wgpu errors that no error scope captured through `tracing` instead of wgpu's default
+/// handler, which panics. With `panic` (debug builds and tests) the error still panics after
+/// being logged so bugs surface immediately; release builds log and keep running — skipping a
+/// broken command buffer is better than crashing the game. Errors tend to repeat every frame,
+/// so only the first ones and then every 1000th are logged.
+pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> Arc<AtomicU64> {
+    let count = Arc::new(AtomicU64::new(0));
+    let counter = count.clone();
+    device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
+        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_multiple_of(1000) {
+            tracing::error!(occurrences = n, "wgpu error: {err}");
+        }
+        if panic {
+            panic!("wgpu error: {err}");
+        }
+    }));
+    device.set_device_lost_callback(|reason, message| match reason {
+        wgpu::DeviceLostReason::Destroyed => tracing::debug!(%message, "GPU device destroyed"),
+        _ => tracing::error!(?reason, %message, "GPU device lost"),
+    });
+    count
 }
 
 /// Display connection handed to wgpu (needed by GLES on Wayland/X11; unused elsewhere).
@@ -320,6 +352,7 @@ impl Renderer {
             .map_err(|e| RenderError::NoAdapter(e.to_string()))?;
         let wanted = wgpu::Features::INDIRECT_FIRST_INSTANCE
             | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+            | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::TEXTURE_COMPRESSION_ASTC
             | wgpu::Features::TEXTURE_COMPRESSION_ETC2;
@@ -332,6 +365,7 @@ impl Renderer {
             })
             .await
             .map_err(|e| RenderError::Device(e.to_string()))?;
+        let gpu_errors = install_error_handler(&device, cfg!(debug_assertions));
         let caps = RenderCapabilities::detect(&adapter, &device);
         tracing::info!(
             adapter = %caps.adapter.name,
@@ -373,6 +407,7 @@ impl Renderer {
             frame,
             stats: RenderStats::default(),
             frame_index: 0,
+            gpu_errors,
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;
@@ -450,7 +485,9 @@ impl Renderer {
         self.surface.is_some()
     }
 
-    /// Resize the primary target (surface and offscreen capture target).
+    /// Resize the primary target. The window surface is reconfigured now; the headless
+    /// offscreen target is reallocated by the next frame, so [`Self::capture`] until then
+    /// still returns the last rendered frame.
     pub fn resize(&mut self, width: u32, height: u32) {
         let (width, height) = (width.max(1), height.max(1));
         self.config.width = width;
@@ -468,27 +505,30 @@ impl Renderer {
                 false,
             );
         }
-        if (self.offscreen.width, self.offscreen.height) != (width, height) {
-            self.offscreen = Attachments::new(
-                &self.device,
-                width,
-                height,
-                self.offscreen.samples,
-                OFFSCREEN_FORMAT,
-                true,
-            );
+    }
+
+    /// Headless: (re)allocate the offscreen target to the configured size and sample count.
+    /// Called at the start of a frame, never between a frame and its capture.
+    pub(crate) fn ensure_offscreen(&mut self) {
+        if self.surface.is_some() {
+            // Windowed: the offscreen target only serves captures, which size it themselves.
+            return;
+        }
+        let (w, h, samples) = (self.config.width, self.config.height, self.config.msaa_samples);
+        let a = &self.offscreen;
+        if (a.width, a.height, a.samples) != (w, h, samples) {
+            self.offscreen = Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
         }
     }
 
-    /// Change MSAA sample count (1 or 4; clamped to device support). Recreates attachments.
+    /// Change MSAA sample count (1 or 4; clamped to device support). Surface attachments are
+    /// recreated now, the headless offscreen target on the next frame.
     pub fn set_msaa_samples(&mut self, samples: u32) {
         let samples = if samples > 1 { self.caps.max_msaa } else { 1 };
         if samples == self.config.msaa_samples {
             return;
         }
         self.config.msaa_samples = samples;
-        let (w, h) = (self.config.width, self.config.height);
-        self.offscreen = Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
         if let Some(s) = &mut self.surface {
             let ok = self
                 .adapter
@@ -542,9 +582,17 @@ impl Renderer {
         self.surface.as_ref().map(|s| s.config.format)
     }
 
-    /// Whether textures of `format` can be uploaded (compressed formats need device features).
+    /// Whether textures of `format` can be uploaded and sampled by materials: compressed
+    /// formats need device features, and the format must be filterable float (integer and
+    /// depth formats never are; 32-bit float only with `FLOAT32_FILTERABLE`).
     pub fn supports_texture_format(&self, format: wgpu::TextureFormat) -> bool {
-        format_supported(&self.device, format)
+        format_supported(&self.adapter, &self.device, format)
+    }
+
+    /// Number of wgpu errors that reached the uncaptured-error handler so far. Release builds
+    /// log these instead of panicking; tests and tools can assert that it stays 0.
+    pub fn gpu_error_count(&self) -> u64 {
+        self.gpu_errors.load(Ordering::Relaxed)
     }
 
     /// Upload all pending meshes/textures now (normally done at the start of each frame).
@@ -580,6 +628,7 @@ impl Renderer {
                     continue;
                 }
                 match create_gpu_texture(
+                    &self.adapter,
                     &self.device,
                     &self.queue,
                     encoder,
@@ -601,10 +650,9 @@ impl Renderer {
 
     fn upload_meshes(&mut self, encoder: &mut wgpu::CommandEncoder, assets: &mut RenderAssets) {
         let pending = std::mem::take(&mut assets.pending_meshes);
-        // Convert + allocate.
+        // Convert; keep the existing placement when the size is unchanged.
         let scratch = &mut self.frame.mesh_scratch;
         scratch.clear();
-        let mut missing = (0u32, 0u32);
         for &h in &pending {
             let Some(entry) = assets.meshes.get_mut(h.raw()) else {
                 continue;
@@ -616,34 +664,60 @@ impl Renderer {
             let mut i = Vec::new();
             crate::arena::build_vertices(&data, &mut v, &mut i);
             let (vc, ic) = (v.len() as u32, i.len() as u32);
-            // Reuse the existing allocation when the size is unchanged.
             let alloc = match entry.gpu {
                 Some(g) if g.alloc.vertex_count == vc && g.alloc.index_count == ic => Some(g.alloc),
                 Some(g) => {
                     assets.arena.free(g.alloc);
                     entry.gpu = None;
-                    assets.arena.alloc(vc, ic)
+                    None
                 }
-                None => assets.arena.alloc(vc, ic),
+                None => None,
             };
-            if alloc.is_none() {
-                missing.0 += vc;
-                missing.1 += ic;
+            scratch.push((h, alloc, v, i, data));
+        }
+
+        // Allocate, growing only the buffer(s) that are short, until everything fits or the
+        // device's max_buffer_size is reached.
+        let arena = &mut assets.arena;
+        let old = (arena.vertices.capacity(), arena.indices.capacity());
+        if arena.vertex.is_none() || arena.index.is_none() {
+            arena.grow_capacity(0, 0, self.caps.max_buffer_size);
+        }
+        // A mesh larger than a whole buffer can ever be is not worth growing for.
+        let (max_v, max_i) = crate::arena::MeshArena::max_capacity(self.caps.max_buffer_size);
+        let fits = |v: &Vec<_>, i: &Vec<u32>| v.len() as u64 <= max_v as u64 && i.len() as u64 <= max_i as u64;
+        loop {
+            let (mut short_v, mut short_i) = (0u32, 0u32);
+            for (_, alloc, v, i, _) in scratch.iter_mut().filter(|e| e.1.is_none() && fits(&e.2, &e.3)) {
+                match arena.try_alloc(v.len() as u32, i.len() as u32) {
+                    Ok(a) => *alloc = Some(a),
+                    Err(short) => {
+                        if short.vertices {
+                            short_v = short_v.saturating_add(v.len() as u32);
+                        }
+                        if short.indices {
+                            short_i = short_i.saturating_add(i.len() as u32);
+                        }
+                    }
+                }
             }
-            scratch.push((h, alloc, v, i));
+            if (short_v, short_i) == (0, 0) {
+                break;
+            }
+            let before = (arena.vertices.capacity(), arena.indices.capacity());
+            arena.grow_capacity(short_v, short_i, self.caps.max_buffer_size);
+            if (arena.vertices.capacity(), arena.indices.capacity()) == before {
+                break; // At the device limit: what is left does not fit.
+            }
         }
         let mut fresh = (u32::MAX, u32::MAX);
-        if missing != (0, 0) || assets.arena.vertex.is_none() {
-            let old = assets.arena.grow_capacity(missing.0, missing.1);
-            for (_, alloc, v, i) in scratch.iter_mut() {
-                if alloc.is_none() {
-                    *alloc = assets.arena.alloc(v.len() as u32, i.len() as u32);
-                    debug_assert!(alloc.is_some(), "arena growth must satisfy pending meshes");
-                }
-            }
+        if arena.vertex.is_none()
+            || arena.index.is_none()
+            || (arena.vertices.capacity(), arena.indices.capacity()) != old
+        {
             let writes: Vec<_> = scratch
                 .iter()
-                .filter_map(|(_, a, v, i)| {
+                .filter_map(|(_, a, v, i, _)| {
                     a.map(|alloc| crate::arena::ArenaWrite {
                         alloc,
                         vertices: v,
@@ -651,13 +725,21 @@ impl Renderer {
                     })
                 })
                 .collect();
-            assets
-                .arena
-                .realloc_gpu(&self.device, encoder, old, &writes, &mut self.uploader);
-            fresh = old;
+            fresh = arena.realloc_gpu(&self.device, encoder, old, &writes, &mut self.uploader);
         }
-        for (h, alloc, v, i) in scratch.drain(..) {
+        for (h, alloc, v, i, data) in scratch.drain(..) {
+            let Some(entry) = assets.meshes.get_mut(h.raw()) else {
+                continue;
+            };
             let Some(alloc) = alloc else {
+                tracing::error!(
+                    mesh = ?h,
+                    vertices = v.len(),
+                    indices = i.len(),
+                    max_buffer_size = self.caps.max_buffer_size,
+                    "mesh does not fit the mesh arena; it is not drawn (update or remove it)"
+                );
+                entry.cpu = Some(data);
                 continue;
             };
             assets.arena.write(
@@ -671,13 +753,11 @@ impl Renderer {
                 fresh.1,
                 &mut self.uploader,
             );
-            if let Some(entry) = assets.meshes.get_mut(h.raw()) {
-                entry.gpu = Some(crate::assets::GpuMesh {
-                    alloc,
-                    sphere: entry.sphere,
-                });
-                self.stats.meshes_uploaded += 1;
-            }
+            entry.gpu = Some(crate::assets::GpuMesh {
+                alloc,
+                sphere: entry.sphere,
+            });
+            self.stats.meshes_uploaded += 1;
         }
     }
 
@@ -786,5 +866,90 @@ impl Renderer {
     /// Non-blocking device poll: fires pending map callbacks (captures, staging recycling).
     pub fn poll(&self) {
         let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use space3d_core::MeshData;
+
+    fn renderer() -> Option<Renderer> {
+        match pollster::block_on(Renderer::new_headless(16, 16)) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("skipping GPU test: no adapter available ({e})");
+                None
+            }
+        }
+    }
+
+    /// Regression: arena growth doubled vertex and index buffers in lockstep and never looked
+    /// at `max_buffer_size`, so create_buffer failed validation (a panic) long before the data
+    /// reached the limit. Growth is now per buffer, clamped, and meshes that cannot fit are
+    /// reported and kept on the CPU instead.
+    #[test]
+    fn mesh_arena_respects_max_buffer_size() {
+        let Some(mut r) = renderer() else { return };
+        r.caps.max_buffer_size = 36 * 16_384; // 16384 vertices
+        let mut assets = RenderAssets::default();
+        let small: Vec<_> = (0..10).map(|_| assets.add_mesh(MeshData::cube(1.0))).collect();
+        let big = assets.add_mesh(MeshData::sphere(1.0, 200, 100)); // 20301 vertices
+        r.upload_assets(&mut assets);
+        assert!(small.iter().all(|m| assets.is_mesh_uploaded(*m)));
+        assert!(!assets.is_mesh_uploaded(big), "does not fit");
+        assert!(assets.contains_mesh(big));
+        let (v, i) = (
+            assets.arena.vertex.as_ref().unwrap(),
+            assets.arena.index.as_ref().unwrap(),
+        );
+        assert!(v.size() <= r.caps.max_buffer_size && i.size() <= r.caps.max_buffer_size);
+        assert_eq!(v.size(), 4096 * 36, "no growth for the small meshes");
+
+        // Index-heavy meshes grow only the index buffer.
+        let fan = MeshData {
+            indices: (0..9000).map(|k| k % 3).collect(),
+            ..MeshData::plane(1.0)
+        };
+        let m = assets.add_mesh(fan);
+        r.upload_assets(&mut assets);
+        assert!(assets.is_mesh_uploaded(m));
+        assert_eq!(assets.arena.vertex.as_ref().unwrap().size(), 4096 * 36);
+        assert!(assets.arena.index.as_ref().unwrap().size() > 8192 * 4);
+
+        // The rejected mesh fits once the limit allows it.
+        r.caps.max_buffer_size = u32::MAX as u64;
+        assert!(assets.update_mesh(big, MeshData::sphere(1.0, 200, 100)));
+        r.upload_assets(&mut assets);
+        assert!(assets.is_mesh_uploaded(big));
+        assert!(small.iter().all(|m| assets.is_mesh_uploaded(*m)));
+        assert_eq!(r.gpu_error_count(), 0);
+    }
+
+    fn invalid_buffer(device: &wgpu::Device) {
+        // MAP_READ may only be combined with COPY_DST: a validation error.
+        let _ = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("invalid on purpose"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+    }
+
+    /// Release builds log uncaptured wgpu errors instead of wgpu's default panic; debug builds
+    /// (and tests) still panic so bugs surface.
+    #[test]
+    fn uncaptured_wgpu_errors_are_logged_in_release_and_panic_in_debug() {
+        let Some(r) = renderer() else { return };
+        assert_eq!(r.gpu_error_count(), 0);
+        let count = install_error_handler(&r.device, false);
+        invalid_buffer(&r.device);
+        invalid_buffer(&r.device);
+        assert_eq!(count.load(Ordering::Relaxed), 2, "logged, not panicked");
+
+        let count = install_error_handler(&r.device, true);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invalid_buffer(&r.device)));
+        assert!(panicked.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 }

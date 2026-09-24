@@ -105,11 +105,13 @@ impl Plugin for RenderPlugin {
 
 /// The `Stage::Render` system: extract the world and draw a frame if a [`Renderer`] exists.
 pub fn render_system(ctx: &mut SystemCtx) {
-    let Some(mut renderer) = ctx.resources.remove::<Renderer>() else {
+    if !ctx.resources.contains::<Renderer>() {
         return;
-    };
-    renderer.render_frame(ctx.world, ctx.resources);
-    ctx.resources.insert(renderer);
+    }
+    let world = &*ctx.world;
+    // `scope` moves the resource's existing Box out and back: no per-frame allocation.
+    ctx.resources
+        .scope::<Renderer, _>(|resources, renderer| renderer.render_frame(world, resources));
 }
 
 /// Create a headless renderer (blocking on adapter/device creation) and insert it.
