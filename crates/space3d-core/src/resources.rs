@@ -1,10 +1,11 @@
-use ahash::AHashMap;
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::any::{Any, TypeId, type_name};
 
 /// Type-keyed singleton storage (one value per type).
 #[derive(Default)]
 pub struct Resources {
-    map: AHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    map: HashMap<TypeId, Box<dyn Any + Send + Sync>, BuildHasherDefault<ahash::AHasher>>,
 }
 
 impl Resources {
