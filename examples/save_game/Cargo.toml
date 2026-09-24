@@ -1,0 +1,15 @@
+[package]
+name = "save_game"
+description = "Space3d example: save slots and settings with space3d-db (SQLite natively, localStorage on the web)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+space3d.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

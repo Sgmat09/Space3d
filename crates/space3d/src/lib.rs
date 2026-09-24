@@ -54,7 +54,8 @@
 //! ## Environment variables understood by the plugin groups
 //!
 //! * `SPACE3D_EXIT_AFTER_FRAMES=N` / `SPACE3D_EXIT_AFTER_SECS=S` — [`AutoExitPlugin`]
-//! * `SPACE3D_HEADLESS=1` or `=WxH` — [`DefaultPlugins`] without a window
+//! * `SPACE3D_HEADLESS=1` or `=WxH` — [`DefaultPlugins`] without a window (each axis clamped
+//!   to `1..=`[`MAX_HEADLESS_SIZE`])
 //! * `SPACE3D_AUDIO=off|mock` — audio backend override (`audio` crate)
 //! * `RUST_LOG` — log filter ([`LogPlugin`], native)
 
@@ -64,7 +65,8 @@ pub mod entry;
 mod plugins;
 
 pub use plugins::{
-    AutoExitPlugin, DefaultPlugins, ENV_EXIT_AFTER_FRAMES, ENV_EXIT_AFTER_SECS, ENV_HEADLESS, LogPlugin, MinimalPlugins,
+    AutoExitPlugin, DefaultPlugins, ENV_EXIT_AFTER_FRAMES, ENV_EXIT_AFTER_SECS, ENV_HEADLESS, LogPlugin,
+    MAX_HEADLESS_SIZE, MinimalPlugins,
 };
 
 pub use space3d_core as core;

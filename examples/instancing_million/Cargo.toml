@@ -1,0 +1,10 @@
+[package]
+name = "instancing_million"
+description = "Space3d example: one million cubes through an explicit InstanceBuffer with dirty-range updates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+space3d.workspace = true

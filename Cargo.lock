@@ -4387,6 +4387,7 @@ dependencies = [
  "serde",
  "serde_json",
  "space3d",
+ "tempfile",
 ]
 
 [[package]]

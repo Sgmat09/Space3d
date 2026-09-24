@@ -1,0 +1,12 @@
+[package]
+name = "multiplayer_chat"
+description = "Space3d example: WebSocket chat server and clients in one binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Path (not `workspace = true`) because inherited workspace deps cannot turn default features off:
+# this example only needs networking — no window, renderer or audio.
+space3d = { path = "../../crates/space3d", default-features = false, features = ["net"] }

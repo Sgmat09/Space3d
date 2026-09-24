@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Space3d — web demo</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05050a; color: #ccd; font: 14px system-ui, sans-serif; overflow: hidden; }
+    /* `!important`: the runner sets the canvas' CSS size from the window size; the page decides. */
+    canvas#space3d { display: block; width: 100vw !important; height: 100vh !important; touch-action: none; outline: none; }
+    #status { position: fixed; left: 12px; bottom: 10px; opacity: .7; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <canvas id="space3d" tabindex="0"></canvas>
+  <div id="status">loading…</div>
+  <script type="module">
+    // `space3d build --target web` runs wasm-bindgen with --out-name web_demo.
+    import init from "./web_demo.js";
+    const status = document.getElementById("status");
+    init()
+      .then(() => { status.textContent = "drag to orbit · wheel/pinch to zoom · tap to recolor · 1–3 patterns"; })
+      .catch((e) => { status.textContent = "failed to start: " + e; console.error(e); });
+  </script>
+</body>
+</html>

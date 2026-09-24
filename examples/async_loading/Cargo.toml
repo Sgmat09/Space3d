@@ -1,0 +1,13 @@
+[package]
+name = "async_loading"
+description = "Space3d example: assets streamed over HTTP and built on the compute pool while the frame keeps ticking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+space3d.workspace = true
+serde.workspace = true
+# Only for the artificial latency (`tokio::time::sleep`) in the demo server's handler.
+tokio.workspace = true

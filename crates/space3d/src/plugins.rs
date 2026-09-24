@@ -67,6 +67,11 @@ impl Plugin for LogPlugin {
 /// both plugin groups install it that way, so any Space3d app can be smoke-tested with
 /// `SPACE3D_EXIT_AFTER_FRAMES=60 cargo run`. When it fires it prints one summary line
 /// (`space3d: auto-exit after N frames ...`) to stderr.
+///
+/// An app runs at most one `AutoExitPlugin` (plugins are de-duplicated by type): with
+/// [`DefaultPlugins`] / [`MinimalPlugins`] prefer their `.exit_after_frames(n)`, which also
+/// works when the environment variables are set. Adding one yourself works too, unless the
+/// group already installed one from the environment (then the environment wins).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AutoExitPlugin {
     /// Exit once `Time::frame` reaches this.
@@ -198,7 +203,11 @@ impl Plugin for MinimalPlugins {
             app.set_tickrate(TickRate::new(hz));
         }
         app.add_plugin(TasksPlugin);
-        app.add_plugin(self.auto_exit);
+        // Only an active limit claims the plugin slot (`App::add_plugin` de-duplicates by type),
+        // so an `AutoExitPlugin` the game adds itself still works.
+        if self.auto_exit.is_active() {
+            app.add_plugin(self.auto_exit);
+        }
     }
 }
 
@@ -437,7 +446,13 @@ impl DefaultPlugins {
     }
 }
 
+/// Largest offscreen size accepted from [`ENV_HEADLESS`] per axis: wgpu's default
+/// `max_texture_dimension_2d`, which every desktop adapter supports.
+pub const MAX_HEADLESS_SIZE: u32 = 8192;
+
 /// Parse a [`ENV_HEADLESS`] value: `WxH`, or a truthy flag (→ `fallback`). Falsy → `None`.
+/// Sizes are clamped to `1..=`[`MAX_HEADLESS_SIZE`] (with a warning), so a typo cannot make
+/// the renderer panic on an oversized texture.
 pub(crate) fn parse_headless(v: &str, fallback: (u32, u32)) -> Option<(u32, u32)> {
     let v = v.trim().to_ascii_lowercase();
     match v.as_str() {
@@ -445,7 +460,15 @@ pub(crate) fn parse_headless(v: &str, fallback: (u32, u32)) -> Option<(u32, u32)
         "1" | "true" | "yes" | "on" => Some(fallback),
         _ => {
             let (w, h) = v.split_once('x')?;
-            Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+            let (w, h): (u32, u32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+            let clamped = (w.clamp(1, MAX_HEADLESS_SIZE), h.clamp(1, MAX_HEADLESS_SIZE));
+            if clamped != (w, h) {
+                eprintln!(
+                    "space3d: {ENV_HEADLESS}={w}x{h} is outside 1..={MAX_HEADLESS_SIZE}; using {}x{}",
+                    clamped.0, clamped.1
+                );
+            }
+            Some(clamped)
         }
     }
 }
@@ -467,7 +490,10 @@ impl Plugin for DefaultPlugins {
             app.set_tickrate(TickRate::new(hz));
         }
         app.add_plugin(TasksPlugin);
-        app.add_plugin(self.auto_exit);
+        // See `MinimalPlugins::build`: an inactive limit must not block a user-added one.
+        if self.auto_exit.is_active() {
+            app.add_plugin(self.auto_exit);
+        }
 
         #[cfg(feature = "render")]
         {
@@ -551,6 +577,24 @@ mod tests {
         assert_eq!(parse_headless(" 32 x 16 ", (8, 9)), Some((32, 16)));
         assert_eq!(parse_headless("0", (8, 9)), None);
         assert_eq!(parse_headless("garbage", (8, 9)), None);
+        assert_eq!(parse_headless("99999x99999", (8, 9)), Some((8192, 8192)));
+        assert_eq!(parse_headless("640x0", (8, 9)), Some((640, 1)));
+        assert_eq!(parse_headless("-5x10", (8, 9)), None);
+    }
+
+    #[test]
+    fn user_auto_exit_works_next_to_the_groups() {
+        // No limit in the environment: the group leaves the slot free for the game's own plugin.
+        if AutoExitPlugin::from_env().is_active() {
+            return;
+        }
+        let mut app = App::new();
+        app.add_plugin(MinimalPlugins::new());
+        app.add_plugin(AutoExitPlugin::frames(3));
+        app.step_ticks(2);
+        assert!(!app.should_exit());
+        app.step_ticks(1);
+        assert!(app.should_exit());
     }
 
     #[test]

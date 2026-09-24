@@ -1,0 +1,38 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+# `cargo run` / `space3d run` start the game (other binaries: `stories`, `editor`{{extra_bins}}).
+default-run = "{{name}}"
+
+# Layout (all discovered automatically by cargo):
+#   src/lib.rs          the game: `build` (full app) + `GamePlugin` (gameplay only)
+#   src/main.rs         desktop + web entry point (`space3d::main!`)
+#   src/bin/stories.rs  storybook viewer / headless gallery (`space3d stories`)
+#   src/bin/editor.rs   scene editor with the game loaded (`space3d editor`)
+#   tests/              input-simulation and golden-screenshot tests (`space3d test`)
+#   mobile/             Android (`cargo apk`) + iOS (Xcode) library — see android/ and ios/
+
+[dependencies]
+# Default engine features + the storybook and editor (dev tools; drop "editor" and delete
+# src/bin/editor.rs to trim compile times).
+space3d = { {{space3d_dep}}, features = ["stories", "editor"] }
+{{extra_dependencies}}
+[dev-dependencies]
+space3d = { {{space3d_dep}}, features = ["stories", "editor", "test"] }
+
+[workspace]
+members = ["mobile"]
+
+# Fast debug builds: optimize dependencies (the engine) fully, your code a little.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,10 +1,33 @@
 [package]
 name = "space3d-cli"
-description = "Space3d cli"
+description = "The `space3d` command: scaffold, run, build (desktop/web/Android/iOS), serve, test, storybook, editor, publish, CI and doctor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "space3d_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "space3d"
+path = "src/main.rs"
+# The binary's docs would collide with the `space3d` facade crate's (`target/doc/space3d/`);
+# everything is documented in the `space3d_cli` library.
+doc = false
 
 [dependencies]
-space3d-core.workspace = true
+space3d-tasks.workspace = true
+space3d-net.workspace = true
+space3d-github.workspace = true
+clap.workspace = true
+include_dir.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

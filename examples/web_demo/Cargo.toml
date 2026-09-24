@@ -1,0 +1,10 @@
+[package]
+name = "web_demo"
+description = "Space3d example: a browser-first instanced scene built for wasm32 with space3d::main!"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+space3d.workspace = true

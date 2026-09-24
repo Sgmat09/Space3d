@@ -1,0 +1,126 @@
+# Performance
+
+Space3d's rules for staying fast are simple: **never block the frame**, **draw many things with
+few draw calls**, and **upload only what changed**. This page explains the mechanisms and how to
+measure them. The renderer internals are documented in
+[crates/space3d-render/ARCHITECTURE.md](../crates/space3d-render/ARCHITECTURE.md).
+
+## Never block the frame
+
+* File, network and database I/O return `space3d_tasks::Task`s (tokio natively,
+  `wasm-bindgen-futures` on the web). Systems `poll()` them or register callbacks with
+  `AsyncQueue::spawn_then` / `track`, which run on the main thread in `PreUpdate`.
+* CPU-heavy work (mesh generation, pathfinding, decoding) goes to the compute pool with
+  `spawn_compute` / `AsyncQueue::compute_then`.
+* The asset server reads bytes on the I/O runtime, decodes on the compute pool and inserts the
+  result in `PreUpdate`; SQLite runs on its own worker thread.
+* `Task::block()` exists for tools and tests only — never call it from a system.
+
+`examples/async_loading` streams 12 textures and a model over HTTP with 0.2–1.6 s of artificial
+latency each, builds a 24k-triangle mesh on the compute pool, and reports the longest frame
+while all of that is in flight. In a debug build on an M4 Max the 14 assets arrive over ~1.4 s
+while ~155 frames are rendered and the longest frame stays around 17–22 ms (texture uploads and
+first-use pipeline creation) — no frame ever waits for a download or a decode.
+
+## Draw many things with few draw calls
+
+**Automatic instancing.** Every entity with `Mesh3d + Material + GlobalTransform` is sorted by
+(pipeline, material, mesh); each run becomes one instanced draw. Equal materials are interned,
+so 1,000 entities with equal-but-separate `Material` values are still one draw.
+
+**Explicit instance buffers** for 100k–1M+ objects without per-entity ECS cost:
+
+```rust
+let buffer = ctx.resources.expect_mut::<InstanceBuffers>().insert(
+    InstanceBuffer::from_vec(instances /* Vec<InstancePacked> */, BufferUsage::Dynamic),
+);
+ctx.world.spawn((InstancedMesh { mesh, material, instances: buffer },));
+```
+
+| instance type | size | contents |
+|---|---|---|
+| `InstanceTransform` | 64 B | model matrix |
+| `InstanceTransformColor` | 80 B | matrix + color |
+| `InstanceCompact` | 32 B | position, uniform scale, f32 quaternion |
+| `InstancePacked` | 32 B | position, scale, snorm16 quaternion, unorm8 color, texture layer |
+
+Any `Pod` struct with an `InstanceLayout` works; the shader is generated for its layout.
+
+**GPU-driven culling.** On adapters with compute + indirect draws, a compute pass frustum-culls
+instances (64 per workgroup, compacted inside the workgroup) and writes indirect draw arguments;
+batches become one `multi_draw_indexed_indirect(_count)` per pipeline run. The chosen path is in
+`RenderStats::draw_path`:
+
+| path | used on | culling |
+|---|---|---|
+| `GpuMultiDrawCount` | Vulkan, DX12 | compute, empty batches skipped by the GPU |
+| `GpuMultiDraw` | Metal, WebGPU with `indirect-first-instance` | compute |
+| `GpuIndirect` | other compute-capable adapters | compute |
+| `CpuDirect` | WebGL2, GLES, downlevel | CPU sphere/AABB tests |
+
+**One mesh arena.** All meshes share one vertex buffer (36-byte vertices) and one index buffer,
+so multi-draws cover many meshes without rebinding.
+
+## Upload only what changed
+
+* **Staging belt.** All buffer uploads are copied straight into mapped staging memory (4 MiB
+  chunks) that is recycled once the GPU is done — no staging allocations in the steady state.
+  Copies of 1 MiB or more are split across worker threads.
+* **Dirty ranges for user buffers.** Every mutating `InstanceBuffer` accessor (`set`,
+  `get_mut`, `range_mut`, `push`, …) records a range; adjacent ranges within 16 instances merge,
+  at most 64 ranges are kept, and more than 50 % dirty becomes one full copy. `Static` buffers
+  upload once; `Stream` buffers upload everything every frame without bookkeeping.
+* **Shadow diffing for renderer buffers.** ECS instances, per-view data, materials and indirect
+  argument templates keep a CPU shadow; only differing bytes are uploaded. **A static scene with
+  a still camera uploads 0 bytes per frame; moving one entity uploads one 64-byte matrix.**
+* **No per-frame reallocations.** Buffers grow 1.5× (meshes 2×) and are reused.
+
+### `instancing_million`
+
+```sh
+cargo run -p instancing_million --release                 # 1,000,000 cubes, animated band
+cargo run -p instancing_million --release -- --static     # no edits: 0 bytes uploaded per frame
+cargo run -p instancing_million --release -- --count 250000 --band 65536
+```
+
+Measured on an Apple M4 Max (Metal, `GpuMultiDraw` path, release build):
+
+| run | instances | triangles | draw calls | uploaded / frame | frame rate |
+|---|---|---|---|---|---|
+| default (animated band) | 1,000,000 | 12,000,000 | 1 (indirect) | 512 KiB | 120 fps (vsync-limited) |
+| `--static` | 1,000,000 | 12,000,000 | 1 (indirect) | 0 KiB | 120 fps (vsync-limited) |
+
+1,000,000 `InstancePacked` cubes are 32 MB (30.5 MiB) of instance data. Each frame the example
+rewrites a band of 16,384 instances — **512 KiB uploaded instead of 30.5 MiB** — and the window
+title (plus stdout every 120 frames) shows FPS, draw path, draw calls and bytes uploaded. `C`
+toggles the CPU path, `F` frustum culling, `Space` pauses the wave; F3 shows the engine debug
+overlay.
+
+## Measuring
+
+* `RenderStats` resource: draw calls (direct / indirect / multi), batches, instances, triangles,
+  `bytes_uploaded`, `instance_bytes_uploaded`, buffer reallocations, compute dispatches, draw
+  path, meshes/textures uploaded.
+* **F3** debug overlay (FPS, frame-time graph, ticks, render stats) and **F4** profiler
+  (per-system timings from `tracing` spans) with the `ui` feature.
+* In tests: `assert_frame_budget`, `RenderBudget` (max draw calls / bytes uploaded / …),
+  `assert_max_allocations` — see [testing.md](testing.md).
+* Benchmarks: `space3d bench` (= `cargo bench`); the engine has criterion benches for the
+  schedule (`space3d-core`), instancing (`space3d-render`), texture ops, SQLite inserts and
+  physics.
+
+## Build settings
+
+Generated projects (and the engine workspace) use:
+
+```toml
+[profile.dev]
+opt-level = 1                  # your code: fast to compile, not unbearably slow
+[profile.dev.package."*"]
+opt-level = 3                  # dependencies: fully optimized once
+[profile.release]
+lto = "thin"
+codegen-units = 1
+```
+
+Release web builds additionally run `wasm-opt -Oz` when binaryen is installed.
