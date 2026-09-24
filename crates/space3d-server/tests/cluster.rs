@@ -346,3 +346,33 @@ impl UnixMs for TestCluster {
         self.unix_clock().now_ms()
     }
 }
+
+#[test]
+fn network_partition_resumes_the_same_slot_through_the_gatekeeper() {
+    use space3d_core::{EventReader, Events};
+    use space3d_replication::client::ConnectionEvent;
+    let mut c = cluster(1);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let (ca, cb, room) = connected_pair(&mut c, &alice, &bob);
+    let server = c.client_server(ca).to_owned();
+    // Alice's link is the first one opened on her game server's network.
+    let link = c.network(&server).links()[0];
+    let mut reader = EventReader::default();
+    c.network(&server).partition(link, Duration::from_secs(2));
+    let mut resumed = false;
+    let back = c.run_until(1200, |c| {
+        if let Some(events) = c.client(ca).resources.get::<Events<ConnectionEvent>>() {
+            for e in reader.read(events) {
+                if let ConnectionEvent::Connected { resumed: true, .. } = e {
+                    resumed = true;
+                }
+            }
+        }
+        resumed && c.client_net(ca).is_connected()
+    });
+    assert!(back, "alice resumed: {:?}", c.client_net(ca).state());
+    assert!(c.client_net(cb).is_connected(), "bob unaffected");
+    assert_eq!(pawns(c.room(room).unwrap()), 2, "same slot and pawn, no duplicate");
+    assert!(c.run_until(120, |c| remote_count(c.client(ca)) == 2));
+}

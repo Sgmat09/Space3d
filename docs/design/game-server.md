@@ -992,6 +992,21 @@ The replication builder may freely change everything else: registry internals, `
 
 Each builder removes the crate-level `#![allow(dead_code, unused_variables, unused_imports, clippy::todo, clippy::ptr_arg)]` once its crate is implemented.
 
+### 18.3 Implementation notes (server builder)
+
+All changes are additive; the §18.1 contract is unchanged.
+
+- **`TestCluster` runs the split topology.** The player service and each game server (`gs-1`, `gs-2`, ...) are separate supervisor `App`s joined by in-process fleet links. Each game server has its own `MemoryNetwork`, and clients reach the player service over loopback HTTP through `PlayerServiceClient`. Rooms are built and ticked on the test thread. Faults: `crash_room` (injected panic, then `gs::shard::rebuild_crashed`) and `kill_game_server` (rooms, supervisor and links vanish, connections are refused, and the lease expires at the player service).
+- **Embedding hooks:**
+  - `BuildOptions::{fleet_link, checkpoints}` inject a fleet link and a checkpoint store for the game-server role.
+  - `ServerMain::with_shared_game(Arc<G>, config)` lets several servers in one process share a game definition.
+  - `ps::FleetHub::add_local(peer)` attaches more in-process game servers.
+  - `gs::shard::rebuild_crashed` is shared by the shard threads and `TestCluster`.
+- **Fleet registry:** a `Register` from a known `server_id` orphans that server's reported rooms until its next heartbeat lists them again. A restarted pod with a stable id therefore leaves its lost rooms eligible for rejoin and restore, while a link blip is healed by the next heartbeat. Orphaned rooms are never forgotten because a heartbeat omits them.
+- **`services.rs`:** the client refreshes tokens automatically when the access token expires within 30 s. A rejected refresh ends the local session. Beyond the listed calls it also offers `register`, `update_profile`, `get_data`/`put_data`, `poll_lobby`, `lobby_action`, `leaderboard_me`, `status`, `set_session`, and `OnlineError::{status, code, retry_after_ms, is_retryable}`.
+- **`loadtest`:** `LoadTestConfig::{from_args, try_from_args}` (clap) plus `parse_histogram` and `histogram_quantile`, which compute the tick p99 from `/metrics` scrapes taken before and after the run.
+- **Open replication item:** `full_state::restore` pre-maps `NetId`s, but `server::change` only creates records for entities that have no `NetId`. Restored entities are therefore never sent to joining clients. The server-side restore paths are tested; the client-visibility assertions are `#[ignore]`d in `crates/space3d-server/tests/cluster.rs` (`*_restored_state_reaches_clients`) until this is fixed.
+
 ---
 
 ## 19. Deferred
