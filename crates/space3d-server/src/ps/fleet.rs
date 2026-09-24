@@ -1,12 +1,16 @@
-//! Fleet registry (player-service side): registrations, heartbeats, leases, room directory,
-//! allocation, orphan detection.
+//! Fleet registry (player-service side, pure logic): registrations, heartbeats, leases, room
+//! directory, presence, allocation, orphan detection.
 //!
-//! Allocation: servers in the region with matching `game_id` + `schema_hash`, `Ready`, not
-//! draining, enough free seats (capacity − players − reserved) → lowest
-//! `players/capacity + tick_p99/tick_budget` → reserve seats for the ticket TTL.
+//! Allocation: servers in the region (any region if none there) with matching `game_id` +
+//! `schema_hash` (when given), `Ready`, not draining, enough free seats (capacity − players −
+//! reserved) → lowest `players/capacity + tick_p99/tick_budget` → reserve seats for the ticket
+//! TTL (released when the players show up in presence or the reservation expires).
 
+use crate::game::RoomSpec;
 use crate::gs::fleet::{FleetDown, FleetUp, Heartbeat, ServerRegistration};
+use crate::gs::rooms::RoomStatus;
 use space3d_replication::{PlayerId, RoomId};
+use std::collections::BTreeMap;
 
 /// Server liveness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +21,17 @@ pub enum ServerState {
     Draining,
     /// Lease expired.
     Dead,
+}
+
+impl ServerState {
+    /// Metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerState::Ready => "ready",
+            ServerState::Draining => "draining",
+            ServerState::Dead => "dead",
+        }
+    }
 }
 
 /// One registered game server.
@@ -34,6 +49,39 @@ pub struct ServerRecord {
     pub reserved: u32,
 }
 
+impl ServerRecord {
+    /// Free player seats.
+    pub fn free_seats(&self) -> u32 {
+        self.registration
+            .capacity
+            .max_players
+            .saturating_sub(self.heartbeat.players)
+            .saturating_sub(self.reserved)
+    }
+
+    fn allocatable(&self) -> bool {
+        self.state == ServerState::Ready && !self.heartbeat.draining
+    }
+}
+
+/// `(region, state) → servers` and `region → free seats` (see [`FleetRegistry::census`]).
+pub type Census = (BTreeMap<(String, &'static str), usize>, BTreeMap<String, u64>);
+
+/// A room known to the player service.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomEntry {
+    /// Hosting server.
+    pub server: String,
+    /// Spec (known for rooms the player service allocated or that reported `RoomOpened`).
+    pub spec: Option<RoomSpec>,
+    /// Last reported status (`None` until the server reports the room).
+    pub status: Option<RoomStatus>,
+    /// The hosting server died; the room awaits rejoin + restore.
+    pub orphaned: bool,
+    /// When the entry was created / orphaned (unix ms).
+    pub since_ms: i64,
+}
+
 /// Side effects the supervisor must perform after feeding a message.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FleetEffect {
@@ -44,7 +92,7 @@ pub enum FleetEffect {
         /// Message.
         msg: FleetDown,
     },
-    /// Apply an outbox op (store), then ack it.
+    /// Apply an outbox op (store), then ack it; or answer a `FetchPlayerData`.
     Apply {
         /// Server id.
         server: String,
@@ -58,42 +106,642 @@ pub enum FleetEffect {
     },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct Reservation {
+    server: String,
+    room: Option<RoomId>,
+    seats: u32,
+    expires_ms: i64,
+}
+
+/// Tick budget used in the load score (60 Hz).
+const TICK_BUDGET_US: f64 = 16_667.0;
+/// Rooms allocated but never reported are forgotten after this.
+const PENDING_ROOM_TTL_MS: i64 = 120_000;
+
 /// The registry.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FleetRegistry {
-    servers: std::collections::BTreeMap<String, ServerRecord>,
-    rooms: std::collections::BTreeMap<RoomId, (String, crate::game::RoomSpec)>,
-    presence: std::collections::BTreeMap<PlayerId, RoomId>,
+    servers: BTreeMap<String, ServerRecord>,
+    rooms: BTreeMap<RoomId, RoomEntry>,
+    presence: BTreeMap<PlayerId, RoomId>,
+    reservations: Vec<Reservation>,
+    lease_ttl_ms: i64,
+    /// Orphaned rooms are forgotten after this (their checkpoints are too old to restore).
+    orphan_ttl_ms: i64,
+}
+
+impl Default for FleetRegistry {
+    fn default() -> Self {
+        Self::new(10_000, 300_000)
+    }
 }
 
 impl FleetRegistry {
+    /// Registry with a lease TTL and an orphan retention time.
+    pub fn new(lease_ttl_ms: i64, orphan_ttl_ms: i64) -> Self {
+        Self {
+            servers: BTreeMap::new(),
+            rooms: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            reservations: Vec::new(),
+            lease_ttl_ms,
+            orphan_ttl_ms,
+        }
+    }
+
+    fn recount_reserved(&mut self) {
+        for s in self.servers.values_mut() {
+            s.reserved = 0;
+        }
+        for r in &self.reservations {
+            if let Some(s) = self.servers.get_mut(&r.server) {
+                s.reserved += r.seats;
+            }
+        }
+    }
+
     /// Feed a message from server `server_id` (the connection's registered id) at `now_ms`.
     pub fn on_message(&mut self, server_id: &str, msg: FleetUp, now_ms: i64) -> Vec<FleetEffect> {
-        todo!()
+        match msg {
+            FleetUp::Register(reg) => {
+                let id = reg.server_id.clone();
+                // A (re)registration means a fresh process or a re-established link: rooms the
+                // server hosted are orphaned until its next heartbeat lists them again (a
+                // restarted pod with the same id has lost them; players rejoin + restore).
+                for e in self.rooms.values_mut().filter(|e| e.server == id && e.status.is_some()) {
+                    e.orphaned = true;
+                    e.since_ms = now_ms;
+                }
+                self.servers.insert(
+                    id.clone(),
+                    ServerRecord {
+                        registration: reg,
+                        heartbeat: Heartbeat::default(),
+                        last_seen_ms: now_ms,
+                        state: ServerState::Ready,
+                        reserved: 0,
+                    },
+                );
+                self.recount_reserved();
+                vec![FleetEffect::Send {
+                    server: id,
+                    msg: FleetDown::Registered {
+                        lease_ttl_ms: self.lease_ttl_ms as u64,
+                        bans: Vec::new(),
+                    },
+                }]
+            }
+            FleetUp::Heartbeat(hb) => {
+                let Some(rec) = self.servers.get_mut(server_id) else {
+                    return Vec::new();
+                };
+                rec.last_seen_ms = now_ms;
+                rec.state = if hb.draining {
+                    ServerState::Draining
+                } else {
+                    ServerState::Ready
+                };
+                let reported: Vec<RoomId> = hb.rooms.iter().map(|r| r.room_id).collect();
+                for status in &hb.rooms {
+                    let entry = self.rooms.entry(status.room_id).or_insert_with(|| RoomEntry {
+                        server: server_id.to_owned(),
+                        spec: None,
+                        status: None,
+                        orphaned: false,
+                        since_ms: now_ms,
+                    });
+                    entry.server = server_id.to_owned();
+                    entry.status = Some(status.clone());
+                    entry.orphaned = false;
+                    for p in &status.player_ids {
+                        self.presence.insert(*p, status.room_id);
+                    }
+                }
+                // Rooms this server reported before but not now are gone.
+                let gone: Vec<RoomId> = self
+                    .rooms
+                    .iter()
+                    .filter(|(id, e)| {
+                        e.server == server_id && e.status.is_some() && !e.orphaned && !reported.contains(id)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in gone {
+                    self.forget_room(id);
+                }
+                if let Some(rec) = self.servers.get_mut(server_id) {
+                    rec.heartbeat = hb;
+                }
+                Vec::new()
+            }
+            FleetUp::RoomOpened { room_id, spec } => {
+                let entry = self.rooms.entry(room_id).or_insert_with(|| RoomEntry {
+                    server: server_id.to_owned(),
+                    spec: None,
+                    status: None,
+                    orphaned: false,
+                    since_ms: now_ms,
+                });
+                entry.server = server_id.to_owned();
+                entry.spec = Some(spec);
+                entry.orphaned = false;
+                Vec::new()
+            }
+            FleetUp::RoomClosed { room_id, .. } => {
+                if self.rooms.get(&room_id).is_some_and(|e| e.server == server_id) {
+                    self.forget_room(room_id);
+                }
+                Vec::new()
+            }
+            FleetUp::PlayerJoined { room_id, player } => {
+                self.presence.insert(player, room_id);
+                if let Some(i) = self
+                    .reservations
+                    .iter()
+                    .position(|r| r.server == server_id && (r.room.is_none() || r.room == Some(room_id)))
+                {
+                    let r = &mut self.reservations[i];
+                    r.seats = r.seats.saturating_sub(1);
+                    if r.seats == 0 {
+                        self.reservations.remove(i);
+                    }
+                    self.recount_reserved();
+                }
+                Vec::new()
+            }
+            FleetUp::PlayerLeft { room_id, player } => {
+                if self.presence.get(&player) == Some(&room_id) {
+                    self.presence.remove(&player);
+                }
+                Vec::new()
+            }
+            op @ (FleetUp::MatchResult { .. }
+            | FleetUp::PlayerDataWrite { .. }
+            | FleetUp::SubmitScore { .. }
+            | FleetUp::FetchPlayerData { .. }) => vec![FleetEffect::Apply {
+                server: server_id.to_owned(),
+                op,
+            }],
+        }
     }
 
-    /// Expire leases; returns effects for dead servers.
+    fn forget_room(&mut self, id: RoomId) {
+        self.rooms.remove(&id);
+        self.presence.retain(|_, r| *r != id);
+        self.reservations.retain(|r| r.room != Some(id));
+        self.recount_reserved();
+    }
+
+    /// Expire leases, reservations and stale pending/orphaned rooms; returns effects for dead
+    /// servers.
     pub fn sweep(&mut self, now_ms: i64, lease_ttl_ms: i64) -> Vec<FleetEffect> {
-        todo!()
+        let mut effects = Vec::new();
+        let dead: Vec<String> = self
+            .servers
+            .iter()
+            .filter(|(_, s)| s.state != ServerState::Dead && now_ms.saturating_sub(s.last_seen_ms) > lease_ttl_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dead {
+            if let Some(s) = self.servers.get_mut(&id) {
+                s.state = ServerState::Dead;
+                s.heartbeat.players = 0;
+            }
+            let mut orphaned = Vec::new();
+            for (room, e) in self.rooms.iter_mut().filter(|(_, e)| e.server == id && !e.orphaned) {
+                e.orphaned = true;
+                e.since_ms = now_ms;
+                orphaned.push(*room);
+            }
+            self.reservations.retain(|r| r.server != id);
+            tracing::warn!(server = %id, rooms = orphaned.len(), "game server lease expired");
+            if !orphaned.is_empty() {
+                effects.push(FleetEffect::Orphaned { rooms: orphaned });
+            }
+        }
+        let before = self.reservations.len();
+        self.reservations.retain(|r| r.expires_ms > now_ms);
+        let stale: Vec<RoomId> = self
+            .rooms
+            .iter()
+            .filter(|(_, e)| {
+                (e.orphaned && now_ms.saturating_sub(e.since_ms) > self.orphan_ttl_ms)
+                    || (!e.orphaned && e.status.is_none() && now_ms.saturating_sub(e.since_ms) > PENDING_ROOM_TTL_MS)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.forget_room(id);
+        }
+        if before != self.reservations.len() {
+            self.recount_reserved();
+        }
+        // Dead servers are forgotten once their rooms are gone.
+        let rooms = &self.rooms;
+        self.servers
+            .retain(|id, s| s.state != ServerState::Dead || rooms.values().any(|e| &e.server == id));
+        effects
     }
 
-    /// Pick a server for `seats` new players.
-    pub fn allocate(&mut self, region: &str, game_id: &str, schema_hash: u64, seats: u32) -> Option<ServerRecord> {
-        todo!()
+    /// Pick a server for `seats` new players (any region if none fits in `region`; empty
+    /// `game_id` / zero `schema_hash` match any server) and reserve the seats until
+    /// `now_ms + reserve_ms`.
+    pub fn allocate(
+        &mut self,
+        region: &str,
+        game_id: &str,
+        schema_hash: u64,
+        seats: u32,
+        now_ms: i64,
+        reserve_ms: i64,
+    ) -> Option<ServerRecord> {
+        let fits = |s: &ServerRecord, any_region: bool| {
+            s.allocatable()
+                && (any_region || region.is_empty() || s.registration.region == region)
+                && (game_id.is_empty() || s.registration.game_id == game_id)
+                && (schema_hash == 0 || s.registration.schema_hash == schema_hash)
+                && s.free_seats() >= seats
+                && (s.registration.capacity.max_rooms == 0
+                    || (s.heartbeat.rooms.len() as u32) < s.registration.capacity.max_rooms)
+        };
+        let score = |s: &ServerRecord| {
+            let cap = s.registration.capacity.max_players.max(1) as f64;
+            (s.heartbeat.players + s.reserved) as f64 / cap + s.heartbeat.tick_p99_us as f64 / TICK_BUDGET_US
+        };
+        let pick = |any: bool| {
+            self.servers
+                .values()
+                .filter(|s| fits(s, any))
+                .min_by(|a, b| score(a).total_cmp(&score(b)))
+                .map(|s| s.registration.server_id.clone())
+        };
+        let id = pick(false).or_else(|| pick(true))?;
+        self.reservations.push(Reservation {
+            server: id.clone(),
+            room: None,
+            seats,
+            expires_ms: now_ms + reserve_ms,
+        });
+        self.recount_reserved();
+        self.servers.get(&id).cloned()
     }
 
-    /// An open room of `mode` with `seats` free (quick play / backfill).
-    pub fn open_room(&self, mode: &str, seats: u32) -> Option<(ServerRecord, crate::game::RoomSpec)> {
-        todo!()
+    /// Record a room the player service created (tickets carry the spec; the server reports
+    /// it with `RoomOpened` once built).
+    pub fn note_room(&mut self, spec: &RoomSpec, server: &str, now_ms: i64) {
+        self.rooms.insert(
+            spec.room_id,
+            RoomEntry {
+                server: server.to_owned(),
+                spec: Some(spec.clone()),
+                status: None,
+                orphaned: false,
+                since_ms: now_ms,
+            },
+        );
     }
 
-    /// Where `player` currently plays (rejoin).
+    /// An open room of `mode` with `seats` free (quick play / backfill): the fullest one that
+    /// still fits, on an allocatable server. Reserves the seats.
+    pub fn open_room(
+        &mut self,
+        mode: &str,
+        seats: u32,
+        now_ms: i64,
+        reserve_ms: i64,
+    ) -> Option<(ServerRecord, RoomSpec)> {
+        let reserved_in = |room: RoomId| -> u32 {
+            self.reservations
+                .iter()
+                .filter(|r| r.room == Some(room))
+                .map(|r| r.seats)
+                .sum()
+        };
+        let best = self
+            .rooms
+            .iter()
+            .filter_map(|(id, e)| {
+                let spec = e.spec.as_ref()?;
+                let server = self.servers.get(&e.server)?;
+                if e.orphaned || spec.mode != mode || !server.allocatable() {
+                    return None;
+                }
+                let (players, joinable) = e
+                    .status
+                    .as_ref()
+                    .map_or((0, true), |s| (u32::from(s.players), s.joinable));
+                let used = players + reserved_in(*id);
+                (joinable && used + seats <= u32::from(spec.max_players)).then_some((used, *id))
+            })
+            .max_by_key(|(used, id)| (*used, std::cmp::Reverse(*id)))?;
+        let entry = self.rooms.get(&best.1)?.clone();
+        self.reservations.push(Reservation {
+            server: entry.server.clone(),
+            room: Some(best.1),
+            seats,
+            expires_ms: now_ms + reserve_ms,
+        });
+        self.recount_reserved();
+        Some((self.servers.get(&entry.server)?.clone(), entry.spec?))
+    }
+
+    /// Move an orphaned room to a new server (rejoin → restore); the caller issues tickets.
+    pub fn reassign(&mut self, room: RoomId, server: &str, now_ms: i64) {
+        if let Some(e) = self.rooms.get_mut(&room) {
+            e.server = server.to_owned();
+            e.orphaned = false;
+            e.status = None;
+            e.since_ms = now_ms;
+        }
+    }
+
+    /// Where `player` currently plays (rejoin): `(room, server)`.
     pub fn room_of(&self, player: PlayerId) -> Option<(RoomId, String)> {
-        todo!()
+        let room = self.presence.get(&player)?;
+        self.rooms.get(room).map(|e| (*room, e.server.clone()))
+    }
+
+    /// A room entry.
+    pub fn room(&self, id: RoomId) -> Option<&RoomEntry> {
+        self.rooms.get(&id)
+    }
+
+    /// All rooms.
+    pub fn rooms(&self) -> impl Iterator<Item = (&RoomId, &RoomEntry)> {
+        self.rooms.iter()
+    }
+
+    /// A server.
+    pub fn server(&self, id: &str) -> Option<&ServerRecord> {
+        self.servers.get(id)
     }
 
     /// All servers.
     pub fn servers(&self) -> Vec<ServerRecord> {
         self.servers.values().cloned().collect()
+    }
+
+    /// `(region, state) → count` and `region → free seats` (metrics / autoscaling).
+    pub fn census(&self) -> Census {
+        let mut states = BTreeMap::new();
+        let mut free = BTreeMap::new();
+        for s in self.servers.values() {
+            *states
+                .entry((s.registration.region.clone(), s.state.label()))
+                .or_insert(0) += 1;
+            let f = free.entry(s.registration.region.clone()).or_insert(0u64);
+            if s.allocatable() {
+                *f += u64::from(s.free_seats());
+            }
+        }
+        (states, free)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gs::fleet::Capacity;
+
+    fn reg(id: &str, region: &str, cap: u32) -> FleetUp {
+        FleetUp::Register(ServerRegistration {
+            token: "t".into(),
+            server_id: id.into(),
+            region: region.into(),
+            public_url: format!("ws://{id}/play"),
+            game_id: "arena".into(),
+            build: "1".into(),
+            protocol: 1,
+            schema_hash: 42,
+            capacity: Capacity {
+                max_rooms: 10,
+                max_players: cap,
+            },
+        })
+    }
+
+    fn hb(players: u32, rooms: Vec<RoomStatus>) -> FleetUp {
+        FleetUp::Heartbeat(Heartbeat {
+            seq: 1,
+            players,
+            tick_p99_us: 1_000,
+            draining: false,
+            rooms,
+        })
+    }
+
+    fn spec(room: u64, mode: &str, max: u16) -> RoomSpec {
+        RoomSpec {
+            room_id: RoomId(room),
+            mode: mode.into(),
+            max_players: max,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn register_heartbeat_allocate_least_loaded() {
+        let mut f = FleetRegistry::new(10_000, 60_000);
+        let eff = f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        assert!(matches!(
+            &eff[0],
+            FleetEffect::Send {
+                msg: FleetDown::Registered {
+                    lease_ttl_ms: 10_000,
+                    ..
+                },
+                ..
+            }
+        ));
+        f.on_message("gs-2", reg("gs-2", "eu", 100), 0);
+        f.on_message("gs-3", reg("gs-3", "us", 100), 0);
+        f.on_message("gs-1", hb(50, vec![]), 100);
+        f.on_message("gs-2", hb(10, vec![]), 100);
+        let s = f.allocate("eu", "arena", 42, 2, 100, 60_000).unwrap();
+        assert_eq!(s.registration.server_id, "gs-2");
+        assert_eq!(f.server("gs-2").unwrap().reserved, 2);
+        assert!(f.allocate("eu", "other-game", 0, 2, 100, 60_000).is_none());
+        assert!(
+            f.allocate("eu", "arena", 7, 2, 100, 60_000).is_none(),
+            "schema mismatch"
+        );
+        assert!(
+            f.allocate("ap", "", 0, 2, 100, 60_000).is_some(),
+            "no server in the region: falls back to any region"
+        );
+        // Reservations expire.
+        f.sweep(70_000, 1_000_000);
+        assert_eq!(f.server("gs-2").unwrap().reserved, 0);
+        // Draining servers are skipped.
+        f.on_message(
+            "gs-3",
+            FleetUp::Heartbeat(Heartbeat {
+                draining: true,
+                ..Default::default()
+            }),
+            100,
+        );
+        assert!(f.allocate("us", "", 0, 1, 100, 1).unwrap().registration.region != "us");
+    }
+
+    #[test]
+    fn leases_expire_and_rooms_orphan() {
+        let mut f = FleetRegistry::new(10_000, 60_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        f.on_message(
+            "gs-1",
+            FleetUp::RoomOpened {
+                room_id: RoomId(5),
+                spec: spec(5, "duel", 2),
+            },
+            0,
+        );
+        f.on_message(
+            "gs-1",
+            hb(
+                1,
+                vec![RoomStatus {
+                    room_id: RoomId(5),
+                    mode: "duel".into(),
+                    players: 1,
+                    max_players: 2,
+                    joinable: true,
+                    player_ids: vec![PlayerId(7)],
+                    ..Default::default()
+                }],
+            ),
+            1_000,
+        );
+        assert_eq!(f.room_of(PlayerId(7)), Some((RoomId(5), "gs-1".into())));
+        assert!(f.sweep(5_000, 10_000).is_empty());
+        let eff = f.sweep(12_000, 10_000);
+        assert_eq!(eff, vec![FleetEffect::Orphaned { rooms: vec![RoomId(5)] }]);
+        assert_eq!(f.server("gs-1").unwrap().state, ServerState::Dead);
+        assert!(f.room(RoomId(5)).unwrap().orphaned);
+        assert!(f.allocate("eu", "", 0, 1, 12_000, 1).is_none());
+        // Rejoin: a new server takes the room over.
+        f.on_message("gs-2", reg("gs-2", "eu", 100), 13_000);
+        let s = f.allocate("eu", "", 0, 1, 13_000, 60_000).unwrap();
+        f.reassign(RoomId(5), &s.registration.server_id, 13_000);
+        assert_eq!(f.room_of(PlayerId(7)), Some((RoomId(5), "gs-2".into())));
+        // Orphans are forgotten after the retention time.
+        f.sweep(200_000, 1_000_000_000);
+        assert!(
+            f.room(RoomId(5)).is_none(),
+            "never reported by gs-2: pending entry expired"
+        );
+    }
+
+    #[test]
+    fn restart_with_the_same_id_orphans_lost_rooms_but_a_relink_keeps_live_ones() {
+        let status = |id: u64, player: u64| RoomStatus {
+            room_id: RoomId(id),
+            mode: "zone".into(),
+            players: 1,
+            max_players: 4,
+            joinable: true,
+            player_ids: vec![PlayerId(player)],
+            ..Default::default()
+        };
+        let mut f = FleetRegistry::new(10_000, 60_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        f.note_room(&spec(1, "zone", 4), "gs-1", 0);
+        f.note_room(&spec(2, "zone", 4), "gs-1", 0);
+        f.on_message("gs-1", hb(1, vec![status(1, 10), status(2, 20)]), 1_000);
+        // Link blip: re-register, then the heartbeat still lists both rooms.
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 2_000);
+        f.on_message("gs-1", hb(2, vec![status(1, 10), status(2, 20)]), 3_000);
+        assert!(!f.room(RoomId(1)).unwrap().orphaned && !f.room(RoomId(2)).unwrap().orphaned);
+        // Process restart: re-register, the heartbeat only lists a room created since.
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 4_000);
+        f.note_room(&spec(3, "zone", 4), "gs-1", 4_000);
+        f.on_message("gs-1", hb(1, vec![status(3, 30)]), 5_000);
+        assert!(
+            f.room(RoomId(1)).unwrap().orphaned,
+            "lost room kept for rejoin + restore"
+        );
+        assert!(f.room(RoomId(2)).unwrap().orphaned);
+        assert_eq!(f.room_of(PlayerId(10)), Some((RoomId(1), "gs-1".into())));
+        assert!(!f.room(RoomId(3)).unwrap().orphaned);
+    }
+
+    #[test]
+    fn open_rooms_presence_and_ops() {
+        let mut f = FleetRegistry::new(10_000, 60_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        f.note_room(&spec(1, "zone", 3), "gs-1", 0);
+        f.note_room(&spec(2, "zone", 3), "gs-1", 0);
+        f.on_message(
+            "gs-1",
+            hb(
+                2,
+                vec![
+                    RoomStatus {
+                        room_id: RoomId(1),
+                        mode: "zone".into(),
+                        players: 2,
+                        max_players: 3,
+                        joinable: true,
+                        ..Default::default()
+                    },
+                    RoomStatus {
+                        room_id: RoomId(2),
+                        mode: "zone".into(),
+                        players: 0,
+                        max_players: 3,
+                        joinable: true,
+                        ..Default::default()
+                    },
+                ],
+            ),
+            10,
+        );
+        let (_, s) = f.open_room("zone", 1, 10, 60_000).unwrap();
+        assert_eq!(s.room_id, RoomId(1), "fullest room first");
+        let (_, s) = f.open_room("zone", 1, 10, 60_000).unwrap();
+        assert_eq!(s.room_id, RoomId(2), "room 1 is now full with the reservation");
+        assert!(f.open_room("duel", 1, 10, 60_000).is_none());
+        f.on_message(
+            "gs-1",
+            FleetUp::PlayerJoined {
+                room_id: RoomId(2),
+                player: PlayerId(3),
+            },
+            20,
+        );
+        assert_eq!(f.room_of(PlayerId(3)).unwrap().0, RoomId(2));
+        f.on_message(
+            "gs-1",
+            FleetUp::PlayerLeft {
+                room_id: RoomId(2),
+                player: PlayerId(3),
+            },
+            21,
+        );
+        assert!(f.room_of(PlayerId(3)).is_none());
+        let eff = f.on_message(
+            "gs-1",
+            FleetUp::SubmitScore {
+                op_id: "o".into(),
+                board: "b".into(),
+                player: PlayerId(1),
+                score: 1,
+            },
+            22,
+        );
+        assert!(matches!(&eff[0], FleetEffect::Apply { server, .. } if server == "gs-1"));
+        f.on_message(
+            "gs-1",
+            FleetUp::RoomClosed {
+                room_id: RoomId(1),
+                reason: "done".into(),
+            },
+            23,
+        );
+        assert!(f.room(RoomId(1)).is_none());
+        let (states, free) = f.census();
+        assert_eq!(states[&("eu".to_owned(), "ready")], 1);
+        assert!(free["eu"] > 0);
     }
 }

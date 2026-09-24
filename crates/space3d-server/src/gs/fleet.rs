@@ -223,38 +223,202 @@ pub enum FleetError {
     Refused(String),
 }
 
+impl FleetUp {
+    /// Idempotency key of an outbox op (`None` for non-op messages).
+    pub fn op_id(&self) -> Option<&str> {
+        match self {
+            FleetUp::MatchResult { op_id, .. }
+            | FleetUp::PlayerDataWrite { op_id, .. }
+            | FleetUp::SubmitScore { op_id, .. } => Some(op_id),
+            _ => None,
+        }
+    }
+
+    /// Mutable idempotency key (outbox assigns missing ones).
+    pub fn op_id_mut(&mut self) -> Option<&mut String> {
+        match self {
+            FleetUp::MatchResult { op_id, .. }
+            | FleetUp::PlayerDataWrite { op_id, .. }
+            | FleetUp::SubmitScore { op_id, .. } => Some(op_id),
+            _ => None,
+        }
+    }
+
+    /// Short name for logs / metrics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            FleetUp::Register(_) => "register",
+            FleetUp::Heartbeat(_) => "heartbeat",
+            FleetUp::RoomOpened { .. } => "room_opened",
+            FleetUp::RoomClosed { .. } => "room_closed",
+            FleetUp::PlayerJoined { .. } => "player_joined",
+            FleetUp::PlayerLeft { .. } => "player_left",
+            FleetUp::MatchResult { .. } => "match_result",
+            FleetUp::PlayerDataWrite { .. } => "player_data_write",
+            FleetUp::SubmitScore { .. } => "submit_score",
+            FleetUp::FetchPlayerData { .. } => "fetch_player_data",
+        }
+    }
+}
+
 /// Game-server side of the fleet link. Non-blocking.
 pub trait FleetLink: Send + Sync + 'static {
-    /// Queue a message.
+    /// Queue a message (`Err(Down)` while not registered; the outbox keeps its ops).
     fn send(&self, msg: FleetUp) -> Result<(), FleetError>;
     /// Next message from the player service.
     fn try_recv(&self) -> Option<FleetDown>;
     /// Whether registered and connected.
     fn is_connected(&self) -> bool;
+    /// Registration counter: changes every time the link (re)registers, so the outbox knows
+    /// to replay everything unacked.
+    fn session(&self) -> u64 {
+        u64::from(self.is_connected())
+    }
 }
 
-/// WebSocket fleet link (split mode).
+/// Largest fleet message (JSON).
+pub const MAX_FLEET_MESSAGE: usize = 16 << 20;
+
+#[derive(Default)]
+struct WsLinkState {
+    connected: std::sync::atomic::AtomicBool,
+    session: std::sync::atomic::AtomicU64,
+    stop: std::sync::atomic::AtomicBool,
+    last_error: parking_lot::Mutex<String>,
+}
+
+/// WebSocket fleet link (split mode): a background loop on the I/O runtime connects to the
+/// player service with its own backoff (never `WsConfig::reconnect`), registers, forwards
+/// queued `FleetUp`s and collects `FleetDown`s. JSON text frames.
 pub struct WsFleetLink {
-    url: String,
-    registration: ServerRegistration,
+    up: async_channel::Sender<FleetUp>,
+    down: async_channel::Receiver<FleetDown>,
+    state: std::sync::Arc<WsLinkState>,
+    _task: space3d_tasks::Task<()>,
 }
 
 impl WsFleetLink {
     /// Start connecting (background reconnect loop on the I/O runtime).
     pub fn connect(url: &str, registration: ServerRegistration) -> Self {
-        todo!()
+        let (up_tx, up_rx) = async_channel::bounded::<FleetUp>(16_384);
+        let (down_tx, down_rx) = async_channel::bounded::<FleetDown>(16_384);
+        let state = std::sync::Arc::new(WsLinkState::default());
+        let task = space3d_tasks::spawn(run_ws_link(url.to_owned(), registration, up_rx, down_tx, state.clone()));
+        Self {
+            up: up_tx,
+            down: down_rx,
+            state,
+            _task: task,
+        }
+    }
+
+    /// Last connection error (diagnostics).
+    pub fn last_error(&self) -> String {
+        self.state.last_error.lock().clone()
+    }
+}
+
+impl Drop for WsFleetLink {
+    fn drop(&mut self) {
+        self.state.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+async fn run_ws_link(
+    url: String,
+    registration: ServerRegistration,
+    up: async_channel::Receiver<FleetUp>,
+    down: async_channel::Sender<FleetDown>,
+    state: std::sync::Arc<WsLinkState>,
+) {
+    use space3d_net::{Backoff, WsClient, WsConfig, WsEventKind};
+    use std::sync::atomic::Ordering;
+    let backoff = Backoff::new(
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(10),
+    );
+    let mut attempt = 0u32;
+    let register = match serde_json::to_string(&FleetUp::Register(registration)) {
+        Ok(s) => s,
+        Err(e) => {
+            *state.last_error.lock() = e.to_string();
+            return;
+        }
+    };
+    while !state.stop.load(Ordering::Acquire) {
+        let conn = WsClient::connect_with(url.clone(), WsConfig::default().max_message_size(MAX_FLEET_MESSAGE));
+        let _ = conn.send(register.clone());
+        let reason: String;
+        'link: loop {
+            if state.stop.load(Ordering::Acquire) {
+                conn.close();
+                return;
+            }
+            while let Some(ev) = conn.poll_event() {
+                match ev {
+                    WsEventKind::Opened => {}
+                    WsEventKind::Message(m) => {
+                        let Some(text) = m.as_text() else { continue };
+                        match serde_json::from_str::<FleetDown>(text) {
+                            Ok(msg) => {
+                                if matches!(msg, FleetDown::Registered { .. }) {
+                                    attempt = 0;
+                                    state.session.fetch_add(1, Ordering::AcqRel);
+                                    state.connected.store(true, Ordering::Release);
+                                    tracing::info!(%url, "registered with the player service");
+                                }
+                                if down.try_send(msg).is_err() {
+                                    tracing::warn!("fleet inbox full; dropping a player-service message");
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "bad fleet message"),
+                        }
+                    }
+                    WsEventKind::Closed { reason: r, .. } => {
+                        reason = r;
+                        break 'link;
+                    }
+                }
+            }
+            if state.connected.load(Ordering::Acquire) {
+                while let Ok(msg) = up.try_recv() {
+                    match serde_json::to_string(&msg) {
+                        Ok(text) => {
+                            if conn.send(text).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "unserializable fleet message"),
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        state.connected.store(false, Ordering::Release);
+        // Anything queued for the dead link is stale (heartbeats) or kept by the outbox.
+        while up.try_recv().is_ok() {}
+        *state.last_error.lock() = reason.clone();
+        tracing::warn!(%url, %reason, attempt, "fleet link down; reconnecting");
+        tokio::time::sleep(backoff.delay(attempt)).await;
+        attempt = attempt.saturating_add(1);
     }
 }
 
 impl FleetLink for WsFleetLink {
     fn send(&self, msg: FleetUp) -> Result<(), FleetError> {
-        todo!()
+        if !self.is_connected() {
+            return Err(FleetError::Down);
+        }
+        self.up.try_send(msg).map_err(|_| FleetError::Down)
     }
     fn try_recv(&self) -> Option<FleetDown> {
-        todo!()
+        self.down.try_recv().ok()
     }
     fn is_connected(&self) -> bool {
-        todo!()
+        self.state.connected.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn session(&self) -> u64 {
+        self.state.session.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -265,6 +429,7 @@ pub struct InProcessFleetLink {
 }
 
 /// Player-service end of an in-process link.
+#[derive(Clone)]
 pub struct InProcessFleetPeer {
     /// Messages from the game server.
     pub up: async_channel::Receiver<FleetUp>,
@@ -297,5 +462,66 @@ impl FleetLink for InProcessFleetLink {
     }
     fn is_connected(&self) -> bool {
         !self.up.is_closed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_roundtrip_as_json() {
+        let msgs = vec![
+            FleetUp::Heartbeat(Heartbeat {
+                seq: 3,
+                players: 2,
+                tick_p99_us: 900,
+                draining: false,
+                rooms: vec![RoomStatus {
+                    room_id: RoomId(9),
+                    mode: "duel".into(),
+                    players: 2,
+                    ..Default::default()
+                }],
+            }),
+            FleetUp::PlayerDataWrite {
+                op_id: "gs-1:9:1".into(),
+                player: PlayerId(4),
+                writes: vec![DataWrite {
+                    key: "progress".into(),
+                    value: serde_json::json!({"level": 3}),
+                    expected_version: None,
+                }],
+            },
+        ];
+        for m in msgs {
+            let text = serde_json::to_string(&m).unwrap();
+            assert_eq!(serde_json::from_str::<FleetUp>(&text).unwrap(), m);
+        }
+        let mut m = FleetUp::SubmitScore {
+            op_id: String::new(),
+            board: "b".into(),
+            player: PlayerId(1),
+            score: 2,
+        };
+        *m.op_id_mut().unwrap() = "x".into();
+        assert_eq!(m.op_id(), Some("x"));
+        assert_eq!(FleetUp::Heartbeat(Heartbeat::default()).op_id(), None);
+    }
+
+    #[test]
+    fn in_process_pair_delivers_both_ways() {
+        let (link, peer) = in_process_pair();
+        link.send(FleetUp::RoomClosed {
+            room_id: RoomId(1),
+            reason: "done".into(),
+        })
+        .unwrap();
+        assert!(matches!(peer.up.try_recv(), Ok(FleetUp::RoomClosed { .. })));
+        peer.down.try_send(FleetDown::Drain).unwrap();
+        assert_eq!(link.try_recv(), Some(FleetDown::Drain));
+        assert!(link.is_connected());
+        drop(peer);
+        assert!(!link.is_connected());
     }
 }

@@ -4741,6 +4741,7 @@ dependencies = [
  "space3d-net",
  "space3d-replication",
  "space3d-scene",
+ "space3d-server",
  "space3d-tasks",
  "tempfile",
  "thiserror 2.0.21",

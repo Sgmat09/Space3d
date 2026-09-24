@@ -4,7 +4,7 @@
 
 role = "all-in-one"          # all-in-one | player-service | game-server
 env = "dev"                  # dev | production
-server_id = "${HOSTNAME}"    # stable id; join tickets are bound to it
+server_id = "${HOSTNAME:-local-1}"  # stable id; join tickets are bound to it
 region = "local"
 
 [log]
