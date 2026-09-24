@@ -407,6 +407,91 @@ fn render_targets_are_resized_not_updated() {
     assert_ne!(before, after, "aspect ratio of the target changed");
 }
 
+/// Regression: render targets and the primary target were created at any requested size. Past
+/// the device's `max_texture_dimension_2d` texture creation failed validation, which
+/// invalidated the frame's whole command buffer — every view was lost, every frame (a panic
+/// in debug builds). Oversized render targets are now not created (logged; their cameras are
+/// skipped and materials sample white) and the primary target is clamped.
+#[test]
+fn targets_past_the_texture_size_limit_do_not_lose_frames() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let max = app
+        .resources
+        .expect::<Renderer>()
+        .device()
+        .limits()
+        .max_texture_dimension_2d;
+    let (cube, rt) = {
+        let a = app.resources.expect_mut::<RenderAssets>();
+        (a.add_mesh(MeshData::cube(1.0)), a.add_render_target(32, 32))
+    };
+    // A monitor showing the render target, whose camera sees a white cube on red.
+    app.world.spawn((
+        Transform::default(),
+        Mesh3d(cube),
+        Material::unlit(Vec4::ONE).with_texture(rt),
+    ));
+    app.world.spawn((
+        Transform::from_xyz(100.0, 0.0, 0.0),
+        Mesh3d(cube),
+        Material::unlit(Vec4::ONE),
+    ));
+    app.world.spawn((
+        Transform::from_xyz(100.0, 0.0, 4.0),
+        Camera3d {
+            order: -1,
+            target: RenderTarget::Texture(rt),
+            clear_color: Some(Vec4::new(1.0, 0.0, 0.0, 1.0)),
+            ..Default::default()
+        },
+    ));
+    spawn_camera(&mut app, 1.5);
+    let before = render_to_image(&mut app).expect("capture");
+    assert_eq!(before.get(4, 32), [255, 0, 0, 255], "the monitor shows the target");
+
+    for (w, h) in [(max + 1, 4), (4, max + 1)] {
+        assert!(
+            app.resources
+                .expect_mut::<RenderAssets>()
+                .resize_render_target(rt, w, h)
+        );
+        let img = render_to_image(&mut app).expect("capture");
+        assert_eq!(stats(&app).views, 1, "{w}x{h}: the target's camera is skipped");
+        assert_eq!(
+            img.get(4, 32),
+            [255, 255, 255, 255],
+            "{w}x{h}: the monitor samples white"
+        );
+        assert_eq!(img.get(0, 0), CLEAR, "{w}x{h}: the primary view is drawn");
+    }
+    // Back within the limit: the target is created again.
+    app.resources
+        .expect_mut::<RenderAssets>()
+        .resize_render_target(rt, 32, 32);
+    assert_eq!(render_to_image(&mut app).expect("capture"), before);
+
+    // A new oversized target does not affect the other views.
+    let big = app.resources.expect_mut::<RenderAssets>().add_render_target(max + 1, 8);
+    app.world.spawn((
+        Transform::from_xyz(-100.0, 0.0, 4.0),
+        Camera3d {
+            target: RenderTarget::Texture(big),
+            ..Default::default()
+        },
+    ));
+    assert_eq!(render_to_image(&mut app).expect("capture"), before);
+
+    // The primary target is clamped per axis.
+    let r = app.resources.expect_mut::<Renderer>();
+    r.resize(max + 5, 2);
+    assert_eq!(r.size(), (max, 2));
+    let img = render_to_image(&mut app).expect("capture");
+    assert_eq!((img.width, img.height), (max, 2));
+    app.resources.expect_mut::<Renderer>().resize(64, 64);
+    assert_eq!(render_to_image(&mut app).expect("capture"), before);
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+}
+
 /// Regression: formats the material binding cannot sample (unfilterable 32-bit float without
 /// FLOAT32_FILTERABLE, integer, depth) were reported as supported and panicked at bind-group
 /// creation. They must be rejected and render with the white fallback.
@@ -561,4 +646,34 @@ fn bgra_instance_colors_match_rgba() {
         count_rgb(&images[1], [255, 255, 0]) > 16,
         "the yellow instance is visible"
     );
+}
+
+/// Regression: debug builds panicked on every uncaptured wgpu error, including the "buffer is
+/// invalid" errors that every use of a lost device produces, so a device loss (driver reset,
+/// GPU removed, `destroy`) crashed the next capture or frame. After the device-lost callback
+/// those errors are only logged: captures fail and frames are dropped, with no panic or hang.
+#[test]
+fn a_lost_device_degrades_instead_of_panicking() {
+    for frames_before_capture in [3, 0] {
+        let Some(mut app) = headless_app(64, 64) else { return };
+        let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(1.0));
+        app.world
+            .spawn((Transform::default(), Mesh3d(mesh), Material::unlit(Vec4::ONE)));
+        spawn_camera(&mut app, 3.0);
+        render_to_image(&mut app).expect("capture");
+        let pending = app.resources.expect_mut::<Renderer>().capture();
+        app.resources.expect::<Renderer>().device().destroy();
+        for _ in 0..frames_before_capture {
+            app.run_stage(Stage::Render);
+        }
+        let r = app.resources.expect_mut::<Renderer>();
+        assert!(
+            r.capture_blocking().is_err(),
+            "{frames_before_capture}: capture of a lost device"
+        );
+        let _ = pending.block();
+        let _ = r.capture().block();
+        assert!(render_to_image(&mut app).is_none());
+        app.run_stage(Stage::Render);
+    }
 }

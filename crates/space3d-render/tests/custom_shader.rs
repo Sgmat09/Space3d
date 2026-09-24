@@ -243,3 +243,27 @@ fn broken_custom_shaders_fall_back_and_hot_reload() {
     let img = render_to_image(&mut app).expect("capture");
     assert_eq!(img.get(20, 32), [255, 255, 255, 255], "removed shader: built-in");
 }
+
+/// Custom shaders cannot declare resources of their own (the forward pipeline layout has none
+/// for them). naga accepts such WGSL, so it is checked explicitly before any GPU work: on
+/// browser WebGPU the pipeline's validation error only arrives later, and every frame drawing
+/// with the invalid pipeline would be lost until then. It falls back like a broken shader.
+#[test]
+fn custom_shaders_declaring_their_own_bindings_fall_back() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let shader = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+        "own binding",
+        "@group(2) @binding(0) var<uniform> extra: vec4<f32>;\n\
+         fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> { return extra; }",
+    ));
+    scene(&mut app, Material::unlit(Vec4::ONE).with_shader(shader));
+    let img = render_to_image(&mut app).expect("capture");
+    assert_eq!(img.get(20, 32), [255, 255, 255, 255], "built-in shader");
+    let r = app.resources.expect::<Renderer>();
+    let err = r.shader_error(shader).unwrap_or_default();
+    assert!(
+        err.contains("`extra`") && err.contains("@group(2) @binding(0)"),
+        "{err}"
+    );
+    assert_eq!(r.gpu_error_count(), 0);
+}

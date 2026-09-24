@@ -267,7 +267,9 @@ impl RenderAssets {
     }
 
     /// Create a color texture cameras can render into ([`crate::RenderTarget::Texture`]) and
-    /// materials can sample.
+    /// materials can sample. A size past the device's `max_texture_dimension_2d` is logged
+    /// and the target is not created until resized: cameras targeting it are skipped and
+    /// materials sample white.
     pub fn add_render_target(&mut self, width: u32, height: u32) -> TextureHandle {
         let h = TextureHandle::from_raw(self.textures.insert(TextureEntry {
             width: width.max(1),

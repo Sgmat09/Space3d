@@ -11,11 +11,11 @@
 // 3. `cull_scatter` like pass 1: each visible instance's slot = record base + visible lanes
 //                   below it (popcount), then its raw words are copied to the output region.
 //
-// Mark/scatter dispatches cover every job that reads the same source buffer for one view; a
-// workgroup finds its job with a binary search over the (frame-global) `wg_start`.
+// Mark/scatter dispatches cover every job that reads the same source buffer, for all views
+// (up to 64 per dispatch: `frusta`); a workgroup finds its job with a binary search over the
+// (frame-global) `wg_start`, and the job names its view's frustum.
 
 struct CullParams {
-    planes: array<vec4<f32>, 6>,
     job_start: u32,
     job_count: u32,
     total_workgroups: u32,
@@ -38,8 +38,8 @@ struct Job {
     dst_word: u32,          // first word of the output region
     draw: u32,              // index into indirect args
     wg_start: u32,          // first workgroup record of this job (frame-global)
+    view: u32,              // frustum of the job's view in `frusta` (< 64)
     pad0: u32,
-    pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: CullParams;
@@ -49,6 +49,8 @@ struct Job {
 // DrawIndexedIndirectArgs (5 words per draw), then 4 words per workgroup record from
 // `params.wg_word`: visibility mask lo/hi, first output slot, unused.
 @group(0) @binding(4) var<storage, read_write> args: array<u32>;
+// Six frustum planes per view (a window of 64 views; one bind group per window).
+@group(0) @binding(5) var<uniform> frusta: array<vec4<f32>, 384>;
 
 var<workgroup> wg_mask: array<atomic<u32>, 2>;
 var<workgroup> sums: array<u32, 64>;
@@ -155,7 +157,7 @@ fn is_visible(job: Job, base: u32) -> bool {
     }
     var visible = true;
     for (var i = 0u; i < 6u; i++) {
-        let p = params.planes[i];
+        let p = frusta[job.view * 6u + i];
         if (dot(p.xyz, center) + p.w < -radius) {
             visible = false;
         }

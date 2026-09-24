@@ -115,6 +115,16 @@ pub(crate) fn create_gpu_texture(
 ) -> Result<u64, String> {
     let sampler = samplers.get(device, entry.sampler);
     if entry.render_target {
+        // A larger texture fails validation, which would invalidate the whole frame's commands.
+        let max = device.limits().max_texture_dimension_2d;
+        if entry.width > max || entry.height > max {
+            return Err(format!(
+                "render target {}x{} exceeds the device's max_texture_dimension_2d ({max}); it is \
+                 not created (cameras targeting it are skipped, materials sample white) until \
+                 resized with resize_render_target",
+                entry.width, entry.height
+            ));
+        }
         let size = wgpu::Extent3d {
             width: entry.width,
             height: entry.height,

@@ -9,7 +9,7 @@ use crate::texture::{SamplerCache, create_gpu_texture, format_supported, white_t
 use space3d_core::ImageData;
 use space3d_tasks::Task;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Renderer errors.
 #[derive(Debug, thiserror::Error)]
@@ -327,23 +327,53 @@ thread_local! {
 /// being logged so bugs surface immediately; release builds log and keep running — skipping a
 /// broken command buffer is better than crashing the game. Errors tend to repeat every frame,
 /// so only the first ones and then every 1000th are logged.
+///
+/// Once the device is lost (driver reset, GPU removed, `destroy`), every resource created
+/// afterwards is invalid and each use of one is reported as an error. Those are the expected
+/// consequence of the loss, not bugs, so from the device-lost callback on they are only
+/// logged, in debug builds too: a lost device degrades (captures fail, frames are dropped)
+/// instead of crashing.
 pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> Arc<AtomicU64> {
     let count = Arc::new(AtomicU64::new(0));
-    let counter = count.clone();
+    let lost = Arc::new(AtomicBool::new(false));
+    let (counter, lost_seen) = (count.clone(), lost.clone());
     device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
         let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let lost = lost_seen.load(Ordering::Acquire);
         if n <= 16 || n.is_multiple_of(1000) {
-            tracing::error!(occurrences = n, "wgpu error: {err}");
+            if lost {
+                tracing::warn!(occurrences = n, "wgpu error after the device was lost: {err}");
+            } else {
+                tracing::error!(occurrences = n, "wgpu error: {err}");
+            }
         }
-        if panic {
+        if panic && !lost {
             panic!("wgpu error: {err}");
         }
     }));
-    device.set_device_lost_callback(|reason, message| match reason {
-        wgpu::DeviceLostReason::Destroyed => tracing::debug!(%message, "GPU device destroyed"),
-        _ => tracing::error!(?reason, %message, "GPU device lost"),
+    device.set_device_lost_callback(move |reason, message| {
+        lost.store(true, Ordering::Release);
+        match reason {
+            wgpu::DeviceLostReason::Destroyed => tracing::debug!(%message, "GPU device destroyed"),
+            _ => tracing::error!(?reason, %message, "GPU device lost"),
+        }
     });
     count
+}
+
+/// Primary target size within `1..=max_dimension` (the device's `max_texture_dimension_2d`):
+/// a larger surface or offscreen texture fails validation, which invalidates the frame's
+/// whole command buffer, every frame. Oversized requests are clamped per axis and logged.
+pub(crate) fn target_size(width: u32, height: u32, max_dimension: u32) -> (u32, u32) {
+    let clamped = (width.clamp(1, max_dimension), height.clamp(1, max_dimension));
+    if clamped.0 < width || clamped.1 < height {
+        tracing::warn!(
+            requested = ?(width, height),
+            used = ?clamped,
+            "primary target larger than the device's max_texture_dimension_2d; clamped"
+        );
+    }
+    clamped
 }
 
 /// Display connection handed to wgpu (needed by GLES on Wayland/X11; unused elsewhere).
@@ -453,8 +483,8 @@ impl Renderer {
             "space3d renderer initialised"
         );
         config.msaa_samples = if config.msaa_samples > 1 { caps.max_msaa } else { 1 };
-        config.width = config.width.max(1);
-        config.height = config.height.max(1);
+        (config.width, config.height) =
+            target_size(config.width, config.height, device.limits().max_texture_dimension_2d);
         let offscreen = Attachments::new(
             &device,
             config.width,
@@ -577,9 +607,10 @@ impl Renderer {
 
     /// Resize the primary target. The window surface is reconfigured now; the headless
     /// offscreen target is reallocated by the next frame, so [`Self::capture`] until then
-    /// still returns the last rendered frame.
+    /// still returns the last rendered frame. Each side is clamped to the device's
+    /// `max_texture_dimension_2d` (see [`Self::size`]).
     pub fn resize(&mut self, width: u32, height: u32) {
-        let (width, height) = (width.max(1), height.max(1));
+        let (width, height) = target_size(width, height, self.device.limits().max_texture_dimension_2d);
         self.config.width = width;
         self.config.height = height;
         if let Some(s) = &mut self.surface {
@@ -635,7 +666,7 @@ impl Renderer {
         self.config.msaa_samples
     }
 
-    /// Current primary target size.
+    /// Current primary target size (as requested, within the device's texture size limit).
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
     }
@@ -856,11 +887,14 @@ impl Renderer {
     /// destruction on the main thread until the GPU caught up.
     pub fn capture(&mut self) -> Task<Result<ImageData, RenderError>> {
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-        let (readback, mut rx, _) = self.submit_capture();
+        let (readback, mut rx, _, error) = self.submit_capture();
         #[cfg(not(target_arch = "wasm32"))]
         {
             let device = self.device.clone();
             space3d_tasks::spawn(async move {
+                if let Some(e) = error.await {
+                    return Err(RenderError::Capture(e));
+                }
                 let mapped = loop {
                     let _ = device.poll(wgpu::PollType::Poll);
                     match rx.try_recv() {
@@ -875,13 +909,32 @@ impl Renderer {
         #[cfg(target_arch = "wasm32")]
         {
             // The browser (WebGPU) or the per-frame device poll (WebGL) resolves the mapping.
-            space3d_tasks::spawn(async move { readback.read(rx.await.map_err(|_| ())) })
+            space3d_tasks::spawn(async move {
+                if let Some(e) = error.await {
+                    return Err(RenderError::Capture(e));
+                }
+                readback.read(rx.await.map_err(|_| ()))
+            })
         }
     }
 
     /// Record and submit the copy of the offscreen target into a `MAP_READ` buffer; returns
-    /// the readback, the mapping result channel and the submission.
-    fn submit_capture(&mut self) -> (CaptureReadback, MapReceiver, wgpu::SubmissionIndex) {
+    /// the readback, the mapping result channel, the submission and the validation error of
+    /// the capture's commands, if any.
+    ///
+    /// The capture runs inside an error scope: its failures are the capture's result, not
+    /// uncaptured errors (which panic in debug builds). This matters once the device is lost —
+    /// after `destroy` the device-lost callback only fires when in-flight work has finished,
+    /// and until then mapping the (invalid) readback buffer is an error.
+    fn submit_capture(
+        &mut self,
+    ) -> (
+        CaptureReadback,
+        MapReceiver,
+        wgpu::SubmissionIndex,
+        impl Future<Output = Option<String>> + use<>,
+    ) {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d capture"),
         });
@@ -923,19 +976,28 @@ impl Renderer {
             let _ = tx.send(r);
         });
         let submission = self.queue.submit([encoder.finish()]);
+        let error = scope.pop();
+        // Native backends resolve the scope immediately; the browser answers asynchronously.
+        #[cfg(not(target_arch = "wasm32"))]
+        let error = std::future::ready(futures::FutureExt::now_or_never(error).flatten().map(|e| e.to_string()));
+        #[cfg(target_arch = "wasm32")]
+        let error = async move { error.await.map(|e| e.to_string()) };
         let readback = CaptureReadback {
             buffer,
             size: (w, h),
             padded,
         };
-        (readback, rx, submission)
+        (readback, rx, submission, error)
     }
 
     /// [`Self::capture`] and wait for the result on the calling thread (tests/tools only;
     /// never from a system).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn capture_blocking(&mut self) -> Result<ImageData, RenderError> {
-        let (readback, mut rx, submission) = self.submit_capture();
+        let (readback, mut rx, submission, error) = self.submit_capture();
+        if let Some(e) = futures::FutureExt::now_or_never(error).flatten() {
+            return Err(RenderError::Capture(e));
+        }
         let mapped = loop {
             match rx.try_recv() {
                 Ok(Some(r)) => break Ok(r),
@@ -1144,5 +1206,27 @@ mod tests {
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invalid_buffer(&r.device)));
         assert!(panicked.is_err());
         assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    /// Once the device is lost every new resource is invalid and each use of one is an error;
+    /// debug builds must log those instead of panicking (the loss is not a bug).
+    #[test]
+    fn errors_after_device_loss_do_not_panic_in_debug() {
+        let Some(r) = renderer() else { return };
+        let count = install_error_handler(&r.device, true);
+        r.device.destroy();
+        // `destroy` loses the device once its in-flight work is done: the callback fires here.
+        let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
+        let buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("after loss"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        assert!(
+            count.load(Ordering::Relaxed) >= 1,
+            "the invalid buffer's error was reported"
+        );
     }
 }

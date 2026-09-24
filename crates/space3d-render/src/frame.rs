@@ -17,8 +17,8 @@ use crate::instance::{
     ScaleKind,
 };
 use crate::pipeline::{
-    CLASS_BLEND, CLASS_DOUBLE_SIDED, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuMaterial,
-    GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, OFFSCREEN_FORMAT, PipelineKey,
+    CLASS_BLEND, CLASS_DOUBLE_SIDED, CULL_VIEWS, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuFrustum,
+    GpuMaterial, GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, OFFSCREEN_FORMAT, PipelineKey,
 };
 use crate::readback::CullReadback;
 use crate::renderer::{RenderCapabilities, Renderer};
@@ -282,17 +282,20 @@ struct Feedback {
     last_used: u64,
 }
 
+/// One mark and one scatter dispatch: the culling jobs of one source buffer, for the views of
+/// one window of [`CULL_VIEWS`] frustums.
 struct Dispatch {
     buffer: SourceBuffer,
     params: GpuCullParams,
     params_offset: u32,
+    /// Window of frustums the dispatch's jobs read (bound at a fixed offset of
+    /// `cull_params`: one bind group per source buffer and window).
+    window: u32,
     wg: (u32, u32),
 }
 
-struct CompactDispatch {
-    params_offset: u32,
-    wg: (u32, u32),
-}
+/// Bytes of one window of frustums (the `frusta` binding of cull.wgsl).
+const FRUSTA_WINDOW: usize = CULL_VIEWS * std::mem::size_of::<GpuFrustum>();
 
 /// Workgroup grid for `n` workgroups within the 65535-per-dimension limit.
 fn dispatch_dims(n: u32) -> (u32, u32) {
@@ -587,7 +590,8 @@ pub(crate) struct FrameState {
     /// Material bind group per texture: (bind group, materials buffer generation, texture
     /// version, texture is an array — selects the pipeline variant).
     material_bgs: FastMap<Option<TextureHandle>, (wgpu::BindGroup, u32, u32, bool)>,
-    cull_bgs: FastMap<SourceBuffer, (wgpu::BindGroup, [u32; 5])>,
+    /// Culling bind group per (source buffer, window of frustums).
+    cull_bgs: FastMap<(SourceBuffer, u32), (wgpu::BindGroup, [u32; 5])>,
     compact_bg: Option<(wgpu::BindGroup, [u32; 5])>,
     arena_buffers: Option<(wgpu::Buffer, wgpu::Buffer)>,
     /// Visible ECS entities in query order: batch key (class | material | mesh), matrix, mesh.
@@ -604,8 +608,12 @@ pub(crate) struct FrameState {
     ecs_buckets: KeyBuckets,
     /// Byte ranges of `ecs` drawn from directly this frame (CPU path upload filter).
     ecs_needed: Vec<Range<usize>>,
-    /// Last frame's ECS matrices exceeded `max_buffer_size` (the overflow is logged once).
+    /// The ECS matrices exceed `max_buffer_size` (this frame once batched; logged once).
     ecs_overflow: bool,
+    /// On overflow: instances kept per batch of `ecs_runs`, and the kept entries of
+    /// `ecs_order` (what `ecs` holds and ECS sources index instead of `ecs_order`).
+    ecs_kept: Vec<u32>,
+    ecs_cut: Vec<u32>,
     /// Last frame's partially visible ECS matrices did not all fit `cpu_visible` (logged once).
     visible_overflow: bool,
     /// Per-instance visibility bits of the batch being CPU-culled.
@@ -616,9 +624,13 @@ pub(crate) struct FrameState {
     draws: Vec<DrawCmd>,
     jobs: Vec<(SourceBuffer, GpuCullJob)>,
     dispatches: Vec<Dispatch>,
-    compacts: Vec<CompactDispatch>,
+    /// Grid of the draw-compaction dispatch (`GpuMultiDrawCount`: one workgroup per run).
+    compact: Option<(u32, u32)>,
     /// Params offset and grid of the per-job prefix-sum dispatch (`cull_scan`).
     scan: Option<(u32, (u32, u32))>,
+    /// Frustum planes of every view with GPU-culled sources, in view order (written to the
+    /// start of `cull_params`, before the dispatch params).
+    cull_planes: Vec<GpuFrustum>,
     feedback: FastMap<TextureHandle, Feedback>,
     args_count: u32,
     run_count: u32,
@@ -703,6 +715,8 @@ impl FrameState {
             ecs_buckets: KeyBuckets::default(),
             ecs_needed: Vec::new(),
             ecs_overflow: false,
+            ecs_kept: Vec::new(),
+            ecs_cut: Vec::new(),
             visible_overflow: false,
             cull_mask: Vec::new(),
             sources: Vec::new(),
@@ -711,8 +725,9 @@ impl FrameState {
             draws: Vec::new(),
             jobs: Vec::new(),
             dispatches: Vec::new(),
-            compacts: Vec::new(),
+            compact: None,
             scan: None,
+            cull_planes: Vec::new(),
             feedback: FastMap::default(),
             args_count: 0,
             run_count: 0,
@@ -744,7 +759,7 @@ impl FrameState {
     }
 
     /// Capacity snapshot of scratch vectors (to count CPU reallocations).
-    fn capacities(&self) -> [usize; 18] {
+    fn capacities(&self) -> [usize; 20] {
         [
             self.ecs_keys.capacity(),
             self.ecs_rows.capacity(),
@@ -756,6 +771,8 @@ impl FrameState {
             self.ecs_order.capacity(),
             self.ecs_runs.capacity(),
             self.ecs_needed.capacity(),
+            self.ecs_kept.capacity(),
+            self.ecs_cut.capacity(),
             self.cull_mask.capacity(),
             self.sources.capacity(),
             self.cameras.capacity(),
@@ -763,8 +780,33 @@ impl FrameState {
             self.draws.capacity(),
             self.jobs.capacity(),
             self.dispatches.capacity(),
-            self.compacts.capacity(),
+            self.cull_planes.capacity(),
         ]
+    }
+}
+
+/// How many instances of each batch (`counts`) to keep so that at most `cap` are kept in
+/// total, taking the overflow from the largest batches: every batch keeps `min(count, t)` for
+/// the largest `t` that fits, and what remains below `cap` goes one instance each to the first
+/// batches (in batch order) that are still cut. A small batch is never dropped because a large
+/// one sorts before it. Deterministic; only runs when the ECS data outgrows `max_buffer_size`.
+fn fair_share(counts: impl Iterator<Item = u32> + Clone, cap: u64, kept: &mut Vec<u32>) {
+    let total = |t: u32| counts.clone().map(|c| c.min(t) as u64).sum::<u64>();
+    let (mut lo, mut hi) = (0u32, counts.clone().max().unwrap_or(0));
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if total(mid) <= cap {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut spare = cap - total(lo);
+    kept.clear();
+    for c in counts {
+        let extra = u32::from(c > lo && spare > 0);
+        spare -= extra as u64;
+        kept.push(c.min(lo) + extra);
     }
 }
 
@@ -903,7 +945,8 @@ impl Renderer {
             if let Some(slot) = self.frame.explicit.get_mut(h.index() as usize) {
                 *slot = None;
             }
-            self.frame.cull_bgs.remove(&SourceBuffer::Explicit(h.index()));
+            let gone = SourceBuffer::Explicit(h.index());
+            self.frame.cull_bgs.retain(|(b, _), _| *b != gone);
         }
         self.prepare(world, &assets, &mut buffers, ambient, &settings, &mut encoder);
         self.encode_compute(&mut encoder);
@@ -1139,34 +1182,47 @@ impl Renderer {
             }
         }
         // The `ecs` buffer cannot exceed the device's `max_buffer_size` (creating it would fail
-        // validation and lose every frame): the matrices past it, in batch order, are not
-        // drawn — the batch crossing the limit is cut — and the overflow is logged once.
-        let ecs_len = f
-            .ecs_order
-            .len()
-            .min(usize::try_from(f.max_buffer_size / 64).unwrap_or(usize::MAX));
-        let overflow = ecs_len < f.ecs_order.len();
-        if overflow && !f.ecs_overflow {
-            tracing::error!(
-                entities = f.ecs_order.len(),
-                drawn = ecs_len,
-                max_buffer_size = f.max_buffer_size,
-                "ECS instance data exceeds the device's max_buffer_size; entities past it are not \
-                 drawn (use InstanceBuffers for this many instances)"
-            );
+        // validation and lose every frame). Past it the largest batches are cut (see
+        // `fair_share`: smaller batches are kept whole), their kept entities are listed in
+        // `ecs_cut` in place of `ecs_order`, and the overflow is logged once.
+        let max_entities = f.max_buffer_size / 64;
+        let overflow = f.ecs_order.len() as u64 > max_entities;
+        if overflow {
+            fair_share(f.ecs_runs.iter().map(|r| r.2), max_entities, &mut f.ecs_kept);
+            f.ecs_cut.clear();
+            for (&(_, first, _), &kept) in f.ecs_runs.iter().zip(&f.ecs_kept) {
+                f.ecs_cut
+                    .extend_from_slice(&f.ecs_order[first as usize..(first + kept) as usize]);
+            }
+            if !f.ecs_overflow {
+                tracing::error!(
+                    entities = f.ecs_order.len(),
+                    drawn = f.ecs_cut.len(),
+                    max_buffer_size = f.max_buffer_size,
+                    "ECS instance data exceeds the device's max_buffer_size; the largest batches \
+                     are not drawn whole (use InstanceBuffers for this many instances)"
+                );
+            }
         }
         f.ecs_overflow = overflow;
+        let ecs_order = if overflow { &f.ecs_cut } else { &f.ecs_order };
         // Matrices in batch order, diffed against last frame's.
         f.ecs.begin();
-        f.ecs
-            .write_gather(0, &f.ecs_order[..ecs_len], &f.ecs_matrices, &mut cpu_reallocs);
+        f.ecs.write_gather(0, ecs_order, &f.ecs_matrices, &mut cpu_reallocs);
         f.sources.clear();
-        for &(key, first, count) in &f.ecs_runs {
-            if first as usize >= ecs_len {
+        let mut cut_first = 0u32;
+        for (i, &(key, first, count)) in f.ecs_runs.iter().enumerate() {
+            let (first, count) = if overflow {
+                let kept = f.ecs_kept[i];
+                cut_first += kept;
+                (cut_first - kept, kept)
+            } else {
+                (first, count)
+            };
+            if count == 0 {
                 continue;
             }
-            let count = count.min(ecs_len as u32 - first);
-            let Some((mesh, triangles)) = assets.gpu_mesh(f.ecs_meshes[f.ecs_order[first as usize] as usize]) else {
+            let Some((mesh, triangles)) = assets.gpu_mesh(f.ecs_meshes[ecs_order[first as usize] as usize]) else {
                 continue;
             };
             // GPU culling reads the ECS buffer through one storage binding (from offset 0): a
@@ -1211,7 +1267,8 @@ impl Renderer {
             let fresh = !matches!(&f.explicit[slot], Some(g) if g.generation == im.instances.generation());
             if fresh {
                 // A reused slot must not pick up a bind group of the previous buffer.
-                f.cull_bgs.remove(&SourceBuffer::Explicit(slot as u32));
+                let reused = SourceBuffer::Explicit(slot as u32);
+                f.cull_bgs.retain(|(b, _), _| *b != reused);
                 use wgpu::BufferUsages as U;
                 let s = if f.storage { U::STORAGE } else { U::empty() };
                 f.explicit[slot] = Some(GpuInstances {
@@ -1288,11 +1345,12 @@ impl Renderer {
         }
         f.jobs.clear();
         f.dispatches.clear();
-        f.compacts.clear();
+        f.compact = None;
         f.views_buf.begin();
         f.cpu_visible.begin();
         f.cull_params.begin();
         f.cull_jobs.begin();
+        f.cull_planes.clear();
         f.templates.begin();
         f.run_meta.begin();
         f.compact_params.begin();
@@ -1350,7 +1408,6 @@ impl Renderer {
 
             let draws_start = f.draws.len();
             let jobs_start = f.jobs.len();
-            let runs_start = f.run_count;
             // Current multi-draw run: (layout, class, material, run_base, draw cmd index, first args).
             let mut run: Option<(u16, u8, u32, u64, usize, u32)> = None;
 
@@ -1460,7 +1517,9 @@ impl Renderer {
                             dst_word: (region / 4) as u32,
                             draw,
                             wg_start: 0,
-                            pad: [0; 2],
+                            // Set once the view's frustum slot is known (below).
+                            view: 0,
+                            pad: 0,
                         },
                     ));
                     // Upper bound until the readback of the visible count (see `render_frame`).
@@ -1477,7 +1536,11 @@ impl Renderer {
                 match s.buffer {
                     SourceBuffer::Ecs => {
                         let range = s.first as usize..(s.first + s.count) as usize;
-                        let order = &f.ecs_order[range];
+                        let order = if f.ecs_overflow {
+                            &f.ecs_cut[range]
+                        } else {
+                            &f.ecs_order[range]
+                        };
                         visible = if culling {
                             cull_mask(&f.ecs_matrices, order, s.mesh.sphere, &frustum, &mut f.cull_mask) as u32
                         } else {
@@ -1587,73 +1650,18 @@ impl Renderer {
                 stats.triangles += visible as u64 * tris;
             }
 
-            // Group this view's culling jobs by source buffer: one dispatch per buffer.
+            // This view's frustum, read by its culling jobs. The jobs of all views are grouped
+            // into dispatches after the loop.
             if f.jobs.len() > jobs_start {
-                let planes = if culling {
+                let planes: GpuFrustum = if culling {
                     frustum.planes.map(|p| p.to_array())
                 } else {
                     [[0.0, 0.0, 0.0, 1.0]; 6]
                 };
-                f.jobs[jobs_start..].sort_unstable_by_key(|(b, j)| (*b, j.draw));
-                let mut j = jobs_start;
-                while j < f.jobs.len() {
-                    let buffer = f.jobs[j].0;
-                    let job_start = (f.cull_jobs.len() / std::mem::size_of::<GpuCullJob>()) as u32;
-                    let mut wg = 0u32;
-                    let mut n = 0u32;
-                    while j < f.jobs.len() && f.jobs[j].0 == buffer {
-                        let job = &mut f.jobs[j].1;
-                        // Frame-global record index: jobs of all dispatches share the records.
-                        job.wg_start = f.wg_total + wg;
-                        wg += job.count.div_ceil(WORKGROUP);
-                        f.cull_jobs.push(bytemuck::bytes_of(job), &mut cpu_reallocs);
-                        n += 1;
-                        j += 1;
-                    }
-                    f.wg_total += wg;
-                    let wgs = dispatch_dims(wg);
-                    // Written after all views, once the record offset (`wg_word`) is known.
-                    let params = GpuCullParams {
-                        planes,
-                        job_start,
-                        job_count: n,
-                        total_workgroups: wg,
-                        workgroups_x: wgs.0,
-                        wg_word: 0,
-                        pad: [0; 3],
-                    };
-                    f.dispatches.push(Dispatch {
-                        buffer,
-                        params,
-                        params_offset: 0,
-                        wg: wgs,
-                    });
-                }
-                if path == DrawPath::GpuMultiDrawCount && f.run_count > runs_start {
-                    for d in &f.draws[draws_start..] {
-                        if let DrawKind::MultiCount { args_first, count, run } = d.kind {
-                            f.run_meta.write_at(
-                                run as usize * 8,
-                                bytemuck::cast_slice(&[args_first, count]),
-                                &mut cpu_reallocs,
-                            );
-                        }
-                    }
-                    let runs = f.run_count - runs_start;
-                    let wg = dispatch_dims(runs);
-                    let p = GpuCompactParams {
-                        run_start: runs_start,
-                        run_count: runs,
-                        workgroups_x: wg.0,
-                        pad: 0,
-                    };
-                    let off = f.compacts.len() * f.uniform_align.max(16);
-                    f.compact_params
-                        .write_at(off, bytemuck::bytes_of(&p), &mut cpu_reallocs);
-                    f.compacts.push(CompactDispatch {
-                        params_offset: off as u32,
-                        wg,
-                    });
+                let slot = f.cull_planes.len() as u32;
+                f.cull_planes.push(planes);
+                for (_, job) in &mut f.jobs[jobs_start..] {
+                    job.view = slot;
                 }
             }
 
@@ -1675,20 +1683,96 @@ impl Renderer {
         }
         stats.views = f.views.len() as u32;
 
-        // Cull params: the per-workgroup compaction records follow the indirect args.
+        // Culling dispatches: every job reading the same source buffer, over all views (in
+        // windows of CULL_VIEWS frustums), is one mark and one scatter dispatch — the dispatch
+        // count depends on the number of source buffers, not on buffers × views. Jobs keep
+        // their output regions and draws, so their order here does not change the image.
+        f.jobs
+            .sort_unstable_by_key(|(b, j)| (j.view as usize / CULL_VIEWS, *b, j.draw));
+        let mut j = 0;
+        while j < f.jobs.len() {
+            let buffer = f.jobs[j].0;
+            let window = f.jobs[j].1.view as usize / CULL_VIEWS;
+            let job_start = (f.cull_jobs.len() / std::mem::size_of::<GpuCullJob>()) as u32;
+            let mut wg = 0u32;
+            let mut n = 0u32;
+            while j < f.jobs.len() && f.jobs[j].0 == buffer && f.jobs[j].1.view as usize / CULL_VIEWS == window {
+                let job = &mut f.jobs[j].1;
+                // Frame-global record index: jobs of all dispatches share the records.
+                job.wg_start = f.wg_total + wg;
+                wg += job.count.div_ceil(WORKGROUP);
+                let gpu_job = GpuCullJob {
+                    view: job.view % CULL_VIEWS as u32,
+                    ..*job
+                };
+                f.cull_jobs.push(bytemuck::bytes_of(&gpu_job), &mut cpu_reallocs);
+                n += 1;
+                j += 1;
+            }
+            f.wg_total += wg;
+            let wgs = dispatch_dims(wg);
+            f.dispatches.push(Dispatch {
+                buffer,
+                // `wg_word` is set below, once the record offset is known.
+                params: GpuCullParams {
+                    job_start,
+                    job_count: n,
+                    total_workgroups: wg,
+                    workgroups_x: wgs.0,
+                    wg_word: 0,
+                    pad: [0; 3],
+                },
+                params_offset: 0,
+                window: window as u32,
+                wg: wgs,
+            });
+        }
+        if path == DrawPath::GpuMultiDrawCount && f.run_count > 0 {
+            // Draw compaction of every view's runs: one workgroup per run.
+            for d in &f.draws {
+                if let DrawKind::MultiCount { args_first, count, run } = d.kind {
+                    f.run_meta.write_at(
+                        run as usize * 8,
+                        bytemuck::cast_slice(&[args_first, count]),
+                        &mut cpu_reallocs,
+                    );
+                }
+            }
+            let wg = dispatch_dims(f.run_count);
+            let p = GpuCompactParams {
+                run_start: 0,
+                run_count: f.run_count,
+                workgroups_x: wg.0,
+                pad: 0,
+            };
+            f.compact_params.write_at(0, bytemuck::bytes_of(&p), &mut cpu_reallocs);
+            f.compact = Some(wg);
+        }
+
+        // Cull params: the frustums first, in whole windows of CULL_VIEWS (bound at fixed
+        // offsets, in the same uniform buffer so culling binds no extra buffer), then one
+        // params block per dispatch and the scan's (dynamic offsets; all offsets are
+        // multiples of FRUSTA_WINDOW or `params_stride`, hence aligned). The per-workgroup
+        // compaction records follow the indirect args.
         let wg_word = align_up(f.args_count as u64 * 5, 4) as u32;
+        f.cull_params
+            .write_at(0, bytemuck::cast_slice(&f.cull_planes), &mut cpu_reallocs);
+        let params_base = f.cull_planes.len().div_ceil(CULL_VIEWS) * FRUSTA_WINDOW;
+        f.cull_params.ensure_len(params_base, &mut cpu_reallocs);
         for (i, d) in f.dispatches.iter_mut().enumerate() {
             d.params.wg_word = wg_word;
-            d.params_offset = (i * params_stride) as u32;
-            f.cull_params
-                .write_at(i * params_stride, bytemuck::bytes_of(&d.params), &mut cpu_reallocs);
+            d.params_offset = (params_base + i * params_stride) as u32;
+            f.cull_params.write_at(
+                d.params_offset as usize,
+                bytemuck::bytes_of(&d.params),
+                &mut cpu_reallocs,
+            );
         }
         let job_total = (f.cull_jobs.len() / std::mem::size_of::<GpuCullJob>()) as u32;
         if job_total > 0 {
             // One prefix-sum workgroup per job, over the jobs of every view.
             let wg = dispatch_dims(job_total);
             let p = GpuCullParams {
-                planes: [[0.0; 4]; 6],
                 job_start: 0,
                 job_count: job_total,
                 total_workgroups: job_total,
@@ -1696,7 +1780,7 @@ impl Renderer {
                 wg_word,
                 pad: [0; 3],
             };
-            let off = f.dispatches.len() * params_stride;
+            let off = params_base + f.dispatches.len() * params_stride;
             f.cull_params.write_at(off, bytemuck::bytes_of(&p), &mut cpu_reallocs);
             f.scan = Some((off as u32, wg));
         }
@@ -1768,6 +1852,9 @@ impl Renderer {
         }
 
         // ---- bind groups ---------------------------------------------------------------
+        // Custom-shader pipelines whose (asynchronous, browser) validation failed since the
+        // last frame fall back to the built-in shader before anything is drawn with them.
+        pipelines.poll_pending(device);
         let vgen = f.views_buf.gpu.generation;
         if f.view_bg.as_ref().is_none_or(|(_, g)| *g != vgen) {
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1908,6 +1995,27 @@ impl Renderer {
         f.feedback.retain(|_, fb| fb.last_used + 60 > frame_index);
 
         if gpu && let Some(cull) = &pipelines.cull {
+            if frame_index.is_multiple_of(256) {
+                // Bind groups of windows no longer dispatched would keep reallocated buffers
+                // alive: drop the outdated ones.
+                let (params, jobs, out, args) = (
+                    f.cull_params.gpu.generation,
+                    f.cull_jobs.gpu.generation,
+                    f.cull_out.generation,
+                    f.args.generation,
+                );
+                let (ecs, explicit) = (f.ecs.gpu.generation, &f.explicit);
+                f.cull_bgs.retain(|(b, _), (_, g)| {
+                    let src = match b {
+                        SourceBuffer::Ecs => Some(ecs),
+                        SourceBuffer::Explicit(slot) => explicit
+                            .get(*slot as usize)
+                            .and_then(Option::as_ref)
+                            .map(|e| e.buf.generation),
+                    };
+                    src.is_some_and(|src| *g == [params, jobs, src, out, args])
+                });
+            }
             for d in 0..f.dispatches.len() {
                 let buffer = f.dispatches[d].buffer;
                 let src = match buffer {
@@ -1921,7 +2029,8 @@ impl Renderer {
                     f.cull_out.generation,
                     f.args.generation,
                 ];
-                if f.cull_bgs.get(&buffer).is_some_and(|(_, g)| *g == gens) {
+                let window = f.dispatches[d].window;
+                if f.cull_bgs.get(&(buffer, window)).is_some_and(|(_, g)| *g == gens) {
                     continue;
                 }
                 let max = f.max_storage_binding;
@@ -1949,11 +2058,19 @@ impl Renderer {
                             binding: 4,
                             resource: binding(f.args.get(), max),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: f.cull_params.buffer(),
+                                offset: window as u64 * FRUSTA_WINDOW as u64,
+                                size: wgpu::BufferSize::new(FRUSTA_WINDOW as u64),
+                            }),
+                        },
                     ],
                 });
-                f.cull_bgs.insert(buffer, (bg, gens));
+                f.cull_bgs.insert((buffer, window), (bg, gens));
             }
-            if !f.compacts.is_empty() {
+            if f.compact.is_some() {
                 let gens = [
                     f.compact_params.gpu.generation,
                     f.run_meta.gpu.generation,
@@ -2018,7 +2135,7 @@ impl Renderer {
         };
         let args_bytes = f.args_count as u64 * ARGS_SIZE;
         encoder.copy_buffer_to_buffer(f.templates.buffer(), 0, f.args.get(), 0, args_bytes);
-        if !f.compacts.is_empty() && f.run_count > 0 {
+        if f.compact.is_some() {
             encoder.clear_buffer(f.counts.get(), 0, Some(align_up(f.run_count as u64 * 4, 4)));
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2028,14 +2145,15 @@ impl Renderer {
         // Each dispatch is its own usage scope, so wgpu orders the passes' storage accesses.
         pass.set_pipeline(&cull.mark);
         for d in &f.dispatches {
-            let (bg, _) = &f.cull_bgs[&d.buffer];
+            let (bg, _) = &f.cull_bgs[&(d.buffer, d.window)];
             pass.set_bind_group(0, bg, &[d.params_offset]);
             pass.dispatch_workgroups(d.wg.0, d.wg.1, 1);
             self.stats.compute_dispatches += 1;
         }
         if let Some((offset, wg)) = f.scan {
             // The scan only touches jobs and args, which every cull bind group shares.
-            let (bg, _) = &f.cull_bgs[&f.dispatches[0].buffer];
+            let d = &f.dispatches[0];
+            let (bg, _) = &f.cull_bgs[&(d.buffer, d.window)];
             pass.set_pipeline(&cull.scan);
             pass.set_bind_group(0, bg, &[offset]);
             pass.dispatch_workgroups(wg.0, wg.1, 1);
@@ -2043,20 +2161,18 @@ impl Renderer {
         }
         pass.set_pipeline(&cull.scatter);
         for d in &f.dispatches {
-            let (bg, _) = &f.cull_bgs[&d.buffer];
+            let (bg, _) = &f.cull_bgs[&(d.buffer, d.window)];
             pass.set_bind_group(0, bg, &[d.params_offset]);
             pass.dispatch_workgroups(d.wg.0, d.wg.1, 1);
             self.stats.compute_dispatches += 1;
         }
         if let Some((bg, _)) = &f.compact_bg
-            && !f.compacts.is_empty()
+            && let Some(wg) = f.compact
         {
             pass.set_pipeline(&cull.compact);
-            for c in &f.compacts {
-                pass.set_bind_group(0, bg, &[c.params_offset]);
-                pass.dispatch_workgroups(c.wg.0, c.wg.1, 1);
-                self.stats.compute_dispatches += 1;
-            }
+            pass.set_bind_group(0, bg, &[0]);
+            pass.dispatch_workgroups(wg.0, wg.1, 1);
+            self.stats.compute_dispatches += 1;
         }
         drop(pass);
         // Visible counts for `RenderStats`, read back without waiting (see `readback.rs`).
@@ -2560,6 +2676,84 @@ mod tests {
         assert!(app.resources.expect::<crate::RenderStats>().compute_dispatches > 0);
     }
 
+    /// Regression: culling ran one mark and one scatter dispatch per (view, source buffer), so
+    /// a scene with 120 small buffers and 13 views took 3121 dispatches (and wgpu-hal's Metal
+    /// backend allocates in each). The jobs of all views reading one buffer now share a
+    /// dispatch, each job selecting its view's frustum: 70 views (two windows of frustums) ×
+    /// 4 buffers take 2 × 2 × 4 + 1 dispatches, and the image equals CpuDirect's.
+    #[test]
+    fn culling_dispatches_scale_with_buffers_not_views() {
+        use crate::{Camera3d, InstanceBuffer, InstanceTransform, InstancedMesh, Mesh3d, RenderStats};
+        use space3d_core::{MeshData, Transform};
+        const VIEWS: usize = 70;
+        let Some(mut app) = headless_app(140, 100) else { return };
+        let best = app.resources.expect::<Renderer>().capabilities().best_draw_path;
+        if best == DrawPath::CpuDirect {
+            return;
+        }
+        let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.2));
+        for i in 0..300 {
+            let p = Vec3::new((i % 30) as f32 * 0.4 - 6.0, (i / 30) as f32 * 0.4 - 2.0, 0.0);
+            app.world.spawn((
+                Transform::from_xyz(p.x, p.y, p.z),
+                Mesh3d(mesh),
+                Material::unlit(Vec4::new(1.0, 0.3, 0.1, 1.0)),
+            ));
+        }
+        for k in 0..3 {
+            let data = (0..200)
+                .map(|i| {
+                    let p = Vec3::new(
+                        (i % 40) as f32 * 0.3 - 6.0,
+                        k as f32 * 1.2 - 2.5 + (i / 40) as f32 * 0.2,
+                        -1.0,
+                    );
+                    InstanceTransform::from_trs(p, glam::Quat::IDENTITY, Vec3::ONE)
+                })
+                .collect();
+            let instances = app
+                .resources
+                .expect_mut::<InstanceBuffers>()
+                .insert(InstanceBuffer::from_vec(data, crate::BufferUsage::Static));
+            app.world.spawn((InstancedMesh {
+                mesh,
+                material: Material::unlit(Vec4::new(0.1, 0.4 + 0.25 * k as f32, 1.0, 1.0)),
+                instances,
+            },));
+        }
+        // A 10 × 7 grid of viewports; each camera looks at a different part of the scene
+        // through a narrow frustum, so every view culls differently.
+        for v in 0..VIEWS {
+            let (col, row) = ((v % 10) as f32, (v / 10) as f32);
+            app.world.spawn((
+                Transform::from_xyz(col * 1.3 - 6.0, row * 0.7 - 2.5, 5.0),
+                Camera3d {
+                    viewport: Some([col / 10.0, row / 7.0, 0.1, 1.0 / 7.0]),
+                    order: v as i32,
+                    ..Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 0.0, 1.0))
+                },
+            ));
+        }
+        set_path(&mut app, DrawPath::CpuDirect);
+        let cpu = crate::render_to_image(&mut app).expect("capture");
+        assert!(app.resources.expect::<RenderStats>().culled > 0, "views cull");
+        for path in paths_up_to(best).skip(1) {
+            set_path(&mut app, path);
+            let img = crate::render_to_image(&mut app).expect("capture");
+            let d = differing_px(&cpu, &img);
+            assert_eq!(d, 0, "{path:?} differs from CpuDirect in {d} px");
+            let r = app.resources.expect::<Renderer>();
+            assert_eq!(r.gpu_error_count(), 0, "{path:?}");
+            assert_eq!(r.frame.jobs.len(), VIEWS * 4, "{path:?}: every source GPU-culled");
+            let compact = u32::from(path == DrawPath::GpuMultiDrawCount);
+            assert_eq!(
+                app.resources.expect::<RenderStats>().compute_dispatches,
+                2 * 2 * 4 + 1 + compact,
+                "{path:?}: mark + scatter per buffer and frustum window, one scan"
+            );
+        }
+    }
+
     /// Headless app on a device created with these limits, so wgpu's own validation fails past
     /// them (not only the renderer's copy of the limits). `None` without an adapter.
     fn limited_app(w: u32, h: u32, max_buffer: u64, max_binding: u64) -> Option<space3d_core::App> {
@@ -2589,23 +2783,62 @@ mod tests {
         img.pixels.chunks(4).filter(|p| p[..3] == rgb).count()
     }
 
-    /// `n` unlit cubes of edge 0.04 in a grid `side` wide, from `(x0, -3)` spanning 4 × 6 units.
+    /// `n` unlit cubes in a grid `side` wide, from `(x0, -3)` spanning 4 × 6 units.
     fn spawn_grid(app: &mut space3d_core::App, mesh: MeshHandle, n: usize, side: usize, x0: f32, rgb: [f32; 3]) {
+        spawn_grid_part(app, mesh, n, n, side, x0, rgb);
+    }
+
+    /// The first `n` cubes of the [`spawn_grid`] of `total` cubes (at the same positions).
+    fn spawn_grid_part(
+        app: &mut space3d_core::App,
+        mesh: MeshHandle,
+        n: usize,
+        total: usize,
+        side: usize,
+        x0: f32,
+        rgb: [f32; 3],
+    ) {
         use crate::Mesh3d;
         use space3d_core::Transform;
         let material = Material::unlit(glam::Vec4::new(rgb[0], rgb[1], rgb[2], 1.0));
         for i in 0..n {
             let x = x0 + (i % side) as f32 * 4.0 / side as f32;
-            let y = (i / side) as f32 * 6.0 / (n.div_ceil(side)) as f32 - 3.0;
+            let y = (i / side) as f32 * 6.0 / (total.div_ceil(side)) as f32 - 3.0;
             app.world
                 .spawn((Transform::from_xyz(x, y, 0.0), Mesh3d(mesh), material.clone()));
         }
     }
 
+    #[test]
+    fn fair_share_cuts_the_largest_batches() {
+        let mut kept = Vec::new();
+        let mut share = |counts: &[u32], cap: u64| {
+            fair_share(counts.iter().copied(), cap, &mut kept);
+            kept.clone()
+        };
+        assert_eq!(share(&[60_000, 10_000, 1], 65_536), [55_535, 10_000, 1]);
+        assert_eq!(share(&[1, 60_000, 10_000], 65_536), [1, 55_535, 10_000]);
+        // Equal batches share the cut; the remainder goes to the first ones.
+        assert_eq!(share(&[5, 5, 5], 7), [3, 2, 2]);
+        assert_eq!(share(&[9, 4, 9], 20), [8, 4, 8]);
+        assert_eq!(share(&[9, 4, 9], 21), [9, 4, 8]);
+        // Everything fits: unchanged.
+        assert_eq!(share(&[10, 20], 30), [10, 20]);
+        assert_eq!(share(&[10, 20], 1000), [10, 20]);
+        assert_eq!(share(&[3, 3], 0), [0, 0]);
+        assert_eq!(share(&[], 5), [] as [u32; 0]);
+        for cap in 0..40 {
+            let k = share(&[17, 2, 11, 0, 6], cap);
+            assert_eq!(k.iter().map(|&x| x as u64).sum::<u64>(), cap.min(36), "cap {cap}");
+        }
+    }
+
     /// Regression: the `ecs` instance buffer grew to whatever the scene needed. Past the
     /// device's `max_buffer_size` creating it failed validation and every frame was lost,
-    /// unrelated objects included (a panic in debug builds). The matrices past the limit, in
-    /// batch order, are now not drawn (logged once): the frame equals the scene without them.
+    /// unrelated objects included (a panic in debug builds). Then the matrices past the limit
+    /// were dropped in batch order, so a small batch sorting after a huge one vanished whole.
+    /// Now the largest batch is cut (logged once): the frame equals the scene without the cut
+    /// entities, and the small batches are all drawn.
     #[test]
     fn ecs_instances_past_max_buffer_size_are_cut_not_fatal() {
         use crate::{Camera3d, RenderStats};
@@ -2614,16 +2847,17 @@ mod tests {
         const MAX: u64 = crate::gpu::STAGING_CHUNK;
         const FIT: usize = (MAX / 64) as usize;
         const RED: usize = 60_000;
-        // A red grid on the left and a green one on the right, whose last rows do not fit.
-        let build = |green: usize| {
+        const GREEN: usize = 10_000;
+        // A red grid on the left, a green one on the right and one cyan cube (its own
+        // material, the last batch); `red` of the RED red cubes are spawned.
+        let build = |red: usize| {
             let mut app = limited_app(96, 64, MAX, MAX)?;
             let mesh = app
                 .resources
                 .expect_mut::<RenderAssets>()
                 .add_mesh(MeshData::cube(0.04));
-            spawn_grid(&mut app, mesh, RED, 250, -5.0, [1.0, 0.0, 0.0]);
-            // Rows of 100: the reference keeps only the rows that fit (`green` < 10 000).
-            for i in 0..green {
+            spawn_grid_part(&mut app, mesh, red, RED, 250, -5.0, [1.0, 0.0, 0.0]);
+            for i in 0..GREEN {
                 let x = 1.0 + (i % 100) as f32 * 0.04;
                 let y = (i / 100) as f32 * 0.06 - 3.0;
                 app.world.spawn((
@@ -2632,6 +2866,12 @@ mod tests {
                     Material::unlit(glam::Vec4::new(0.0, 1.0, 0.0, 1.0)),
                 ));
             }
+            let cube = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.6));
+            app.world.spawn((
+                Transform::from_xyz(-0.5, 2.0, 0.0),
+                crate::Mesh3d(cube),
+                Material::unlit(glam::Vec4::new(0.0, 1.0, 1.0, 1.0)),
+            ));
             app.world.spawn((
                 Transform::from_xyz(0.0, 0.0, 8.0),
                 Camera3d::default().with_clear_color(glam::Vec4::new(0.0, 0.0, 0.0, 1.0)),
@@ -2644,7 +2884,7 @@ mod tests {
         let best = probe.resources.expect::<Renderer>().capabilities().best_draw_path;
         drop(probe);
         for path in paths_up_to(best) {
-            let mut app = build(10_000).expect("adapter");
+            let mut app = build(RED).expect("adapter");
             set_path(&mut app, path);
             // Two frames: the first allocates, the second diffs against the shadow.
             crate::render_to_image(&mut app).expect("capture");
@@ -2653,9 +2893,16 @@ mod tests {
             assert_eq!(r.gpu_error_count(), 0, "{path:?}");
             assert!(r.frame.ecs_overflow, "{path:?}");
             assert!(r.frame.ecs.gpu.capacity() <= MAX, "{path:?}");
-            assert_eq!(app.resources.expect::<RenderStats>().instances, FIT as u64, "{path:?}");
+            assert_eq!(
+                r.frame.ecs_kept,
+                [(FIT - GREEN - 1) as u32, GREEN as u32, 1],
+                "{path:?}"
+            );
+            let stats = app.resources.expect::<RenderStats>();
+            assert_eq!((stats.instances, stats.batches), (FIT as u64, 3), "{path:?}");
 
-            let mut app = build(FIT - RED).expect("adapter");
+            // The same scene without the red cubes that were cut.
+            let mut app = build(FIT - GREEN - 1).expect("adapter");
             set_path(&mut app, path);
             let reference = crate::render_to_image(&mut app).expect("capture");
             assert!(
@@ -2668,7 +2915,8 @@ mod tests {
                 "{path:?}: differs from the scene without the cut entities in {d} px"
             );
             assert!(count_px(&cut, [255, 0, 0]) > 500, "{path:?}: red grid");
-            assert!(count_px(&cut, [0, 255, 0]) > 200, "{path:?}: green rows that fit");
+            assert!(count_px(&cut, [0, 255, 0]) > 300, "{path:?}: green grid");
+            assert!(count_px(&cut, [0, 255, 255]) > 20, "{path:?}: the cyan cube");
         }
     }
 
@@ -3259,6 +3507,71 @@ mod tests {
         app.resources.expect_mut::<RenderAssets>().remove_shader(h);
         app.step_ticks(256);
         assert_eq!(counts(&app), (0, 0));
+    }
+
+    /// Regression: on browser WebGPU the error scope around a custom-shader pipeline answers
+    /// asynchronously and the answer was dropped, so an invalid pipeline stayed cached and
+    /// every frame drawing with it was lost. Pending answers are now polled each frame and an
+    /// invalid pipeline is replaced by the built-in one (reported through `shader_error`).
+    /// Native backends answer at once, so the pending answer is injected here.
+    #[test]
+    fn custom_pipelines_rejected_asynchronously_fall_back() {
+        use crate::{Camera3d, CustomShader, Mesh3d};
+        use space3d_core::{MeshData, Transform};
+        let Some(mut app) = headless_app(16, 16) else { return };
+        let green = "fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }";
+        let (mesh, h) = {
+            let a = app.resources.expect_mut::<RenderAssets>();
+            (
+                a.add_mesh(MeshData::cube(1.0)),
+                a.add_shader(CustomShader::new("green", green)),
+            )
+        };
+        app.world.spawn((
+            Transform::default(),
+            Mesh3d(mesh),
+            Material::unlit(Vec4::new(1.0, 0.0, 0.0, 1.0)).with_shader(h),
+        ));
+        app.world
+            .spawn((Transform::from_xyz(0.0, 0.0, 3.0), Camera3d::default()));
+        let center = |app: &mut space3d_core::App| crate::render_to_image(app).expect("capture").get(8, 8);
+        assert_eq!(center(&mut app), [0, 255, 0, 255], "custom shader");
+
+        // Every frame until the (injected) answer arrives draws with the custom pipeline; the
+        // first frame after it draws with the built-in one.
+        let answer = |app: &mut space3d_core::App, error: Option<&str>| {
+            let p = &mut app.resources.expect_mut::<Renderer>().pipelines;
+            for key in p.custom_keys() {
+                p.defer_validation(key, error.map(str::to_owned));
+            }
+            for _ in 0..1000 {
+                let img = crate::render_to_image(app).expect("capture");
+                if app.resources.expect::<Renderer>().pipelines.pending_count() == 0 {
+                    return img.get(8, 8);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("the injected answer never resolved");
+        };
+        assert_eq!(answer(&mut app, None), [0, 255, 0, 255], "valid: kept");
+        assert_eq!(app.resources.expect::<Renderer>().shader_error(h), None);
+        assert_eq!(answer(&mut app, Some("injected: invalid pipeline")), [255, 0, 0, 255]);
+        let r = app.resources.expect::<Renderer>();
+        assert_eq!(r.shader_error(h), Some("injected: invalid pipeline"));
+        assert_eq!(r.pipelines.custom_keys().len(), 1, "the key maps to the fallback");
+        assert_eq!(center(&mut app), [255, 0, 0, 255], "stays on the built-in shader");
+
+        // Answers for a version replaced meanwhile are dropped with it.
+        let p = &mut app.resources.expect_mut::<Renderer>().pipelines;
+        for key in p.custom_keys() {
+            p.defer_validation(key, Some("stale".into()));
+        }
+        app.resources
+            .expect_mut::<RenderAssets>()
+            .update_shader(h, CustomShader::new("green", format!("{green}\nfn v2() {{}}")));
+        assert_eq!(center(&mut app), [0, 255, 0, 255], "new version");
+        let r = app.resources.expect::<Renderer>();
+        assert_eq!((r.pipelines.pending_count(), r.shader_error(h)), (0, None));
     }
 
     #[test]

@@ -51,7 +51,8 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
                           for edited blocks) → one draw per visible run of blocks
    Gpu*:       each cullable source → CullJob + output region in `cull_out`
                                     + DrawIndexedIndirectArgs template
-               jobs grouped per source buffer → one mark + one scatter dispatch each
+ Gpu*: the jobs of all views grouped per source buffer (views in windows of 64 frustums)
+       → one mark + one scatter dispatch each, one scan, [one compaction]
 
  flush TrackedBuffers (only changed bytes) ─► staging ring ─► copy_buffer_to_buffer
    (CpuDirect: `ecs` uploads only ranges drawn from it; the rest stays pending)
@@ -163,8 +164,16 @@ GPU culling (`shaders/cull.wgsl`):
 
 * A **job** per (view, source): source word offset, count, stride, how to decode position/scale
   (`CullSource::Matrix`, or `TranslationScale` in f32 or f16), mesh bounding sphere, output
-  region, indirect-args index. Jobs of the same source buffer share one dispatch; each workgroup finds
-  its job by binary search over `wg_start`, so a dispatch covers any number of batches.
+  region, indirect-args index and its view's frustum. The jobs of *all views* that read the
+  same source buffer share one dispatch: each workgroup finds its job by binary search over
+  `wg_start`, and the job selects its view's six planes in a uniform array of 64 frustums
+  (views past 64 go to further windows: one more mark + scatter dispatch per buffer and 64
+  views, each window bound at its own fixed offset). The frustums sit at the start of the
+  cull-params uniform buffer, so culling binds no extra buffer and no extra dynamic offset
+  (either costs wgpu an allocation per frame). The dispatch count therefore depends on the
+  number of source buffers, not on buffers × views: 120 explicit buffers seen by 13 views
+  take 241 dispatches (it was 3121 with a mark + scatter dispatch per view and buffer —
+  `frame::tests::culling_dispatches_scale_with_buffers_not_views`).
 * **Order-preserving compaction** in three dispatches, so GPU paths draw visible instances in
   exactly the CPU path's order (alpha blending and equal-depth surfaces are deterministic):
   1. `cull_mark`: 64 instances per workgroup; the frustum test result becomes a 64-bit mask
@@ -185,9 +194,10 @@ GPU culling (`shaders/cull.wgsl`):
   regions are contiguous (run base aligned to 256 B) and `first_instance` is relative to the run
   base, so a run is a single multi-draw. Meshes differ only in `first_index/base_vertex` thanks to
   the mesh arena — no rebinding inside a run.
-* `GpuMultiDrawCount` adds `compact.wgsl`: one workgroup per run moves the run's non-empty
-  args to its front **in their original order** (block counts + prefix sum) and stores the
-  count, so `multi_draw_indexed_indirect_count` skips fully culled batches.
+* `GpuMultiDrawCount` adds `compact.wgsl`: one workgroup per run (one dispatch for the runs of
+  every view) moves the run's non-empty args to its front **in their original order** (block
+  counts + prefix sum) and stores the count, so `multi_draw_indexed_indirect_count` skips
+  fully culled batches.
 * Explicit buffers larger than `max_storage_buffer_binding_size`, ECS batches that end past
   it in the `ecs` buffer (bound from offset 0, so the batches before them keep GPU culling:
   `frame::tests::ecs_batches_inside_the_storage_binding_keep_gpu_culling`), and output regions
@@ -224,15 +234,20 @@ Each (instance layout, sRGB mode, texture kind, shader version) gets its own mod
 pipelines, cached like the built-in ones; the material's shader is part of its identity and
 of the batch order. `update_shader` (hot reload) bumps a version that drops the old
 pipelines; `remove_shader` reverts its materials to the built-in shader, and the pipelines of
-removed shaders are released at the next 256-frame sweep. A shader that does not compile is
-validated with naga first (the portable capability set) and its pipeline is created inside a
-validation error scope, so the error never reaches the uncaptured-error handler: it is logged
-once, reported by `Renderer::shader_error`, and the draws fall back to the built-in shader.
-(Native backends resolve the error scope immediately; in the browser its result arrives
-asynchronously and is not waited for, so there naga's validation is the check.)
-Custom shaders cannot declare their own bindings, and culling still uses the instance's
-position and scale (a vertex hook that moves geometry far outside the mesh bounds can be culled
-while visible).
+removed shaders are released at the next 256-frame sweep. A custom shader is validated with
+naga first (the portable capability set), which includes a check that it declares no
+resources of its own — naga accepts those, but the forward pipeline layout has no bindings for
+them, so their pipeline would be invalid. Its pipeline is then created inside validation and
+internal error scopes, so no error reaches the uncaptured-error handler: a failure is logged
+once, reported by `Renderer::shader_error`, and the draws of that pipeline key fall back to the
+built-in shader. Native backends answer the scopes immediately. In the browser the answer
+arrives asynchronously: the pipeline is used meanwhile, the answer is polled every frame
+(`Pipelines::poll_pending`), and an invalid pipeline is then replaced by the built-in one —
+so an invalid custom pipeline costs at most the few frames until the browser answers
+(`frame::tests::custom_pipelines_rejected_asynchronously_fall_back` injects such an answer;
+`tests/custom_shader.rs::custom_shaders_declaring_their_own_bindings_fall_back`).
+Culling still uses the instance's position and scale (a vertex hook that moves geometry far
+outside the mesh bounds can be culled while visible).
 
 ## CPU → GPU transfer
 
@@ -339,7 +354,7 @@ frame's content, like a video feedback loop.
 | `cpu_visible` | VERTEX | persistent | shadow diff (CPU path, partially visible batches) |
 | view uniforms | UNIFORM, dynamic offset per camera | persistent | shadow diff |
 | material uniforms | UNIFORM, dynamic offset per material | persistent | on intern only |
-| cull params / jobs / templates | UNIFORM / STORAGE / COPY_SRC | persistent | shadow diff |
+| cull params (+ view frustums) / jobs / templates | UNIFORM / STORAGE / COPY_SRC | persistent | shadow diff |
 | `cull_out`, args (+ compaction records), compacted args, counts | STORAGE+VERTEX / STORAGE+INDIRECT (args also COPY_SRC for the stats readback) | persistent, 1.5× | GPU only (compute, copy, clear) |
 | run meta (multi-draw-count runs) | STORAGE | persistent | shadow diff |
 | render-target feedback copies | TEXTURE_BINDING+COPY_DST | while a view samples its own target (+60 frames) | GPU copy before the pass |
@@ -347,15 +362,29 @@ frame's content, like a video feedback loop.
 | capture readback | MAP_READ | per capture | GPU copy |
 | culling-stats readback (3) | MAP_READ | persistent ring, 1.5× (all idle slots grow together) | GPU copy of the indirect args |
 
-Every `GrowBuffer` (1.5× growth) is clamped to the device's `max_buffer_size`; callers keep the
-requested size itself within it (a larger buffer fails validation, which loses the whole frame):
-explicit instance buffers over the limit are logged and not drawn; ECS matrices past it (more
-than `max_buffer_size / 64` entities — 4 194 304 at WebGPU's default 256 MiB) are not drawn, in
-batch order, the batch crossing the limit cut and the overflow logged once; and a partially
-visible ECS batch that no longer fits `cpu_visible` (which accumulates every view's) is drawn
-whole from `ecs`, unculled (`frame::tests::ecs_instances_past_max_buffer_size_are_cut_not_fatal`,
+Every `GrowBuffer` (1.5× growth) is clamped to the device's `max_buffer_size`. A larger
+buffer fails validation, which loses the whole frame, so the buffers whose size the scene
+drives keep the requested size itself within the limit: explicit instance buffers over it are
+logged and not drawn; ECS matrices past it (more than `max_buffer_size / 64` entities) are cut
+from the largest batches — every batch keeps up to the same count, so the small batches of
+other materials or meshes are drawn whole whatever their sort order — and the overflow is
+logged once; a partially visible ECS batch that no longer fits `cpu_visible` (which
+accumulates every view's) is drawn whole from `ecs`, unculled; `cull_out` and the indirect
+args (with their records) are bounded by the storage-binding checks of GPU culling
+(`frame::tests::ecs_instances_past_max_buffer_size_are_cut_not_fatal`,
 `partially_visible_ecs_past_max_buffer_size_is_drawn_unculled`; both run on a device created
-with those limits, so wgpu validates them).
+with those limits, so wgpu validates them). The other renderer buffers (materials, view
+uniforms, cull jobs and params, draw templates, run meta) grow with the number of distinct
+materials, views and draws — 20–256 B each, so reaching `max_buffer_size` would take millions
+of them — and are not checked: past the limit they would fail validation (and trip
+`GrowBuffer`'s debug assertion first).
+
+Textures are bounded the same way by `max_texture_dimension_2d`: image textures over it are
+refused (sampled as white), render targets over it are not created — logged; cameras
+targeting them are skipped and materials sample white — until `resize_render_target` brings
+them within it, and the primary target (window surface or headless target) is clamped to it
+per axis (`Renderer::size` reports the clamped size;
+`tests/headless.rs::targets_past_the_texture_size_limit_do_not_lose_frames`).
 
 ## Allocation in the steady state
 **Renderer code allocates nothing per frame.** All per-frame scratch (ECS keys/rows/matrices/
@@ -387,6 +416,10 @@ Backtraces of one traced frame per case put every allocation inside a wgpu, wgpu
 call, except rayon's injector queue (crossbeam-deque), which allocates one block per 63 jobs
 submitted from outside the pool — about once every 15–60 frames. The culling-stats readback
 accounts for 7–8 of the GPU paths' allocations. No bytes stay allocated across frames.
+wgpu-hal's Metal backend allocates in every compute dispatch and bind, so the GPU paths'
+count grows with the number of culling dispatches — two per source buffer (and window of 64
+views), whatever the number of views: 40 explicit buffers seen by 4 views allocate 298 times
+per frame on `GpuMultiDraw` (544 when every view had its own dispatches; `CpuDirect`: 124).
 
 `tests/alloc.rs` pins this: a scene with 40k moving ECS entities (two materials, one
 textured), a 100k-instance dynamic buffer rewritten every frame, an f16 buffer and a custom
@@ -438,7 +471,14 @@ overlapping alpha-blended instances repeatedly and against CpuDirect).
 The renderer installs a wgpu uncaptured-error handler: errors are logged through `tracing`
 (the first 16, then every 1000th) and counted (`Renderer::gpu_error_count`). Debug builds and
 tests still panic on them so bugs surface; release builds keep running instead of taking wgpu's
-default panic. A device-lost callback logs as well. On `CurrentSurfaceTexture::Outdated` the
+default panic. A device-lost callback logs as well and records the loss: every resource
+created after it is invalid and every use of one is an error, which from then on is only
+logged, in debug builds too. Captures run inside a validation error scope, so their errors
+become the capture's `Err` (and `render_to_image`'s `None`) rather than uncaptured errors —
+this also covers the time between `Device::destroy` and the callback, which wgpu only fires
+once in-flight work has finished. A lost device thus degrades (captures fail, frames are
+dropped) instead of crashing (`tests/headless.rs::a_lost_device_degrades_instead_of_panicking`,
+`renderer::tests::errors_after_device_loss_do_not_panic_in_debug`). On `CurrentSurfaceTexture::Outdated` the
 surface is reconfigured; on `Lost` it is dropped (`has_surface()` turns false, frames render
 offscreen) because a lost surface must be recreated from the window with `set_surface`, and
 reconfiguring it fails validation.
@@ -503,6 +543,14 @@ about 35 % in the 64 MB staging copy, 27 % in the serial per-entity key pass (ma
 interning, visibility and mesh checks) and 38 % in the parallel matrix gather and diff, so 1M+
 dynamic objects belong in `InstanceBuffer`s. Allocation counts are in [Allocation in the steady state](#allocation-in-the-steady-state).
 
+Many small GPU-culled buffers seen by many views (120 explicit buffers of 50 instances, 12
+render-target views + the primary, 128×96; per frame, CPU submit / CPU + GPU wall; three
+interleaved runs, load ≈ 20–27): culling dispatches per source buffer for all views cut
+`GpuMultiDraw` from 1.2–1.6 / 9.7–10.6 ms (3121 dispatches) to 0.45–0.6 / 1.9–2.6 ms (241);
+the pre-`render-fixes` renderer, with one unordered dispatch per view and buffer, took
+0.8–1.0 / 6.9–7.3 ms (1560), `CpuDirect` 0.25 / 0.8 ms. Typical scenes (4 buffers × 100k
+instances, 2 views) are unchanged within noise (25 → 9 dispatches).
+
 ## Known limitations
 * No shadows, IBL or post-processing; lighting is metallic/roughness Blinn-Phong with Schlick
   Fresnel, 4 directional + 16 point lights.
@@ -514,7 +562,12 @@ dynamic objects belong in `InstanceBuffer`s. Allocation counts are in [Allocatio
 * Transparent instances are not depth-sorted within a batch.
 * ECS extraction interns materials and checks meshes serially (the matrix gather and diff are
   parallel); instance layouts whose position is not f32/f16 are not culled per instance.
-* ECS entities past `max_buffer_size / 64` (4 194 304 on WebGPU/WebGL2 defaults) are not drawn;
-  that many objects belong in `InstanceBuffer`s.
+* ECS entities past `max_buffer_size / 64` are not all drawn (the largest batches are cut).
+  The renderer requests the adapter's own limits, so this is 4 194 304 entities only where the
+  adapter reports WebGPU's 256 MiB default; native adapters and browsers usually report more,
+  and wgpu's GL backend reports `i32::MAX` (33.5 M entities). That many objects belong in
+  `InstanceBuffer`s anyway.
+* Render targets larger than `max_texture_dimension_2d` are not created, and the primary
+  target is clamped to it (see Buffer lifetimes).
 * Custom shaders are hooks inside the forward shader: they cannot declare bindings or replace
   the lighting model's inputs, and culling ignores vertex displacement.

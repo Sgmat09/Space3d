@@ -51,11 +51,17 @@ pub(crate) struct GpuMaterial {
     pub params: [f32; 4],
 }
 
+/// Views whose frustums one culling dispatch can read: the `frusta` uniform of cull.wgsl
+/// (`CULL_VIEWS * 96` bytes = 6 KiB, a multiple of every allowed uniform offset alignment).
+pub(crate) const CULL_VIEWS: usize = 64;
+
+/// Frustum planes of one view (`frusta` in cull.wgsl: 6 × `vec4<f32>` per view).
+pub(crate) type GpuFrustum = [[f32; 4]; 6];
+
 /// Matches `CullParams` in cull.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 pub(crate) struct GpuCullParams {
-    pub planes: [[f32; 4]; 6],
     pub job_start: u32,
     pub job_count: u32,
     pub total_workgroups: u32,
@@ -80,7 +86,9 @@ pub(crate) struct GpuCullJob {
     pub dst_word: u32,
     pub draw: u32,
     pub wg_start: u32,
-    pub pad: [u32; 2],
+    /// Frustum of the job's view in the dispatch's `frusta` window (`< CULL_VIEWS`).
+    pub view: u32,
+    pub pad: u32,
 }
 
 /// Matches `CompactParams` in compact.wgsl.
@@ -327,12 +335,56 @@ pub(crate) fn forward_shader(
 
 /// Parse and validate WGSL with naga (the portable subset: no optional capabilities), with a
 /// readable error message.
+#[cfg(test)]
 pub(crate) fn validate_wgsl(src: &str) -> Result<(), String> {
+    parse_and_validate(src).map(drop)
+}
+
+fn parse_and_validate(src: &str) -> Result<wgpu::naga::Module, String> {
     use wgpu::naga;
     let module = naga::front::wgsl::parse_str(src).map_err(|e| e.emit_to_string(src))?;
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
         .validate(&module)
         .map_err(|e| e.emit_to_string(src))?;
+    Ok(module)
+}
+
+/// Resources the forward template declares, `(group, binding, name)`: the only ones in the
+/// forward pipeline layout, so the only ones a custom shader can use.
+const TEMPLATE_RESOURCES: [(u32, u32, &str); 4] = [
+    (0, 0, "view"),
+    (1, 0, "material"),
+    (1, 1, "base_tex"),
+    (1, 2, "base_sampler"),
+];
+
+/// [`validate_wgsl`] for a forward shader with a custom shader spliced in, which may declare
+/// no resources of its own. naga accepts such modules, but their pipeline fails validation
+/// against the layout — detected here synchronously, because on browser WebGPU the error
+/// scope around pipeline creation only answers later (see [`Pipelines::poll_pending`]).
+pub(crate) fn validate_custom_wgsl(src: &str) -> Result<(), String> {
+    use wgpu::naga::AddressSpace as A;
+    let module = parse_and_validate(src)?;
+    for (_, g) in module.global_variables.iter() {
+        let name = g.name.as_deref().unwrap_or("<unnamed>");
+        let allowed = match g.space {
+            A::Function | A::Private | A::WorkGroup => true,
+            _ => g
+                .binding
+                .as_ref()
+                .is_some_and(|b| TEMPLATE_RESOURCES.contains(&(b.group, b.binding, name))),
+        };
+        if !allowed {
+            let at = g.binding.as_ref().map_or(String::new(), |b| {
+                format!(" at @group({}) @binding({})", b.group, b.binding)
+            });
+            return Err(format!(
+                "custom shaders cannot declare resources: `{name}` ({:?}){at} is not bound by the \
+                 forward pipeline (only `view`, `material`, `base_tex` and `base_sampler` are)",
+                g.space
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -422,6 +474,14 @@ pub(crate) struct CullPipelines {
     pub compact: wgpu::ComputePipeline,
 }
 
+/// A custom-shader forward pipeline in use while its validation result is still unknown.
+struct PendingPipeline {
+    key: PipelineKey,
+    module_key: ModuleKey,
+    /// Error message, if the pipeline (or its module) turned out to be invalid.
+    error: space3d_tasks::Task<Option<String>>,
+}
+
 /// Mip-generation blit for one source view dimension (`[single-layer, array]`).
 struct Blit {
     bgl: wgpu::BindGroupLayout,
@@ -441,6 +501,9 @@ pub(crate) struct Pipelines {
     custom: FastMap<ShaderHandle, (u32, Arc<CustomShader>)>,
     /// First build error of a custom shader version.
     custom_errors: FastMap<ShaderHandle, (u32, String)>,
+    /// Custom-shader pipelines whose error scope has not answered yet (browser WebGPU; native
+    /// backends answer immediately). See [`Self::poll_pending`].
+    pending: Vec<PendingPipeline>,
     /// Registered instance layouts; index = layout id.
     pub layouts: Vec<&'static InstanceLayout>,
     pub cull: Option<CullPipelines>,
@@ -531,6 +594,15 @@ impl Pipelines {
                     storage_entry(2, true),
                     storage_entry(3, false),
                     storage_entry(4, false),
+                    // Frustums of up to CULL_VIEWS views (a uniform: storage bindings stay at
+                    // four, the minimum some GLES devices offer). A static offset: one more
+                    // dynamic offset per bind costs wgpu an allocation per frame.
+                    uniform_entry(
+                        5,
+                        wgpu::ShaderStages::COMPUTE,
+                        false,
+                        (CULL_VIEWS * std::mem::size_of::<GpuFrustum>()) as u64,
+                    ),
                 ],
             });
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -633,6 +705,7 @@ impl Pipelines {
             forward: FastMap::default(),
             custom: FastMap::default(),
             custom_errors: FastMap::default(),
+            pending: Vec::new(),
             layouts: vec![<crate::instance::InstanceTransform as crate::instance::InstanceData>::LAYOUT],
             cull,
             blits,
@@ -676,6 +749,7 @@ impl Pipelines {
                 self.forward.retain(|k, _| k.shader.is_none_or(|(h, _)| h != handle));
                 self.shaders.retain(|k, _| k.3.is_none_or(|(h, _)| h != handle));
                 self.custom_errors.remove(&handle);
+                self.pending.retain(|p| p.key.shader.is_none_or(|(h, _)| h != handle));
             }
             None => {}
         }
@@ -690,6 +764,7 @@ impl Pipelines {
         }
         self.custom.retain(|&h, _| live(h));
         self.custom_errors.retain(|&h, _| live(h));
+        self.pending.retain(|p| p.key.shader.is_none_or(|(h, _)| live(h)));
         self.forward.retain(|k, _| k.shader.is_none_or(|(h, _)| live(h)));
         self.shaders.retain(|k, _| k.3.is_none_or(|(h, _)| live(h)));
     }
@@ -714,7 +789,7 @@ impl Pipelines {
     pub fn forward(&mut self, device: &wgpu::Device, key: PipelineKey) -> &wgpu::RenderPipeline {
         if !self.forward.contains_key(&key) {
             let pipeline = match key.shader {
-                None => self.build_forward(device, key, None).expect("built-in shader builds"),
+                None => self.build_forward(device, key, None).expect("built-in shader builds").0,
                 Some((handle, version)) => {
                     let source = self
                         .custom
@@ -726,18 +801,13 @@ impl Pipelines {
                         None => Err("shader not registered".to_string()),
                     };
                     match built {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let layout = self.layouts[key.layout as usize].name;
-                            let name = source.as_ref().map_or("?", |s| s.name.as_str());
-                            tracing::error!(
-                                shader = name,
-                                layout,
-                                "custom shader failed to build; drawing with the built-in shader:\n{e}"
-                            );
-                            self.custom_errors.entry(handle).or_insert((version, e));
-                            self.forward(device, PipelineKey { shader: None, ..key }).clone()
+                        Ok((p, pending)) => {
+                            if let Some((module_key, error)) = pending {
+                                self.pending.push(PendingPipeline { key, module_key, error });
+                            }
+                            p
                         }
+                        Err(e) => self.custom_failed(device, key, e),
                     }
                 }
             };
@@ -746,24 +816,116 @@ impl Pipelines {
         &self.forward[&key]
     }
 
-    /// Build a forward pipeline. Custom shaders are validated with naga first and built inside
-    /// a validation error scope, so their errors never reach the uncaptured-error handler.
+    /// Report a custom-shader pipeline that failed (`key.shader` is set) and return the
+    /// built-in pipeline drawn in its place.
+    fn custom_failed(&mut self, device: &wgpu::Device, key: PipelineKey, error: String) -> wgpu::RenderPipeline {
+        let layout = self.layouts[key.layout as usize].name;
+        if let Some((handle, version)) = key.shader {
+            let name = self.custom.get(&handle).map_or("?", |(_, s)| s.name.as_str());
+            tracing::error!(
+                shader = name,
+                layout,
+                "custom shader failed to build; drawing with the built-in shader:\n{error}"
+            );
+            self.custom_errors.entry(handle).or_insert((version, error));
+        }
+        self.forward(device, PipelineKey { shader: None, ..key }).clone()
+    }
+
+    /// Resolve custom-shader pipelines whose error scope answered since the last frame (only
+    /// browser WebGPU answers asynchronously). An invalid one is reported like a synchronous
+    /// failure and replaced by the built-in pipeline, so from then on its draws no longer
+    /// invalidate the frame. Called once per frame; nothing to do on native backends.
+    pub fn poll_pending(&mut self, device: &wgpu::Device) {
+        let mut i = 0;
+        while i < self.pending.len() {
+            let p = &mut self.pending[i];
+            let result = match p.error.poll() {
+                Some(r) => r,
+                None if p.error.state() == space3d_tasks::TaskState::Cancelled => None,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let PendingPipeline { key, module_key, .. } = self.pending.swap_remove(i);
+            let current = key
+                .shader
+                .is_some_and(|(h, v)| self.custom.get(&h).is_some_and(|(cv, _)| *cv == v));
+            // Stale versions were dropped by `sync_custom` / `retain_custom` already.
+            if let Some(e) = result
+                && current
+            {
+                self.shaders.remove(&module_key);
+                let fallback = self.custom_failed(device, key, e);
+                self.forward.insert(key, fallback);
+            }
+        }
+    }
+
+    /// Resolve `key`'s pending validation with `error` (tests: native backends never pend).
+    #[cfg(test)]
+    pub fn defer_validation(&mut self, key: PipelineKey, error: Option<String>) {
+        let module_key = (key.layout, key.manual_srgb, key.layered, key.shader);
+        let error = space3d_tasks::spawn(async move { error });
+        self.pending.push(PendingPipeline { key, module_key, error });
+    }
+
+    /// Keys of the cached forward pipelines of custom shaders (tests).
+    #[cfg(test)]
+    pub fn custom_keys(&self) -> Vec<PipelineKey> {
+        self.forward.keys().filter(|k| k.shader.is_some()).copied().collect()
+    }
+
+    /// Validation of pipelines still pending (tests).
+    #[cfg(test)]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Build a forward pipeline. Custom shaders are validated with naga first (including that
+    /// they declare no resources the layout lacks) and built inside validation and internal
+    /// error scopes, so their errors never reach the uncaptured-error handler. Where the
+    /// scopes do not answer immediately (browser WebGPU), the pipeline is returned with its
+    /// pending result (for [`Self::poll_pending`]).
+    #[allow(clippy::type_complexity)]
     fn build_forward(
         &mut self,
         device: &wgpu::Device,
         key: PipelineKey,
         custom: Option<&Arc<CustomShader>>,
-    ) -> Result<wgpu::RenderPipeline, String> {
+    ) -> Result<
+        (
+            wgpu::RenderPipeline,
+            Option<(ModuleKey, space3d_tasks::Task<Option<String>>)>,
+        ),
+        String,
+    > {
         let layout = self.layouts[key.layout as usize];
         let module_key = (key.layout, key.manual_srgb, key.layered, key.shader);
-        let scope = custom.map(|_| device.push_error_scope(wgpu::ErrorFilter::Validation));
-        let module = match self.shaders.get(&module_key) {
-            Some(m) => m.clone(),
+        let cached = self.shaders.get(&module_key).cloned();
+        let source = match cached {
+            Some(_) => None,
             None => {
                 let source = forward_shader(layout, key.manual_srgb, key.layered, custom.map(|c| &**c));
                 if custom.is_some() {
-                    validate_wgsl(&source)?;
+                    validate_custom_wgsl(&source)?;
                 }
+                Some(source)
+            }
+        };
+        // Backend shader translation failures are internal errors, not validation errors.
+        // (Pushed after every early return: the scopes must be popped in reverse order.)
+        let scopes = custom.map(|_| {
+            (
+                device.push_error_scope(wgpu::ErrorFilter::Validation),
+                device.push_error_scope(wgpu::ErrorFilter::Internal),
+            )
+        });
+        let module = match cached {
+            Some(m) => m,
+            None => {
+                let source = source.expect("generated when not cached");
                 let label = custom.map_or(layout.name, |c| c.name.as_str());
                 let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some(label),
@@ -829,15 +991,27 @@ impl Pipelines {
             multiview_mask: None,
             cache: None,
         });
-        // Native backends resolve the scope immediately; on the web the result arrives later
-        // (and naga has already validated the code).
-        if let Some(scope) = scope
-            && let Some(Some(e)) = futures::FutureExt::now_or_never(scope.pop())
-        {
-            self.shaders.remove(&module_key);
-            return Err(e.to_string());
+        let Some((validation, internal)) = scopes else {
+            return Ok((pipeline, None));
+        };
+        // Scopes pop innermost first.
+        let (internal, validation) = (internal.pop(), validation.pop());
+        let mut error = Box::pin(async move {
+            match internal.await {
+                Some(e) => Some(e.to_string()),
+                None => validation.await.map(|e| e.to_string()),
+            }
+        });
+        // Native backends resolve the scopes immediately; in the browser the result arrives
+        // later: the pipeline is used meanwhile and replaced if it turns out to be invalid.
+        match futures::FutureExt::now_or_never(&mut error) {
+            Some(Some(e)) => {
+                self.shaders.remove(&module_key);
+                Err(e)
+            }
+            Some(None) => Ok((pipeline, None)),
+            None => Ok((pipeline, Some((module_key, space3d_tasks::spawn(error))))),
         }
-        Ok(pipeline)
     }
 
     /// Mip-generation pipeline for a color format, sampling a single-layer (`D2`) or an array
@@ -954,6 +1128,47 @@ mod tests {
         assert!(e.contains("undefined_thing") || e.contains("fragment_hook"), "{e}");
     }
 
+    /// Regression: naga accepts a custom shader that declares its own resources, but the
+    /// forward pipeline layout lacks them, so the pipeline is invalid. Native backends report
+    /// that through the error scope at once; browser WebGPU only later, and meanwhile every
+    /// frame drawing with it was lost. Such shaders are now rejected before any GPU work.
+    #[test]
+    fn custom_shaders_cannot_declare_resources() {
+        let hook = "fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> { return c * extra; }";
+        for decl in [
+            "@group(2) @binding(0) var<uniform> extra: vec4<f32>;",
+            "@group(1) @binding(3) var<uniform> extra: vec4<f32>;",
+            "@group(0) @binding(1) var<storage, read> extra_buf: array<vec4<f32>>;
+             fn extra_at() -> vec4<f32> { return extra_buf[0]; }
+             const extra = vec4<f32>(1.0);",
+        ] {
+            let custom = CustomShader::new(
+                "own",
+                format!(
+                    "{decl}
+{hook}"
+                ),
+            );
+            let src = forward_shader(InstanceTransform::LAYOUT, false, false, Some(&custom));
+            validate(&src); // naga alone accepts it
+            let e = validate_custom_wgsl(&src).unwrap_err();
+            assert!(e.contains("extra") && e.contains("cannot declare resources"), "{e}");
+        }
+        // Private variables and the template's own resources are fine.
+        let ok = CustomShader::new(
+            "ok",
+            "var<private> k: vec4<f32> = vec4<f32>(0.5);
+             fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> {
+                 return c * k * material.base_color * sample_base(in.uv, 0) + view.ambient;
+}
+",
+        );
+        for layered in [false, true] {
+            validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, false, layered, Some(&ok)))
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
     /// The generated accessors read the attributes the layout declares.
     #[test]
     fn generated_accessors_use_the_declared_attributes() {
@@ -990,7 +1205,10 @@ mod tests {
             64 + 16 * 3 + 32 * (MAX_DIR_LIGHTS + MAX_POINT_LIGHTS)
         );
         assert_eq!(std::mem::size_of::<GpuMaterial>(), 48);
-        assert_eq!(std::mem::size_of::<GpuCullParams>(), 128);
+        assert_eq!(std::mem::size_of::<GpuCullParams>(), 32);
+        assert_eq!(std::mem::size_of::<GpuFrustum>(), 96);
+        // Dynamic offsets of the `frusta` window must be aligned (256 at most in WebGPU).
+        assert!((CULL_VIEWS * std::mem::size_of::<GpuFrustum>()).is_multiple_of(256));
         assert_eq!(std::mem::size_of::<GpuCompactParams>(), 16);
         assert_eq!(std::mem::size_of::<GpuCullJob>(), 64);
     }
