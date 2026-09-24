@@ -5,13 +5,15 @@
 //!   asynchronously on the web) or, on mobile resume, recreate its surface.
 //! * `suspended` — drop the surface (Android destroys the native window in background).
 //! * `window_event` — feed [`Input`], track size/DPI/focus, render on `RedrawRequested`.
+//!   Before rendering, a surface the renderer dropped as lost (Vulkan `SURFACE_LOST`, DX12)
+//!   is recreated, at most once per `SurfaceRetry::INTERVAL`.
 //! * `about_to_wait` — request the next redraw (continuous rendering).
 
 use crate::input::{Input, MouseButton, TouchPhase};
 use crate::window::{PlatformEvent, WindowPlugin, WindowState};
 use glam::{UVec2, Vec2};
 use space3d_core::{App, Events};
-use space3d_render::{Renderer, RendererConfig};
+use space3d_render::{RenderError, Renderer, RendererConfig};
 use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
@@ -34,6 +36,7 @@ pub(crate) struct WinitRunner {
     exiting: bool,
     applied_title: String,
     applied_cursor: (bool, bool),
+    surface_retry: SurfaceRetry,
     #[cfg(target_arch = "wasm32")]
     pending: std::rc::Rc<std::cell::RefCell<Option<Result<Renderer, space3d_render::RenderError>>>>,
 }
@@ -54,6 +57,57 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     {
         EventLoop::new()
     }
+}
+
+/// Throttles re-attaching a presentation surface after the renderer dropped it (a lost
+/// surface can only be replaced, and on a window that really cannot present every attempt
+/// fails). Also rate-limits a lose/recreate cycle, since a successful attempt counts too.
+#[derive(Debug, Default)]
+struct SurfaceRetry {
+    last_attempt: Option<Instant>,
+    failing: bool,
+}
+
+impl SurfaceRetry {
+    /// Minimum time between two recreation attempts.
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Whether to try attaching a new surface now. `renderer_has_surface` is `None` while no
+    /// renderer exists. Never while suspended: Android drops the surface on purpose then.
+    fn due(&self, now: Instant, suspended: bool, has_window: bool, renderer_has_surface: Option<bool>) -> bool {
+        !suspended
+            && has_window
+            && renderer_has_surface == Some(false)
+            && self
+                .last_attempt
+                .is_none_or(|last| now.duration_since(last) >= Self::INTERVAL)
+    }
+
+    /// Record a failed attempt. Returns `true` for the first failure of a streak (log it).
+    fn failed(&mut self, now: Instant) -> bool {
+        self.last_attempt = Some(now);
+        !std::mem::replace(&mut self.failing, true)
+    }
+
+    /// Record a successful attempt. Returns `true` if it ends a failure streak (log it).
+    fn succeeded(&mut self, now: Instant) -> bool {
+        self.last_attempt = Some(now);
+        std::mem::replace(&mut self.failing, false)
+    }
+}
+
+/// Attach a new presentation surface for `window` to `r` and size it to the window.
+fn attach_surface(r: &mut Renderer, window: &Arc<Window>) -> Result<(), RenderError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    r.set_surface(window.clone())?;
+    #[cfg(target_arch = "wasm32")]
+    match crate::web::canvas_of(window) {
+        Some(c) => r.set_surface(space3d_render::wgpu::SurfaceTarget::Canvas(c))?,
+        None => return Err(RenderError::Surface("window has no canvas".into())),
+    }
+    let size = window.inner_size();
+    r.resize(size.width.max(1), size.height.max(1));
+    Ok(())
 }
 
 /// Runner installed by [`WindowPlugin`]. Falls back to the headless runner when no event loop
@@ -78,6 +132,7 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         raw_mouse_motion: false,
         exiting: false,
         applied_cursor: (true, false),
+        surface_retry: SurfaceRetry::default(),
         #[cfg(target_arch = "wasm32")]
         pending: Default::default(),
     };
@@ -151,27 +206,18 @@ impl WinitRunner {
 
     /// Create the renderer on first resume, or reattach the surface on later resumes.
     fn ensure_renderer(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
-        let size = window.inner_size();
-        let size = UVec2::new(size.width, size.height).max(UVec2::ONE);
-        if let Some(r) = self.app.resources.get_mut::<Renderer>() {
+        if let Some(r) = self.app.resources.get::<Renderer>() {
             if !r.has_surface() {
-                #[cfg(not(target_arch = "wasm32"))]
-                let result = r.set_surface(window.clone());
-                #[cfg(target_arch = "wasm32")]
-                let result = match crate::web::canvas_of(window) {
-                    Some(c) => r.set_surface(space3d_render::wgpu::SurfaceTarget::Canvas(c)),
-                    None => Err(space3d_render::RenderError::Surface("window has no canvas".into())),
-                };
-                match result {
-                    Ok(()) => r.resize(size.x, size.y),
-                    Err(e) => tracing::error!("failed to recreate surface: {e}"),
-                }
+                // Resume attaches immediately, regardless of the retry interval.
+                self.reattach_surface(window, Instant::now());
             }
             return;
         }
         if self.renderer_requested {
             return;
         }
+        let size = window.inner_size();
+        let size = UVec2::new(size.width, size.height).max(UVec2::ONE);
         self.renderer_requested = true;
         let config = self.renderer_config(size);
         #[cfg(not(target_arch = "wasm32"))]
@@ -207,6 +253,47 @@ impl WinitRunner {
         }
     }
 
+    /// Attach a new surface to the existing renderer. Only the first failure of a streak is
+    /// logged as an error, so a window that cannot present does not spam every retry.
+    fn reattach_surface(&mut self, window: &Arc<Window>, now: Instant) {
+        let Some(r) = self.app.resources.get_mut::<Renderer>() else {
+            return;
+        };
+        match attach_surface(r, window) {
+            Ok(()) => {
+                if self.surface_retry.succeeded(now) {
+                    tracing::info!("presentation surface recreated");
+                }
+            }
+            Err(e) => {
+                if self.surface_retry.failed(now) {
+                    tracing::error!(
+                        "failed to recreate surface: {e}; retrying every {:?} (further failures logged at debug)",
+                        SurfaceRetry::INTERVAL
+                    );
+                } else {
+                    tracing::debug!("failed to recreate surface: {e}");
+                }
+            }
+        }
+    }
+
+    /// Recreate a surface the renderer dropped as lost (desktop never resumes, so
+    /// `ensure_renderer` would not). Throttled by [`SurfaceRetry`].
+    fn recover_surface(&mut self, now: Instant) {
+        let suspended = self.state().suspended;
+        let has_surface = self.app.resources.get::<Renderer>().map(Renderer::has_surface);
+        if !self
+            .surface_retry
+            .due(now, suspended, self.window.is_some(), has_surface)
+        {
+            return;
+        }
+        if let Some(window) = self.window.clone() {
+            self.reattach_surface(&window, now);
+        }
+    }
+
     /// Web: install the renderer once its async creation finished.
     #[cfg(target_arch = "wasm32")]
     fn poll_pending_renderer(&mut self) {
@@ -234,6 +321,7 @@ impl WinitRunner {
         let now = Instant::now();
         let dt = self.last_frame.map_or(Duration::ZERO, |last| now - last);
         self.last_frame = Some(now);
+        self.recover_surface(now);
         if let Some(w) = &self.window {
             w.pre_present_notify();
         }
@@ -391,5 +479,55 @@ impl ApplicationHandler for WinitRunner {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_retry_needs_window_renderer_and_missing_surface() {
+        let r = SurfaceRetry::default();
+        let now = Instant::now();
+        assert!(r.due(now, false, true, Some(false)));
+        assert!(
+            !r.due(now, true, true, Some(false)),
+            "suspended: Android dropped it on purpose"
+        );
+        assert!(!r.due(now, false, false, Some(false)), "no window");
+        assert!(!r.due(now, false, true, None), "no renderer yet");
+        assert!(!r.due(now, false, true, Some(true)), "surface attached");
+    }
+
+    #[test]
+    fn surface_retry_backs_off_after_any_attempt() {
+        let t0 = Instant::now();
+        let almost = t0 + SurfaceRetry::INTERVAL - Duration::from_millis(1);
+        let later = t0 + SurfaceRetry::INTERVAL;
+
+        let mut r = SurfaceRetry::default();
+        r.failed(t0);
+        assert!(!r.due(t0, false, true, Some(false)));
+        assert!(!r.due(almost, false, true, Some(false)));
+        assert!(r.due(later, false, true, Some(false)));
+
+        // A success throttles too: a surface lost again right away waits for the interval.
+        let mut r = SurfaceRetry::default();
+        r.succeeded(t0);
+        assert!(!r.due(almost, false, true, Some(false)));
+        assert!(r.due(later, false, true, Some(false)));
+    }
+
+    #[test]
+    fn surface_retry_logs_once_per_failure_streak() {
+        let mut r = SurfaceRetry::default();
+        let t = Instant::now();
+        assert!(!r.succeeded(t), "success without a prior failure is not a recovery");
+        assert!(r.failed(t), "first failure is logged");
+        assert!(!r.failed(t), "repeated failures are not");
+        assert!(!r.failed(t));
+        assert!(r.succeeded(t), "recovery after a failure is logged");
+        assert!(r.failed(t), "a new streak logs again");
     }
 }

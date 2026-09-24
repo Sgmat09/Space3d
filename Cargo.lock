@@ -4486,6 +4486,7 @@ dependencies = [
 name = "space3d-stories"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "space3d-core",
 ]
 
