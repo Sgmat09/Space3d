@@ -45,7 +45,9 @@ pub(crate) fn client_interpolate(ctx: &mut SystemCtx) {
                 for entry in registry.components() {
                     match entry.mode {
                         ClientMode::Interpolate | ClientMode::PredictAndInterpolate => {
-                            entry.ops.interpolate_all(world, render, max_ext)
+                            entry
+                                .ops
+                                .interpolate_all(world, render, max_ext, net.last_snapshot_tick)
                         }
                         ClientMode::Delayed => entry.ops.release_delayed_all(world, render),
                         _ => {}

@@ -669,7 +669,7 @@ app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Ticket { url, tic
 ### 9.4 Interpolation and jitter buffer (`client/interpolation.rs`)
 
 - **`InterpClock`:** `render_tick = (server_estimate − (rtt/2)·hz) − delay`, i.e. the delay trails the newest tick a snapshot can have arrived for, not the server's current tick. The delay is `clamp(send_interval + jitter_k·jitter + ½ tick, 35 ms, 250 ms)`, slewed by ±5 % playback speed, and snaps beyond 10 ticks.
-- **`SnapshotBuffer<T>`** holds 32 samples per `Interpolate`/`PredictAndInterpolate` component of each non-predicted entity. `sample(render_tick, lerp, max_extrapolate)` holds or extrapolates for up to 100 ms, then freezes.
+- **`SnapshotBuffer<T>`** holds 32 samples per `Interpolate`/`PredictAndInterpolate` component of each non-predicted entity. `sample(render_tick, lerp, max_extrapolate)` holds or extrapolates for up to 100 ms, then freezes. Extrapolation only applies to entities present in the newest snapshot received: an entity missing from newer snapshots is unchanged (or deferred by the budget), so it holds its last value instead of overshooting a stop or a teleport.
 - **Gap fix:** a sample arriving more than `send_interval` after the previous one gets a synthetic copy of the previous value inserted at `tick − send_interval`, so resting entities do not slide.
 - **`Delayed` components** and `Interpolated` events release when `render_tick` reaches their tick.
 

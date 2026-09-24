@@ -132,6 +132,68 @@ fn rollback_beyond_max_snaps_then_recovers() {
     converged(&mut h, a, 60);
 }
 
+/// Replay correctness: with changing inputs and a server-side impulse, every tick the client
+/// predicts after the correction equals the server's authoritative state for that tick
+/// (bit-for-bit after quantization), and so does every tick before the impulse.
+#[test]
+fn replayed_prediction_matches_the_server_timeline_exactly() {
+    let mut config = HarnessConfig {
+        seed: 43,
+        link: link(40),
+        ..Default::default()
+    };
+    // No visual smoothing: the rendered transform is the simulated one.
+    config.client.prediction.smoothing_half_life = Duration::ZERO;
+    let mut h = with_rules(config);
+    let a = walker(&mut h, "alice", |t| Move {
+        x: [1, 1, 0, -1, -1, 0, 1][(t.0 / 7 % 7) as usize],
+        z: [0, 1, 1, 0, -1, -1][(t.0 / 11 % 6) as usize],
+    });
+    connect(&mut h, a);
+    h.step_ticks(60);
+    let server_pawn = pawn(h.server(), h.player(a)).unwrap();
+    let mut client_pos = std::collections::BTreeMap::new();
+    let mut server_pos = std::collections::BTreeMap::new();
+    let mut mis_r = EventReader::default();
+    let _ = read::<Mispredicted>(h.client(a), &mut mis_r);
+    let mut impulse_tick = None;
+    let mut corrected_after = None;
+    for i in 0..240 {
+        if i == 60 {
+            h.server_mut()
+                .world
+                .get::<&mut Transform>(server_pawn)
+                .unwrap()
+                .translation
+                .z += 3.0;
+            impulse_tick = Some(h.server_net().tick().0 + 1);
+        }
+        h.step();
+        let events = read::<Mispredicted>(h.client(a), &mut mis_r);
+        let predicted = h.client_net(a).predicted_tick().unwrap().0 - 1;
+        if !events.is_empty() {
+            assert!(events.iter().all(|m| m.replayed > 0), "{events:?}");
+            corrected_after = Some(predicted);
+        }
+        let ce = controlled(h.client(a)).unwrap();
+        client_pos.insert(predicted, h.client(a).world.get::<&Transform>(ce).unwrap().translation);
+        server_pos.insert(
+            h.server_net().tick().0,
+            h.server().world.get::<&Transform>(server_pawn).unwrap().translation,
+        );
+    }
+    let (impulse, corrected) = (impulse_tick.unwrap(), corrected_after.expect("no rollback"));
+    let mut compared = 0;
+    for (t, c) in &client_pos {
+        let Some(s) = server_pos.get(t) else { continue };
+        if *t < impulse || *t > corrected {
+            assert!((*c - *s).abs().max_element() < 1e-6, "tick {t}: client {c} server {s}");
+            compared += 1;
+        }
+    }
+    assert!(compared > 150, "compared {compared} ticks");
+}
+
 /// A dropped client that never comes back is removed when the resume window expires.
 #[test]
 fn resume_window_expiry_emits_player_left_timeout() {
@@ -475,6 +537,163 @@ fn remote_pawn_is_drawn_at_the_server_position_of_the_render_tick() {
     // The render delay stays within its bounds (35–250 ms) and above one send interval.
     let delay = h.client_net(viewer).stats().interp_delay_ticks;
     assert!((2.0..=15.0).contains(&delay), "interp delay {delay} ticks");
+}
+
+/// Move → stop → teleport → rest: the remote copy never slides before the move starts, never
+/// overshoots a stop by more than a snapshot interval of motion, and settles exactly (no
+/// extrapolation into places the entity never went) once it rests.
+#[test]
+fn remote_entity_settles_after_stops_and_teleports() {
+    let mut h = with_rules(HarnessConfig {
+        seed: 44,
+        link: link(30),
+        ..Default::default()
+    });
+    let probe = h
+        .server_mut()
+        .world
+        .spawn((Replicated, Transform::from_xyz(0.0, 0.0, 5.0), Health(1)));
+    let a = observer(&mut h, "alice");
+    connect(&mut h, a);
+    h.step_ticks(60);
+    let set_x = |h: &mut NetHarness, x: f32| {
+        h.server_mut().world.get::<&mut Transform>(probe).unwrap().translation.x = x;
+    };
+    let drawn = |h: &NetHarness| {
+        let e = h.client_entity(a, probe).unwrap();
+        h.client(a).world.get::<&Transform>(e).unwrap().translation
+    };
+    // Rest, then move at 6 m/s for 1 s, then stop at 6 m.
+    for _ in 0..30 {
+        h.step();
+        assert_eq!(drawn(&h).x, 0.0, "slid while at rest");
+    }
+    let mut x = 0.0;
+    for _ in 0..60 {
+        x += 0.1;
+        set_x(&mut h, x);
+        h.step();
+        assert!(drawn(&h).x <= x + 1e-3);
+    }
+    let stop = x;
+    let mut peak = 0.0f32;
+    for _ in 0..60 {
+        h.step();
+        peak = peak.max(drawn(&h).x);
+    }
+    assert!(peak <= stop + 0.25, "overshot the stop: {peak} > {stop}");
+    assert!((drawn(&h).x - stop).abs() < 1e-3, "did not settle: {}", drawn(&h).x);
+    // Teleport far away and rest there.
+    set_x(&mut h, -15.0);
+    let mut lowest = f32::MAX;
+    for _ in 0..60 {
+        h.step();
+        lowest = lowest.min(drawn(&h).x);
+    }
+    assert!(
+        lowest >= -15.0 - 1e-3,
+        "extrapolated past the teleport target: {lowest}"
+    );
+    assert!((drawn(&h).x + 15.0).abs() < 1e-3);
+    converged(&mut h, a, 30);
+}
+
+/// A 500 ms client hitch: the client falls behind the server, resyncs its predicted tick and
+/// is back to exact prediction within a second.
+#[test]
+fn client_stall_resyncs_and_recovers() {
+    let mut h = with_rules(HarnessConfig {
+        seed: 41,
+        link: link(30),
+        ..Default::default()
+    });
+    let a = walker(&mut h, "alice", |t| Move {
+        x: if (t.0 / 50).is_multiple_of(2) { 1 } else { -1 },
+        z: 1,
+    });
+    connect(&mut h, a);
+    h.step_ticks(120);
+    let missing0 = h.server_net().room_stats().inputs_missing;
+    let mut mis_r = EventReader::default();
+    let _ = read::<Mispredicted>(h.client(a), &mut mis_r);
+    h.stall(a, Duration::from_millis(500));
+    let mut during = Vec::new();
+    for _ in 0..90 {
+        h.step();
+        during.extend(read::<Mispredicted>(h.client(a), &mut mis_r));
+    }
+    assert!(h.client_net(a).is_connected());
+    assert!(
+        h.server_net().room_stats().inputs_missing > missing0,
+        "the server should have run short of inputs during the stall"
+    );
+    let mut after = 0;
+    for _ in 0..120 {
+        h.step();
+        after += read::<Mispredicted>(h.client(a), &mut mis_r).len();
+    }
+    assert_eq!(after, 0, "still mispredicting after the stall (during: {during:?})");
+    let lead = i64::from(h.client_net(a).predicted_tick().unwrap().0) - i64::from(h.server_net().tick().0);
+    assert!((2..=12).contains(&lead), "prediction lead {lead}");
+    converged(&mut h, a, 60);
+}
+
+/// CI smoke load: 50 walking bots in one room for 10 s on broadband links. Everyone stays
+/// connected and converged, every client's downstream stays within its budget and inputs
+/// arrive on time. (Bytes and counts, not timing.)
+#[test]
+fn fifty_bots_in_one_room() {
+    let mut h = with_rules(HarnessConfig {
+        seed: 42,
+        link: LinkProfile::symmetric(LinkConditions::broadband()),
+        server: space3d_replication::server::ServerNetConfig {
+            max_clients: 64,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let clients: Vec<ClientHandle> = (0..50u32)
+        .map(|i| {
+            h.add_client(
+                ClientSpec::named(&format!("bot-{i}")).with_phase(Duration::from_micros(u64::from(i) * 331)),
+                move |app| {
+                    app.add_plugin(TestProtocol);
+                    install_bot(
+                        app,
+                        scripted(move |t: Tick| Move {
+                            x: if ((t.0 + i * 7) / 60).is_multiple_of(2) { 1 } else { -1 },
+                            z: if ((t.0 + i * 13) / 90).is_multiple_of(2) { 1 } else { -1 },
+                        }),
+                    );
+                },
+            )
+        })
+        .collect();
+    assert!(
+        h.run_until(900, |h| clients.iter().all(|c| h.client_net(*c).is_connected())),
+        "not everyone connected"
+    );
+    h.step_ticks(120);
+    let bytes0: Vec<u64> = clients.iter().map(|c| h.client_net(*c).stats().bytes_in).collect();
+    let stats0 = h.server_net().room_stats().clone();
+    h.step_ticks(600);
+    let stats = h.server_net().room_stats().clone();
+    let budget = f64::from(space3d_replication::server::ServerNetConfig::default().client_bandwidth);
+    for (i, c) in clients.iter().enumerate() {
+        let rate = (h.client_net(*c).stats().bytes_in - bytes0[i]) as f64 / 10.0;
+        assert!(rate <= budget * 1.05, "client {i}: {rate:.0} B/s");
+        assert!(h.client_net(*c).is_connected());
+    }
+    // Broadband has 0.1 % loss: on a stream each lost packet is a ≥ 200 ms retransmission stall
+    // (head-of-line blocking), i.e. ~12 missing inputs; ~30 such stalls are expected here.
+    let ticks = 600 * 50;
+    let missing = stats.inputs_missing - stats0.inputs_missing;
+    assert!(missing * 50 <= ticks, "{missing} of {ticks} inputs missing");
+    assert_eq!(stats.kicks, 0);
+    assert_eq!(h.server_net().connected_count(), 50);
+    for c in &clients {
+        converged(&mut h, *c, 300);
+    }
 }
 
 // --- Render-timed state -------------------------------------------------------------------

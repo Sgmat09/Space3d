@@ -496,7 +496,11 @@ pub(crate) trait ComponentOps: Send + Sync + 'static {
         send_interval: u8,
     ) -> Result<(), DecodeError>;
     #[cfg(feature = "client")]
-    fn interpolate_all(&self, world: &mut World, render_tick: f64, max_extrapolate_ticks: f64);
+    /// Write interpolated values at `render_tick`. Extrapolation past the newest sample (at most
+    /// `max_extrapolate_ticks`) only happens for entities present in the newest snapshot
+    /// (`newest_snapshot`): an entity missing from newer snapshots did not change (or was
+    /// deferred by the budget), so it holds its last value instead of overshooting.
+    fn interpolate_all(&self, world: &mut World, render_tick: f64, max_extrapolate_ticks: f64, newest_snapshot: Tick);
     /// Newest buffered (interpolated / delayed) value, encoded (harness convergence checks).
     #[cfg(feature = "harness")]
     fn newest_sample(&self, world: &World, e: Entity, w: &mut Writer, ctx: &EncodeCtx<'_>) -> Option<Tick>;
@@ -636,7 +640,7 @@ impl<T: Component + Clone> ComponentOps for TypedComponent<T> {
     }
 
     #[cfg(feature = "client")]
-    fn interpolate_all(&self, world: &mut World, render_tick: f64, max_extrapolate_ticks: f64) {
+    fn interpolate_all(&self, world: &mut World, render_tick: f64, max_extrapolate_ticks: f64, newest_snapshot: Tick) {
         let Some(lerp) = self.rule.interpolate else {
             return;
         };
@@ -645,7 +649,9 @@ impl<T: Component + Clone> ComponentOps for TypedComponent<T> {
             .query_mut::<(&mut InterpBuffer<T>, &mut T)>()
             .without::<&crate::Predicted>()
         {
-            if let Some(v) = buf.0.sample_with(render_tick, lerp, extrapolate, max_extrapolate_ticks) {
+            let current = buf.0.newest().is_some_and(|(t, _)| *t >= newest_snapshot);
+            let max_ext = if current { max_extrapolate_ticks } else { 0.0 };
+            if let Some(v) = buf.0.sample_with(render_tick, lerp, extrapolate, max_ext) {
                 *value = v;
             }
             // Keep one sample before the render tick for the next lerp.

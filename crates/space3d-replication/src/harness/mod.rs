@@ -136,6 +136,8 @@ struct ClientSlot {
     app: App,
     spec: ClientSpec,
     next_frame_at: Duration,
+    /// Extra frame time of the next frame (a simulated hitch, see [`NetHarness::stall`]).
+    stall: Duration,
     link: Option<LinkId>,
     player: PlayerId,
 }
@@ -221,6 +223,7 @@ impl NetHarness {
             next_frame_at: self.now + spec.phase,
             player: PlayerIdentity::dev(&spec.name).player,
             spec,
+            stall: Duration::ZERO,
             link: None,
         });
         handle
@@ -244,9 +247,9 @@ impl NetHarness {
             }
             self.network.pump();
             self.route_all();
-            let dt = self.clients[i].spec.frame_dt;
+            let dt = self.clients[i].spec.frame_dt + std::mem::take(&mut self.clients[i].stall);
             self.clients[i].app.update(dt);
-            self.clients[i].next_frame_at += dt;
+            self.clients[i].next_frame_at = at + self.clients[i].spec.frame_dt;
         }
         self.clock.set(target);
         self.network.pump();
@@ -339,6 +342,14 @@ impl NetHarness {
             self.network.set_profile(link, profile.clone());
         }
         self.clients[c.0].spec.link = Some(profile);
+    }
+
+    /// Freeze a client for `duration` (a frame hitch: GC pause, tab in background, debugger).
+    /// Its next frame starts `duration` late and sees a correspondingly long frame time.
+    pub fn stall(&mut self, c: ClientHandle, duration: Duration) {
+        let slot = &mut self.clients[c.0];
+        slot.next_frame_at += duration;
+        slot.stall += duration;
     }
 
     /// Drop a client's link for `duration` (it should resume afterwards).
