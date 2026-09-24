@@ -227,6 +227,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arena-server"
+version = "0.1.0"
+dependencies = [
+ "arena-shared",
+ "serde_json",
+ "space3d-core",
+ "space3d-replication",
+ "space3d-server",
+]
+
+[[package]]
 name = "arena-shared"
 version = "0.1.0"
 dependencies = [
