@@ -1,6 +1,6 @@
 [package]
 name = "space3d-physics"
-description = "Space3d physics"
+description = "Space3d physics: rapier3d rigid bodies, colliders, raycasts on the fixed tick"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,13 @@ license.workspace = true
 
 [dependencies]
 space3d-core.workspace = true
+glam.workspace = true
+tracing.workspace = true
+rapier3d = "0.35.3"
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "falling_boxes"
+harness = false

@@ -38,7 +38,7 @@ impl ImageData {
         let mut img = Self::new(size, size);
         for y in 0..size {
             for x in 0..size {
-                img.set(x, y, if ((x / cell) + (y / cell)) % 2 == 0 { a } else { b });
+                img.set(x, y, if ((x / cell) + (y / cell)).is_multiple_of(2) { a } else { b });
             }
         }
         img
