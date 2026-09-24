@@ -642,6 +642,7 @@ app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Ticket { url, tic
 - **`TickPacer`** is a PI controller on the server-reported `input_slack` relative to `target_slack_ticks` (1.5, plus 2·jitter, raised after a head-of-line stall is detected).
   - `PaceAction::Scale(s)` with `s ∈ [0.95, 1.05]` sets `TickRate::hz = nominal × s`.
   - `PaceAction::Resync(n)` fires when the error exceeds 8 ticks: jump the tick and clear history.
+  - *Implementation notes (replication builder):* the jitter term `2·jitter` is capped at 6 ticks (`PacerConfig::max_jitter_margin_ticks`), because downstream queueing also inflates the RTT variance; a missing input (`i8::MIN`) only speeds up and raises the stall boost, never jumps; after a resync to tick T, slack feedback is ignored until the server has consumed an input for T or later (its EWMA still describes the old timeline). The server drops inputs beyond `T + max_input_ahead` without a strike (the slack is still reported so the client pulls back); only ticks beyond `4 × max_input_ahead` strike.
   - `SimTime.dt` and `Time::fixed_delta` inside `run_sim` stay nominal, so **no `space3d-core` change is needed**.
 
 ### 9.3 Prediction and reconciliation (`client/prediction.rs`)
@@ -659,13 +660,15 @@ app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Ticket { url, tic
 
 **When a snapshot for S arrives:** for each `Predicted` entity, compare the confirmed bytes with `history[S]` (or apply `rollback_when`). On a difference, set `rollback_from = min(rollback_from, S)`.
 
+**Snaps:** when a rollback cannot be replayed (longer than `max_rollback_ticks`, or inputs missing after a resync), the confirmed values are written and the recorded history before the current predicted tick T is dropped; confirmations older than T then only update the confirmed values, so one snap is followed by at most one ordinary replay. While the prediction lead itself exceeds `max_rollback_ticks` every correction snaps, so keep it above the expected lead (default 32 ticks ≈ 530 ms).
+
 **Visuals:** `PredictionError` decays with `smoothing_half_life` (60 ms), and errors above `snap_distance` (2 m) snap instead. It is applied to the rendered transform only and never simulated.
 
 **Predicted spawns** (a projectile keyed by `(tick, counter)` and matched on the server spawn) are phase 3.
 
 ### 9.4 Interpolation and jitter buffer (`client/interpolation.rs`)
 
-- **`InterpClock`:** `render_tick = server_estimate − delay`. The delay is `clamp(send_interval + jitter_k·jitter + ½ tick, 35 ms, 250 ms)`, slewed by ±5 % playback speed, and snaps beyond 10 ticks.
+- **`InterpClock`:** `render_tick = (server_estimate − (rtt/2)·hz) − delay`, i.e. the delay trails the newest tick a snapshot can have arrived for, not the server's current tick. The delay is `clamp(send_interval + jitter_k·jitter + ½ tick, 35 ms, 250 ms)`, slewed by ±5 % playback speed, and snaps beyond 10 ticks.
 - **`SnapshotBuffer<T>`** holds 32 samples per `Interpolate`/`PredictAndInterpolate` component of each non-predicted entity. `sample(render_tick, lerp, max_extrapolate)` holds or extrapolates for up to 100 ms, then freezes.
 - **Gap fix:** a sample arriving more than `send_interval` after the previous one gets a synthetic copy of the previous value inserted at `tick − send_interval`, so resting entities do not slide.
 - **`Delayed` components** and `Interpolated` events release when `render_tick` reaches their tick.

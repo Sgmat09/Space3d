@@ -428,16 +428,18 @@ impl InterpClock {
         raw.clamp(lo, hi.max(lo))
     }
 
-    /// Advance by the frame delta and return the render tick (fractional).
+    /// Advance by the frame delta and return the render tick (fractional). `newest_tick` is the
+    /// newest server tick a snapshot can have arrived for (server estimate − one-way trip); the
+    /// render tick trails it by [`Self::target_delay_ticks`].
     pub fn update(
         &mut self,
         frame_dt: Duration,
-        server_estimate: f64,
+        newest_tick: f64,
         jitter: Duration,
         tick_hz: f64,
         send_interval: u8,
     ) -> f64 {
-        let target = server_estimate - self.target_delay_ticks(jitter, tick_hz, send_interval);
+        let target = newest_tick - self.target_delay_ticks(jitter, tick_hz, send_interval);
         let render = match self.render_tick {
             None => target,
             Some(r) => {
@@ -452,7 +454,7 @@ impl InterpClock {
             }
         };
         self.render_tick = Some(render);
-        self.delay_ticks = server_estimate - render;
+        self.delay_ticks = newest_tick - render;
         render
     }
 

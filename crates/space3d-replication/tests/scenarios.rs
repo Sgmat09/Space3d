@@ -420,6 +420,63 @@ fn flow_control_bounds_the_backlog_on_a_slow_stream() {
     converged(&mut h, a, 900);
 }
 
+/// Interpolation timing: at every client frame (144 Hz, phase-shifted against the 60 Hz server,
+/// 30 Hz snapshots), a remote pawn moving at constant speed is drawn exactly where the server
+/// had it at the client's render tick; the render tick advances smoothly and never backwards.
+#[test]
+fn remote_pawn_is_drawn_at_the_server_position_of_the_render_tick() {
+    let mut h = with_rules(HarnessConfig {
+        seed: 40,
+        link: LinkProfile::symmetric(LinkConditions {
+            latency: Duration::from_millis(30),
+            jitter: Duration::from_millis(4),
+            ..LinkConditions::perfect()
+        }),
+        ..Default::default()
+    });
+    let mover = walker(&mut h, "mover", |_| Move { x: 1, z: 0 });
+    let viewer = h.add_client(
+        ClientSpec::named("viewer")
+            .with_frame_dt(Duration::from_secs_f64(1.0 / 144.0))
+            .with_phase(Duration::from_millis(3)),
+        |app| {
+            app.add_plugin(TestProtocol);
+        },
+    );
+    connect(&mut h, mover);
+    connect(&mut h, viewer);
+    h.step_ticks(120);
+    let server_pawn = pawn(h.server(), h.player(mover)).unwrap();
+    // Server x per tick (state after the tick).
+    let mut history: Vec<(u32, f32)> = Vec::new();
+    let mut last_render = f64::MIN;
+    let mut worst = 0.0f32;
+    for _ in 0..300 {
+        h.step();
+        let tick = h.server_net().tick().0;
+        let x = h.server().world.get::<&Transform>(server_pawn).unwrap().translation.x;
+        history.push((tick, x));
+        let render = h.client_net(viewer).render_tick().unwrap();
+        assert!(render >= last_render, "render tick went backwards");
+        last_render = render;
+        let (Some(a), Some(b)) = (
+            history.iter().rev().find(|(t, _)| f64::from(*t) <= render),
+            history.iter().find(|(t, _)| f64::from(*t) > render),
+        ) else {
+            continue;
+        };
+        let expected = a.1 + (b.1 - a.1) * ((render - f64::from(a.0)) / f64::from(b.0 - a.0)) as f32;
+        let remote = h.client_entity(viewer, server_pawn).unwrap();
+        let drawn = h.client(viewer).world.get::<&Transform>(remote).unwrap().translation.x;
+        worst = worst.max((drawn - expected).abs());
+    }
+    // 1 mm position quantization; no extrapolation or stutter on a clean link.
+    assert!(worst < 0.002, "drawn position off by {worst} m");
+    // The render delay stays within its bounds (35–250 ms) and above one send interval.
+    let delay = h.client_net(viewer).stats().interp_delay_ticks;
+    assert!((2.0..=15.0).contains(&delay), "interp delay {delay} ticks");
+}
+
 // --- Render-timed state -------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

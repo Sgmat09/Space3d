@@ -1,0 +1,16 @@
+[package]
+name = "arena-shared"
+description = "Arena example: the networked protocol shared by the dedicated server and the clients (components, input, messages, simulation, server rules)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+space3d-core.workspace = true
+space3d-replication.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+space3d-replication = { workspace = true, features = ["harness"] }

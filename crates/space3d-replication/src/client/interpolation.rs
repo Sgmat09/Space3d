@@ -35,9 +35,12 @@ pub(crate) fn client_interpolate(ctx: &mut SystemCtx) {
                 && let Some(est) = conn.clock.estimate(now)
             {
                 let hz = f64::from(welcome.tick_hz.max(1));
+                // Snapshots describe the server as it was one trip ago: the jitter-buffer delay
+                // is applied to the newest tick that can have arrived, not to the server's now.
+                let arrived = est - conn.rtt.srtt().as_secs_f64() / 2.0 * hz;
                 let render = net
                     .interp
-                    .update(frame_dt, est, conn.rtt.rttvar(), hz, welcome.send_interval);
+                    .update(frame_dt, arrived, conn.rtt.rttvar(), hz, welcome.send_interval);
                 let max_ext = net.interp.max_extrapolation_ticks(hz);
                 for entry in registry.components() {
                     match entry.mode {
@@ -165,9 +168,10 @@ impl<T: Clone> SnapshotBuffer<T> {
         Some(lerp(a, b, frac))
     }
 
-    /// Drop samples older than `tick` (keeping one before it).
+    /// Drop samples older than `tick`, keeping one at or before it (the lerp origin) and never
+    /// fewer than two (extrapolation needs the last two).
     pub fn prune(&mut self, tick: Tick) {
-        while self.samples.len() > 1 && self.samples[1].0 <= tick {
+        while self.samples.len() > 2 && self.samples[1].0 <= tick {
             self.samples.pop_front();
         }
     }

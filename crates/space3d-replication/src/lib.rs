@@ -60,10 +60,8 @@ pub mod server;
 
 #[cfg(feature = "api")]
 pub mod api;
-// Owned by the space3d-server builder (docs/design/game-server.md §3.1); the crate-level
-// skeleton allow lives on here until `services.rs` is implemented.
+// Owned by the space3d-server builder (docs/design/game-server.md §3.1).
 #[cfg(all(feature = "api", feature = "client"))]
-#[allow(dead_code, unused_variables, unused_imports, clippy::todo)]
 pub mod services;
 
 #[cfg(feature = "harness")]

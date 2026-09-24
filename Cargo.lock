@@ -213,6 +213,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arena-client"
+version = "0.1.0"
+dependencies = [
+ "arena-shared",
+ "space3d-core",
+ "space3d-platform",
+ "space3d-render",
+ "space3d-replication",
+ "tracing",
+ "tracing-subscriber",
+ "web-sys",
+]
+
+[[package]]
+name = "arena-shared"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "space3d-core",
+ "space3d-replication",
+]
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
