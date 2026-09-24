@@ -377,6 +377,11 @@ impl FrameState {
         strided(std::mem::size_of::<GpuCullParams>(), self.uniform_align)
     }
 
+    /// Whether any prepared view of the last frame draws to the primary target.
+    pub(crate) fn has_primary_view(&self) -> bool {
+        self.views.iter().any(|v| matches!(v.target, ViewTarget::Primary))
+    }
+
     /// Capacity snapshot of scratch vectors (to count CPU reallocations).
     fn capacities(&self) -> [usize; 8] {
         [
@@ -480,6 +485,8 @@ impl Renderer {
             })
         });
         self.encode_views(&mut encoder, surface_view.as_ref(), false);
+        self.overlays.sync(resources.get::<crate::overlay::RenderOverlays>());
+        self.encode_frame_overlays(&mut encoder, surface_view.as_ref());
 
         self.uploader.finish();
         self.queue.submit([encoder.finish()]);

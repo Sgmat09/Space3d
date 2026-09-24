@@ -1,6 +1,6 @@
 [package]
 name = "space3d-ui"
-description = "Space3d ui"
+description = "Space3d ui: egui integration rendered through the render overlay hook, debug overlay, profiler and console"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,17 @@ license.workspace = true
 
 [dependencies]
 space3d-core.workspace = true
+space3d-render.workspace = true
+space3d-platform.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+web-time.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tracing-wasm.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

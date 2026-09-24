@@ -1,11 +1,69 @@
 [package]
 name = "space3d"
-description = "Space3d game engine (facade crate)"
+description = "Space3d game engine (facade crate): feature-gated re-exports, plugin groups, prelude and the main! entry macro"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["gamedev", "engine", "3d", "wgpu", "ecs"]
+categories = ["game-engines", "graphics", "wasm"]
+
+[features]
+default = ["render", "platform", "assets", "audio", "physics", "scene", "net", "db", "ui"]
+## wgpu renderer (meshes, materials, lights, instancing, headless capture).
+render = ["dep:space3d-render"]
+## winit window + input runner (desktop, web, Android, iOS). Implies `render`.
+platform = ["render", "dep:space3d-platform"]
+## Asset server, image/glTF/OBJ loaders, hot reload, texture & mesh editing.
+assets = ["dep:space3d-assets"]
+## kira audio with spatial emitters.
+audio = ["dep:space3d-audio"]
+## rapier rigid bodies, colliders, raycasts.
+physics = ["dep:space3d-physics"]
+## Scene/prefab serialization (RON/JSON) and world snapshots.
+scene = ["dep:space3d-scene"]
+## HTTP + WebSocket clients (and native servers).
+net = ["dep:space3d-net"]
+## SQLite (native) / localStorage (web): KV, save slots, leaderboards.
+db = ["dep:space3d-db"]
+## egui integration, debug overlay, profiler. Implies `platform`.
+ui = ["platform", "dep:space3d-ui"]
+## Scene inspector, texture editor, model editor. Implies `ui`.
+editor = ["ui", "dep:space3d-editor"]
+## GitHub releases / update checker / crash reporter.
+github = ["dep:space3d-github"]
+## Storybook: stories, knobs, viewer, batch screenshots.
+stories = ["dep:space3d-stories"]
+## Test harness: headless apps, input simulation, golden screenshots.
+test = ["dep:space3d-test"]
 
 [dependencies]
 space3d-core.workspace = true
 space3d-tasks.workspace = true
+tracing.workspace = true
+space3d-render = { workspace = true, optional = true }
+space3d-platform = { workspace = true, optional = true }
+space3d-assets = { workspace = true, optional = true }
+space3d-audio = { workspace = true, optional = true }
+space3d-physics = { workspace = true, optional = true }
+space3d-scene = { workspace = true, optional = true }
+space3d-net = { workspace = true, optional = true }
+space3d-db = { workspace = true, optional = true }
+space3d-ui = { workspace = true, optional = true }
+space3d-editor = { workspace = true, optional = true }
+space3d-github = { workspace = true, optional = true }
+space3d-stories = { workspace = true, optional = true }
+space3d-test = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+console_error_panic_hook.workspace = true
+tracing-wasm.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

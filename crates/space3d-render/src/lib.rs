@@ -12,6 +12,8 @@
 //!   `multi_draw_indexed_indirect[_count]` where supported; CPU culling + direct draws on
 //!   WebGL2/downlevel ([`DrawPath`]).
 //! * **Headless capture** — [`Renderer::capture`] / [`render_to_image`].
+//! * **Overlays** — [`RenderOverlay`]s registered in [`RenderOverlays`] draw after the 3D scene
+//!   into the final target (window surface or capture target), e.g. the egui UI.
 //!
 //! ```no_run
 //! use space3d_core::prelude::*;
@@ -34,6 +36,7 @@ mod frame;
 mod gpu;
 mod handles;
 mod instance;
+mod overlay;
 mod pipeline;
 mod renderer;
 mod stats;
@@ -52,6 +55,9 @@ pub use instance::{
     BufferUsage, CullSource, InstanceAttribute, InstanceBuffer, InstanceBuffers, InstanceCompact, InstanceData,
     InstanceLayout, InstancePacked, InstanceSemantic, InstanceTransform, InstanceTransformColor, InstancedMesh,
     ScaleKind,
+};
+pub use overlay::{
+    OverlayTarget, OverlayTargetKind, RENDER_TARGET_FORMAT, RenderOverlay, RenderOverlays, SharedOverlay, lock_overlay,
 };
 pub use renderer::{DisplayHandle, RenderCapabilities, RenderError, Renderer, RendererConfig};
 pub use stats::{DrawPath, RenderStats};
@@ -88,7 +94,8 @@ impl Plugin for RenderPlugin {
             .init_resource::<InstanceBuffers>()
             .init_resource::<AmbientLight>()
             .init_resource::<RenderStats>()
-            .init_resource::<RenderSettings>();
+            .init_resource::<RenderSettings>()
+            .init_resource::<RenderOverlays>();
         app.add_system_named(Stage::Render, "render::render_frame", render_system);
         if let Some((w, h)) = self.headless {
             #[cfg(not(target_arch = "wasm32"))]
@@ -154,7 +161,7 @@ pub mod prelude {
     pub use crate::{
         AmbientLight, BufferUsage, Camera3d, DirectionalLight, DrawPath, InstanceBuffer, InstanceBuffers,
         InstanceCompact, InstanceData, InstanceTransform, InstanceTransformColor, InstancedMesh, Material, Mesh3d,
-        MeshHandle, PointLight, Projection, RenderAssets, RenderPlugin, RenderSettings, RenderStats, RenderTarget,
-        Renderer, TextureHandle, Visibility, render_to_image,
+        MeshHandle, OverlayTarget, PointLight, Projection, RenderAssets, RenderOverlay, RenderOverlays, RenderPlugin,
+        RenderSettings, RenderStats, RenderTarget, Renderer, TextureHandle, Visibility, render_to_image,
     };
 }

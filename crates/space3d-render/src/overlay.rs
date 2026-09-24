@@ -1,0 +1,393 @@
+//! Render overlays: let other crates draw **after the 3D scene into the final color target**.
+//!
+//! An overlay (the egui UI of `space3d-ui`, debug gizmos, a custom HUD...) implements
+//! [`RenderOverlay`] and is registered in the [`RenderOverlays`] resource with a priority.
+//! Every frame the renderer:
+//!
+//! 1. records the 3D views as usual (MSAA is resolved first),
+//! 2. calls [`RenderOverlay::prepare`] on every overlay (ascending priority) with the frame's
+//!    command encoder — upload buffers/textures here,
+//! 3. opens **one** single-sample render pass on the final target (`LoadOp::Load`, no depth)
+//!    and calls [`RenderOverlay::render`] on every overlay in the same order.
+//!
+//! The final target is the window surface when windowed, and the offscreen capture target when
+//! headless — so overlays show up in [`crate::Renderer::capture`] / [`crate::render_to_image`]
+//! screenshots. For windowed captures the renderer re-records the primary views into the
+//! offscreen target and runs the overlays again with [`OverlayTargetKind::Capture`] (possibly
+//! with a different texture format than the surface — overlays must handle both).
+//!
+//! When no camera draws to the primary target this frame, the headless target is cleared to
+//! opaque black before the overlays run (the surface is cleared by the renderer already), so
+//! UI-only apps never show stale pixels.
+//!
+//! Overlays are shared as `Arc<Mutex<dyn RenderOverlay>>` ([`SharedOverlay`]): the owner keeps a
+//! typed handle (returned by [`RenderOverlays::insert`]) to feed per-frame data, and the
+//! renderer keeps a snapshot of the list so windowed captures can replay it.
+//!
+//! ```no_run
+//! use space3d_render::*;
+//! struct Hud;
+//! impl RenderOverlay for Hud {
+//!     fn prepare(&mut self, _: &wgpu::Device, _: &wgpu::Queue, _: &mut wgpu::CommandEncoder, _: &OverlayTarget) {}
+//!     fn render(&self, pass: &mut wgpu::RenderPass<'static>, target: &OverlayTarget) {
+//!         // pass.set_pipeline(...); pass.draw(0..3, 0..1);
+//!         let _ = (pass, target);
+//!     }
+//! }
+//! let mut app = space3d_core::App::new();
+//! app.add_plugin(RenderPlugin::default());
+//! let hud = app.resources.expect_mut::<RenderOverlays>().insert("hud", 100, Hud);
+//! # let _ = hud;
+//! ```
+
+use crate::assets::RenderAssets;
+use crate::handles::TextureHandle;
+use crate::pipeline::OFFSCREEN_FORMAT;
+use crate::renderer::Renderer;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Color format of the headless/capture target and of textures created with
+/// [`RenderAssets::add_render_target`] (sRGB: sampling returns linear values).
+pub const RENDER_TARGET_FORMAT: wgpu::TextureFormat = OFFSCREEN_FORMAT;
+
+/// Which target an overlay pass draws into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OverlayTargetKind {
+    /// The window surface (already MSAA-resolved).
+    Surface,
+    /// The headless offscreen target (what [`crate::Renderer::capture`] reads).
+    Offscreen,
+    /// The offscreen target while a windowed frame is re-recorded for a capture.
+    Capture,
+}
+
+/// Description of the color target handed to [`RenderOverlay`]s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayTarget {
+    /// Target size in physical pixels.
+    pub size: (u32, u32),
+    /// Color format of the target (the render pass uses exactly this format, 1 sample,
+    /// no depth attachment).
+    pub format: wgpu::TextureFormat,
+    /// Physical pixels per logical pixel, from [`RenderOverlays::scale_factor`].
+    pub scale_factor: f32,
+    /// Surface, headless offscreen, or capture replay.
+    pub kind: OverlayTargetKind,
+}
+
+/// Something drawn on top of the 3D scene, into the final color target (the window surface,
+/// or the headless target read by [`crate::Renderer::capture`], so overlays appear in
+/// screenshots).
+///
+/// Each frame, after the 3D views (MSAA already resolved), the renderer calls
+/// [`RenderOverlay::prepare`] on every registered overlay in [`RenderOverlays`] order, then
+/// opens one single-sample pass on the target (`LoadOp::Load`, no depth) and calls
+/// [`RenderOverlay::render`] in the same order. For windowed captures the overlays run again
+/// with [`OverlayTargetKind::Capture`], possibly with a different texture format than the
+/// surface, so implementations must handle any `target.format`.
+pub trait RenderOverlay: Send + Sync + 'static {
+    /// Upload per-frame data. Called once per overlay pass, before [`Self::render`], with the
+    /// frame's encoder (work recorded here executes before the overlay pass).
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &OverlayTarget,
+    );
+
+    /// Record draw commands into the shared overlay pass (single sample, no depth,
+    /// `target.format`). Viewport and scissor are reset to the full target for each overlay.
+    fn render(&self, pass: &mut wgpu::RenderPass<'static>, target: &OverlayTarget);
+}
+
+/// A registered overlay, shared between its owner and the renderer.
+pub type SharedOverlay = Arc<Mutex<dyn RenderOverlay>>;
+
+/// Lock an overlay, recovering from a poisoned mutex (a panicking overlay must not take the
+/// renderer down with it).
+pub fn lock_overlay(overlay: &SharedOverlay) -> MutexGuard<'_, dyn RenderOverlay> {
+    overlay.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct OverlayEntry {
+    name: String,
+    priority: i32,
+    seq: u64,
+    overlay: SharedOverlay,
+}
+
+/// Globally unique list generations, so the renderer notices any change (even when the
+/// resource is replaced wholesale).
+fn next_generation() -> u64 {
+    static GENERATION: AtomicU64 = AtomicU64::new(1);
+    GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Registered overlays (resource, inserted by [`crate::RenderPlugin`]). Lower priorities draw
+/// first (underneath); equal priorities draw in insertion order.
+pub struct RenderOverlays {
+    entries: Vec<OverlayEntry>,
+    next_seq: u64,
+    generation: u64,
+    scale_factor: f32,
+}
+
+impl Default for RenderOverlays {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_seq: 0,
+            generation: next_generation(),
+            scale_factor: 1.0,
+        }
+    }
+}
+
+impl std::fmt::Debug for RenderOverlays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderOverlays")
+            .field("overlays", &self.names().collect::<Vec<_>>())
+            .field("scale_factor", &self.scale_factor)
+            .finish()
+    }
+}
+
+impl RenderOverlays {
+    /// Register `overlay` under `name` (replacing any overlay with that name) and return a
+    /// typed handle the owner can lock to feed it data.
+    pub fn insert<T: RenderOverlay>(&mut self, name: impl Into<String>, priority: i32, overlay: T) -> Arc<Mutex<T>> {
+        let shared = Arc::new(Mutex::new(overlay));
+        self.insert_shared(name, priority, shared.clone());
+        shared
+    }
+
+    /// Register an already shared overlay. Returns the overlay previously registered under
+    /// `name`, if any.
+    pub fn insert_shared(
+        &mut self,
+        name: impl Into<String>,
+        priority: i32,
+        overlay: SharedOverlay,
+    ) -> Option<SharedOverlay> {
+        let name = name.into();
+        let old = self.remove(&name);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let at = self.entries.partition_point(|e| (e.priority, e.seq) < (priority, seq));
+        self.entries.insert(
+            at,
+            OverlayEntry {
+                name,
+                priority,
+                seq,
+                overlay,
+            },
+        );
+        self.generation = next_generation();
+        old
+    }
+
+    /// Unregister an overlay; returns it if it existed.
+    pub fn remove(&mut self, name: &str) -> Option<SharedOverlay> {
+        let i = self.entries.iter().position(|e| e.name == name)?;
+        self.generation = next_generation();
+        Some(self.entries.remove(i).overlay)
+    }
+
+    /// Overlay registered under `name`.
+    pub fn get(&self, name: &str) -> Option<&SharedOverlay> {
+        self.entries.iter().find(|e| e.name == name).map(|e| &e.overlay)
+    }
+
+    /// Whether an overlay with this name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.entries.iter().any(|e| e.name == name)
+    }
+
+    /// `(name, priority)` in draw order.
+    pub fn names(&self) -> impl Iterator<Item = (&str, i32)> {
+        self.entries.iter().map(|e| (e.name.as_str(), e.priority))
+    }
+
+    /// Number of overlays.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// No overlays registered.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Scale factor passed to overlays in [`OverlayTarget::scale_factor`] (default 1.0).
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    /// Set the scale factor passed to overlays (e.g. the window's DPI scale).
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        self.scale_factor = scale_factor;
+    }
+}
+
+/// The renderer's snapshot of [`RenderOverlays`] (re-cloned only when the list changes), kept so
+/// windowed captures can replay the overlays outside of `render_frame`.
+#[derive(Default)]
+pub(crate) struct OverlayCache {
+    generation: u64,
+    list: Vec<SharedOverlay>,
+    scale_factor: f32,
+}
+
+impl OverlayCache {
+    pub(crate) fn sync(&mut self, overlays: Option<&RenderOverlays>) {
+        match overlays {
+            Some(o) => {
+                self.scale_factor = o.scale_factor;
+                if o.generation != self.generation {
+                    self.list.clear();
+                    self.list.extend(o.entries.iter().map(|e| e.overlay.clone()));
+                    self.generation = o.generation;
+                }
+            }
+            None => {
+                self.list.clear();
+                self.generation = 0;
+            }
+        }
+    }
+}
+
+impl Renderer {
+    /// Overlays of a regular frame: surface when windowed, offscreen target when headless.
+    pub(crate) fn encode_frame_overlays(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        surface_view: Option<&wgpu::TextureView>,
+    ) {
+        if self.overlays.list.is_empty() {
+            return;
+        }
+        match (&self.surface, surface_view) {
+            (Some(s), Some(view)) => {
+                let target = OverlayTarget {
+                    size: (s.config.width, s.config.height),
+                    format: s.config.format,
+                    scale_factor: self.overlays.scale_factor,
+                    kind: OverlayTargetKind::Surface,
+                };
+                // The renderer already cleared the surface if no camera drew to it.
+                self.encode_overlays(encoder, view, &target, false);
+            }
+            // Surface frame unavailable (minimized/occluded): nothing to draw into.
+            (Some(_), None) => {}
+            (None, _) => self.encode_offscreen_overlays(encoder, OverlayTargetKind::Offscreen),
+        }
+    }
+
+    /// Overlays replayed into the offscreen target for a windowed capture.
+    pub(crate) fn encode_capture_overlays(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.overlays.list.is_empty() {
+            self.encode_offscreen_overlays(encoder, OverlayTargetKind::Capture);
+        }
+    }
+
+    fn encode_offscreen_overlays(&mut self, encoder: &mut wgpu::CommandEncoder, kind: OverlayTargetKind) {
+        let Some(view) = self.offscreen.color_view.clone() else {
+            return;
+        };
+        let target = OverlayTarget {
+            size: (self.offscreen.width, self.offscreen.height),
+            format: self.offscreen.format,
+            scale_factor: self.overlays.scale_factor,
+            kind,
+        };
+        let clear = !self.frame.has_primary_view();
+        self.encode_overlays(encoder, &view, &target, clear);
+    }
+
+    fn encode_overlays(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        target: &OverlayTarget,
+        clear: bool,
+    ) {
+        for overlay in &self.overlays.list {
+            lock_overlay(overlay).prepare(&self.device, &self.queue, encoder, target);
+        }
+        let load = if clear {
+            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let mut pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("space3d overlays"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            })
+            .forget_lifetime();
+        let (w, h) = target.size;
+        for overlay in &self.overlays.list {
+            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            pass.set_scissor_rect(0, 0, w, h);
+            lock_overlay(overlay).render(&mut pass, target);
+        }
+    }
+}
+
+impl RenderAssets {
+    /// A sampleable 2D view (format [`RENDER_TARGET_FORMAT`]) of a texture created with
+    /// [`RenderAssets::add_render_target`], once the renderer has created it (the frame after
+    /// registration). Used to show render targets in overlays, e.g. as egui images.
+    pub fn render_target_view(&self, handle: TextureHandle) -> Option<wgpu::TextureView> {
+        let entry = self.textures.get(handle.raw())?;
+        entry.gpu.as_ref()?.target_view.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Nop;
+    impl RenderOverlay for Nop {
+        fn prepare(&mut self, _: &wgpu::Device, _: &wgpu::Queue, _: &mut wgpu::CommandEncoder, _: &OverlayTarget) {}
+        fn render(&self, _: &mut wgpu::RenderPass<'static>, _: &OverlayTarget) {}
+    }
+
+    #[test]
+    fn ordering_replace_and_remove() {
+        let mut o = RenderOverlays::default();
+        o.insert("ui", 100, Nop);
+        o.insert("hud", 0, Nop);
+        o.insert("gizmo", 100, Nop);
+        assert_eq!(
+            o.names().collect::<Vec<_>>(),
+            vec![("hud", 0), ("ui", 100), ("gizmo", 100)]
+        );
+        let g = o.generation;
+        assert!(o.insert_shared("ui", -5, Arc::new(Mutex::new(Nop))).is_some());
+        assert_ne!(o.generation, g, "changes bump the generation");
+        assert_eq!(o.names().next(), Some(("ui", -5)));
+        assert!(o.remove("hud").is_some() && o.remove("hud").is_none());
+        assert_eq!(o.len(), 2);
+
+        let mut cache = OverlayCache::default();
+        cache.sync(Some(&o));
+        assert_eq!(cache.list.len(), 2);
+        cache.sync(None);
+        assert!(cache.list.is_empty());
+    }
+}

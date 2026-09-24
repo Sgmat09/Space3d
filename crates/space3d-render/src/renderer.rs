@@ -230,6 +230,8 @@ pub struct Renderer {
     pub(crate) frame: FrameState,
     pub(crate) stats: RenderStats,
     pub(crate) frame_index: u64,
+    /// Snapshot of the `RenderOverlays` resource (see `overlay.rs`).
+    pub(crate) overlays: crate::overlay::OverlayCache,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -373,6 +375,7 @@ impl Renderer {
             frame,
             stats: RenderStats::default(),
             frame_index: 0,
+            overlays: Default::default(),
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;
@@ -692,6 +695,7 @@ impl Renderer {
         });
         if self.surface.is_some() {
             self.encode_primary_to_offscreen(&mut encoder);
+            self.encode_capture_overlays(&mut encoder);
         }
         let (w, h) = (self.offscreen.width, self.offscreen.height);
         let padded = align_up(w as u64 * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
