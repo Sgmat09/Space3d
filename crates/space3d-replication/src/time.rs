@@ -251,6 +251,10 @@ pub struct PacerConfig {
     pub target_slack_ticks: f64,
     /// Error beyond which the client jumps its predicted tick instead of dilating (default 8).
     pub hard_resync_ticks: f64,
+    /// Cap on the jitter term `2 · jitter_ticks` of the target (default 6 ticks). The jitter
+    /// comes from the RTT variance, which downstream queueing (bufferbloat) also inflates;
+    /// uncapped it would push inputs past the server's input window.
+    pub max_jitter_margin_ticks: f64,
 }
 
 impl Default for PacerConfig {
@@ -259,6 +263,7 @@ impl Default for PacerConfig {
             max_scale_delta: 0.05,
             target_slack_ticks: 1.5,
             hard_resync_ticks: 8.0,
+            max_jitter_margin_ticks: 6.0,
         }
     }
 }
@@ -304,7 +309,9 @@ impl TickPacer {
 
     /// Target slack in ticks for the current jitter.
     pub fn target(&self, jitter_ticks: f64) -> f64 {
-        self.config.target_slack_ticks + 2.0 * jitter_ticks.max(0.0) + self.stall_boost
+        self.config.target_slack_ticks
+            + (2.0 * jitter_ticks.max(0.0)).min(self.config.max_jitter_margin_ticks.max(0.0))
+            + self.stall_boost
     }
 
     /// Feed one snapshot's feedback. `input_slack` is in quarter ticks; `i8::MIN` means
@@ -320,15 +327,20 @@ impl TickPacer {
 
     /// Feed a decoded slack in ticks (`None` = input missing).
     pub fn on_slack(&mut self, slack: Option<f64>, jitter_ticks: f64) -> PaceAction {
+        let max = self.config.max_scale_delta;
         let slack = match slack {
             Some(s) => {
                 self.stall_boost = (self.stall_boost - 0.01).max(0.0);
                 s
             }
             None => {
-                // Missing input: likely a stall on a stream transport; ask for more margin.
+                // Missing input: likely a stall on a stream transport; ask for more margin and
+                // speed up. How late it was is unknown, so never jump on this alone (the
+                // clock-based check in the client driver catches large errors).
                 self.stall_boost = (self.stall_boost + 0.25).min(2.0);
-                -1.0
+                self.integral = (self.integral + Self::KI).clamp(-max, max);
+                self.scale = 1.0 + max;
+                return PaceAction::Scale(self.scale);
             }
         };
         let error = self.target(jitter_ticks) - slack;
@@ -337,7 +349,6 @@ impl TickPacer {
             self.scale = 1.0;
             return PaceAction::Resync(error.round() as i64);
         }
-        let max = self.config.max_scale_delta;
         self.integral = (self.integral + Self::KI * error).clamp(-max, max);
         self.scale = 1.0 + (Self::KP * error + self.integral).clamp(-max, max);
         PaceAction::Scale(self.scale)
@@ -574,9 +585,9 @@ mod tests {
         }
         // 20 ticks late → jump forward.
         assert!(matches!(p.on_feedback(-80, 0.0), PaceAction::Resync(n) if n > 8));
-        // Missing input raises the target.
+        // Missing input raises the target and speeds up, but never jumps.
         let t0 = p.target(0.0);
-        p.on_feedback(i8::MIN, 0.0);
+        assert_eq!(p.on_feedback(i8::MIN, 0.0), PaceAction::Scale(1.05));
         assert!(p.target(0.0) > t0);
     }
 

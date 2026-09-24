@@ -44,6 +44,43 @@ pub struct ClientEntity {
     pub known_present: u64,
     /// Tick of the record that set `known_present`.
     pub known_tick: Tick,
+    /// Datagram: acked records that could not advance `ack_tick` yet, as `(baseline, tick)`.
+    /// A record written against baseline B holds every change in `(B, tick]`, so it advances
+    /// `ack_tick` only once `ack_tick >= B` (an earlier packet may still be lost).
+    pub acked_ahead: smallvec::SmallVec<[(Tick, Tick); 2]>,
+}
+
+impl ClientEntity {
+    /// Datagram ack of a record written at `tick` against `baseline`.
+    pub(crate) fn on_record_acked(&mut self, baseline: Tick, tick: Tick) {
+        if tick <= self.ack_tick {
+            return;
+        }
+        if baseline <= self.ack_tick {
+            self.ack_tick = tick;
+        } else {
+            self.acked_ahead.push((baseline, tick));
+        }
+        // Chain records whose baseline is now covered.
+        loop {
+            let ack = self.ack_tick;
+            let Some(next) = self
+                .acked_ahead
+                .iter()
+                .filter(|(b, t)| *b <= ack && *t > ack)
+                .map(|(_, t)| *t)
+                .max()
+            else {
+                break;
+            };
+            self.ack_tick = next;
+        }
+        let ack = self.ack_tick;
+        self.acked_ahead.retain(|(_, t)| *t > ack);
+        while self.acked_ahead.len() > 8 {
+            self.acked_ahead.remove(0);
+        }
+    }
 }
 
 /// Entities in one sent datagram packet (acks advance their `ack_tick`).
@@ -61,6 +98,8 @@ pub struct SentRecord {
     pub present: Vec<u64>,
     /// Whether the entity was written as a spawn (parallel to `entities`).
     pub spawns: Vec<bool>,
+    /// Baseline each entity was written against (parallel to `entities`).
+    pub baselines: Vec<Tick>,
     /// Send time (loss detection, RTT).
     pub sent_at: Duration,
 }
@@ -183,6 +222,8 @@ struct Pick {
     removed: u64,
     allowed: u64,
     spawn: bool,
+    /// The record holds every due change after this tick.
+    baseline: Tick,
 }
 
 fn send_client(
@@ -473,6 +514,7 @@ fn build_snapshot(
             removed,
             allowed,
             spawn,
+            baseline: if spawn { Tick::ZERO } else { baseline },
         };
         let size = entity_size(rec, comps, removed);
         if own || (removed != 0 && comps == 0) {
@@ -594,7 +636,13 @@ fn build_snapshot(
         if sw.len() > first_limit && sw.entity_count() > 1 {
             sw.rollback(cp);
             let mut w = Writer::new();
-            std::mem::take(&mut sw).finish(header, &mut w);
+            // Only the last part completes the sync (a resumed client drops every entity not
+            // re-confirmed by then).
+            let part_header = SnapshotHeader {
+                flags: header.flags & !sflags::SYNC_COMPLETE,
+                ..header
+            };
+            std::mem::take(&mut sw).finish(part_header, &mut w);
             out.push((w.into_vec(), std::mem::take(&mut part), std::mem::take(&mut desp)));
             first_limit = max_block;
             sw.begin_entity(p.net_id, p.op, p.comps, p.removed);
@@ -779,6 +827,7 @@ fn send_datagram(
                 rec.entities.push(p.net_id);
                 rec.present.push(p.allowed);
                 rec.spawns.push(p.spawn);
+                rec.baselines.push(p.baseline);
                 if let Some(ce) = slot.view.entities.get_mut(&p.net_id) {
                     ce.last_sent_tick = tick;
                 }
@@ -816,8 +865,10 @@ fn detect_losses(slot: &mut Slot, now: Duration) {
     slot.view.sent = keep;
     for r in lost {
         for id in &r.entities {
+            // The lost changes are not covered by `ack_tick`: resend everything since then
+            // (with current values), even if a later packet already carried newer changes.
             if let Some(ce) = slot.view.entities.get_mut(id)
-                && ce.last_sent_tick == r.tick
+                && ce.ack_tick < r.tick
             {
                 ce.last_sent_tick = ce.ack_tick;
             }
@@ -849,9 +900,7 @@ pub(crate) fn on_ack(server: &mut NetServer, client: NetClientId, ack: AckField,
     for r in acked {
         for (i, id) in r.entities.iter().enumerate() {
             if let Some(ce) = slot.view.entities.get_mut(id) {
-                if r.tick > ce.ack_tick {
-                    ce.ack_tick = r.tick;
-                }
+                ce.on_record_acked(r.baselines[i], r.tick);
                 if r.spawns[i] {
                     ce.spawned = true;
                 }
@@ -864,5 +913,67 @@ pub(crate) fn on_ack(server: &mut NetServer, client: NetClientId, ack: AckField,
         for id in &r.despawns {
             slot.view.despawning.remove(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datagram_acks_chain_through_baselines() {
+        let mut ce = ClientEntity::default();
+        // P1 (tick 10, baseline 0) is in flight; P2 (tick 12) only holds changes after 10.
+        ce.on_record_acked(Tick(10), Tick(12));
+        assert_eq!(ce.ack_tick, Tick(0), "P2 alone must not cover P1's changes");
+        // P1 arrives late: the chain advances through P2.
+        ce.on_record_acked(Tick(0), Tick(10));
+        assert_eq!(ce.ack_tick, Tick(12));
+        assert!(ce.acked_ahead.is_empty());
+        // Older / duplicate acks are ignored.
+        ce.on_record_acked(Tick(0), Tick(8));
+        assert_eq!(ce.ack_tick, Tick(12));
+        // A full resend (baseline = ack) advances directly.
+        ce.on_record_acked(Tick(12), Tick(20));
+        assert_eq!(ce.ack_tick, Tick(20));
+    }
+
+    #[test]
+    fn datagram_loss_forces_a_resend_since_the_ack() {
+        use crate::server::{PlayerIdentity, ServerNetConfig};
+        let config = ServerNetConfig::default();
+        let mut slot = Slot::new(
+            NetClientId(0),
+            PlayerIdentity::dev("a"),
+            Tick(0),
+            &config,
+            Duration::ZERO,
+        );
+        let id = NetId(1);
+        slot.view.entities.insert(
+            id,
+            ClientEntity {
+                spawned: true,
+                ack_tick: Tick(4),
+                last_sent_tick: Tick(12),
+                ..Default::default()
+            },
+        );
+        for (seq, tick) in [(1u16, 10u32), (2, 12)] {
+            slot.view.sent.push(SentRecord {
+                seq,
+                tick: Tick(tick),
+                entities: vec![id],
+                present: vec![1],
+                spawns: vec![false],
+                baselines: vec![Tick(4)],
+                sent_at: Duration::ZERO,
+                ..Default::default()
+            });
+        }
+        // Both presumed lost: everything since the ack becomes due again.
+        detect_losses(&mut slot, Duration::from_secs(5));
+        assert!(slot.view.sent.is_empty());
+        assert_eq!(slot.view.entities[&id].last_sent_tick, Tick(4));
     }
 }

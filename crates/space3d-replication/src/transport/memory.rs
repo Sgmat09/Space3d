@@ -349,6 +349,13 @@ impl MemoryNetwork {
     pub fn server_stats(&self, link: LinkId) -> Option<TransportStats> {
         self.find(link).map(|l| l.lock().server_stats)
     }
+
+    /// Server → client bytes queued on `link` and not yet delivered (what the server's
+    /// `LinkTx::backlog_bytes` reports).
+    pub fn down_backlog(&self, link: LinkId) -> Option<usize> {
+        let now = self.now();
+        self.find(link).map(|l| l.lock().down.backlog_bytes(now))
+    }
 }
 
 /// Server side of a [`MemoryNetwork`]: yields [`LinkEvent`]s (after [`MemoryNetwork::pump`]).

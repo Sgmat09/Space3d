@@ -70,15 +70,22 @@ pub(crate) fn client_receive(ctx: &mut SystemCtx) {
                 }
             }
             super::prediction::remove_visual_offsets(world);
+            // Packets first: a `Disconnect` (or the last snapshots) may arrive together with the
+            // close, and must be seen before the state machine notices the closed link.
+            let mut received = |net: &mut NetClient| {
+                while let Some(pkt) = net
+                    .conn
+                    .as_mut()
+                    .and_then(|c| c.transport.as_mut())
+                    .and_then(|t| t.recv())
+                {
+                    handle_packet(net, registry, world, res, now, &pkt);
+                }
+            };
+            received(net);
             super::connection::drive(net, now, registry);
-            while let Some(pkt) = net
-                .conn
-                .as_mut()
-                .and_then(|c| c.transport.as_mut())
-                .and_then(|t| t.recv())
-            {
-                handle_packet(net, registry, world, res, now, &pkt);
-            }
+            // A link opened by `drive` may already hold a Welcome (zero-latency transports).
+            received(net);
             flush_events(net, res);
         });
     });
@@ -436,6 +443,9 @@ fn apply_snapshot(
                         net.prediction.request_rollback(tick);
                     }
                     r
+                } else if !net.prediction.compares(tick) {
+                    // History before a snap is stale; the confirmed value is stored above.
+                    entry.ops.check(bytes, &mut ctx)
                 } else {
                     // Compare with what we predicted for that tick.
                     let differs = match super::prediction::history_bytes(world, entity, tick, *kind) {

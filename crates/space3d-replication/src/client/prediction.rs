@@ -119,6 +119,12 @@ pub(crate) struct PredictionState {
     pub(crate) confirmed: FastMap<NetId, Confirmed>,
     pub(crate) nominal_hz: f64,
     pub(crate) scale: f64,
+    /// After a snap (no replay) at predicted tick T, the history of ticks before T is stale:
+    /// confirmations older than this only update the confirmed values.
+    pub(crate) snap_floor: Option<Tick>,
+    /// After a resync to tick T, the server's slack feedback describes the old timeline until
+    /// it consumed an input for T or later: feedback is ignored until then.
+    pub(crate) feedback_after: Option<Tick>,
 }
 
 impl PredictionState {
@@ -134,8 +140,15 @@ impl PredictionState {
     pub(crate) fn stop(&mut self) {
         self.next_tick = None;
         self.rollback_from = None;
+        self.snap_floor = None;
+        self.feedback_after = None;
         self.inputs.entries.clear();
         self.scale = 1.0;
+    }
+
+    /// Whether a confirmation for `tick` should be compared with the predicted history.
+    pub(crate) fn compares(&self, tick: Tick) -> bool {
+        self.snap_floor.is_none_or(|f| tick >= f)
     }
 
     /// Forget everything.
@@ -211,9 +224,15 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
         }
         Some(next) => {
             if let Some(slack) = net.pending_slack.take() {
-                match conn.pacer.on_feedback(slack, jitter_ticks) {
-                    PaceAction::Scale(s) => prediction.scale = s,
-                    PaceAction::Resync(n) => resync(prediction, Tick((i64::from(next.0) + n).max(1) as u32)),
+                let fresh = prediction
+                    .feedback_after
+                    .is_none_or(|t| conn.input_ack.is_some_and(|a| a >= t));
+                if fresh {
+                    prediction.feedback_after = None;
+                    match conn.pacer.on_feedback(slack, jitter_ticks) {
+                        PaceAction::Scale(s) => prediction.scale = s,
+                        PaceAction::Resync(n) => resync(prediction, Tick((i64::from(next.0) + n).max(1) as u32)),
+                    }
                 }
             }
             let next = prediction.next_tick.unwrap_or(next);
@@ -237,7 +256,10 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
 
 fn resync(p: &mut PredictionState, to: Tick) {
     tracing::debug!(?p.next_tick, ?to, "prediction resync");
+    // Ticks skipped by a forward jump get the server's repeated input (they are "missing"
+    // on the server, which the pacer answers with a speed-up, never another jump).
     p.next_tick = Some(to);
+    p.feedback_after = Some(to);
     p.inputs.entries.clear();
     p.scale = 1.0;
     // Rebuild from the newest confirmed state.
@@ -375,7 +397,7 @@ fn rollback_and_replay(
     dt: Duration,
 ) {
     let before = visual(world);
-    let (replay, max_rollback) = {
+    let replay = {
         let net = res.expect_mut::<NetClient>();
         // Write the confirmed values of every predicted entity.
         let confirmed: Vec<(NetId, Tick, PredictedComps)> = net
@@ -400,16 +422,19 @@ fn rollback_and_replay(
         let have_inputs =
             registry.input().is_none() || (from.0 + 1..=last).all(|t| net.prediction.inputs.get(Tick(t)).is_some());
         let max = u32::from(net.config.prediction.max_rollback_ticks);
-        (
-            if n > 0 && n <= max && have_inputs {
-                Some((from.0 + 1, last))
-            } else {
-                None
-            },
-            max,
-        )
+        (n > 0 && n <= max && have_inputs).then_some((from.0 + 1, last))
     };
-    let _ = max_rollback;
+    if replay.is_none() {
+        // Snap: the confirmed state stands in for ticks `from+1 .. next`, whose recorded
+        // history no longer describes this timeline. Compare again from `next` on (a single
+        // follow-up rollback then catches the lead up, if it is within `max_rollback_ticks`).
+        for (e, _) in predicted_entities(world) {
+            if let Ok(mut h) = world.get::<&mut PredictionHistory>(e) {
+                h.entries.clear();
+            }
+        }
+        res.expect_mut::<NetClient>().prediction.snap_floor = Some(next);
+    }
     let mut replayed = 0u32;
     if let Some((a, b)) = replay {
         for t in a..=b {

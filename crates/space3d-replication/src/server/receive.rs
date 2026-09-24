@@ -539,10 +539,19 @@ fn receive_inputs(
         return;
     };
     let tick = server.tick;
+    let next = tick.next();
     let max_ahead = server.config.max_input_ahead;
-    if win.newest_tick.0 > tick.0.saturating_add(max_ahead).saturating_add(1) {
+    let limit = tick.0.saturating_add(max_ahead).saturating_add(1);
+    if win.newest_tick.0 > limit {
         server.stats.inputs_invalid += 1;
-        strike(server, client, now, "input too far ahead");
+        // An honest client can overshoot after a clock disturbance: drop the inputs but report
+        // the slack so its pacer pulls back. Only absurd ticks count as a violation.
+        if let Some(slot) = server.slots.get_mut(client) {
+            slot.inputs.observe_slack(win.newest_tick.since(next) as f32);
+        }
+        if win.newest_tick.0 > tick.0.saturating_add(max_ahead.saturating_mul(4)) {
+            strike(server, client, now, "input too far ahead");
+        }
         return;
     }
     let mut strikes = 0;
@@ -552,7 +561,6 @@ fn receive_inputs(
         };
         slot.view_delay_q8 = win.view_delay_q8;
         // Slack of the newest input: how many ticks before it is needed it arrived.
-        let next = tick.next();
         slot.inputs.observe_slack(win.newest_tick.since(next) as f32);
         for (t, payload) in win.iter() {
             if t < next {
