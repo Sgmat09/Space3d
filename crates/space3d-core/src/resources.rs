@@ -55,11 +55,15 @@ impl Resources {
 
     /// Temporarily take a resource out so it can be used alongside `&mut self`.
     pub fn scope<T: Send + Sync + 'static, R>(&mut self, f: impl FnOnce(&mut Self, &mut T) -> R) -> R {
-        let mut value = self
-            .remove::<T>()
+        // Move the existing Box out and back in: no reallocation per call (hot path for
+        // per-frame systems such as the renderer).
+        let boxed = self
+            .map
+            .remove(&TypeId::of::<T>())
             .unwrap_or_else(|| panic!("missing resource {}", type_name::<T>()));
-        let out = f(self, &mut value);
-        self.insert(value);
+        let mut boxed: Box<T> = boxed.downcast().expect("resource type mismatch");
+        let out = f(self, &mut boxed);
+        self.map.insert(TypeId::of::<T>(), boxed);
         out
     }
 }
@@ -77,5 +81,15 @@ mod tests {
         assert_eq!(r.expect::<String>(), "a6");
         assert_eq!(r.remove::<u32>(), Some(6));
         assert!(!r.contains::<u32>());
+    }
+
+    #[test]
+    fn scope_keeps_the_same_allocation() {
+        let mut r = Resources::default();
+        r.insert([0u8; 4096]);
+        let before = r.expect::<[u8; 4096]>().as_ptr();
+        r.scope::<[u8; 4096], _>(|_, v| v[0] = 1);
+        assert_eq!(r.expect::<[u8; 4096]>().as_ptr(), before);
+        assert_eq!(r.expect::<[u8; 4096]>()[0], 1);
     }
 }
