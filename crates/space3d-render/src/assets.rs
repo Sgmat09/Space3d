@@ -79,7 +79,10 @@ impl TextureSource {
     /// sRGB RGBA8 texture array (all layers must share the size).
     pub fn from_layers(layers: &[ImageData]) -> Option<Self> {
         let first = layers.first()?;
-        if layers.iter().any(|l| l.width != first.width || l.height != first.height) {
+        if layers
+            .iter()
+            .any(|l| l.width != first.width || l.height != first.height)
+        {
             return None;
         }
         let mut data = Vec::with_capacity(first.pixels.len() * layers.len());
@@ -221,7 +224,9 @@ impl RenderAssets {
 
     /// Whether the mesh is resident on the GPU.
     pub fn is_mesh_uploaded(&self, handle: MeshHandle) -> bool {
-        self.meshes.get(handle.raw()).is_some_and(|e| e.gpu.is_some() && e.cpu.is_none())
+        self.meshes
+            .get(handle.raw())
+            .is_some_and(|e| e.gpu.is_some() && e.cpu.is_none())
     }
 
     /// Number of live meshes.

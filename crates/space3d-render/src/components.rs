@@ -116,10 +116,24 @@ impl Material {
 /// Camera projection.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Projection {
-    /// Perspective with vertical field of view in radians.
-    Perspective { fov_y: f32, near: f32, far: f32 },
-    /// Orthographic; `height` is the visible world-space height (width follows aspect).
-    Orthographic { height: f32, near: f32, far: f32 },
+    /// Perspective projection.
+    Perspective {
+        /// Vertical field of view in radians.
+        fov_y: f32,
+        /// Near plane distance.
+        near: f32,
+        /// Far plane distance.
+        far: f32,
+    },
+    /// Orthographic projection (width follows the aspect ratio).
+    Orthographic {
+        /// Visible world-space height.
+        height: f32,
+        /// Near plane distance.
+        near: f32,
+        /// Far plane distance.
+        far: f32,
+    },
 }
 
 impl Default for Projection {

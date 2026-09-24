@@ -207,8 +207,16 @@ impl MeshArena {
                 mapped_at_creation: true,
             })
         };
-        let vb = make("space3d mesh arena vertices", new_v as u64 * VERTEX_SIZE, wgpu::BufferUsages::VERTEX);
-        let ib = make("space3d mesh arena indices", new_i as u64 * INDEX_SIZE, wgpu::BufferUsages::INDEX);
+        let vb = make(
+            "space3d mesh arena vertices",
+            new_v as u64 * VERTEX_SIZE,
+            wgpu::BufferUsages::VERTEX,
+        );
+        let ib = make(
+            "space3d mesh arena indices",
+            new_i as u64 * INDEX_SIZE,
+            wgpu::BufferUsages::INDEX,
+        );
         up.reallocations += 2;
         {
             let mut vmap = vb.get_mapped_range_mut(..).expect("arena map");

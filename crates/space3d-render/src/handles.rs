@@ -137,7 +137,6 @@ impl<T> SlotMap<T> {
     pub fn len(&self) -> usize {
         self.len
     }
-
 }
 
 #[cfg(test)]

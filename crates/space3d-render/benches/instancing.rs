@@ -54,7 +54,11 @@ fn explicit(c: &mut Criterion) {
             .resources
             .expect_mut::<InstanceBuffers>()
             .insert(InstanceBuffer::from_vec(data, BufferUsage::Dynamic));
-        app.world.spawn((InstancedMesh { mesh, material: Material::default(), instances: h },));
+        app.world.spawn((InstancedMesh {
+            mesh,
+            material: Material::default(),
+            instances: h,
+        },));
         app.step_ticks(1);
         wait(&app);
         let mut t = 0.0f32;
@@ -62,7 +66,11 @@ fn explicit(c: &mut Criterion) {
         group.bench_function(format!("explicit/{}k", n / 1000), |b| {
             b.iter(|| {
                 t += 0.01;
-                let buf = app.resources.expect_mut::<InstanceBuffers>().get_mut::<InstanceCompact>(h).unwrap();
+                let buf = app
+                    .resources
+                    .expect_mut::<InstanceBuffers>()
+                    .get_mut::<InstanceCompact>(h)
+                    .unwrap();
                 for inst in buf.as_mut_slice() {
                     inst.translation[1] = t;
                 }
@@ -77,7 +85,11 @@ fn explicit(c: &mut Criterion) {
     let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.1));
     let n = 100_000;
     for i in 0..n {
-        app.world.spawn((Transform::from_xyz(i as f32 * 0.01, 0.0, 0.0), Mesh3d(mesh), Material::default()));
+        app.world.spawn((
+            Transform::from_xyz(i as f32 * 0.01, 0.0, 0.0),
+            Mesh3d(mesh),
+            Material::default(),
+        ));
     }
     app.step_ticks(1);
     wait(&app);
@@ -96,7 +108,9 @@ fn explicit(c: &mut Criterion) {
 
 fn mesh_arena(c: &mut Criterion) {
     let Some(mut r) = renderer() else { return };
-    let meshes: Vec<MeshData> = (0..1000).map(|i| MeshData::sphere(1.0, 8 + i % 16, 4 + i % 8)).collect();
+    let meshes: Vec<MeshData> = (0..1000)
+        .map(|i| MeshData::sphere(1.0, 8 + i % 16, 4 + i % 8))
+        .collect();
     let mut group = c.benchmark_group("mesh_arena");
     group.sample_size(20);
     group.throughput(Throughput::Elements(meshes.len() as u64));

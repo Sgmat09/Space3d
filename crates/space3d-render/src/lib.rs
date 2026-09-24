@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Space3d renderer: a wgpu 30 forward renderer built around instancing and minimal
 //! CPU→GPU traffic. Works windowed (via `space3d-platform`) and **headless** (tests,
 //! storybook, CI screenshots). See `ARCHITECTURE.md` for the full data-flow description.
@@ -49,7 +50,8 @@ pub use frame::RenderSettings;
 pub use handles::{InstanceBufferHandle, MeshHandle, TextureHandle};
 pub use instance::{
     BufferUsage, CullSource, InstanceAttribute, InstanceBuffer, InstanceBuffers, InstanceCompact, InstanceData,
-    InstanceLayout, InstancePacked, InstanceSemantic, InstanceTransform, InstanceTransformColor, InstancedMesh, ScaleKind,
+    InstanceLayout, InstancePacked, InstanceSemantic, InstanceTransform, InstanceTransformColor, InstancedMesh,
+    ScaleKind,
 };
 pub use renderer::{DisplayHandle, RenderCapabilities, RenderError, Renderer, RendererConfig};
 pub use stats::{DrawPath, RenderStats};
@@ -94,7 +96,9 @@ impl Plugin for RenderPlugin {
                 tracing::warn!("headless renderer unavailable: {e}");
             }
             #[cfg(target_arch = "wasm32")]
-            tracing::warn!("RenderPlugin::headless({w}, {h}) is not supported on the web; insert a Renderer asynchronously");
+            tracing::warn!(
+                "RenderPlugin::headless({w}, {h}) is not supported on the web; insert a Renderer asynchronously"
+            );
         }
     }
 }
@@ -148,9 +152,9 @@ pub fn render_to_image(app: &mut App) -> Option<ImageData> {
 /// Common imports.
 pub mod prelude {
     pub use crate::{
-        AmbientLight, BufferUsage, Camera3d, DirectionalLight, DrawPath, InstanceBuffer, InstanceBuffers, InstanceCompact,
-        InstanceData, InstanceTransform, InstanceTransformColor, InstancedMesh, Material, Mesh3d, MeshHandle, PointLight,
-        Projection, RenderAssets, RenderPlugin, RenderSettings, RenderStats, RenderTarget, Renderer, TextureHandle,
-        Visibility, render_to_image,
+        AmbientLight, BufferUsage, Camera3d, DirectionalLight, DrawPath, InstanceBuffer, InstanceBuffers,
+        InstanceCompact, InstanceData, InstanceTransform, InstanceTransformColor, InstancedMesh, Material, Mesh3d,
+        MeshHandle, PointLight, Projection, RenderAssets, RenderPlugin, RenderSettings, RenderStats, RenderTarget,
+        Renderer, TextureHandle, Visibility, render_to_image,
     };
 }

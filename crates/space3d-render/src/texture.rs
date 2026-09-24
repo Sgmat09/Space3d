@@ -2,8 +2,8 @@
 //! render-target textures and sampler caching.
 
 use crate::assets::{AddressMode, FilterMode, GpuTexture, SamplerSettings, TextureEntry, TextureSource};
-use crate::pipeline::{DEPTH_FORMAT, OFFSCREEN_FORMAT, Pipelines};
 use crate::handles::FastMap;
+use crate::pipeline::{DEPTH_FORMAT, OFFSCREEN_FORMAT, Pipelines};
 
 /// Samplers shared by all textures with equal settings.
 #[derive(Default)]
@@ -43,7 +43,12 @@ impl SamplerCache {
 }
 
 /// Bytes of one mip level of one layer (and its row pitch / row count in blocks).
-pub(crate) fn mip_layout(format: wgpu::TextureFormat, width: u32, height: u32, mip: u32) -> Option<(u32, u32, u32, u32)> {
+pub(crate) fn mip_layout(
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    mip: u32,
+) -> Option<(u32, u32, u32, u32)> {
     let (bw, bh) = format.block_dimensions();
     let block_size = format.block_copy_size(None)?;
     let w = (width >> mip).max(1);
@@ -215,7 +220,16 @@ fn upload_source(
     }
 
     if generate {
-        generate_mips(device, encoder, pipelines, &texture, format, src.layers, provided_mips, mip_count);
+        generate_mips(
+            device,
+            encoder,
+            pipelines,
+            &texture,
+            format,
+            src.layers,
+            provided_mips,
+            mip_count,
+        );
     }
 
     Ok((

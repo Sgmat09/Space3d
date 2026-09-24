@@ -5,20 +5,22 @@
 
 use crate::arena::{ArenaAlloc, Vertex};
 use crate::assets::{GpuMesh, RenderAssets};
-use crate::components::{AmbientLight, Camera3d, DirectionalLight, Material, Mesh3d, PointLight, RenderTarget, Visibility};
-use crate::culling::{Aabb, Frustum};
+use crate::components::{
+    AmbientLight, Camera3d, DirectionalLight, Material, Mesh3d, PointLight, RenderTarget, Visibility,
+};
 #[cfg(test)]
 use crate::culling::Sphere;
+use crate::culling::{Aabb, Frustum};
 use crate::gpu::{GrowBuffer, TrackedBuffer, align_up};
+use crate::handles::FastMap;
 use crate::handles::{MeshHandle, TextureHandle};
 use crate::instance::{BufferUsage, CullSource, ErasedInstanceBuffer, InstanceBuffers, InstancedMesh, ScaleKind};
 use crate::pipeline::{
-    CLASS_BLEND, CLASS_DOUBLE_SIDED, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuMaterial, GpuPointLight,
-    GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, OFFSCREEN_FORMAT, PipelineKey,
+    CLASS_BLEND, CLASS_DOUBLE_SIDED, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuMaterial,
+    GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, OFFSCREEN_FORMAT, PipelineKey,
 };
 use crate::renderer::{RenderCapabilities, Renderer};
 use crate::stats::DrawPath;
-use crate::handles::FastMap;
 use bytemuck::Zeroable;
 use glam::{Mat4, Vec3, Vec4};
 use space3d_core::{Entity, GlobalTransform, Resources, World};
@@ -223,7 +225,12 @@ impl MaterialTable {
         self.map.insert(key, id);
         let gpu = GpuMaterial {
             base_color: m.base_color.to_array(),
-            emissive: [m.emissive.x, m.emissive.y, m.emissive.z, if m.unlit { 1.0 } else { 0.0 }],
+            emissive: [
+                m.emissive.x,
+                m.emissive.y,
+                m.emissive.z,
+                if m.unlit { 1.0 } else { 0.0 },
+            ],
             params: [
                 m.metallic,
                 m.roughness,
@@ -431,8 +438,14 @@ impl Renderer {
         self.frame.path = path;
 
         // Move the asset/instance registries out without re-boxing resources.
-        let mut assets = resources.get_mut::<RenderAssets>().map(std::mem::take).unwrap_or_default();
-        let mut buffers = resources.get_mut::<InstanceBuffers>().map(std::mem::take).unwrap_or_default();
+        let mut assets = resources
+            .get_mut::<RenderAssets>()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let mut buffers = resources
+            .get_mut::<InstanceBuffers>()
+            .map(std::mem::take)
+            .unwrap_or_default();
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d frame"),
@@ -442,6 +455,7 @@ impl Renderer {
             if let Some(slot) = self.frame.explicit.get_mut(h.index() as usize) {
                 *slot = None;
             }
+            self.frame.cull_bgs.remove(&SourceBuffer::Explicit(h.index()));
         }
         self.prepare(world, &assets, &mut buffers, ambient, &settings, &mut encoder);
         self.encode_compute(&mut encoder);
@@ -450,7 +464,9 @@ impl Renderer {
         let mut surface_tex = None;
         if let Some(s) = &self.surface {
             match s.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => surface_tex = Some(t),
+                wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                    surface_tex = Some(t)
+                }
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                     s.surface.configure(&self.device, &s.config);
                 }
@@ -581,6 +597,11 @@ impl Renderer {
 
         // ---- ECS batching ------------------------------------------------------------
         f.materials.gc(frame_index);
+        if frame_index.is_multiple_of(256) {
+            // Drop bind groups of removed textures (they keep the GPU texture alive).
+            f.material_bgs
+                .retain(|t, _| t.is_none_or(|h| assets.contains_texture(h)));
+        }
         f.items.clear();
         let mut seq = 0u32;
         for (gt, mesh, mat, vis) in world
@@ -590,9 +611,13 @@ impl Renderer {
             if vis == Some(&Visibility::Hidden) || !assets.is_mesh_uploaded(mesh.0) {
                 continue;
             }
-            let (material, class) =
-                f.materials
-                    .intern(mat, frame_index, &mut f.materials_buf, material_stride, &mut cpu_reallocs);
+            let (material, class) = f.materials.intern(
+                mat,
+                frame_index,
+                &mut f.materials_buf,
+                material_stride,
+                &mut cpu_reallocs,
+            );
             f.items.push(EcsItem {
                 key: (class as u64) << 56 | (material as u64) << 32 | mesh.0.index() as u64,
                 seq,
@@ -651,6 +676,8 @@ impl Renderer {
             }
             let fresh = !matches!(&f.explicit[slot], Some(g) if g.generation == im.instances.generation());
             if fresh {
+                // A reused slot must not pick up a bind group of the previous buffer.
+                f.cull_bgs.remove(&SourceBuffer::Explicit(slot as u32));
                 use wgpu::BufferUsages as U;
                 let s = if f.storage { U::STORAGE } else { U::empty() };
                 f.explicit[slot] = Some(GpuInstances {
@@ -671,9 +698,13 @@ impl Renderer {
             }
             let layout = ib.layout();
             let layout_id = pipelines.layout_id(layout);
-            let (material, class) =
-                f.materials
-                    .intern(&im.material, frame_index, &mut f.materials_buf, material_stride, &mut cpu_reallocs);
+            let (material, class) = f.materials.intern(
+                &im.material,
+                frame_index,
+                &mut f.materials_buf,
+                material_stride,
+                &mut cpu_reallocs,
+            );
             let mut cull = layout.cull_source();
             if (g.len as u64) * layout.stride as u64 > f.max_storage_binding {
                 cull = CullSource::None;
@@ -694,7 +725,15 @@ impl Renderer {
             });
         }
         f.sources.sort_unstable_by_key(|s| {
-            (s.blend, s.class, s.layout, s.material, s.mesh.alloc.first_index, s.buffer, s.first)
+            (
+                s.blend,
+                s.class,
+                s.layout,
+                s.material,
+                s.mesh.alloc.first_index,
+                s.buffer,
+                s.first,
+            )
         });
         stats.batches = f.sources.len() as u32;
 
@@ -754,7 +793,8 @@ impl Renderer {
                 dir_lights: dir,
                 point_lights: point,
             };
-            f.views_buf.write_at(view_offset, bytemuck::bytes_of(&gv), &mut cpu_reallocs);
+            f.views_buf
+                .write_at(view_offset, bytemuck::bytes_of(&gv), &mut cpu_reallocs);
 
             let draws_start = f.draws.len();
             let jobs_start = f.jobs.len();
@@ -837,7 +877,8 @@ impl Renderer {
                         }
                         _ => (0, draw),
                     };
-                    f.draw_meta.push(bytemuck::cast_slice(&[run_index, run_first]), &mut cpu_reallocs);
+                    f.draw_meta
+                        .push(bytemuck::cast_slice(&[run_index, run_first]), &mut cpu_reallocs);
                     if !multi {
                         f.draws.push(DrawCmd {
                             vb: VertexSource::CullOut,
@@ -971,7 +1012,11 @@ impl Renderer {
                         j += 1;
                     }
                     let max_dim = 65535;
-                    let wgs = if wg <= max_dim { (wg, 1) } else { (max_dim, wg.div_ceil(max_dim)) };
+                    let wgs = if wg <= max_dim {
+                        (wg, 1)
+                    } else {
+                        (max_dim, wg.div_ceil(max_dim))
+                    };
                     let params = GpuCullParams {
                         planes,
                         job_start,
@@ -980,7 +1025,8 @@ impl Renderer {
                         workgroups_x: wgs.0,
                     };
                     let params_offset = f.dispatches.len() * params_stride;
-                    f.cull_params.write_at(params_offset, bytemuck::bytes_of(&params), &mut cpu_reallocs);
+                    f.cull_params
+                        .write_at(params_offset, bytemuck::bytes_of(&params), &mut cpu_reallocs);
                     f.dispatches.push(Dispatch {
                         buffer,
                         params_offset: params_offset as u32,
@@ -994,7 +1040,8 @@ impl Renderer {
                         pad: [0; 2],
                     };
                     let off = f.compacts.len() * f.uniform_align.max(16);
-                    f.compact_params.write_at(off, bytemuck::bytes_of(&p), &mut cpu_reallocs);
+                    f.compact_params
+                        .write_at(off, bytemuck::bytes_of(&p), &mut cpu_reallocs);
                     f.compacts.push(CompactDispatch {
                         params_offset: off as u32,
                         draw_count: p.draw_count,
@@ -1015,10 +1062,14 @@ impl Renderer {
 
         // ---- upload ------------------------------------------------------------------
         // Bindings cover one full element even when empty.
-        f.views_buf.ensure_len(std::mem::size_of::<GpuView>(), &mut cpu_reallocs);
-        f.materials_buf.ensure_len(std::mem::size_of::<GpuMaterial>(), &mut cpu_reallocs);
-        f.cull_params.ensure_len(std::mem::size_of::<GpuCullParams>(), &mut cpu_reallocs);
-        f.compact_params.ensure_len(std::mem::size_of::<GpuCompactParams>(), &mut cpu_reallocs);
+        f.views_buf
+            .ensure_len(std::mem::size_of::<GpuView>(), &mut cpu_reallocs);
+        f.materials_buf
+            .ensure_len(std::mem::size_of::<GpuMaterial>(), &mut cpu_reallocs);
+        f.cull_params
+            .ensure_len(std::mem::size_of::<GpuCullParams>(), &mut cpu_reallocs);
+        f.compact_params
+            .ensure_len(std::mem::size_of::<GpuCompactParams>(), &mut cpu_reallocs);
         let inst_before = up.bytes;
         f.ecs.flush(device, encoder, up);
         f.cpu_visible.flush(device, encoder, up);
@@ -1149,7 +1200,10 @@ impl Renderer {
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: uniform_binding(f.compact_params.buffer(), std::mem::size_of::<GpuCompactParams>()),
+                                resource: uniform_binding(
+                                    f.compact_params.buffer(),
+                                    std::mem::size_of::<GpuCompactParams>(),
+                                ),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
@@ -1175,7 +1229,11 @@ impl Renderer {
         }
 
         let caps_after = f.capacities();
-        cpu_reallocs += caps_before.iter().zip(caps_after.iter()).filter(|(a, b)| a != b).count() as u32;
+        cpu_reallocs += caps_before
+            .iter()
+            .zip(caps_after.iter())
+            .filter(|(a, b)| a != b)
+            .count() as u32;
         stats.cpu_reallocations += cpu_reallocs;
     }
 
@@ -1237,7 +1295,14 @@ impl Renderer {
                     let s = self.surface.as_ref().expect("surface");
                     let a = &s.attachments;
                     match &a.msaa_view {
-                        Some(m) => (m.clone(), Some(sv.clone()), a.depth_view.clone(), a.format, a.samples, s.manual_srgb),
+                        Some(m) => (
+                            m.clone(),
+                            Some(sv.clone()),
+                            a.depth_view.clone(),
+                            a.format,
+                            a.samples,
+                            s.manual_srgb,
+                        ),
                         None => (sv.clone(), None, a.depth_view.clone(), a.format, 1, s.manual_srgb),
                     }
                 }
@@ -1249,17 +1314,38 @@ impl Renderer {
                     let a = &self.offscreen;
                     let target = a.color_view.clone().expect("offscreen color");
                     match &a.msaa_view {
-                        Some(m) => (m.clone(), Some(target), a.depth_view.clone(), a.format, a.samples, false),
+                        Some(m) => (
+                            m.clone(),
+                            Some(target),
+                            a.depth_view.clone(),
+                            a.format,
+                            a.samples,
+                            false,
+                        ),
                         None => (target, None, a.depth_view.clone(), a.format, 1, false),
                     }
                 }
-                (ViewTarget::Texture { color, depth }, _) => (color.clone(), None, depth.clone(), OFFSCREEN_FORMAT, 1, false),
+                (ViewTarget::Texture { color, depth }, _) => {
+                    (color.clone(), None, depth.clone(), OFFSCREEN_FORMAT, 1, false)
+                }
             };
             presented |= is_primary;
-            self.encode_pass(encoder, view, &color, resolve.as_ref(), &depth, format, samples, manual_srgb);
+            self.encode_pass(
+                encoder,
+                view,
+                &color,
+                resolve.as_ref(),
+                &depth,
+                format,
+                samples,
+                manual_srgb,
+            );
         }
         // Nothing drew to the window: still clear it so stale content is not shown.
-        if !presented && !primary_to_offscreen && let Some(sv) = surface_view {
+        if !presented
+            && !primary_to_offscreen
+            && let Some(sv) = surface_view
+        {
             let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("space3d clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1407,7 +1493,8 @@ impl Renderer {
     pub(crate) fn encode_primary_to_offscreen(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let (w, h) = self.primary_size();
         if (self.offscreen.width, self.offscreen.height) != (w, h) {
-            self.offscreen = crate::renderer::Attachments::new(&self.device, w, h, self.offscreen.samples, OFFSCREEN_FORMAT, true);
+            self.offscreen =
+                crate::renderer::Attachments::new(&self.device, w, h, self.offscreen.samples, OFFSCREEN_FORMAT, true);
         }
         let draw_calls = self.stats.draw_calls;
         self.encode_views(encoder, None, true);
@@ -1427,7 +1514,9 @@ fn sync_instances(
     let stride = ib.layout().stride as usize;
     let len = ib.len();
     let needed = len * stride;
-    let realloc = g.buf.ensure(device, needed as u64, ib.usage() == BufferUsage::Static, up);
+    let realloc = g
+        .buf
+        .ensure(device, needed as u64, ib.usage() == BufferUsage::Static, up);
     let before = up.bytes;
     if needed > 0 {
         let bytes = ib.bytes();

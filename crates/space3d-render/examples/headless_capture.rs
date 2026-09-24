@@ -33,12 +33,19 @@ fn main() {
     app.world.spawn((
         Transform::from_xyz(0.0, -0.5, 0.0),
         Mesh3d(plane),
-        Material::default().with_texture(checker).with_metallic_roughness(0.0, 0.9),
+        Material::default()
+            .with_texture(checker)
+            .with_metallic_roughness(0.0, 0.9),
     ));
     for i in 0..7 {
         let x = i as f32 * 1.4 - 4.2;
         let h = i as f32 / 7.0 * std::f32::consts::TAU;
-        let color = Vec4::new(0.5 + 0.5 * h.cos(), 0.5 + 0.5 * (h + 2.1).cos(), 0.5 + 0.5 * (h + 4.2).cos(), 1.0);
+        let color = Vec4::new(
+            0.5 + 0.5 * h.cos(),
+            0.5 + 0.5 * (h + 2.1).cos(),
+            0.5 + 0.5 * (h + 4.2).cos(),
+            1.0,
+        );
         app.world.spawn((
             Transform::from_xyz(x, 0.0, 0.0).with_rotation(Quat::from_rotation_y(i as f32 * 0.4)),
             Mesh3d(cube),
@@ -63,16 +70,30 @@ fn main() {
         ));
     }
     let instances = app.resources.expect_mut::<InstanceBuffers>().insert(buf);
-    app.world.spawn((InstancedMesh { mesh: cube, material: Material::default(), instances },));
+    app.world.spawn((InstancedMesh {
+        mesh: cube,
+        material: Material::default(),
+        instances,
+    },));
     app.world.spawn((
         Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(-0.4, -1.0, -0.5), Vec3::Y),
-        DirectionalLight { color: Vec3::new(1.0, 0.95, 0.9), intensity: 2.5 },
+        DirectionalLight {
+            color: Vec3::new(1.0, 0.95, 0.9),
+            intensity: 2.5,
+        },
     ));
     app.world.spawn((
         Transform::from_xyz(0.0, 2.5, 2.0),
-        PointLight { color: Vec3::new(1.0, 0.5, 0.2), intensity: 20.0, range: 8.0 },
+        PointLight {
+            color: Vec3::new(1.0, 0.5, 0.2),
+            intensity: 20.0,
+            range: 8.0,
+        },
     ));
-    app.insert_resource(AmbientLight { color: Vec3::new(0.6, 0.7, 1.0), intensity: 0.15 });
+    app.insert_resource(AmbientLight {
+        color: Vec3::new(0.6, 0.7, 1.0),
+        intensity: 0.15,
+    });
     app.world.spawn((
         Transform::from_xyz(0.0, 2.5, 7.5).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
         Camera3d::default().with_clear_color(Vec4::new(0.05, 0.07, 0.12, 1.0)),

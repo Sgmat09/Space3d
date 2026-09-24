@@ -55,7 +55,10 @@ impl Uploader {
         let Some(size) = wgpu::BufferSize::new(data.len() as u64) else {
             return;
         };
-        debug_assert!(offset.is_multiple_of(4) && data.len().is_multiple_of(4), "unaligned upload");
+        debug_assert!(
+            offset.is_multiple_of(4) && data.len().is_multiple_of(4),
+            "unaligned upload"
+        );
         let mut view = self.belt.write_buffer(encoder, target, offset, size);
         copy_to_staging(view.slice(..), data);
         self.bytes += data.len() as u64;
@@ -199,7 +202,8 @@ impl TrackedBuffer {
         if len > self.shadow.len() {
             if len > self.shadow.capacity() {
                 *cpu_reallocs += 1;
-                self.shadow.reserve(len.max(self.shadow.capacity() * 3 / 2) - self.shadow.len());
+                self.shadow
+                    .reserve(len.max(self.shadow.capacity() * 3 / 2) - self.shadow.len());
             }
             // The GPU tail past the old shadow length was never written, so it is still
             // zero-initialized (wgpu guarantees this) and matches the zeroed shadow tail.
@@ -236,12 +240,7 @@ impl TrackedBuffer {
     }
 
     /// Upload changed ranges (or everything after reallocation). Returns bytes uploaded.
-    pub fn flush(
-        &mut self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        up: &mut Uploader,
-    ) -> u64 {
+    pub fn flush(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, up: &mut Uploader) -> u64 {
         let len = self.len.next_multiple_of(4);
         if len > self.shadow.len() {
             self.shadow.resize(len, 0);

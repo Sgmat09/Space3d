@@ -87,10 +87,15 @@ pub struct InstanceLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CullSource {
     /// Translation = column 3, scale = longest of columns 0..2.
-    Matrix { offset: u32 },
-    /// Translation at `translation` (f32 xyz); optional scale.
+    Matrix {
+        /// Byte offset of the first matrix column.
+        offset: u32,
+    },
+    /// Translation (f32 xyz) plus optional scale.
     TranslationScale {
+        /// Byte offset of the translation.
         translation: u32,
+        /// Byte offset and encoding of the scale, if any.
         scale: Option<(u32, ScaleKind)>,
     },
     /// Position not decodable; the whole buffer is drawn without per-instance culling.
@@ -110,7 +115,10 @@ impl InstanceLayout {
     /// Check that attributes fit the stride and use formats the built-in shader understands.
     pub fn validate(&self) -> Result<(), String> {
         if self.stride == 0 || !self.stride.is_multiple_of(4) {
-            return Err(format!("{}: stride {} must be a non-zero multiple of 4", self.name, self.stride));
+            return Err(format!(
+                "{}: stride {} must be a non-zero multiple of 4",
+                self.name, self.stride
+            ));
         }
         let mut transform = false;
         for a in self.attributes {
@@ -123,12 +131,18 @@ impl InstanceLayout {
                 a.format.size() as u32
             };
             if a.offset + size > self.stride || !a.offset.is_multiple_of(4) {
-                return Err(format!("{}: attribute {:?} out of bounds/unaligned", self.name, a.semantic));
+                return Err(format!(
+                    "{}: attribute {:?} out of bounds/unaligned",
+                    self.name, a.semantic
+                ));
             }
             if wgsl_type(a.format).is_none() {
                 return Err(format!("{}: unsupported vertex format {:?}", self.name, a.format));
             }
-            transform |= matches!(a.semantic, InstanceSemantic::ModelMatrix | InstanceSemantic::Translation);
+            transform |= matches!(
+                a.semantic,
+                InstanceSemantic::ModelMatrix | InstanceSemantic::Translation
+            );
         }
         if !transform {
             return Err(format!("{}: needs a ModelMatrix or Translation attribute", self.name));
@@ -140,7 +154,13 @@ impl InstanceLayout {
     pub fn location_count(&self) -> u32 {
         self.attributes
             .iter()
-            .map(|a| if a.semantic == InstanceSemantic::ModelMatrix { 4 } else { 1 })
+            .map(|a| {
+                if a.semantic == InstanceSemantic::ModelMatrix {
+                    4
+                } else {
+                    1
+                }
+            })
             .sum()
     }
 
@@ -159,7 +179,10 @@ impl InstanceLayout {
         if !matches!(t.format, VertexFormat::Float32x3 | VertexFormat::Float32x4) {
             return CullSource::None;
         }
-        let scale = match (self.find(InstanceSemantic::Scale), self.find(InstanceSemantic::UniformScale)) {
+        let scale = match (
+            self.find(InstanceSemantic::Scale),
+            self.find(InstanceSemantic::UniformScale),
+        ) {
             (Some(s), _) if matches!(s.format, VertexFormat::Float32x3 | VertexFormat::Float32x4) => {
                 Some((s.offset, ScaleKind::Vector))
             }
@@ -187,7 +210,11 @@ impl InstanceLayout {
                 let c1 = v3(offset + 16);
                 let c2 = v3(offset + 32);
                 let t = v3(offset + 48);
-                let s = c0.length_squared().max(c1.length_squared()).max(c2.length_squared()).sqrt();
+                let s = c0
+                    .length_squared()
+                    .max(c1.length_squared())
+                    .max(c2.length_squared())
+                    .sqrt();
                 Some((t, s))
             }
             CullSource::TranslationScale { translation, scale } => {
@@ -262,7 +289,11 @@ impl InstanceData for InstanceTransform {
     const LAYOUT: &'static InstanceLayout = &InstanceLayout {
         name: "InstanceTransform",
         stride: 64,
-        attributes: &[InstanceAttribute::new(InstanceSemantic::ModelMatrix, VertexFormat::Float32x4, 0)],
+        attributes: &[InstanceAttribute::new(
+            InstanceSemantic::ModelMatrix,
+            VertexFormat::Float32x4,
+            0,
+        )],
     };
 }
 
@@ -352,7 +383,10 @@ pub struct InstancePacked {
 impl InstancePacked {
     /// Pack from full-precision values.
     pub fn new(translation: Vec3, rotation: Quat, scale: f32, color: glam::Vec4, layer: u32) -> Self {
-        let q = rotation.normalize().to_array().map(|c| (c.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16);
+        let q = rotation
+            .normalize()
+            .to_array()
+            .map(|c| (c.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16);
         let c = color.to_array().map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
         Self {
             translation: translation.to_array(),
@@ -673,7 +707,11 @@ mod tests {
 
     #[test]
     fn decode_bounds_matches_values() {
-        let t = InstanceTransform::from_trs(Vec3::new(1.0, 2.0, 3.0), Quat::from_rotation_y(1.0), Vec3::new(1.0, 4.0, 2.0));
+        let t = InstanceTransform::from_trs(
+            Vec3::new(1.0, 2.0, 3.0),
+            Quat::from_rotation_y(1.0),
+            Vec3::new(1.0, 4.0, 2.0),
+        );
         let (p, s) = t.bounds().unwrap();
         assert!((p - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-5);
         assert!((s - 4.0).abs() < 1e-5);
@@ -684,7 +722,9 @@ mod tests {
     #[test]
     fn dirty_tracking_and_bounds() {
         let mut b = InstanceBuffer::from_vec(
-            (0..100).map(|i| InstanceCompact::new(Vec3::splat(i as f32), Quat::IDENTITY, 1.0)).collect(),
+            (0..100)
+                .map(|i| InstanceCompact::new(Vec3::splat(i as f32), Quat::IDENTITY, 1.0))
+                .collect(),
             BufferUsage::Dynamic,
         );
         assert_eq!(b.dirty_ranges(), &[0..100]);

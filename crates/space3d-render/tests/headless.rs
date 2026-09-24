@@ -9,7 +9,8 @@ use space3d_render::*;
 fn cube_covers_center_and_corners_stay_clear() {
     let Some(mut app) = headless_app(64, 64) else { return };
     let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(1.0));
-    app.world.spawn((Transform::default(), Mesh3d(mesh), Material::srgb(0.9, 0.3, 0.2)));
+    app.world
+        .spawn((Transform::default(), Mesh3d(mesh), Material::srgb(0.9, 0.3, 0.2)));
     spawn_camera(&mut app, 3.0);
     spawn_sun(&mut app);
     let img = render_to_image(&mut app).expect("capture");
@@ -26,7 +27,10 @@ fn cube_covers_center_and_corners_stay_clear() {
 #[test]
 fn output_is_deterministic() {
     let Some(mut app) = headless_app(96, 64) else { return };
-    let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::sphere(0.8, 24, 12));
+    let mesh = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_mesh(MeshData::sphere(0.8, 24, 12));
     for i in 0..5 {
         app.world.spawn((
             Transform::from_xyz(i as f32 - 2.0, 0.0, 0.0),
@@ -34,7 +38,13 @@ fn output_is_deterministic() {
             Material::srgb(0.2 * i as f32, 0.8, 0.4).with_metallic_roughness(0.5, 0.3),
         ));
     }
-    app.world.spawn((Transform::from_xyz(0.0, 2.0, 2.0), PointLight { intensity: 8.0, ..Default::default() }));
+    app.world.spawn((
+        Transform::from_xyz(0.0, 2.0, 2.0),
+        PointLight {
+            intensity: 8.0,
+            ..Default::default()
+        },
+    ));
     spawn_camera(&mut app, 5.0);
     spawn_sun(&mut app);
     let a = render_to_image(&mut app).expect("capture");
@@ -56,7 +66,8 @@ fn capture_task_resolves() {
 fn msaa_and_resize() {
     let Some(mut app) = headless_app(32, 32) else { return };
     let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(1.0));
-    app.world.spawn((Transform::default(), Mesh3d(mesh), Material::unlit(Vec4::ONE)));
+    app.world
+        .spawn((Transform::default(), Mesh3d(mesh), Material::unlit(Vec4::ONE)));
     spawn_camera(&mut app, 3.0);
     app.resources.expect_mut::<Renderer>().resize(48, 40);
     let img = render_to_image(&mut app).expect("capture");
@@ -75,12 +86,20 @@ fn textured_mesh_and_render_target() {
         (quad, tex, rt)
     };
     // Unlit checker cube seen by the main camera.
-    app.world.spawn((Transform::default(), Mesh3d(quad), Material::unlit(Vec4::ONE).with_texture(tex)));
+    app.world.spawn((
+        Transform::default(),
+        Mesh3d(quad),
+        Material::unlit(Vec4::ONE).with_texture(tex),
+    ));
     spawn_camera(&mut app, 2.5);
     // Second camera renders into a texture first (order -1); must not disturb the primary.
     app.world.spawn((
         Transform::from_xyz(0.0, 0.0, 5.0),
-        Camera3d { order: -1, target: RenderTarget::Texture(rt), ..Default::default() },
+        Camera3d {
+            order: -1,
+            target: RenderTarget::Texture(rt),
+            ..Default::default()
+        },
     ));
     let img = render_to_image(&mut app).expect("capture");
     let mut reds = 0;
@@ -93,7 +112,10 @@ fn textured_mesh_and_render_target() {
             greens += 1;
         }
     }
-    assert!(reds > 100 && greens > 100, "checker texture visible (r={reds}, g={greens})");
+    assert!(
+        reds > 100 && greens > 100,
+        "checker texture visible (r={reds}, g={greens})"
+    );
     assert_eq!(stats(&app).views, 2);
 }
 
@@ -101,12 +123,17 @@ fn textured_mesh_and_render_target() {
 fn many_meshes_share_the_arena() {
     let Some(mut app) = headless_app(64, 64) else { return };
     let meshes: Vec<_> = (0..200)
-        .map(|i| app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::sphere(0.5, 4 + i % 13, 3 + i % 7)))
+        .map(|i| {
+            app.resources
+                .expect_mut::<RenderAssets>()
+                .add_mesh(MeshData::sphere(0.5, 4 + i % 13, 3 + i % 7))
+        })
         .collect();
     for (i, m) in meshes.iter().enumerate() {
         let x = (i % 20) as f32 * 0.5 - 5.0;
         let y = (i / 20) as f32 * 0.5 - 2.5;
-        app.world.spawn((Transform::from_xyz(x, y, 0.0), Mesh3d(*m), Material::default()));
+        app.world
+            .spawn((Transform::from_xyz(x, y, 0.0), Mesh3d(*m), Material::default()));
     }
     spawn_camera(&mut app, 8.0);
     set_path(&mut app, DrawPath::CpuDirect);

@@ -140,7 +140,14 @@ pub(crate) struct Attachments {
 }
 
 impl Attachments {
-    pub fn new(device: &wgpu::Device, width: u32, height: u32, samples: u32, format: wgpu::TextureFormat, offscreen: bool) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        samples: u32,
+        format: wgpu::TextureFormat,
+        offscreen: bool,
+    ) -> Self {
         let size = wgpu::Extent3d {
             width: width.max(1),
             height: height.max(1),
@@ -163,13 +170,26 @@ impl Attachments {
                 "space3d offscreen color",
                 format,
                 1,
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
             )
         });
         let msaa_view = (samples > 1).then(|| {
-            tex("space3d msaa color", format, samples, wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default())
+            tex(
+                "space3d msaa color",
+                format,
+                samples,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            )
+            .create_view(&Default::default())
         });
-        let depth = tex("space3d depth", DEPTH_FORMAT, samples, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth = tex(
+            "space3d depth",
+            DEPTH_FORMAT,
+            samples,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
         Self {
             width: size.width,
             height: size.height,
@@ -322,7 +342,14 @@ impl Renderer {
         config.msaa_samples = if config.msaa_samples > 1 { caps.max_msaa } else { 1 };
         config.width = config.width.max(1);
         config.height = config.height.max(1);
-        let offscreen = Attachments::new(&device, config.width, config.height, config.msaa_samples, OFFSCREEN_FORMAT, true);
+        let offscreen = Attachments::new(
+            &device,
+            config.width,
+            config.height,
+            config.msaa_samples,
+            OFFSCREEN_FORMAT,
+            true,
+        );
         let pipelines = Pipelines::new(&device, caps.compute && caps.indirect);
         let white = white_texture(&device, &queue);
         let mut samplers = SamplerCache::default();
@@ -372,12 +399,20 @@ impl Renderer {
             height: self.config.height,
             present_mode,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
         };
         surface.configure(&self.device, &config);
         let samples = if self.config.msaa_samples > 1
-            && self.adapter.get_texture_format_features(format).flags.sample_count_supported(self.config.msaa_samples)
+            && self
+                .adapter
+                .get_texture_format_features(format)
+                .flags
+                .sample_count_supported(self.config.msaa_samples)
         {
             self.config.msaa_samples
         } else {
@@ -424,10 +459,24 @@ impl Renderer {
             s.config.width = width;
             s.config.height = height;
             s.surface.configure(&self.device, &s.config);
-            s.attachments = Attachments::new(&self.device, width, height, s.attachments.samples, s.config.format, false);
+            s.attachments = Attachments::new(
+                &self.device,
+                width,
+                height,
+                s.attachments.samples,
+                s.config.format,
+                false,
+            );
         }
         if (self.offscreen.width, self.offscreen.height) != (width, height) {
-            self.offscreen = Attachments::new(&self.device, width, height, self.offscreen.samples, OFFSCREEN_FORMAT, true);
+            self.offscreen = Attachments::new(
+                &self.device,
+                width,
+                height,
+                self.offscreen.samples,
+                OFFSCREEN_FORMAT,
+                true,
+            );
         }
     }
 
@@ -447,7 +496,14 @@ impl Renderer {
                 .flags
                 .sample_count_supported(samples);
             let samples = if ok { samples } else { 1 };
-            s.attachments = Attachments::new(&self.device, s.config.width, s.config.height, samples, s.config.format, false);
+            s.attachments = Attachments::new(
+                &self.device,
+                s.config.width,
+                s.config.height,
+                samples,
+                s.config.format,
+                false,
+            );
         }
     }
 
@@ -523,7 +579,14 @@ impl Renderer {
                 if entry.render_target && entry.gpu.is_some() {
                     continue;
                 }
-                match create_gpu_texture(&self.device, &self.queue, encoder, &mut self.pipelines, &mut self.samplers, entry) {
+                match create_gpu_texture(
+                    &self.device,
+                    &self.queue,
+                    encoder,
+                    &mut self.pipelines,
+                    &mut self.samplers,
+                    entry,
+                ) {
                     Ok(bytes) => {
                         self.uploader.bytes += bytes;
                         self.stats.textures_uploaded += 1;
@@ -588,7 +651,9 @@ impl Renderer {
                     })
                 })
                 .collect();
-            assets.arena.realloc_gpu(&self.device, encoder, old, &writes, &mut self.uploader);
+            assets
+                .arena
+                .realloc_gpu(&self.device, encoder, old, &writes, &mut self.uploader);
             fresh = old;
         }
         for (h, alloc, v, i) in scratch.drain(..) {
@@ -664,26 +729,27 @@ impl Renderer {
         });
         self.queue.submit([encoder.finish()]);
 
-        let read = move |buffer: wgpu::Buffer, ok: Result<(), wgpu::BufferAsyncError>| -> Result<ImageData, RenderError> {
-            ok.map_err(|e| RenderError::Capture(e.to_string()))?;
-            let view = buffer
-                .slice(..)
-                .get_mapped_range()
-                .map_err(|e| RenderError::Capture(format!("{e:?}")))?;
-            let row = w as usize * 4;
-            let mut pixels = Vec::with_capacity(row * h as usize);
-            for y in 0..h as usize {
-                let start = y * padded as usize;
-                pixels.extend_from_slice(&view[start..start + row]);
-            }
-            drop(view);
-            buffer.unmap();
-            Ok(ImageData {
-                width: w,
-                height: h,
-                pixels,
-            })
-        };
+        let read =
+            move |buffer: wgpu::Buffer, ok: Result<(), wgpu::BufferAsyncError>| -> Result<ImageData, RenderError> {
+                ok.map_err(|e| RenderError::Capture(e.to_string()))?;
+                let view = buffer
+                    .slice(..)
+                    .get_mapped_range()
+                    .map_err(|e| RenderError::Capture(format!("{e:?}")))?;
+                let row = w as usize * 4;
+                let mut pixels = Vec::with_capacity(row * h as usize);
+                for y in 0..h as usize {
+                    let start = y * padded as usize;
+                    pixels.extend_from_slice(&view[start..start + row]);
+                }
+                drop(view);
+                buffer.unmap();
+                Ok(ImageData {
+                    width: w,
+                    height: h,
+                    pixels,
+                })
+            };
 
         #[cfg(not(target_arch = "wasm32"))]
         {

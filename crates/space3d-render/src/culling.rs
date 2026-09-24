@@ -150,12 +150,27 @@ mod tests {
     #[test]
     fn sphere_culling() {
         let f = frustum();
-        assert!(f.intersects_sphere(&Sphere { center: Vec3::ZERO, radius: 1.0 }));
-        assert!(!f.intersects_sphere(&Sphere { center: Vec3::new(0.0, 0.0, 10.0), radius: 1.0 }));
-        assert!(!f.intersects_sphere(&Sphere { center: Vec3::new(100.0, 0.0, 0.0), radius: 1.0 }));
-        assert!(!f.intersects_sphere(&Sphere { center: Vec3::new(0.0, 0.0, -200.0), radius: 1.0 }));
+        assert!(f.intersects_sphere(&Sphere {
+            center: Vec3::ZERO,
+            radius: 1.0
+        }));
+        assert!(!f.intersects_sphere(&Sphere {
+            center: Vec3::new(0.0, 0.0, 10.0),
+            radius: 1.0
+        }));
+        assert!(!f.intersects_sphere(&Sphere {
+            center: Vec3::new(100.0, 0.0, 0.0),
+            radius: 1.0
+        }));
+        assert!(!f.intersects_sphere(&Sphere {
+            center: Vec3::new(0.0, 0.0, -200.0),
+            radius: 1.0
+        }));
         // Straddling the left plane still counts.
-        assert!(f.intersects_sphere(&Sphere { center: Vec3::new(-3.4, 0.0, 0.0), radius: 1.0 }));
+        assert!(f.intersects_sphere(&Sphere {
+            center: Vec3::new(-3.4, 0.0, 0.0),
+            radius: 1.0
+        }));
     }
 
     #[test]
@@ -169,7 +184,11 @@ mod tests {
     #[test]
     fn transformed_sphere_scales() {
         let m = Mat4::from_scale_rotation_translation(Vec3::new(1.0, 3.0, 2.0), glam::Quat::IDENTITY, Vec3::X);
-        let s = Sphere { center: Vec3::ZERO, radius: 1.0 }.transformed(&m);
+        let s = Sphere {
+            center: Vec3::ZERO,
+            radius: 1.0,
+        }
+        .transformed(&m);
         assert_eq!(s.center, Vec3::X);
         assert!((s.radius - 3.0).abs() < 1e-6);
     }

@@ -1,8 +1,8 @@
 //! Shader generation, GPU uniform layouts and the pipeline cache.
 
 use crate::arena::{VERTEX_ATTRIBUTES, VERTEX_SIZE};
-use crate::instance::{InstanceLayout, InstanceSemantic, wgsl_type};
 use crate::handles::FastMap;
+use crate::instance::{InstanceLayout, InstanceSemantic, wgsl_type};
 use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
 
@@ -172,9 +172,10 @@ pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
         s += &format!("    return mat4x4<f32>(inst.a{i}_0, inst.a{i}_1, inst.a{i}_2, inst.a{i}_3);\n");
     } else {
         let te = t.map_or("vec3<f32>(0.0)".to_string(), |(e, ty)| to_vec3(&e, ty));
-        let re = r.map_or("mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0))".to_string(), |(e, ty)| {
-            format!("quat_to_mat3({})", to_vec4(&e, ty, "1.0"))
-        });
+        let re = r.map_or(
+            "mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0))".to_string(),
+            |(e, ty)| format!("quat_to_mat3({})", to_vec4(&e, ty, "1.0")),
+        );
         let se = match (sc, us) {
             (Some((e, ty)), _) => to_vec3(&e, ty),
             (None, Some((e, ty))) => {
@@ -198,7 +199,9 @@ pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
     s += "fn instance_uv_rect(inst: InstanceInput) -> vec4<f32> {\n";
     s += &format!(
         "    return {};\n}}\n\n",
-        rect.map_or("vec4<f32>(0.0, 0.0, 1.0, 1.0)".to_string(), |(e, ty)| to_vec4(&e, ty, "1.0"))
+        rect.map_or("vec4<f32>(0.0, 0.0, 1.0, 1.0)".to_string(), |(e, ty)| to_vec4(
+            &e, ty, "1.0"
+        ))
     );
     s += "fn instance_layer(inst: InstanceInput) -> i32 {\n";
     s += &format!(
@@ -321,7 +324,12 @@ impl Pipelines {
         let material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("space3d material"),
             entries: &[
-                uniform_entry(0, wgpu::ShaderStages::FRAGMENT, true, std::mem::size_of::<GpuMaterial>() as u64),
+                uniform_entry(
+                    0,
+                    wgpu::ShaderStages::FRAGMENT,
+                    true,
+                    std::mem::size_of::<GpuMaterial>() as u64,
+                ),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -350,7 +358,12 @@ impl Pipelines {
             let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("space3d cull"),
                 entries: &[
-                    uniform_entry(0, wgpu::ShaderStages::COMPUTE, true, std::mem::size_of::<GpuCullParams>() as u64),
+                    uniform_entry(
+                        0,
+                        wgpu::ShaderStages::COMPUTE,
+                        true,
+                        std::mem::size_of::<GpuCullParams>() as u64,
+                    ),
                     storage_entry(1, true),
                     storage_entry(2, true),
                     storage_entry(3, false),
@@ -377,7 +390,12 @@ impl Pipelines {
             let compact_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("space3d compact"),
                 entries: &[
-                    uniform_entry(0, wgpu::ShaderStages::COMPUTE, true, std::mem::size_of::<GpuCompactParams>() as u64),
+                    uniform_entry(
+                        0,
+                        wgpu::ShaderStages::COMPUTE,
+                        true,
+                        std::mem::size_of::<GpuCompactParams>() as u64,
+                    ),
                     storage_entry(1, true),
                     storage_entry(2, true),
                     storage_entry(3, false),
@@ -463,7 +481,11 @@ impl Pipelines {
 
     /// Stable id for an instance layout (registers it on first use).
     pub fn layout_id(&mut self, layout: &'static InstanceLayout) -> u16 {
-        if let Some(i) = self.layouts.iter().position(|l| std::ptr::eq(*l, layout) || **l == *layout) {
+        if let Some(i) = self
+            .layouts
+            .iter()
+            .position(|l| std::ptr::eq(*l, layout) || **l == *layout)
+        {
             return i as u16;
         }
         self.layouts.push(layout);
@@ -542,7 +564,11 @@ impl Pipelines {
     }
 
     /// Mip-generation pipeline for a color format.
-    pub fn blit(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) -> (&wgpu::RenderPipeline, &wgpu::BindGroupLayout) {
+    pub fn blit(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> (&wgpu::RenderPipeline, &wgpu::BindGroupLayout) {
         let (module, layout) = (&self.blit_module, &self.blit_layout);
         let p = self.blit.entry(format).or_insert_with(|| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -569,7 +595,6 @@ impl Pipelines {
         });
         (p, &self.blit_bgl)
     }
-
 }
 
 #[cfg(test)]
@@ -578,7 +603,8 @@ mod tests {
     use crate::instance::*;
 
     fn validate(src: &str) {
-        let module = wgpu::naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(src)));
+        let module =
+            wgpu::naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(src)));
         let mut v = wgpu::naga::valid::Validator::new(
             wgpu::naga::valid::ValidationFlags::all(),
             wgpu::naga::valid::Capabilities::empty(),
@@ -604,7 +630,10 @@ mod tests {
 
     #[test]
     fn uniform_sizes_match_wgsl() {
-        assert_eq!(std::mem::size_of::<GpuView>(), 64 + 16 * 3 + 32 * (MAX_DIR_LIGHTS + MAX_POINT_LIGHTS));
+        assert_eq!(
+            std::mem::size_of::<GpuView>(),
+            64 + 16 * 3 + 32 * (MAX_DIR_LIGHTS + MAX_POINT_LIGHTS)
+        );
         assert_eq!(std::mem::size_of::<GpuMaterial>(), 48);
         assert_eq!(std::mem::size_of::<GpuCullParams>(), 112);
         assert_eq!(std::mem::size_of::<GpuCullJob>(), 64);

@@ -4434,9 +4434,11 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "glam 0.33.9",
+ "image",
  "pollster",
  "space3d-core",
  "space3d-render",
+ "space3d-tasks",
  "tracing",
  "tracing-wasm",
  "wasm-bindgen",

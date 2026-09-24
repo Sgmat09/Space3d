@@ -32,7 +32,10 @@ pub fn spawn_camera(app: &mut App, z: f32) -> Entity {
 pub fn spawn_sun(app: &mut App) {
     app.world.spawn((
         Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(-0.3, -1.0, -0.6), Vec3::Y),
-        DirectionalLight { color: Vec3::ONE, intensity: 2.0 },
+        DirectionalLight {
+            color: Vec3::ONE,
+            intensity: 2.0,
+        },
     ));
 }
 
