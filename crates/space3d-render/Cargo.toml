@@ -1,6 +1,6 @@
 [package]
 name = "space3d-render"
-description = "Space3d render"
+description = "Space3d wgpu forward renderer: meshes, materials, lights, GPU instancing, GPU culling, headless capture"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,28 @@ license.workspace = true
 
 [dependencies]
 space3d-core.workspace = true
+space3d-tasks.workspace = true
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+ahash.workspace = true
+tracing.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# WebGPU when the browser has it, WebGL2 otherwise. The fragile Send/Sync feature is required
+# because engine resources must be `Send + Sync`; wasm32 without atomics is single-threaded.
+wgpu = { workspace = true, features = ["webgl", "fragile-send-sync-non-atomic-wasm"] }
+
+[dev-dependencies]
+pollster.workspace = true
+criterion.workspace = true
+image.workspace = true
+
+[[bench]]
+name = "instancing"
+harness = false
