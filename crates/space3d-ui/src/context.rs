@@ -247,7 +247,7 @@ pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator,
 
     let mut events = Vec::new();
     if let Some(input) = sys.resources.get::<Input>() {
-        translator.translate(input, ppp, &clipboard, &mut events);
+        translator.translate(input, ppp, time, &clipboard, &mut events);
     }
     events.extend(injected);
     if let Some(o) = sys.resources.get_mut::<RenderOverlays>() {

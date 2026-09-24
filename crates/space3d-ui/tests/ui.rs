@@ -254,3 +254,73 @@ fn ui_without_renderer_or_window_still_runs() {
     app.step_ticks(2);
     assert_eq!(*app.resources.expect::<i32>(), 3, "disabled UI skips ui systems");
 }
+
+/// App with one focused single-line text field whose content is the `String` resource.
+fn text_field_app(initial: &str) -> App {
+    let mut app = App::new();
+    app.add_plugin(UiPlugin::deterministic());
+    app.insert_resource(initial.to_owned());
+    app.add_ui_system(|ctx, sys| {
+        egui::Window::new("Text").fixed_pos([10.0, 10.0]).show(ctx, |ui| {
+            let text = sys.resources.expect_mut::<String>();
+            let r = ui.text_edit_singleline(text);
+            if ctx.cumulative_pass_nr() == 1 {
+                r.request_focus();
+            }
+        });
+    });
+    app.step_ticks(2);
+    app
+}
+
+#[test]
+fn held_backspace_repeats_in_text_fields() {
+    let mut app = text_field_app("");
+    let alphabet = "abcdefghijklmnopqrstuvwxyz";
+    app.resources.expect_mut::<Input>().inject_text(alphabet);
+    app.step_ticks(1);
+    assert_eq!(app.resources.expect::<String>(), alphabet);
+    // Hold Backspace for one second (60 ticks at the default 60 Hz): one press, then repeats
+    // after the delay.
+    app.resources.expect_mut::<Input>().inject_key_down(KeyCode::Backspace);
+    app.step_ticks(60);
+    app.resources.expect_mut::<Input>().inject_key_up(KeyCode::Backspace);
+    app.step_ticks(1);
+    let left = app.resources.expect::<String>().len();
+    assert!(left <= 26 - 10, "holding Backspace deleted {} chars", 26 - left);
+    assert!(left > 0, "repeat rate is bounded");
+}
+
+#[test]
+fn console_key_types_into_focused_text_fields() {
+    let mut app = text_field_app("");
+    let tap_backquote = |app: &mut App| {
+        let input = app.resources.expect_mut::<Input>();
+        input.inject_key_tap(KeyCode::Backquote);
+        input.inject_text("`");
+        app.step_ticks(1);
+    };
+    tap_backquote(&mut app);
+    assert_eq!(app.resources.expect::<String>(), "`", "typed into the field");
+    assert!(
+        !app.resources.expect::<Console>().visible,
+        "console not toggled while typing"
+    );
+    // F3 is not a text key: it still works while typing.
+    app.resources.expect_mut::<Input>().inject_key_tap(KeyCode::F3);
+    app.step_ticks(1);
+    assert!(app.resources.expect::<DebugOverlay>().visible);
+
+    // Leave the field: the key toggles the console again.
+    app.resources.expect_mut::<Input>().inject_key_tap(KeyCode::Escape);
+    app.step_ticks(1);
+    assert!(!app.resources.expect::<EguiContext>().wants_keyboard_input());
+    tap_backquote(&mut app);
+    assert!(app.resources.expect::<Console>().visible);
+    // The console focuses its input; the key then closes it again.
+    app.step_ticks(2);
+    assert!(app.resources.expect::<Console>().input_has_focus());
+    tap_backquote(&mut app);
+    assert!(!app.resources.expect::<Console>().visible);
+    assert_eq!(app.resources.expect::<String>(), "`", "field untouched meanwhile");
+}

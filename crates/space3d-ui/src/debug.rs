@@ -113,13 +113,61 @@ fn bytes(n: u64) -> String {
     }
 }
 
+/// Whether `key` types nothing into a text field (function keys), so it may act as a hotkey
+/// while an egui text field has keyboard focus.
+fn is_function_key(key: KeyCode) -> bool {
+    use KeyCode as K;
+    matches!(
+        key,
+        K::F1
+            | K::F2
+            | K::F3
+            | K::F4
+            | K::F5
+            | K::F6
+            | K::F7
+            | K::F8
+            | K::F9
+            | K::F10
+            | K::F11
+            | K::F12
+            | K::F13
+            | K::F14
+            | K::F15
+            | K::F16
+            | K::F17
+            | K::F18
+            | K::F19
+            | K::F20
+            | K::F21
+            | K::F22
+            | K::F23
+            | K::F24
+    )
+}
+
 /// `Stage::PreUpdate`: F3 / F4 / backquote toggles.
+///
+/// While an egui text field has keyboard focus (as of the last pass), hotkeys that type text
+/// (the default backquote console key, or any non-function key) are ignored so typing them
+/// into the inspector, a path field or a knob does not toggle anything — except that the
+/// console key still closes the console while the console's own input line has focus.
 pub(crate) fn hotkeys(sys: &mut SystemCtx, keys: (Option<KeyCode>, Option<KeyCode>, Option<KeyCode>)) {
+    let typing = sys
+        .resources
+        .get::<EguiContext>()
+        .is_some_and(EguiContext::wants_keyboard_input);
+    let console_focused = sys
+        .resources
+        .get::<Console>()
+        .is_some_and(|c| c.visible && c.input_has_focus());
     let Some(input) = sys.resources.get::<Input>() else {
         return;
     };
-    let hit = |k: Option<KeyCode>| k.is_some_and(|k| input.just_pressed(k));
-    let (debug, profiler, console) = (hit(keys.0), hit(keys.1), hit(keys.2));
+    let hit = |k: Option<KeyCode>, allowed_while_typing: bool| {
+        k.is_some_and(|k| input.just_pressed(k) && (!typing || allowed_while_typing || is_function_key(k)))
+    };
+    let (debug, profiler, console) = (hit(keys.0, false), hit(keys.1, false), hit(keys.2, console_focused));
     if debug && let Some(d) = sys.resources.get_mut::<DebugOverlay>() {
         d.visible = !d.visible;
     }

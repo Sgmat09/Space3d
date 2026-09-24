@@ -4,6 +4,12 @@
 //! edges every frame: pointer moves, button presses/releases (a press and release in the same
 //! frame become a click), wheel, keys, typed text and touches. Because tests drive the same
 //! `Input` resource through `inject_*`, UI interaction is fully scriptable.
+//!
+//! `Input` drops the OS's key repeats (a held key is simply "pressed"), but egui text fields
+//! only act on key *presses*, so held editing/navigation keys ([`REPEAT_KEYS`]: Backspace,
+//! Delete, arrows, Home/End, ...) get synthesized repeat presses: after [`REPEAT_DELAY`]
+//! seconds, one every [`REPEAT_INTERVAL`]. The timing uses `space3d_core::Time`, so it is
+//! deterministic under `App::step_ticks`.
 
 use space3d_core::glam::Vec2;
 use space3d_platform::{Input, KeyCode, MouseButton};
@@ -213,6 +219,33 @@ const KEYS: &[KeyCode] = {
     ]
 };
 
+/// Held keys that auto-repeat (editing and navigation keys; printable characters repeat
+/// through the OS text events instead).
+pub const REPEAT_KEYS: &[KeyCode] = {
+    use KeyCode as K;
+    &[
+        K::Backspace,
+        K::Delete,
+        K::ArrowLeft,
+        K::ArrowRight,
+        K::ArrowUp,
+        K::ArrowDown,
+        K::Home,
+        K::End,
+        K::PageUp,
+        K::PageDown,
+        K::Enter,
+        K::NumpadEnter,
+        K::Tab,
+    ]
+};
+/// Seconds a key must be held before it starts repeating.
+pub const REPEAT_DELAY: f64 = 0.5;
+/// Seconds between synthesized repeats.
+pub const REPEAT_INTERVAL: f64 = 1.0 / 30.0;
+/// Upper bound on repeats emitted per key and frame (long frames do not burst).
+const MAX_REPEATS_PER_FRAME: u32 = 4;
+
 const BUTTONS: [(MouseButton, egui::PointerButton); 5] = [
     (MouseButton::Left, egui::PointerButton::Primary),
     (MouseButton::Right, egui::PointerButton::Secondary),
@@ -251,18 +284,28 @@ fn printable(c: char) -> bool {
     !private_use && !c.is_control()
 }
 
-/// Per-frame translator (keeps the last pointer position and modifiers).
+/// Per-frame translator (keeps the last pointer position, modifiers and key-repeat timers).
 #[derive(Default)]
 pub(crate) struct InputTranslator {
     last_pos: Option<egui::Pos2>,
     last_modifiers: egui::Modifiers,
     /// Touch that emulates the mouse pointer (first finger down).
     pointer_touch: Option<u64>,
+    /// Held [`REPEAT_KEYS`] and the time of their next synthesized repeat.
+    repeats: Vec<(KeyCode, f64)>,
 }
 
 impl InputTranslator {
     /// Append this frame's egui events for `input` (physical pixels → points with `ppp`).
-    pub(crate) fn translate(&mut self, input: &Input, ppp: f32, clipboard: &str, out: &mut Vec<egui::Event>) {
+    /// `time` is the app time in seconds (drives key repeat).
+    pub(crate) fn translate(
+        &mut self,
+        input: &Input,
+        ppp: f32,
+        time: f64,
+        clipboard: &str,
+        out: &mut Vec<egui::Event>,
+    ) {
         let to_points = |p: Vec2| egui::pos2(p.x / ppp, p.y / ppp);
         let mods = modifiers(input);
         if mods != self.last_modifiers {
@@ -358,6 +401,8 @@ impl InputTranslator {
             }
         }
 
+        self.key_repeats(input, time, mods, out);
+
         // Typed text (not while a command shortcut is held).
         let text: String = input.text().chars().filter(|&c| printable(c)).collect();
         if !text.is_empty() && !(mods.command || (mods.ctrl && !mods.alt)) {
@@ -429,9 +474,105 @@ impl InputTranslator {
     }
 }
 
+impl InputTranslator {
+    /// Synthesized repeat presses for held [`REPEAT_KEYS`].
+    fn key_repeats(&mut self, input: &Input, time: f64, mods: egui::Modifiers, out: &mut Vec<egui::Event>) {
+        self.repeats
+            .retain(|(k, _)| input.pressed(*k) && !input.just_pressed(*k));
+        for &code in REPEAT_KEYS {
+            if !input.pressed(code) {
+                continue;
+            }
+            let Some(key) = egui_key(code) else { continue };
+            let Some(i) = self.repeats.iter().position(|(k, _)| *k == code) else {
+                // Newly held (or held before the UI started): repeat after the delay.
+                self.repeats.push((code, time + REPEAT_DELAY));
+                continue;
+            };
+            let next = &mut self.repeats[i].1;
+            let mut n = 0;
+            while time >= *next && n < MAX_REPEATS_PER_FRAME {
+                out.push(egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: true,
+                    modifiers: mods,
+                });
+                *next += REPEAT_INTERVAL;
+                n += 1;
+            }
+            if time >= *next {
+                // Too far behind (long frame): skip the backlog instead of bursting.
+                *next = time + REPEAT_INTERVAL;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repeats(ev: &[egui::Event], key: egui::Key) -> usize {
+        ev.iter()
+            .filter(|e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: true, .. } if *k == key))
+            .count()
+    }
+
+    #[test]
+    fn held_editing_keys_repeat_after_a_delay() {
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_key_down(KeyCode::Backspace);
+        input.inject_key_down(KeyCode::KeyA);
+        let mut ev = Vec::new();
+        t.translate(&input, 1.0, 10.0, "", &mut ev);
+        assert_eq!(repeats(&ev, egui::Key::Backspace), 0, "first frame: only the press");
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            egui::Event::Key {
+                key: egui::Key::Backspace,
+                pressed: true,
+                repeat: false,
+                ..
+            }
+        )));
+        let mut total = 0;
+        let mut frame_time = 10.0;
+        for _ in 0..60 {
+            input.end_frame();
+            frame_time += 1.0 / 60.0;
+            ev.clear();
+            t.translate(&input, 1.0, frame_time, "", &mut ev);
+            if frame_time - 10.0 < REPEAT_DELAY - 1e-9 {
+                assert_eq!(repeats(&ev, egui::Key::Backspace), 0, "no repeat before the delay");
+            }
+            total += repeats(&ev, egui::Key::Backspace);
+            assert_eq!(repeats(&ev, egui::Key::A), 0, "letters repeat through text events");
+        }
+        // 1 s held: repeats during the last 0.5 s at 30 Hz.
+        assert!((13..=17).contains(&total), "{total} repeats");
+        // A long frame does not burst.
+        input.end_frame();
+        ev.clear();
+        t.translate(&input, 1.0, frame_time + 5.0, "", &mut ev);
+        assert!(repeats(&ev, egui::Key::Backspace) <= MAX_REPEATS_PER_FRAME as usize);
+        // Released: no more repeats; pressed again: delay starts over.
+        input.end_frame();
+        input.inject_key_up(KeyCode::Backspace);
+        ev.clear();
+        t.translate(&input, 1.0, frame_time + 6.0, "", &mut ev);
+        assert_eq!(repeats(&ev, egui::Key::Backspace), 0);
+        input.end_frame();
+        input.inject_key_down(KeyCode::Backspace);
+        ev.clear();
+        t.translate(&input, 1.0, frame_time + 7.0, "", &mut ev);
+        input.end_frame();
+        ev.clear();
+        t.translate(&input, 1.0, frame_time + 7.1, "", &mut ev);
+        assert_eq!(repeats(&ev, egui::Key::Backspace), 0);
+    }
 
     #[test]
     fn keys_table_is_fully_mapped() {
@@ -452,7 +593,7 @@ mod tests {
         input.inject_text("hi\u{8}");
         input.inject_wheel(Vec2::new(0.0, -1.0));
         let mut ev = Vec::new();
-        t.translate(&input, 2.0, "", &mut ev);
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
         assert!(ev.contains(&egui::Event::PointerMoved(egui::pos2(10.0, 20.0))));
         let presses: Vec<bool> = ev
             .iter()
@@ -467,10 +608,10 @@ mod tests {
         // Unchanged position: no new move event.
         input.end_frame();
         ev.clear();
-        t.translate(&input, 2.0, "", &mut ev);
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
         assert!(ev.is_empty(), "{ev:?}");
         input.inject_mouse_left();
-        t.translate(&input, 2.0, "", &mut ev);
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
         assert_eq!(ev, vec![egui::Event::PointerGone]);
     }
 
@@ -486,7 +627,7 @@ mod tests {
         input.inject_key_down(cmd);
         input.inject_key_tap(KeyCode::KeyV);
         let mut ev = Vec::new();
-        t.translate(&input, 1.0, "pasted", &mut ev);
+        t.translate(&input, 1.0, 0.0, "pasted", &mut ev);
         assert!(
             ev.iter()
                 .any(|e| matches!(e, egui::Event::ModifiersChanged(m) if m.command))
@@ -500,7 +641,7 @@ mod tests {
         input.inject_key_up(cmd);
         input.inject_key_tap(KeyCode::Enter);
         ev.clear();
-        t.translate(&input, 1.0, "", &mut ev);
+        t.translate(&input, 1.0, 0.0, "", &mut ev);
         let enter: Vec<bool> = ev
             .iter()
             .filter_map(|e| match e {
@@ -521,7 +662,7 @@ mod tests {
         let mut input = Input::default();
         input.inject_touch(7, space3d_platform::TouchPhase::Started, Vec2::new(10.0, 10.0));
         let mut ev = Vec::new();
-        t.translate(&input, 1.0, "", &mut ev);
+        t.translate(&input, 1.0, 0.0, "", &mut ev);
         assert!(ev.iter().any(|e| matches!(
             e,
             egui::Event::Touch {
@@ -536,7 +677,7 @@ mod tests {
         input.end_frame();
         input.inject_touch(7, space3d_platform::TouchPhase::Ended, Vec2::new(12.0, 10.0));
         ev.clear();
-        t.translate(&input, 1.0, "", &mut ev);
+        t.translate(&input, 1.0, 0.0, "", &mut ev);
         assert!(
             ev.iter()
                 .any(|e| matches!(e, egui::Event::PointerButton { pressed: false, .. }))

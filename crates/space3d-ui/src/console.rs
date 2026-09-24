@@ -207,6 +207,7 @@ pub struct Console {
     commands: BTreeMap<String, ConsoleCommand>,
     pending: Vec<String>,
     focus_input: bool,
+    input_focused: bool,
 }
 
 impl std::fmt::Debug for Console {
@@ -234,6 +235,7 @@ impl Default for Console {
             commands: BTreeMap::new(),
             pending: Vec::new(),
             focus_input: false,
+            input_focused: false,
         }
     }
 }
@@ -432,6 +434,14 @@ impl Console {
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
         self.focus_input = self.visible;
+        if !self.visible {
+            self.input_focused = false;
+        }
+    }
+
+    /// Whether the command input line had keyboard focus in the last drawn frame.
+    pub fn input_has_focus(&self) -> bool {
+        self.input_focused
     }
 
     /// Draw the console into `ui` (log view + input line).
@@ -514,6 +524,7 @@ impl Console {
             self.history_pos = None;
             response.request_focus();
         }
+        self.input_focused = response.has_focus() || self.focus_input;
     }
 }
 
@@ -538,6 +549,11 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
         if !open {
             c.visible = false;
         }
+    }
+    if let Some(c) = sys.resources.get_mut::<Console>()
+        && !c.visible
+    {
+        c.input_focused = false;
     }
     Console::run_pending(sys);
 }
