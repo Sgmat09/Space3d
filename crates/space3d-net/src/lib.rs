@@ -59,7 +59,10 @@ pub use channel::{Channel, Codec, Frame};
 pub use client::{Http, HttpConfig, HttpRequest, HttpResponse, Method};
 pub use error::NetError;
 #[cfg(not(target_arch = "wasm32"))]
-pub use server::{ClientId, CorsLayer, HttpServer, ServerEvent, ServerHandle, ShutdownTrigger, WsServer};
+pub use server::{
+    AcceptHook, ClientId, ConnectMeta, CorsLayer, HttpServer, ServerEvent, ServerHandle, ShutdownTrigger, WsServer,
+    WsServerConfig,
+};
 pub use ws::{
     ConnectionId, Message, WsClient, WsConfig, WsConnection, WsEvent, WsEventKind, WsState, ws_events_system,
 };
@@ -113,7 +116,7 @@ pub mod prelude {
         NetPlugin, ReconnectPolicy, RetryPolicy, WsClient, WsConfig, WsConnection, WsEvent, WsEventKind, WsState,
     };
     #[cfg(not(target_arch = "wasm32"))]
-    pub use crate::{ClientId, HttpServer, ServerEvent, ServerHandle, WsServer};
+    pub use crate::{ClientId, HttpServer, ServerEvent, ServerHandle, WsServer, WsServerConfig};
 }
 
 #[cfg(test)]

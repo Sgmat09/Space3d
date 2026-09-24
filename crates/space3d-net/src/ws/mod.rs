@@ -121,6 +121,9 @@ pub struct WsConfig {
     pub reconnect: Option<ReconnectPolicy>,
     /// Limit for a single connect + handshake attempt (default 10 s).
     pub connect_timeout: Option<Duration>,
+    /// Largest accepted inbound message in bytes; a bigger one closes the connection
+    /// (`1009` on the web). `None` keeps the backend default (64 MiB natively, unlimited on the web).
+    pub max_message_size: Option<usize>,
 }
 
 impl Default for WsConfig {
@@ -128,6 +131,7 @@ impl Default for WsConfig {
         Self {
             reconnect: None,
             connect_timeout: Some(Duration::from_secs(10)),
+            max_message_size: None,
         }
     }
 }
@@ -141,6 +145,11 @@ impl WsConfig {
     /// Set the per-attempt connect timeout.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
+        self
+    }
+    /// Cap the size of inbound messages (and frames) in bytes.
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = Some(bytes);
         self
     }
 }
@@ -224,6 +233,12 @@ impl WsConnection {
             return Err(NetError::Closed);
         }
         self.outgoing.try_send(msg.into()).map_err(|_| NetError::Closed)
+    }
+
+    /// Messages queued by [`Self::send`] that the socket has not taken yet (e.g. while
+    /// connecting or when the network is congested). Useful to skip optional traffic.
+    pub fn queued_outgoing(&self) -> usize {
+        self.outgoing.len()
     }
 
     /// Next received message, skipping lifecycle events (see [`Self::state`]). Never blocks.
@@ -452,7 +467,10 @@ impl Driver {
         let mut attempt = 0u32;
         loop {
             self.set_state(WsState::Connecting);
-            let connect = rt::timeout(self.config.connect_timeout, Socket::connect(&self.url));
+            let connect = rt::timeout(
+                self.config.connect_timeout,
+                Socket::connect(&self.url, self.config.max_message_size),
+            );
             let (reason, was_open) = match rt::race(connect, self.close.recv()).await {
                 rt::Race::Stopped => return self.finish(CLOSED_BY_CLIENT.into()),
                 rt::Race::Done(Err(e)) => (e.to_string(), false),

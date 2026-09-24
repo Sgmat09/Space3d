@@ -1,0 +1,44 @@
+# Split-mode local stack: one player service + two game servers.
+#   SPACE3D_KEYS=k1:$(openssl rand -base64 32) SPACE3D_FLEET_TOKEN=dev-fleet SPACE3D_ADMIN_TOKENS=dev-admin \
+#   docker compose -f crates/space3d-server/deploy/compose.yaml up --build
+x-game: &game
+  build: { context: ../../.., dockerfile: crates/space3d-server/deploy/Dockerfile, args: { BIN: arena-server } }
+  environment: &genv
+    SPACE3D__ROLE: game-server
+    SPACE3D__FLEET__PLAYER_SERVICE_URL: ws://players:8080/internal/v1/fleet
+    SPACE3D__FLEET__PLAYER_SERVICE_HTTP: http://players:8080
+    SPACE3D__ADMIN__BIND: 0.0.0.0:9090
+    SPACE3D__PERSISTENCE__DATA_DIR: /data
+    SPACE3D_KEYS: ${SPACE3D_KEYS}
+    SPACE3D_FLEET_TOKEN: ${SPACE3D_FLEET_TOKEN}
+    SPACE3D_ADMIN_TOKENS: ${SPACE3D_ADMIN_TOKENS}
+  healthcheck: { test: ["CMD", "/usr/local/bin/server", "healthcheck", "--ready"], interval: 5s }
+services:
+  players:
+    build: { context: ../../.., dockerfile: crates/space3d-server/deploy/Dockerfile, args: { BIN: space3d-server } }
+    environment:
+      SPACE3D__ROLE: player-service
+      SPACE3D__PLAYER_SERVICE__DB_PATH: /data/players.db
+      SPACE3D__ADMIN__BIND: 0.0.0.0:9090
+      SPACE3D_KEYS: ${SPACE3D_KEYS}
+      SPACE3D_FLEET_TOKEN: ${SPACE3D_FLEET_TOKEN}
+      SPACE3D_ADMIN_TOKENS: ${SPACE3D_ADMIN_TOKENS}
+    ports: ["8080:8080"]
+    volumes: ["players:/data"]
+  gs-1:
+    <<: *game
+    environment:
+      <<: *genv
+      SPACE3D__SERVER_ID: gs-1
+      SPACE3D__GAME__PUBLIC_URL: ws://127.0.0.1:7777/play
+    ports: ["7777:7777"]
+    volumes: ["gs1:/data"]
+  gs-2:
+    <<: *game
+    environment:
+      <<: *genv
+      SPACE3D__SERVER_ID: gs-2
+      SPACE3D__GAME__PUBLIC_URL: ws://127.0.0.1:7778/play
+    ports: ["7778:7777"]
+    volumes: ["gs2:/data"]
+volumes: { players: {}, gs1: {}, gs2: {} }

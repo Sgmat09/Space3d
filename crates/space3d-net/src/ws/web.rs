@@ -47,8 +47,9 @@ fn resolve(url: &str) -> String {
 }
 
 impl Socket {
-    pub async fn connect(url: &str) -> Result<Self, String> {
+    pub async fn connect(url: &str, max_message_size: Option<usize>) -> Result<Self, String> {
         let ws = WebSocket::new(&resolve(url)).map_err(js_err)?;
+        let limit = max_message_size.unwrap_or(usize::MAX);
         ws.set_binary_type(BinaryType::Arraybuffer);
         let (tx, rx) = async_channel::unbounded();
 
@@ -57,15 +58,27 @@ impl Socket {
             let _ = t.try_send(JsEvent::Open);
         });
         let t = tx.clone();
+        let ws_for_limit = ws.clone();
         let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             let data = e.data();
             let msg = if let Some(s) = data.as_string() {
                 Message::Text(s)
             } else if let Ok(buf) = data.dyn_into::<js_sys::ArrayBuffer>() {
+                if buf.byte_length() as usize > limit {
+                    // The browser has already buffered it; refuse to hand it to the game.
+                    let _ = ws_for_limit.close_with_code_and_reason(1009, "message too big");
+                    let _ = t.try_send(JsEvent::Close("closed (1009): message too big".into()));
+                    return;
+                }
                 Message::Binary(js_sys::Uint8Array::new(&buf).to_vec())
             } else {
                 return;
             };
+            if msg.len() > limit {
+                let _ = ws_for_limit.close_with_code_and_reason(1009, "message too big");
+                let _ = t.try_send(JsEvent::Close("closed (1009): message too big".into()));
+                return;
+            }
             let _ = t.try_send(JsEvent::Message(msg));
         });
         let t = tx.clone();

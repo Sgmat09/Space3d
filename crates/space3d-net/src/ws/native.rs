@@ -4,6 +4,7 @@ use super::{Incoming, Message};
 use crate::error::error_chain;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TMessage;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub(crate) struct Socket {
@@ -11,10 +12,15 @@ pub(crate) struct Socket {
 }
 
 impl Socket {
-    pub async fn connect(url: &str) -> Result<Self, String> {
+    pub async fn connect(url: &str, max_message_size: Option<usize>) -> Result<Self, String> {
         crate::tls::ensure_crypto_provider();
+        let config = max_message_size.map(|n| {
+            WebSocketConfig::default()
+                .max_message_size(Some(n))
+                .max_frame_size(Some(n))
+        });
         // Nagle off: game traffic is many small latency-sensitive frames.
-        let (inner, _response) = tokio_tungstenite::connect_async_with_config(url, None, true)
+        let (inner, _response) = tokio_tungstenite::connect_async_with_config(url, config, true)
             .await
             .map_err(|e| error_chain(&e))?;
         Ok(Self { inner })

@@ -3,6 +3,7 @@
 use crate::{Message, NetError};
 use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::MethodRouter;
 use futures::{SinkExt, StreamExt};
@@ -10,13 +11,120 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Server-assigned id of a connected WebSocket client (unique per [`WsServer`], never reused).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(pub u64);
+
+/// Decides whether an upgrade request may become a WebSocket client.
+/// `Err(status)` rejects it with that HTTP status (e.g. `403`, `429`).
+pub type AcceptHook = Arc<dyn Fn(&ConnectMeta) -> Result<(), u16> + Send + Sync>;
+
+/// Limits and admission policy of a [`WsServer`] (see [`WsServer::with_config`]).
+///
+/// Every queue is bounded so a slow or hostile peer cannot grow server memory without
+/// limit. The defaults suit general-purpose servers; game endpoints should use much
+/// tighter values (the `space3d-server` gateway uses a 16 KiB `max_message_size`).
+#[derive(Clone)]
+pub struct WsServerConfig {
+    /// Largest accepted inbound message in bytes. A bigger message closes the
+    /// connection with `1009 message too big`. Default 1 MiB (tungstenite's own default is 64 MiB).
+    pub max_message_size: usize,
+    /// Largest accepted inbound frame in bytes. Default: `max_message_size`.
+    pub max_frame_size: usize,
+    /// Bytes queued for one client but not yet written to its socket. A send that
+    /// would exceed it fails with [`NetError::Closed`] and closes the client with
+    /// `1008 slow consumer`. Default 16 MiB.
+    pub outbound_limit_bytes: usize,
+    /// Inbound messages waiting to be polled (all clients together). A message arriving
+    /// while the inbox is full is dropped and its sender is closed with `1008 inbox full`.
+    /// Lifecycle events never count. Default 65 536.
+    pub inbound_queue: usize,
+    /// Concurrent clients; upgrades beyond it get `503`. Default 100 000.
+    pub max_connections: usize,
+    /// Accept text frames. When `false`, a text frame closes the client with `1003`. Default `true`.
+    pub accept_text: bool,
+    /// Optional admission hook run before the upgrade (IP bans, per-IP caps, `Origin` checks).
+    pub accept: Option<AcceptHook>,
+}
+
+impl Default for WsServerConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: 1 << 20,
+            max_frame_size: 1 << 20,
+            outbound_limit_bytes: 16 << 20,
+            inbound_queue: 65_536,
+            max_connections: 100_000,
+            accept_text: true,
+            accept: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for WsServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsServerConfig")
+            .field("max_message_size", &self.max_message_size)
+            .field("max_frame_size", &self.max_frame_size)
+            .field("outbound_limit_bytes", &self.outbound_limit_bytes)
+            .field("inbound_queue", &self.inbound_queue)
+            .field("max_connections", &self.max_connections)
+            .field("accept_text", &self.accept_text)
+            .field("accept", &self.accept.is_some())
+            .finish()
+    }
+}
+
+impl WsServerConfig {
+    /// Set both the message and the frame size limit.
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes;
+        self.max_frame_size = bytes;
+        self
+    }
+    /// Set the per-client outbound backlog limit.
+    pub fn outbound_limit_bytes(mut self, bytes: usize) -> Self {
+        self.outbound_limit_bytes = bytes;
+        self
+    }
+    /// Set the shared inbound queue bound.
+    pub fn inbound_queue(mut self, messages: usize) -> Self {
+        self.inbound_queue = messages;
+        self
+    }
+    /// Set the concurrent connection limit.
+    pub fn max_connections(mut self, n: usize) -> Self {
+        self.max_connections = n;
+        self
+    }
+    /// Accept or reject text frames.
+    pub fn accept_text(mut self, yes: bool) -> Self {
+        self.accept_text = yes;
+        self
+    }
+    /// Install an admission hook.
+    pub fn accept(mut self, hook: impl Fn(&ConnectMeta) -> Result<(), u16> + Send + Sync + 'static) -> Self {
+        self.accept = Some(Arc::new(hook));
+        self
+    }
+}
+
+/// What the server knows about a client from its upgrade request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectMeta {
+    /// TCP peer address (a proxy's address when behind one; see `forwarded_for`).
+    pub addr: SocketAddr,
+    /// `Origin` header (browsers always send it; use it against cross-site WebSocket hijacking).
+    pub origin: Option<String>,
+    /// `X-Forwarded-For` header, verbatim. Only trust it when `addr` is a known proxy.
+    pub forwarded_for: Option<String>,
+    /// `User-Agent` header.
+    pub user_agent: Option<String>,
+}
 
 /// Inbound traffic of a [`WsServer`], polled by engine systems
 /// ([`WsServer::try_recv`] / [`WsServer::drain`], or `Events<ServerEvent>` when the
@@ -60,20 +168,29 @@ impl ServerEvent {
 
 enum Outgoing {
     Message(Message),
-    Close(String),
+    Close(u16, String),
 }
 
 struct Slot {
     tx: mpsc::UnboundedSender<Outgoing>,
-    addr: SocketAddr,
+    meta: ConnectMeta,
+    /// Bytes queued in `tx` but not yet written to the socket.
+    queued: Arc<AtomicUsize>,
 }
 
 struct Inner {
+    config: WsServerConfig,
     clients: Mutex<BTreeMap<ClientId, Slot>>,
     events_tx: async_channel::Sender<ServerEvent>,
     events_rx: async_channel::Receiver<ServerEvent>,
+    /// `ServerEvent::Message`s currently queued (bounded by `config.inbound_queue`).
+    inbound: AtomicUsize,
     next_id: AtomicU64,
 }
+
+const CLOSE_TOO_BIG: u16 = 1009;
+const CLOSE_POLICY: u16 = 1008;
+const CLOSE_UNSUPPORTED: u16 = 1003;
 
 /// WebSocket server state, shareable between the network runtime and engine systems.
 ///
@@ -103,17 +220,31 @@ impl std::fmt::Debug for WsServer {
 }
 
 impl WsServer {
-    /// A server with no clients yet.
+    /// A server with no clients yet and default [`WsServerConfig`] limits.
     pub fn new() -> Self {
+        Self::with_config(WsServerConfig::default())
+    }
+
+    /// A server with explicit limits and admission policy.
+    pub fn with_config(config: WsServerConfig) -> Self {
+        // Lifecycle events are few (bounded by connections); message events are counted
+        // against `config.inbound_queue` separately, so the channel itself is unbounded.
         let (events_tx, events_rx) = async_channel::unbounded();
         Self {
             inner: Arc::new(Inner {
+                config,
                 clients: Mutex::new(BTreeMap::new()),
                 events_tx,
                 events_rx,
+                inbound: AtomicUsize::new(0),
                 next_id: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// The limits this server was created with.
+    pub fn config(&self) -> &WsServerConfig {
+        &self.inner.config
     }
 
     /// Serve this WebSocket server on `addr` (any path). Port `0` picks a free port.
@@ -125,13 +256,28 @@ impl WsServer {
             .start()
     }
 
-    /// Queue `msg` for one client.
+    /// Queue `msg` for one client. Never blocks.
+    ///
+    /// Fails with [`NetError::Closed`] (and closes the client with `1008 slow consumer`)
+    /// if the message would push its backlog over [`WsServerConfig::outbound_limit_bytes`].
     pub fn send(&self, client: ClientId, msg: impl Into<Message>) -> Result<(), NetError> {
         let clients = self.inner.clients.lock();
         let slot = clients.get(&client).ok_or(NetError::UnknownPeer(client.0))?;
-        slot.tx
-            .send(Outgoing::Message(msg.into()))
-            .map_err(|_| NetError::Closed)
+        self.enqueue(slot, msg.into())
+    }
+
+    fn enqueue(&self, slot: &Slot, msg: Message) -> Result<(), NetError> {
+        let len = msg.len();
+        let before = slot.queued.fetch_add(len, Ordering::AcqRel);
+        if before + len > self.inner.config.outbound_limit_bytes {
+            slot.queued.fetch_sub(len, Ordering::AcqRel);
+            let _ = slot.tx.send(Outgoing::Close(CLOSE_POLICY, "slow consumer".into()));
+            return Err(NetError::Closed);
+        }
+        slot.tx.send(Outgoing::Message(msg)).map_err(|_| {
+            slot.queued.fetch_sub(len, Ordering::AcqRel);
+            NetError::Closed
+        })
     }
 
     /// Queue `msg` for every connected client; returns how many it was queued for.
@@ -149,14 +295,20 @@ impl WsServer {
         clients
             .iter()
             .filter(|(id, _)| keep(**id))
-            .filter(|(_, slot)| slot.tx.send(Outgoing::Message(msg.clone())).is_ok())
+            .filter(|(_, slot)| self.enqueue(slot, msg.clone()).is_ok())
             .count()
     }
 
     /// Close one client's connection (after flushing its queued messages).
     pub fn disconnect(&self, client: ClientId, reason: impl Into<String>) {
+        self.disconnect_with(client, close_code::NORMAL, reason);
+    }
+
+    /// Close one client's connection with an explicit WebSocket close code
+    /// (e.g. `1008` policy violation, `1001` going away).
+    pub fn disconnect_with(&self, client: ClientId, code: u16, reason: impl Into<String>) {
         if let Some(slot) = self.inner.clients.lock().get(&client) {
-            let _ = slot.tx.send(Outgoing::Close(reason.into()));
+            let _ = slot.tx.send(Outgoing::Close(code, reason.into()));
         }
     }
 
@@ -164,7 +316,7 @@ impl WsServer {
     pub fn disconnect_all(&self, reason: impl Into<String>) {
         let reason = reason.into();
         for slot in self.inner.clients.lock().values() {
-            let _ = slot.tx.send(Outgoing::Close(reason.clone()));
+            let _ = slot.tx.send(Outgoing::Close(close_code::NORMAL, reason.clone()));
         }
     }
 
@@ -185,12 +337,66 @@ impl WsServer {
 
     /// Remote address of a connected client.
     pub fn client_addr(&self, client: ClientId) -> Option<SocketAddr> {
-        self.inner.clients.lock().get(&client).map(|s| s.addr)
+        self.inner.clients.lock().get(&client).map(|s| s.meta.addr)
+    }
+
+    /// Upgrade-request metadata (address, `Origin`, `X-Forwarded-For`, `User-Agent`) of a connected client.
+    pub fn client_meta(&self, client: ClientId) -> Option<ConnectMeta> {
+        self.inner.clients.lock().get(&client).map(|s| s.meta.clone())
+    }
+
+    /// Bytes queued for `client` that its socket has not accepted yet (flow control:
+    /// skip optional traffic while this grows). `None` if the client is not connected.
+    pub fn backlog_bytes(&self, client: ClientId) -> Option<usize> {
+        self.inner
+            .clients
+            .lock()
+            .get(&client)
+            .map(|s| s.queued.load(Ordering::Acquire))
+    }
+
+    /// Inbound messages currently waiting to be polled.
+    pub fn inbound_len(&self) -> usize {
+        self.inner.inbound.load(Ordering::Acquire)
     }
 
     /// Next inbound event, if any. Never blocks.
     pub fn try_recv(&self) -> Option<ServerEvent> {
-        self.inner.events_rx.try_recv().ok()
+        let ev = self.inner.events_rx.try_recv().ok()?;
+        self.note_dequeued(&ev);
+        Some(ev)
+    }
+
+    /// Wait for the next inbound event (for consumers running on the async runtime, e.g. a
+    /// gateway task). `None` once every handle to the server is gone. Never call from a system.
+    pub async fn recv(&self) -> Option<ServerEvent> {
+        let ev = self.inner.events_rx.recv().await.ok()?;
+        self.note_dequeued(&ev);
+        Some(ev)
+    }
+
+    fn note_dequeued(&self, ev: &ServerEvent) {
+        if matches!(ev, ServerEvent::Message { .. }) {
+            self.inner.inbound.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Queue an inbound message; `false` if the inbox is full (the caller closes the sender).
+    fn push_inbound(&self, client: ClientId, message: Message) -> bool {
+        let prev = self.inner.inbound.fetch_add(1, Ordering::AcqRel);
+        if prev >= self.inner.config.inbound_queue {
+            self.inner.inbound.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        if self
+            .inner
+            .events_tx
+            .try_send(ServerEvent::Message { client, message })
+            .is_err()
+        {
+            self.inner.inbound.fetch_sub(1, Ordering::AcqRel);
+        }
+        true
     }
 
     /// All queued inbound events, oldest first.
@@ -204,14 +410,23 @@ impl WsServer {
         axum::routing::get(upgrade).with_state((self.clone(), shutdown))
     }
 
-    async fn run_client(self, socket: WebSocket, addr: SocketAddr, shutdown: CancellationToken) {
+    async fn run_client(self, socket: WebSocket, meta: ConnectMeta, shutdown: CancellationToken) {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let addr = meta.addr;
         let id = {
             // Allocate, register and announce atomically: `Connected` events arrive in
             // id order, and the client is sendable by the time anyone sees the event.
             let mut clients = self.inner.clients.lock();
             let id = ClientId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-            clients.insert(id, Slot { tx, addr });
+            clients.insert(
+                id,
+                Slot {
+                    tx,
+                    meta,
+                    queued: queued.clone(),
+                },
+            );
             let _ = self
                 .inner
                 .events_tx
@@ -230,16 +445,19 @@ impl WsServer {
                 }
                 out = rx.recv() => match out {
                     Some(Outgoing::Message(m)) => {
+                        let len = m.len();
                         let m = match m {
                             Message::Text(s) => AxMessage::Text(s.into()),
                             Message::Binary(b) => AxMessage::Binary(b.into()),
                         };
-                        if let Err(e) = sink.send(m).await {
+                        let sent = sink.send(m).await;
+                        queued.fetch_sub(len, Ordering::AcqRel);
+                        if let Err(e) = sent {
                             break format!("send failed: {e}");
                         }
                     }
-                    Some(Outgoing::Close(reason)) => {
-                        let frame = CloseFrame { code: close_code::NORMAL, reason: reason.clone().into() };
+                    Some(Outgoing::Close(code, reason)) => {
+                        let frame = CloseFrame { code, reason: reason.clone().into() };
                         let _ = sink.send(AxMessage::Close(Some(frame))).await;
                         break reason;
                     }
@@ -247,12 +465,23 @@ impl WsServer {
                 },
                 inc = stream.next() => match inc {
                     Some(Ok(AxMessage::Text(t))) => {
-                        let message = Message::Text(t.as_str().to_owned());
-                        let _ = self.inner.events_tx.try_send(ServerEvent::Message { client: id, message });
+                        if !self.inner.config.accept_text {
+                            let frame = CloseFrame { code: CLOSE_UNSUPPORTED, reason: "text frames not accepted".into() };
+                            let _ = sink.send(AxMessage::Close(Some(frame))).await;
+                            break "text frame rejected".to_owned();
+                        }
+                        if !self.push_inbound(id, Message::Text(t.as_str().to_owned())) {
+                            let frame = CloseFrame { code: CLOSE_POLICY, reason: "inbox full".into() };
+                            let _ = sink.send(AxMessage::Close(Some(frame))).await;
+                            break "inbox full".to_owned();
+                        }
                     }
                     Some(Ok(AxMessage::Binary(b))) => {
-                        let message = Message::Binary(b.to_vec());
-                        let _ = self.inner.events_tx.try_send(ServerEvent::Message { client: id, message });
+                        if !self.push_inbound(id, Message::Binary(b.to_vec())) {
+                            let frame = CloseFrame { code: CLOSE_POLICY, reason: "inbox full".into() };
+                            let _ = sink.send(AxMessage::Close(Some(frame))).await;
+                            break "inbox full".to_owned();
+                        }
                     }
                     Some(Ok(AxMessage::Ping(_) | AxMessage::Pong(_))) => {}
                     Some(Ok(AxMessage::Close(frame))) => {
@@ -262,7 +491,15 @@ impl WsServer {
                             None => "closed by client".to_owned(),
                         };
                     }
-                    Some(Err(e)) => break format!("connection error: {e}"),
+                    Some(Err(e)) => {
+                        let text = crate::error::error_chain(&e);
+                        if text.contains("too long") || text.contains("Space limit") {
+                            let frame = CloseFrame { code: CLOSE_TOO_BIG, reason: "message too big".into() };
+                            let _ = sink.send(AxMessage::Close(Some(frame))).await;
+                            break format!("message too big: {text}");
+                        }
+                        break format!("connection error: {text}");
+                    }
                     None => break "connection closed".to_owned(),
                 },
             }
@@ -277,13 +514,38 @@ impl WsServer {
     }
 }
 
+fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
+}
+
 async fn upgrade(
     State((server, shutdown)): State<(WsServer, CancellationToken)>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     if shutdown.is_cancelled() {
-        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    upgrade.on_upgrade(move |socket| server.run_client(socket, addr, shutdown))
+    let config = &server.inner.config;
+    if server.client_count() >= config.max_connections {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let meta = ConnectMeta {
+        addr,
+        origin: header_string(&headers, header::ORIGIN),
+        forwarded_for: header_string(&headers, header::HeaderName::from_static("x-forwarded-for")),
+        user_agent: header_string(&headers, header::USER_AGENT),
+    };
+    if let Some(hook) = &config.accept
+        && let Err(status) = hook(&meta)
+    {
+        return StatusCode::from_u16(status)
+            .unwrap_or(StatusCode::FORBIDDEN)
+            .into_response();
+    }
+    upgrade
+        .max_message_size(config.max_message_size)
+        .max_frame_size(config.max_frame_size)
+        .on_upgrade(move |socket| server.run_client(socket, meta, shutdown))
 }
