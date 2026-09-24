@@ -1,6 +1,6 @@
 [package]
 name = "space3d-net"
-description = "Space3d net"
+description = "Space3d networking: non-blocking HTTP + WebSocket clients (native & web), axum servers, typed netcode channels"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,35 @@ license.workspace = true
 
 [dependencies]
 space3d-core.workspace = true
+space3d-tasks.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+async-channel.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+http.workspace = true
+url.workspace = true
+reqwest.workspace = true
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-tungstenite.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+# Same major as tokio-tungstenite/reqwest use; only needed to pin the process-wide crypto provider.
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Event"] }
+
+# Integration tests spin up localhost servers: native only.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
