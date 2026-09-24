@@ -8,7 +8,11 @@ pub struct Events<T> {
 
 impl<T> Default for Events<T> {
     fn default() -> Self {
-        Self { a: Vec::new(), b: Vec::new(), next_id: 0 }
+        Self {
+            a: Vec::new(),
+            b: Vec::new(),
+            next_id: 0,
+        }
     }
 }
 
@@ -48,7 +52,12 @@ impl EventReader {
     pub fn read<'a, T>(&mut self, events: &'a Events<T>) -> impl Iterator<Item = &'a T> {
         let from = self.last;
         self.last = events.next_id;
-        events.a.iter().chain(events.b.iter()).filter(move |(id, _)| *id >= from).map(|(_, e)| e)
+        events
+            .a
+            .iter()
+            .chain(events.b.iter())
+            .filter(move |(id, _)| *id >= from)
+            .map(|(_, e)| e)
     }
 }
 

@@ -15,7 +15,9 @@ fn bench(c: &mut Criterion) {
             t.translation += v.0 * dt;
         }
     });
-    c.bench_function("100k entities, 1 tick + transform propagation", |b| b.iter(|| app.step_ticks(1)));
+    c.bench_function("100k entities, 1 tick + transform propagation", |b| {
+        b.iter(|| app.step_ticks(1))
+    });
 }
 
 criterion_group!(benches, bench);

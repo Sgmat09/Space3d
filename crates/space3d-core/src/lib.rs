@@ -11,6 +11,7 @@
 //! 7. `Last` — event buffer swap, cleanup
 
 pub mod app;
+pub mod data;
 pub mod events;
 pub mod resources;
 pub mod schedule;
@@ -18,6 +19,7 @@ pub mod time;
 pub mod transform;
 
 pub use app::{App, AppExit, Plugin};
+pub use data::{ImageData, MeshData};
 pub use events::{EventReader, Events};
 pub use resources::Resources;
 pub use schedule::{Stage, SystemCtx};
@@ -30,8 +32,8 @@ pub use hecs::{Entity, World};
 
 pub mod prelude {
     pub use crate::{
-        App, AppExit, Entity, EventReader, Events, GlobalTransform, Name, Plugin, Resources,
-        Parent, Stage, SystemCtx, TickRate, Time, Transform, World,
+        App, AppExit, Entity, EventReader, Events, GlobalTransform, ImageData, MeshData, Name, Parent, Plugin,
+        Resources, Stage, SystemCtx, TickRate, Time, Transform, World,
     };
     pub use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 }

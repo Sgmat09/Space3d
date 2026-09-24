@@ -48,7 +48,10 @@ impl App {
             runner: Some(Box::new(headless_runner)),
         };
         app.resources.insert(TickRate::default());
-        app.resources.insert(Time { fixed_delta: TickRate::default().step(), ..Default::default() });
+        app.resources.insert(Time {
+            fixed_delta: TickRate::default().step(),
+            ..Default::default()
+        });
         app.add_event::<AppExit>();
         app.add_system_named(Stage::PostUpdate, "core::propagate_transforms", |ctx| {
             crate::transform::propagate_transforms(ctx.world)
@@ -109,7 +112,10 @@ impl App {
         name: &'static str,
         system: impl FnMut(&mut SystemCtx) + Send + 'static,
     ) -> &mut Self {
-        self.schedule.stages[stage.index()].push(NamedSystem { name, run: Box::new(system) });
+        self.schedule.stages[stage.index()].push(NamedSystem {
+            name,
+            run: Box::new(system),
+        });
         self
     }
 
@@ -263,7 +269,9 @@ mod tests {
     fn transforms_propagate_to_children() {
         let mut app = App::new();
         let parent = app.world.spawn((Transform::from_xyz(1.0, 0.0, 0.0),));
-        let child = app.world.spawn((Transform::from_xyz(0.0, 2.0, 0.0), crate::transform::Parent(parent)));
+        let child = app
+            .world
+            .spawn((Transform::from_xyz(0.0, 2.0, 0.0), crate::transform::Parent(parent)));
         app.step_ticks(1);
         let g = app.world.get::<&GlobalTransform>(child).unwrap().0;
         assert_eq!(g.w_axis.truncate(), glam::Vec3::new(1.0, 2.0, 0.0));

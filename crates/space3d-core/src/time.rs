@@ -11,7 +11,10 @@ pub struct TickRate {
 impl TickRate {
     pub fn new(hz: f64) -> Self {
         assert!(hz > 0.0, "tickrate must be positive");
-        Self { hz, max_steps_per_frame: 8 }
+        Self {
+            hz,
+            max_steps_per_frame: 8,
+        }
     }
     pub fn step(&self) -> Duration {
         Duration::from_secs_f64(1.0 / self.hz)

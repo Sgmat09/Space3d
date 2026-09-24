@@ -120,7 +120,11 @@ where
     runtime().spawn(wrapped);
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(wrapped);
-    Task { rx, done: None, cancelled: false }
+    Task {
+        rx,
+        done: None,
+        cancelled: false,
+    }
 }
 
 /// Run a CPU-bound closure off the main thread (rayon on native; inline on web).
@@ -138,7 +142,11 @@ where
     {
         let _ = tx.send(f());
     }
-    Task { rx, done: None, cancelled: false }
+    Task {
+        rx,
+        done: None,
+        cancelled: false,
+    }
 }
 
 type Callback = Box<dyn FnMut(&mut SystemCtx) -> bool + Send>;
@@ -168,7 +176,11 @@ impl AsyncQueue {
     }
 
     /// Attach a main-thread callback to an existing task.
-    pub fn track<T: Send + 'static>(&mut self, mut task: Task<T>, then: impl FnOnce(&mut SystemCtx, T) + Send + 'static) {
+    pub fn track<T: Send + 'static>(
+        &mut self,
+        mut task: Task<T>,
+        then: impl FnOnce(&mut SystemCtx, T) + Send + 'static,
+    ) {
         let mut then = Some(then);
         self.pending.get_mut().push(Box::new(move |ctx| match task.state() {
             TaskState::Pending => false,

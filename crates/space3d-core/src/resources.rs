@@ -42,17 +42,21 @@ impl Resources {
 
     /// Panics with the type name if missing.
     pub fn expect<T: 'static>(&self) -> &T {
-        self.get().unwrap_or_else(|| panic!("missing resource {}", type_name::<T>()))
+        self.get()
+            .unwrap_or_else(|| panic!("missing resource {}", type_name::<T>()))
     }
 
     /// Panics with the type name if missing.
     pub fn expect_mut<T: 'static>(&mut self) -> &mut T {
-        self.get_mut().unwrap_or_else(|| panic!("missing resource {}", type_name::<T>()))
+        self.get_mut()
+            .unwrap_or_else(|| panic!("missing resource {}", type_name::<T>()))
     }
 
     /// Temporarily take a resource out so it can be used alongside `&mut self`.
     pub fn scope<T: Send + Sync + 'static, R>(&mut self, f: impl FnOnce(&mut Self, &mut T) -> R) -> R {
-        let mut value = self.remove::<T>().unwrap_or_else(|| panic!("missing resource {}", type_name::<T>()));
+        let mut value = self
+            .remove::<T>()
+            .unwrap_or_else(|| panic!("missing resource {}", type_name::<T>()));
         let out = f(self, &mut value);
         self.insert(value);
         out

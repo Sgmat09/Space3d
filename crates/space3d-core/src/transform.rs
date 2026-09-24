@@ -15,10 +15,17 @@ impl Default for Transform {
 }
 
 impl Transform {
-    pub const IDENTITY: Self = Self { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE };
+    pub const IDENTITY: Self = Self {
+        translation: Vec3::ZERO,
+        rotation: Quat::IDENTITY,
+        scale: Vec3::ONE,
+    };
 
     pub fn from_xyz(x: f32, y: f32, z: f32) -> Self {
-        Self { translation: Vec3::new(x, y, z), ..Self::IDENTITY }
+        Self {
+            translation: Vec3::new(x, y, z),
+            ..Self::IDENTITY
+        }
     }
     pub fn with_rotation(mut self, r: Quat) -> Self {
         self.rotation = r;
@@ -57,7 +64,10 @@ pub struct Name(pub String);
 pub fn propagate_transforms(world: &mut hecs::World) {
     // Roots first.
     let mut missing = Vec::new();
-    for (e, t, g) in world.query_mut::<(hecs::Entity, &Transform, Option<&mut GlobalTransform>)>().without::<&Parent>() {
+    for (e, t, g) in world
+        .query_mut::<(hecs::Entity, &Transform, Option<&mut GlobalTransform>)>()
+        .without::<&Parent>()
+    {
         match g {
             Some(g) => g.0 = t.matrix(),
             None => missing.push((e, GlobalTransform(t.matrix()))),
@@ -75,7 +85,9 @@ pub fn propagate_transforms(world: &mut hecs::World) {
     for _depth in 0..32 {
         let mut changed = false;
         for &(e, parent, local) in &children {
-            let Ok(pg) = world.get::<&GlobalTransform>(parent).map(|g| g.0) else { continue };
+            let Ok(pg) = world.get::<&GlobalTransform>(parent).map(|g| g.0) else {
+                continue;
+            };
             let new = pg * local;
             match world.get::<&mut GlobalTransform>(e) {
                 Ok(mut g) => {
