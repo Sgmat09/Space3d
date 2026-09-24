@@ -18,14 +18,22 @@
 //! h.assert_converged(a).unwrap();
 //! ```
 
-use crate::client::ClientConfig;
-use crate::server::{RoomSender, ServerNetConfig};
-use crate::time::ManualClock;
-use crate::transport::LinkEvent;
+use crate::client::{ClientConfig, ClientReplicationPlugin, ConnectTarget, NetClient};
+use crate::mapping::EncodeCtx;
+use crate::protocol::handshake::{HelloAuth, ResumeToken};
+use crate::registry::ReplicationRegistry;
+use crate::server::handshake::{SecretSource, parse_hello, reject_packet};
+use crate::server::{
+    JoinRequest, PlayerIdentity, RoomInbound, RoomSender, ServerNetConfig, ServerReplicationPlugin, room_channel,
+};
+use crate::time::{ManualClock, NetClockHandle};
 use crate::transport::conditioner::{LinkProfile, Semantics};
 use crate::transport::memory::{MemoryNetwork, MemoryServerEndpoint};
-use crate::{LinkId, NetId};
+use crate::transport::{CloseCode, Lane, LinkEvent, LinkTx, PeerInfo};
+use crate::wire::Writer;
+use crate::{FastMap, LinkId, NetId, PlayerId};
 use space3d_core::{App, Entity};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Harness settings.
@@ -81,6 +89,24 @@ impl ClientSpec {
             phase: Duration::ZERO,
         }
     }
+
+    /// Builder: link conditions.
+    pub fn with_link(mut self, link: LinkProfile) -> Self {
+        self.link = Some(link);
+        self
+    }
+
+    /// Builder: frame time.
+    pub fn with_frame_dt(mut self, dt: Duration) -> Self {
+        self.frame_dt = dt;
+        self
+    }
+
+    /// Builder: phase offset.
+    pub fn with_phase(mut self, phase: Duration) -> Self {
+        self.phase = phase;
+        self
+    }
 }
 
 /// Index of a harness client.
@@ -111,6 +137,12 @@ struct ClientSlot {
     spec: ClientSpec,
     next_frame_at: Duration,
     link: Option<LinkId>,
+    player: PlayerId,
+}
+
+enum Route {
+    Pending { tx: Arc<dyn LinkTx>, peer: PeerInfo },
+    Joined,
 }
 
 /// The harness. See the module docs.
@@ -123,25 +155,109 @@ pub struct NetHarness {
     clients: Vec<ClientSlot>,
     config: HarnessConfig,
     step: Duration,
+    now: Duration,
+    routes: FastMap<LinkId, Route>,
 }
 
 impl NetHarness {
     /// Build the room `App` (`ServerReplicationPlugin` + inbox + clock are added for you; the
     /// closure adds the game's protocol and server rules).
-    pub fn new(config: HarnessConfig, build_server: impl FnOnce(&mut App)) -> Self {
-        todo!()
+    pub fn new(mut config: HarnessConfig, build_server: impl FnOnce(&mut App)) -> Self {
+        if config.server.game_id.is_empty() {
+            config.server.game_id = "harness".into();
+        }
+        let clock = ManualClock::new();
+        let handle = NetClockHandle(Arc::new(clock.clone()));
+        let network = MemoryNetwork::new(config.seed, handle.clone(), config.semantics);
+        let endpoint = network.server_endpoint();
+        let mut server = App::new().with_tickrate(config.tick_hz);
+        server.insert_resource(handle);
+        let (room, inbox) = room_channel(8192);
+        server.insert_resource(inbox);
+        server.insert_resource(SecretSource::seeded(config.seed ^ 0x5ec2_e75e));
+        server.add_plugin(ServerReplicationPlugin {
+            config: config.server.clone(),
+        });
+        build_server(&mut server);
+        let step = Duration::from_secs_f64(1.0 / config.tick_hz);
+        Self {
+            clock,
+            network,
+            endpoint,
+            server,
+            room,
+            clients: Vec::new(),
+            config,
+            step,
+            now: Duration::ZERO,
+            routes: FastMap::default(),
+        }
     }
 
     /// Add a client (`ClientReplicationPlugin` + clock added; the closure adds the game's
     /// protocol and input sampler). It starts connecting immediately with `HelloAuth::Dev`.
     pub fn add_client(&mut self, spec: ClientSpec, build: impl FnOnce(&mut App)) -> ClientHandle {
-        todo!()
+        let mut app = App::new().with_tickrate(self.config.tick_hz);
+        app.insert_resource(NetClockHandle(Arc::new(self.clock.clone())));
+        let profile = spec.link.clone().unwrap_or_else(|| self.config.link.clone());
+        let connector: Arc<dyn crate::transport::Connector> = Arc::new(self.network.connector(profile));
+        let mut cc = self.config.client.clone();
+        cc.connector = connector.clone();
+        if cc.game_id.is_empty() {
+            cc.game_id = self.config.server.game_id.clone();
+        }
+        app.add_plugin(ClientReplicationPlugin { config: cc });
+        build(&mut app);
+        app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Custom {
+            connector,
+            url: "mem://room".into(),
+            auth: HelloAuth::Dev {
+                name: spec.name.clone(),
+            },
+        });
+        let handle = ClientHandle(self.clients.len());
+        self.clients.push(ClientSlot {
+            app,
+            next_frame_at: self.now + spec.phase,
+            player: PlayerIdentity::dev(&spec.name).player,
+            spec,
+            link: None,
+        });
+        handle
     }
 
     /// Advance virtual time by one server tick: deliver due packets, run client frames that
     /// are due (ordered by `(time, client index)`), run one server tick, route link events.
     pub fn step(&mut self) {
-        todo!()
+        let target = self.now + self.step;
+        loop {
+            let next = self
+                .clients
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.next_frame_at <= target)
+                .min_by_key(|(i, c)| (c.next_frame_at, *i))
+                .map(|(i, c)| (i, c.next_frame_at));
+            let Some((i, at)) = next else { break };
+            if at > self.clock_now() {
+                self.clock.set(at);
+            }
+            self.network.pump();
+            self.route_all();
+            let dt = self.clients[i].spec.frame_dt;
+            self.clients[i].app.update(dt);
+            self.clients[i].next_frame_at += dt;
+        }
+        self.clock.set(target);
+        self.network.pump();
+        self.route_all();
+        self.server.update(self.step);
+        self.now = target;
+    }
+
+    fn clock_now(&self) -> Duration {
+        use crate::time::NetClock;
+        self.clock.now()
     }
 
     /// `step()` × n.
@@ -202,6 +318,16 @@ impl NetHarness {
         &self.network
     }
 
+    /// Number of clients added.
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Account of a harness client.
+    pub fn player(&self, c: ClientHandle) -> PlayerId {
+        self.clients[c.0].player
+    }
+
     /// Current link of a client.
     pub fn link(&self, c: ClientHandle) -> Option<LinkId> {
         self.clients[c.0].link
@@ -209,24 +335,100 @@ impl NetHarness {
 
     /// Change a client's link conditions.
     pub fn set_link(&mut self, c: ClientHandle, profile: LinkProfile) {
-        todo!()
+        if let Some(link) = self.clients[c.0].link {
+            self.network.set_profile(link, profile.clone());
+        }
+        self.clients[c.0].spec.link = Some(profile);
     }
 
     /// Drop a client's link for `duration` (it should resume afterwards).
     pub fn partition(&mut self, c: ClientHandle, duration: Duration) {
-        todo!()
+        if let Some(link) = self.clients[c.0].link {
+            self.network.partition(link, duration);
+        }
     }
 
     /// The client entity mirroring a server entity.
     pub fn client_entity(&self, c: ClientHandle, server_entity: Entity) -> Option<Entity> {
-        todo!()
+        let id = self.server_net().net_id(server_entity)?;
+        self.client_net(c).entity(id)
     }
 
     /// Compare every entity in the client's scope: same set, identical encoded bytes for every
     /// replicated component the client may see (predicted components compared at the last
-    /// confirmed tick).
+    /// confirmed tick). Changes newer than the client's last received snapshot are skipped
+    /// (still in flight).
     pub fn assert_converged(&self, c: ClientHandle) -> Result<(), ConvergenceError> {
-        todo!()
+        let net = self.client_net(c);
+        let server = self.server_net();
+        let Some(client_id) = net.client_id() else {
+            return Err(ConvergenceError::Missing(NetId(0)));
+        };
+        let registry = self.server.resources.expect::<ReplicationRegistry>();
+        let client_registry = self.clients[c.0].app.resources.expect::<ReplicationRegistry>();
+        let cworld = &self.clients[c.0].app.world;
+        let player = self.clients[c.0].player;
+        let team = server
+            .clients()
+            .into_iter()
+            .find(|i| i.client == client_id)
+            .and_then(|i| i.identity.team);
+        let scope = server.scope_of(client_id);
+        let last = net.last_snapshot_tick();
+        let enc = EncodeCtx::client(&net.map);
+        let mut w = Writer::new();
+        for &id in &scope {
+            let Some(e) = net.entity(id) else {
+                return Err(ConvergenceError::Missing(id));
+            };
+            let Some(rec) = server.cache.get(id) else { continue };
+            let allowed = crate::server::send::audience_mask(rec, registry, player, team, &self.server.world);
+            let predicted = cworld.satisfies::<&crate::Predicted>(e);
+            for entry in client_registry.components() {
+                let kind = entry.kind.expect("frozen").0;
+                let bit = 1u64 << kind;
+                let server_slot = rec.comp(kind).filter(|_| allowed & bit != 0);
+                if let Some(s) = server_slot
+                    && (s.changed_tick > last || rec.structure_tick > last)
+                {
+                    continue; // in flight
+                }
+                if server_slot.is_none() && rec.structure_tick > last {
+                    continue;
+                }
+                w.clear();
+                let client_bytes: Option<Vec<u8>> = if predicted && entry.mode.is_predicted() {
+                    net.prediction
+                        .confirmed
+                        .get(&id)
+                        .and_then(|c| c.comps.iter().find(|(k, _)| *k == kind).map(|(_, b)| b.clone()))
+                } else if entry.mode.is_interpolated() || entry.mode == crate::ClientMode::Delayed {
+                    match entry.ops.newest_sample(cworld, e, &mut w, &enc) {
+                        Some(_) => Some(w.as_slice().to_vec()),
+                        None => entry.ops.encode(cworld, e, &mut w, &enc).then(|| w.as_slice().to_vec()),
+                    }
+                } else {
+                    entry.ops.encode(cworld, e, &mut w, &enc).then(|| w.as_slice().to_vec())
+                };
+                let same = match (server_slot, &client_bytes) {
+                    (Some(s), Some(b)) => s.bytes.as_slice() == b.as_slice(),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    return Err(ConvergenceError::Differs {
+                        net_id: id,
+                        component: entry.name.to_owned(),
+                    });
+                }
+            }
+        }
+        for id in net.net_ids() {
+            if scope.binary_search(&id).is_err() {
+                return Err(ConvergenceError::Extra(id));
+            }
+        }
+        Ok(())
     }
 
     /// Hash of every packet delivered so far (determinism: equal for equal seeds).
@@ -234,7 +436,78 @@ impl NetHarness {
         self.network.wire_digest()
     }
 
+    fn route_all(&mut self) {
+        for ev in self.endpoint.drain() {
+            self.route(ev);
+        }
+    }
+
     fn route(&mut self, event: LinkEvent) {
-        todo!()
+        match event {
+            LinkEvent::Opened { link, peer, tx } => {
+                self.routes.insert(link, Route::Pending { tx, peer });
+            }
+            LinkEvent::Packet { link, data, .. } => match self.routes.remove(&link) {
+                Some(Route::Pending { tx, peer }) => match parse_hello(&data) {
+                    Ok(hello) => {
+                        let identity = match &hello.auth {
+                            HelloAuth::Dev { name } => Some(PlayerIdentity::dev(name)),
+                            _ => None,
+                        };
+                        let player = match &hello.auth {
+                            HelloAuth::Dev { name } => Some(PlayerIdentity::dev(name).player),
+                            HelloAuth::Resume(bytes) => ResumeToken::decode(bytes).ok().and_then(|t| {
+                                self.server_net()
+                                    .clients()
+                                    .into_iter()
+                                    .find(|i| i.client == t.client)
+                                    .map(|i| i.identity.player)
+                            }),
+                            HelloAuth::Ticket(_) => None,
+                        };
+                        if let Some(p) = player
+                            && let Some(slot) = self.clients.iter_mut().find(|c| c.player == p)
+                        {
+                            slot.link = Some(link);
+                        }
+                        let req = JoinRequest {
+                            link,
+                            tx: tx.clone(),
+                            peer,
+                            hello,
+                            identity,
+                        };
+                        if self.room.try_send(RoomInbound::Join(Box::new(req))).is_ok() {
+                            self.routes.insert(link, Route::Joined);
+                        } else {
+                            tx.close(CloseCode::POLICY, "room inbox full");
+                        }
+                    }
+                    Err(code) => {
+                        let _ = tx.send(Lane::Reliable, reject_packet(code, "bad hello", None));
+                        tx.close(CloseCode::POLICY, "bad hello");
+                    }
+                },
+                Some(Route::Joined) => {
+                    self.routes.insert(link, Route::Joined);
+                    let _ = self.room.try_send(RoomInbound::Packet { link, bytes: data });
+                }
+                None => {}
+            },
+            LinkEvent::Closed { link, reason } => {
+                if let Some(Route::Joined) = self.routes.remove(&link) {
+                    let _ = self.room.try_send(RoomInbound::Closed { link, reason });
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for NetHarness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetHarness")
+            .field("now", &self.now)
+            .field("clients", &self.clients.len())
+            .finish_non_exhaustive()
     }
 }

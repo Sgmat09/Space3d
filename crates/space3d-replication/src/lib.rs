@@ -33,9 +33,9 @@
 //! }
 //! ```
 #![warn(missing_docs)]
-// SKELETON PHASE: most bodies are `todo!()` and many items are not wired up yet.
-// The replication builder removes this allow once the crate is implemented.
-#![allow(dead_code, unused_variables, unused_imports, clippy::todo, clippy::ptr_arg)]
+// Without `server` or `client` only the protocol, transports and registry types remain; the
+// type-erased registry operations are then unused.
+#![cfg_attr(not(any(feature = "server", feature = "client")), allow(dead_code))]
 
 pub mod components;
 pub mod ids;
@@ -60,7 +60,10 @@ pub mod server;
 
 #[cfg(feature = "api")]
 pub mod api;
+// Owned by the space3d-server builder (docs/design/game-server.md §3.1); the crate-level
+// skeleton allow lives on here until `services.rs` is implemented.
 #[cfg(all(feature = "api", feature = "client"))]
+#[allow(dead_code, unused_variables, unused_imports, clippy::todo)]
 pub mod services;
 
 #[cfg(feature = "harness")]

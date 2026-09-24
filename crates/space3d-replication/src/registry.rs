@@ -467,8 +467,10 @@ pub(crate) trait ComponentOps: Send + Sync + 'static {
     /// Decode `bytes` (all of them) and insert / overwrite the component.
     fn apply(&self, world: &mut World, e: Entity, bytes: &[u8], ctx: &mut DecodeCtx<'_>) -> Result<(), DecodeError>;
     /// Decode only (validation, comparisons).
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     fn check(&self, bytes: &[u8], ctx: &mut DecodeCtx<'_>) -> Result<(), DecodeError>;
     /// Remove the component (and any client buffers).
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     fn remove(&self, world: &mut World, e: Entity);
     /// Round the value through the codec and write it back; the encoding of the written-back
     /// value is left in `out`. `false` if absent or not decodable (value untouched).
@@ -481,6 +483,7 @@ pub(crate) trait ComponentOps: Send + Sync + 'static {
         out: &mut Writer,
     ) -> bool;
     /// Misprediction test between two encodings (`rollback_when` or byte inequality).
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     fn differs(&self, a: &[u8], b: &[u8], ctx: &mut DecodeCtx<'_>) -> bool;
     #[cfg(feature = "client")]
     fn push_sample(
@@ -494,7 +497,8 @@ pub(crate) trait ComponentOps: Send + Sync + 'static {
     ) -> Result<(), DecodeError>;
     #[cfg(feature = "client")]
     fn interpolate_all(&self, world: &mut World, render_tick: f64, max_extrapolate_ticks: f64);
-    #[cfg(feature = "client")]
+    /// Newest buffered (interpolated / delayed) value, encoded (harness convergence checks).
+    #[cfg(feature = "harness")]
     fn newest_sample(&self, world: &World, e: Entity, w: &mut Writer, ctx: &EncodeCtx<'_>) -> Option<Tick>;
     #[cfg(feature = "client")]
     fn push_delayed(
@@ -649,7 +653,8 @@ impl<T: Component + Clone> ComponentOps for TypedComponent<T> {
         }
     }
 
-    #[cfg(feature = "client")]
+    /// Newest buffered (interpolated / delayed) value, encoded (harness convergence checks).
+    #[cfg(feature = "harness")]
     fn newest_sample(&self, world: &World, e: Entity, w: &mut Writer, ctx: &EncodeCtx<'_>) -> Option<Tick> {
         if let Ok(buf) = world.get::<&InterpBuffer<T>>(e)
             && let Some((tick, v)) = buf.0.newest()
@@ -744,10 +749,13 @@ pub(crate) type InputValue = Box<dyn std::any::Any + Send + Sync>;
 pub(crate) trait InputOps: Send + Sync + 'static {
     /// Decode (exact) and sanitize. `Ok((value, true))` when sanitize passed; `Ok((neutral, false))`
     /// when sanitize rejected it (strike).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     fn decode(&self, bytes: &[u8]) -> Result<(InputValue, bool), DecodeError>;
     fn neutral(&self) -> InputValue;
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     fn repeat(&self, v: &InputValue) -> InputValue;
     fn clone_value(&self, v: &InputValue) -> InputValue;
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     fn encode(&self, v: &InputValue) -> Vec<u8>;
     /// Insert/overwrite `PlayerInput<I>` on `e`.
     fn write(&self, world: &mut World, e: Entity, v: &InputValue);
@@ -826,6 +834,7 @@ pub(crate) struct InputEntry {
 
 /// Why an inbound message was refused (strike).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) enum MessageReject {
     Decode(DecodeError),
     Invalid(&'static str),
@@ -834,6 +843,7 @@ pub(crate) enum MessageReject {
 /// Type-erased operations of one message type.
 pub(crate) trait MessageOps: Send + Sync + 'static {
     /// Server: decode, validate, push `Events<FromClient<M>>`.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     fn deliver_from_client(
         &self,
         resources: &mut space3d_core::Resources,
@@ -843,6 +853,7 @@ pub(crate) trait MessageOps: Send + Sync + 'static {
         tick: Tick,
     ) -> Result<(), MessageReject>;
     /// Client: decode, push `Events<FromServer<M>>`.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     fn deliver_from_server(
         &self,
         resources: &mut space3d_core::Resources,
@@ -900,11 +911,13 @@ pub(crate) struct MessageEntry {
 
 impl MessageEntry {
     /// Whether clients may send it.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn client_may_send(&self) -> bool {
         matches!(self.config.direction, Direction::ClientToServer | Direction::Both)
     }
 
     /// Whether the server may send it.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn server_may_send(&self) -> bool {
         matches!(self.config.direction, Direction::ServerToClient | Direction::Both)
     }
@@ -1138,6 +1151,12 @@ impl ReplicationRegistry {
         self.input.as_ref().map(|i| i.name)
     }
 
+    /// Whether `I` is the registered input type (an `InputSampler<J>` for any other `J` is
+    /// never called).
+    pub fn input_is<I: 'static>(&self) -> bool {
+        self.input.as_ref().is_some_and(|i| i.type_id == TypeId::of::<I>())
+    }
+
     /// Registered message names in kind order (after freeze).
     pub fn message_names(&self) -> Vec<&'static str> {
         self.messages.iter().map(|m| m.name).collect()
@@ -1170,6 +1189,11 @@ impl ReplicationRegistry {
         self.messages.get(usize::from(kind))
     }
 
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub(crate) fn message_by_type(&self, type_id: TypeId) -> Option<&MessageEntry> {
+        self.messages.iter().find(|m| m.type_id == type_id)
+    }
+
     /// Mask of all registered kinds with a predicted client mode.
     pub(crate) fn predicted_mask(&self) -> u64 {
         self.components
@@ -1179,6 +1203,7 @@ impl ReplicationRegistry {
     }
 
     /// Mask of all kinds interpolated on non-predicting clients.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn interpolated_mask(&self) -> u64 {
         self.components
             .iter()
@@ -1187,6 +1212,7 @@ impl ReplicationRegistry {
     }
 
     /// Mask of all kinds with authoritative quantization.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn quantized_mask(&self) -> u64 {
         self.components
             .iter()
@@ -1299,6 +1325,7 @@ mod tests {
         assert!(!h.ops.contains(&world, other));
         assert!(h.ops.differs(&bytes, &[8], &mut DecodeCtx::empty()));
         // Input ops.
+        assert!(r.input_is::<Move>() && !r.input_is::<Health>());
         let input = r.input().unwrap();
         let (v, ok) = input.ops.decode(&postcard::to_stdvec(&Move { x: 3 }).unwrap()).unwrap();
         assert!(ok);

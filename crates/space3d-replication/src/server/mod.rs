@@ -31,10 +31,11 @@ use crate::protocol::WireLimits;
 use crate::protocol::control::Notice;
 use crate::protocol::handshake::{DisconnectCode, Hello};
 use crate::stats::{NetStats, RoomNetStats};
+use crate::time::NetClockHandle;
 use crate::transport::{LinkTx, PeerInfo};
 use crate::{LinkId, NetClientId, NetId, NetMessage, PlayerId, RoomId, Target, Tick};
 use serde::{Deserialize, Serialize};
-use space3d_core::{App, Entity, Plugin};
+use space3d_core::{App, Entity, Events, Plugin, Stage};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,7 +58,26 @@ pub struct PlayerIdentity {
 impl PlayerIdentity {
     /// Identity for `HelloAuth::Dev { name }`: `PlayerId` = FNV-1a 64 of `"dev:" + name` (never 0).
     pub fn dev(name: &str) -> Self {
-        todo!()
+        let h = crate::registry::fnv1a(0xcbf2_9ce4_8422_2325, format!("dev:{name}").as_bytes());
+        Self {
+            player: PlayerId(h.max(1)),
+            display_name: name.to_owned(),
+            team: None,
+            is_bot: false,
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    /// Identity of a server-side bot (`PlayerId` derived like [`Self::dev`] from `"bot:" + name`).
+    pub fn bot(name: &str) -> Self {
+        let h = crate::registry::fnv1a(0xcbf2_9ce4_8422_2325, format!("bot:{name}").as_bytes());
+        Self {
+            player: PlayerId(h.max(1)),
+            display_name: name.to_owned(),
+            team: None,
+            is_bot: true,
+            extra: serde_json::Value::Null,
+        }
     }
 }
 
@@ -280,7 +300,32 @@ pub struct ServerReplicationPlugin {
 
 impl Plugin for ServerReplicationPlugin {
     fn build(&self, app: &mut App) {
-        todo!("resources (NetServer, NetClockHandle if missing), events, systems per the module table")
+        app.init_resource::<crate::ReplicationRegistry>();
+        app.init_resource::<crate::SimSchedule>();
+        app.init_resource::<NetClockHandle>();
+        if !app.resources.contains::<NetServer>() {
+            app.insert_resource(NetServer::new(self.config.clone()));
+        }
+        app.add_event::<PlayerJoined>();
+        app.add_event::<PlayerDisconnected>();
+        app.add_event::<PlayerResumed>();
+        app.add_event::<PlayerLeft>();
+        app.add_system_named(Stage::Startup, "replication::server_startup", |ctx| {
+            crate::freeze_registry(ctx);
+            if !ctx.resources.contains::<handshake::SecretSource>() {
+                tracing::warn!("no SecretSource resource: resume secrets use an insecure seeded generator (dev only)");
+                let seed = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x5eed);
+                ctx.resources.insert(handshake::SecretSource::seeded(seed));
+            }
+        });
+        app.add_system_named(Stage::PreUpdate, "replication::server_receive", receive::server_receive);
+        app.add_system_named(Stage::FixedUpdate, "replication::server_tick", inputs::server_tick);
+        app.add_system_named(Stage::PostUpdate, "replication::lagcomp_record", lagcomp::record_system);
+        app.add_system_named(Stage::Render, "replication::server_collect", change::server_collect);
+        app.add_system_named(Stage::Render, "replication::server_send", send::server_send);
     }
 }
 
@@ -352,7 +397,9 @@ pub enum LeaveReason {
     Timeout,
     /// Kicked (game, admin, strikes, slow consumer).
     Kicked(DisconnectCode, String),
-    /// The same player joined again on another link (old slot freed).
+    /// Reserved: the same player joined again on another link. The room currently *rebinds*
+    /// the existing slot instead (old link closed with `Superseded`, `PlayerResumed` fired),
+    /// so this reason is not emitted.
     Superseded,
     /// The room is closing.
     RoomClosed,
@@ -369,14 +416,48 @@ pub struct PlayerLeft {
     pub reason: LeaveReason,
 }
 
+/// Events produced inside `NetServer` methods, flushed into `Events<T>` by the systems.
+#[derive(Debug)]
+pub(crate) enum PendingEvent {
+    Joined(PlayerJoined),
+    Disconnected(PlayerDisconnected),
+    Resumed(PlayerResumed),
+    Left(PlayerLeft),
+}
+
+/// A message queued with [`NetServer::send`], resolved (kind, recipients) at the next send.
+pub(crate) struct QueuedMessage {
+    pub(crate) type_id: std::any::TypeId,
+    pub(crate) type_name: &'static str,
+    pub(crate) target: Target,
+    pub(crate) bytes: Vec<u8>,
+}
+
 /// Room-side replication state and API (resource).
 pub struct NetServer {
-    config: ServerNetConfig,
-    tick: Tick,
-    joinable: bool,
-    ids: crate::mapping::NetIdMap,
-    slots: slots::SlotTable,
-    stats: RoomNetStats,
+    pub(crate) config: ServerNetConfig,
+    pub(crate) tick: Tick,
+    pub(crate) joinable: bool,
+    pub(crate) ids: crate::mapping::NetIdMap,
+    pub(crate) slots: slots::SlotTable,
+    pub(crate) stats: RoomNetStats,
+    pub(crate) cache: change::ChangeCache,
+    pub(crate) visibility: crate::FastMap<(PlayerId, Entity), Visibility>,
+    pub(crate) rules: Vec<Box<dyn interest::VisibilityRule>>,
+    pub(crate) pending: Vec<PendingEvent>,
+    pub(crate) messages: Vec<QueuedMessage>,
+    pub(crate) tick_started_at: Duration,
+}
+
+impl std::fmt::Debug for NetServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetServer")
+            .field("room", &self.config.room)
+            .field("tick", &self.tick)
+            .field("clients", &self.slots.iter().count())
+            .field("entities", &self.cache.records.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl NetServer {
@@ -389,12 +470,24 @@ impl NetServer {
             ids: Default::default(),
             slots: Default::default(),
             stats: Default::default(),
+            cache: Default::default(),
+            visibility: Default::default(),
+            rules: Vec::new(),
+            pending: Vec::new(),
+            messages: Vec::new(),
+            tick_started_at: Duration::ZERO,
         }
     }
 
     /// Settings.
     pub fn config(&self) -> &ServerNetConfig {
         &self.config
+    }
+
+    /// Mutable settings (e.g. `room_epoch` after a restore). Changing `send_interval` or limits
+    /// affects clients joining afterwards.
+    pub fn config_mut(&mut self) -> &mut ServerNetConfig {
+        &mut self.config
     }
 
     /// Current room tick (the tick being / last simulated).
@@ -408,25 +501,99 @@ impl NetServer {
     }
 
     /// Queue a typed message for `target` (encoded once; sent with the next packet of each
-    /// recipient; reliable-lane messages are never dropped, unreliable ones may be).
+    /// recipient; reliable-lane messages are never dropped, unreliable ones may be). Messages
+    /// for clients without a live link are dropped. The type must be registered with
+    /// `add_message` in a server-to-client direction (checked when the message is sent).
     pub fn send<M: NetMessage>(&mut self, target: Target, msg: &M) {
-        todo!()
+        match postcard::to_stdvec(msg) {
+            Ok(bytes) => self.messages.push(QueuedMessage {
+                type_id: std::any::TypeId::of::<M>(),
+                type_name: std::any::type_name::<M>(),
+                target,
+                bytes,
+            }),
+            Err(e) => tracing::error!(message = std::any::type_name::<M>(), %e, "message encode failed"),
+        }
     }
 
     /// Queue a notice (admin broadcast, shutdown warning).
     pub fn notice(&mut self, target: Target, notice: Notice) {
-        todo!()
+        let msg = crate::protocol::control::ControlMsg::Notice(notice);
+        let bytes: Arc<[u8]> = match postcard::to_stdvec(&msg) {
+            Ok(b) => b.into(),
+            Err(_) => return,
+        };
+        for c in self.recipients(&target) {
+            if let Some(slot) = self.slots.get_mut(c) {
+                slot.queue_reliable(crate::protocol::ChannelId::Control, bytes.clone());
+            }
+        }
+    }
+
+    /// Slots addressed by `target` (live links only).
+    pub(crate) fn recipients(&self, target: &Target) -> Vec<NetClientId> {
+        let net_id = match target {
+            Target::ObserversOf(e) => self.ids.net_id(*e),
+            _ => None,
+        };
+        self.slots
+            .iter()
+            .filter(|s| s.link.is_some())
+            .filter(|s| match target {
+                Target::All => true,
+                Target::Client(c) => s.client == *c,
+                Target::Player(p) => s.identity.player == *p,
+                Target::AllExcept(p) => s.identity.player != *p,
+                Target::Players(ps) => ps.contains(&s.identity.player),
+                Target::ObserversOf(_) => net_id.is_some_and(|id| s.view.entities.get(&id).is_some_and(|e| e.spawned)),
+                Target::Team(t) => s.identity.team == Some(*t),
+            })
+            .map(|s| s.client)
+            .collect()
     }
 
     /// Disconnect a player (`Disconnect` packet, then close). Emits `PlayerLeft` (or
     /// `PlayerDisconnected` when `resume_allowed`).
     pub fn kick(&mut self, player: PlayerId, code: DisconnectCode, reason: &str, resume_allowed: bool) {
-        todo!()
+        let Some(client) = self.slots.by_player.get(&player).copied() else {
+            return;
+        };
+        self.stats.kicks += 1;
+        self.drop_link(client, Some((code, reason)), resume_allowed);
+        if resume_allowed {
+            let until = self.resume_deadline();
+            if let Some(slot) = self.slots.get_mut(client) {
+                slot.state = SlotState::Disconnected { until };
+                self.pending.push(PendingEvent::Disconnected(PlayerDisconnected {
+                    client,
+                    player,
+                    resume_until: until,
+                }));
+            }
+        } else {
+            self.free_slot(client, LeaveReason::Kicked(code, reason.to_owned()));
+        }
     }
 
     /// Disconnect everyone (room close / server shutdown).
     pub fn disconnect_all(&mut self, code: DisconnectCode, reason: &str, resume_allowed: bool) {
-        todo!()
+        let players: Vec<PlayerId> = self.slots.iter().map(|s| s.identity.player).collect();
+        for p in players {
+            if resume_allowed {
+                self.kick(p, code, reason, true);
+            } else {
+                let Some(client) = self.slots.by_player.get(&p).copied() else {
+                    continue;
+                };
+                self.drop_link(client, Some((code, reason)), false);
+                let reason = if code == DisconnectCode::RoomClosed || code == DisconnectCode::ServerShutdown {
+                    LeaveReason::RoomClosed
+                } else {
+                    LeaveReason::Kicked(code, reason.to_owned())
+                };
+                self.free_slot(client, reason);
+            }
+        }
     }
 
     /// Whether new joins are accepted (resumes always are).
@@ -441,22 +608,39 @@ impl NetServer {
 
     /// All slots.
     pub fn clients(&self) -> Vec<ClientInfo> {
-        todo!()
+        self.slots
+            .iter()
+            .map(|s| ClientInfo {
+                client: s.client,
+                identity: s.identity.clone(),
+                link: s.link.as_ref().map(|l| l.0),
+                state: s.state,
+                joined_tick: s.joined_tick,
+            })
+            .collect()
     }
 
     /// Slot of a player.
     pub fn client_of(&self, player: PlayerId) -> Option<NetClientId> {
-        todo!()
+        self.slots.by_player.get(&player).copied()
     }
 
     /// Connected (not disconnected) slot count.
     pub fn connected_count(&self) -> usize {
-        todo!()
+        self.slots
+            .iter()
+            .filter(|s| !matches!(s.state, SlotState::Disconnected { .. }))
+            .count()
     }
 
     /// Link statistics of a slot.
     pub fn stats(&self, client: NetClientId) -> Option<NetStats> {
-        todo!()
+        let s = self.slots.get(client)?;
+        let mut stats = s.stats.clone();
+        stats.rtt = s.rtt.srtt();
+        stats.jitter = s.rtt.rttvar();
+        stats.input_slack = s.inputs.slack();
+        Some(stats)
     }
 
     /// Cumulative room counters (the server crate exports deltas as metrics).
@@ -476,20 +660,147 @@ impl NetServer {
 
     /// Per-player visibility override of one entity.
     pub fn set_visibility(&mut self, player: PlayerId, entity: Entity, visibility: Visibility) {
-        todo!()
+        if visibility == Visibility::Default {
+            self.visibility.remove(&(player, entity));
+        } else {
+            self.visibility.insert((player, entity), visibility);
+        }
     }
 
     /// Add a game relevancy rule, evaluated for candidates on interest ticks (fog of war).
     pub fn add_visibility_rule(&mut self, rule: impl interest::VisibilityRule) {
-        todo!()
+        self.rules.push(Box::new(rule));
     }
 
     /// Plug a server-side bot into a slot (no link; its input comes from `brain` each tick).
+    /// Returns `NetClientId(u16::MAX)` when the room is full.
     pub fn add_virtual_client(
         &mut self,
         identity: PlayerIdentity,
         brain: Box<dyn inputs::VirtualBrain>,
     ) -> NetClientId {
-        todo!()
+        let Some(client) = self.slots.allocate(self.config.max_clients) else {
+            tracing::warn!(room = %self.config.room, "add_virtual_client: room full");
+            return NetClientId(u16::MAX);
+        };
+        let mut slot = slots::Slot::new(client, identity.clone(), self.tick, &self.config, Duration::ZERO);
+        slot.state = SlotState::Connected;
+        slot.brain = Some(brain);
+        self.slots.insert(slot);
+        self.stats.joins += 1;
+        self.pending
+            .push(PendingEvent::Joined(PlayerJoined { client, identity }));
+        client
+    }
+
+    /// Players whose slot is currently in the resume window.
+    pub fn disconnected_players(&self) -> Vec<PlayerId> {
+        self.slots
+            .iter()
+            .filter(|s| matches!(s.state, SlotState::Disconnected { .. }))
+            .map(|s| s.identity.player)
+            .collect()
+    }
+
+    /// Number of replicated entities known to the change cache (after the last send tick).
+    pub fn replicated_count(&self) -> usize {
+        self.cache.records.len()
+    }
+
+    /// Whether `client` currently has `entity` spawned (in scope and delivered).
+    pub fn in_scope(&self, client: NetClientId, entity: Entity) -> bool {
+        let Some(id) = self.ids.net_id(entity) else {
+            return false;
+        };
+        self.slots
+            .get(client)
+            .is_some_and(|s| s.view.entities.get(&id).is_some_and(|e| e.spawned))
+    }
+
+    /// Visible `NetId`s of a slot (spawned on the client), ascending.
+    pub fn scope_of(&self, client: NetClientId) -> Vec<NetId> {
+        let Some(s) = self.slots.get(client) else {
+            return Vec::new();
+        };
+        let mut v: Vec<NetId> = s
+            .view
+            .entities
+            .iter()
+            .filter(|(_, e)| e.spawned)
+            .map(|(id, _)| *id)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Current interpolation delay of a client's view in ticks (lag compensation).
+    pub fn view_delay_ticks(&self, client: NetClientId) -> Option<f32> {
+        self.slots.get(client).map(|s| s.view_delay_q8 as f32 / 256.0)
+    }
+
+    /// Room tick at which a disconnected slot expires.
+    pub(crate) fn resume_deadline(&self) -> Tick {
+        let hz = self.tick_hz();
+        let ticks = (self.config.resume_window.as_secs_f64() * hz).ceil() as u32;
+        self.tick.after(ticks.max(1))
+    }
+
+    /// Nominal tick rate (from `ServerNetConfig`-independent `TickRate`, cached at receive time).
+    pub(crate) fn tick_hz(&self) -> f64 {
+        self.slots.tick_hz
+    }
+
+    /// Close a slot's link (optionally sending `Disconnect` first). The slot stays.
+    pub(crate) fn drop_link(
+        &mut self,
+        client: NetClientId,
+        disconnect: Option<(DisconnectCode, &str)>,
+        resume_allowed: bool,
+    ) {
+        let Some(slot) = self.slots.get_mut(client) else { return };
+        let Some((link, tx)) = slot.link.take() else { return };
+        if let Some((code, reason)) = disconnect {
+            let pkt = crate::protocol::encode_handshake(
+                crate::protocol::PacketKind::Disconnect,
+                &crate::protocol::handshake::Disconnect::new(code, reason, resume_allowed),
+            );
+            let _ = tx.send(crate::transport::Lane::Reliable, pkt);
+            let close = match code {
+                DisconnectCode::ProtocolViolation | DisconnectCode::RateLimited | DisconnectCode::SlowConsumer => {
+                    crate::transport::CloseCode::POLICY
+                }
+                DisconnectCode::ServerShutdown => crate::transport::CloseCode::GOING_AWAY,
+                _ => crate::transport::CloseCode::NORMAL,
+            };
+            tx.close(close, reason);
+        } else {
+            tx.close(crate::transport::CloseCode::NORMAL, "closed");
+        }
+        slot.clear_link_state();
+        self.slots.by_link.remove(&link);
+    }
+
+    /// Free a slot for good and emit `PlayerLeft`.
+    pub(crate) fn free_slot(&mut self, client: NetClientId, reason: LeaveReason) {
+        self.drop_link(client, None, false);
+        if let Some(slot) = self.slots.remove(client) {
+            self.pending.push(PendingEvent::Left(PlayerLeft {
+                client,
+                player: slot.identity.player,
+                reason,
+            }));
+        }
+    }
+
+    /// Move pending events into `Events<T>`.
+    pub(crate) fn flush_events(&mut self, resources: &mut space3d_core::Resources) {
+        for ev in self.pending.drain(..) {
+            match ev {
+                PendingEvent::Joined(e) => resources.init::<Events<PlayerJoined>>().send(e),
+                PendingEvent::Disconnected(e) => resources.init::<Events<PlayerDisconnected>>().send(e),
+                PendingEvent::Resumed(e) => resources.init::<Events<PlayerResumed>>().send(e),
+                PendingEvent::Left(e) => resources.init::<Events<PlayerLeft>>().send(e),
+            }
+        }
     }
 }

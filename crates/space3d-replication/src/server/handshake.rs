@@ -7,7 +7,16 @@ use crate::wire::DecodeError;
 /// Decode and structurally validate the first packet of a link (must be a `Hello`, ≤
 /// `MAX_HANDSHAKE_BYTES`). Used by the gateway before authentication.
 pub fn parse_hello(bytes: &[u8]) -> Result<Hello, RejectCode> {
-    todo!()
+    if bytes.len() > crate::protocol::MAX_HANDSHAKE_BYTES {
+        return Err(RejectCode::Malformed);
+    }
+    match crate::protocol::peek(bytes) {
+        Some((PacketKind::Hello, 0)) => {}
+        _ => return Err(RejectCode::Malformed),
+    }
+    let hello: Hello = crate::wire::postcard_exact(&bytes[1..]).map_err(|_| RejectCode::Malformed)?;
+    hello.validate()?;
+    Ok(hello)
 }
 
 /// Route a resume: the token's room, without verifying it (the room verifies).
@@ -73,4 +82,42 @@ impl SecretSource {
 /// Limits used to validate inbound packets before a Welcome (handshake only).
 pub fn handshake_limits() -> WireLimits {
     WireLimits::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::encode_handshake;
+    use crate::protocol::handshake::{ClientCaps, HelloAuth};
+
+    #[test]
+    fn parse_hello_checks_structure() {
+        let h = Hello::new("g", "1", 7, HelloAuth::Dev { name: "a".into() }, ClientCaps::default());
+        let bytes = encode_handshake(PacketKind::Hello, &h);
+        assert_eq!(parse_hello(&bytes), Ok(h.clone()));
+        let mut bad = h.clone();
+        bad.protocol = 99;
+        assert_eq!(
+            parse_hello(&encode_handshake(PacketKind::Hello, &bad)),
+            Err(RejectCode::VersionMismatch)
+        );
+        assert_eq!(parse_hello(&[0x04, 0x00]), Err(RejectCode::Malformed));
+        assert_eq!(parse_hello(&vec![0x01; 5000]), Err(RejectCode::Malformed));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(parse_hello(&trailing), Err(RejectCode::Malformed));
+    }
+
+    #[test]
+    fn ct_eq_and_secrets() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        let mut a = SecretSource::seeded(1);
+        let mut b = SecretSource::seeded(1);
+        assert_eq!(a.generate(), b.generate());
+        assert_ne!(a.generate(), [0; 16]);
+        let r = reject_packet(RejectCode::RoomFull, &"x".repeat(300), Some(5));
+        assert!(r.len() < 200);
+    }
 }

@@ -13,7 +13,7 @@ use crate::NetId;
 use space3d_core::Entity;
 
 /// Server-side bidirectional map (resource owned by `NetServer`).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct NetIdMap {
     to_net: HashMap<Entity, NetId>,
     to_entity: HashMap<NetId, Entity>,

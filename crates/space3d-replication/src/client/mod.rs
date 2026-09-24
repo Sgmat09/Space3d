@@ -25,7 +25,7 @@ use crate::stats::NetStats;
 use crate::time::{InterpConfig, PacerConfig};
 use crate::transport::Connector;
 use crate::{NetClientId, NetId, NetMessage, PlayerId, RoomId, Tick};
-use space3d_core::{App, Entity, Plugin};
+use space3d_core::{App, Entity, Plugin, Stage};
 use space3d_net::ReconnectPolicy;
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,7 +136,26 @@ pub struct ClientReplicationPlugin {
 
 impl Plugin for ClientReplicationPlugin {
     fn build(&self, app: &mut App) {
-        todo!("resources (NetClient, NetClockHandle if missing), events, systems per the module table")
+        app.init_resource::<crate::ReplicationRegistry>();
+        app.init_resource::<crate::SimSchedule>();
+        app.init_resource::<crate::time::NetClockHandle>();
+        if !app.resources.contains::<NetClient>() {
+            app.insert_resource(NetClient::new(self.config.clone()));
+        }
+        app.add_event::<ConnectionEvent>();
+        app.add_event::<RemoteDespawned>();
+        app.add_event::<Mispredicted>();
+        app.add_system_named(Stage::Startup, "replication::client_startup", crate::freeze_registry);
+        app.add_system_named(Stage::PreUpdate, "replication::client_receive", receive::client_receive);
+        app.add_system_named(Stage::PreUpdate, "replication::client_pace", prediction::client_pace);
+        app.add_system_named(Stage::FixedUpdate, "replication::client_tick", prediction::client_tick);
+        app.add_system_named(
+            Stage::Update,
+            "replication::client_interpolate",
+            interpolation::client_interpolate,
+        );
+        app.add_system_named(Stage::PostUpdate, "replication::client_send", connection::client_send);
+        app.add_system_named(Stage::Last, "replication::client_despawn", receive::client_despawn);
     }
 }
 
@@ -274,33 +293,141 @@ pub struct Mispredicted {
 
 /// Client replication state and API (resource).
 pub struct NetClient {
-    config: ClientConfig,
-    state: ConnectionState,
-    conn: Option<connection::Connection>,
-    map: crate::mapping::EntityMap,
-    stats: NetStats,
+    pub(crate) config: ClientConfig,
+    pub(crate) state: ConnectionState,
+    pub(crate) conn: Option<connection::Connection>,
+    pub(crate) map: crate::mapping::EntityMap,
+    pub(crate) stats: NetStats,
+    /// Connection events waiting to be emitted.
+    pub(crate) events: Vec<ConnectionEvent>,
+    /// `TypeId` → (kind, config) of registered messages (filled at the first frame).
+    pub(crate) msg_table: crate::FastMap<std::any::TypeId, (u16, crate::MessageConfig)>,
+    /// Outgoing blocks for the next packet.
+    pub(crate) out_reliable: Vec<(crate::protocol::ChannelId, Vec<u8>)>,
+    pub(crate) out_unreliable: Vec<(crate::protocol::ChannelId, Vec<u8>)>,
+    /// Per-entity replication metadata.
+    pub(crate) metas: crate::FastMap<NetId, receive::EntityMeta>,
+    /// Entities to despawn in `Last`.
+    pub(crate) despawn_queue: Vec<Entity>,
+    /// After a resume: `NetId`s re-confirmed since (the rest is dropped at `SYNC_COMPLETE`).
+    pub(crate) reset_seen: Option<crate::FastMap<NetId, ()>>,
+    /// Values waiting for referenced entities.
+    pub(crate) pending_refs: receive::PendingRefs,
+    /// Server messages held for `EventTiming::Interpolated`: `(tick, kind, bytes)`.
+    pub(crate) timed_messages: Vec<(Tick, u16, Vec<u8>)>,
+    /// Newest snapshot tick applied.
+    pub(crate) last_snapshot_tick: Tick,
+    /// Datagram receive window for acks: newest seq + 32-bit history.
+    pub(crate) recv_ack: Option<crate::protocol::AckField>,
+    /// Prediction.
+    pub(crate) prediction: prediction::PredictionState,
+    /// Interpolation clock.
+    pub(crate) interp: crate::time::InterpClock,
+    /// Latest server-reported input slack (quarter ticks) waiting for the pacer.
+    pub(crate) pending_slack: Option<i8>,
+    /// `RemoteDespawned` events waiting to be emitted.
+    pub(crate) pending_despawn_events: Vec<RemoteDespawned>,
+    /// Report bookkeeping.
+    pub(crate) report_at: Duration,
+    pub(crate) report_rollbacks: u64,
+    pub(crate) report_resims: u64,
+}
+
+impl std::fmt::Debug for NetClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetClient")
+            .field("state", &self.state)
+            .field("entities", &self.map.len())
+            .field("predicted_tick", &self.prediction.next_tick)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NetClient {
     /// New idle client (inserted by the plugin).
     pub fn new(config: ClientConfig) -> Self {
+        let interp = crate::time::InterpClock::new(config.interp);
+        let prediction = prediction::PredictionState::new();
         Self {
             config,
             state: ConnectionState::Idle,
             conn: None,
             map: Default::default(),
             stats: NetStats::default(),
+            events: Vec::new(),
+            msg_table: Default::default(),
+            out_reliable: Vec::new(),
+            out_unreliable: Vec::new(),
+            metas: Default::default(),
+            despawn_queue: Vec::new(),
+            reset_seen: None,
+            pending_refs: Default::default(),
+            timed_messages: Vec::new(),
+            last_snapshot_tick: Tick::ZERO,
+            recv_ack: None,
+            prediction,
+            interp,
+            pending_slack: None,
+            pending_despawn_events: Vec::new(),
+            report_at: Duration::ZERO,
+            report_rollbacks: 0,
+            report_resims: 0,
         }
+    }
+
+    /// Settings.
+    pub fn config(&self) -> &ClientConfig {
+        &self.config
     }
 
     /// Start connecting (replaces any current connection).
     pub fn connect(&mut self, target: ConnectTarget) {
-        todo!()
+        if let Some(mut old) = self.conn.take()
+            && let Some(mut t) = old.transport.take()
+        {
+            t.close(crate::transport::CloseCode::NORMAL, "reconnecting");
+        }
+        let (connector, url, auth) = match target {
+            ConnectTarget::Dev { url, name } => (self.config.connector.clone(), url, HelloAuth::Dev { name }),
+            ConnectTarget::Ticket { url, ticket } => (self.config.connector.clone(), url, HelloAuth::Ticket(ticket)),
+            ConnectTarget::Custom { connector, url, auth } => (connector, url, auth),
+        };
+        self.conn = Some(connection::Connection::new(connector, url, auth, &self.config));
+        self.state = ConnectionState::Connecting { attempt: 0 };
+        self.events.push(ConnectionEvent::Connecting);
     }
 
-    /// Leave (`ControlMsg::Leave` + `Disconnect(Leave)`, no reconnect).
+    /// Leave (`ControlMsg::Leave` + `Disconnect(Leave)`, no reconnect). Replicated entities are
+    /// despawned (with `RemoteDespawned`) at the next frame.
     pub fn disconnect(&mut self) {
-        todo!()
+        if let Some(conn) = self.conn.as_mut()
+            && let Some(mut t) = conn.transport.take()
+        {
+            if conn.welcome.is_some() {
+                let mut dw = crate::protocol::DataWriter::new(None, None, Tick::ZERO);
+                if let Ok(b) = postcard::to_stdvec(&crate::protocol::control::ControlMsg::Leave) {
+                    dw.block_bytes(crate::protocol::ChannelId::Control, &b);
+                }
+                let _ = t.send(crate::transport::Lane::Reliable, dw.finish());
+            }
+            let _ = t.send(
+                crate::transport::Lane::Reliable,
+                crate::protocol::encode_handshake(
+                    crate::protocol::PacketKind::Disconnect,
+                    &crate::protocol::handshake::Disconnect::new(DisconnectCode::Leave, "leaving", false),
+                ),
+            );
+            t.close(crate::transport::CloseCode::NORMAL, "leaving");
+        }
+        if self.conn.take().is_some() {
+            self.events.push(ConnectionEvent::Disconnected {
+                code: Some(DisconnectCode::Leave),
+                reason: "left".into(),
+                will_reconnect: false,
+            });
+        }
+        self.state = ConnectionState::Idle;
+        self.clear_session_state(true);
     }
 
     /// Current state.
@@ -315,18 +442,54 @@ impl NetClient {
 
     /// Slot, once welcomed.
     pub fn client_id(&self) -> Option<NetClientId> {
-        todo!()
+        self.conn.as_ref()?.welcome.as_ref().map(|w| w.client)
     }
 
     /// Account, once welcomed.
     pub fn player_id(&self) -> Option<PlayerId> {
-        todo!()
+        self.conn.as_ref()?.welcome.as_ref().map(|w| w.player)
+    }
+
+    /// Room, once welcomed.
+    pub fn room_id(&self) -> Option<RoomId> {
+        self.conn.as_ref()?.welcome.as_ref().map(|w| w.room)
     }
 
     /// Queue a client command (`Events<FromClient<M>>` on the server). Fails when not
     /// connected, when `M` is not registered `ClientToServer`/`Both`, or over its size cap.
     pub fn send<M: NetMessage>(&mut self, msg: &M) -> Result<(), crate::transport::TransportError> {
-        todo!()
+        use crate::transport::TransportError;
+        if !matches!(self.state, ConnectionState::Syncing | ConnectionState::Connected) {
+            return Err(TransportError::Closed);
+        }
+        let Some((kind, config)) = self.msg_table.get(&std::any::TypeId::of::<M>()).copied() else {
+            return Err(TransportError::Unsupported("message type not registered"));
+        };
+        if !matches!(
+            config.direction,
+            crate::Direction::ClientToServer | crate::Direction::Both
+        ) {
+            return Err(TransportError::Unsupported("message is server-to-client only"));
+        }
+        let body = postcard::to_stdvec(msg).map_err(|_| TransportError::Unsupported("message encode failed"))?;
+        if body.len() > config.max_bytes as usize {
+            return Err(TransportError::TooLarge {
+                len: body.len(),
+                max: config.max_bytes as usize,
+            });
+        }
+        let mut w = crate::wire::Writer::with_capacity(body.len() + 3);
+        w.varu16(kind);
+        w.raw(&body);
+        match config.lane {
+            crate::transport::Lane::Reliable => self
+                .out_reliable
+                .push((crate::protocol::ChannelId::MsgReliable, w.into_vec())),
+            crate::transport::Lane::Unreliable => self
+                .out_unreliable
+                .push((crate::protocol::ChannelId::MsgUnreliable, w.into_vec())),
+        }
+        Ok(())
     }
 
     /// Local entity of a `NetId`.
@@ -341,21 +504,64 @@ impl NetClient {
 
     /// Estimated current server tick (fractional).
     pub fn server_tick_estimate(&self) -> Option<f64> {
-        todo!()
+        let conn = self.conn.as_ref()?;
+        conn.clock.estimate(conn.now)
     }
 
     /// Tick of the next predicted simulation step.
     pub fn predicted_tick(&self) -> Option<Tick> {
-        todo!()
+        self.prediction.next_tick
     }
 
     /// Render tick used for interpolation (fractional).
     pub fn render_tick(&self) -> Option<f64> {
-        todo!()
+        self.interp.render_tick()
     }
 
     /// Statistics.
     pub fn stats(&self) -> &NetStats {
         &self.stats
+    }
+
+    /// Newest snapshot tick applied.
+    pub fn last_snapshot_tick(&self) -> Tick {
+        self.last_snapshot_tick
+    }
+
+    /// All mapped `NetId`s, ascending.
+    pub fn net_ids(&self) -> Vec<NetId> {
+        self.map.net_ids()
+    }
+
+    /// Room tick rate from the last `Welcome`.
+    pub fn tick_hz(&self) -> Option<f64> {
+        self.conn.as_ref()?.welcome.as_ref().map(|w| f64::from(w.tick_hz))
+    }
+
+    /// Drop replicated entities and prediction state (leave / new epoch / fresh join).
+    pub(crate) fn clear_session_state(&mut self, entities: bool) {
+        if entities {
+            for id in self.map.net_ids() {
+                if let Some(e) = self.map.remove(id) {
+                    self.despawn_queue.push(e);
+                    self.pending_despawn_events.push(RemoteDespawned {
+                        net_id: id,
+                        entity: e,
+                        out_of_scope: false,
+                    });
+                }
+            }
+            self.metas.clear();
+            self.pending_refs.entries.clear();
+        }
+        self.reset_seen = None;
+        self.timed_messages.clear();
+        self.last_snapshot_tick = Tick::ZERO;
+        self.recv_ack = None;
+        self.prediction.clear();
+        self.interp.reset();
+        self.pending_slack = None;
+        self.out_reliable.clear();
+        self.out_unreliable.clear();
     }
 }

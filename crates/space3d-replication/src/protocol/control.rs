@@ -78,6 +78,8 @@ pub struct ClientReport {
     pub rollbacks: u32,
     /// Replayed ticks since the last report.
     pub resim_ticks: u32,
+    /// Smoothed round-trip time (ms) as measured by the client.
+    pub rtt_ms: f32,
 }
 
 /// Control channel payload (reliable, ordered).

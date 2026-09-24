@@ -8,8 +8,67 @@
 //! was at rest and unchanged values were not sent), a copy of the previous value is inserted at
 //! `tick − send_interval` so the entity does not slide across the gap.
 
+use super::{ConnectionState, NetClient};
 use crate::Tick;
+use crate::registry::{ClientMode, ReplicationRegistry};
+use space3d_core::{SystemCtx, Time};
 use std::collections::VecDeque;
+
+/// The `replication::client_interpolate` system (Update): render clock, interpolation buffers,
+/// `Delayed` values, render-timed messages and the predicted visual correction.
+pub(crate) fn client_interpolate(ctx: &mut SystemCtx) {
+    let now = ctx.resources.init::<crate::time::NetClockHandle>().now();
+    let frame_dt = ctx.resources.get::<Time>().map(|t| t.delta).unwrap_or_default();
+    let world = &mut *ctx.world;
+    let resources = &mut *ctx.resources;
+    if !resources.contains::<NetClient>() || !resources.contains::<ReplicationRegistry>() {
+        return;
+    }
+    resources.scope::<NetClient, _>(|res, net| {
+        res.scope::<ReplicationRegistry, _>(|res, registry| {
+            if !registry.is_frozen() {
+                return;
+            }
+            if matches!(net.state, ConnectionState::Syncing | ConnectionState::Connected)
+                && let Some(conn) = net.conn.as_ref()
+                && let Some(welcome) = conn.welcome.as_ref()
+                && let Some(est) = conn.clock.estimate(now)
+            {
+                let hz = f64::from(welcome.tick_hz.max(1));
+                let render = net
+                    .interp
+                    .update(frame_dt, est, conn.rtt.rttvar(), hz, welcome.send_interval);
+                let max_ext = net.interp.max_extrapolation_ticks(hz);
+                for entry in registry.components() {
+                    match entry.mode {
+                        ClientMode::Interpolate | ClientMode::PredictAndInterpolate => {
+                            entry.ops.interpolate_all(world, render, max_ext)
+                        }
+                        ClientMode::Delayed => entry.ops.release_delayed_all(world, render),
+                        _ => {}
+                    }
+                }
+                if !net.timed_messages.is_empty() {
+                    let mut keep = Vec::new();
+                    for (tick, kind, body) in std::mem::take(&mut net.timed_messages) {
+                        if f64::from(tick.0) <= render {
+                            if let Some(m) = registry.message(kind)
+                                && let Err(e) = m.ops.deliver_from_server(res, &body, tick)
+                            {
+                                tracing::warn!(%e, message = m.name, "bad message from server");
+                            }
+                        } else {
+                            keep.push((tick, kind, body));
+                        }
+                    }
+                    net.timed_messages = keep;
+                }
+                net.stats.interp_delay_ticks = net.interp.delay_ticks() as f32;
+            }
+            super::prediction::apply_visual_offsets(world, frame_dt, net.config.prediction.smoothing_half_life);
+        });
+    });
+}
 
 /// Time-ordered samples of one component (capacity 32).
 #[derive(Clone, Debug)]

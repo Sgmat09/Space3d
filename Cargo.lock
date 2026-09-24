@@ -4695,6 +4695,7 @@ dependencies = [
  "space3d-core",
  "space3d-db",
  "space3d-net",
+ "space3d-replication",
  "space3d-tasks",
  "thiserror 2.0.21",
  "tracing",

@@ -18,8 +18,15 @@ impl<I: NetInput, F: FnMut(&World, Tick) -> I + Send + Sync + 'static> Bot<I> fo
 }
 
 /// Install `bot` as the app's `InputSampler<I>` (replaces a player sampler).
-pub fn install_bot<I: NetInput>(app: &mut App, bot: impl Bot<I>) {
-    todo!()
+pub fn install_bot<I: NetInput>(app: &mut App, mut bot: impl Bot<I>) {
+    app.insert_resource(crate::InputSampler::<I>::new(move |ctx| {
+        let tick = ctx
+            .resources
+            .get::<crate::client::NetClient>()
+            .and_then(|n| n.predicted_tick())
+            .unwrap_or_default();
+        bot.think(ctx.world, tick)
+    }));
 }
 
 /// Deterministic scripted inputs: `script(tick) -> I`.
