@@ -3,7 +3,7 @@
 //! Every scratch `Vec` here lives in [`FrameState`] and is reused, so the steady state performs
 //! no heap allocation in our code (`RenderStats::cpu_reallocations` counts the exceptions).
 
-use crate::arena::{ArenaAlloc, Vertex};
+use crate::arena::{ArenaAlloc, VERTEX_SIZE, Vertex};
 use crate::assets::{GpuMesh, RenderAssets};
 use crate::components::{
     AmbientLight, Camera3d, DirectionalLight, Material, Mesh3d, PointLight, RenderTarget, Visibility,
@@ -349,7 +349,9 @@ pub(crate) struct FrameState {
     explicit: Vec<Option<GpuInstances>>,
     materials: MaterialTable,
     view_bg: Option<(wgpu::BindGroup, u32)>,
-    material_bgs: FastMap<Option<TextureHandle>, (wgpu::BindGroup, u32, u32)>,
+    /// Material bind group per texture: (bind group, materials buffer generation, texture
+    /// version, texture is an array — selects the pipeline variant).
+    material_bgs: FastMap<Option<TextureHandle>, (wgpu::BindGroup, u32, u32, bool)>,
     cull_bgs: FastMap<SourceBuffer, (wgpu::BindGroup, [u32; 5])>,
     compact_bg: Option<(wgpu::BindGroup, [u32; 5])>,
     arena_buffers: Option<(wgpu::Buffer, wgpu::Buffer)>,
@@ -376,6 +378,9 @@ pub(crate) struct FrameState {
     /// Largest storage binding, a multiple of 4 and at most `max_buffer_size`.
     max_storage_binding: u64,
     max_buffer_size: u64,
+    /// Largest `base_vertex` passed to a direct draw since the last `prepare`.
+    #[cfg(test)]
+    pub(crate) max_direct_base_vertex: i32,
 }
 
 fn strided(size: usize, align: usize) -> usize {
@@ -444,6 +449,8 @@ impl FrameState {
             uniform_align: device.limits().min_uniform_buffer_offset_alignment as usize,
             max_storage_binding: caps.max_storage_binding,
             max_buffer_size: caps.max_buffer_size,
+            #[cfg(test)]
+            max_direct_base_vertex: 0,
         }
     }
 
@@ -543,10 +550,23 @@ impl Renderer {
 
         // Acquire the surface only when something presents.
         let mut surface_tex = None;
-        if let Some(s) = &self.surface {
+        if let Some(s) = &mut self.surface {
             match SurfaceAcquire::from_current(s.surface.get_current_texture()) {
-                SurfaceAcquire::Present(t) => surface_tex = Some(t),
+                SurfaceAcquire::Present(t) => {
+                    s.presented = true;
+                    surface_tex = Some(t);
+                }
                 SurfaceAcquire::Reconfigure => s.surface.configure(&self.device, &s.config),
+                SurfaceAcquire::Recreate
+                    if crate::renderer::retry_without_view_formats(
+                        cfg!(target_arch = "wasm32"),
+                        s.presented,
+                        &s.config,
+                    ) =>
+                {
+                    tracing::warn!("the canvas rejected its sRGB view format; encoding sRGB in the shader instead");
+                    s.drop_srgb_view(&self.device);
+                }
                 SurfaceAcquire::Recreate => {
                     // `has_surface()` turns false: the platform layer attaches a new surface
                     // with `set_surface`. Until then frames render offscreen.
@@ -558,7 +578,7 @@ impl Renderer {
         }
         let surface_view = surface_tex.as_ref().map(|t| {
             t.texture.create_view(&wgpu::TextureViewDescriptor {
-                format: self.surface.as_ref().map(|s| s.config.format),
+                format: self.surface.as_ref().map(|s| s.view_format),
                 ..Default::default()
             })
         });
@@ -846,6 +866,10 @@ impl Renderer {
         // ---- views -------------------------------------------------------------------
         f.views.clear();
         f.draws.clear();
+        #[cfg(test)]
+        {
+            f.max_direct_base_vertex = 0;
+        }
         f.jobs.clear();
         f.dispatches.clear();
         f.compacts.clear();
@@ -1267,21 +1291,21 @@ impl Renderer {
         let mgen = f.materials_buf.gpu.generation;
         for d in 0..f.draws.len() {
             let tex = f.materials.texture(f.draws[d].material);
-            let (view, sampler, version) = match tex.and_then(|h| assets.textures.get(h.raw())) {
+            let (view, sampler, version, layered) = match tex.and_then(|h| assets.textures.get(h.raw())) {
                 Some(e) => match &e.gpu {
-                    Some(g) => (&g.view, &g.sampler, e.version),
-                    None => (&*white, &*white_sampler, u32::MAX),
+                    Some(g) => (&g.view, &g.sampler, e.version, g.layered),
+                    None => (&*white, &*white_sampler, u32::MAX, false),
                 },
-                None => (&*white, &*white_sampler, u32::MAX),
+                None => (&*white, &*white_sampler, u32::MAX, false),
             };
             let valid = f
                 .material_bgs
                 .get(&tex)
-                .is_some_and(|(_, g, v)| *g == mgen && *v == version);
+                .is_some_and(|(_, g, v, _)| *g == mgen && *v == version);
             if !valid {
                 let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("space3d material"),
-                    layout: &pipelines.material_bgl,
+                    layout: pipelines.material_bgl(layered),
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -1297,7 +1321,7 @@ impl Renderer {
                         },
                     ],
                 });
-                f.material_bgs.insert(tex, (bg, mgen, version));
+                f.material_bgs.insert(tex, (bg, mgen, version, layered));
             }
         }
         // Views sampling their own render target bind a copy of it (see `ViewData::feedback`).
@@ -1337,7 +1361,7 @@ impl Renderer {
                         view_formats: &[],
                     });
                     let view = texture.create_view(&wgpu::TextureViewDescriptor {
-                        dimension: Some(wgpu::TextureViewDimension::D2Array),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
                         ..Default::default()
                     });
                     let fresh = Feedback {
@@ -1361,7 +1385,8 @@ impl Renderer {
             if fb.bind_group.as_ref().is_none_or(|(_, gen_)| *gen_ != mgen) {
                 let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("space3d material (render target feedback)"),
-                    layout: &pipelines.material_bgl,
+                    // Render targets (and their copies) are single-layer.
+                    layout: pipelines.material_bgl(false),
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -1697,44 +1722,62 @@ impl Renderer {
             return;
         }
         pass.set_bind_group(0, view_bg, &[view.view_offset]);
-        pass.set_vertex_buffer(0, vb.slice(..));
         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
         let material_stride = f.material_stride() as u32;
+        let base_vertex_supported = self.caps.base_vertex;
         // The render target this pass draws into must not be sampled by it.
         let own_target = match &view.target {
             ViewTarget::Texture { handle, .. } if view.feedback => Some(*handle),
             _ => None,
         };
-        let mut last_pipeline: Option<(u16, u8)> = None;
+        let mut last_pipeline: Option<(u16, u8, bool)> = None;
         let mut last_material = u32::MAX;
+        let mut layered = false;
         let mut last_vb: Option<(VertexSource, u64)> = None;
+        // First arena vertex bound to slot 0 (see `direct_vertex_base`).
+        let mut slot0: Option<u32> = None;
+        #[cfg(test)]
+        let mut max_direct_base_vertex = self.frame.max_direct_base_vertex;
         for cmd in &f.draws[view.draws.clone()] {
-            if last_pipeline != Some((cmd.layout, cmd.class)) {
+            // (Indirect draws take their counts from the args buffer.)
+            let direct = matches!(cmd.kind, DrawKind::Direct { .. });
+            if direct && cmd.index_count == 0 {
+                continue;
+            }
+            if cmd.material != last_material {
+                let tex = f.materials.texture(cmd.material);
+                let bg = match tex {
+                    // Render targets and their feedback copies are single-layer.
+                    Some(t) if Some(t) == own_target => f
+                        .feedback
+                        .get(&t)
+                        .and_then(|fb| fb.bind_group.as_ref())
+                        .map(|(bg, _)| (bg, false)),
+                    _ => f.material_bgs.get(&tex).map(|(bg, _, _, l)| (bg, *l)),
+                };
+                let Some((bg, l)) = bg else {
+                    continue;
+                };
+                pass.set_bind_group(1, bg, &[cmd.material * material_stride]);
+                last_material = cmd.material;
+                layered = l;
+            }
+            if last_pipeline != Some((cmd.layout, cmd.class, layered)) {
                 let key = PipelineKey {
                     layout: cmd.layout,
                     class: cmd.class,
                     format,
                     samples,
                     manual_srgb,
+                    layered,
                 };
                 pass.set_pipeline(self.pipelines.forward(&self.device, key));
-                last_pipeline = Some((cmd.layout, cmd.class));
+                last_pipeline = Some((cmd.layout, cmd.class, layered));
             }
-            if cmd.material != last_material {
-                let tex = f.materials.texture(cmd.material);
-                let bg = match tex {
-                    Some(t) if Some(t) == own_target => f
-                        .feedback
-                        .get(&t)
-                        .and_then(|fb| fb.bind_group.as_ref())
-                        .map(|(bg, _)| bg),
-                    _ => f.material_bgs.get(&tex).map(|(bg, ..)| bg),
-                };
-                let Some(bg) = bg else {
-                    continue;
-                };
-                pass.set_bind_group(1, bg, &[cmd.material * material_stride]);
-                last_material = cmd.material;
+            let (first_vertex, base_vertex) = direct_vertex_base(cmd.base_vertex, direct, base_vertex_supported);
+            if slot0 != Some(first_vertex) {
+                pass.set_vertex_buffer(0, vb.slice(first_vertex as u64 * VERTEX_SIZE..));
+                slot0 = Some(first_vertex);
             }
             if last_vb != Some((cmd.vb, cmd.vb_offset)) {
                 let buffer = match cmd.vb {
@@ -1752,7 +1795,11 @@ impl Renderer {
             let indices = cmd.first_index..cmd.first_index + cmd.index_count;
             match cmd.kind {
                 DrawKind::Direct { instances } => {
-                    pass.draw_indexed(indices, cmd.base_vertex, 0..instances);
+                    #[cfg(test)]
+                    {
+                        max_direct_base_vertex = max_direct_base_vertex.max(base_vertex);
+                    }
+                    pass.draw_indexed(indices, base_vertex, 0..instances);
                 }
                 DrawKind::Indirect { args } => {
                     pass.draw_indexed_indirect(f.args.get(), args as u64 * ARGS_SIZE);
@@ -1777,6 +1824,10 @@ impl Renderer {
             }
             self.stats.draw_calls += 1;
         }
+        #[cfg(test)]
+        {
+            self.frame.max_direct_base_vertex = max_direct_base_vertex;
+        }
     }
 
     /// Re-record the last frame's primary views into the offscreen target (for capture). The
@@ -1792,6 +1843,21 @@ impl Renderer {
         let draw_calls = self.stats.draw_calls;
         self.encode_views(encoder, None, true);
         self.stats.draw_calls = draw_calls;
+    }
+}
+
+/// Where vertex slot 0 starts in the mesh arena (in vertices) and the `base_vertex` to draw
+/// with. Normally the whole arena is bound and draws select their mesh with `base_vertex`.
+/// Without `DownlevelFlags::BASE_VERTEX` (WebGL2, GLES < 3.2) a non-zero base is not possible
+/// in direct draws — wgpu does not reject it, and the GL backend then calls a missing entry
+/// point (a panic on the web) — so the arena is bound from the mesh's first vertex instead
+/// (`36 * n` bytes: always a valid 4-byte-aligned offset) and the draw uses base 0. Indirect
+/// draws carry their base in the args; GPU paths are only chosen with `BASE_VERTEX`.
+fn direct_vertex_base(base_vertex: i32, direct: bool, supported: bool) -> (u32, i32) {
+    if direct && !supported && base_vertex > 0 {
+        (base_vertex as u32, 0)
+    } else {
+        (0, base_vertex)
     }
 }
 
@@ -2064,6 +2130,253 @@ mod tests {
                     "run {r} slot {slot}"
                 );
             }
+        }
+    }
+
+    /// Instances with an snorm16 translation: not decodable by the GPU culler
+    /// (`CullSource::None`), so GPU paths draw them with direct draws too.
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct SnormInstance {
+        translation: [i16; 4],
+    }
+    impl InstanceData for SnormInstance {
+        const LAYOUT: &'static crate::InstanceLayout = &crate::InstanceLayout {
+            name: "SnormInstance",
+            stride: 8,
+            attributes: &[crate::InstanceAttribute::new(
+                crate::InstanceSemantic::Translation,
+                wgpu::VertexFormat::Snorm16x4,
+                0,
+            )],
+        };
+    }
+
+    fn snorm(v: f32) -> i16 {
+        (v * i16::MAX as f32).round() as i16
+    }
+
+    /// Several meshes (so most draws have `base_vertex > 0`) through every source kind: ECS
+    /// batches, a cullable explicit buffer and an uncullable one (direct even on GPU paths).
+    fn many_mesh_scene(app: &mut space3d_core::App) {
+        use crate::{Camera3d, InstanceBuffer, InstanceTransform, InstancedMesh, Mesh3d};
+        use space3d_core::{MeshData, Transform};
+        let (cube, sphere, plane, small) = {
+            let a = app.resources.expect_mut::<RenderAssets>();
+            (
+                a.add_mesh(MeshData::cube(0.8)),
+                a.add_mesh(MeshData::sphere(0.5, 16, 8)),
+                a.add_mesh(MeshData::plane(1.0)),
+                a.add_mesh(MeshData::cube(0.3)),
+            )
+        };
+        let colors = [
+            Vec4::new(1.0, 0.0, 0.0, 1.0),
+            Vec4::new(0.0, 1.0, 0.0, 1.0),
+            Vec4::new(1.0, 1.0, 0.0, 1.0),
+            Vec4::new(1.0, 0.0, 1.0, 1.0),
+        ];
+        for (i, (mesh, color)) in [cube, sphere, plane, small].into_iter().zip(colors).enumerate() {
+            app.world.spawn((
+                Transform::from_xyz(i as f32 * 1.2 - 1.8, 1.0, 0.0).with_rotation(glam::Quat::from_rotation_x(0.6)),
+                Mesh3d(mesh),
+                Material::unlit(color),
+            ));
+        }
+        let data = (0..4)
+            .map(|i| {
+                InstanceTransform::from_trs(
+                    Vec3::new(i as f32 - 1.5, -0.2, 0.0),
+                    glam::Quat::IDENTITY,
+                    Vec3::splat(0.6),
+                )
+            })
+            .collect();
+        let instances = app
+            .resources
+            .expect_mut::<InstanceBuffers>()
+            .insert(InstanceBuffer::from_vec(data, crate::BufferUsage::Static));
+        app.world.spawn((InstancedMesh {
+            mesh: sphere,
+            material: Material::unlit(Vec4::new(0.0, 1.0, 1.0, 1.0)),
+            instances,
+        },));
+        let data = (0..4)
+            .map(|i| SnormInstance {
+                translation: [snorm(i as f32 * 0.5 - 0.75), snorm(-0.9), 0, 0],
+            })
+            .collect();
+        let instances = app
+            .resources
+            .expect_mut::<InstanceBuffers>()
+            .insert(InstanceBuffer::from_vec(data, crate::BufferUsage::Static));
+        app.world.spawn((InstancedMesh {
+            mesh: small,
+            material: Material::unlit(Vec4::new(1.0, 1.0, 1.0, 1.0)),
+            instances,
+        },));
+        app.world.spawn((
+            Transform::from_xyz(0.0, 0.0, 5.0),
+            Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 1.0, 1.0)),
+        ));
+    }
+
+    /// Regression: direct draws passed each mesh's arena offset as `base_vertex`. WebGL2 and
+    /// GLES < 3.2 lack `DownlevelFlags::BASE_VERTEX`; wgpu does not reject it there and its GL
+    /// backend calls a missing entry point (a panic on the web; on ANGLE ES 3.0 every mesh but
+    /// the first vanished). Without the flag, direct draws now bind the arena from the mesh's
+    /// first vertex and pass 0, and the image is unchanged. Also run on the best GPU path,
+    /// whose uncullable sources are drawn directly between indirect draws. (On a device
+    /// without the flag — e.g. `WGPU_BACKEND=gl` on ANGLE — only the emulated path runs.)
+    #[test]
+    fn direct_draws_without_base_vertex_bind_the_arena_at_the_mesh() {
+        let Some(mut app) = headless_app(96, 64) else { return };
+        many_mesh_scene(&mut app);
+        let caps = app.resources.expect::<Renderer>().capabilities().clone();
+        let mut reference = None;
+        for path in [DrawPath::CpuDirect, caps.best_draw_path] {
+            set_path(&mut app, path);
+            let native = caps.base_vertex.then(|| {
+                let image = crate::render_to_image(&mut app).expect("capture");
+                let used = app.resources.expect::<Renderer>().frame.max_direct_base_vertex;
+                assert!(used > 0, "{path:?}: the scene draws meshes at base_vertex > 0");
+                image
+            });
+
+            app.resources.expect_mut::<Renderer>().caps.base_vertex = false;
+            let emulated = crate::render_to_image(&mut app).expect("capture");
+            let r = app.resources.expect_mut::<Renderer>();
+            r.caps.base_vertex = caps.base_vertex;
+            assert_eq!(r.frame.max_direct_base_vertex, 0, "{path:?}: direct draws use base 0");
+            assert_eq!(r.gpu_error_count(), 0);
+            if let Some(native) = &native {
+                let d = differing_px(native, &emulated);
+                assert_eq!(d, 0, "{path:?}: emulated base_vertex differs in {d} px");
+            }
+            let reference = reference.get_or_insert(emulated.clone());
+            let d = differing_px(reference, &emulated);
+            assert_eq!(d, 0, "{path:?} differs from CpuDirect in {d} px");
+        }
+        // Every mesh is visible: red cube, green sphere, yellow plane, magenta small cube,
+        // cyan explicit spheres, white snorm-placed cubes.
+        let img = reference.expect("rendered");
+        for color in [
+            [255, 0, 0],
+            [0, 255, 0],
+            [255, 255, 0],
+            [255, 0, 255],
+            [0, 255, 255],
+            [255, 255, 255],
+        ] {
+            let n = img.pixels.chunks(4).filter(|p| p[..3] == color).count();
+            assert!(n > 10, "color {color:?} covers {n} px");
+        }
+    }
+
+    #[test]
+    fn direct_vertex_base_rebinds_only_without_base_vertex() {
+        assert_eq!(direct_vertex_base(24, true, true), (0, 24));
+        assert_eq!(direct_vertex_base(24, true, false), (24, 0));
+        assert_eq!(direct_vertex_base(0, true, false), (0, 0));
+        // Indirect args carry their own base; slot 0 must start at vertex 0 for them.
+        assert_eq!(direct_vertex_base(24, false, false), (0, 24));
+    }
+
+    /// Meshes uploaded before an arena growth, meshes whose placement straddles the old
+    /// capacity (written through the staging belt after the GPU copy), and in-place /
+    /// resizing `update_mesh` all render exactly like a fresh single-upload app — with and
+    /// without `BASE_VERTEX`, on CpuDirect and the best GPU path.
+    #[test]
+    fn arena_growth_and_mesh_updates_render_like_fresh_uploads() {
+        use crate::{Camera3d, Mesh3d, RenderStats};
+        use space3d_core::{MeshData, Transform};
+        let Some(probe) = headless_app(8, 8) else { return };
+        let caps = probe.resources.expect::<Renderer>().capabilities().clone();
+        drop(probe);
+        let setup = |path: DrawPath, base_vertex: bool| {
+            let mut app = headless_app(128, 64).expect("adapter");
+            set_path(&mut app, path);
+            app.resources.expect_mut::<Renderer>().caps.base_vertex = base_vertex;
+            app.world.spawn((
+                Transform::from_xyz(0.0, 0.0, 6.0),
+                Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 1.0, 1.0)),
+            ));
+            app
+        };
+        let white = Material::unlit(Vec4::ONE);
+        let red = Material::unlit(Vec4::new(1.0, 0.0, 0.0, 1.0));
+        let fresh = |path, base_vertex, a: Option<MeshData>, b: Option<MeshData>| {
+            let mut app = setup(path, base_vertex);
+            for (mesh, x, m) in [(a, -2.0, &white), (b, 2.0, &red)] {
+                if let Some(mesh) = mesh {
+                    let h = app.resources.expect_mut::<RenderAssets>().add_mesh(mesh);
+                    app.world
+                        .spawn((Transform::from_xyz(x, 0.0, 0.0), Mesh3d(h), m.clone()));
+                }
+            }
+            crate::render_to_image(&mut app).expect("capture")
+        };
+        let native = caps.base_vertex;
+        let runs = [
+            (DrawPath::CpuDirect, false),
+            (DrawPath::CpuDirect, true),
+            (caps.best_draw_path, true),
+        ];
+        // Native base_vertex only where the device has it.
+        for (path, base_vertex) in runs.into_iter().filter(|(_, b)| native || !b) {
+            let ctx = format!("{path:?}, base_vertex {base_vertex}");
+            let mut app = setup(path, base_vertex);
+            let a = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(1.0));
+            app.world
+                .spawn((Transform::from_xyz(-2.0, 0.0, 0.0), Mesh3d(a), white.clone()));
+            let img = crate::render_to_image(&mut app).expect("capture");
+            assert_eq!(
+                differing_px(&img, &fresh(path, base_vertex, Some(MeshData::cube(1.0)), None)),
+                0,
+                "{ctx}"
+            );
+
+            // 8385 vertices: the arena grows and B is placed at base 24, straddling the old
+            // 4096-vertex capacity.
+            let big = || MeshData::sphere(1.0, 128, 64);
+            let b = app.resources.expect_mut::<RenderAssets>().add_mesh(big());
+            app.world
+                .spawn((Transform::from_xyz(2.0, 0.0, 0.0), Mesh3d(b), red.clone()));
+            let img = crate::render_to_image(&mut app).expect("capture");
+            assert!(
+                app.resources.expect::<RenderStats>().buffer_reallocations > 0,
+                "{ctx}: arena grew"
+            );
+            let reference = fresh(path, base_vertex, Some(MeshData::cube(1.0)), Some(big()));
+            assert_eq!(differing_px(&img, &reference), 0, "{ctx}: after growth");
+
+            // Many more meshes: another growth, placed entirely in the fresh region.
+            for i in 0..300 {
+                app.resources
+                    .expect_mut::<RenderAssets>()
+                    .add_mesh(MeshData::sphere(0.3, 8 + i % 20, 6 + i % 10));
+            }
+            let img = crate::render_to_image(&mut app).expect("capture");
+            assert_eq!(differing_px(&img, &reference), 0, "{ctx}: unrelated growth");
+
+            // Same vertex/index counts: updated in place.
+            assert!(
+                app.resources
+                    .expect_mut::<RenderAssets>()
+                    .update_mesh(a, MeshData::cube(1.6))
+            );
+            let img = crate::render_to_image(&mut app).expect("capture");
+            let reference = fresh(path, base_vertex, Some(MeshData::cube(1.6)), Some(big()));
+            assert_eq!(differing_px(&img, &reference), 0, "{ctx}: in-place update");
+
+            // Different size: freed and placed again; then large enough to grow the arena.
+            for mesh in [MeshData::sphere(0.5, 16, 8), MeshData::sphere(0.5, 256, 128)] {
+                assert!(app.resources.expect_mut::<RenderAssets>().update_mesh(a, mesh.clone()));
+                let img = crate::render_to_image(&mut app).expect("capture");
+                let reference = fresh(path, base_vertex, Some(mesh), Some(big()));
+                assert_eq!(differing_px(&img, &reference), 0, "{ctx}: resizing update");
+            }
+            assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
         }
     }
 

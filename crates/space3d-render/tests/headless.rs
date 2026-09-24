@@ -398,3 +398,84 @@ fn unsamplable_texture_formats_fall_back_to_white() {
         app.world.despawn(cam).unwrap();
     }
 }
+
+/// Scenes that stress what downlevel backends do differently (see `tests/gl.rs`, which runs
+/// them on GL): arena meshes at `base_vertex > 0`, single-layer textures and render targets
+/// sampled as `texture_2d`, mips of texture arrays generated through an array view (layer
+/// picked per draw), and `Unorm8x4Bgra` instance colors (emulated with a swizzle). Here they
+/// must render correctly on the default backend.
+#[test]
+fn portability_scenes_render_on_the_default_backend() {
+    for (name, scene) in scenes::ALL {
+        let Some(mut app) = headless_app(96, 64) else { return };
+        let colors = scene(&mut app);
+        let img = render_to_image(&mut app).expect("capture");
+        for c in colors {
+            let n = count_rgb(&img, *c);
+            assert!(n >= 16, "{name}: color {c:?} covers {n} px");
+        }
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+}
+
+/// `Unorm8x4Bgra` instance colors render exactly like the same colors in `Unorm8x4`.
+#[test]
+fn bgra_instance_colors_match_rgba() {
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Rgba {
+        position: [f32; 3],
+        rgba: [u8; 4],
+    }
+    impl InstanceData for Rgba {
+        const LAYOUT: &'static InstanceLayout = &InstanceLayout {
+            name: "Rgba",
+            stride: 16,
+            attributes: &[
+                InstanceAttribute::new(InstanceSemantic::Translation, wgpu::VertexFormat::Float32x3, 0),
+                InstanceAttribute::new(InstanceSemantic::Color, wgpu::VertexFormat::Unorm8x4, 12),
+            ],
+        };
+    }
+    let colors = [[200u8, 30, 90, 255], [10, 220, 140, 128], [255, 255, 0, 255]];
+    let mut images = Vec::new();
+    for bgra in [false, true] {
+        let Some(mut app) = headless_app(64, 32) else { return };
+        spawn_camera(&mut app, 4.0);
+        let cube = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.8));
+        let position = |i: usize| [i as f32 - 1.0, 0.0, 0.0];
+        let instances = if bgra {
+            let data = (0..3)
+                .map(|i| {
+                    let [r, g, b, a] = colors[i];
+                    scenes::BgraInstance {
+                        position: position(i),
+                        bgra: [b, g, r, a],
+                    }
+                })
+                .collect();
+            let buffer = InstanceBuffer::from_vec(data, BufferUsage::Static);
+            app.resources.expect_mut::<InstanceBuffers>().insert(buffer)
+        } else {
+            let data = (0..3)
+                .map(|i| Rgba {
+                    position: position(i),
+                    rgba: colors[i],
+                })
+                .collect();
+            let buffer = InstanceBuffer::from_vec(data, BufferUsage::Static);
+            app.resources.expect_mut::<InstanceBuffers>().insert(buffer)
+        };
+        app.world.spawn((InstancedMesh {
+            mesh: cube,
+            material: Material::unlit(Vec4::ONE),
+            instances,
+        },));
+        images.push(render_to_image(&mut app).expect("capture"));
+    }
+    assert_eq!(diff_fraction(&images[0], &images[1], 0), 0.0);
+    assert!(
+        count_rgb(&images[1], [255, 255, 0]) > 16,
+        "the yellow instance is visible"
+    );
+}

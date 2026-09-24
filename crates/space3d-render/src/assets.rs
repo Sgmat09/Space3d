@@ -123,8 +123,10 @@ pub(crate) struct MeshEntry {
 }
 
 pub(crate) struct GpuTexture {
-    /// D2Array view for sampling.
+    /// View for sampling: `D2` for single-layer textures, `D2Array` for arrays (`layered`).
     pub view: wgpu::TextureView,
+    /// More than one layer: sampled as `texture_2d_array` (see `pipeline::sampled_view_dimension`).
+    pub layered: bool,
     pub sampler: wgpu::Sampler,
     /// Single-layer D2 view (render targets).
     pub target_view: Option<wgpu::TextureView>,

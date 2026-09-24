@@ -74,6 +74,12 @@ pub struct RenderCapabilities {
     pub indirect_first_instance: bool,
     /// `multi_draw_indexed_indirect_count` available.
     pub multi_draw_indirect_count: bool,
+    /// Non-zero `base_vertex` in direct indexed draws (`DownlevelFlags::BASE_VERTEX`). Missing
+    /// on WebGL2 and GLES < 3.2, where wgpu does not validate it and the GL backend calls an
+    /// entry point that does not exist (a panic on the web). Without it, direct draws rebind
+    /// the arena's vertex buffer at each mesh's first vertex and draw with `base_vertex = 0`,
+    /// and GPU-driven paths are not offered.
+    pub base_vertex: bool,
     /// BC / ASTC / ETC2 compressed textures.
     pub texture_compression: (bool, bool, bool),
     /// Best draw path for this device.
@@ -96,14 +102,10 @@ impl RenderCapabilities {
             && limits.max_compute_workgroup_size_x >= 64
             && limits.max_compute_invocations_per_workgroup >= 64;
         let indirect = dl.flags.contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+        let base_vertex = dl.flags.contains(wgpu::DownlevelFlags::BASE_VERTEX);
         let ifi = features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
         let mdic = features.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
-        let best_draw_path = match (compute && indirect, ifi, mdic) {
-            (true, true, true) => DrawPath::GpuMultiDrawCount,
-            (true, true, false) => DrawPath::GpuMultiDraw,
-            (true, false, _) => DrawPath::GpuIndirect,
-            _ => DrawPath::CpuDirect,
-        };
+        let best_draw_path = best_draw_path(compute && indirect, base_vertex, ifi, mdic);
         let msaa4 = adapter
             .get_texture_format_features(OFFSCREEN_FORMAT)
             .flags
@@ -118,6 +120,7 @@ impl RenderCapabilities {
             indirect,
             indirect_first_instance: ifi,
             multi_draw_indirect_count: mdic,
+            base_vertex,
             texture_compression: (
                 features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
                 features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC),
@@ -129,6 +132,18 @@ impl RenderCapabilities {
             max_storage_binding: limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) & !3,
             max_buffer_size: limits.max_buffer_size,
         }
+    }
+}
+
+/// Best draw path for a device. GPU-driven paths need compute + indirect draws, and are only
+/// offered with `BASE_VERTEX`: devices without it (WebGL2, GLES 3.0/3.1) are the downlevel
+/// targets `CpuDirect` exists for, and it is the path whose direct draws emulate `base_vertex`.
+fn best_draw_path(compute_indirect: bool, base_vertex: bool, first_instance: bool, multi_count: bool) -> DrawPath {
+    match (compute_indirect && base_vertex, first_instance, multi_count) {
+        (true, true, true) => DrawPath::GpuMultiDrawCount,
+        (true, true, false) => DrawPath::GpuMultiDraw,
+        (true, false, _) => DrawPath::GpuIndirect,
+        _ => DrawPath::CpuDirect,
     }
 }
 
@@ -212,8 +227,55 @@ impl Attachments {
 pub(crate) struct SurfaceState {
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
+    /// Format of the views frames render into: `config.format`, or its sRGB twin (listed in
+    /// `config.view_formats`) when the surface itself has no sRGB format.
+    pub view_format: wgpu::TextureFormat,
+    /// The shader encodes sRGB itself (no sRGB format or view available).
     pub manual_srgb: bool,
     pub attachments: Attachments,
+    /// A frame was acquired with the current configuration.
+    pub presented: bool,
+}
+
+impl SurfaceState {
+    /// Render without the sRGB view format: reconfigure the surface without it and encode sRGB
+    /// in the shader instead.
+    pub(crate) fn drop_srgb_view(&mut self, device: &wgpu::Device) {
+        self.config.view_formats.clear();
+        self.view_format = self.config.format;
+        self.manual_srgb = !self.view_format.is_srgb();
+        let a = &self.attachments;
+        self.attachments = Attachments::new(device, a.width, a.height, a.samples, self.view_format, false);
+        self.surface.configure(device, &self.config);
+    }
+}
+
+/// Whether a surface that reported `Lost` should be reconfigured without its sRGB view format
+/// instead of being given up. On the web, wgpu reports a canvas configuration the browser
+/// rejected as `Lost` (native wgpu validates view formats when configuring instead), so a
+/// canvas that never produced a frame with a view format may have been refused because of it.
+/// Recreating the surface would configure it the same way again, forever.
+pub(crate) fn retry_without_view_formats(web: bool, presented: bool, config: &wgpu::SurfaceConfiguration) -> bool {
+    web && !presented && !config.view_formats.is_empty()
+}
+
+/// Surface texture format and the format frames are rendered in, from a surface's supported
+/// formats (`None` if there are none). An sRGB format is preferred. Browser WebGPU canvases
+/// offer only `Bgra8Unorm`/`Rgba8Unorm`(/`Rgba16Float`), but allow an sRGB *view* of the
+/// canvas texture: rendering through it keeps blending and MSAA resolves in linear space,
+/// like native sRGB surfaces. Only formats without an sRGB twin (or devices without
+/// `SURFACE_VIEW_FORMATS`) fall back to encoding sRGB in the shader, where blending then
+/// operates on encoded values.
+pub(crate) fn surface_formats(
+    formats: &[wgpu::TextureFormat],
+    view_formats_supported: bool,
+) -> Option<(wgpu::TextureFormat, wgpu::TextureFormat)> {
+    let first = *formats.first()?;
+    if let Some(srgb) = formats.iter().copied().find(|f| f.is_srgb()) {
+        return Some((srgb, srgb));
+    }
+    let view = first.add_srgb_suffix();
+    Some((first, if view_formats_supported { view } else { first }))
 }
 
 /// The GPU renderer. Insert it as a resource (the platform runner does this for windows; use
@@ -417,10 +479,14 @@ impl Renderer {
 
     fn configure_surface(&mut self, surface: wgpu::Surface<'static>) -> Result<(), RenderError> {
         let caps = surface.get_capabilities(&self.adapter);
-        let Some(&first) = caps.formats.first() else {
+        let view_formats_supported = self
+            .adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS);
+        let Some((format, view_format)) = surface_formats(&caps.formats, view_formats_supported) else {
             return Err(RenderError::Surface("surface not supported by adapter".into()));
         };
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(first);
         let present_mode = if self.config.vsync {
             wgpu::PresentMode::AutoVsync
         } else {
@@ -439,13 +505,17 @@ impl Renderer {
                 .first()
                 .copied()
                 .unwrap_or(wgpu::CompositeAlphaMode::Auto),
-            view_formats: vec![],
+            view_formats: if view_format != format {
+                vec![view_format]
+            } else {
+                vec![]
+            },
         };
         surface.configure(&self.device, &config);
         let samples = if self.config.msaa_samples > 1
             && self
                 .adapter
-                .get_texture_format_features(format)
+                .get_texture_format_features(view_format)
                 .flags
                 .sample_count_supported(self.config.msaa_samples)
         {
@@ -453,12 +523,15 @@ impl Renderer {
         } else {
             1
         };
-        let attachments = Attachments::new(&self.device, config.width, config.height, samples, format, false);
+        // The MSAA and depth attachments are separate textures: they use the view format.
+        let attachments = Attachments::new(&self.device, config.width, config.height, samples, view_format, false);
         self.surface = Some(SurfaceState {
             surface,
-            manual_srgb: !format.is_srgb(),
+            view_format,
+            manual_srgb: !view_format.is_srgb(),
             config,
             attachments,
+            presented: false,
         });
         Ok(())
     }
@@ -496,14 +569,7 @@ impl Renderer {
             s.config.width = width;
             s.config.height = height;
             s.surface.configure(&self.device, &s.config);
-            s.attachments = Attachments::new(
-                &self.device,
-                width,
-                height,
-                s.attachments.samples,
-                s.config.format,
-                false,
-            );
+            s.attachments = Attachments::new(&self.device, width, height, s.attachments.samples, s.view_format, false);
         }
     }
 
@@ -532,7 +598,7 @@ impl Renderer {
         if let Some(s) = &mut self.surface {
             let ok = self
                 .adapter
-                .get_texture_format_features(s.config.format)
+                .get_texture_format_features(s.view_format)
                 .flags
                 .sample_count_supported(samples);
             let samples = if ok { samples } else { 1 };
@@ -541,7 +607,7 @@ impl Renderer {
                 s.config.width,
                 s.config.height,
                 samples,
-                s.config.format,
+                s.view_format,
                 false,
             );
         }
@@ -577,9 +643,12 @@ impl Renderer {
         &self.stats
     }
 
-    /// Surface format when windowed.
+    /// Format frames are rendered in when windowed (for overlays drawing into the same view):
+    /// the surface format, or its sRGB view format where the surface itself has no sRGB format
+    /// (browser WebGPU canvases). It changes if a browser rejects the sRGB view format, so
+    /// overlays should check it every frame.
     pub fn surface_format(&self) -> Option<wgpu::TextureFormat> {
-        self.surface.as_ref().map(|s| s.config.format)
+        self.surface.as_ref().map(|s| s.view_format)
     }
 
     /// Whether textures of `format` can be uploaded and sampled by materials: compressed
@@ -924,6 +993,70 @@ mod tests {
         assert!(assets.is_mesh_uploaded(big));
         assert!(small.iter().all(|m| assets.is_mesh_uploaded(*m)));
         assert_eq!(r.gpu_error_count(), 0);
+    }
+
+    /// Regression: browser WebGPU canvases offer no sRGB format, so the renderer encoded sRGB in
+    /// the shader and blending/MSAA resolves ran on encoded values (50% white over black gave
+    /// 128 instead of 188). It now renders through an sRGB view of the canvas texture.
+    #[test]
+    fn surfaces_without_srgb_formats_render_through_an_srgb_view() {
+        use wgpu::TextureFormat as F;
+        let webgpu_canvas = [F::Bgra8Unorm, F::Rgba8Unorm, F::Rgba16Float];
+        assert_eq!(
+            surface_formats(&webgpu_canvas, true),
+            Some((F::Bgra8Unorm, F::Bgra8UnormSrgb))
+        );
+        // Without SURFACE_VIEW_FORMATS: in-shader encoding.
+        assert_eq!(
+            surface_formats(&webgpu_canvas, false),
+            Some((F::Bgra8Unorm, F::Bgra8Unorm))
+        );
+        // Native surfaces with an sRGB format use it directly.
+        assert_eq!(
+            surface_formats(&[F::Bgra8Unorm, F::Bgra8UnormSrgb], true),
+            Some((F::Bgra8UnormSrgb, F::Bgra8UnormSrgb))
+        );
+        // Formats without an sRGB twin keep in-shader encoding.
+        assert_eq!(
+            surface_formats(&[F::Rgba16Float], true),
+            Some((F::Rgba16Float, F::Rgba16Float))
+        );
+        assert_eq!(surface_formats(&[], true), None);
+    }
+
+    /// A canvas that rejects the sRGB view format (reported as `Lost` on the web) is
+    /// reconfigured without it once, instead of being recreated with the same configuration
+    /// in a loop. Native surfaces and surfaces that already presented are recreated.
+    #[test]
+    fn rejected_srgb_view_formats_fall_back_to_shader_encoding() {
+        use wgpu::TextureFormat as F;
+        let mut config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: F::Bgra8Unorm,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: 8,
+            height: 8,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![F::Bgra8UnormSrgb],
+        };
+        assert!(retry_without_view_formats(true, false, &config));
+        assert!(!retry_without_view_formats(true, true, &config));
+        assert!(!retry_without_view_formats(false, false, &config));
+        config.view_formats.clear();
+        assert!(!retry_without_view_formats(true, false, &config));
+    }
+
+    /// Without `DownlevelFlags::BASE_VERTEX` (WebGL2, GLES < 3.2) only `CpuDirect` is offered:
+    /// it is the path whose direct draws emulate `base_vertex`.
+    #[test]
+    fn gpu_paths_require_base_vertex() {
+        assert_eq!(best_draw_path(true, true, true, true), DrawPath::GpuMultiDrawCount);
+        assert_eq!(best_draw_path(true, true, true, false), DrawPath::GpuMultiDraw);
+        assert_eq!(best_draw_path(true, true, false, false), DrawPath::GpuIndirect);
+        assert_eq!(best_draw_path(true, false, true, true), DrawPath::CpuDirect);
+        assert_eq!(best_draw_path(false, true, true, true), DrawPath::CpuDirect);
     }
 
     fn invalid_buffer(device: &wgpu::Device) {

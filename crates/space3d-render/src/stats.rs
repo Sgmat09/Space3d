@@ -5,7 +5,9 @@
 /// [`crate::RenderSettings::draw_path`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DrawPath {
-    /// CPU frustum culling + `draw_indexed` per batch. Works everywhere (WebGL2, downlevel).
+    /// CPU frustum culling + `draw_indexed` per batch. Works everywhere (WebGL2, downlevel);
+    /// the only path on devices without `DownlevelFlags::BASE_VERTEX`, where its draws bind the
+    /// mesh arena at each mesh instead of passing a `base_vertex`.
     #[default]
     CpuDirect,
     /// Compute-shader culling writing `DrawIndexedIndirectArgs`; one `draw_indexed_indirect`

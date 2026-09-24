@@ -3,7 +3,10 @@
 //
 // The INSTANCE marker below is replaced by the renderer with an `InstanceInput` struct and
 // accessor functions generated from the instance layout (see `pipeline.rs`); the CONSTS
-// marker with per-pipeline constants.
+// marker with per-pipeline constants; the TEXTURE marker with the material texture binding
+// (`texture_2d` for single-layer textures, `texture_2d_array` for arrays) and `sample_base`.
+// Single-layer textures are never bound as arrays: wgpu's GL backend binds them with the
+// TEXTURE_2D target, which a `sampler2DArray` reads as black on WebGL2/GLES.
 
 //#CONSTS
 
@@ -37,8 +40,8 @@ struct MaterialParams {
 
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
-@group(1) @binding(1) var base_tex: texture_2d_array<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
+//#TEXTURE
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -148,7 +151,7 @@ fn brdf(base: vec3<f32>, metallic: f32, roughness: f32, n: vec3<f32>, v: vec3<f3
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     // Sample unconditionally (uniform control flow); `params.z` blends it in.
-    let tex = textureSample(base_tex, base_sampler, in.uv, in.layer);
+    let tex = sample_base(in.uv, in.layer);
     let texel = mix(vec4<f32>(1.0), tex, material.params.z);
     let base = material.base_color * in.color * texel;
 

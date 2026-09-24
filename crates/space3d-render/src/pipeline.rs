@@ -103,12 +103,33 @@ pub(crate) struct PipelineKey {
     pub format: wgpu::TextureFormat,
     pub samples: u32,
     pub manual_srgb: bool,
+    /// The material texture is a multi-layer array (`texture_2d_array`); otherwise it is bound
+    /// as `texture_2d` (see [`Pipelines::material_bgl`]).
+    pub layered: bool,
 }
 
 const FORWARD_TEMPLATE: &str = include_str!("shaders/forward.wgsl");
 const CULL_SHADER: &str = include_str!("shaders/cull.wgsl");
 const COMPACT_SHADER: &str = include_str!("shaders/compact.wgsl");
-const BLIT_SHADER: &str = include_str!("shaders/blit.wgsl");
+const BLIT_TEMPLATE: &str = include_str!("shaders/blit.wgsl");
+
+/// Mip-generation blit shader sampling a `texture_2d` or a `texture_2d_array` source.
+pub(crate) fn blit_shader(layered: bool) -> String {
+    let source = if layered {
+        "@group(0) @binding(0) var src_tex: texture_2d_array<f32>;\n\
+         @group(0) @binding(1) var src_sampler: sampler;\n\n\
+         @fragment\n\
+         fn fs_main(in: VsOut) -> @location(0) vec4<f32> {\n    \
+         return textureSample(src_tex, src_sampler, in.uv, in.layer);\n}\n"
+    } else {
+        "@group(0) @binding(0) var src_tex: texture_2d<f32>;\n\
+         @group(0) @binding(1) var src_sampler: sampler;\n\n\
+         @fragment\n\
+         fn fs_main(in: VsOut) -> @location(0) vec4<f32> {\n    \
+         return textureSample(src_tex, src_sampler, in.uv);\n}\n"
+    };
+    BLIT_TEMPLATE.replace("//#SOURCE", source)
+}
 
 fn to_vec4(expr: &str, ty: &str, fill: &str) -> String {
     match ty {
@@ -153,7 +174,8 @@ pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
         }
         s += &format!("    @location({loc}) a{i}: {ty},\n");
         loc += 1;
-        let field = (format!("inst.a{i}"), ty);
+        let (_, swizzle) = attribute_format(a.format);
+        let field = (format!("inst.a{i}{swizzle}"), ty);
         match a.semantic {
             InstanceSemantic::Translation => t = Some(field),
             InstanceSemantic::Rotation => r = Some(field),
@@ -219,11 +241,39 @@ pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
     s
 }
 
-/// Full forward shader source for a layout.
-pub(crate) fn forward_shader(layout: &InstanceLayout, manual_srgb: bool) -> String {
+/// Material texture binding and its sampling function (`sample_base`).
+fn texture_wgsl(layered: bool) -> &'static str {
+    if layered {
+        "@group(1) @binding(1) var base_tex: texture_2d_array<f32>;\n\n\
+         fn sample_base(uv: vec2<f32>, layer: i32) -> vec4<f32> {\n    \
+         return textureSample(base_tex, base_sampler, uv, layer);\n}\n"
+    } else {
+        // Single-layer textures: the instance layer is irrelevant (an array lookup would clamp
+        // it to layer 0 as well).
+        "@group(1) @binding(1) var base_tex: texture_2d<f32>;\n\n\
+         fn sample_base(uv: vec2<f32>, layer: i32) -> vec4<f32> {\n    \
+         return textureSample(base_tex, base_sampler, uv);\n}\n"
+    }
+}
+
+/// Full forward shader source for a layout and material texture kind.
+pub(crate) fn forward_shader(layout: &InstanceLayout, manual_srgb: bool, layered: bool) -> String {
     FORWARD_TEMPLATE
         .replace("//#CONSTS", &format!("const MANUAL_SRGB: bool = {manual_srgb};"))
+        .replace("//#TEXTURE", texture_wgsl(layered))
         .replace("//#INSTANCE", &instance_wgsl(layout))
+}
+
+/// Vertex format handed to wgpu for an instance attribute format, and the swizzle the shader
+/// applies to it. `Unorm8x4Bgra` is fetched as `Unorm8x4` and swizzled back to RGBA: wgpu's GL
+/// backend passes `GL_BGRA` as the component count, which WebGL2/GLES reject (the attribute
+/// then reads garbage, or the draw crashes the driver), and browsers' WebGPU may not offer it.
+/// The swizzle is free, so every backend takes the same path.
+pub(crate) fn attribute_format(format: wgpu::VertexFormat) -> (wgpu::VertexFormat, &'static str) {
+    match format {
+        wgpu::VertexFormat::Unorm8x4Bgra => (wgpu::VertexFormat::Unorm8x4, ".zyxw"),
+        f => (f, ""),
+    }
 }
 
 /// Instance vertex attributes (shader locations from 4).
@@ -245,7 +295,7 @@ pub(crate) fn instance_attributes(layout: &InstanceLayout) -> Vec<wgpu::VertexAt
             }
             _ => {
                 out.push(wgpu::VertexAttribute {
-                    format: a.format,
+                    format: attribute_format(a.format).0,
                     offset: a.offset as u64,
                     shader_location: loc,
                 });
@@ -300,21 +350,52 @@ pub(crate) struct CullPipelines {
     pub compact: wgpu::ComputePipeline,
 }
 
+/// Mip-generation blit for one source view dimension (`[single-layer, array]`).
+struct Blit {
+    bgl: wgpu::BindGroupLayout,
+    module: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+}
+
 /// Bind group layouts, shaders and cached pipelines.
 pub(crate) struct Pipelines {
     pub view_bgl: wgpu::BindGroupLayout,
-    pub material_bgl: wgpu::BindGroupLayout,
-    layout: wgpu::PipelineLayout,
-    shaders: FastMap<(u16, bool), wgpu::ShaderModule>,
+    /// Material layouts: `[single-layer (texture_2d), array (texture_2d_array)]`.
+    material_bgls: [wgpu::BindGroupLayout; 2],
+    layouts_by_texture: [wgpu::PipelineLayout; 2],
+    shaders: FastMap<(u16, bool, bool), wgpu::ShaderModule>,
     forward: FastMap<PipelineKey, wgpu::RenderPipeline>,
     /// Registered instance layouts; index = layout id.
     pub layouts: Vec<&'static InstanceLayout>,
     pub cull: Option<CullPipelines>,
-    blit_bgl: wgpu::BindGroupLayout,
-    blit_module: wgpu::ShaderModule,
-    blit_layout: wgpu::PipelineLayout,
-    blit: FastMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    blits: [Blit; 2],
+    blit: FastMap<(wgpu::TextureFormat, bool), wgpu::RenderPipeline>,
     pub blit_sampler: wgpu::Sampler,
+}
+
+/// Bind group layout entry of a filterable float texture of the given view dimension.
+fn texture_entry(binding: u32, view_dimension: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// View dimension of a sampled 2D texture: single-layer textures are `D2`, arrays `D2Array`.
+/// GL binds a texture with a target chosen from its layer count alone, so the view (and the
+/// shader's texture type) must match that count.
+pub(crate) fn sampled_view_dimension(layered: bool) -> wgpu::TextureViewDimension {
+    if layered {
+        wgpu::TextureViewDimension::D2Array
+    } else {
+        wgpu::TextureViewDimension::D2
+    }
 }
 
 impl Pipelines {
@@ -328,37 +409,36 @@ impl Pipelines {
                 std::mem::size_of::<GpuView>() as u64,
             )],
         });
-        let material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("space3d material"),
-            entries: &[
-                uniform_entry(
-                    0,
-                    wgpu::ShaderStages::FRAGMENT,
-                    true,
-                    std::mem::size_of::<GpuMaterial>() as u64,
-                ),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
+        let material_bgls = [false, true].map(|layered| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(if layered {
+                    "space3d material (texture array)"
+                } else {
+                    "space3d material"
+                }),
+                entries: &[
+                    uniform_entry(
+                        0,
+                        wgpu::ShaderStages::FRAGMENT,
+                        true,
+                        std::mem::size_of::<GpuMaterial>() as u64,
+                    ),
+                    texture_entry(1, sampled_view_dimension(layered)),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+                ],
+            })
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("space3d forward"),
-            bind_group_layouts: &[Some(&view_bgl), Some(&material_bgl)],
-            immediate_size: 0,
+        let layouts_by_texture = [0, 1].map(|i| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("space3d forward"),
+                bind_group_layouts: &[Some(&view_bgl), Some(&material_bgls[i])],
+                immediate_size: 0,
+            })
         });
 
         let cull = compute.then(|| {
@@ -439,35 +519,29 @@ impl Pipelines {
             }
         });
 
-        let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("space3d blit"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let blits = [false, true].map(|layered| {
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("space3d blit"),
+                entries: &[
+                    texture_entry(0, sampled_view_dimension(layered)),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("space3d blit"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(BLIT_SHADER)),
-        });
-        let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("space3d blit"),
-            bind_group_layouts: &[Some(&blit_bgl)],
-            immediate_size: 0,
+                ],
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("space3d blit"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(blit_shader(layered))),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("space3d blit"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            Blit { bgl, module, layout }
         });
         let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("space3d blit"),
@@ -477,18 +551,21 @@ impl Pipelines {
         });
         Self {
             view_bgl,
-            material_bgl,
-            layout,
+            material_bgls,
+            layouts_by_texture,
             shaders: FastMap::default(),
             forward: FastMap::default(),
             layouts: vec![<crate::instance::InstanceTransform as crate::instance::InstanceData>::LAYOUT],
             cull,
-            blit_bgl,
-            blit_module,
-            blit_layout,
+            blits,
             blit: FastMap::default(),
             blit_sampler,
         }
+    }
+
+    /// Material bind group layout for a single-layer (`texture_2d`) or array texture.
+    pub fn material_bgl(&self, layered: bool) -> &wgpu::BindGroupLayout {
+        &self.material_bgls[layered as usize]
     }
 
     /// Stable id for an instance layout (registers it on first use).
@@ -508,17 +585,24 @@ impl Pipelines {
     pub fn forward(&mut self, device: &wgpu::Device, key: PipelineKey) -> &wgpu::RenderPipeline {
         if !self.forward.contains_key(&key) {
             let layout = self.layouts[key.layout as usize];
-            let module = self.shaders.entry((key.layout, key.manual_srgb)).or_insert_with(|| {
-                device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some(layout.name),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(forward_shader(layout, key.manual_srgb))),
-                })
-            });
+            let module = self
+                .shaders
+                .entry((key.layout, key.manual_srgb, key.layered))
+                .or_insert_with(|| {
+                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some(layout.name),
+                        source: wgpu::ShaderSource::Wgsl(Cow::Owned(forward_shader(
+                            layout,
+                            key.manual_srgb,
+                            key.layered,
+                        ))),
+                    })
+                });
             let inst_attrs = instance_attributes(layout);
             let blend = key.class & CLASS_BLEND != 0;
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(layout.name),
-                layout: Some(&self.layout),
+                layout: Some(&self.layouts_by_texture[key.layered as usize]),
                 vertex: wgpu::VertexState {
                     module,
                     entry_point: Some("vs_main"),
@@ -575,14 +659,17 @@ impl Pipelines {
         &self.forward[&key]
     }
 
-    /// Mip-generation pipeline for a color format.
+    /// Mip-generation pipeline for a color format, sampling a single-layer (`D2`) or an array
+    /// (`D2Array`, layer chosen by the draw's vertex range) source view.
     pub fn blit(
         &mut self,
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
+        layered: bool,
     ) -> (&wgpu::RenderPipeline, &wgpu::BindGroupLayout) {
-        let (module, layout) = (&self.blit_module, &self.blit_layout);
-        let p = self.blit.entry(format).or_insert_with(|| {
+        let blit = &self.blits[layered as usize];
+        let (module, layout) = (&blit.module, &blit.layout);
+        let p = self.blit.entry((format, layered)).or_insert_with(|| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("space3d mipgen"),
                 layout: Some(layout),
@@ -605,7 +692,7 @@ impl Pipelines {
                 cache: None,
             })
         });
-        (p, &self.blit_bgl)
+        (p, &blit.bgl)
     }
 }
 
@@ -632,12 +719,14 @@ mod tests {
             InstanceCompact::LAYOUT,
             InstancePacked::LAYOUT,
         ] {
-            validate(&forward_shader(l, false));
-            validate(&forward_shader(l, true));
+            for (manual_srgb, layered) in [(false, false), (true, false), (false, true), (true, true)] {
+                validate(&forward_shader(l, manual_srgb, layered));
+            }
         }
         validate(CULL_SHADER);
         validate(COMPACT_SHADER);
-        validate(BLIT_SHADER);
+        validate(&blit_shader(false));
+        validate(&blit_shader(true));
     }
 
     #[test]
@@ -650,6 +739,28 @@ mod tests {
         assert_eq!(std::mem::size_of::<GpuCullParams>(), 128);
         assert_eq!(std::mem::size_of::<GpuCompactParams>(), 16);
         assert_eq!(std::mem::size_of::<GpuCullJob>(), 64);
+    }
+
+    /// Regression: `Unorm8x4Bgra` reached wgpu's GL backend, which cannot express it (WebGL2 /
+    /// GLES: INVALID_VALUE and garbage colors; ANGLE: a crash). It is now fetched as `Unorm8x4`
+    /// and swizzled in the generated shader.
+    #[test]
+    fn bgra_instance_colors_are_emulated() {
+        const LAYOUT: &InstanceLayout = &InstanceLayout {
+            name: "Bgra",
+            stride: 16,
+            attributes: &[
+                InstanceAttribute::new(InstanceSemantic::Translation, wgpu::VertexFormat::Float32x3, 0),
+                InstanceAttribute::new(InstanceSemantic::Color, wgpu::VertexFormat::Unorm8x4Bgra, 12),
+            ],
+        };
+        LAYOUT.validate().expect("valid layout");
+        let attrs = instance_attributes(LAYOUT);
+        assert!(attrs.iter().all(|a| a.format != wgpu::VertexFormat::Unorm8x4Bgra));
+        assert_eq!(attrs[1].format, wgpu::VertexFormat::Unorm8x4);
+        let src = instance_wgsl(LAYOUT);
+        assert!(src.contains("return inst.a1.zyxw;"), "{src}");
+        validate(&forward_shader(LAYOUT, false, false));
     }
 
     #[test]

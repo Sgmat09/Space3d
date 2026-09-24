@@ -84,7 +84,10 @@ a `const LAYOUT: &'static InstanceLayout` listing attributes and their *semantic
 
 `pipeline.rs` generates the `InstanceInput` struct and accessor functions for each layout and
 splices them into `forward.wgsl` (`instance_model`, `instance_color`, `instance_uv_rect`,
-`instance_layer`). Pipelines are cached by `(layout, class, format, samples, manual_srgb)`.
+`instance_layer`). Pipelines are cached by `(layout, class, format, samples, manual_srgb,
+layered)` (`layered`: the material texture is an array, see Textures). `Unorm8x4Bgra`
+attributes are fetched as `Unorm8x4` and swizzled in the generated shader: wgpu's GL backend
+passes `GL_BGRA` as the component count, which WebGL2/GLES reject.
 Built-ins: `InstanceTransform` (64 B), `InstanceTransformColor` (80 B), `InstanceCompact`
 (32 B: pos + uniform scale + f32 quat), `InstancePacked` (32 B: pos + scale + snorm16 quat +
 unorm8 color + layer — 2.5× smaller than matrix + color).
@@ -112,6 +115,9 @@ lowered at runtime via `RenderSettings::draw_path`; reported in `RenderStats::dr
 | `GpuMultiDraw` | compute + indirect + `INDIRECT_FIRST_INSTANCE` (Metal, WebGPU w/ feature) | compute | `multi_draw_indexed_indirect` per run |
 | `GpuIndirect` | compute + indirect | compute | `draw_indexed_indirect` per batch; vertex buffer rebound at the batch's region (no `first_instance` needed) |
 | `CpuDirect` | none (WebGL2, GLES, downlevel) | CPU spheres/AABBs | `draw_indexed` per batch |
+
+GPU paths additionally require `DownlevelFlags::BASE_VERTEX`; devices without it (WebGL2,
+GLES 3.0/3.1) always use `CpuDirect` (see Mesh arena).
 
 GPU culling (`shaders/cull.wgsl`):
 
@@ -182,15 +188,31 @@ drawn. The regrown buffer is created `mapped_at_creation`: meshes landing in the
 are written straight into the mapping, old contents are copied GPU→GPU. Updates of same-sized
 meshes are written in place; removals free their ranges for reuse.
 
+Draws select their mesh with `first_index` + `base_vertex` (indices are stored unrebased).
+WebGL2 and GLES < 3.2 lack `DownlevelFlags::BASE_VERTEX`; wgpu does not validate it and its GL
+backend then calls `glDrawElementsInstancedBaseVertex`, which panics on the web (and on ANGLE
+ES 3.0 draws every mesh but the first wrong). Without the flag (`RenderCapabilities::
+base_vertex`), direct draws bind the arena's vertex buffer from the mesh's first vertex
+(`36·n` bytes, always 4-aligned; rebound only when the mesh changes) and pass `base_vertex = 0`.
+Indirect args carry the base themselves and are only used where the flag exists.
+
 ### Textures
 `queue.write_texture` per layer/mip with the row pitch computed from the format's block size
 (works for BC7/ASTC/ETC2 when `TEXTURE_COMPRESSION_*` is enabled — check
 `Renderer::supports_texture_format`). Materials sample through a filterable-float binding, so
 only formats that are filterable float on the device are accepted (`FLOAT32_FILTERABLE` is
 requested when available); integer, depth and unsupported formats log an error and sample
-white. All material textures are 2D arrays (layer chosen per instance). Missing mips of
-formats the device can render to are generated on the GPU with a linear blit per level
-(sRGB-correct); otherwise only the provided mips are uploaded.
+white. Single-layer textures (images, render targets, the white fallback) are bound as `D2`
+views and sampled as `texture_2d`; multi-layer textures as `D2Array` / `texture_2d_array`
+with the layer chosen per instance. The two kinds use separate material bind group layouts
+and pipeline variants: wgpu's GL backend binds a texture with the target implied by its layer
+count (a 1-layer texture is `TEXTURE_2D`, which a `sampler2DArray` reads as black), and it
+makes square textures with a multiple of 6 layers cube maps — on GL those arrays get one
+unused extra layer. Missing mips of formats the device can render to are generated on the GPU
+with a linear blit per level and layer (sRGB-correct): the source is a view of the previous
+level of the texture's own kind (all layers for arrays, layer picked by the draw's vertex
+range), since GL cannot sample one layer of an array through a `D2` view. Otherwise only the
+provided mips are uploaded.
 
 Render-target textures (`RenderAssets::add_render_target`, resized with
 `resize_render_target`) get their own depth buffer and can be sampled by materials. A texture
@@ -265,6 +287,16 @@ surface is reconfigured; on `Lost` it is dropped (`has_surface()` turns false, f
 offscreen) because a lost surface must be recreated from the window with `set_surface`, and
 reconfiguring it fails validation.
 
+Surfaces prefer an sRGB format. Browser WebGPU canvases have none (`Bgra8Unorm`/
+`Rgba8Unorm`), so the canvas is configured with its sRGB twin as a view format and frames
+render through that view (MSAA attachment in the same format): blending and MSAA resolves run
+in linear space as on native. Only without `SURFACE_VIEW_FORMATS` or an sRGB twin (e.g.
+`Rgba16Float`) does the shader encode sRGB itself (`manual_srgb`, blending on encoded values).
+wgpu reports a canvas configuration the browser rejects as `Lost`; a canvas that is lost before
+its first frame with a view format is reconfigured without it (in-shader encoding) rather than
+recreated with the same configuration. `Renderer::surface_format` is the view format, for
+overlays drawing into the same view.
+
 ## Platform fallbacks
 
 | platform | backend | draw path (typical) | notes |
@@ -273,17 +305,22 @@ reconfiguring it fails validation.
 | Linux | Vulkan (GLES fallback) | `GpuMultiDrawCount` / `CpuDirect` on GLES | GLES gets the winit display handle via `new_with_surface_and_display` |
 | macOS / iOS | Metal | `GpuMultiDraw` | multi-draw is emulated by wgpu-hal as a loop |
 | Android | Vulkan / GLES | `GpuMultiDraw*` / `CpuDirect` | surface dropped on suspend, recreated on resume |
-| Web (WebGPU) | browser WebGPU | `GpuIndirect` or `GpuMultiDraw` (`indirect-first-instance`) | renderer created asynchronously |
-| Web (WebGL2) | wgpu GL | `CpuDirect` | no storage buffers/compute; surfaces without sRGB format use in-shader sRGB encoding |
+| Web (WebGPU) | browser WebGPU | `GpuIndirect` or `GpuMultiDraw` (`indirect-first-instance`) | renderer created asynchronously; renders through an sRGB view of the canvas |
+| Web (WebGL2) | wgpu GL | `CpuDirect` | no storage buffers/compute, no `BASE_VERTEX` (arena rebound per mesh); surfaces without sRGB format use in-shader sRGB encoding |
+
+The GL-specific behaviour (no `BASE_VERTEX`, texture targets fixed by layer count, no BGRA
+vertex formats) is covered by `tests/gl.rs`, which renders the `tests/common` portability
+scenes on wgpu's GL backend and compares them with the default backend; it skips without a GL
+adapter (on macOS, use ANGLE — ES 3.0, WebGL2's level — as described in the file). Unit tests
+also force `caps.base_vertex = false` on the default backend.
 
 ## Known limitations
 * No shadows, IBL or post-processing; lighting is metallic/roughness Blinn-Phong with Schlick
   Fresnel, 4 directional + 16 point lights.
-* Material textures (including single-layer ones and render targets) are bound as `D2Array`
-  views. wgpu's GL backend binds a single-layer texture with its `TEXTURE_2D` target, so on
-  WebGL2/GLES textured materials can sample black (not verified on a GL device).
-* The platform runner recreates a surface only on resume; after a `Lost` surface the window
-  stays blank until then.
+* After a `Lost` surface the platform runner attaches a new one on a later redraw (throttled
+  to once per second), so the window can stay blank briefly.
+* Layer indices past a texture array's last layer sample the unused padding layer on GL for
+  square arrays of 6k layers (other backends clamp to the last layer).
 * GPU-culled visible counts are not read back (stats report pre-cull counts on GPU paths).
 * Transparent instances are not depth-sorted within a batch.
 * `InstanceSemantic::Custom` attributes need a custom pipeline, which is not exposed yet.

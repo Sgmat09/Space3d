@@ -56,6 +56,8 @@ pub struct InstanceAttribute {
     /// Meaning of the attribute.
     pub semantic: InstanceSemantic,
     /// Vertex format of the attribute (for `ModelMatrix`: `Float32x4`, 4 columns).
+    /// `Unorm8x4Bgra` works on every backend: it is fetched as `Unorm8x4` and swizzled in the
+    /// shader (wgpu's GL backend cannot express it).
     pub format: VertexFormat,
     /// Byte offset inside the instance struct.
     pub offset: u32,

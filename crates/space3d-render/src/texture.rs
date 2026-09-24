@@ -3,7 +3,7 @@
 
 use crate::assets::{AddressMode, FilterMode, GpuTexture, SamplerSettings, TextureEntry, TextureSource};
 use crate::handles::FastMap;
-use crate::pipeline::{DEPTH_FORMAT, OFFSCREEN_FORMAT, Pipelines};
+use crate::pipeline::{DEPTH_FORMAT, OFFSCREEN_FORMAT, Pipelines, sampled_view_dimension};
 
 /// Samplers shared by all textures with equal settings.
 #[derive(Default)]
@@ -142,15 +142,15 @@ pub(crate) fn create_gpu_texture(
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
+        // One D2 view serves as color attachment and for sampling.
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            ..Default::default()
+        });
         entry.gpu = Some(GpuTexture {
-            view: texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                ..Default::default()
-            }),
-            target_view: Some(texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                ..Default::default()
-            })),
+            view: view.clone(),
+            layered: false,
+            target_view: Some(view),
             depth_view: Some(depth.create_view(&Default::default())),
             sampler,
         });
@@ -194,6 +194,14 @@ fn upload_source(
     if src.width > limits.max_texture_dimension_2d || src.height > limits.max_texture_dimension_2d {
         return Err(format!("texture {}x{} exceeds device limit", src.width, src.height));
     }
+    let gl = adapter.get_info().backend == wgpu::Backend::Gl;
+    let allocated_layers = allocated_layers(src.layers, src.width, src.height, gl);
+    if allocated_layers > limits.max_texture_array_layers {
+        return Err(format!(
+            "texture has {} layers; the device allows {}",
+            src.layers, limits.max_texture_array_layers
+        ));
+    }
     let provided_mips = src.mip_level_count.max(1);
     let full = src.full_mip_count();
     let generate = src.generate_mipmaps && provided_mips < full && mip_renderable(adapter, device, format);
@@ -208,7 +216,7 @@ fn upload_source(
         size: wgpu::Extent3d {
             width: src.width,
             height: src.height,
-            depth_or_array_layers: src.layers,
+            depth_or_array_layers: allocated_layers,
         },
         mip_level_count: mip_count,
         sample_count: 1,
@@ -265,12 +273,14 @@ fn upload_source(
         );
     }
 
+    let layered = src.layers > 1;
     Ok((
         GpuTexture {
             view: texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                dimension: Some(sampled_view_dimension(layered)),
                 ..Default::default()
             }),
+            layered,
             sampler,
             target_view: None,
             depth_view: None,
@@ -279,7 +289,25 @@ fn upload_source(
     ))
 }
 
+/// Layers to allocate for a sampled texture of `layers` layers. wgpu's GL backend picks a
+/// texture's GL target from its descriptor alone and makes every square texture whose layer
+/// count is a multiple of 6 a cube map (array), which the forward shader's `sampler2DArray`
+/// reads as black. There such arrays get one extra, unused layer.
+pub(crate) fn allocated_layers(layers: u32, width: u32, height: u32, gl: bool) -> u32 {
+    if gl && width == height && layers.is_multiple_of(6) {
+        layers + 1
+    } else {
+        layers
+    }
+}
+
 /// Downsample mip `m-1` into mip `m` for every layer with a linear blit.
+///
+/// The source is sampled through a view of the texture's own kind — `D2` for single-layer
+/// textures, `D2Array` over all layers for arrays (the layer is picked by the draw's vertex
+/// range, see `blit.wgsl`). wgpu's GL backend binds a sampled texture with the target implied
+/// by its layer count and ignores a view's base layer, so a `D2` view of one layer of an array
+/// samples black there. Each destination is a single-layer `D2` render attachment.
 #[allow(clippy::too_many_arguments)]
 fn generate_mips(
     device: &wgpu::Device,
@@ -291,12 +319,22 @@ fn generate_mips(
     first_generated: u32,
     mip_count: u32,
 ) {
+    let layered = layers > 1;
     let sampler = pipelines.blit_sampler.clone();
-    let (pipeline, bgl) = pipelines.blit(device, format);
+    let (pipeline, bgl) = pipelines.blit(device, format, layered);
     let (pipeline, bgl) = (pipeline.clone(), bgl.clone());
-    let view = |mip: u32, layer: u32| {
+    let source = |mip: u32| {
         texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("space3d mip view"),
+            label: Some("space3d mip source"),
+            dimension: Some(sampled_view_dimension(layered)),
+            base_mip_level: mip,
+            mip_level_count: Some(1),
+            ..Default::default()
+        })
+    };
+    let target = |mip: u32, layer: u32| {
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("space3d mip target"),
             dimension: Some(wgpu::TextureViewDimension::D2),
             base_mip_level: mip,
             mip_level_count: Some(1),
@@ -305,24 +343,24 @@ fn generate_mips(
             ..Default::default()
         })
     };
-    for layer in 0..layers {
-        for mip in first_generated.max(1)..mip_count {
-            let src = view(mip - 1, layer);
-            let dst = view(mip, layer);
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("space3d mipgen"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&src),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            });
+    for mip in first_generated.max(1)..mip_count {
+        let src = source(mip - 1);
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("space3d mipgen"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        for layer in 0..layers {
+            let dst = target(mip, layer);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("space3d mipgen"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -338,12 +376,13 @@ fn generate_mips(
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.draw(0..3, 0..1);
+            pass.draw(layer * 3..layer * 3 + 3, 0..1);
         }
     }
 }
 
-/// 1x1 white texture used when a material has no (or a missing) texture.
+/// 1x1 white texture (single-layer `D2` view) used when a material has no (or a missing)
+/// texture.
 pub(crate) fn white_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("space3d white"),
@@ -379,7 +418,7 @@ pub(crate) fn white_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu:
         },
     );
     texture.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        dimension: Some(wgpu::TextureViewDimension::D2),
         ..Default::default()
     })
 }
@@ -397,5 +436,16 @@ mod tests {
         // 4x4 blocks of 16 bytes; a 2x2 mip still occupies one block.
         assert_eq!(mip_layout(bc, 64, 64, 0), Some((256, 16, 64, 64)));
         assert_eq!(mip_layout(bc, 64, 64, 5), Some((16, 1, 4, 4)));
+    }
+
+    /// Regression: on GL, square arrays of 6k layers became cube maps and sampled black.
+    #[test]
+    fn cube_compatible_arrays_are_padded_on_gl() {
+        assert_eq!(allocated_layers(6, 16, 16, true), 7);
+        assert_eq!(allocated_layers(12, 16, 16, true), 13);
+        assert_eq!(allocated_layers(6, 16, 8, true), 6);
+        assert_eq!(allocated_layers(5, 16, 16, true), 5);
+        assert_eq!(allocated_layers(1, 16, 16, true), 1);
+        assert_eq!(allocated_layers(6, 16, 16, false), 6);
     }
 }

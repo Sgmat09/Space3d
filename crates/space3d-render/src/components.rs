@@ -44,7 +44,8 @@ pub fn linear_to_srgb(c: f32) -> f32 {
 pub struct Material {
     /// Linear RGBA multiplier (and alpha when `alpha_blend`).
     pub base_color: Vec4,
-    /// Optional sRGB color texture (sampled as a 2D array; layer selected per instance).
+    /// Optional sRGB color texture. Texture arrays pick their layer per instance
+    /// ([`crate::InstanceSemantic::TextureLayer`]); single-layer textures ignore it.
     pub base_color_texture: Option<TextureHandle>,
     /// 0 = dielectric, 1 = metal.
     pub metallic: f32,
