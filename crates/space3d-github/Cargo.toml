@@ -1,6 +1,6 @@
 [package]
 name = "space3d-github"
-description = "Space3d github"
+description = "Space3d GitHub integration: REST client (repos, releases, issues, workflows), update checker, crash reporter, CI templates"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,23 @@ license.workspace = true
 
 [dependencies]
 space3d-core.workspace = true
+space3d-tasks.workspace = true
+reqwest = { workspace = true, features = ["query"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+web-time.workspace = true
+semver = { version = "1.0.28", features = ["serde"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["fs"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { workspace = true, features = ["Window", "Storage"] }
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+yaml-rust2 = "0.13.0"
