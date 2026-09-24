@@ -1,0 +1,13 @@
+# Space3d policy: always track the latest stable release of every dependency.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 20
+    groups:
+      egui-wgpu-winit:
+        patterns: ["egui*", "wgpu*", "naga", "winit"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
