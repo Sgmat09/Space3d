@@ -74,7 +74,8 @@ jobs:
       - name: Room panics are contained (profile server)
         run: |
           cargo test --profile server -p space3d-server --test cluster -- \
-            room_crash_is_contained a_crash_looping_room_is_closed
+            room_crash_is_contained a_crash_looping_room_is_closed a_room_crash_during_its_drain_handoff
+          cargo test --profile server -p space3d-server --test handoff -- crash
           cargo test --profile server -p space3d-server --test e2e
 
   mobile:

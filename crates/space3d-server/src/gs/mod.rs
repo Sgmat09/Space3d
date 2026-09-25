@@ -134,7 +134,12 @@ impl space3d_core::Plugin for GameServerPlugin {
         };
         app.add_system_named(Stage::Update, "gs::supervisor", move |ctx| {
             state.tick();
+            // One report for both: the lifecycle may stop the process one tick after the gate
+            // reads flushed, so `Deregister` must already be on its way by then (a room closing
+            // on its shard between two reports used to let the process stop first and send it
+            // right before the link closed).
             let report = state.drain_report();
+            state.deregister_when_drained(report);
             if let Some(gates) = ctx.resources.get_mut::<DrainGates>() {
                 gates.set("game-server", report);
             }
@@ -159,9 +164,12 @@ impl GsState {
         self.prune_checkpoints(now);
         self.metrics();
         self.lifecycle();
-        if !self.deregistered && self.drain_report().flushed {
-            // Drain done (rooms closed or handed off, outbox flushed): leave the fleet now
-            // rather than when the lease runs out (best effort; the lease still covers it).
+    }
+
+    /// Drain done (rooms closed or handed off, outbox flushed): leave the fleet now rather than
+    /// when the lease runs out (best effort; the lease still covers it).
+    fn deregister_when_drained(&mut self, report: DrainReport) {
+        if !self.deregistered && report.flushed {
             self.deregistered = true;
             let _ = self.rt.fleet.send(FleetUp::Deregister {
                 reason: "drained".into(),
@@ -276,6 +284,11 @@ impl GsState {
                         None => self.rt.rooms.broadcast(cmd),
                     }
                 }
+                FleetDown::RoomMovingAck { room_id } => {
+                    if let Some(h) = self.rt.rooms.get(room_id) {
+                        let _ = h.command(RoomCommand::MoveAcked);
+                    }
+                }
                 FleetDown::Drain => {
                     if self.rt.lifecycle.requests() == 0 {
                         self.rt.lifecycle.drain();
@@ -318,6 +331,15 @@ impl GsState {
                     } else {
                         // Player service unreachable: answer empty so the game can proceed.
                         self.answer_fetch(room, player, Vec::new());
+                    }
+                }
+                FleetUp::RoomMoving { room_id } => {
+                    // The room keeps its clients until the player service acknowledged the
+                    // move; with the link down there is nobody to wait for.
+                    if self.rt.fleet.send(FleetUp::RoomMoving { room_id }).is_err()
+                        && let Some(h) = self.rt.rooms.get(room)
+                    {
+                        let _ = h.command(RoomCommand::MoveAcked);
                     }
                 }
                 other => {

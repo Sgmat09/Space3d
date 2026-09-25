@@ -18,7 +18,7 @@
 //! tick cost; rooms never migrate (deferred).
 
 use super::checkpoint::Checkpoint;
-use super::room::{RoomBuild, RoomRuntime, build_room_app, panic_message, run_tick_guarded};
+use super::room::{RoomBuild, build_room_app, panic_message, run_tick_guarded};
 use super::rooms::{RoomEnv, RoomPhase, RoomStatus};
 use crate::clock::{SystemUnixClock, UnixClock};
 use crate::game::RoomSpec;
@@ -329,11 +329,11 @@ pub fn rebuild_crashed(
     }));
     let epoch = epoch_of(app);
     let inbox = app.resources.remove::<NetInbox>();
-    let runtime = app.resources.remove::<RoomRuntime>();
-    let (Some(inbox), Some(runtime)) = (inbox, runtime) else {
+    let parts = super::room::take_for_rebuild(app);
+    let (Some(inbox), Some((commands, last, carried))) = (inbox, parts) else {
         return Err("crashed".into());
     };
-    let (commands, last, upload): (_, Option<Checkpoint>, _) = runtime.into_parts();
+    let last: Option<Checkpoint> = last;
     let build = RoomBuild {
         spec: spec.clone(),
         env: env.clone(),
@@ -348,18 +348,19 @@ pub fn rebuild_crashed(
         Ok(Ok(fresh)) => {
             let old = std::mem::replace(app, fresh);
             let _ = catch_unwind(AssertUnwindSafe(move || drop(old)));
+            super::room::adopt_carried(app, carried);
             status.lock().phase = RoomPhase::Running;
             tracing::warn!(room = %spec.room_id, epoch = epoch_of(app), "room rebuilt after crash");
             Ok(())
         }
         Ok(Err(e)) => {
             tracing::error!(room = %spec.room_id, error = %e, "room rebuild failed");
-            super::room::delete_checkpoint_after(env, spec.room_id, upload);
+            carried.discard(env, spec.room_id, epoch);
             Err("rebuild failed".into())
         }
         Err(p) => {
             tracing::error!(room = %spec.room_id, panic = %panic_message(p), "room rebuild panicked");
-            super::room::delete_checkpoint_after(env, spec.room_id, upload);
+            carried.discard(env, spec.room_id, epoch);
             Err("rebuild panicked".into())
         }
     }

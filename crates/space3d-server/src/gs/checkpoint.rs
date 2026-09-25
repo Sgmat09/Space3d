@@ -168,8 +168,11 @@ pub trait CheckpointStore: Send + Sync + 'static {
     fn get(&self, room: RoomId) -> Task<Result<Option<Vec<u8>>, StoreError>>;
     /// Rooms with checkpoints newer than `min_saved_ms`.
     fn recent(&self, min_saved_ms: i64) -> Task<Result<Vec<RoomId>, StoreError>>;
-    /// Delete (room closed normally).
-    fn delete(&self, room: RoomId) -> Task<Result<(), StoreError>>;
+    /// Delete the room's checkpoint if its epoch is `through_epoch` or older (room closed
+    /// normally, or voided). A newer checkpoint belongs to a copy restored elsewhere and stays
+    /// (a stale copy that closes must not delete the live copy's checkpoint). `u32::MAX` deletes
+    /// whatever is stored.
+    fn delete(&self, room: RoomId, through_epoch: u32) -> Task<Result<(), StoreError>>;
     /// Delete every checkpoint captured before `before_ms` and return how many went. Such
     /// checkpoints can no longer be restored (older than `recovery_max_age`); this garbage
     /// collects rooms that ended without a normal close (crash loops, orphans nobody rejoined,
@@ -334,11 +337,11 @@ impl CheckpointStore for LocalCheckpoints {
         }))
     }
 
-    fn delete(&self, room: RoomId) -> Task<Result<(), StoreError>> {
-        flatten(
-            self.db
-                .execute("DELETE FROM gs_checkpoints WHERE room_id = ?1", (room.0 as i64,)),
-        )
+    fn delete(&self, room: RoomId, through_epoch: u32) -> Task<Result<(), StoreError>> {
+        flatten(self.db.execute(
+            "DELETE FROM gs_checkpoints WHERE room_id = ?1 AND epoch <= ?2",
+            (room.0 as i64, i64::from(through_epoch)),
+        ))
         .map_unit()
     }
 
@@ -440,8 +443,9 @@ impl CheckpointStore for RemoteCheckpoints {
         })
     }
 
-    fn delete(&self, room: RoomId) -> Task<Result<(), StoreError>> {
-        let fut = self.http.fetch(self.auth(HttpRequest::delete(self.url(room))));
+    fn delete(&self, room: RoomId, through_epoch: u32) -> Task<Result<(), StoreError>> {
+        let url = format!("{}?through_epoch={through_epoch}", self.url(room));
+        let fut = self.http.fetch(self.auth(HttpRequest::delete(url)));
         space3d_tasks::spawn(async move {
             let res = fut.await.map_err(net_err)?;
             if res.status == 404 {
@@ -491,8 +495,8 @@ impl CheckpointStore for PlayerServiceCheckpoints {
         flatten(self.store.recent_checkpoints(min_saved_ms))
     }
 
-    fn delete(&self, room: RoomId) -> Task<Result<(), StoreError>> {
-        flatten(self.store.delete_checkpoint(room))
+    fn delete(&self, room: RoomId, through_epoch: u32) -> Task<Result<(), StoreError>> {
+        flatten(self.store.delete_checkpoint(room, through_epoch))
     }
 
     fn prune(&self, before_ms: i64) -> Task<Result<u64, StoreError>> {
@@ -534,8 +538,11 @@ impl CheckpointStore for MemoryCheckpoints {
             .collect()))
     }
 
-    fn delete(&self, room: RoomId) -> Task<Result<(), StoreError>> {
-        self.map.lock().remove(&room);
+    fn delete(&self, room: RoomId, through_epoch: u32) -> Task<Result<(), StoreError>> {
+        let mut map = self.map.lock();
+        if map.get(&room).is_some_and(|(key, _)| key.epoch <= through_epoch) {
+            map.remove(&room);
+        }
         ready(Ok(()))
     }
 
@@ -564,7 +571,7 @@ pub fn upload_rescued(
                 continue;
             };
             let Ok((_, key)) = Checkpoint::peek(&bytes) else {
-                rescue.delete(room).wait().await.ok_or_else(lost)??;
+                rescue.delete(room, u32::MAX).wait().await.ok_or_else(lost)??;
                 continue;
             };
             let remote = store.get(room).wait().await.ok_or_else(lost)??;
@@ -575,7 +582,7 @@ pub fn upload_rescued(
                 store.put(room, bytes).wait().await.ok_or_else(lost)??;
                 uploaded += 1;
             }
-            rescue.delete(room).wait().await.ok_or_else(lost)??;
+            rescue.delete(room, u32::MAX).wait().await.ok_or_else(lost)??;
         }
         if uploaded > 0 {
             tracing::info!(rooms = uploaded, "uploaded checkpoints saved by a forced stop");
@@ -600,7 +607,7 @@ impl CheckpointStore for NoCheckpoints {
         ready(Ok(Vec::new()))
     }
 
-    fn delete(&self, _room: RoomId) -> Task<Result<(), StoreError>> {
+    fn delete(&self, _room: RoomId, _through_epoch: u32) -> Task<Result<(), StoreError>> {
         ready(Ok(()))
     }
 
@@ -700,7 +707,15 @@ mod tests {
         // Garbage and foreign rooms are refused.
         assert!(b(store.put(RoomId(5), vec![1, 2, 3])).is_err());
         assert!(b(store.put(RoomId(6), sample(5, 5_000).to_bytes())).is_err());
-        b(store.delete(RoomId(5))).unwrap();
+        // Regression: a delete only removes a checkpoint of the deleting copy's epoch or older
+        // (a stale copy closing behind a fleet partition deleted the live copy's checkpoint).
+        b(store.delete(RoomId(5), 2)).unwrap();
+        assert_eq!(
+            stored_key(store, 5),
+            Some(key(3, 1_800)),
+            "a newer copy's checkpoint stays"
+        );
+        b(store.delete(RoomId(5), 3)).unwrap();
         assert_eq!(b(store.get(RoomId(5))).unwrap(), None);
         // Garbage collection deletes exactly the checkpoints captured before the cutoff.
         b(store.put(RoomId(7), sample(7, 1_000).to_bytes())).unwrap();
@@ -709,7 +724,7 @@ mod tests {
         assert_eq!(b(store.get(RoomId(7))).unwrap(), None);
         assert_eq!(stored_key(store, 8), Some(key(2, 3_000)));
         assert_eq!(b(store.prune(2_000)).unwrap(), 0);
-        b(store.delete(RoomId(8))).unwrap();
+        b(store.delete(RoomId(8), u32::MAX)).unwrap();
     }
 
     #[test]

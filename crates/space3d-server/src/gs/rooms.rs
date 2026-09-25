@@ -93,6 +93,10 @@ pub enum RoomCommand {
     /// uploading checkpoints, `Disconnect(ServerShutdown)` ("rejoin"), keep the stored
     /// checkpoint, remove.
     Superseded,
+    /// The player service recorded that this room is moving (its answer to
+    /// `FleetUp::RoomMoving`, `FleetDown::RoomMovingAck`): it now holds the players' rejoins
+    /// until the room is stored, so the room may send its clients away.
+    MoveAcked,
     /// Checkpoint now.
     Checkpoint,
     /// Accept/refuse new joins.
@@ -149,6 +153,11 @@ pub struct RoomStatus {
     /// behind that were made after this point (`ps::fleet`).
     #[serde(default)]
     pub origin: RoomOrigin,
+    /// The room moves to another server when its server drains (a persistent room with
+    /// checkpoints enabled): once the server reports draining, the player service holds its
+    /// players' rejoins until the room is stored, instead of sending them back to it.
+    #[serde(default)]
+    pub moves_on_drain: bool,
 }
 
 /// A point in a room's history: its epoch (bumped by every restore and crash rebuild), then
@@ -456,6 +465,7 @@ impl RoomManager {
                 created_ms: now_ms,
                 persistent: spec.persistent,
                 abandon_on_loss: self.env.game.recovery_policy(&spec) == crate::game::RecoveryPolicy::Abandon,
+                moves_on_drain: spec.persistent && self.env.checkpoints.enabled(),
                 ..Default::default()
             }));
             let handle = RoomHandle {

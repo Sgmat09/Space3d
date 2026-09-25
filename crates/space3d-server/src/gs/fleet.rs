@@ -121,10 +121,13 @@ pub enum FleetUp {
         #[serde(default)]
         restorable: bool,
     },
-    /// A draining server froze a persistent room for a handoff: its clients were disconnected
-    /// and its final checkpoint is uploading (`RoomClosed { restorable: true }` follows once it
-    /// is stored). A rejoin meanwhile waits for that instead of going back to the frozen room
-    /// or restoring an older checkpoint.
+    /// A room is about to move to another server: a draining server's persistent room (it
+    /// freezes for its handoff) or a room closing restorable at shutdown.
+    /// `RoomClosed { restorable: true }` follows once its final checkpoint is stored. The player
+    /// service answers `FleetDown::RoomMovingAck` and from then on holds its players' rejoins
+    /// until the room is stored (instead of sending them back to the room they left, or
+    /// restoring an older checkpoint); the room sends its clients away only after that answer
+    /// (or a short timeout).
     RoomMoving {
         /// Room.
         room_id: RoomId,
@@ -250,6 +253,11 @@ pub enum FleetDown {
         /// Text.
         text: String,
     },
+    /// Answer to `FleetUp::RoomMoving`: the player service holds the room's rejoins now.
+    RoomMovingAck {
+        /// Room.
+        room_id: RoomId,
+    },
     /// Start draining.
     Drain,
     /// Outbox entry applied.
@@ -342,6 +350,12 @@ pub trait FleetLink: Send + Sync + 'static {
     fn session(&self) -> u64 {
         u64::from(self.is_connected())
     }
+    /// Process exit: deliver what is still queued (a drained server's `Deregister`) and close
+    /// the link with a closing handshake, waiting at most `timeout`. Blocks the calling thread
+    /// (called once, after the supervisor loop ended — never from a system).
+    fn shutdown(&self, timeout: std::time::Duration) {
+        let _ = timeout;
+    }
 }
 
 /// Largest fleet message (JSON).
@@ -373,8 +387,13 @@ struct WsLinkState {
     connected: std::sync::atomic::AtomicBool,
     session: std::sync::atomic::AtomicU64,
     stop: std::sync::atomic::AtomicBool,
+    /// The link task ended (after its closing handshake on a stop).
+    done: std::sync::atomic::AtomicBool,
     last_error: parking_lot::Mutex<String>,
 }
+
+/// Longest a stopping fleet link waits for its closing handshake.
+const FLEET_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// WebSocket fleet link (split mode): a background loop on the I/O runtime connects to the
 /// player service with its own backoff (never `WsConfig::reconnect`), registers, forwards
@@ -392,8 +411,13 @@ impl WsFleetLink {
         let (up_tx, up_rx) = async_channel::bounded::<FleetUp>(16_384);
         let (down_tx, down_rx) = async_channel::bounded::<FleetDown>(16_384);
         let state = std::sync::Arc::new(WsLinkState::default());
+        let link = run_ws_link(url.to_owned(), registration, up_rx, down_tx, state.clone());
+        let ended = state.clone();
         let task = space3d_tasks::spawn(tracing::Instrument::instrument(
-            run_ws_link(url.to_owned(), registration, up_rx, down_tx, state.clone()),
+            async move {
+                link.await;
+                ended.done.store(true, std::sync::atomic::Ordering::Release);
+            },
             tracing::Span::current(),
         ));
         Self {
@@ -450,7 +474,25 @@ async fn run_ws_link(
         let reason: String;
         'link: loop {
             if state.stop.load(Ordering::Acquire) {
+                if state.connected.load(Ordering::Acquire) {
+                    // Deliver what is queued (a drained server's `Deregister`) before closing.
+                    while let Ok(msg) = up.try_recv() {
+                        if let Ok(text) = serde_json::to_string(&msg) {
+                            let _ = conn.send(text);
+                        }
+                    }
+                }
+                // Close with a handshake (the player service then sees a clean close, not a
+                // reset), bounded.
                 conn.close();
+                let deadline = tokio::time::Instant::now() + FLEET_CLOSE_WAIT;
+                while tokio::time::Instant::now() < deadline {
+                    if std::iter::from_fn(|| conn.poll_event()).any(|ev| matches!(ev, WsEventKind::Closed { .. })) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                state.connected.store(false, Ordering::Release);
                 return;
             }
             while let Some(ev) = conn.poll_event() {
@@ -518,6 +560,19 @@ impl FleetLink for WsFleetLink {
     }
     fn session(&self) -> u64 {
         self.state.session.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn shutdown(&self, timeout: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let connected = self.is_connected();
+        self.state.stop.store(true, Ordering::Release);
+        if !connected {
+            // Nothing to deliver; the reconnect loop ends on its own.
+            return;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.state.done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 }
 

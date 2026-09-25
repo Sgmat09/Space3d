@@ -54,6 +54,10 @@ pub struct ClientEntity {
     /// Controlled entity: snapshots since its unchanged predicted components were last
     /// re-confirmed (see `priority::CONFIRM_EVERY`).
     pub confirm_skipped: u16,
+    /// Which stay in the client's view this state belongs to (`ClientView::next_scope` when
+    /// the entity entered the view). Datagram acks and losses of records written during an
+    /// earlier stay (the entity left and came back meanwhile) are not applied to it.
+    pub scope: u32,
 }
 
 impl ClientEntity {
@@ -84,6 +88,11 @@ pub struct SentRecord {
     pub spawns: Vec<bool>,
     /// Baseline each entity was written against (parallel to `entities`).
     pub baselines: Vec<Tick>,
+    /// Stay in scope each entity was written in (parallel to `entities`, see
+    /// [`ClientEntity::scope`]).
+    pub scopes: Vec<u32>,
+    /// Stay in scope each despawn ended (parallel to `despawns`).
+    pub despawn_scopes: Vec<u32>,
     /// Send time (loss detection, RTT).
     pub sent_at: Duration,
     /// Presumed lost (its entities became due again); a late ack still credits it and samples
@@ -110,10 +119,12 @@ pub struct ClientView {
     pub relevant: Vec<NetId>,
     /// Send ticks since the last interest evaluation.
     pub interest_age: u16,
-    /// Datagram: despawns sent but not acked yet (`NetId` → out of scope).
-    pub despawning: FastMap<NetId, bool>,
+    /// Datagram: despawns sent but not acked yet (`NetId` → (out of scope, the stay it ended)).
+    pub despawning: FastMap<NetId, (bool, u32)>,
     /// Links bound so far (a second link means a resume → `FULL_RESET`).
     pub links_bound: u32,
+    /// Stays in scope started so far (see [`ClientEntity::scope`]).
+    pub next_scope: u32,
 }
 
 impl ClientView {
@@ -220,6 +231,8 @@ struct Pick {
     spawn: bool,
     /// The record holds every due change after this tick.
     baseline: Tick,
+    /// Stay in scope it was written in.
+    scope: u32,
 }
 
 /// One snapshot part: encoded block, its entities, its despawns.
@@ -440,7 +453,7 @@ fn build_snapshot(
         if ever_sent {
             let out_of_scope = cache.get(id).is_some();
             if datagram {
-                slot.view.despawning.insert(id, out_of_scope);
+                slot.view.despawning.insert(id, (out_of_scope, ce.scope));
             } else {
                 despawns.push(DespawnRecord {
                     net_id: id,
@@ -450,7 +463,7 @@ fn build_snapshot(
         }
     }
     if datagram {
-        let mut pending: Vec<(NetId, bool)> = slot.view.despawning.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut pending: Vec<(NetId, bool)> = slot.view.despawning.iter().map(|(k, (oos, _))| (*k, *oos)).collect();
         pending.sort_unstable();
         for (id, oos) in pending {
             if relevant.binary_search(&id).is_ok() {
@@ -477,7 +490,15 @@ fn build_snapshot(
     let mut all_spawned = true;
     for &id in &relevant {
         let Some(rec) = cache.get(id) else { continue };
-        let ce = slot.view.entities.entry(id).or_default();
+        let view = &mut slot.view;
+        let ce = view.entities.entry(id).or_insert_with(|| {
+            // A new stay in the view: acks of what was sent during an earlier one never apply.
+            view.next_scope = view.next_scope.wrapping_add(1);
+            ClientEntity {
+                scope: view.next_scope,
+                ..Default::default()
+            }
+        });
         let allowed = audience_mask(rec, registry, player, team, world);
         let own = rec.is_owned_by(player);
         let controlled = rec.controller == Some(player);
@@ -532,6 +553,7 @@ fn build_snapshot(
             allowed,
             spawn,
             baseline: if spawn { Tick::ZERO } else { baseline },
+            scope: ce.scope,
         };
         let size = entity_size(rec, comps, removed);
         // Outside the budget: the controlled (predicted) entities, which need a confirmation
@@ -893,12 +915,17 @@ fn send_datagram(
                 rec.present.push(p.allowed);
                 rec.spawns.push(p.spawn);
                 rec.baselines.push(p.baseline);
+                rec.scopes.push(p.scope);
                 if let Some(ce) = slot.view.entities.get_mut(&p.net_id) {
                     ce.last_sent_tick = tick;
                     ce.on_wire = true;
                 }
             }
             rec.despawns = desp.iter().map(|d| d.net_id).collect();
+            rec.despawn_scopes = desp
+                .iter()
+                .map(|d| slot.view.despawning.get(&d.net_id).map_or(0, |(_, scope)| *scope))
+                .collect();
         }
         if dw.is_empty() {
             continue;
@@ -932,11 +959,12 @@ fn detect_losses(slot: &mut Slot, now: Duration) {
             continue;
         }
         r.lost = true;
-        for id in &r.entities {
+        for (i, id) in r.entities.iter().enumerate() {
             // The lost changes are not covered by `ack_tick`: the next record carries every
             // change since then (records are written against the ack), and an unacked spawn
             // may be sent again.
             if let Some(ce) = view.entities.get_mut(id)
+                && r.scopes.get(i) == Some(&ce.scope)
                 && ce.ack_tick < r.tick
             {
                 ce.last_sent_tick = ce.ack_tick;
@@ -968,7 +996,11 @@ pub(crate) fn on_ack(server: &mut NetServer, client: NetClientId, ack: AckField,
     }
     for r in acked {
         for (i, id) in r.entities.iter().enumerate() {
-            if let Some(ce) = slot.view.entities.get_mut(id) {
+            // Only for the stay it was sent in: after the entity left and came back, a late ack
+            // of its old spawn says nothing about the new one.
+            if let Some(ce) = slot.view.entities.get_mut(id)
+                && r.scopes.get(i) == Some(&ce.scope)
+            {
                 ce.on_record_acked(r.baselines[i], r.tick);
                 if r.spawns[i] {
                     ce.spawned = true;
@@ -979,8 +1011,11 @@ pub(crate) fn on_ack(server: &mut NetServer, client: NetClientId, ack: AckField,
                 }
             }
         }
-        for id in &r.despawns {
-            slot.view.despawning.remove(id);
+        for (id, scope) in r.despawns.iter().zip(&r.despawn_scopes) {
+            // Likewise, a late ack of an earlier despawn does not confirm a later one.
+            if slot.view.despawning.get(id).is_some_and(|(_, s)| s == scope) {
+                slot.view.despawning.remove(id);
+            }
         }
     }
 }
@@ -1030,6 +1065,7 @@ mod tests {
                 present: vec![1],
                 spawns: vec![false],
                 baselines: vec![Tick(4)],
+                scopes: vec![0],
                 sent_at: Duration::ZERO,
                 ..Default::default()
             });

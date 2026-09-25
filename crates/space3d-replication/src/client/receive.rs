@@ -229,9 +229,11 @@ fn on_reject(net: &mut NetClient, conn: &mut Connection, now: Duration, r: Rejec
         net.state = ConnectionState::Reconnecting { attempt: conn.attempt };
         return;
     }
-    // Transient refusals (server busy, rate limited) that name a retry delay are retried with
-    // credentials that can be presented again: a resume token within its window, or dev auth.
-    let transient = r.retry_after_ms.is_some() && matches!(r.code, RejectCode::RoomFull | RejectCode::RateLimited);
+    // Transient refusals (server busy, rate limited, draining) that name a retry delay are
+    // retried with credentials that can be presented again: a resume token within its window,
+    // or dev auth. A spent join ticket cannot: the session fails with the refusal, and
+    // `FailReason::retry_after` tells the game when to ask the player service again.
+    let transient = r.is_transient();
     let reusable = conn.resuming || matches!(conn.auth, HelloAuth::Dev { .. });
     let policy = net.config.reconnect;
     if transient && reusable && policy.max_attempts.is_none_or(|m| conn.attempt < m) {
@@ -656,6 +658,33 @@ mod tests {
             message: "room busy".into(),
             retry_after_ms: Some(1_000),
         }
+    }
+
+    /// Regression: a draining server's refusal (`ServerDraining`, with a retry delay) was
+    /// terminal even for reusable credentials, and a ticket client had no retry hint.
+    #[test]
+    fn server_draining_is_a_transient_refusal() {
+        let now = Duration::from_secs(10);
+        let draining = Reject {
+            code: RejectCode::ServerDraining,
+            message: "server draining".into(),
+            retry_after_ms: Some(1_000),
+        };
+        let (mut net, mut conn) = handshaking(HelloAuth::Dev { name: "a".into() }, false);
+        on_reject(&mut net, &mut conn, now, draining.clone());
+        assert!(!matches!(net.state, ConnectionState::Failed(_)), "{:?}", net.state);
+        assert!(conn.retry_at.is_some_and(|t| t >= now + Duration::from_secs(1)));
+        // A spent ticket fails, but says when to ask the player service again.
+        let (mut net, mut conn) = handshaking(HelloAuth::Ticket("t".into()), false);
+        on_reject(&mut net, &mut conn, now, draining);
+        let ConnectionState::Failed(reason) = &net.state else {
+            panic!("{:?}", net.state)
+        };
+        assert_eq!(reason.retry_after(), Some(Duration::from_secs(1)));
+        assert_eq!(
+            FailReason::Rejected(Reject::new(RejectCode::BadTicket, "no")).retry_after(),
+            None
+        );
     }
 
     /// A resume refused as busy (with a retry delay) is retried, not treated as terminal.

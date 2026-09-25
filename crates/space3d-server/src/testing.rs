@@ -78,6 +78,12 @@ pub struct TestClusterConfig {
     pub client: ClientConfig,
     /// Start of the wall clock (unix ms).
     pub start_ms: i64,
+    /// Run the supervisor apps (game servers and player service: fleet links, lifecycle,
+    /// matchmaking) every this many steps, not every step. Production supervisors run at
+    /// 10 Hz while rooms tick at 60 Hz (`6`): messages between the rooms, the fleet link and
+    /// the player service then take as long to cross as they do for real, while clients react
+    /// to their room at once.
+    pub supervisor_every: u32,
 }
 
 impl Default for TestClusterConfig {
@@ -101,6 +107,7 @@ impl Default for TestClusterConfig {
             semantics: Semantics::Stream,
             client: ClientConfig::default(),
             start_ms: 1_800_000_000_000,
+            supervisor_every: 1,
         }
     }
 }
@@ -164,6 +171,7 @@ pub struct TestCluster {
     nodes: Vec<GsNode>,
     clients: Vec<ClientSlot>,
     crashes: u64,
+    steps: u64,
 }
 
 fn loopback() -> SocketAddr {
@@ -210,6 +218,7 @@ impl TestCluster {
             nodes: Vec::new(),
             clients: Vec::new(),
             crashes: 0,
+            steps: 0,
             config,
         };
         for i in 0..cluster.config.game_servers.max(1) {
@@ -454,8 +463,12 @@ impl TestCluster {
     /// ticks, game-server supervisors, player-service supervisor.
     pub fn step(&mut self) {
         self.now += self.step;
+        self.steps += 1;
         self.clock.set(self.now);
         self.unix.set_ms(self.config.start_ms + self.now.as_millis() as i64);
+        let every = self.config.supervisor_every.max(1);
+        let supervise = self.steps.is_multiple_of(u64::from(every));
+        let supervisor_step = self.step * every;
         for i in 0..self.nodes.len() {
             self.route(i);
         }
@@ -473,10 +486,14 @@ impl TestCluster {
                 gate.sweep(now);
                 gate.enforce_ip_bans(self.unix.now_ms());
                 drop(gate);
-                app.update(self.step);
+                if supervise {
+                    app.update(supervisor_step);
+                }
             }
         }
-        self.ps_app.update(self.step);
+        if supervise {
+            self.ps_app.update(supervisor_step);
+        }
     }
 
     /// `step()` × n.

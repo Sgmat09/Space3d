@@ -1534,3 +1534,106 @@ fn lost_snapshots_never_step_a_moving_remote_entity_back() {
         );
     }
 }
+
+// ---- datagram acks across stays in scope ------------------------------------------------------
+
+/// A datagram client whose acks take a second to come back (`link(loss)` sets the downlink
+/// loss) and one entity, synced and visible: `(harness, client, entity, link)`.
+fn late_acks() -> (NetHarness, ClientHandle, Entity, impl Fn(f32) -> LinkProfile) {
+    let link = |loss: f32| LinkProfile {
+        up: LinkConditions {
+            latency: Duration::from_millis(1_000),
+            ..LinkConditions::perfect()
+        },
+        down: LinkConditions {
+            latency: Duration::from_millis(30),
+            loss,
+            ..LinkConditions::perfect()
+        },
+    };
+    let mut h = with_rules(HarnessConfig {
+        seed: 7,
+        semantics: Semantics::Datagram,
+        link: link(0.0),
+        ..Default::default()
+    });
+    let a = observer(&mut h, "alice");
+    assert!(h.run_until(900, |h| h.client_net(a).is_connected()));
+    let e = h
+        .server_mut()
+        .world
+        .spawn((Replicated, Transform::from_xyz(1.0, 0.0, 0.0), Health(5)));
+    // Everything sent so far acked.
+    h.step_ticks(180);
+    assert!(h.client_entity(a, e).is_some());
+    (h, a, e, link)
+}
+
+fn set_visibility(h: &mut NetHarness, c: ClientHandle, e: Entity, v: Visibility) {
+    let player = h.player(c);
+    h.server_mut()
+        .resources
+        .expect_mut::<NetServer>()
+        .set_visibility(player, e, v);
+}
+
+/// Regression: datagram acks were applied by `NetId` alone. An entity that left the client's
+/// view and came back got fresh per-client state, but a late ack of a packet sent during its
+/// earlier stay (its spawn) was then applied to that fresh state: the server marked the new
+/// stay's spawn delivered while it had actually been lost, never resent it, and the client
+/// never saw the entity again. Acks are now fenced by the stay they were sent in.
+#[test]
+fn a_late_ack_from_an_earlier_stay_in_scope_never_marks_a_respawn_delivered() {
+    let (mut h, a, e, link) = late_acks();
+    set_visibility(&mut h, a, e, Visibility::Hidden);
+    assert!(h.run_until(30, |h| h.client_entity(a, e).is_none()), "despawned");
+    h.step_ticks(120);
+    // First stay: the spawn arrives; its ack is a second away.
+    set_visibility(&mut h, a, e, Visibility::Default);
+    assert!(h.run_until(30, |h| h.client_entity(a, e).is_some()), "spawned");
+    // It leaves: the despawn arrives.
+    set_visibility(&mut h, a, e, Visibility::Hidden);
+    assert!(h.run_until(30, |h| h.client_entity(a, e).is_none()), "despawned");
+    // Second stay, while the first spawn's ack is still on its way: its spawn is lost.
+    h.set_link(a, link(1.0));
+    set_visibility(&mut h, a, e, Visibility::Default);
+    h.step_ticks(12);
+    h.set_link(a, link(0.0));
+    // The first stay's ack arrives, then the second spawn is presumed lost and sent again.
+    let back = h.run_until(900, |h| h.client_entity(a, e).is_some());
+    assert!(
+        back,
+        "the entity never came back to the client ({} entities there)",
+        h.client_net(a).net_ids().len()
+    );
+    assert!(
+        h.run_until(300, |h| h.assert_converged(a).is_ok()),
+        "{:?}",
+        h.assert_converged(a)
+    );
+}
+
+/// The despawn side of the same regression: a late ack of an entity's first despawn (from an
+/// earlier stay) confirmed a later, lost despawn, which was then never resent — the client
+/// kept a ghost of the entity.
+#[test]
+fn a_late_despawn_ack_from_an_earlier_stay_never_confirms_a_later_despawn() {
+    let (mut h, a, e, link) = late_acks();
+    // It leaves (the despawn arrives; its ack is a second away) and comes back.
+    set_visibility(&mut h, a, e, Visibility::Hidden);
+    assert!(h.run_until(30, |h| h.client_entity(a, e).is_none()), "despawned");
+    set_visibility(&mut h, a, e, Visibility::Default);
+    assert!(h.run_until(30, |h| h.client_entity(a, e).is_some()), "spawned again");
+    // It leaves again; this despawn is lost for as long as the first one's ack takes.
+    h.set_link(a, link(1.0));
+    set_visibility(&mut h, a, e, Visibility::Hidden);
+    h.step_ticks(90);
+    h.set_link(a, link(0.0));
+    let gone = h.run_until(900, |h| h.client_entity(a, e).is_none());
+    assert!(gone, "the client kept a ghost of the entity");
+    assert!(
+        h.run_until(300, |h| h.assert_converged(a).is_ok()),
+        "{:?}",
+        h.assert_converged(a)
+    );
+}

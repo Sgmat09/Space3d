@@ -209,6 +209,21 @@ pub enum FailReason {
     Unreachable(String),
 }
 
+impl FailReason {
+    /// For a transient refusal (server draining, room full, rate limited: see
+    /// [`Reject::is_transient`]) of credentials that cannot be presented again (a spent join
+    /// ticket), how long to wait before asking the player service for a new assignment
+    /// (`POST /v1/sessions/rejoin`). `None` otherwise.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            FailReason::Rejected(r) if r.is_transient() => {
+                r.retry_after_ms.map(|ms| Duration::from_millis(u64::from(ms)))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Connection state (`NetClient::state`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {

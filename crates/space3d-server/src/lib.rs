@@ -131,13 +131,21 @@ pub struct Listeners(pub Vec<ServerHandle>);
 pub struct ShutdownGuard {
     ingress_stop: Option<async_channel::Sender<()>>,
     shards: Option<gs::shard::ShardPool>,
+    fleet: Option<Arc<dyn FleetLink>>,
 }
+
+/// Longest the process waits at exit for the fleet link's last messages and closing handshake.
+const FLEET_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 impl Drop for ShutdownGuard {
     fn drop(&mut self) {
         self.ingress_stop.take();
         if let Some(s) = self.shards.take() {
             s.stop();
+        }
+        if let Some(fleet) = self.fleet.take() {
+            // A drained server leaves the fleet with a clean close, not a connection reset.
+            fleet.shutdown(FLEET_SHUTDOWN_WAIT);
         }
     }
 }
@@ -612,6 +620,7 @@ impl<G: GameDefinition> ServerMain<G> {
         let mut guard = ShutdownGuard {
             ingress_stop: None,
             shards: None,
+            fleet: None,
         };
         if let Some((runtime, transport)) = gs_parts {
             let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
@@ -627,6 +636,7 @@ impl<G: GameDefinition> ServerMain<G> {
             drop(gs::ingress::spawn_until(ingress, stop_rx));
             guard.ingress_stop = Some(stop_tx);
             guard.shards = runtime.shards.clone();
+            guard.fleet = Some(runtime.fleet.clone());
             app.insert_resource(GameServerHandle {
                 game_addr: real(config.game.bind),
                 admin_addr,

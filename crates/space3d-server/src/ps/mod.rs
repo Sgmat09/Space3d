@@ -446,6 +446,11 @@ pub struct FleetHub {
     conns: BTreeMap<Conn, Option<String>>,
     /// WS connections not registered yet → when they connected (unix ms).
     unregistered_since: BTreeMap<ClientId, i64>,
+    /// WS links that closed since the last poll, with the reason: removed only after the
+    /// messages they sent before closing were handled (a drained server's `Deregister` is
+    /// followed by its close at once; handled after the connection was gone, it counted as
+    /// unregistered and was dropped).
+    closed: Vec<(ClientId, String)>,
 }
 
 impl FleetHub {
@@ -457,6 +462,7 @@ impl FleetHub {
             local,
             conns,
             unregistered_since: BTreeMap::new(),
+            closed: Vec::new(),
         }
     }
 
@@ -525,9 +531,7 @@ impl FleetHub {
                     }
                     ServerEvent::Disconnected { client, reason } => {
                         self.unregistered_since.remove(&client);
-                        if let Some(Some(id)) = self.conns.remove(&Conn::Ws(client)) {
-                            tracing::warn!(server = %id, %reason, "fleet link closed");
-                        }
+                        self.closed.push((client, reason));
                     }
                     ServerEvent::Message { client, message } => {
                         let parsed = message.as_text().map(serde_json::from_str::<FleetUp>);
@@ -659,6 +663,18 @@ fn fleet_io(svc: &Arc<PlayerService>, hub: &mut FleetHub, now: i64) {
         };
         let effects = svc.fleet.lock().on_message(&server, msg, now);
         apply_effects(svc, hub, effects);
+    }
+    for (client, reason) in std::mem::take(&mut hub.closed) {
+        let Some(Some(server)) = hub.conns.remove(&Conn::Ws(client)) else {
+            continue;
+        };
+        // A server that deregistered (drain finished) closing its link is the normal end.
+        let left = svc.fleet.lock().server(&server).is_none_or(|s| s.left);
+        if left {
+            tracing::info!(%server, %reason, "fleet link closed (server left the fleet)");
+        } else {
+            tracing::warn!(%server, %reason, "fleet link closed");
+        }
     }
     let effects = svc
         .fleet

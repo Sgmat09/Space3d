@@ -12,8 +12,9 @@ use space3d_server::clock::ManualUnixClock;
 use space3d_server::game::RoomSpec;
 use space3d_server::gs::checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpoints, StoreError};
 use space3d_server::gs::fleet::FleetUp;
-use space3d_server::gs::room::{RoomBuild, build_room_app, run_tick, stop_hosted};
+use space3d_server::gs::room::{RoomBuild, build_room_app, run_tick, run_tick_guarded, stop_hosted};
 use space3d_server::gs::rooms::{RoomCommand, RoomEnv, RoomPhase, RoomStatus};
+use space3d_server::gs::shard::{CrashGuard, recover_crashed};
 use space3d_server::testing::{TestCluster, TestClusterConfig};
 use space3d_tasks::Task;
 use std::collections::VecDeque;
@@ -116,10 +117,16 @@ impl CheckpointStore for TestStore {
         space3d_tasks::spawn(async { Ok(Vec::new()) })
     }
 
-    fn delete(&self, _room: RoomId) -> Task<Result<(), StoreError>> {
+    fn delete(&self, _room: RoomId, through_epoch: u32) -> Task<Result<(), StoreError>> {
         let inner = self.0.clone();
         space3d_tasks::spawn(async move {
-            inner.lock().stored = None;
+            let mut s = inner.lock();
+            if s.stored
+                .as_ref()
+                .is_some_and(|b| Checkpoint::peek(b).unwrap().1.epoch <= through_epoch)
+            {
+                s.stored = None;
+            }
             Ok(())
         })
     }
@@ -138,6 +145,7 @@ struct Room {
     uplink: async_channel::Receiver<(RoomId, FleetUp)>,
     fleet: Vec<FleetUp>,
     counter: Entity,
+    hold_move_acks: bool,
 }
 
 fn spec() -> RoomSpec {
@@ -195,6 +203,7 @@ impl Room {
             uplink: up_rx,
             fleet: Vec::new(),
             counter,
+            hold_move_acks: false,
         }
     }
 
@@ -203,12 +212,31 @@ impl Room {
     }
 
     /// One tick; `advance_ms` of wall clock first (0 = a catch-up tick in the same millisecond).
+    /// The player service's side of the fleet link: a `RoomMoving` is acknowledged at once
+    /// (`RoomCommand::MoveAcked`, applied at the next tick) unless `hold_move_acks` is set.
     fn tick(&mut self, advance_ms: i64) {
         self.unix.advance_ms(advance_ms);
         run_tick(&mut self.app, STEP);
         while let Ok((_, msg)) = self.uplink.try_recv() {
+            if matches!(msg, FleetUp::RoomMoving { .. }) && !self.hold_move_acks {
+                self.commands.send(RoomCommand::MoveAcked).unwrap();
+            }
             self.fleet.push(msg);
         }
+    }
+
+    /// Drain the (persistent) room: it announces the move, is acknowledged, and freezes on the
+    /// next tick. Returns the counter at the freeze (what the freeze capture holds).
+    fn drain_and_freeze(&mut self) -> u16 {
+        self.commands
+            .send(RoomCommand::Drain {
+                deadline: Duration::from_secs(30),
+            })
+            .unwrap();
+        self.tick(17);
+        assert!(self.moving(), "the player service is told first");
+        self.tick(17);
+        self.health()
     }
 
     /// Tick with real time in between (background serialization and uploads) until `pred`.
@@ -274,13 +302,7 @@ fn a_frozen_room_is_not_restorable_until_its_freeze_capture_is_stored() {
     }
     assert_eq!(r.store.0.lock().puts, 0);
     r.store.set(Mode::Down);
-    r.commands
-        .send(RoomCommand::Drain {
-            deadline: Duration::from_secs(30),
-        })
-        .unwrap();
-    r.tick(17);
-    let frozen_at = r.health();
+    let frozen_at = r.drain_and_freeze();
     r.commands.send(RoomCommand::Shutdown).unwrap();
     // 25 s of ticks with the store unreachable (well past the 15 s shutdown wait).
     assert!(
@@ -311,13 +333,7 @@ fn an_unconfirmed_freeze_capture_goes_to_the_rescue_store_at_stop() {
     }
     assert_eq!(r.store.0.lock().puts, 0);
     r.store.set(Mode::Down);
-    r.commands
-        .send(RoomCommand::Drain {
-            deadline: Duration::from_secs(30),
-        })
-        .unwrap();
-    r.tick(17);
-    let frozen_at = r.health();
+    let frozen_at = r.drain_and_freeze();
     r.commands.send(RoomCommand::Shutdown).unwrap();
     assert!(!r.tick_until(120, |r| r.closed()));
     let write = stop_hosted(&mut r.app).expect("a rescue write");
@@ -341,16 +357,31 @@ fn an_earlier_capture_in_the_same_millisecond_does_not_complete_the_handoff() {
     }
     assert_eq!(r.store.0.lock().puts, 0);
     r.store.set(Mode::Hold);
-    // Tick N-1 captures (an admin checkpoint request); tick N (a catch-up tick, same unix
-    // millisecond) receives the drain.
-    r.commands.send(RoomCommand::Checkpoint).unwrap();
-    r.tick(17);
-    let before = r.health();
+    // The drain is announced; tick N-1 captures (an admin checkpoint request); tick N (a
+    // catch-up tick, same unix millisecond) receives the move's acknowledgement and freezes.
+    r.hold_move_acks = true;
     r.commands
         .send(RoomCommand::Drain {
             deadline: Duration::from_secs(30),
         })
         .unwrap();
+    r.tick(17);
+    assert!(r.moving());
+    // Let the drain tick's own capture through (it is not the point of this test).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while r.store.held() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(r.store.release_one());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while r.store.stored().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    r.tick(17);
+    r.commands.send(RoomCommand::Checkpoint).unwrap();
+    r.tick(17);
+    let before = r.health();
+    r.commands.send(RoomCommand::MoveAcked).unwrap();
     r.tick(0);
     let frozen_at = r.health();
     assert_eq!(frozen_at, before + 1);
@@ -378,5 +409,143 @@ fn an_earlier_capture_in_the_same_millisecond_does_not_complete_the_handoff() {
         restored_health(&r.env, cp),
         frozen_at,
         "the freeze capture, not tick N-1's"
+    );
+}
+
+/// Regression (drain handoff over real processes): the room froze and disconnected its clients
+/// in the drain tick, while `RoomMoving` only reached the player service a supervisor tick or
+/// two later — the clients' rejoin (~20 ms) got a ticket straight back to the draining server,
+/// which refused it (`ServerDraining`). The room now keeps its clients until the player service
+/// acknowledged the move (it then holds their rejoins), or `MOVE_ACK_WAIT` passed.
+#[test]
+fn a_moving_room_keeps_its_clients_until_the_player_service_acknowledged_the_move() {
+    let captures = |r: &Room| r.store.0.lock().puts;
+    let mut r = Room::new();
+    for _ in 0..30 {
+        r.tick(17);
+    }
+    r.hold_move_acks = true;
+    r.commands
+        .send(RoomCommand::Drain {
+            deadline: Duration::from_secs(30),
+        })
+        .unwrap();
+    r.tick(17);
+    assert!(r.moving(), "RoomMoving goes out on the drain tick");
+    assert!(r.tick_until(60, |r| captures(r) == 1), "the drain tick's capture");
+    // No acknowledgement for a second: not frozen (no freeze capture), not closed.
+    assert!(!r.tick_until(60, |r| captures(r) > 1 || r.closed()));
+    r.commands.send(RoomCommand::MoveAcked).unwrap();
+    r.tick(17);
+    let frozen_at = r.health();
+    assert!(r.tick_until(300, |r| r.closed()), "frozen and handed off after the ack");
+    assert!(r.reported_restorable());
+    assert_eq!(restored_health(&r.env, r.store.stored().unwrap()), frozen_at);
+
+    // Without any acknowledgement the room goes after MOVE_ACK_WAIT anyway.
+    let mut r = Room::new();
+    for _ in 0..30 {
+        r.tick(17);
+    }
+    r.hold_move_acks = true;
+    r.commands
+        .send(RoomCommand::Drain {
+            deadline: Duration::from_secs(30),
+        })
+        .unwrap();
+    r.tick(17);
+    let wait_ticks = (space3d_server::gs::room::MOVE_ACK_WAIT.as_secs_f64() * 60.0) as u32;
+    assert!(!r.tick_until(wait_ticks - 10, |r| r.closed()));
+    assert!(r.tick_until(300, |r| r.closed() && r.reported_restorable()));
+}
+
+/// A tick of the room that panics (the shard's crash path: `catch_unwind` → rebuild from the
+/// in-memory checkpoint, epoch + 1). Returns whether the room is still alive.
+fn crash(r: &mut Room, guard: &mut CrashGuard, at: Duration) -> bool {
+    r.app
+        .add_system(Stage::Update, |_| panic!("handoff test: injected panic"));
+    let why = run_tick_guarded(&mut r.app, STEP).expect_err("the tick panics");
+    recover_crashed(
+        &mut r.app,
+        &spec(),
+        &r.env,
+        &r.status,
+        1_900_000_000_000,
+        guard,
+        at,
+        &why,
+    )
+}
+
+/// Regression: a panic while a persistent room was frozen for its drain handoff rebuilt it as a
+/// fresh room that knew nothing of the handoff — it never stored its freeze capture or closed
+/// restorable, so the player service kept it "moving" and every rejoin failed. The rebuilt
+/// room now continues the handoff from its freeze capture.
+#[test]
+fn a_crash_while_frozen_for_the_handoff_continues_the_handoff() {
+    let mut r = Room::new();
+    for _ in 0..30 {
+        r.tick(17);
+    }
+    r.store.set(Mode::Down);
+    let frozen_at = r.drain_and_freeze();
+    r.tick(17);
+    // The room panics while frozen, before its freeze capture is stored.
+    let mut guard = CrashGuard::default();
+    assert!(crash(&mut r, &mut guard, Duration::from_secs(1)), "rebuilt");
+    assert!(!r.closed());
+    r.store.set(Mode::Up);
+    assert!(
+        r.tick_until(600, |r| r.closed()),
+        "the rebuilt room finishes the handoff"
+    );
+    assert!(r.reported_restorable());
+    let cp = r.store.stored().expect("freeze capture stored");
+    assert_eq!(restored_health(&r.env, cp), frozen_at, "exactly the freeze capture");
+}
+
+/// Regression: a crash-looping room deletes its stored checkpoint (a still-valid ticket would
+/// otherwise recreate it from the state it keeps crashing on), but the delete only waited for
+/// the last incarnation's upload: an upload the first incarnation started before it crashed
+/// landed afterwards and resurrected the checkpoint.
+#[test]
+fn a_crash_loop_delete_is_not_undone_by_an_earlier_incarnation_s_upload() {
+    let mut r = Room::new();
+    for _ in 0..30 {
+        r.tick(17);
+    }
+    r.store.set(Mode::Hold);
+    r.commands.send(RoomCommand::Checkpoint).unwrap();
+    r.tick(17);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while r.store.held() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(r.store.held(), 1, "the first incarnation's upload is on its way");
+    let mut guard = CrashGuard::default();
+    assert!(crash(&mut r, &mut guard, Duration::from_secs(1)));
+    r.tick(17);
+    assert!(crash(&mut r, &mut guard, Duration::from_secs(2)));
+    r.tick(17);
+    assert!(!crash(&mut r, &mut guard, Duration::from_secs(3)), "crash loop: closed");
+    // The early upload lands well after the crash-loop delete was requested.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(r.store.release_one());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut gone_since = None;
+    while Instant::now() < deadline {
+        match (r.store.0.lock().stored.is_none(), gone_since) {
+            (true, None) => gone_since = Some(Instant::now()),
+            (false, _) => gone_since = None,
+            _ => {}
+        }
+        if gone_since.is_some_and(|t: Instant| t.elapsed() > Duration::from_millis(500)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        r.store.0.lock().stored.is_none(),
+        "the crash-looping room's checkpoint came back"
     );
 }

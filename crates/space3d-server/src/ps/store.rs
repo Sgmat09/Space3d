@@ -189,8 +189,9 @@ pub trait PlayerStore: Send + Sync + 'static {
     ) -> Task<Result<bool, StoreError>>;
     /// Load a room checkpoint.
     fn get_checkpoint(&self, room: RoomId) -> Task<Result<Option<StoredCheckpoint>, StoreError>>;
-    /// Delete a room checkpoint (room closed normally).
-    fn delete_checkpoint(&self, room: RoomId) -> Task<Result<(), StoreError>>;
+    /// Delete a room checkpoint of epoch `through_epoch` or older (room closed normally, or
+    /// voided with `u32::MAX`); a newer one belongs to a copy restored elsewhere and stays.
+    fn delete_checkpoint(&self, room: RoomId, through_epoch: u32) -> Task<Result<(), StoreError>>;
     /// Rooms with checkpoints saved at or after `min_saved_ms`.
     fn recent_checkpoints(&self, min_saved_ms: i64) -> Task<Result<Vec<RoomId>, StoreError>>;
     /// Delete every checkpoint saved before `before_ms` (garbage collection of checkpoints too
@@ -790,10 +791,10 @@ impl PlayerStore for SqliteStore {
         })
     }
 
-    fn delete_checkpoint(&self, room: RoomId) -> Task<Result<(), StoreError>> {
+    fn delete_checkpoint(&self, room: RoomId, through_epoch: u32) -> Task<Result<(), StoreError>> {
         self.tx(move |c| {
-            c.prepare_cached("DELETE FROM room_checkpoints WHERE room_id = ?1")?
-                .execute([room.0 as i64])?;
+            c.prepare_cached("DELETE FROM room_checkpoints WHERE room_id = ?1 AND epoch <= ?2")?
+                .execute(params![room.0 as i64, i64::from(through_epoch)])?;
             Ok(())
         })
     }
@@ -1077,7 +1078,7 @@ mod tests {
         assert!(b(s.put_checkpoint(RoomId(1), vec![6], key(2, 10))).unwrap());
         assert!(!b(s.put_checkpoint(RoomId(1), vec![7], key(1, 99))).unwrap());
         assert_eq!(b(s.get_checkpoint(RoomId(1))).unwrap(), Some((10, vec![6])));
-        b(s.delete_checkpoint(RoomId(1))).unwrap();
+        b(s.delete_checkpoint(RoomId(1), u32::MAX)).unwrap();
         assert_eq!(b(s.get_checkpoint(RoomId(1))).unwrap(), None);
         assert!(b(s.put_checkpoint(RoomId(2), vec![1], key(1, 100))).unwrap());
         assert!(b(s.put_checkpoint(RoomId(3), vec![2], key(1, 300))).unwrap());

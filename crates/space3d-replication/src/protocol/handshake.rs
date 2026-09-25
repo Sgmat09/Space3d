@@ -333,6 +333,16 @@ impl Reject {
             retry_after_ms: None,
         }
     }
+
+    /// A refusal worth retrying after `retry_after_ms`: the server is draining (the room is
+    /// moving, or will be placed elsewhere), the room is full, or the client is rate limited.
+    pub fn is_transient(&self) -> bool {
+        self.retry_after_ms.is_some()
+            && matches!(
+                self.code,
+                RejectCode::ServerDraining | RejectCode::RoomFull | RejectCode::RateLimited
+            )
+    }
 }
 
 impl Disconnect {

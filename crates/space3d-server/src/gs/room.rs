@@ -239,6 +239,10 @@ pub fn stop_hosted(app: &mut App) -> Option<Task<Result<(), StoreError>>> {
     if !rt.handoff_pending() {
         return None;
     }
+    if rt.handoff == Handoff::Freeze {
+        // Still waiting to freeze (the move was never acknowledged): capture it now, locally.
+        return emergency_stop(app);
+    }
     let store = rt.env.rescue.clone()?;
     let cp = rt.freeze_capture()?;
     tracing::error!(
@@ -405,7 +409,8 @@ pub struct PlayerDataLoaded {
 enum Handoff {
     /// Not handing off.
     None,
-    /// Drain received: freeze at the end of this tick ([`freeze_for_handoff`]).
+    /// Drain received: freeze ([`freeze_for_handoff`]) at the end of the first tick after the
+    /// player service acknowledged the move ([`MoveNotice`]).
     Freeze,
     /// Frozen (clients gone): the capture taken right after the freeze tick is the room's
     /// final state; the room closes once exactly that capture is stored.
@@ -417,6 +422,31 @@ enum Handoff {
         capture: Option<i64>,
     },
 }
+
+/// Telling the player service that the room is about to move (`FleetUp::RoomMoving`) before
+/// its clients are sent away: a drain handoff freezes the room, a shutdown closes it
+/// restorable, and either way the clients rejoin through the player service within
+/// milliseconds. The player service must already hold those rejoins
+/// (`ps::routes::wait_for_handoff`), or it sends them straight back to the room they just
+/// left, whose server refuses them (`Reject(ServerDraining)`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MoveNotice {
+    /// Not moving.
+    #[default]
+    None,
+    /// `RoomMoving` sent; the clients stay until `RoomCommand::MoveAcked` arrives, for at most
+    /// [`MOVE_ACK_WAIT`] (ticks waited so far).
+    Sent {
+        /// Ticks waited.
+        waited: u32,
+    },
+    /// Acknowledged (or given up waiting): the clients may go.
+    Done,
+}
+
+/// Longest a moving room keeps its clients while waiting for the player service to
+/// acknowledge the move (a lost or slow fleet link must not hold the drain).
+pub const MOVE_ACK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq)]
 enum Closing {
@@ -436,27 +466,30 @@ enum Closing {
 /// A checkpoint upload in flight.
 pub type Upload = Task<Result<(), StoreError>>;
 
-/// Delete `room`'s stored checkpoint once `upload` (an upload already in flight) settled — a
-/// later landing would resurrect the row.
-pub fn delete_checkpoint_after(env: &RoomEnv, room: RoomId, upload: Option<Upload>) {
+/// Delete `room`'s stored checkpoint once `uploads` (uploads already in flight, of this copy
+/// and of the incarnations a crash rebuild replaced) settled — a later landing would resurrect
+/// the row. Only a checkpoint of epoch `through_epoch` or older goes: a newer one belongs to a
+/// copy restored elsewhere (a stale copy left running behind a fleet partition that closes
+/// normally must not delete the live copy's checkpoint).
+pub fn delete_checkpoint_after(env: &RoomEnv, room: RoomId, through_epoch: u32, uploads: Vec<Upload>) {
     if !env.checkpoints.enabled() {
         return;
     }
     let store = env.checkpoints.clone();
     drop(space3d_tasks::spawn(async move {
-        if let Some(upload) = upload {
+        for upload in uploads {
             let _ = upload.wait().await;
         }
-        if let Some(Err(e)) = store.delete(room).wait().await {
+        if let Some(Err(e)) = store.delete(room, through_epoch).wait().await {
             tracing::warn!(%room, error = %e, "checkpoint delete failed");
         }
     }));
 }
 
 /// The room is closed for good outside a normal close (crash loop): stop its uploads and
-/// delete its stored checkpoint (after an upload in flight settled). Otherwise the row stays
-/// until garbage collection, and a join ticket that is still valid recreates the crash-looping
-/// room from it.
+/// delete its stored checkpoint (after every upload in flight settled, including those its
+/// earlier incarnations started before they crashed). Otherwise the row stays until garbage
+/// collection, and a join ticket that is still valid recreates the crash-looping room from it.
 pub fn discard_checkpoint(app: &mut App) {
     let Some(rt) = app.resources.get_mut::<RoomRuntime>() else {
         return;
@@ -464,8 +497,102 @@ pub fn discard_checkpoint(app: &mut App) {
     rt.retired.store(true, Ordering::Release);
     rt.want_checkpoint = false;
     rt.queued_upload = None;
-    let upload = rt.upload.take();
-    delete_checkpoint_after(&rt.env, rt.spec.room_id, upload);
+    let uploads = rt.take_uploads();
+    delete_checkpoint_after(&rt.env, rt.spec.room_id, rt.epoch, uploads);
+}
+
+/// What a crash rebuild carries from the crashed incarnation of a room into the rebuilt one
+/// ([`take_for_rebuild`] → [`adopt_carried`]): its uploads still in flight, and where it was in
+/// its drain (phase, joinability, drain deadline, handoff, move notice, pending close,
+/// confirmed capture). A panic while a persistent room was frozen for its drain handoff used to
+/// rebuild it as a fresh, joinable room that never finished the handoff — the player service
+/// kept it "moving" and every rejoin failed.
+pub struct Carried {
+    uploads: Vec<Upload>,
+    phase: RoomPhase,
+    joinable: bool,
+    drain_deadline_ms: Option<i64>,
+    handoff: Handoff,
+    move_notice: MoveNotice,
+    closing: Option<Closing>,
+    uploaded_ms: Option<i64>,
+}
+
+impl Carried {
+    /// The rebuild failed: the room is gone for good; delete its stored checkpoint once the
+    /// carried uploads settled.
+    pub fn discard(self, env: &RoomEnv, room: RoomId, through_epoch: u32) {
+        delete_checkpoint_after(env, room, through_epoch, self.uploads);
+    }
+}
+
+/// A crashed room's parts for its rebuild: the command receiver, its latest in-memory
+/// checkpoint and what the rebuilt room carries over ([`Carried`]). Removes the `RoomRuntime`.
+/// A queued upload is abandoned (the rebuilt room, epoch + 1, uploads its own; stores refuse
+/// older epochs anyway).
+pub fn take_for_rebuild(
+    app: &mut App,
+) -> Option<(crossbeam_channel::Receiver<RoomCommand>, Option<Checkpoint>, Carried)> {
+    let joinable = app.resources.get::<NetServer>().is_none_or(NetServer::is_joinable);
+    let drain_deadline_ms = app.resources.get::<RoomContext>().and_then(|c| c.drain_deadline_ms);
+    let mut rt = app.resources.remove::<RoomRuntime>()?;
+    let uploads = rt.take_uploads();
+    let carried = Carried {
+        uploads,
+        phase: rt.phase,
+        joinable,
+        drain_deadline_ms,
+        handoff: rt.handoff,
+        move_notice: rt.move_notice,
+        closing: rt.closing.take(),
+        uploaded_ms: rt.uploaded_ms,
+    };
+    Some((rt.commands.clone(), rt.last_checkpoint.take(), carried))
+}
+
+/// Continue the crashed incarnation's state in its rebuilt room (see [`Carried`]). A room
+/// frozen for its handoff stays frozen on exactly its freeze capture (the room was rebuilt from
+/// it) and uploads it again; a room frozen before its freeze capture was taken freezes again
+/// at once (its clients are gone already).
+pub fn adopt_carried(app: &mut App, carried: Carried) {
+    let Carried {
+        uploads,
+        phase,
+        joinable,
+        drain_deadline_ms,
+        handoff,
+        move_notice,
+        closing,
+        uploaded_ms,
+    } = carried;
+    if let Some(ctx) = app.resources.get_mut::<RoomContext>() {
+        ctx.drain_deadline_ms = drain_deadline_ms;
+    }
+    if !joinable && let Some(net) = app.resources.get_mut::<NetServer>() {
+        net.set_joinable(false);
+    }
+    let Some(rt) = app.resources.get_mut::<RoomRuntime>() else {
+        return;
+    };
+    let restored_from = rt.last_checkpoint.as_ref().map(|cp| cp.saved_ms);
+    rt.earlier_uploads = uploads;
+    if matches!(phase, RoomPhase::Running | RoomPhase::Ending) {
+        rt.phase = phase;
+    }
+    rt.closing = closing;
+    rt.uploaded_ms = uploaded_ms;
+    rt.move_notice = move_notice;
+    rt.handoff = match handoff {
+        Handoff::Frozen { capture: Some(at) } if restored_from == Some(at) => Handoff::Frozen { capture: Some(at) },
+        Handoff::Frozen { .. } => {
+            rt.move_notice = MoveNotice::Done;
+            Handoff::Freeze
+        }
+        other => other,
+    };
+    if rt.handoff != Handoff::None {
+        tracing::warn!(room = %rt.spec.room_id, handoff = ?rt.handoff, "room rebuilt during its drain handoff; continuing it");
+    }
 }
 
 /// Resource: the room's operational state (internal; inserted by [`build_room_app`]).
@@ -495,6 +622,13 @@ pub struct RoomRuntime {
     uploaded_ms: Option<i64>,
     /// Drain handoff of a persistent room (see [`Handoff`]).
     handoff: Handoff,
+    /// Announcing a move to the player service (see [`MoveNotice`]).
+    move_notice: MoveNotice,
+    /// [`MOVE_ACK_WAIT`] in ticks.
+    move_ack_wait_ticks: u32,
+    /// Uploads that earlier incarnations of this room (replaced by crash rebuilds) had in
+    /// flight: deleting the stored checkpoint waits for them too.
+    earlier_uploads: Vec<Upload>,
     /// Ticks until a failed handoff upload is retried.
     handoff_retry_in: u32,
     resumed: EventReader,
@@ -544,6 +678,9 @@ impl RoomRuntime {
             uploading_ms: None,
             uploaded_ms: None,
             handoff: Handoff::None,
+            move_notice: MoveNotice::None,
+            move_ack_wait_ticks: ticks(MOVE_ACK_WAIT),
+            earlier_uploads: Vec::new(),
             handoff_retry_in: 0,
             resumed: EventReader::default(),
             bans_seen: u64::MAX,
@@ -556,17 +693,30 @@ impl RoomRuntime {
         }
     }
 
-    /// Split for a crash rebuild: the command receiver, the latest in-memory checkpoint and the
-    /// upload in flight (if any). A queued upload is abandoned (the rebuilt room, epoch + 1,
-    /// uploads its own; stores refuse older epochs anyway).
-    pub fn into_parts(
-        mut self,
-    ) -> (
-        crossbeam_channel::Receiver<RoomCommand>,
-        Option<Checkpoint>,
-        Option<Upload>,
-    ) {
-        (self.commands.clone(), self.last_checkpoint.take(), self.upload.take())
+    /// Every upload still in flight: this copy's and its earlier incarnations' (finished ones
+    /// are dropped). A queued upload is abandoned.
+    fn take_uploads(&mut self) -> Vec<Upload> {
+        self.queued_upload = None;
+        let mut uploads = std::mem::take(&mut self.earlier_uploads);
+        uploads.extend(self.upload.take());
+        uploads.retain_mut(|t| t.state() == TaskState::Pending);
+        uploads
+    }
+
+    /// Tell the player service the room is about to move (once); the clients stay until it
+    /// acknowledged ([`MoveNotice`]).
+    fn announce_move(&mut self) {
+        if self.move_notice == MoveNotice::None {
+            self.uplink(FleetUp::RoomMoving {
+                room_id: self.spec.room_id,
+            });
+            self.move_notice = MoveNotice::Sent { waited: 0 };
+        }
+    }
+
+    /// Still waiting for the player service to acknowledge the move.
+    fn awaiting_move_ack(&self) -> bool {
+        matches!(self.move_notice, MoveNotice::Sent { .. })
     }
 
     /// Current phase.
@@ -594,10 +744,14 @@ impl RoomRuntime {
         }
     }
 
-    /// Frozen for a handoff and the freeze capture is not stored yet.
+    /// Handing off and the freeze capture is not stored yet (not taken yet while the room waits
+    /// for the player service to acknowledge the move).
     fn handoff_pending(&self) -> bool {
-        matches!(self.handoff, Handoff::Frozen { capture }
-            if capture.is_none_or(|at| self.uploaded_ms.is_none_or(|saved| saved < at)))
+        match self.handoff {
+            Handoff::None => false,
+            Handoff::Freeze => true,
+            Handoff::Frozen { capture } => capture.is_none_or(|at| self.uploaded_ms.is_none_or(|saved| saved < at)),
+        }
     }
 
     /// The freeze capture of a room frozen for a handoff (once taken).
@@ -656,6 +810,7 @@ impl RoomRuntime {
     }
 
     fn poll_upload(&mut self) {
+        self.earlier_uploads.retain_mut(|t| t.state() == TaskState::Pending);
         let Some(task) = &mut self.upload else {
             return;
         };
@@ -756,9 +911,19 @@ fn apply_command(
             rt.closing.get_or_insert(Closing::Close(reason));
         }
         RoomCommand::Shutdown => {
-            if !matches!(rt.closing, Some(Closing::Shutdown { .. })) {
+            // A superseded copy closes as such (nothing uploaded; the live copy owns the room).
+            if !matches!(rt.closing, Some(Closing::Shutdown { .. } | Closing::Superseded)) {
                 rt.closing = Some(Closing::Shutdown { waited: 0 });
                 rt.request_checkpoint();
+                if rt.env.checkpoints.enabled() {
+                    // It closes restorable: its players' rejoin restores it elsewhere.
+                    rt.announce_move();
+                }
+            }
+        }
+        RoomCommand::MoveAcked => {
+            if rt.awaiting_move_ack() {
+                rt.move_notice = MoveNotice::Done;
             }
         }
         RoomCommand::Drain { deadline } => {
@@ -770,11 +935,13 @@ fn apply_command(
             net.set_joinable(false);
             net.notice(Target::All, Notice::ShuttingDown { in_ms });
             if rt.spec.persistent && rt.env.checkpoints.enabled() && rt.handoff == Handoff::None {
-                // Persistent worlds move: the room freezes at the end of this tick (see
-                // `freeze_for_handoff`) and closes once its freeze capture is stored; its
-                // players' rejoin then restores it on another server from exactly that state.
+                // Persistent worlds move: once the player service acknowledged the move, the
+                // room freezes (see `freeze_for_handoff`) and closes when its freeze capture is
+                // stored; its players' rejoin then restores it on another server from exactly
+                // that state.
                 net.notice(Target::All, Notice::Reconnect);
                 rt.handoff = Handoff::Freeze;
+                rt.announce_move();
             }
             rt.set_phase(RoomPhase::Ending);
         }
@@ -837,7 +1004,15 @@ fn room_ops(ctx: &mut SystemCtx) {
         forward_requests(res, rt);
         let arrived = presence(res, rt);
         enforce_bans(res, rt, arrived);
-        if rt.handoff == Handoff::Freeze {
+        if let MoveNotice::Sent { waited } = rt.move_notice {
+            if waited >= rt.move_ack_wait_ticks {
+                tracing::warn!(room = %rt.spec.room_id, "the player service did not acknowledge the move in time; sending the clients away anyway");
+                rt.move_notice = MoveNotice::Done;
+            } else {
+                rt.move_notice = MoveNotice::Sent { waited: waited + 1 };
+            }
+        }
+        if rt.handoff == Handoff::Freeze && !rt.awaiting_move_ack() {
             freeze_for_handoff(res, rt);
         }
         rt.poll_upload();
@@ -980,22 +1155,20 @@ fn forward_requests(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     }
 }
 
-/// Freeze a draining persistent room for its handoff (end of the drain tick, after this tick's
-/// snapshot went out): its clients are disconnected (`Disconnect(ServerShutdown)`, "rejoin"),
-/// so from here on nobody can change or observe it, and the capture taken right after this
-/// tick holds everything its players saw. The player service holds their rejoins
-/// (`FleetUp::RoomMoving`) until that capture is stored and the room closes
-/// (`RoomClosed { restorable }`). Keeping the room playable during the upload lost every change
-/// made in that window: the restore used the earlier capture.
+/// Freeze a draining persistent room for its handoff (end of the first tick after the player
+/// service acknowledged the move, after this tick's snapshot went out): its clients are
+/// disconnected (`Disconnect(ServerShutdown)`, "rejoin"), so from here on nobody can change or
+/// observe it, and the capture taken right after this tick holds everything its players saw.
+/// The player service already holds their rejoins (it acknowledged `FleetUp::RoomMoving`) until
+/// that capture is stored and the room closes (`RoomClosed { restorable }`). Keeping the room
+/// playable during the upload lost every change made in that window: the restore used the
+/// earlier capture.
 fn freeze_for_handoff(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     res.expect_mut::<NetServer>().disconnect_all(
         DisconnectCode::ServerShutdown,
         "room moved to another server; rejoin",
         false,
     );
-    rt.uplink(FleetUp::RoomMoving {
-        room_id: rt.spec.room_id,
-    });
     rt.want_checkpoint = true;
     rt.queued_upload = None;
     rt.handoff = Handoff::Frozen { capture: None };
@@ -1080,7 +1253,9 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
         }
         Closing::Shutdown { waited } => {
             let busy = rt.want_checkpoint || rt.uploading();
-            if busy && waited < SHUTDOWN_UPLOAD_WAIT_S * rt.ticks_per_second {
+            // The clients go once the player service holds their rejoins (bounded by
+            // `MOVE_ACK_WAIT`), and the final capture is stored (bounded).
+            if (busy && waited < SHUTDOWN_UPLOAD_WAIT_S * rt.ticks_per_second) || rt.awaiting_move_ack() {
                 rt.closing = Some(Closing::Shutdown { waited: waited + 1 });
                 return;
             }
@@ -1097,10 +1272,10 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     };
     res.expect_mut::<NetServer>().disconnect_all(code, &reason, false);
     if !keep_checkpoint && rt.env.checkpoints.enabled() {
-        // Delete after the in-flight upload settles (a later upload would resurrect the row).
-        rt.queued_upload = None;
-        let upload = rt.upload.take();
-        delete_checkpoint_after(&rt.env, rt.spec.room_id, upload);
+        // Delete after the uploads in flight settle (a later upload would resurrect the row),
+        // and only this copy's checkpoint (or an older one).
+        let uploads = rt.take_uploads();
+        delete_checkpoint_after(&rt.env, rt.spec.room_id, rt.epoch, uploads);
     }
     rt.uplink(FleetUp::RoomClosed {
         room_id: rt.spec.room_id,
@@ -1220,6 +1395,7 @@ fn publish_status(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
         persistent: rt.spec.persistent,
         abandon_on_loss: rt.env.game.recovery_policy(&rt.spec) == crate::game::RecoveryPolicy::Abandon,
         origin: rt.origin,
+        moves_on_drain: rt.spec.persistent && rt.env.checkpoints.enabled(),
     };
 }
 

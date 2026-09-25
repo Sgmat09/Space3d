@@ -122,9 +122,12 @@ pub struct RoomEntry {
     pub status: Option<RoomStatus>,
     /// The hosting server died; the room awaits rejoin + restore.
     pub orphaned: bool,
-    /// A draining server froze the room for a handoff and is storing its final checkpoint
-    /// (`FleetUp::RoomMoving`); cleared when it is stored (`RoomClosed { restorable }`).
+    /// The room is about to move (`FleetUp::RoomMoving`: a draining server froze it for a
+    /// handoff, or closes it restorable at shutdown) and its final checkpoint is being stored;
+    /// cleared when it is (`RoomClosed { restorable }`).
     pub moving: bool,
+    /// When `moving` was set (unix ms; see [`HANDOFF_STALL_MS`]).
+    pub moving_since_ms: i64,
     /// When the entry was created / orphaned (unix ms).
     pub since_ms: i64,
 }
@@ -190,6 +193,24 @@ enum OpVerdict {
     /// The live copy has not reported its restore point yet: neither apply nor ack (the
     /// outbox sends it again).
     Hold,
+}
+
+/// A room still moving this long after its server said so (`FleetUp::RoomMoving`) is given up
+/// on: its final checkpoint never got stored (the room crashed or hung while frozen, its store
+/// kept failing). A rejoin then restores it elsewhere from the last checkpoint that was stored,
+/// and the copy left behind is closed (`FleetDown::RoomSuperseded`) instead of holding every
+/// rejoin forever.
+pub const HANDOFF_STALL_MS: i64 = 30_000;
+
+/// Whether a rejoin into a room has to wait for its handoff ([`FleetRegistry::moving`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Moving {
+    /// Not moving: the rejoin goes to where the room is (or restores it if it was lost).
+    No,
+    /// Moving: wait until the room is stored (`RoomClosed { restorable }`), then restore it.
+    Yes,
+    /// The move stalled ([`HANDOFF_STALL_MS`]): restore from the last stored checkpoint.
+    Stalled,
 }
 
 /// Tick budget used in the load score (60 Hz).
@@ -333,6 +354,7 @@ impl FleetRegistry {
                         status: None,
                         orphaned: false,
                         moving: false,
+                        moving_since_ms: 0,
                         since_ms: now_ms,
                     });
                     entry.server = server_id.to_owned();
@@ -385,6 +407,7 @@ impl FleetRegistry {
                     status: None,
                     orphaned: false,
                     moving: false,
+                    moving_since_ms: 0,
                     since_ms: now_ms,
                 });
                 entry.server = server_id.to_owned();
@@ -414,10 +437,18 @@ impl FleetRegistry {
                 Vec::new()
             }
             FleetUp::RoomMoving { room_id } => {
-                if let Some(e) = self.rooms.get_mut(&room_id).filter(|e| e.server == server_id) {
+                if let Some(e) = self.rooms.get_mut(&room_id).filter(|e| e.server == server_id)
+                    && !e.moving
+                {
                     e.moving = true;
+                    e.moving_since_ms = now_ms;
                 }
-                Vec::new()
+                // The room keeps its clients until this answer: from here on their rejoins are
+                // held (`moving`), not sent back to the room they are leaving.
+                vec![FleetEffect::Send {
+                    server: server_id.to_owned(),
+                    msg: FleetDown::RoomMovingAck { room_id },
+                }]
             }
             FleetUp::Deregister { reason } => {
                 tracing::info!(server = %server_id, %reason, "game server deregistered");
@@ -722,6 +753,7 @@ impl FleetRegistry {
                 status: None,
                 orphaned: false,
                 moving: false,
+                moving_since_ms: 0,
                 since_ms: now_ms,
             },
         );
@@ -828,6 +860,30 @@ impl FleetRegistry {
                     since_ms: now_ms,
                 },
             );
+        }
+    }
+
+    /// Whether a rejoin into `room` must wait for a handoff: the room said it is moving
+    /// (`FleetUp::RoomMoving`), or it moves on drain and its server is draining (its
+    /// `RoomMoving` may still be on the way). Never for a room whose server is gone (orphaned /
+    /// dead: restore now).
+    pub fn moving(&self, room: RoomId, now_ms: i64) -> Moving {
+        let Some(e) = self.rooms.get(&room).filter(|e| !e.orphaned) else {
+            return Moving::No;
+        };
+        let Some(server) = self.servers.get(&e.server).filter(|s| s.state != ServerState::Dead) else {
+            return Moving::No;
+        };
+        if e.moving {
+            if now_ms.saturating_sub(e.moving_since_ms) >= HANDOFF_STALL_MS {
+                Moving::Stalled
+            } else {
+                Moving::Yes
+            }
+        } else if server.state == ServerState::Draining && e.status.as_ref().is_some_and(|s| s.moves_on_drain) {
+            Moving::Yes
+        } else {
+            Moving::No
         }
     }
 
@@ -1277,8 +1333,20 @@ mod tests {
         f.note_room(&spec(1, "world", 8), "gs-1", 0);
         f.on_message("gs-2", FleetUp::RoomMoving { room_id: RoomId(1) }, 10);
         assert!(!f.room(RoomId(1)).unwrap().moving, "only the host moves its room");
-        f.on_message("gs-1", FleetUp::RoomMoving { room_id: RoomId(1) }, 20);
+        // The room keeps its clients until this answer.
+        let effects = f.on_message("gs-1", FleetUp::RoomMoving { room_id: RoomId(1) }, 20);
+        assert_eq!(
+            effects,
+            vec![FleetEffect::Send {
+                server: "gs-1".into(),
+                msg: FleetDown::RoomMovingAck { room_id: RoomId(1) }
+            }]
+        );
         assert!(f.room(RoomId(1)).unwrap().moving);
+        assert_eq!(f.moving(RoomId(1), 20), Moving::Yes);
+        // A move that never completes is given up on: restore from the last stored checkpoint.
+        assert_eq!(f.moving(RoomId(1), 20 + HANDOFF_STALL_MS - 1), Moving::Yes);
+        assert_eq!(f.moving(RoomId(1), 20 + HANDOFF_STALL_MS), Moving::Stalled);
         f.on_message(
             "gs-1",
             FleetUp::RoomClosed {
@@ -1290,6 +1358,38 @@ mod tests {
         );
         let e = f.room(RoomId(1)).unwrap();
         assert!(e.orphaned && !e.moving);
+        assert_eq!(f.moving(RoomId(1), 40), Moving::No, "stored: restore now");
+    }
+
+    /// A draining server's persistent room is moving as soon as the draining heartbeat is in,
+    /// even before its `RoomMoving` arrives (rejoins must not be sent back to it); a match room
+    /// on a draining server is not (its rejoins go back to it).
+    #[test]
+    fn rooms_that_move_on_drain_are_moving_once_their_server_drains() {
+        let status = |id: u64, moves_on_drain: bool| RoomStatus {
+            room_id: RoomId(id),
+            mode: "world".into(),
+            players: 1,
+            max_players: 8,
+            player_ids: vec![PlayerId(id * 10)],
+            moves_on_drain,
+            ..Default::default()
+        };
+        let mut f = FleetRegistry::new(10_000, 300_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        f.on_message("gs-1", hb(2, vec![status(1, true), status(2, false)]), 10);
+        assert_eq!(f.moving(RoomId(1), 10), Moving::No);
+        let draining = Heartbeat {
+            draining: true,
+            rooms: vec![status(1, true), status(2, false)],
+            ..Default::default()
+        };
+        f.on_message("gs-1", FleetUp::Heartbeat(draining), 20);
+        assert_eq!(f.moving(RoomId(1), 20), Moving::Yes);
+        assert_eq!(f.moving(RoomId(2), 20), Moving::No, "a match finishes where it runs");
+        // The server is gone: restore now.
+        f.sweep(20 + 10_001, 10_000);
+        assert_eq!(f.moving(RoomId(1), 20 + 10_001), Moving::No);
     }
 
     #[test]

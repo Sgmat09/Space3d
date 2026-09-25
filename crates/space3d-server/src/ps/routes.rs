@@ -493,33 +493,32 @@ async fn quick_play(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, bo
     )))
 }
 
-/// Longest a rejoin waits for a persistent room that its draining server froze for a handoff
-/// (`FleetUp::RoomMoving`) until the room's final checkpoint is stored.
+/// Longest a rejoin waits for a room that is moving to another server (`FleetUp::RoomMoving`,
+/// or a draining server's persistent room) until the room's final checkpoint is stored.
 const HANDOFF_REJOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Wait (bounded, real time) while `player`'s room is being handed off: going back to the
-/// frozen room would fail, and restoring it now would use an older checkpoint.
+/// Retry hint of a rejoin that timed out waiting for a handoff (`503 room_moving`).
+const HANDOFF_RETRY_AFTER_MS: u32 = 1_000;
+
+/// Wait (bounded, real time) while `player`'s room is being handed off: going back to the room
+/// being frozen / closed would fail (its server is draining), and restoring it now would use an
+/// older checkpoint.
 async fn wait_for_handoff(svc: &PlayerService, player: PlayerId) -> Result<(), ApiErr> {
     let started = std::time::Instant::now();
     loop {
         let moving = {
             let fleet = svc.fleet.lock();
-            fleet.room_of(player).is_some_and(|(room, server)| {
-                fleet.room(room).is_some_and(|e| e.moving && !e.orphaned)
-                    && fleet
-                        .server(&server)
-                        .is_some_and(|s| s.state != super::fleet::ServerState::Dead)
-            })
+            fleet
+                .room_of(player)
+                .is_some_and(|(room, _)| fleet.moving(room, svc.now_ms()) == super::fleet::Moving::Yes)
         };
         if !moving {
             return Ok(());
         }
         if started.elapsed() >= HANDOFF_REJOIN_WAIT {
-            return Err(api_err(
-                503,
-                "room_moving",
-                "the room is moving to another server; retry",
-            ));
+            let mut e = api_err(503, "room_moving", "the room is moving to another server; retry");
+            e.1.retry_after_ms = Some(HANDOFF_RETRY_AFTER_MS);
+            return Err(e);
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -528,9 +527,9 @@ async fn wait_for_handoff(svc: &PlayerService, player: PlayerId) -> Result<(), A
 async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res<Assignment> {
     let who = require(&svc, &meta)?;
     let account = account_of(&svc, who.player()).await?;
+    wait_for_handoff(&svc, account.id).await?;
     let now = svc.now_ms();
     let reserve = svc.config.player_service.join_ticket_ttl.as_millis() as i64;
-    wait_for_handoff(&svc, account.id).await?;
     let mut abandoned: Option<(RoomId, Option<space3d_replication::MatchId>)> = None;
     let placed = {
         let mut fleet = svc.fleet.lock();
@@ -563,7 +562,13 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
             .filter(|s| s.state != super::fleet::ServerState::Dead)
             .cloned();
         let abandon = entry.status.as_ref().is_some_and(|s| s.abandon_on_loss);
-        if let (false, Some(host)) = (entry.orphaned, host) {
+        // A handoff that never completed (the room's final checkpoint was never stored): restore
+        // from the last stored checkpoint; the copy left behind is superseded.
+        let stalled = fleet.moving(room, now) == super::fleet::Moving::Stalled;
+        if stalled {
+            tracing::warn!(%room, server = %server_id, "room handoff stalled; restoring it from its last stored checkpoint");
+        }
+        if let (false, Some(host)) = (entry.orphaned || stalled, host) {
             Some((host, spec, team))
         } else if entry.orphaned && abandon {
             // `RecoveryPolicy::Abandon`: void the room; clients go back to matchmaking.
@@ -600,7 +605,7 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
     if let Some((room, match_id)) = abandoned {
         tracing::info!(room = %room, ?match_id, "orphaned room abandoned (recovery policy); match void");
         // Its checkpoint is never restored (the room is void); do not keep it until GC.
-        drop(svc.store.delete_checkpoint(room));
+        drop(svc.store.delete_checkpoint(room, u32::MAX));
         let detail = serde_json::json!({ "room": room, "match_id": match_id, "reason": "server lost" });
         let _ = wait(svc.store.audit("system".into(), "match_void".into(), detail, now)).await;
         svc.metrics.match_void();
@@ -852,14 +857,23 @@ async fn cp_get(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, Path(i
     }
 }
 
+#[derive(serde::Deserialize)]
+struct DeleteQuery {
+    /// Delete only a checkpoint of this epoch or older (the deleting copy's); absent = any.
+    #[serde(default)]
+    through_epoch: Option<u32>,
+}
+
 async fn cp_delete(
     State(svc): State<Arc<PlayerService>>,
     meta: RequestMeta,
     Path(id): Path<String>,
+    Query(q): Query<DeleteQuery>,
 ) -> Result<StatusCode, ApiErr> {
     fleet_auth(&svc, &meta)?;
     let room: RoomId = id.parse().map_err(|_| api_err(400, "bad_request", "room id"))?;
-    wait(svc.store.delete_checkpoint(room)).await?;
+    let through = q.through_epoch.unwrap_or(u32::MAX);
+    wait(svc.store.delete_checkpoint(room, through)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

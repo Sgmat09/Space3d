@@ -28,7 +28,7 @@ fn two_hundred_clients_through_the_player_service() {
     let queues = format!(
         "[{{ name = \"{MODE}\", mode = \"{MODE}\", teams = 1, team_size = 20, min_players = 1, backfill = true }}]"
     );
-    let server = Server::start(&[("SPACE3D__MATCHMAKING__QUEUES", queues.as_str())]);
+    let mut server = Server::start(&[("SPACE3D__MATCHMAKING__QUEUES", queues.as_str())]);
     let protocol: fn(&mut space3d_core::App) = |app| {
         app.add_plugin(CubesProtocol);
     };
@@ -58,8 +58,9 @@ fn two_hundred_clients_through_the_player_service() {
     )
     .expect("load test runs");
     println!("{report:#?}");
-    let (status, err) = server.stop();
-    assert!(status.success(), "server exit {status}:\n{err}");
+    let status = server.stop();
+    assert!(status.success(), "server exit {status}:\n{}", server.proc.output());
+    server.proc.assert_no_errors();
     assert_eq!(report.connected, clients, "{report:#?}");
     let server_side = report.server.as_ref().expect("metrics scraped");
     // Shard threads catch up to `max_catchup_ticks` late ticks; skipping means a room fell

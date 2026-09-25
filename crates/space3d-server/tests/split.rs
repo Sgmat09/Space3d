@@ -267,3 +267,81 @@ fn split_processes_register_play_checkpoint_lose_a_server_and_restore_elsewhere(
     });
     assert!(restored, "restored room detail: {detail}");
 }
+
+/// Regression: a game server that leaves the fleet sends `Deregister` and closes its link right
+/// after (a graceful close since the fleet link closes with a handshake). When both reached the
+/// player service within one supervisor tick, the close removed the connection before its
+/// messages were handled: the `Deregister` then counted as coming from an unregistered link and
+/// was dropped (the server stayed "ready" until its lease ran out, and its clean close was
+/// logged as a warning). The player service now handles a link's last messages first.
+#[test]
+fn a_deregister_sent_right_before_the_fleet_link_closes_is_handled() {
+    use space3d_net::{WsClient, WsConfig};
+    use space3d_server::gs::fleet::{Capacity, FleetUp, ServerRegistration};
+    let dir = tempfile::tempdir().unwrap();
+    let mut ps = player_service(dir.path());
+    let handle = ps.resources.expect::<PlayerServiceHandle>().clone();
+    let token = secrets().fleet_token.clone();
+    let registration = ServerRegistration {
+        token: token.clone(),
+        server_id: "gs-raw".into(),
+        region: String::new(),
+        public_url: "ws://127.0.0.1:9/play".into(),
+        game_id: GAME_ID.into(),
+        build: "test".into(),
+        protocol: space3d_replication::PROTOCOL_VERSION,
+        schema_hash: 0,
+        capacity: Capacity {
+            max_rooms: 1,
+            max_players: 1,
+        },
+        modes: Vec::new(),
+    };
+    let url = format!("{}/internal/v1/fleet", handle.url().replacen("http://", "ws://", 1));
+    let link = WsClient::connect_with(
+        url,
+        WsConfig::default().header("authorization", format!("Bearer {token}")),
+    );
+    link.send(serde_json::to_string(&FleetUp::Register(registration)).unwrap())
+        .unwrap();
+    let known = |ps: &App| {
+        ps.resources
+            .expect::<PlayerServiceHandle>()
+            .service
+            .fleet
+            .lock()
+            .server("gs-raw")
+            .map(|s| s.state)
+    };
+    let end = Instant::now() + Duration::from_secs(10);
+    while known(&ps).is_none() {
+        assert!(Instant::now() < end, "registered");
+        ps.update(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(known(&ps), Some(ServerState::Ready));
+    // Leave the fleet: `Deregister`, then close at once — both arrive before the player
+    // service's next tick.
+    link.send(
+        serde_json::to_string(&FleetUp::Deregister {
+            reason: "drained".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    link.close();
+    let end = Instant::now() + Duration::from_secs(10);
+    while !link.is_closed() {
+        assert!(Instant::now() < end, "closed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    ps.update(Duration::from_millis(100));
+    // Deregistered: dead at once, and forgotten (it hosted no rooms) — long before its lease
+    // (2 s) could have run out.
+    assert!(
+        matches!(known(&ps), None | Some(ServerState::Dead)),
+        "the Deregister was dropped: {:?}",
+        known(&ps)
+    );
+}
