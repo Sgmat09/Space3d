@@ -249,8 +249,9 @@ fn exposure_stops_are_linear() {
 fn ldr_fallback_matches_hdr_perceptually() {
     let Some(mut app) = headless_app(96, 64) else { return };
     let cam = lit_scene(&mut app);
+    // Bloom is off in the Ldr fallback by design: compare the rest.
     app.world
-        .insert_one(cam, PostProcess::default().with_exposure(1.0))
+        .insert_one(cam, PostProcess::default().without_bloom().with_exposure(1.0))
         .unwrap();
     let hdr = render(&mut app);
     let s = stats(&app);
@@ -318,7 +319,10 @@ fn compact_hdr_only_on_opaque_primary() {
     let compact = app.resources.expect::<Renderer>().graphics_caps().compact_hdr_format;
     quad(&mut app, Vec3::splat(2.0), Vec3::ZERO, 1.0);
     let cam = camera(&mut app, Vec4::new(0.0, 0.0, 0.0, 1.0));
-    app.world.insert_one(cam, PostProcess::default()).unwrap();
+    // The scene texture alone (no bloom chain).
+    app.world
+        .insert_one(cam, PostProcess::default().without_bloom())
+        .unwrap();
     let bytes = |app: &mut App| {
         render(app);
         stats(app).target_bytes
@@ -407,7 +411,7 @@ fn gizmo_camera_is_display_view() {
     quad(&mut app, Vec3::splat(0.5), Vec3::ZERO, 1.0);
     let cam = camera(&mut app, Vec4::new(0.0, 0.0, 0.0, 1.0));
     app.world
-        .insert_one(cam, PostProcess::default().with_exposure(2.0))
+        .insert_one(cam, PostProcess::default().without_bloom().with_exposure(2.0))
         .unwrap();
     let tonemapped = render(&mut app).get(W / 2, H / 2);
     let agx = Tonemapper::AgX.apply(Vec3::splat(2.0));
@@ -680,7 +684,10 @@ fn webgl2_override_parity_msaa_and_blending() {
     for (name, samples, blended, split) in cases {
         let Some(mut app) = headless_app(PW, PH) else { return };
         let cam = lit_scene(&mut app);
-        app.world.insert_one(cam, PostProcess::default()).unwrap();
+        // Bloom is off in the Ldr fallback by design: compare the rest.
+        app.world
+            .insert_one(cam, PostProcess::default().without_bloom())
+            .unwrap();
         let translucent = blended.then(|| {
             let mesh = app
                 .resources
@@ -707,7 +714,7 @@ fn webgl2_override_parity_msaa_and_blending() {
                     clear_color: Some(Vec4::new(0.3, 0.2, 0.1, 1.0)),
                     ..Default::default()
                 },
-                PostProcess::default().with_exposure(-0.5),
+                PostProcess::default().without_bloom().with_exposure(-0.5),
             ));
             let gizmo = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.3));
             app.world.spawn((

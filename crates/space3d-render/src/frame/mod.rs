@@ -34,8 +34,8 @@ use extract::{GpuInstances, KeyBuckets, MaterialTable, Source, SourceBuffer};
 pub(crate) use nodes::{NodeCache, SceneInputs};
 use plan::{CameraItem, CameraPlan, FramePostGroup, PrimaryDisplay, TargetGroup};
 pub(crate) use plan::{GroupTarget, PlanWarnings};
-pub(crate) use targets::TexturePool;
 use targets::{Feedback, GroupTextures, ResolvedDepth};
+pub(crate) use targets::{PoolDesc, TexturePool};
 use views::{Dispatch, SceneLights, ViewData, ViewTarget};
 
 /// Runtime render options (resource).
