@@ -4711,6 +4711,7 @@ dependencies = [
  "space3d-editor",
  "space3d-github",
  "space3d-net",
+ "space3d-particles",
  "space3d-physics",
  "space3d-platform",
  "space3d-render",
@@ -4742,6 +4743,7 @@ dependencies = [
  "serde",
  "serde_json",
  "space3d-core",
+ "space3d-render",
  "space3d-tasks",
  "tempfile",
  "thiserror 2.0.21",
@@ -4888,6 +4890,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "space3d-particles"
+version = "0.1.0"
+dependencies = [
+ "ron",
+ "serde",
+ "space3d-core",
+ "space3d-render",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "space3d-physics"
 version = "0.1.0"
 dependencies = [
@@ -4961,6 +4975,7 @@ dependencies = [
  "serde",
  "serde_json",
  "space3d-core",
+ "space3d-particles",
  "space3d-physics",
  "space3d-render",
  "space3d-test",

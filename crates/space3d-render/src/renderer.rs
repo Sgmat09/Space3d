@@ -302,6 +302,32 @@ pub struct Renderer {
     pub(crate) overlays: crate::overlay::OverlayCache,
     /// Uncaptured wgpu errors so far (see [`install_error_handler`]).
     pub(crate) gpu_errors: Arc<AtomicU64>,
+    /// Graphics capabilities (unmasked; see [`Renderer::graphics_caps`]).
+    pub(crate) graphics: crate::caps::GraphicsCaps,
+    /// Shared node / overlay layouts.
+    pub(crate) layouts: crate::node::FrameLayouts,
+    /// Unique id of this renderer (see `FrameInfo::renderer`).
+    pub(crate) id: u64,
+    /// GPU pass timings (see [`Renderer::gpu_timings`]).
+    pub(crate) gpu_timings: crate::timing::GpuTimings,
+}
+
+/// What [`Renderer::prewarm`] builds, in addition to the post pipelines of the current post
+/// cameras and every node's `prewarm` for the pass targets reachable in the current modes.
+#[derive(Clone, Debug, Default)]
+pub struct PrewarmRequest {
+    /// Materials whose forward pipelines to build.
+    pub materials: Vec<crate::Material>,
+    /// Instance layouts to build them for (the ECS layout is always included).
+    pub layouts: Vec<&'static crate::InstanceLayout>,
+    /// Extra color formats to build for (e.g. the capture format when windowed).
+    pub formats: Vec<wgpu::TextureFormat>,
+}
+
+/// Renderer ids: unique per process.
+fn next_renderer_id() -> u64 {
+    static ID: AtomicU64 = AtomicU64::new(1);
+    ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl std::fmt::Debug for Renderer {
@@ -458,7 +484,8 @@ impl Renderer {
             | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::TEXTURE_COMPRESSION_ASTC
-            | wgpu::Features::TEXTURE_COMPRESSION_ETC2;
+            | wgpu::Features::TEXTURE_COMPRESSION_ETC2
+            | crate::caps::WANTED_FEATURES;
         #[cfg_attr(not(test), expect(unused_mut))]
         let mut required_limits = adapter.limits();
         #[cfg(test)]
@@ -501,6 +528,12 @@ impl Renderer {
         let white_sampler = samplers.get(&device, Default::default());
         let frame = FrameState::new(&caps, &device);
         let uploader = Uploader::new(&device);
+        let graphics = crate::caps::GraphicsCaps::detect(&adapter, &device, &caps);
+        let layouts = crate::node::FrameLayouts::new(&device, &pipelines.view_bgl);
+        let gpu_timings = crate::timing::GpuTimings {
+            supported: graphics.timestamps,
+            ..Default::default()
+        };
         let mut renderer = Self {
             instance,
             adapter,
@@ -520,6 +553,10 @@ impl Renderer {
             frame_index: 0,
             overlays: Default::default(),
             gpu_errors,
+            graphics,
+            layouts,
+            id: next_renderer_id(),
+            gpu_timings,
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;
@@ -1033,6 +1070,73 @@ impl Renderer {
     /// Non-blocking device poll: fires pending map callbacks (captures, staging recycling).
     pub fn poll(&self) {
         let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+
+    /// Graphics capabilities of the device (one probe for every graphics feature). The frame
+    /// masks them with [`crate::FrameSettings::downlevel`] each frame.
+    pub fn graphics_caps(&self) -> &crate::caps::GraphicsCaps {
+        &self.graphics
+    }
+
+    /// Shared layouts for render nodes and overlays (renderer lifetime).
+    pub fn frame_layouts(&self) -> &crate::node::FrameLayouts {
+        &self.layouts
+    }
+
+    /// Unique id of this renderer: a new renderer (or device) has a new one, so nodes rebuild
+    /// their GPU state.
+    pub fn renderer_id(&self) -> u64 {
+        self.id
+    }
+
+    /// GPU pass timings of a recent frame ([`crate::FrameSettings::gpu_timing`]).
+    pub fn gpu_timings(&self) -> &crate::timing::GpuTimings {
+        &self.gpu_timings
+    }
+
+    /// The primary target group's scene color before post (after `HdrScene` overlays), as
+    /// linear float pixels. `Err(RenderError::Capture)` in Direct mode — every frame until the
+    /// frame renders intermediate groups (graphics milestone F4).
+    pub fn capture_scene_hdr(&mut self) -> Task<Result<space3d_core::HdrImageData, RenderError>> {
+        let result = self.scene_hdr_unavailable();
+        space3d_tasks::spawn(async move { result })
+    }
+
+    /// [`Self::capture_scene_hdr`], waiting on the calling thread (tests and tools only).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn capture_scene_hdr_blocking(&mut self) -> Result<space3d_core::HdrImageData, RenderError> {
+        self.scene_hdr_unavailable()
+    }
+
+    fn scene_hdr_unavailable(&self) -> Result<space3d_core::HdrImageData, RenderError> {
+        // STUB(F4): intermediate groups keep their scene texture for this readback.
+        Err(RenderError::Capture(
+            "the primary target renders in Direct mode: there is no scene texture".into(),
+        ))
+    }
+
+    /// Last read-back exposure (stops, incl. compensation) of a post camera
+    /// ([`crate::FrameSettings::read_exposure`]).
+    pub fn camera_exposure(&self, camera: space3d_core::Entity) -> Option<f32> {
+        let _ = camera; // STUB(P-POST)
+        None
+    }
+
+    /// Forget a camera's temporal post history (auto exposure snaps next frame).
+    pub fn reset_post_history(&mut self, camera: space3d_core::Entity) {
+        let _ = camera; // STUB(P-POST)
+    }
+
+    /// Build pipelines ahead of use (loading screens: WebGL2 links programs at creation, 50–150
+    /// ms each).
+    pub fn prewarm(&mut self, request: &PrewarmRequest) {
+        let _ = request; // STUB(F + P-MAT + P-POST): forward, post and node pipelines
+    }
+
+    /// Where a cubemap is on its way to being usable as an environment.
+    pub fn environment_state(&self, cubemap: crate::handles::CubemapHandle) -> crate::lighting::api::EnvironmentState {
+        let _ = cubemap; // STUB(P-MAT)
+        crate::lighting::api::EnvironmentState::Missing
     }
 }
 

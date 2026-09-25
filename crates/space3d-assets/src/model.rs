@@ -36,6 +36,13 @@ pub struct Primitive {
     pub mesh: MeshData,
     /// Index into [`ModelData::materials`].
     pub material: Option<usize>,
+    /// glTF `TANGENT` `[x, y, z, w]` (w = ±1 bitangent sign), one per vertex; empty when the
+    /// source has none.
+    #[serde(default)]
+    pub tangents: Vec<[f32; 4]>,
+    /// glTF `TEXCOORD_1`, one per vertex; empty when the source has none.
+    #[serde(default)]
+    pub uvs1: Vec<[f32; 2]>,
 }
 
 /// How a material's alpha channel is interpreted.
@@ -71,6 +78,114 @@ pub struct MaterialData {
     pub alpha_mode: AlphaMode,
     /// Disable back-face culling.
     pub double_sided: bool,
+    /// Index into [`ModelData::images`] for the metallic-roughness (linear) texture.
+    #[serde(default)]
+    pub metallic_roughness_texture: Option<usize>,
+    /// Index into [`ModelData::images`] for the occlusion (linear) texture.
+    #[serde(default)]
+    pub occlusion_texture: Option<usize>,
+    /// Index into [`ModelData::images`] for the emissive (sRGB) texture.
+    #[serde(default)]
+    pub emissive_texture: Option<usize>,
+    /// Normal map XY scale. Default 1.
+    #[serde(default = "one")]
+    pub normal_scale: f32,
+    /// Occlusion strength. Default 1.
+    #[serde(default = "one")]
+    pub occlusion_strength: f32,
+    /// `KHR_materials_emissive_strength` (× `emissive`). Default 1.
+    #[serde(default = "one")]
+    pub emissive_strength: f32,
+    /// `KHR_materials_unlit`.
+    #[serde(default)]
+    pub unlit: bool,
+    /// Per-slot texture coordinates, transforms and samplers.
+    #[serde(default)]
+    pub texture_info: MaterialTextureInfo,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+/// Per-slot texture details of a [`MaterialData`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaterialTextureInfo {
+    /// Base color slot.
+    pub base_color: TextureInfo,
+    /// Metallic-roughness slot.
+    pub metallic_roughness: TextureInfo,
+    /// Normal slot.
+    pub normal: TextureInfo,
+    /// Occlusion slot.
+    pub occlusion: TextureInfo,
+    /// Emissive slot.
+    pub emissive: TextureInfo,
+}
+
+/// How a material slot samples its texture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextureInfo {
+    /// glTF `texCoord` (0 or 1 are used).
+    pub tex_coord: u32,
+    /// `KHR_texture_transform`.
+    pub transform: Option<UvTransformData>,
+    /// The glTF sampler.
+    pub sampler: SamplerData,
+}
+
+/// `KHR_texture_transform` of a slot: `uv' = T(offset) · R(rotation) · S(scale) · uv`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UvTransformData {
+    /// Translation.
+    pub offset: [f32; 2],
+    /// Rotation in radians.
+    pub rotation: f32,
+    /// Scale.
+    pub scale: [f32; 2],
+    /// `texCoord` override.
+    pub tex_coord: Option<u32>,
+}
+
+impl Default for UvTransformData {
+    fn default() -> Self {
+        Self {
+            offset: [0.0; 2],
+            rotation: 0.0,
+            scale: [1.0; 2],
+            tex_coord: None,
+        }
+    }
+}
+
+/// A glTF sampler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SamplerData {
+    /// Wrap along u.
+    pub wrap_s: WrapMode,
+    /// Wrap along v.
+    pub wrap_t: WrapMode,
+    /// Nearest-neighbour magnification.
+    pub nearest_mag: bool,
+    /// Nearest-neighbour minification.
+    pub nearest_min: bool,
+}
+
+/// Texture wrap mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WrapMode {
+    /// Repeat.
+    #[default]
+    Repeat,
+    /// Clamp to the edge.
+    ClampToEdge,
+    /// Mirrored repeat.
+    MirroredRepeat,
 }
 
 impl Default for MaterialData {
@@ -85,6 +200,14 @@ impl Default for MaterialData {
             normal_texture: None,
             alpha_mode: AlphaMode::Opaque,
             double_sided: false,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
+            normal_scale: 1.0,
+            occlusion_strength: 1.0,
+            emissive_strength: 1.0,
+            unlit: false,
+            texture_info: MaterialTextureInfo::default(),
         }
     }
 }
@@ -113,6 +236,7 @@ impl ModelData {
                 primitives: vec![Primitive {
                     mesh,
                     material: Some(0),
+                    ..Default::default()
                 }],
             }],
             materials: vec![MaterialData::default()],

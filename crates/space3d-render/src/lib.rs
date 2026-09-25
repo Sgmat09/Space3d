@@ -31,6 +31,7 @@
 
 mod arena;
 mod assets;
+mod caps;
 mod components;
 mod culling;
 mod dirty;
@@ -38,13 +39,21 @@ mod frame;
 mod gpu;
 mod handles;
 mod instance;
+mod lighting;
+mod material;
+mod node;
+mod output;
 mod overlay;
 mod pipeline;
+mod post;
+mod quality;
 mod readback;
 mod renderer;
+mod settings;
 mod shader;
 mod stats;
 mod texture;
+mod timing;
 
 pub use assets::{AddressMode, FilterMode, RenderAssets, SamplerSettings, TextureSource};
 pub use components::{
@@ -61,11 +70,27 @@ pub use instance::{
     InstanceTransformColor, InstancedMesh, MAX_INSTANCE_LOCATIONS, ScaleKind, f16_to_f32, f32_to_f16,
 };
 pub use overlay::{
-    OverlayTarget, OverlayTargetKind, RENDER_TARGET_FORMAT, RenderOverlay, RenderOverlays, SharedOverlay, lock_overlay,
+    OverlayScene, OverlayStage, OverlayTarget, OverlayTargetKind, RENDER_TARGET_FORMAT, RenderOverlay, RenderOverlays,
+    SharedOverlay, lock_overlay,
 };
-pub use renderer::{DisplayHandle, RenderCapabilities, RenderError, Renderer, RendererConfig};
+pub use renderer::{DisplayHandle, PrewarmRequest, RenderCapabilities, RenderError, Renderer, RendererConfig};
 pub use shader::CustomShader;
 pub use stats::{DrawPath, RenderStats};
+
+// Graphics API hubs (graphics spec §2.1): each area adds items to its hub, never to this file.
+pub use caps::GraphicsCaps;
+pub use lighting::api::*;
+pub use material::*;
+pub use node::{
+    DepthAccess, DrawContext, FULLSCREEN_WGSL, FrameInfo, FrameKind, FrameLayouts, FrameMode, MESH_VERTEX_LAYOUT,
+    MeshRef, PassTarget, PhaseSlot, PrepareContext, RenderNode, RenderNodes, RenderPhase, SceneDepthRef, SceneReads,
+    SharedNode, SlotMask, TextureRef, VIEW_WGSL, ViewInfo, ViewPrepareContext, ViewRole, lock_node, scene_wgsl,
+};
+pub use output::{OUTPUT_WGSL, OutputEncoding, Tonemapper};
+pub use post::api::*;
+pub use quality::GraphicsQuality;
+pub use settings::*;
+pub use timing::{GpuScope, GpuTimings};
 
 pub use glam;
 pub use wgpu;
@@ -100,7 +125,14 @@ impl Plugin for RenderPlugin {
             .init_resource::<AmbientLight>()
             .init_resource::<RenderStats>()
             .init_resource::<RenderSettings>()
-            .init_resource::<RenderOverlays>();
+            .init_resource::<RenderOverlays>()
+            .init_resource::<FrameSettings>()
+            .init_resource::<LightingSettings>()
+            .init_resource::<RenderNodes>()
+            .init_resource::<GpuTimings>();
+        let nodes = app.resources.expect_mut::<RenderNodes>();
+        lighting::Lighting::register_nodes(nodes);
+        post::PostState::register_nodes(nodes);
         app.add_system_named(Stage::Render, "render::render_frame", render_system);
         if let Some((w, h)) = self.headless {
             #[cfg(not(target_arch = "wasm32"))]
@@ -164,6 +196,10 @@ pub fn render_to_image(app: &mut App) -> Option<ImageData> {
 }
 
 /// Common imports.
+///
+/// Graphics additions are limited to a curated, collision-checked list (graphics spec §2.2.10:
+/// `PostProcess`, `Tonemapper`, `Bloom`, `CameraFrame`, `Skybox`, `EnvironmentLight`,
+/// `DirectionalShadow`, `CubemapHandle`); everything else is reachable through the crate root.
 pub mod prelude {
     pub use crate::{
         AmbientLight, BufferUsage, Camera3d, CustomShader, DirectionalLight, DrawPath, InstanceBuffer, InstanceBuffers,
@@ -171,5 +207,8 @@ pub mod prelude {
         Material, Mesh3d, MeshHandle, OverlayTarget, PointLight, Projection, RenderAssets, RenderOverlay,
         RenderOverlays, RenderPlugin, RenderSettings, RenderStats, RenderTarget, Renderer, ShaderHandle, TextureHandle,
         Visibility, render_to_image,
+    };
+    pub use crate::{
+        Bloom, CameraFrame, CubemapHandle, DirectionalShadow, EnvironmentLight, PostProcess, Skybox, Tonemapper,
     };
 }

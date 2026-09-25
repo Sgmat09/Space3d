@@ -194,6 +194,7 @@ pub fn load_gltf(bytes: &[u8], ctx: &LoadContext, load_images: bool) -> Result<M
                     gltf::material::AlphaMode::Blend => AlphaMode::Blend,
                 },
                 double_sided: m.double_sided(),
+                ..MaterialData::default() // STUB(P-MAT): the other slots (PM2)
             }
         })
         .collect();
@@ -243,6 +244,7 @@ pub fn load_gltf(bytes: &[u8], ctx: &LoadContext, load_images: bool) -> Result<M
             primitives.push(Primitive {
                 mesh: m,
                 material: prim.material().index(),
+                ..Primitive::default() // STUB(P-MAT): TANGENT, TEXCOORD_1 (PM2)
             });
         }
         meshes.push(ModelMesh {

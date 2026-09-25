@@ -159,6 +159,7 @@ pub fn load_obj(bytes: &[u8], ctx: &LoadContext, load_materials: bool) -> Result
                     AlphaMode::Opaque
                 },
                 double_sided: false,
+                ..MaterialData::default()
             }
         })
         .collect();
@@ -221,6 +222,7 @@ pub fn load_obj(bytes: &[u8], ctx: &LoadContext, load_materials: bool) -> Result
             primitives: vec![Primitive {
                 mesh,
                 material: m.material_id.filter(|&i| i < mats.len()),
+                ..Primitive::default()
             }],
         });
         nodes.push(NodeData {

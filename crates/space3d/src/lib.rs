@@ -42,6 +42,7 @@
 //! | `assets` | asset server, loaders, hot reload, texture/mesh editing | `assets` (yes) |
 //! | `audio` | kira audio, spatial emitters | `audio` (yes) |
 //! | `physics` | rapier physics | `physics` (yes) |
+//! | `particles` | particle effects (own prelude: `space3d::particles::prelude`) | `particles` (no) |
 //! | `scene` | scenes, prefabs, snapshots | `scene` (yes) |
 //! | `net` | HTTP/WebSocket clients + native servers | `net` (yes) |
 //! | `db` | SQLite / localStorage stores | `db` (yes) |
@@ -87,6 +88,8 @@ pub use space3d_editor as editor;
 pub use space3d_github as github;
 #[cfg(feature = "net")]
 pub use space3d_net as net;
+#[cfg(feature = "particles")]
+pub use space3d_particles as particles;
 #[cfg(feature = "physics")]
 pub use space3d_physics as physics;
 #[cfg(feature = "platform")]

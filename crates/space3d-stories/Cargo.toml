@@ -9,14 +9,17 @@ publish.workspace = true
 
 [features]
 default = ["engine"]
-## Built-in engine storybook (`engine_storybook()`), including a physics story.
-engine = ["dep:space3d-physics"]
+## Built-in engine storybook (`engine_storybook()`), including physics and particle stories.
+engine = ["dep:space3d-physics", "particles"]
+## Particle stories (`Engine/Particles/*`) in the engine storybook.
+particles = ["dep:space3d-particles"]
 
 [dependencies]
 space3d-core.workspace = true
 space3d-render.workspace = true
 space3d-test.workspace = true
 space3d-physics = { workspace = true, optional = true }
+space3d-particles = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

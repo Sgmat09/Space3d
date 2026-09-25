@@ -163,6 +163,8 @@ pub(crate) fn create_gpu_texture(
             target_view: Some(view),
             depth_view: Some(depth.create_view(&Default::default())),
             sampler,
+            format: OFFSCREEN_FORMAT,
+            layers: 1,
         });
         entry.version = entry.version.wrapping_add(1);
         return Ok(0);
@@ -309,6 +311,8 @@ fn upload_source(
             sampler,
             target_view: None,
             depth_view: None,
+            format,
+            layers: src.layers,
         },
         bytes,
     ))

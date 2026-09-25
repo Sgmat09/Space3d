@@ -61,6 +61,10 @@ define_handle!(
     /// Handle to a [`crate::CustomShader`] stored in [`crate::RenderAssets`].
     ShaderHandle
 );
+define_handle!(
+    /// Handle to a cubemap stored in [`crate::RenderAssets`] ([`crate::RenderAssets::add_cubemap`]).
+    CubemapHandle
+);
 
 /// Untyped generational id used internally by [`SlotMap`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

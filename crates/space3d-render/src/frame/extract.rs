@@ -700,3 +700,13 @@ impl FrameState {
         *reallocs += cpu_reallocs;
     }
 }
+
+/// Whether the batches of `material` cast shadows (the depth views' draw filter).
+#[allow(
+    dead_code,
+    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
+)]
+pub(crate) fn source_casts(materials: &MaterialTable, material: u32) -> bool {
+    let _ = (materials, material); // STUB(P-MAT): ShadowMode / blend / unlit rules
+    false
+}

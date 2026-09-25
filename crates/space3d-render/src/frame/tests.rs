@@ -3,6 +3,7 @@
 use super::draws::*;
 use super::extract::*;
 use super::plan::*;
+use super::targets::*;
 use super::views::*;
 use super::*;
 use crate::arena::ArenaAlloc;
@@ -1882,4 +1883,36 @@ fn instance_sphere_kinds() {
     let s = instance_sphere(&mesh, InstanceCompact::LAYOUT.cull_source(), bytemuck::bytes_of(&c)).unwrap();
     assert_eq!(s.center, Vec3::new(1.0, 2.0, 3.0));
     assert_eq!(s.radius, 2.0);
+}
+
+/// The texture pool hands out free textures of an equal description, creates only what it
+/// lacks and evicts textures unused for 3 frames.
+#[test]
+fn texture_pool_reuses_and_evicts() {
+    let Some(app) = headless_app(4, 4) else { return };
+    let r = app.resources.expect::<Renderer>();
+    let mut pool = TexturePool::default();
+    let desc = PoolDesc {
+        size: (32, 16),
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        mips: 3,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+    };
+    pool.begin_frame(1);
+    let a = pool.acquire(&r.device, desc);
+    let b = pool.acquire(&r.device, desc);
+    assert_ne!(a, b, "in use: a second texture");
+    assert_eq!(pool.get(a).mips.len(), 3);
+    assert_eq!(pool.take_created(), 2);
+    pool.release_all();
+    pool.begin_frame(2);
+    let again = pool.acquire(&r.device, desc);
+    assert_eq!((again, pool.get(again).generation), (a, 1), "request order, reused");
+    assert_eq!(pool.take_created(), 0, "steady state creates nothing");
+    pool.release_all();
+    pool.begin_frame(5);
+    pool.evict();
+    let fresh = pool.acquire(&r.device, desc);
+    assert_eq!(pool.get(fresh).generation, 3, "evicted after 3 unused frames");
+    assert_eq!(r.gpu_error_count(), 0);
 }

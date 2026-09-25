@@ -1,13 +1,14 @@
 //! Built-in engine storybook: one story per major renderer/engine feature.
 //!
 //! One file per area (graphics spec §2.8): `basics` (the original stories), `frame`,
-//! `materials` + `lighting`, `post`, `particles` and `showcase`. Each exports
+//! `materials` + `lighting`, `post`, `particles` (feature `particles`) and `showcase`. Each exports
 //! `pub(crate) fn stories() -> Vec<Story>`; [`engine_storybook`] concatenates them in that order.
 
 mod basics;
 mod frame;
 mod lighting;
 mod materials;
+#[cfg(feature = "particles")]
 mod particles;
 mod post;
 mod showcase;
@@ -81,6 +82,7 @@ pub fn engine_storybook() -> Storybook {
         materials::stories(),
         lighting::stories(),
         post::stories(),
+        #[cfg(feature = "particles")]
         particles::stories(),
         showcase::stories(),
     ];

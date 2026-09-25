@@ -11,10 +11,13 @@ publish.workspace = true
 default = ["hot-reload"]
 ## Watch the filesystem asset root and reload changed assets (native only; no-op on wasm).
 hot-reload = ["dep:notify"]
+## `space3d_assets::render`: upload models to `space3d-render` (enabled by the facade's `render`).
+render = ["dep:space3d-render"]
 
 [dependencies]
 space3d-core.workspace = true
 space3d-tasks.workspace = true
+space3d-render = { workspace = true, optional = true }
 glam.workspace = true
 parking_lot.workspace = true
 futures.workspace = true

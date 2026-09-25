@@ -19,7 +19,7 @@ pub mod time;
 pub mod transform;
 
 pub use app::{App, AppExit, Plugin};
-pub use data::{ImageData, MeshData};
+pub use data::{HdrImageData, ImageData, MeshData};
 pub use events::{EventReader, Events};
 pub use resources::Resources;
 pub use schedule::{Stage, SystemCtx};

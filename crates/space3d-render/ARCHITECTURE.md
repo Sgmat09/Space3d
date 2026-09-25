@@ -17,11 +17,13 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | `texture.rs` | `write_texture` uploads (block-aware pitch), GPU mip generation, sampler cache |
 | `pipeline/` | `mod.rs` (pipeline cache, `PipelineKey`, culling/blit/clear pipelines, culling uniforms), `view.rs` (`GpuView`, lights), `forward.rs` (forward shader composition, `GpuMaterial`, material layouts, forward pipelines, custom-shader validation), `instance.rs` (instance attributes, generated `InstanceInput` WGSL) |
 | `shader.rs` | `CustomShader`: user WGSL hooks spliced into the forward shader |
+| `settings.rs`, `caps.rs`, `output.rs`, `node.rs`, `timing.rs`, `quality.rs` | graphics API (frame): `FrameSettings`/`CameraFrame`, `GraphicsCaps`, `OutputEncoding`/`Tonemapper`/`OUTPUT_WGSL`, the render-node API, `GpuTimings`, `GraphicsQuality` (see `docs/graphics/api.md`) |
+| `material.rs`, `lighting/`, `post/` | graphics API hubs of the materials and post areas (`BlendMode`…, cubemaps/`Skybox`/shadows/`LightingSettings`, `PostProcess`…) and their crate-internal frame contracts (`Lighting`, `PostState`) |
 | `readback.rs` | non-blocking readback of GPU-culled visible counts for `RenderStats` |
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
 | `dirty.rs` | `DirtyRanges`: sorted, coalescing range set |
 | `stats.rs` | `RenderStats`, `DrawPath` |
-| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears) |
+| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `post/distortion.wgsl` |
 
 ## Frame data flow
 
@@ -248,6 +250,13 @@ attachments, so per target and frame:
   `tests/headless.rs::the_first_view_of_a_frame_clears_its_target`).
 * Depth is per camera: every pass clears the whole depth attachment and discards it, so a
   camera never tests against another's geometry.
+* Viewports are not limited to the target: a rect within wgpu's viewport limits (at most
+  `max_texture_dimension_2d` wide and high, within twice that of the origin) is drawn as is;
+  any other — a 101× zoom viewport, a far-off or non-finite one — is drawn through its part
+  within the target with the projection remapped in clip space so each pixel shows what the
+  whole viewport would (`ViewportRect::fitted`), and one entirely outside draws nothing.
+  Passing such a rect to `set_viewport` failed validation and lost the frame
+  (`frame::tests::out_of_range_viewports_draw_their_visible_part`).
 * A pass's attachments have the size its views were prepared for on every path. When the
   window's surface is lost after a frame's views were prepared (`SurfaceAcquire::Recreate`),
   the frame's primary views are drawn offscreen, like the frames until a new surface is
@@ -293,8 +302,17 @@ cannot run alike on every backend: resources of its own (the forward pipeline la
 bindings for them, so their pipeline would be invalid), workgroup memory (`var<workgroup>`,
 used or not: WGSL allows it in compute shaders only, and backends disagree about it in the
 vertex and fragment stages the hooks run in — Metal accepts it, GL and browsers reject it),
-any other address space but `function`/`private`, and `override` constants without a default
-(the pipeline sets none). Its pipeline is then created inside validation and internal error
+any other address space but `function`/`private`, `override` constants without a default
+(the pipeline sets none), and built-ins WebGL2 / GLES 3.0 cannot compile — GLSL ES 3.00 lacks
+`countOneBits`, `reverseBits`, `extractBits`, `insertBits`, `firstLeadingBit`,
+`firstTrailingBit`, `countTrailingZeros`, `ldexp`, `dot4I8Packed`/`dot4U8Packed`,
+`unpack4xI8`/`unpack4xU8` and `textureGather*` (naga's GLSL backend emits them anyway), and the
+forward entry points are translated to GLSL ES 3.00 once to catch what naga refuses there
+(`textureNumLevels`, `pack4x8unorm`, …). Rejecting those on every backend keeps a shader that
+works on the machine it is written on working on the web (`CustomShader` has the per-backend
+table; `pipeline::tests::custom_shaders_cannot_use_builtins_webgl2_lacks`, and
+`tests/custom_shader.rs::custom_shaders_are_limited_to_what_webgl2_compiles`, which also runs
+on ANGLE). Its pipeline is then created inside validation and internal error
 scopes, so no error reaches the uncaptured-error handler: a failure is logged once, reported
 by `Renderer::shader_error`, and the draws of that pipeline key fall back to the built-in
 shader. Native backends answer the scopes immediately. In the browser the answer
@@ -520,7 +538,11 @@ wgpu's device-wide snatch lock for the whole GPU wait, which stalled `queue.pres
 destruction on the main thread (`capture_blocking` waits on the calling thread for its own
 submission only). Windowed renderers re-record the last frame's primary
 views into the offscreen target before copying (surface textures are not readable), at the
-size those views were prepared for. `resize`/`set_msaa_samples` reallocate the headless target
+size those views were prepared for, then run the overlays (`OverlayTargetKind::Capture`) on top
+of them — views first, as in a frame (`Renderer::encode_capture_replay`;
+`frame::tests::capture_replay_draws_overlays_after_the_views` forces the replay headless and
+checks it equals the frame). Surface overlays get the frame's view format (the sRGB view of a
+browser canvas), not the surface texture's. `resize`/`set_msaa_samples` reallocate the headless target
 lazily at the next frame, so a capture in between still returns the last rendered frame.
 `render_to_image(&mut App)` propagates transforms, renders one frame without advancing time and
 blocks for the capture (native only). Output is deterministic on one machine on every draw
