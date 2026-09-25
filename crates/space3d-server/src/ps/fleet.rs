@@ -103,8 +103,13 @@ impl Build {
 
     /// Whether a server registered with `registration` can host this build.
     pub fn accepts(&self, registration: &ServerRegistration) -> bool {
-        (self.game_id.is_empty() || registration.game_id == self.game_id)
-            && (self.schema_hash == 0 || registration.schema_hash == self.schema_hash)
+        self.accepts_build(&Self::of(registration))
+    }
+
+    /// Whether a server (or a room) of build `other` can host this build.
+    pub fn accepts_build(&self, other: &Build) -> bool {
+        (self.game_id.is_empty() || other.game_id == self.game_id)
+            && (self.schema_hash == 0 || other.schema_hash == self.schema_hash)
     }
 }
 
@@ -211,6 +216,17 @@ pub enum Moving {
     Yes,
     /// The move stalled ([`HANDOFF_STALL_MS`]): restore from the last stored checkpoint.
     Stalled,
+}
+
+/// Why quick play cannot join a persistent room where it is (see
+/// [`FleetRegistry::displaced_room_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Displaced {
+    /// Moving ([`Moving::Yes`]): wait until its final checkpoint is stored.
+    Moving,
+    /// Handed off, lost with its server, or its move stalled: restore it on another server
+    /// (as its players' rejoin would).
+    Restorable,
 }
 
 /// Tick budget used in the load score (60 Hz).
@@ -794,7 +810,14 @@ impl FleetRegistry {
             .filter_map(|(id, e)| {
                 let spec = e.spec.as_ref()?;
                 let server = self.servers.get(&e.server)?;
-                if e.orphaned || spec.mode != mode || !server.allocatable() || !build.accepts(&server.registration) {
+                // A moving room (its server drains) is not joinable where it is: see
+                // `displaced_room_for`.
+                if e.orphaned
+                    || e.moving
+                    || spec.mode != mode
+                    || !server.allocatable()
+                    || !build.accepts(&server.registration)
+                {
                     return None;
                 }
                 let (reported, joinable) = e
@@ -818,6 +841,67 @@ impl FleetRegistry {
         });
         self.recount_reserved();
         Some((self.servers.get(&entry.server)?.clone(), entry.spec?))
+    }
+
+    /// The fullest persistent room of `mode` with `seats` free, for a client of `build`, that
+    /// quick play cannot join where it is ([`Self::open_room_for`] skips it): it is moving to
+    /// another server, or waits to be restored after a handoff or a server loss. A persistent
+    /// room is one world: quick play waits for its handoff or restores it (as its players'
+    /// rejoin would) instead of opening a second copy next to it — its players come back to
+    /// the first one, and the world would stay split for good.
+    ///
+    /// A lost room (orphaned) counts once the loss is settled: its server is dead, handed it
+    /// off, or was heard from since without listing it. Right after a server registers again,
+    /// its rooms are orphaned until its next heartbeat lists them (a re-established link, not
+    /// a restart): those stay where they are. Rooms voided on loss
+    /// (`RecoveryPolicy::Abandon`) are not restored.
+    pub fn displaced_room_for(
+        &self,
+        mode: &str,
+        build: &Build,
+        seats: u32,
+        now_ms: i64,
+    ) -> Option<(RoomId, Displaced)> {
+        let present = self.present_per_room();
+        self.rooms
+            .iter()
+            .filter_map(|(id, e)| {
+                let spec = e.spec.as_ref()?;
+                if !spec.persistent || spec.mode != mode || !build.accepts_build(&e.build) {
+                    return None;
+                }
+                let displaced = if e.orphaned {
+                    let abandon = e.status.as_ref().is_some_and(|s| s.abandon_on_loss);
+                    (!abandon && self.orphan_settled(e)).then_some(Displaced::Restorable)?
+                } else {
+                    match self.moving(*id, now_ms) {
+                        Moving::Yes => Displaced::Moving,
+                        Moving::Stalled => Displaced::Restorable,
+                        Moving::No => return None,
+                    }
+                };
+                let reported = e.status.as_ref().map_or(0, |s| u32::from(s.players));
+                let reserved: u32 = self
+                    .reservations
+                    .iter()
+                    .filter(|r| r.room == Some(*id))
+                    .map(|r| r.seats)
+                    .sum();
+                let used = reported.max(present.get(id).copied().unwrap_or(0)) + reserved;
+                (used + seats <= u32::from(spec.max_players)).then_some((used, *id, displaced))
+            })
+            .max_by_key(|(used, id, _)| (*used, std::cmp::Reverse(*id)))
+            .map(|(_, id, displaced)| (id, displaced))
+    }
+
+    /// Whether an orphaned room is lost where it was (see [`Self::displaced_room_for`]).
+    fn orphan_settled(&self, e: &RoomEntry) -> bool {
+        // Handed off: `RoomClosed { restorable }` cleared its status.
+        e.status.is_none()
+            || self
+                .servers
+                .get(&e.server)
+                .is_none_or(|s| s.state == ServerState::Dead || s.last_seen_ms > e.since_ms)
     }
 
     /// The reservation made last (by [`Self::allocate`] / [`Self::open_room_for`]) is
@@ -1390,6 +1474,147 @@ mod tests {
         // The server is gone: restore now.
         f.sweep(20 + 10_001, 10_000);
         assert_eq!(f.moving(RoomId(1), 20 + 10_001), Moving::No);
+    }
+
+    /// Regression (verifier runs 03/15/21): quick play skipped a persistent room that was
+    /// moving (its server draining) or waiting to be restored, and opened a second copy of the
+    /// world next to it for good. Such a room is now found as displaced: moving (wait for the
+    /// handoff) or restorable (handed off, lost with its server, or its move stalled) — but
+    /// not a room its server may still list (orphaned by a re-registration until the next
+    /// heartbeat), a room voided on loss, a full one, another mode or build, or a match room.
+    #[test]
+    fn quick_play_finds_a_persistent_room_that_is_on_the_move() {
+        let world = |id: u64, players: u16, persistent: bool| {
+            let mut s = spec(id, "world", 3);
+            s.persistent = persistent;
+            (
+                s,
+                RoomStatus {
+                    room_id: RoomId(id),
+                    mode: "world".into(),
+                    players,
+                    max_players: 3,
+                    joinable: true,
+                    player_ids: (0..u64::from(players)).map(|p| PlayerId(id * 10 + p)).collect(),
+                    persistent,
+                    moves_on_drain: persistent,
+                    ..Default::default()
+                },
+            )
+        };
+        let any = Build::default();
+        let mut f = FleetRegistry::new(10_000, 300_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        f.on_message("gs-2", reg("gs-2", "eu", 100), 0);
+        let (w1, s1) = world(1, 1, true);
+        let (m2, s2) = world(2, 1, false);
+        f.note_room(&w1, "gs-1", 0);
+        f.note_room(&m2, "gs-1", 0);
+        f.on_message("gs-1", hb(2, vec![s1.clone(), s2.clone()]), 10);
+        assert!(f.open_room_for("world", &any, 1, 10, 60_000).is_some());
+        assert_eq!(f.displaced_room_for("world", &any, 1, 10), None, "joinable where it is");
+        f.reservations.clear();
+        f.recount_reserved();
+
+        // Its server drains: the world moves (before and after its `RoomMoving`), the match
+        // room stays where it is.
+        let draining = |rooms| {
+            FleetUp::Heartbeat(Heartbeat {
+                draining: true,
+                players: 2,
+                rooms,
+                ..Default::default()
+            })
+        };
+        f.on_message("gs-1", draining(vec![s1.clone(), s2.clone()]), 20);
+        assert!(f.open_room_for("world", &any, 1, 20, 60_000).is_none());
+        assert_eq!(
+            f.displaced_room_for("world", &any, 1, 20),
+            Some((RoomId(1), Displaced::Moving))
+        );
+        f.on_message("gs-1", FleetUp::RoomMoving { room_id: RoomId(1) }, 30);
+        assert_eq!(
+            f.displaced_room_for("world", &any, 1, 30),
+            Some((RoomId(1), Displaced::Moving))
+        );
+        // A move that stalled is restored from its last stored checkpoint.
+        assert_eq!(
+            f.displaced_room_for("world", &any, 1, 30 + HANDOFF_STALL_MS),
+            Some((RoomId(1), Displaced::Restorable))
+        );
+        // Not for another mode, another build, or with no free seat.
+        assert_eq!(f.displaced_room_for("zone", &any, 1, 30), None);
+        assert_eq!(f.displaced_room_for("world", &Build::new("arena", 7), 1, 30), None);
+        assert_eq!(
+            f.displaced_room_for("world", &Build::new("arena", 42), 2, 30),
+            Some((RoomId(1), Displaced::Moving))
+        );
+        assert_eq!(f.displaced_room_for("world", &any, 3, 30), None, "full");
+        // Handed off: restorable (presence kept).
+        f.on_message(
+            "gs-1",
+            FleetUp::RoomClosed {
+                room_id: RoomId(1),
+                reason: "handoff".into(),
+                restorable: true,
+            },
+            40,
+        );
+        assert_eq!(
+            f.displaced_room_for("world", &any, 1, 40),
+            Some((RoomId(1), Displaced::Restorable))
+        );
+        assert_eq!(
+            f.displaced_room_for("world", &any, 2, 40),
+            Some((RoomId(1), Displaced::Restorable))
+        );
+        assert_eq!(
+            f.displaced_room_for("world", &any, 3, 40),
+            None,
+            "its player comes back"
+        );
+        // Once restored elsewhere it is an open room again.
+        f.reassign(RoomId(1), "gs-2", 50);
+        assert_eq!(f.displaced_room_for("world", &any, 1, 50), None);
+        assert_eq!(
+            f.open_room_for("world", &any, 1, 50, 60_000).unwrap().1.room_id,
+            RoomId(1)
+        );
+
+        // A server that registers again orphans its rooms until its next heartbeat: they are
+        // not restored meanwhile (the link came back, the rooms still run there).
+        let (w3, s3) = world(3, 1, true);
+        f.note_room(&w3, "gs-2", 60);
+        f.on_message("gs-2", hb(1, vec![s3.clone()]), 60);
+        f.reservations.clear();
+        f.recount_reserved();
+        f.on_message("gs-2", reg("gs-2", "eu", 100), 70);
+        assert!(f.room(RoomId(3)).unwrap().orphaned);
+        assert_eq!(f.displaced_room_for("world", &any, 1, 70), None, "may still run there");
+        // Its next heartbeat does not list it (a restarted process): lost, restorable.
+        f.on_message("gs-2", hb(0, vec![]), 80);
+        assert_eq!(
+            f.displaced_room_for("world", &any, 1, 80),
+            Some((RoomId(3), Displaced::Restorable))
+        );
+
+        // Lost with its server: restorable, unless the game voids it (`RecoveryPolicy::Abandon`).
+        let mut f = FleetRegistry::new(10_000, 300_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        let (w4, mut s4) = world(4, 1, true);
+        s4.abandon_on_loss = true;
+        f.note_room(&w1, "gs-1", 0);
+        f.note_room(&w4, "gs-1", 0);
+        f.on_message("gs-1", hb(2, vec![s1, s4]), 10);
+        f.reservations.clear();
+        f.recount_reserved();
+        f.sweep(10 + 10_001, 10_000);
+        assert!(f.room(RoomId(1)).unwrap().orphaned && f.room(RoomId(4)).unwrap().orphaned);
+        assert_eq!(
+            f.displaced_room_for("world", &any, 1, 10_020),
+            Some((RoomId(1), Displaced::Restorable))
+        );
+        assert_eq!(f.displaced_room_for("world", &any, 3, 10_020), None);
     }
 
     #[test]

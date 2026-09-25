@@ -219,7 +219,11 @@ pub(crate) fn server_receive(ctx: &mut SystemCtx) {
 }
 
 fn reject(req: &JoinRequest, code: RejectCode, message: &str) {
-    let pkt = super::handshake::reject_packet(code, message, None);
+    reject_with(req, code, message, None);
+}
+
+fn reject_with(req: &JoinRequest, code: RejectCode, message: &str, retry_after_ms: Option<u32>) {
+    let pkt = super::handshake::reject_packet(code, message, retry_after_ms);
     let _ = req.tx.send(Lane::Reliable, pkt);
     req.tx.close(CloseCode::POLICY, message);
 }
@@ -306,9 +310,9 @@ fn handle_join(
         }));
         return;
     }
-    if !server.joinable {
+    if let Some(r) = &server.join_refusal {
         server.stats.rejects += 1;
-        return reject(&req, RejectCode::RoomClosed, "room is not accepting players");
+        return reject_with(&req, r.code, &r.message, r.retry_after_ms);
     }
     let Some(client) = server.slots.allocate(server.config.max_clients) else {
         server.stats.rejects += 1;
@@ -390,7 +394,7 @@ fn send_welcome(server: &mut NetServer, client: NetClientId, req: &JoinRequest, 
         send_interval: server.config.send_interval.max(1),
         server_tick: server.tick,
         resume: token.encode(),
-        resume_window_s: server.config.resume_window.as_secs().min(u64::from(u16::MAX)) as u16,
+        resume_window_s: resume_window_s(server.config.resume_window),
         limits: server.config.limits,
         down_bytes_per_sec: slot.down_rate,
         resumed,
@@ -399,6 +403,12 @@ fn send_welcome(server: &mut NetServer, client: NetClientId, req: &JoinRequest, 
     let _ = req
         .tx
         .send(Lane::Reliable, encode_handshake(PacketKind::Welcome, &welcome));
+}
+
+/// `Welcome::resume_window_s` of a resume window, rounded up: clients stop resuming when it is
+/// over (counted from the loss), so a window of less than a second must not read as none.
+fn resume_window_s(window: Duration) -> u16 {
+    window.as_millis().div_ceil(1000).min(u128::from(u16::MAX)) as u16
 }
 
 fn handle_closed(server: &mut NetServer, link: LinkId, reason: &str) {
@@ -820,5 +830,22 @@ mod tests {
         // Never exceeds the burst.
         assert!(b.take(Duration::from_secs(100), 2.0));
         assert!(!b.take(Duration::from_secs(100), 1.0));
+    }
+
+    /// A sub-second resume window is advertised as one second, not zero (a client reads zero as
+    /// "no resume": it stops resuming when the advertised window is over).
+    #[test]
+    fn the_advertised_resume_window_rounds_up() {
+        for (window, s) in [
+            (Duration::ZERO, 0),
+            (Duration::from_millis(1), 1),
+            (Duration::from_millis(500), 1),
+            (Duration::from_secs(1), 1),
+            (Duration::from_millis(1_500), 2),
+            (Duration::from_secs(20), 20),
+            (Duration::from_secs(1 << 20), u16::MAX),
+        ] {
+            assert_eq!(resume_window_s(window), s, "{window:?}");
+        }
     }
 }

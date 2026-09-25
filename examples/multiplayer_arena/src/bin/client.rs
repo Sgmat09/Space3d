@@ -15,7 +15,9 @@
 //!
 //! With `--ps`, a failed session (room crash or handoff, server loss, expired resume) is
 //! recovered through `POST /v1/sessions/rejoin`, which may restore the room on another game
-//! server; retry hints are honoured with backoff (see `online_flow`).
+//! server; retry hints are honoured with backoff (see `online_flow`). While a game server does
+//! not answer, the client asks the player service every few seconds whether the room moved
+//! (see `Probe`).
 //!
 //! The window title shows the connection state, RTT, cube count, rollbacks and bandwidth. On
 //! exit (`--frames` / `--seconds`, Esc, or closing the window) a one-line summary is printed.
@@ -193,41 +195,68 @@ fn init_logging() {
 
 // ---- player service flow ------------------------------------------------------------------------
 
+/// A pending player-service answer: a new assignment, or `None` (nothing to rejoin).
+type Answer = Task<Result<Option<Assignment>, OnlineError>>;
+
 /// Where the client is in the online flow (resource).
 enum Online {
     /// Dev auth: `NetClient` was pointed at the game server directly.
     Dev,
     LoggingIn(PlayerServiceClient, Task<Result<SessionTokens, OnlineError>>),
-    QuickPlay(PlayerServiceClient, Task<Result<Assignment, OnlineError>>),
-    /// Connected (or connecting) with a ticket; watches for a failed session.
+    QuickPlay {
+        api: PlayerServiceClient,
+        task: Task<Result<Assignment, OnlineError>>,
+        rejoin: Rejoins,
+    },
+    /// Connected (or connecting) with a ticket for game server `server`; watches for a failed
+    /// session, and asks the player service where the room is while that server does not
+    /// answer ([`Probe`]).
     Playing {
         api: PlayerServiceClient,
         rejoin: Rejoins,
+        server: String,
+        probe: Option<Probe>,
     },
-    /// Waiting before asking the player service to rejoin (a retry hint or backoff).
+    /// Waiting before asking the player service again (a retry hint or backoff).
     Waiting {
         api: PlayerServiceClient,
         until_s: f64,
         rejoin: Rejoins,
+        then: Ask,
     },
     Rejoining {
         api: PlayerServiceClient,
-        task: Task<Result<Option<Assignment>, OnlineError>>,
+        task: Answer,
         rejoin: Rejoins,
     },
     Failed,
 }
 
-/// Rejoin attempts since the session last worked: the budget resets once connected again.
+/// What to ask the player service after [`Online::Waiting`].
+#[derive(Clone, Copy, Debug)]
+enum Ask {
+    /// `POST /v1/sessions/rejoin`: where the room of a lost session is now.
+    Rejoin,
+    /// `POST /v1/play/quick`: a room to play in.
+    QuickPlay,
+}
+
+/// Attempts in a row since the session last worked: the budget resets once connected again.
 #[derive(Clone, Copy, Debug, Default)]
 struct Rejoins {
     attempts: u32,
 }
 
-/// Rejoin attempts in a row (without getting connected in between) before giving up.
+/// Attempts in a row (without getting connected in between) before giving up.
 const MAX_REJOINS: u32 = 8;
-/// Backoff between rejoin attempts in a row: 250 ms, doubling, at most 4 s (≈ 16 s in all).
+/// Backoff between attempts in a row: 250 ms, doubling, at most 4 s (≈ 16 s in all, longer
+/// when the player service asks for more).
 const REJOIN_BACKOFF_S: (f64, f64) = (0.25, 4.0);
+/// A reconnect that has not succeeded after this long asks the player service where the room
+/// is ([`Probe`]), then again at [`PROBE_EVERY_S`].
+const PROBE_AFTER_S: f64 = 2.0;
+/// See [`PROBE_AFTER_S`].
+const PROBE_EVERY_S: f64 = 2.0;
 
 impl Rejoins {
     /// Seconds to wait before the next attempt: the server's or player service's retry hint
@@ -243,11 +272,47 @@ impl Rejoins {
     }
 }
 
+/// While the game server does not answer — `NetClient` keeps reconnecting (resuming the
+/// session, or re-sending a ticket that never got in) and every attempt fails — the server may
+/// be gone: once its lease expires the player service restores the room elsewhere. Rather than
+/// wait for the reconnect schedule to run out (it ends with the resume window, ~20 s), ask the
+/// player service where the room is every few seconds (rejoin for a session, quick play for a
+/// ticket that never got in — or for a session the player service never heard of, when the
+/// server was lost right after admitting the player) and follow an answer that names another
+/// server.
+struct Probe {
+    ask: Ask,
+    next_s: f64,
+    task: Option<Answer>,
+}
+
+/// Quick play as an [`Answer`].
+fn quick_answer(api: &PlayerServiceClient) -> Answer {
+    let call = api.quick_play(&QuickPlayRequest {
+        mode: MODE.into(),
+        ..Default::default()
+    });
+    space3d_tasks::spawn(async move {
+        call.wait()
+            .await
+            .unwrap_or(Err(OnlineError::Net(space3d_net::NetError::Closed)))
+            .map(Some)
+    })
+}
+
+/// Whether asking the player service again may help: it said when (`retry_after_ms`: the room
+/// is moving, no server has room yet, rate limited), or it failed / was unreachable (5xx, 429,
+/// transport errors).
+fn retryable(e: &OnlineError) -> bool {
+    e.retry_after_ms().is_some() || e.is_retryable() || matches!(e, OnlineError::Net(_))
+}
+
 /// PreUpdate: poll the player-service calls (never blocks the frame) and hand tickets to
 /// `NetClient`. A lost session (room moved, crashed or closed, server gone) is recovered
-/// through `POST /v1/sessions/rejoin`, honouring retry hints (`Reject.retry_after_ms` of a
-/// draining server, `ApiError.retry_after_ms` of a player service holding a moving room) with
-/// backoff, and giving up after [`MAX_REJOINS`] attempts in a row.
+/// through `POST /v1/sessions/rejoin` — or quick play when there is nothing to rejoin —
+/// honouring retry hints (`Reject.retry_after_ms` of a draining server or a room on the move,
+/// `ApiError.retry_after_ms` of a player service holding a moving room or waiting for
+/// capacity) with backoff, and giving up after [`MAX_REJOINS`] attempts in a row.
 fn online_flow(ctx: &mut SystemCtx) {
     let now_s = ctx.time().elapsed_secs();
     let state = std::mem::replace(ctx.resources.expect_mut::<Online>(), Online::Failed);
@@ -257,21 +322,30 @@ fn online_flow(ctx: &mut SystemCtx) {
             ..Default::default()
         })
     };
-    // Schedule the next rejoin attempt, or give up.
-    let retry = |api: PlayerServiceClient, rejoin: Rejoins, hint: Option<std::time::Duration>, why: String| {
+    // Schedule the next attempt, or give up.
+    let retry = |api: PlayerServiceClient,
+                 rejoin: Rejoins,
+                 hint: Option<std::time::Duration>,
+                 then: Ask,
+                 why: String| {
         if rejoin.attempts >= MAX_REJOINS {
             tracing::error!(attempts = rejoin.attempts, %why, "giving up rejoining");
             return Online::Failed;
         }
         let wait = rejoin.delay_s(hint);
-        tracing::warn!(%why, attempt = rejoin.attempts + 1, wait_s = wait, "session lost; rejoining through the player service");
+        tracing::warn!(%why, attempt = rejoin.attempts + 1, wait_s = wait, ?then, "session lost; asking the player service again");
         Online::Waiting {
             api,
             until_s: now_s + wait,
             rejoin: Rejoins {
                 attempts: rejoin.attempts + 1,
             },
+            then,
         }
+    };
+    let hint_of = |e: &OnlineError| {
+        e.retry_after_ms()
+            .map(|ms| std::time::Duration::from_millis(u64::from(ms)))
     };
     let next = match state {
         Online::LoggingIn(api, mut task) => match task.poll() {
@@ -279,43 +353,142 @@ fn online_flow(ctx: &mut SystemCtx) {
             Some(Ok(tokens)) => {
                 tracing::info!(player = %tokens.profile.player_id, "logged in as a guest");
                 let task = quick(&api);
-                Online::QuickPlay(api, task)
+                Online::QuickPlay {
+                    api,
+                    task,
+                    rejoin: Rejoins::default(),
+                }
             }
             Some(Err(e)) => {
                 tracing::error!(error = %e, "guest login failed");
                 Online::Failed
             }
         },
-        Online::QuickPlay(api, mut task) => match task.poll() {
-            None => Online::QuickPlay(api, task),
+        Online::QuickPlay { api, mut task, rejoin } => match task.poll() {
+            None => Online::QuickPlay { api, task, rejoin },
             Some(Ok(a)) => {
                 tracing::info!(server = %a.server_id, room = %a.room_id, "join ticket received");
                 connect_ticket(ctx, &a);
                 Online::Playing {
                     api,
-                    rejoin: Rejoins::default(),
+                    rejoin,
+                    server: a.server_id,
+                    probe: None,
                 }
+            }
+            // No server has room yet (`503 no_capacity`), the room is moving, rate limited, or
+            // the player service is briefly unreachable: ask again.
+            Some(Err(e)) if retryable(&e) => {
+                let hint = hint_of(&e);
+                retry(api, rejoin, hint, Ask::QuickPlay, format!("quick play failed: {e}"))
             }
             Some(Err(e)) => {
                 tracing::error!(error = %e, "quick play failed");
                 Online::Failed
             }
         },
-        Online::Playing { api, mut rejoin } => match ctx.resources.expect::<NetClient>().state().clone() {
+        Online::Playing {
+            api,
+            mut rejoin,
+            server,
+            mut probe,
+        } => {
+            let state = ctx.resources.expect::<NetClient>().state().clone();
             // Resume tokens are process-local: after a room handoff or crash, or a server
             // loss, the player service knows where the room lives now (restoring it if
             // needed). A draining server's refusal says when to ask again.
-            ConnectionState::Failed(reason) => retry(api, rejoin, reason.retry_after(), format!("{reason:?}")),
-            state => {
+            if let ConnectionState::Failed(reason) = state {
+                retry(api, rejoin, reason.retry_after(), Ask::Rejoin, format!("{reason:?}"))
+            } else {
                 if matches!(state, ConnectionState::Connected) {
                     rejoin = Rejoins::default();
                 }
-                Online::Playing { api, rejoin }
+                let stuck = match state {
+                    ConnectionState::Reconnecting { .. } => Some(Ask::Rejoin),
+                    ConnectionState::Connecting { attempt } if attempt > 0 => Some(Ask::QuickPlay),
+                    _ => None,
+                };
+                let mut moved = None;
+                match stuck {
+                    None => probe = None,
+                    Some(ask) => {
+                        let p = probe.get_or_insert(Probe {
+                            ask,
+                            next_s: now_s + PROBE_AFTER_S,
+                            task: None,
+                        });
+                        match p.task.as_mut().map(Task::poll) {
+                            Some(Some(Ok(Some(a)))) if a.server_id != server => moved = Some(a),
+                            // Nothing to rejoin: the server was lost before the player service
+                            // heard the player joined. Quick play finds (restores) the room.
+                            Some(Some(Ok(None))) => {
+                                p.task = None;
+                                p.ask = Ask::QuickPlay;
+                                p.next_s = now_s;
+                            }
+                            Some(Some(_)) => {
+                                p.task = None;
+                                p.next_s = now_s + PROBE_EVERY_S;
+                            }
+                            Some(None) => {}
+                            None if now_s >= p.next_s => {
+                                p.task = Some(match p.ask {
+                                    Ask::Rejoin => api.rejoin(),
+                                    Ask::QuickPlay => quick_answer(&api),
+                                });
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                match moved {
+                    Some(a) => {
+                        tracing::warn!(from = %server, to = %a.server_id, room = %a.room_id, "game server not answering; the room is on another server now, following it");
+                        connect_ticket(ctx, &a);
+                        Online::Playing {
+                            api,
+                            rejoin,
+                            server: a.server_id,
+                            probe: None,
+                        }
+                    }
+                    None => Online::Playing {
+                        api,
+                        rejoin,
+                        server,
+                        probe,
+                    },
+                }
             }
+        }
+        Online::Waiting {
+            api,
+            until_s,
+            rejoin,
+            then,
+        } if now_s < until_s => Online::Waiting {
+            api,
+            until_s,
+            rejoin,
+            then,
         },
-        Online::Waiting { api, until_s, rejoin } if now_s < until_s => Online::Waiting { api, until_s, rejoin },
-        Online::Waiting { api, rejoin, .. } => Online::Rejoining {
+        Online::Waiting {
+            api,
+            rejoin,
+            then: Ask::Rejoin,
+            ..
+        } => Online::Rejoining {
             task: api.rejoin(),
+            api,
+            rejoin,
+        },
+        Online::Waiting {
+            api,
+            rejoin,
+            then: Ask::QuickPlay,
+            ..
+        } => Online::QuickPlay {
+            task: quick(&api),
             api,
             rejoin,
         },
@@ -324,20 +497,24 @@ fn online_flow(ctx: &mut SystemCtx) {
             Some(Ok(Some(a))) => {
                 tracing::info!(server = %a.server_id, room = %a.room_id, "rejoining");
                 connect_ticket(ctx, &a);
-                Online::Playing { api, rejoin }
+                Online::Playing {
+                    api,
+                    rejoin,
+                    server: a.server_id,
+                    probe: None,
+                }
             }
             Some(Ok(None)) => {
-                tracing::info!("room is gone; quick play again");
+                tracing::info!("no room to rejoin; quick play again");
                 let task = quick(&api);
-                Online::QuickPlay(api, task)
+                Online::QuickPlay { api, task, rejoin }
             }
-            // The room is moving (`503 room_moving`), no capacity yet, or the player service is
-            // briefly unreachable: try again.
-            Some(Err(e)) if e.retry_after_ms().is_some() || matches!(e, OnlineError::Net(_)) => {
-                let hint = e
-                    .retry_after_ms()
-                    .map(|ms| std::time::Duration::from_millis(u64::from(ms)));
-                retry(api, rejoin, hint, format!("rejoin failed: {e}"))
+            // The room is moving (`503 room_moving`), no server has room for it yet
+            // (`503 no_capacity`: a rolling restart), or the player service is briefly
+            // unreachable: try again.
+            Some(Err(e)) if retryable(&e) => {
+                let hint = hint_of(&e);
+                retry(api, rejoin, hint, Ask::Rejoin, format!("rejoin failed: {e}"))
             }
             Some(Err(e)) => {
                 tracing::error!(error = %e, "rejoin failed");

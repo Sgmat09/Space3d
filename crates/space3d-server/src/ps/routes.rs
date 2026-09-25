@@ -472,17 +472,28 @@ async fn quick_play(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, bo
     let account = account_of(&svc, who.player()).await?;
     let extra = serde_json::json!({ "rating": account.rating });
     let build = Build::new(&req.game_id, req.schema_hash);
-    let (server, spec) = svc
-        .quick_play_room(&best_region(&req.region_pings), &req.mode, &build, account.id)
-        .map_err(|why| match why {
-            super::QuickPlayRefusal::NoCapacity => {
-                let mut e = api_err(503, "no_capacity", "no game server available");
-                e.1.retry_after_ms = Some(5_000);
-                e
+    let region = best_region(&req.region_pings);
+    // The persistent room of the mode is being handed off: wait (bounded, like a rejoin) until
+    // it can be restored, then join it there — never open a second copy of it meanwhile.
+    let started = std::time::Instant::now();
+    let placed = loop {
+        match svc.quick_play_room(&region, &req.mode, &build, account.id) {
+            Err(super::QuickPlayRefusal::RoomMoving) if started.elapsed() < HANDOFF_REJOIN_WAIT => {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            super::QuickPlayRefusal::UnknownMode => api_err(404, "unknown_mode", "no server hosts this mode"),
-            super::QuickPlayRefusal::RoomRate => limited(10_000, "too many new rooms"),
-        })?;
+            other => break other,
+        }
+    };
+    let (server, spec) = placed.map_err(|why| match why {
+        super::QuickPlayRefusal::NoCapacity => {
+            let mut e = api_err(503, "no_capacity", "no game server available");
+            e.1.retry_after_ms = Some(NO_CAPACITY_RETRY_AFTER_MS);
+            e
+        }
+        super::QuickPlayRefusal::RoomMoving => room_moving(),
+        super::QuickPlayRefusal::UnknownMode => api_err(404, "unknown_mode", "no server hosts this mode"),
+        super::QuickPlayRefusal::RoomRate => limited(10_000, "too many new rooms"),
+    })?;
     Ok(Json(svc.issue_ticket(
         account.id,
         &account.display_name,
@@ -493,12 +504,24 @@ async fn quick_play(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, bo
     )))
 }
 
-/// Longest a rejoin waits for a room that is moving to another server (`FleetUp::RoomMoving`,
-/// or a draining server's persistent room) until the room's final checkpoint is stored.
+/// Longest a rejoin or a quick play waits for a room that is moving to another server
+/// (`FleetUp::RoomMoving`, or a draining server's persistent room) until the room's final
+/// checkpoint is stored.
 const HANDOFF_REJOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Retry hint of a rejoin that timed out waiting for a handoff (`503 room_moving`).
+/// Retry hint of a rejoin or quick play that timed out waiting for a handoff
+/// (`503 room_moving`).
 const HANDOFF_RETRY_AFTER_MS: u32 = 1_000;
+
+/// Retry hint of a quick play or rejoin that found no game server with room (`503 no_capacity`):
+/// servers come back (a rolling restart) or are added (autoscaling).
+const NO_CAPACITY_RETRY_AFTER_MS: u32 = 5_000;
+
+fn room_moving() -> ApiErr {
+    let mut e = api_err(503, "room_moving", "the room is moving to another server; retry");
+    e.1.retry_after_ms = Some(HANDOFF_RETRY_AFTER_MS);
+    e
+}
 
 /// Wait (bounded, real time) while `player`'s room is being handed off: going back to the room
 /// being frozen / closed would fail (its server is draining), and restoring it now would use an
@@ -516,9 +539,7 @@ async fn wait_for_handoff(svc: &PlayerService, player: PlayerId) -> Result<(), A
             return Ok(());
         }
         if started.elapsed() >= HANDOFF_REJOIN_WAIT {
-            let mut e = api_err(503, "room_moving", "the room is moving to another server; retry");
-            e.1.retry_after_ms = Some(HANDOFF_RETRY_AFTER_MS);
-            return Err(e);
+            return Err(room_moving());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -529,7 +550,6 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
     let account = account_of(&svc, who.player()).await?;
     wait_for_handoff(&svc, account.id).await?;
     let now = svc.now_ms();
-    let reserve = svc.config.player_service.join_ticket_ttl.as_millis() as i64;
     let mut abandoned: Option<(RoomId, Option<space3d_replication::MatchId>)> = None;
     let placed = {
         let mut fleet = svc.fleet.lock();
@@ -578,27 +598,13 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
         } else {
             // Server lost or room handed off: restore the room elsewhere from its checkpoint,
             // on a server of the same game and schema (it must be able to load the checkpoint).
-            let region = fleet
-                .server(&server_id)
-                .map(|s| s.registration.region.clone())
-                .unwrap_or_default();
-            let seats = u32::from(spec.max_players.max(1));
-            let target = fleet
-                .allocate(
-                    &region,
-                    &entry.build.game_id,
-                    entry.build.schema_hash,
-                    seats,
-                    now,
-                    reserve,
-                )
-                .ok_or_else(|| api_err(503, "no_capacity", "no compatible game server available"))?;
-            fleet.reassign(room, &target.registration.server_id, now);
-            tracing::info!(room = %room, from = %server_id, to = %target.registration.server_id, "room moved for rejoin");
-            svc.send_fleet(
-                &target.registration.server_id,
-                crate::gs::fleet::FleetDown::PrepareRoom { spec: spec.clone() },
-            );
+            // None may have room for it right now (a rolling restart of the only server): the
+            // players ask again once one does.
+            let target = svc.restore_room(&mut fleet, room, "rejoin").ok_or_else(|| {
+                let mut e = api_err(503, "no_capacity", "no compatible game server available");
+                e.1.retry_after_ms = Some(NO_CAPACITY_RETRY_AFTER_MS);
+                e
+            })?;
             Some((target, spec, team))
         }
     };

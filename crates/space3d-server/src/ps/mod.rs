@@ -322,12 +322,52 @@ impl PlayerService {
         Some((server, spec))
     }
 
+    /// Move a room whose server was lost, or that a draining server handed off, to another
+    /// server and have it restored there (`PrepareRoom`: the room loads its stored checkpoint).
+    /// The new server runs the build that created the room (it must be able to load the
+    /// checkpoint), preferably in the region of the old one, and gets the room's full capacity
+    /// reserved. `None` when no such server has room for it. The caller holds the fleet lock
+    /// and issues the tickets; `by` names it in the log (`"rejoin"`, `"quick play"`).
+    pub fn restore_room(
+        &self,
+        fleet: &mut fleet::FleetRegistry,
+        room: RoomId,
+        by: &'static str,
+    ) -> Option<fleet::ServerRecord> {
+        let now = self.now_ms();
+        let entry = fleet.room(room)?.clone();
+        let spec = entry.spec?;
+        let region = fleet
+            .server(&entry.server)
+            .map(|s| s.registration.region.clone())
+            .unwrap_or_default();
+        let seats = u32::from(spec.max_players.max(1));
+        let target = fleet.allocate(
+            &region,
+            &entry.build.game_id,
+            entry.build.schema_hash,
+            seats,
+            now,
+            self.ticket_reserve_ms(),
+        )?;
+        fleet.reassign(room, &target.registration.server_id, now);
+        tracing::info!(room = %room, from = %entry.server, to = %target.registration.server_id, by, "room moved for a restore");
+        self.send_fleet(&target.registration.server_id, FleetDown::PrepareRoom { spec });
+        Some(target)
+    }
+
     /// Quick play for `player`: the fullest open room of `mode` with a free seat, else a fresh
     /// one (capacity and params from the queue with that mode) on a server that hosts the mode.
     /// Finding and allocating happen under one fleet lock, so concurrent quick plays fill one
     /// new room instead of each opening their own. The seat is reserved for `player`, and a
     /// player holds at most one such reservation (a new quick play releases the previous one);
     /// opening a fresh room also takes a token of the per-account room budget.
+    ///
+    /// A persistent room of the mode with a free seat that is on the move comes before a fresh
+    /// room (see [`fleet::FleetRegistry::displaced_room_for`]): while it is handed off the
+    /// answer is [`QuickPlayRefusal::RoomMoving`] (ask again shortly), and once it was handed
+    /// off or lost with its server it is restored elsewhere ([`Self::restore_room`]) and the
+    /// player placed in it.
     pub fn quick_play_room(
         &self,
         region: &str,
@@ -339,9 +379,23 @@ impl PlayerService {
         let reserve = self.ticket_reserve_ms();
         let (found, fresh) = {
             let mut fleet = self.fleet.lock();
-            let (found, fresh) = match fleet.open_room_for(mode, build, 1, now, reserve) {
-                Some(open) => (open, false),
-                None => {
+            let open = fleet.open_room_for(mode, build, 1, now, reserve);
+            let displaced = match open {
+                Some(_) => None,
+                None => fleet.displaced_room_for(mode, build, 1, now),
+            };
+            let (found, fresh) = match (open, displaced) {
+                (Some(open), _) => (open, false),
+                (None, Some((_, fleet::Displaced::Moving))) => return Err(QuickPlayRefusal::RoomMoving),
+                (None, Some((room, fleet::Displaced::Restorable))) => {
+                    self.restore_room(&mut fleet, room, "quick play")
+                        .ok_or(QuickPlayRefusal::NoCapacity)?;
+                    let open = fleet
+                        .open_room_for(mode, build, 1, now, reserve)
+                        .ok_or(QuickPlayRefusal::NoCapacity)?;
+                    (open, false)
+                }
+                (None, None) => {
                     let queue = self.config.matchmaking.queues.iter().find(|q| q.mode == mode);
                     if queue.is_none() && fleet.mode_unknown(build, mode) {
                         return Err(QuickPlayRefusal::UnknownMode);
@@ -415,6 +469,9 @@ impl PlayerService {
 pub enum QuickPlayRefusal {
     /// No compatible server with free seats / room slots.
     NoCapacity,
+    /// The persistent room of the mode is moving to another server (drain handoff): ask again
+    /// once its final checkpoint is stored.
+    RoomMoving,
     /// No configured queue and no server hosts the mode.
     UnknownMode,
     /// The account opened too many rooms recently.

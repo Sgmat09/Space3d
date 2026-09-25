@@ -9,7 +9,7 @@ use space3d_net::{Http, HttpRequest};
 use space3d_replication::api::SessionTokens;
 use space3d_replication::client::{ConnectionState, FailReason, NetClient};
 use space3d_replication::harness::ClientHandle;
-use space3d_replication::protocol::handshake::DisconnectCode;
+use space3d_replication::protocol::handshake::{DisconnectCode, RejectCode};
 use space3d_replication::{PlayerId, RoomId};
 use space3d_server::gs::checkpoint::Checkpoint;
 use space3d_server::ps::fleet::ServerState;
@@ -1122,6 +1122,198 @@ fn a_rejoin_sent_the_moment_the_handoff_disconnects_is_held_for_the_restore() {
         c.client_net(ca).is_connected() && c.client_net(cb).is_connected() && remote_count(c.client(cb)) == 2
     }));
     assert_eq!(pawn_health(c.room(room).unwrap(), player(&alice)), Some(42));
+}
+
+/// Rooms of `mode` the player service knows (live, moving or waiting for a restore).
+fn rooms_of_mode(c: &TestCluster, mode: &str) -> Vec<RoomId> {
+    c.player_service()
+        .fleet
+        .lock()
+        .rooms()
+        .filter(|(_, e)| e.spec.as_ref().is_some_and(|s| s.mode == mode))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+fn quick_play_in_background(
+    c: &TestCluster,
+    tokens: &SessionTokens,
+    mode: &str,
+) -> std::thread::JoinHandle<
+    Option<Result<space3d_replication::api::Assignment, space3d_replication::services::OnlineError>>,
+> {
+    let api = c.api(tokens);
+    let req = space3d_replication::api::QuickPlayRequest {
+        mode: mode.to_owned(),
+        ..Default::default()
+    };
+    std::thread::spawn(move || api.quick_play(&req).block())
+}
+
+/// Regression (verifier runs 03/15/21, real processes): a player whose quick play was answered
+/// in the moment a persistent room's server began to drain got a ticket into that room, which
+/// refused it as closed for good (`Reject(RoomClosed)`, no retry delay). Their rejoin found
+/// nothing (they had never joined), and their next quick play — the draining server no longer
+/// taking players — opened a second copy of the world on another server, next to the restored
+/// one, for good. The moving room now refuses the ticket as transient (`ServerDraining` with a
+/// retry delay), and a quick play into a mode whose persistent room is moving waits for the
+/// handoff, then joins the room where it was restored.
+#[test]
+fn a_quick_play_during_a_handoff_joins_the_moved_room() {
+    let mut c = persistent_cluster(2);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let a = c.quick_play(&alice, "world").expect("quick play");
+    let (room, host) = (a.room_id, a.server_id.clone());
+    let ca = c.connect(&a, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    assert!(c.run_until(600, |c| c.client_net(ca).is_connected()));
+    c.step_ticks(30);
+    // Bob's quick play is answered just before the player service hears of the drain.
+    let b = c.quick_play(&bob, "world").expect("quick play");
+    assert_eq!((b.room_id, b.server_id.as_str()), (room, host.as_str()));
+    let (status, _) = admin(&c, &host, "POST", "/admin/v1/drain", None, true);
+    assert_eq!(status, 202);
+    assert!(c.run_until(600, |c| {
+        c.player_service().fleet.lock().room(room).is_some_and(|e| e.moving)
+    }));
+    let cb = c.connect(&b, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    assert!(c.run_until(300, |c| matches!(c.client_net(cb).state(), ConnectionState::Failed(_))));
+    let ConnectionState::Failed(why) = c.client_net(cb).state().clone() else {
+        unreachable!()
+    };
+    assert!(
+        matches!(&why, FailReason::Rejected(r) if r.code == RejectCode::ServerDraining),
+        "{why:?}"
+    );
+    assert!(why.retry_after().is_some(), "a transient refusal: ask again ({why:?})");
+    // Bob asks the player service again: there is nothing to rejoin (he never joined), and his
+    // quick play waits while the room moves — no second copy of the world meanwhile.
+    assert_eq!(c.rejoin(&bob).expect("rejoin"), None);
+    assert!(
+        c.player_service().fleet.lock().room(room).is_some_and(|e| e.moving),
+        "the room is still moving"
+    );
+    let quick = quick_play_in_background(&c, &bob, "world");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!quick.is_finished(), "quick play waits for the handoff");
+    assert_eq!(rooms_of_mode(&c, "world"), vec![room]);
+    assert!(
+        run_until_bg(&mut c, 1800, |_| quick.is_finished()),
+        "answered after the handoff"
+    );
+    let b = quick.join().unwrap().expect("task").expect("quick play");
+    assert_eq!(b.room_id, room, "bob joins the world, not a new room");
+    assert_ne!(b.server_id, host, "where it was restored");
+    assert!(failed_with(&c, ca, DisconnectCode::ServerShutdown));
+    let a = c.rejoin(&alice).unwrap().expect("restorable");
+    assert_eq!((a.room_id, a.server_id.as_str()), (room, b.server_id.as_str()));
+    c.reconnect(ca, &a);
+    c.reconnect(cb, &b);
+    assert!(c.run_until(900, |c| {
+        c.client_net(ca).is_connected()
+            && c.client_net(cb).is_connected()
+            && remote_count(c.client(ca)) == 2
+            && remote_count(c.client(cb)) == 2
+    }));
+    assert_eq!(rooms_of_mode(&c, "world"), vec![room], "one world");
+}
+
+/// A quick play into a mode whose persistent room was lost with its server (its lease
+/// expired, its players not back yet) restores that room on another server and places the
+/// player in it, as its players' rejoin would — instead of opening a second world that the
+/// returning players would never see.
+#[test]
+fn a_quick_play_restores_a_lost_world_instead_of_opening_another() {
+    let mut c = persistent_cluster(2);
+    let alice = c.guest("alice");
+    let carol = c.guest("carol");
+    let a = c.quick_play(&alice, "world").expect("quick play");
+    let (room, lost) = (a.room_id, a.server_id.clone());
+    let ca = c.connect(&a, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    assert!(c.run_until(600, |c| c.client_net(ca).is_connected()));
+    send(&mut c, ca, &SetHealth(9));
+    assert!(c.run_until(120, |c| pawn_health(c.room(room).unwrap(), player(&alice)) == Some(9)));
+    let set_at = c.unix_clock_ms();
+    let (status, _) = admin(
+        &c,
+        &lost,
+        "POST",
+        &format!("/admin/v1/rooms/{room}/checkpoint"),
+        None,
+        true,
+    );
+    assert_eq!(status, 202);
+    let stored = run_until_bg(&mut c, 600, |c| {
+        c.player_service()
+            .store
+            .get_checkpoint(room)
+            .block()
+            .unwrap()
+            .unwrap()
+            .is_some_and(|(saved, _)| saved > set_at)
+    });
+    assert!(stored, "a checkpoint with the change reached the player service");
+    c.kill_game_server(&lost);
+    let lease = c.player_service().config.fleet.lease_ttl;
+    let ticks = (lease.as_secs_f64() * 60.0) as u64 + 180;
+    assert!(c.run_until(ticks, |c| {
+        c.player_service().fleet.lock().room(room).is_some_and(|e| e.orphaned)
+    }));
+    let k = c.quick_play(&carol, "world").expect("quick play");
+    assert_eq!(k.room_id, room, "the world, restored");
+    assert_ne!(k.server_id, lost);
+    let a = c.rejoin(&alice).unwrap().expect("restorable");
+    assert_eq!((a.room_id, a.server_id.as_str()), (room, k.server_id.as_str()));
+    c.reconnect(ca, &a);
+    let ck = c.connect(&k, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    assert!(c.run_until(900, |c| {
+        c.client_net(ca).is_connected() && c.client_net(ck).is_connected() && remote_count(c.client(ck)) == 2
+    }));
+    assert_eq!(
+        pawn_health(c.room(room).unwrap(), player(&alice)),
+        Some(9),
+        "restored state"
+    );
+    assert_eq!(rooms_of_mode(&c, "world"), vec![room], "one world");
+}
+
+/// Regression (verifier, rolling restart of a single game server): a rejoin that found no
+/// game server able to take the room answered `503 no_capacity` without a retry delay (quick
+/// play had one), so the example client gave up at once instead of waiting for the
+/// replacement server. Both now say when to ask again.
+#[test]
+fn no_capacity_for_a_restore_says_when_to_ask_again() {
+    let mut c = persistent_cluster(1);
+    let alice = c.guest("alice");
+    let carol = c.guest("carol");
+    let a = c.quick_play(&alice, "world").expect("quick play");
+    let (room, host) = (a.room_id, a.server_id.clone());
+    let ca = c.connect(&a, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    assert!(c.run_until(600, |c| c.client_net(ca).is_connected()));
+    c.step_ticks(30);
+    let (status, _) = admin(&c, &host, "POST", "/admin/v1/drain", None, true);
+    assert_eq!(status, 202);
+    assert!(run_until_bg(&mut c, 1800, |c| {
+        c.player_service().fleet.lock().room(room).is_some_and(|e| e.orphaned)
+    }));
+    for e in [
+        c.rejoin(&alice).unwrap_err(),
+        c.quick_play(&carol, "world").unwrap_err(),
+    ] {
+        assert_eq!((e.status(), e.code()), (Some(503), Some("no_capacity")), "{e}");
+        assert!(e.retry_after_ms().is_some(), "{e}");
+    }
+    assert_eq!(rooms_of_mode(&c, "world"), vec![room], "still restorable");
 }
 
 /// Regression: a room that panicked while frozen for its drain handoff was rebuilt as a

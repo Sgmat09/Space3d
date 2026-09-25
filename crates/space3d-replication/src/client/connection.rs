@@ -29,6 +29,8 @@ use std::time::Duration;
 const PING_BURST: (u32, Duration) = (8, Duration::from_millis(100));
 /// Client statistics report period.
 const REPORT_EVERY: Duration = Duration::from_secs(5);
+/// The last resume attempt starts this long before the resume window ends.
+const RESUME_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
 
 /// Live connection data.
 pub struct Connection {
@@ -60,6 +62,9 @@ pub struct Connection {
     pub(crate) resuming: bool,
     /// The one-time Dev fallback after `ResumeExpired` was used.
     pub(crate) fell_back: bool,
+    /// When the session's link was lost (cleared by the next `Welcome`): resume attempts stop
+    /// once the server's resume window (`Welcome::resume_window_s`) has passed since.
+    pub(crate) lost_at: Option<Duration>,
     /// Clock time of the current frame.
     pub(crate) now: Duration,
     pub(crate) next_ping_at: Duration,
@@ -92,6 +97,7 @@ impl Connection {
             resume_token: None,
             resuming: false,
             fell_back: false,
+            lost_at: None,
             now: Duration::ZERO,
             next_ping_at: Duration::ZERO,
             pings_sent: 0,
@@ -176,23 +182,57 @@ fn send_hello(net: &mut NetClient, conn: &mut Connection, now: Duration, registr
     net.state = ConnectionState::Handshaking;
 }
 
+impl Connection {
+    /// End of the resume window of the session lost at `lost_at` (the server keeps the slot
+    /// that long after the link went; later resumes cannot succeed). `None` without a session.
+    pub(crate) fn resume_deadline(&self) -> Option<Duration> {
+        let window = Duration::from_secs(u64::from(self.welcome.as_ref()?.resume_window_s));
+        Some(self.lost_at? + window)
+    }
+
+    /// Whether a resume can still start at `at` and find the slot (see
+    /// [`Self::resume_deadline`]; the last one starts [`RESUME_DEADLINE_MARGIN`] before it).
+    pub(crate) fn resume_open(&self, at: Duration) -> bool {
+        self.resume_deadline()
+            .is_none_or(|end| at + RESUME_DEADLINE_MARGIN < end)
+    }
+}
+
 /// The link of the current attempt is gone: reconnect (with resume when possible) or give up.
+///
+/// Resuming stops with the server's resume window (`Welcome::resume_window_s`, counted from
+/// the loss): the last attempt is made just before it ends, and then the session fails
+/// (`FailReason::Unreachable`) — a slot kept no longer cannot be resumed, and a game server
+/// that was lost with it (its resume state died with the process) is never coming back, so
+/// the game should ask the player service where the room is now (rejoin) instead of retrying
+/// for the whole reconnect schedule.
 pub(crate) fn lost(net: &mut NetClient, conn: &mut Connection, now: Duration, reason: &str) {
     if let Some(mut t) = conn.transport.take() {
         t.close(CloseCode::NORMAL, reason);
     }
     conn.hello_sent = false;
     let in_session = matches!(net.state, ConnectionState::Syncing | ConnectionState::Connected);
+    if in_session {
+        conn.lost_at = Some(now);
+    }
     let policy = net.config.reconnect;
     let allowed = policy.max_attempts.is_none_or(|m| conn.attempt < m);
-    let can_resume = net.config.resume && conn.resume_token.is_some() && conn.welcome.is_some() && !conn.fell_back;
+    let can_resume = net.config.resume
+        && conn.resume_token.is_some()
+        && conn.welcome.is_some()
+        && !conn.fell_back
+        && conn.resume_open(now);
     let can_reauth = conn.welcome.is_none() || matches!(conn.auth, HelloAuth::Dev { .. });
     if allowed && (can_resume || can_reauth) {
-        let delay = if in_session {
+        let mut delay = if in_session {
             Duration::ZERO
         } else {
             policy.backoff.delay(conn.attempt)
         };
+        if !can_reauth && let Some(end) = conn.resume_deadline() {
+            // The last resume goes just before the window closes, not after it.
+            delay = delay.min(end.saturating_sub(now + RESUME_DEADLINE_MARGIN));
+        }
         conn.retry_at = Some(now + delay);
         conn.attempt += 1;
         if in_session {
@@ -211,11 +251,16 @@ pub(crate) fn lost(net: &mut NetClient, conn: &mut Connection, now: Duration, re
         }
         tracing::debug!(reason, attempt = conn.attempt, "connection lost; retrying");
     } else {
+        let reason = if allowed && conn.welcome.is_some() && !conn.resume_open(now) {
+            format!("{reason} (resume window over)")
+        } else {
+            reason.to_owned()
+        };
         tracing::info!(reason, "connection lost; giving up");
-        net.state = ConnectionState::Failed(FailReason::Unreachable(reason.to_owned()));
+        net.state = ConnectionState::Failed(FailReason::Unreachable(reason.clone()));
         net.events.push(ConnectionEvent::Disconnected {
             code: None,
-            reason: reason.to_owned(),
+            reason,
             will_reconnect: false,
         });
     }
@@ -381,5 +426,126 @@ fn send_frame(net: &mut NetClient, conn: &mut Connection, now: Duration, fps: f3
     net.stats.bytes_out += sent as u64;
     if ok && let Some(t) = newest_input {
         conn.last_input_sent = Some(t);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::protocol::WireLimits;
+    use crate::transport::TransportError;
+    use crate::{NetClientId, PlayerId, RoomId};
+
+    /// A game server that is gone: every connect is refused at once (and counted).
+    #[derive(Default)]
+    struct Refused(std::sync::atomic::AtomicUsize);
+
+    impl Connector for Refused {
+        fn connect(&self, _url: &str) -> Result<Box<dyn ClientTransport>, TransportError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(TransportError::Connect("Connection refused (os error 61)".into()))
+        }
+    }
+
+    pub(crate) fn welcome(resume_window_s: u16) -> Welcome {
+        Welcome {
+            client: NetClientId(0),
+            player: PlayerId(7),
+            room: RoomId(9),
+            room_epoch: 1,
+            tick_hz: 60,
+            send_interval: 2,
+            server_tick: Tick(0),
+            resume: vec![1, 2, 3],
+            resume_window_s,
+            limits: WireLimits::default(),
+            down_bytes_per_sec: 0,
+            resumed: false,
+            echo_client_time_us: 0,
+        }
+    }
+
+    /// A session (joined with `auth`) whose link drops at `at`; its server is gone.
+    fn dropped(auth: HelloAuth, resume_window_s: u16, at: Duration) -> (NetClient, Arc<Refused>) {
+        let mut net = NetClient::new(ClientConfig::default());
+        let server = Arc::new(Refused::default());
+        let mut conn = Connection::new(server.clone(), "ws://gs-1/play".into(), auth, &net.config);
+        conn.welcome = Some(welcome(resume_window_s));
+        conn.resume_token = Some(vec![1, 2, 3]);
+        net.state = ConnectionState::Connected;
+        lost(&mut net, &mut conn, at, "Connection reset without closing handshake");
+        net.conn = Some(conn);
+        (net, server)
+    }
+
+    /// Drive frames every 50 ms from `from` for at most `limit`: when the client tried to
+    /// connect, and when it gave up.
+    fn run(
+        net: &mut NetClient,
+        server: &Refused,
+        from: Duration,
+        limit: Duration,
+    ) -> (Vec<Duration>, Option<Duration>) {
+        let registry = ReplicationRegistry::default();
+        let mut attempts = Vec::new();
+        let mut t = from;
+        while t < from + limit {
+            t += Duration::from_millis(50);
+            let before = server.0.load(std::sync::atomic::Ordering::Relaxed);
+            drive(net, t, &registry);
+            if server.0.load(std::sync::atomic::Ordering::Relaxed) > before {
+                attempts.push(t - from);
+            }
+            if matches!(net.state, ConnectionState::Failed(_)) {
+                return (attempts, Some(t - from));
+            }
+        }
+        (attempts, None)
+    }
+
+    /// Regression: after its game server was lost (every reconnect refused at once), a client
+    /// kept resuming for its whole reconnect schedule — 10 attempts over ~56 s — although the
+    /// server keeps a slot only for the resume window (20 s) and a lost server's resume state
+    /// died with it. The player service had the room restorable after ~10 s, but the client
+    /// asked it only once the schedule ran out. Resuming now stops with the resume window: the
+    /// last attempt goes just before it ends, then the session fails and the game rejoins.
+    #[test]
+    fn resuming_stops_when_the_resume_window_is_over() {
+        let t0 = Duration::from_secs(100);
+        let (mut net, gs) = dropped(HelloAuth::Ticket("spent".into()), 20, t0);
+        assert!(matches!(net.state, ConnectionState::Reconnecting { .. }));
+        let (attempts, failed) = run(&mut net, &gs, t0, Duration::from_secs(70));
+        let failed = failed.expect("gave up");
+        assert!(
+            failed >= Duration::from_secs(19) && failed < Duration::from_secs(20),
+            "gave up {failed:?} after the loss (attempts at {attempts:?})"
+        );
+        let last = *attempts.last().unwrap();
+        assert!(
+            last >= Duration::from_millis(19_800) && last < Duration::from_secs(20),
+            "the last resume goes just before the window ends: {attempts:?}"
+        );
+        assert!(attempts.len() < 10, "{attempts:?}");
+        let ConnectionState::Failed(FailReason::Unreachable(why)) = &net.state else {
+            panic!("{:?}", net.state)
+        };
+        assert!(why.contains("resume window"), "{why}");
+
+        // A short window ends the attempts sooner; the reconnect schedule still bounds a long one.
+        let (mut net, gs) = dropped(HelloAuth::Ticket("spent".into()), 2, t0);
+        let (_, failed) = run(&mut net, &gs, t0, Duration::from_secs(70));
+        assert!(failed.is_some_and(|f| f < Duration::from_secs(2)), "{failed:?}");
+        let (mut net, gs) = dropped(HelloAuth::Ticket("spent".into()), u16::MAX, t0);
+        let (attempts, failed) = run(&mut net, &gs, t0, Duration::from_secs(70));
+        assert!(failed.is_some(), "the reconnect policy's 10 attempts still apply");
+        assert_eq!(attempts.len(), 10);
+
+        // Dev credentials can join afresh once the slot is gone: not bound by the window.
+        let (mut net, gs) = dropped(HelloAuth::Dev { name: "a".into() }, 2, t0);
+        let (attempts, _) = run(&mut net, &gs, t0, Duration::from_secs(10));
+        assert!(
+            attempts.last().is_some_and(|t| *t > Duration::from_secs(2)),
+            "{attempts:?}"
+        );
     }
 }

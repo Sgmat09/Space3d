@@ -90,7 +90,8 @@ client                 player service                        game server
 ```
 
 The ticket carries the room spec, so starting a match needs no RPC between the services. A
-dropped link resumes the same slot within 20 s using the resume token. After a room crash
+dropped link resumes the same slot within 20 s using the resume token (the client stops
+trying when those 20 s are over). After a room crash
 or a server loss, the client calls `POST /v1/sessions/rejoin`. The player service may then
 restore the room on another game server from its last checkpoint.
 
@@ -478,6 +479,12 @@ clients per room.
   checkpoint). The example client rejoins on any
   lost session, honouring retry hints (`Reject(ServerDraining).retry_after_ms`,
   `ApiError.retry_after_ms`) with backoff (0.25 s doubling to 4 s, 8 attempts in a row).
+- A quick play into the mode of a persistent room that is moving waits for the move the same
+  way (then joins the room where it was restored), and a quick play into the mode of a
+  persistent room that was handed off or lost with its server restores it, as a rejoin would.
+  A ticket the PS issued a moment before it heard of the drain is refused as transient
+  (`Reject(ServerDraining)` with `retry_after_ms`), so its holder asks the PS again. Quick play
+  never opens a second copy of a world while the first one is on its way.
 - Rooms still open at the drain deadline also report the move and wait for the
   acknowledgement before they disconnect their clients (their checkpoints stay restorable).
 - When the drain completes the server deregisters (the PS stops counting it at once) and closes
@@ -491,7 +498,7 @@ clients per room.
 |---|---|
 | Link blip | Resume within `resume_window`: same slot and pawn, with a full resync |
 | Room panic | Build with `--profile server`, which uses `panic = "unwind"`. The room is rebuilt from its last checkpoint and players rejoin (a room that was draining or handing off stays so). Three crashes in 5 minutes close the room and delete its checkpoint (after every upload still in flight, so none brings it back). |
-| Game server lost | The lease expires in `lease_ttl`. Rejoin restores the room from the PS-stored checkpoint on another server of the same game and schema hash. With `RecoveryPolicy::Abandon` the room is voided instead (audit `match_void`); rejoin answers 404 and players queue again. |
+| Game server lost | The lease expires in `lease_ttl`. Rejoin (or a quick play into the mode of a lost persistent room) restores the room from the PS-stored checkpoint on another server of the same game and schema hash; with no such server free, `503 no_capacity` carries `retry_after_ms` (5 s). Clients stop resuming when `resume_window` is over; the example client also asks the PS every 2 s while its reconnect keeps failing, so it is back in the restored room about `lease_ttl` + 2 s after the loss. With `RecoveryPolicy::Abandon` the room is voided instead (audit `match_void`); rejoin answers 404 and players queue again. |
 | Player service down | Rooms keep playing, results queue in the game servers' durable outbox, and `/readyz` stays ready (`space3d_fleet_connected` shows the link). Logins and matchmaking pause until the PS returns; the outbox then flushes. |
 | Game server cut off from the PS (PS up) for longer than `lease_ttl` | The game server keeps playing its rooms, but the PS counts it as lost: a player who rejoins meanwhile gets the room restored elsewhere, and that copy is the one that counts. When the link is back, the PS closes the stale copy (`Disconnect(ServerShutdown)`); its players rejoin the live copy and lose what they did in the stale one — including its match results, scores and player-data writes after the point the live copy was restored from, which the PS drops when the outbox replays them. A stale copy that closes on its own (match over, empty) never deletes the live copy's checkpoint. |
 
@@ -512,7 +519,7 @@ clients per room.
 | Full stack in process: PS, GSs, gatekeeper, tickets, rooms and clients over the conditioned memory network, with manual clocks (`TestCluster`) | `crates/space3d-server/tests/{cluster,acceptance}.rs` | `cargo test -p space3d-server` |
 | Real sockets: all-in-one; split with lease expiry and restore; separate PS and GS Apps with ticket then connect | `crates/space3d-server/tests/{e2e,split,acceptance}.rs` | same |
 | Abuse over real sockets: idle / slow / excess sockets, trickled bodies, `X-Forwarded-For` lines, login lockout, cross-site admin requests, lobby limits, audit actor; the deployment files' documented commands | `crates/space3d-server/tests/{abuse,deploy}.rs` | same |
-| Example: WASD through the `ActionMap` in the harness; the shipped `server` plus 2 `client --headless --bot` processes; the split drain handoff with real processes (player service, 2 game servers, 2 bots, SIGTERM the hosting game server mid-play: the room moves, both bots play on). Every process's stdout and stderr is captured and must hold no ERROR line (`SPACE3D_PROCESS_TEST_LOGS=<dir>` keeps them) | `examples/multiplayer_arena/tests/{netcode,processes}.rs` | `cargo test -p multiplayer_arena` |
+| Example: WASD through the `ActionMap` in the harness; the shipped `server` plus 2 `client --headless --bot` processes; the split drain handoff with real processes (player service, 2 game servers, 2 bots, SIGTERM the hosting game server mid-play: the room moves, both bots play on; 2 more bots that quick play while it moves join it there, one world); the split crash (SIGKILL the hosting game server: with a 4 s lease both bots are back in the restored room within 12 s). Every process's stdout and stderr is captured and must hold no ERROR line (`SPACE3D_PROCESS_TEST_LOGS=<dir>` keeps them) | `examples/multiplayer_arena/tests/{netcode,processes}.rs` | `cargo test -p multiplayer_arena` |
 | Load: 200 bots | `examples/multiplayer_arena/tests/load.rs` (`#[ignore]`), `loadtest` binary | see §7.3 |
 
 ### 7.1 Lossy network acceptance

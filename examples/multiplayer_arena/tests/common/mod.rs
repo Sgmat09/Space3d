@@ -71,6 +71,12 @@ impl Proc {
         assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
     }
 
+    /// SIGKILL (a crash: no drain, no goodbye).
+    pub fn kill(&self) {
+        let pid = self.pid().to_string();
+        assert!(Command::new("kill").args(["-KILL", &pid]).status().unwrap().success());
+    }
+
     /// Wait for the exit (then for the output readers); `None` on timeout.
     pub fn wait(&mut self, deadline: Duration) -> Option<ExitStatus> {
         let status = wait_exit(self.child.as_mut().expect("running"), deadline)?;

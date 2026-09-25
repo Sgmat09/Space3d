@@ -194,6 +194,7 @@ fn on_welcome(
     conn.resume_token = Some(w.resume.clone());
     conn.attempt = 0;
     conn.fell_back = false;
+    conn.lost_at = None;
     conn.pings_sent = 0;
     conn.next_ping_at = now;
     conn.last_input_sent = None;
@@ -233,16 +234,18 @@ fn on_reject(net: &mut NetClient, conn: &mut Connection, now: Duration, r: Rejec
     // retried with credentials that can be presented again: a resume token within its window,
     // or dev auth. A spent join ticket cannot: the session fails with the refusal, and
     // `FailReason::retry_after` tells the game when to ask the player service again.
+    // A resume that could only be retried after the server's resume window is not retried.
     let transient = r.is_transient();
-    let reusable = conn.resuming || matches!(conn.auth, HelloAuth::Dev { .. });
     let policy = net.config.reconnect;
+    let wait = Duration::from_millis(u64::from(r.retry_after_ms.unwrap_or(1_000)));
+    let retry_at = now + wait.max(policy.backoff.delay(conn.attempt));
+    let reusable = (conn.resuming && conn.resume_open(retry_at)) || matches!(conn.auth, HelloAuth::Dev { .. });
     if transient && reusable && policy.max_attempts.is_none_or(|m| conn.attempt < m) {
         if let Some(mut t) = conn.transport.take() {
             t.close(crate::transport::CloseCode::NORMAL, "rejected (retrying)");
         }
         conn.hello_sent = false;
-        let wait = Duration::from_millis(u64::from(r.retry_after_ms.unwrap_or(1_000)));
-        conn.retry_at = Some(now + wait.max(policy.backoff.delay(conn.attempt)));
+        conn.retry_at = Some(retry_at);
         conn.attempt += 1;
         tracing::debug!(code = ?r.code, attempt = conn.attempt, "transient reject; retrying");
         if conn.welcome.is_some() {
@@ -714,6 +717,29 @@ mod tests {
         let (mut net, mut conn) = handshaking(HelloAuth::Dev { name: "a".into() }, false);
         on_reject(&mut net, &mut conn, now, busy());
         assert!(!matches!(net.state, ConnectionState::Failed(_)));
+    }
+
+    /// A transient refusal of a resume is not retried when the retry would come after the
+    /// server's resume window (the slot is gone by then): the session fails, and the game asks
+    /// the player service where the room is.
+    #[test]
+    fn a_resume_is_not_retried_past_the_resume_window() {
+        let now = Duration::from_secs(10);
+        for (window_s, lost_ago, retried) in [
+            (20, Duration::from_secs(1), true),
+            (1, Duration::from_millis(500), false),
+        ] {
+            let (mut net, mut conn) = handshaking(HelloAuth::Ticket("t".into()), true);
+            conn.welcome = Some(crate::client::connection::tests::welcome(window_s));
+            conn.lost_at = Some(now - lost_ago);
+            on_reject(&mut net, &mut conn, now, busy());
+            assert_eq!(
+                !matches!(net.state, ConnectionState::Failed(_)),
+                retried,
+                "{:?}",
+                net.state
+            );
+        }
     }
 
     #[test]

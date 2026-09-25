@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use space3d_core::{App, EventReader, Events, Stage, SystemCtx};
 use space3d_replication::protocol::control::{Notice, NoticeLevel};
-use space3d_replication::protocol::handshake::DisconnectCode;
+use space3d_replication::protocol::handshake::{DisconnectCode, Reject, RejectCode};
 use space3d_replication::server::handshake::SecretSource;
 use space3d_replication::server::{
     NetInbox, NetServer, PlayerJoined, PlayerLeft, PlayerResumed, ServerReplicationPlugin, SlotState, full_state,
@@ -448,6 +448,20 @@ enum MoveNotice {
 /// acknowledge the move (a lost or slow fleet link must not hold the drain).
 pub const MOVE_ACK_WAIT: Duration = Duration::from_secs(2);
 
+/// Retry delay a room that moves on drain gives the newcomers it refuses (see
+/// [`moving_refusal`]).
+pub const MOVING_RETRY_AFTER_MS: u32 = 1_000;
+
+/// How a draining room that moves to another server refuses new players: transient
+/// (`ServerDraining` with a retry delay), so they ask the player service again.
+pub fn moving_refusal() -> Reject {
+    Reject {
+        code: RejectCode::ServerDraining,
+        message: "room is moving to another server; ask the player service again".into(),
+        retry_after_ms: Some(MOVING_RETRY_AFTER_MS),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Closing {
     Close(String),
@@ -510,7 +524,7 @@ pub fn discard_checkpoint(app: &mut App) {
 pub struct Carried {
     uploads: Vec<Upload>,
     phase: RoomPhase,
-    joinable: bool,
+    join_refusal: Option<Reject>,
     drain_deadline_ms: Option<i64>,
     handoff: Handoff,
     move_notice: MoveNotice,
@@ -533,14 +547,14 @@ impl Carried {
 pub fn take_for_rebuild(
     app: &mut App,
 ) -> Option<(crossbeam_channel::Receiver<RoomCommand>, Option<Checkpoint>, Carried)> {
-    let joinable = app.resources.get::<NetServer>().is_none_or(NetServer::is_joinable);
+    let join_refusal = app.resources.get::<NetServer>().and_then(|n| n.join_refusal().cloned());
     let drain_deadline_ms = app.resources.get::<RoomContext>().and_then(|c| c.drain_deadline_ms);
     let mut rt = app.resources.remove::<RoomRuntime>()?;
     let uploads = rt.take_uploads();
     let carried = Carried {
         uploads,
         phase: rt.phase,
-        joinable,
+        join_refusal,
         drain_deadline_ms,
         handoff: rt.handoff,
         move_notice: rt.move_notice,
@@ -558,7 +572,7 @@ pub fn adopt_carried(app: &mut App, carried: Carried) {
     let Carried {
         uploads,
         phase,
-        joinable,
+        join_refusal,
         drain_deadline_ms,
         handoff,
         move_notice,
@@ -568,8 +582,10 @@ pub fn adopt_carried(app: &mut App, carried: Carried) {
     if let Some(ctx) = app.resources.get_mut::<RoomContext>() {
         ctx.drain_deadline_ms = drain_deadline_ms;
     }
-    if !joinable && let Some(net) = app.resources.get_mut::<NetServer>() {
-        net.set_joinable(false);
+    if let Some(refusal) = join_refusal
+        && let Some(net) = app.resources.get_mut::<NetServer>()
+    {
+        net.refuse_joins(refusal);
     }
     let Some(rt) = app.resources.get_mut::<RoomRuntime>() else {
         return;
@@ -932,9 +948,18 @@ fn apply_command(
                 ctx.drain_deadline_ms = Some(rt.env.unix.now_ms() + i64::from(in_ms));
             }
             let net = res.expect_mut::<NetServer>();
-            net.set_joinable(false);
+            let moves = rt.spec.persistent && rt.env.checkpoints.enabled();
+            if moves {
+                // A ticket the player service issued before it heard of the drain: the player
+                // is to ask again (the player service holds the request until the room moved,
+                // then places them in it) — `RoomClosed` would read as "gone for good", and
+                // they would open a second copy of the world elsewhere.
+                net.refuse_joins(moving_refusal());
+            } else {
+                net.set_joinable(false);
+            }
             net.notice(Target::All, Notice::ShuttingDown { in_ms });
-            if rt.spec.persistent && rt.env.checkpoints.enabled() && rt.handoff == Handoff::None {
+            if moves && rt.handoff == Handoff::None {
                 // Persistent worlds move: once the player service acknowledged the move, the
                 // room freezes (see `freeze_for_handoff`) and closes when its freeze capture is
                 // stored; its players' rejoin then restores it on another server from exactly

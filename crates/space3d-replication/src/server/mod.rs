@@ -29,7 +29,7 @@ pub mod slots;
 
 use crate::protocol::WireLimits;
 use crate::protocol::control::Notice;
-use crate::protocol::handshake::{DisconnectCode, Hello};
+use crate::protocol::handshake::{DisconnectCode, Hello, Reject, RejectCode};
 use crate::stats::{NetStats, RoomNetStats};
 use crate::time::NetClockHandle;
 use crate::transport::{LinkTx, PeerInfo};
@@ -447,7 +447,8 @@ pub(crate) struct QueuedMessage {
 pub struct NetServer {
     pub(crate) config: ServerNetConfig,
     pub(crate) tick: Tick,
-    pub(crate) joinable: bool,
+    /// How new joins are refused (`None`: joinable; see [`NetServer::refuse_joins`]).
+    pub(crate) join_refusal: Option<Reject>,
     pub(crate) ids: crate::mapping::NetIdMap,
     pub(crate) slots: slots::SlotTable,
     pub(crate) stats: RoomNetStats,
@@ -476,7 +477,7 @@ impl NetServer {
         Self {
             config,
             tick: Tick::ZERO,
-            joinable: true,
+            join_refusal: None,
             ids: Default::default(),
             slots: Default::default(),
             stats: Default::default(),
@@ -606,14 +607,31 @@ impl NetServer {
         }
     }
 
-    /// Whether new joins are accepted (resumes always are).
+    /// Whether new joins are accepted (resumes always are). A closed room refuses new players
+    /// with `Reject(RoomClosed)`, which says the room is gone for good; see
+    /// [`Self::refuse_joins`] for another refusal.
     pub fn set_joinable(&mut self, joinable: bool) {
-        self.joinable = joinable;
+        self.join_refusal = (!joinable).then(|| Reject::new(RejectCode::RoomClosed, "room is not accepting players"));
+    }
+
+    /// Stop accepting new joins and refuse them with `refusal` (resumes still pass). For a room
+    /// that is about to move to another server, a transient refusal
+    /// (`ServerDraining` with `retry_after_ms`, see [`Reject::is_transient`]) tells a player
+    /// whose ticket was issued before the move to ask the player service again — which places
+    /// them in the room once it moved — instead of reading the room as closed for good.
+    /// [`Self::set_joinable`] replaces it.
+    pub fn refuse_joins(&mut self, refusal: Reject) {
+        self.join_refusal = Some(refusal);
+    }
+
+    /// How new joins are refused (`None` while joinable).
+    pub fn join_refusal(&self) -> Option<&Reject> {
+        self.join_refusal.as_ref()
     }
 
     /// See [`Self::set_joinable`].
     pub fn is_joinable(&self) -> bool {
-        self.joinable
+        self.join_refusal.is_none()
     }
 
     /// All slots.

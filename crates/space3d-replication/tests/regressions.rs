@@ -11,7 +11,7 @@ use space3d_core::prelude::*;
 use space3d_replication::harness::{ClientHandle, ClientSpec, HarnessConfig, NetHarness};
 use space3d_replication::mapping::{DecodeCtx, EncodeCtx};
 use space3d_replication::prelude::*;
-use space3d_replication::protocol::handshake::{ClientCaps, DisconnectCode, Hello, HelloAuth, RejectCode};
+use space3d_replication::protocol::handshake::{ClientCaps, DisconnectCode, Hello, HelloAuth, Reject, RejectCode};
 use space3d_replication::protocol::{
     ChannelId, DataWriter, MAGIC, PROTOCOL_VERSION, Packet, WireLimits, decode_packet,
 };
@@ -220,8 +220,12 @@ impl FakeTx {
     }
 
     fn reject(&self) -> Option<RejectCode> {
+        self.refusal().map(|r| r.code)
+    }
+
+    fn refusal(&self) -> Option<Reject> {
         self.packets().into_iter().find_map(|p| match p {
-            Packet::Reject(r) => Some(r.code),
+            Packet::Reject(r) => Some(r),
             _ => None,
         })
     }
@@ -433,6 +437,44 @@ fn wrong_schema_hash_is_rejected() {
     assert!(fake.is_closed());
     assert!(r.net().clients().is_empty());
     assert_eq!(r.net().room_stats().rejects, 1);
+}
+
+/// Regression: a room that stopped taking players refused every newcomer with
+/// `Reject(RoomClosed)` and no retry delay — for a persistent room about to move to another
+/// server, that told a player whose ticket was issued a moment before the move that the room was
+/// gone for good, and they opened a second copy of it elsewhere. A room now refuses with the
+/// refusal it was closed with (a transient `ServerDraining` with a retry delay for a room on the
+/// move); `set_joinable(false)` still means `RoomClosed`, and a player already in the room
+/// keeps their slot either way.
+#[test]
+fn a_room_closed_to_new_players_refuses_them_with_its_refusal() {
+    let mut r = Room::new();
+    let _alice = r.join(1, "alice");
+    let moving = Reject {
+        code: RejectCode::ServerDraining,
+        message: "room is moving to another server".into(),
+        retry_after_ms: Some(1_000),
+    };
+    r.app.resources.expect_mut::<NetServer>().refuse_joins(moving.clone());
+    assert!(!r.net().is_joinable());
+    let late = r.join(2, "late");
+    assert_eq!(late.refusal(), Some(moving.clone()));
+    assert!(late.refusal().unwrap().is_transient(), "asks the player to come back");
+    assert!(late.is_closed());
+    // Alice again (a new link of a player who holds a slot) is not a newcomer.
+    let again = r.join(3, "alice");
+    assert_eq!(again.refusal(), None);
+    assert_eq!(r.net().clients().len(), 1);
+    // Closed for good: `RoomClosed`, nothing to retry.
+    r.app.resources.expect_mut::<NetServer>().set_joinable(false);
+    let closed = r.join(4, "later").refusal().expect("refused");
+    assert_eq!(closed.code, RejectCode::RoomClosed);
+    assert!(!closed.is_transient());
+    r.app.resources.expect_mut::<NetServer>().set_joinable(true);
+    assert_eq!(r.net().join_refusal(), None);
+    assert_eq!(r.join(5, "bob").refusal(), None);
+    assert_eq!(r.net().clients().len(), 2);
+    assert_eq!(r.net().room_stats().rejects, 2);
 }
 
 /// A downstream backlog above `backlog_kick_bytes` for 5 s → `Disconnect(SlowConsumer)`

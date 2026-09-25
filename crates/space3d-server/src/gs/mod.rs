@@ -423,8 +423,11 @@ impl GsState {
             self.rt.rooms.set_draining(true);
             let deadline = self.rt.config.game.drain_timeout;
             self.rt.rooms.broadcast(|| RoomCommand::Drain { deadline });
-            // Tell the player service right away (no new allocations here).
-            self.next_heartbeat_ms = i64::MIN;
+            // Tell the player service now, not a supervisor tick later: no new allocations
+            // here, and rejoins / quick plays into the rooms that move on drain wait for their
+            // handoff (a ticket it issued before it knew is refused as transient).
+            self.heartbeat();
+            self.next_heartbeat_ms = self.rt.unix.now_ms() + self.rt.config.fleet.heartbeat.as_millis() as i64;
             tracing::info!(rooms = self.rt.rooms.len(), "game server draining");
         }
         if phase >= Phase::Stopping && !self.stop_started {
