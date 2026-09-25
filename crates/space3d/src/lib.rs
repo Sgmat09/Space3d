@@ -182,8 +182,9 @@ pub mod prelude {
 
     #[cfg(feature = "ai")]
     pub use space3d_ai::{
-        Ai, AiError, AiErrorCode, AiEvent, AiPlugin, AiTool, BackendChoice, ContentRequest, DecisionRequest,
-        DialogueTurn, Emotion, NpcConfig, NpcEvent, Persona, Script, ScriptStep, ScriptedBackend, SessionConfig,
-        TalkOptions, ToolChoice, ToolOutput, ToolReply, TurnEvent,
+        Ai, AiError, AiErrorCode, AiEvent, AiPlugin, AiTool, BackendChoice, ContentRequest, Decision, DecisionOption,
+        DecisionRequest, DialogueTurn, Emotion, NpcConfig, NpcEvent, Persona, RespondOptions, Script, ScriptStep,
+        ScriptedBackend, SessionConfig, TalkOptions, ToolChoice, ToolInvocation, ToolOutput, ToolReply, ToolResponder,
+        TurnEvent,
     };
 }
