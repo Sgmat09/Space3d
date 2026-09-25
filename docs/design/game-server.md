@@ -1093,6 +1093,7 @@ All additive to the §18.1 contract except the snapshot op bit (protocol version
 - **Rooms and fleet:** room migration between shards and servers; work stealing (needs `Runner: Send` in core); Agones or k8s operator.
 - **Player service:** Postgres `PlayerStore` plus an HA matchmaker; OAuth and platform auth (Steam, Apple, Google, Discord) via an `ExternalAuthVerifier`; email verification; parties, friends, presence, chat; Glicko-2; WS push for matchmaking.
 - **Other:** in-process TLS; replay recording (inputs plus checkpoints); a proc-macro `#[derive(NetCodec)]`.
+- **Known limitation, entity references across scope:** an entity-reference component (e.g. `core.parent`) whose target leaves a client's scope and later re-enters it is not re-sent, so that client's reference can stay unresolved until the referencing component changes again. Planned fix: re-send a record's entity references when their target's scope epoch changes.
 - **CLI and facade:** `space3d-cli` integration (`space3d server run|docker`) and `space3d` facade re-exports, because those crates are being built elsewhere. Planned: `space3d::net` re-exports `space3d_replication::prelude`.
 
 ## 20. Risks

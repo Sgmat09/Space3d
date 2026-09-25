@@ -9,12 +9,27 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// A loopback port for a child server to bind.
+///
+/// Not `bind(0)`: that hands out an ephemeral port, which the OS may give to any outbound
+/// connection (readiness polls, bot WebSockets, other suites) before the child binds it. Ports
+/// come from below the ephemeral range (macOS/BSD 49152+, Linux 32768+), spread by pid so
+/// parallel test binaries don't overlap, and unique within this process via a counter; each
+/// candidate is checked to be bindable right now.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const BASE: u16 = 20_000;
+    const SPAN: u16 = 12_000; // 20000..32000
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let offset = (std::process::id() % 97) as u16 * 120;
+    for _ in 0..SPAN {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = BASE + (offset + n) % SPAN;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free loopback port in {BASE}..{}", BASE + SPAN);
 }
 
 /// A child process with stdout and stderr captured by reader threads (a chatty child never
