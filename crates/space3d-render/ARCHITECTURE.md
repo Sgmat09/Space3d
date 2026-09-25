@@ -9,13 +9,13 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | module | role |
 |---|---|
 | `renderer.rs` | `Renderer`: instance/adapter/device/queue, capability detection, surfaces, offscreen target, asset upload, `capture()` |
-| `frame.rs` | per-frame extract → batch → cull → upload → encode; `RenderSettings`; material interning |
+| `frame/` | per-frame work: `mod.rs` (`render_frame` orchestration, `FrameState`, `RenderSettings`, uploads), `plan.rs` (cameras, viewport rects), `extract.rs` (ECS/explicit extraction, batching, material interning), `views.rs` (lights, `GpuView`s, draw commands, CPU culling, GPU culling jobs/dispatches), `draws.rs` (material bind groups, `encode_draws`), `passes.rs` (view passes, capture replay), `targets.rs` (render-target feedback copies), `tests.rs` |
 | `instance.rs` | `InstanceData` trait, `InstanceLayout`/semantics, built-in formats, `InstanceBuffer<T>`, `InstanceBuffers`, `InstancedMesh` |
 | `gpu.rs` | `Uploader` (staging ring), `GrowBuffer`, `TrackedBuffer` (shadow-diffed uploads), parallel staging copies |
 | `arena.rs` | mesh arena: shared vertex/index buffers, first-fit range allocator, GPU-side growth |
 | `assets.rs` | `RenderAssets`: handle allocation without a GPU, pending uploads, textures/render targets |
 | `texture.rs` | `write_texture` uploads (block-aware pitch), GPU mip generation, sampler cache |
-| `pipeline.rs` | GPU uniform layouts, WGSL generation per instance layout (+ custom shader hooks), pipeline cache |
+| `pipeline/` | `mod.rs` (pipeline cache, `PipelineKey`, culling/blit/clear pipelines, culling uniforms), `view.rs` (`GpuView`, lights), `forward.rs` (forward shader composition, `GpuMaterial`, material layouts, forward pipelines, custom-shader validation), `instance.rs` (instance attributes, generated `InstanceInput` WGSL) |
 | `shader.rs` | `CustomShader`: user WGSL hooks spliced into the forward shader |
 | `readback.rs` | non-blocking readback of GPU-culled visible counts for `RenderStats` |
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
@@ -106,7 +106,7 @@ a `const LAYOUT: &'static InstanceLayout` listing attributes and their *semantic
 | `TextureLayer` | texture-array layer (atlas page / animation frame) |
 | `Custom(n)` | bound as `inst.customN`; read by [custom shaders](#custom-shaders) via `instance_customN(inst)`, ignored by the built-in shader |
 
-`pipeline.rs` generates the `InstanceInput` struct and accessor functions for each layout and
+`pipeline/instance.rs` generates the `InstanceInput` struct and accessor functions for each layout and
 splices them into `forward.wgsl` (`instance_model`, `instance_color`, `instance_uv_rect`,
 `instance_layer`, `instance_custom0..3` plus one per declared `Custom(n)`). `validate()`
 enforces WebGPU's rules (offset aligned to `min(4, format size)`, each semantic once) and at

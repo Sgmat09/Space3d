@@ -1,55 +1,23 @@
 //! Shader generation, GPU uniform layouts and the pipeline cache.
 
-use crate::arena::{VERTEX_ATTRIBUTES, VERTEX_SIZE};
 use crate::handles::{FastMap, ShaderHandle};
-use crate::instance::{InstanceLayout, InstanceSemantic, wgsl_type};
-use crate::shader::{CustomShader, hooks_wgsl};
+use crate::instance::InstanceLayout;
+use crate::shader::CustomShader;
 use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
 use std::sync::Arc;
+
+mod forward;
+mod instance;
+mod view;
+
+pub(crate) use forward::GpuMaterial;
+pub(crate) use view::{GpuDirLight, GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS};
 
 /// Depth buffer format used by every pass.
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Format of the offscreen/capture target and render-target textures.
 pub(crate) const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-
-pub(crate) const MAX_DIR_LIGHTS: usize = 4;
-pub(crate) const MAX_POINT_LIGHTS: usize = 16;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, Pod, Zeroable)]
-pub(crate) struct GpuDirLight {
-    pub direction: [f32; 4],
-    pub color: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, Pod, Zeroable)]
-pub(crate) struct GpuPointLight {
-    pub position_range: [f32; 4],
-    pub color: [f32; 4],
-}
-
-/// Matches `View` in forward.wgsl (std140-compatible).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub(crate) struct GpuView {
-    pub view_proj: [[f32; 4]; 4],
-    pub camera_pos: [f32; 4],
-    pub ambient: [f32; 4],
-    pub counts: [u32; 4],
-    pub dir_lights: [GpuDirLight; MAX_DIR_LIGHTS],
-    pub point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
-}
-
-/// Matches `MaterialParams` in forward.wgsl.
-#[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
-pub(crate) struct GpuMaterial {
-    pub base_color: [f32; 4],
-    pub emissive: [f32; 4],
-    pub params: [f32; 4],
-}
 
 /// Views whose frustums one culling dispatch can read: the `frusta` uniform of cull.wgsl
 /// (`CULL_VIEWS * 96` bytes = 6 KiB, a multiple of every allowed uniform offset alignment).
@@ -121,13 +89,12 @@ pub(crate) struct PipelineKey {
 }
 
 /// Shader module cache key: (layout, manual sRGB, layered texture, custom shader).
-type ModuleKey = (u16, bool, bool, Option<(ShaderHandle, u32)>);
+pub(super) type ModuleKey = (u16, bool, bool, Option<(ShaderHandle, u32)>);
 
-const FORWARD_TEMPLATE: &str = include_str!("shaders/forward.wgsl");
-const CULL_SHADER: &str = include_str!("shaders/cull.wgsl");
-const COMPACT_SHADER: &str = include_str!("shaders/compact.wgsl");
-const BLIT_TEMPLATE: &str = include_str!("shaders/blit.wgsl");
-const CLEAR_SHADER: &str = include_str!("shaders/clear.wgsl");
+const CULL_SHADER: &str = include_str!("../shaders/cull.wgsl");
+const COMPACT_SHADER: &str = include_str!("../shaders/compact.wgsl");
+const BLIT_TEMPLATE: &str = include_str!("../shaders/blit.wgsl");
+const CLEAR_SHADER: &str = include_str!("../shaders/clear.wgsl");
 
 /// Mip-generation blit shader sampling a `texture_2d` or a `texture_2d_array` source.
 pub(crate) fn blit_shader(layered: bool) -> String {
@@ -147,193 +114,6 @@ pub(crate) fn blit_shader(layered: bool) -> String {
     BLIT_TEMPLATE.replace("//#SOURCE", source)
 }
 
-fn to_vec4(expr: &str, ty: &str, fill: &str) -> String {
-    match ty {
-        "vec4<f32>" => expr.to_string(),
-        "vec3<f32>" => format!("vec4<f32>({expr}, {fill})"),
-        "vec2<f32>" => format!("vec4<f32>({expr}, {fill}, {fill})"),
-        "f32" => format!("vec4<f32>({expr})"),
-        t if t.starts_with("vec4<") => format!("vec4<f32>({expr})"),
-        _ => format!("vec4<f32>(f32({expr}))"),
-    }
-}
-
-fn to_vec3(expr: &str, ty: &str) -> String {
-    match ty {
-        "vec3<f32>" => expr.to_string(),
-        "vec4<f32>" => format!("{expr}.xyz"),
-        "f32" => format!("vec3<f32>({expr})"),
-        "vec2<f32>" => format!("vec3<f32>({expr}, 0.0)"),
-        _ => "vec3<f32>(0.0)".to_string(),
-    }
-}
-
-/// Zero-padded `vec4<f32>` of a custom attribute value of WGSL type `ty`.
-fn custom_vec4(expr: &str, ty: &str) -> String {
-    match ty {
-        "vec4<f32>" => expr.to_string(),
-        "vec3<f32>" => format!("vec4<f32>({expr}, 0.0)"),
-        "vec2<f32>" => format!("vec4<f32>({expr}, 0.0, 0.0)"),
-        "f32" => format!("vec4<f32>({expr}, 0.0, 0.0, 0.0)"),
-        "u32" | "i32" => format!("vec4<f32>(f32({expr}), 0.0, 0.0, 0.0)"),
-        t if t.starts_with("vec2<") => format!("vec4<f32>(vec2<f32>({expr}), 0.0, 0.0)"),
-        t if t.starts_with("vec3<") => format!("vec4<f32>(vec3<f32>({expr}), 0.0)"),
-        _ => format!("vec4<f32>({expr})"),
-    }
-}
-
-/// Custom slots that always get an accessor (zero when the layout lacks them), so one custom
-/// shader compiles for every layout.
-const CUSTOM_ACCESSORS: u8 = 4;
-
-/// Generate the `InstanceInput` struct + accessor functions for a layout. Instance attributes
-/// start at shader location 4 (0..3 are the mesh vertex), in attribute order (see
-/// [`instance_attributes`]).
-pub(crate) fn instance_wgsl(layout: &InstanceLayout) -> String {
-    let mut s = String::from("struct InstanceInput {\n");
-    let mut loc = 4;
-    let mut model = None;
-    let (mut t, mut r, mut sc, mut us, mut color, mut rect, mut layer) = (None, None, None, None, None, None, None);
-    let mut custom = Vec::new();
-    for (i, a) in layout.attributes.iter().enumerate() {
-        let ty = wgsl_type(a.format).unwrap_or("vec4<f32>");
-        if a.semantic == InstanceSemantic::ModelMatrix {
-            for c in 0..4 {
-                s += &format!("    @location({loc}) a{i}_{c}: vec4<f32>,\n");
-                loc += 1;
-            }
-            model = Some(i);
-            continue;
-        }
-        let (_, swizzle) = attribute_format(a.format);
-        if let InstanceSemantic::Custom(n) = a.semantic {
-            // The raw field is in fetch order (memory order for BGRA formats); the accessor
-            // applies the swizzle like the built-in semantics.
-            s += &format!("    @location({loc}) custom{n}: {ty},\n");
-            loc += 1;
-            custom.push((n, ty, swizzle));
-            continue;
-        }
-        s += &format!("    @location({loc}) a{i}: {ty},\n");
-        loc += 1;
-        let e = format!("inst.a{i}{swizzle}");
-        match a.semantic {
-            InstanceSemantic::Translation => t = Some((e, ty)),
-            InstanceSemantic::TranslationScale => {
-                t = Some((format!("{e}.xyz"), "vec3<f32>"));
-                us = Some((format!("{e}.w"), "f32"));
-            }
-            InstanceSemantic::Rotation => r = Some((e, ty)),
-            InstanceSemantic::Scale => sc = Some((e, ty)),
-            InstanceSemantic::UniformScale => us = Some((e, ty)),
-            InstanceSemantic::Color => color = Some((e, ty)),
-            InstanceSemantic::UvRect => rect = Some((e, ty)),
-            InstanceSemantic::TextureLayer => layer = Some((e, ty)),
-            InstanceSemantic::ModelMatrix | InstanceSemantic::Custom(_) => {}
-        }
-    }
-    if loc == 4 {
-        // Keep the struct non-empty for degenerate layouts.
-        s += "    @location(4) unused: vec4<f32>,\n";
-    }
-    s += "}\n\n";
-
-    s += "fn instance_model(inst: InstanceInput) -> mat4x4<f32> {\n";
-    if let Some(i) = model {
-        s += &format!("    return mat4x4<f32>(inst.a{i}_0, inst.a{i}_1, inst.a{i}_2, inst.a{i}_3);\n");
-    } else {
-        let te = t.map_or("vec3<f32>(0.0)".to_string(), |(e, ty)| to_vec3(&e, ty));
-        let re = r.map_or(
-            "mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0))".to_string(),
-            |(e, ty)| format!("quat_to_mat3({})", to_vec4(&e, ty, "1.0")),
-        );
-        let se = match (sc, us) {
-            (Some((e, ty)), _) => to_vec3(&e, ty),
-            (None, Some((e, ty))) => {
-                if ty == "f32" {
-                    format!("vec3<f32>({e})")
-                } else {
-                    format!("vec3<f32>({}.x)", e)
-                }
-            }
-            (None, None) => "vec3<f32>(1.0)".to_string(),
-        };
-        s += &format!("    return trs({te}, {re}, {se});\n");
-    }
-    s += "}\n\n";
-
-    s += "fn instance_color(inst: InstanceInput) -> vec4<f32> {\n";
-    s += &format!(
-        "    return {};\n}}\n\n",
-        color.map_or("vec4<f32>(1.0)".to_string(), |(e, ty)| to_vec4(&e, ty, "1.0"))
-    );
-    s += "fn instance_uv_rect(inst: InstanceInput) -> vec4<f32> {\n";
-    s += &format!(
-        "    return {};\n}}\n\n",
-        rect.map_or("vec4<f32>(0.0, 0.0, 1.0, 1.0)".to_string(), |(e, ty)| to_vec4(
-            &e, ty, "1.0"
-        ))
-    );
-    s += "fn instance_layer(inst: InstanceInput) -> i32 {\n";
-    s += &format!(
-        "    return {};\n}}\n",
-        layer.map_or("0".to_string(), |(e, ty)| match ty {
-            "i32" => e,
-            "u32" | "f32" => format!("i32({e})"),
-            _ => format!("i32({e}.x)"),
-        })
-    );
-    // Custom attributes for custom shaders: declared slots, and slots 0..4 as zero otherwise.
-    for n in 0..CUSTOM_ACCESSORS {
-        if !custom.iter().any(|(c, ..)| *c == n) {
-            s += &format!(
-                "\nfn instance_custom{n}(inst: InstanceInput) -> vec4<f32> {{\n    return vec4<f32>(0.0);\n}}\n"
-            );
-        }
-    }
-    for (n, ty, swizzle) in custom {
-        let e = custom_vec4(&format!("inst.custom{n}{swizzle}"), ty);
-        s += &format!("\nfn instance_custom{n}(inst: InstanceInput) -> vec4<f32> {{\n    return {e};\n}}\n");
-    }
-    s
-}
-
-/// Material texture binding and its sampling function (`sample_base`).
-fn texture_wgsl(layered: bool) -> &'static str {
-    if layered {
-        "@group(1) @binding(1) var base_tex: texture_2d_array<f32>;\n\n\
-         fn sample_base(uv: vec2<f32>, layer: i32) -> vec4<f32> {\n    \
-         return textureSample(base_tex, base_sampler, uv, layer);\n}\n"
-    } else {
-        // Single-layer textures: the instance layer is irrelevant (an array lookup would clamp
-        // it to layer 0 as well).
-        "@group(1) @binding(1) var base_tex: texture_2d<f32>;\n\n\
-         fn sample_base(uv: vec2<f32>, layer: i32) -> vec4<f32> {\n    \
-         return textureSample(base_tex, base_sampler, uv);\n}\n"
-    }
-}
-
-/// Full forward shader source for a layout, material texture kind and custom shader.
-pub(crate) fn forward_shader(
-    layout: &InstanceLayout,
-    manual_srgb: bool,
-    layered: bool,
-    custom: Option<&CustomShader>,
-) -> String {
-    let varyings = if custom.is_some() {
-        "    @location(5) custom: vec4<f32>,"
-    } else {
-        ""
-    };
-    // The user's code is spliced in last, so markers inside it are left alone.
-    FORWARD_TEMPLATE
-        .replace("//#CONSTS", &format!("const MANUAL_SRGB: bool = {manual_srgb};"))
-        .replace("//#TEXTURE", texture_wgsl(layered))
-        .replace("//#INSTANCE", &instance_wgsl(layout))
-        .replace("//#VARYINGS", varyings)
-        .replace("//#HOOKS", &hooks_wgsl(custom))
-}
-
 /// Parse and validate WGSL with naga (the portable subset: no optional capabilities), with a
 /// readable error message.
 #[cfg(test)]
@@ -341,7 +121,7 @@ pub(crate) fn validate_wgsl(src: &str) -> Result<(), String> {
     parse_and_validate(src).map(drop)
 }
 
-fn parse_and_validate(src: &str) -> Result<(naga::Module, naga::valid::ModuleInfo), String> {
+pub(super) fn parse_and_validate(src: &str) -> Result<(naga::Module, naga::valid::ModuleInfo), String> {
     let module = naga::front::wgsl::parse_str(src).map_err(|e| e.emit_to_string(src))?;
     let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
         .validate(&module)
@@ -349,241 +129,12 @@ fn parse_and_validate(src: &str) -> Result<(naga::Module, naga::valid::ModuleInf
     Ok((module, info))
 }
 
-/// WGSL built-in functions GLSL ES 3.00 — WebGL2, and GLES 3.0 devices through wgpu's GL
-/// backend — lacks: GLSL ES 3.10 brought them. naga's GLSL backend emits them regardless of the
-/// version (it polyfills `frexp`, `countLeadingZeros`, `fma` and the fine/coarse derivatives,
-/// and refuses `pack4x8snorm`/`pack4x8unorm` itself), so the GL driver fails to compile the
-/// shader — only on those devices, and in the browser only once the pipeline is created.
-const GLES3_MISSING: [(naga::MathFunction, &str); 12] = {
-    use naga::MathFunction as M;
-    [
-        (M::CountOneBits, "countOneBits"),
-        (M::ReverseBits, "reverseBits"),
-        (M::ExtractBits, "extractBits"),
-        (M::InsertBits, "insertBits"),
-        (M::FirstTrailingBit, "firstTrailingBit"),
-        (M::FirstLeadingBit, "firstLeadingBit"),
-        (M::CountTrailingZeros, "countTrailingZeros"),
-        (M::Ldexp, "ldexp"),
-        (M::Dot4I8Packed, "dot4I8Packed"),
-        (M::Dot4U8Packed, "dot4U8Packed"),
-        (M::Unpack4xI8, "unpack4xI8"),
-        (M::Unpack4xU8, "unpack4xU8"),
-    ]
-};
-
-/// The first built-in function of [`GLES3_MISSING`] (or `textureGather*`, also GLSL ES 3.10)
-/// any function of `module` calls, used or not.
-fn gles3_missing_builtin(module: &naga::Module) -> Option<&'static str> {
-    let functions = module
-        .functions
-        .iter()
-        .map(|(_, f)| f)
-        .chain(module.entry_points.iter().map(|e| &e.function));
-    for f in functions {
-        for (_, e) in f.expressions.iter() {
-            match *e {
-                naga::Expression::Math { fun, .. } => {
-                    if let Some((_, name)) = GLES3_MISSING.iter().find(|(m, _)| *m == fun) {
-                        return Some(name);
-                    }
-                }
-                naga::Expression::ImageSample { gather: Some(_), .. } => return Some("textureGather"),
-                _ => {}
-            }
-        }
-    }
-    None
-}
-
-/// Translate the forward entry points (`vs_main`, `fs_main`) to GLSL ES 3.00 the way wgpu's GL
-/// backend does on WebGL2 (overrides at their defaults); the error, if naga refuses (image
-/// queries GLSL ES lacks such as `textureNumLevels`, `pack4x8snorm`, …).
-fn gles3_translation_error(module: &naga::Module, info: &naga::valid::ModuleInfo) -> Option<String> {
-    use naga::back::glsl;
-    let options = glsl::Options {
-        version: glsl::Version::Embedded {
-            version: 300,
-            is_webgl: true,
-        },
-        writer_flags: glsl::WriterFlags::ADJUST_COORDINATE_SPACE | glsl::WriterFlags::FORCE_POINT_SIZE,
-        binding_map: Default::default(),
-        zero_initialize_workgroup_memory: true,
-    };
-    let constants = naga::back::PipelineConstants::default();
-    for (stage, entry_point) in [
-        (naga::ShaderStage::Vertex, "vs_main"),
-        (naga::ShaderStage::Fragment, "fs_main"),
-    ] {
-        let translated =
-            naga::back::pipeline_constants::process_overrides(module, info, Some((stage, entry_point)), &constants)
-                .map_err(|e| e.to_string())
-                .and_then(|(module, info)| {
-                    let pipeline = glsl::PipelineOptions {
-                        shader_stage: stage,
-                        entry_point: entry_point.to_string(),
-                        multiview: None,
-                    };
-                    let mut out = String::new();
-                    let policies = naga::proc::BoundsCheckPolicies::default();
-                    glsl::Writer::new(&mut out, &module, &info, &options, &pipeline, policies)
-                        .and_then(|mut w| w.write().map(drop))
-                        .map_err(|e| e.to_string())
-                });
-        if let Err(e) = translated {
-            return Some(format!("{stage:?} stage: {e}"));
-        }
-    }
-    None
-}
-
-/// Resources the forward template declares, `(group, binding, name)`: the only ones in the
-/// forward pipeline layout, so the only ones a custom shader can use.
-const TEMPLATE_RESOURCES: [(u32, u32, &str); 4] = [
-    (0, 0, "view"),
-    (1, 0, "material"),
-    (1, 1, "base_tex"),
-    (1, 2, "base_sampler"),
-];
-
-/// [`validate_wgsl`] for a forward shader with a custom shader spliced in, checking what naga
-/// accepts but the forward pipeline cannot run the same way on every backend:
-///
-/// * resources of its own: the pipeline layout has no bindings for them, so the pipeline
-///   fails validation;
-/// * workgroup memory (`var<workgroup>`, used or not): WGSL allows it in compute shaders only,
-///   naga in any stage, and backends disagree about it in the vertex and fragment stages the
-///   hooks run in (Metal accepts it, GL and browsers reject it);
-/// * any other address space but `function` and `private` (immediates, mesh and ray-tracing
-///   payloads: optional capabilities the forward pipeline does not use);
-/// * pipeline constants (`override`) without a default: the forward pipeline sets none, so
-///   creating it fails;
-/// * built-in functions WebGL2 / GLES 3.0 (GLSL ES 3.00) lacks ([`GLES3_MISSING`],
-///   `textureGather*`), and anything else naga cannot translate to GLSL ES 3.00
-///   (`textureNumLevels`, `textureNumSamples`, `pack4x8snorm`, `pack4x8unorm`, …). Metal,
-///   Vulkan, DX12 and WebGPU run them, but a shader that works there would silently fall back to
-///   the built-in shader on WebGL2: they are rejected on every backend, so the problem shows up
-///   on the machine the shader is written on (see [`CustomShader`] for the list).
-///
-/// Detected here synchronously, because on browser WebGPU the error scope around pipeline
-/// creation only answers later (see [`Pipelines::poll_pending`]): until then every frame
-/// drawing with the invalid pipeline is lost.
-pub(crate) fn validate_custom_wgsl(src: &str) -> Result<(), String> {
-    use naga::AddressSpace as A;
-    let (module, info) = parse_and_validate(src)?;
-    for (_, g) in module.global_variables.iter() {
-        let name = g.name.as_deref().unwrap_or("<unnamed>");
-        match g.space {
-            A::Function | A::Private => {}
-            A::WorkGroup => {
-                return Err(format!(
-                    "custom shaders cannot use workgroup memory: `var<workgroup> {name}` exists \
-                     only in compute shaders, and the hooks run in the vertex and fragment stages \
-                     (use `var<private>` for per-invocation state)"
-                ));
-            }
-            A::Uniform | A::Storage { .. } | A::Handle => {
-                let template = g
-                    .binding
-                    .as_ref()
-                    .is_some_and(|b| TEMPLATE_RESOURCES.contains(&(b.group, b.binding, name)));
-                if !template {
-                    let at = g.binding.as_ref().map_or(String::new(), |b| {
-                        format!(" at @group({}) @binding({})", b.group, b.binding)
-                    });
-                    return Err(format!(
-                        "custom shaders cannot declare resources: `{name}` ({:?}){at} is not bound \
-                         by the forward pipeline (only `view`, `material`, `base_tex` and \
-                         `base_sampler` are)",
-                        g.space
-                    ));
-                }
-            }
-            space => {
-                return Err(format!(
-                    "custom shaders cannot declare `{name}` in the {space:?} address space: \
-                     only `var<private>` globals (and the template's resources) are portable to \
-                     every backend"
-                ));
-            }
-        }
-    }
-    for (_, o) in module.overrides.iter() {
-        if o.init.is_none() {
-            let name = o.name.as_deref().unwrap_or("<unnamed>");
-            return Err(format!(
-                "custom shaders cannot declare pipeline constants without a default: \
-                 `override {name}` needs one (`override {name}: T = value;`), since the forward \
-                 pipeline sets no constants"
-            ));
-        }
-    }
-    if let Some(name) = gles3_missing_builtin(&module) {
-        return Err(format!(
-            "custom shaders cannot use `{name}`: WebGL2 and GLES 3.0 devices (GLSL ES 3.00) \
-             lack it, so the shader would not compile there; custom shaders are limited to what \
-             every backend runs"
-        ));
-    }
-    if let Some(e) = gles3_translation_error(&module, &info) {
-        return Err(format!(
-            "custom shader does not translate to GLSL ES 3.00 (WebGL2 / GLES 3.0), so it would \
-             not run there; custom shaders are limited to what every backend runs: {e}"
-        ));
-    }
-    Ok(())
-}
-
-/// Vertex format handed to wgpu for an instance attribute format, and the swizzle the shader
-/// applies to it. `Unorm8x4Bgra` is fetched as `Unorm8x4` and swizzled back to RGBA: wgpu's GL
-/// backend passes `GL_BGRA` as the component count, which WebGL2/GLES reject (the attribute
-/// then reads garbage, or the draw crashes the driver), and browsers' WebGPU may not offer it.
-/// The swizzle is free, so every backend takes the same path.
-pub(crate) fn attribute_format(format: wgpu::VertexFormat) -> (wgpu::VertexFormat, &'static str) {
-    match format {
-        wgpu::VertexFormat::Unorm8x4Bgra => (wgpu::VertexFormat::Unorm8x4, ".zyxw"),
-        f => (f, ""),
-    }
-}
-
-/// Instance vertex attributes (shader locations from 4, in attribute order; `Custom` ones
-/// included so custom shaders can read them).
-pub(crate) fn instance_attributes(layout: &InstanceLayout) -> Vec<wgpu::VertexAttribute> {
-    let mut out = Vec::new();
-    let mut loc = 4;
-    for a in layout.attributes {
-        match a.semantic {
-            InstanceSemantic::ModelMatrix => {
-                for c in 0..4 {
-                    out.push(wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: (a.offset + c * 16) as u64,
-                        shader_location: loc,
-                    });
-                    loc += 1;
-                }
-            }
-            _ => {
-                out.push(wgpu::VertexAttribute {
-                    format: attribute_format(a.format).0,
-                    offset: a.offset as u64,
-                    shader_location: loc,
-                });
-                loc += 1;
-            }
-        }
-    }
-    if out.is_empty() {
-        out.push(wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Float32x4,
-            offset: 0,
-            shader_location: 4,
-        });
-    }
-    out
-}
-
-fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages, dynamic: bool, size: u64) -> wgpu::BindGroupLayoutEntry {
+pub(super) fn uniform_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+    dynamic: bool,
+    size: u64,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
@@ -664,7 +215,7 @@ pub(crate) struct Pipelines {
 }
 
 /// Bind group layout entry of a filterable float texture of the given view dimension.
-fn texture_entry(binding: u32, view_dimension: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
+pub(super) fn texture_entry(binding: u32, view_dimension: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -699,30 +250,7 @@ impl Pipelines {
                 std::mem::size_of::<GpuView>() as u64,
             )],
         });
-        let material_bgls = [false, true].map(|layered| {
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some(if layered {
-                    "space3d material (texture array)"
-                } else {
-                    "space3d material"
-                }),
-                entries: &[
-                    uniform_entry(
-                        0,
-                        wgpu::ShaderStages::FRAGMENT,
-                        true,
-                        std::mem::size_of::<GpuMaterial>() as u64,
-                    ),
-                    texture_entry(1, sampled_view_dimension(layered)),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            })
-        });
+        let material_bgls = forward::material_bgls(device);
         let layouts_by_texture = [0, 1].map(|i| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("space3d forward"),
@@ -1046,137 +574,6 @@ impl Pipelines {
         self.pending.len()
     }
 
-    /// Build a forward pipeline. Custom shaders are validated with naga first (including that
-    /// they declare no resources the layout lacks) and built inside validation and internal
-    /// error scopes, so their errors never reach the uncaptured-error handler. Where the
-    /// scopes do not answer immediately (browser WebGPU), the pipeline is returned with its
-    /// pending result (for [`Self::poll_pending`]).
-    #[allow(clippy::type_complexity)]
-    fn build_forward(
-        &mut self,
-        device: &wgpu::Device,
-        key: PipelineKey,
-        custom: Option<&Arc<CustomShader>>,
-    ) -> Result<
-        (
-            wgpu::RenderPipeline,
-            Option<(ModuleKey, space3d_tasks::Task<Option<String>>)>,
-        ),
-        String,
-    > {
-        let layout = self.layouts[key.layout as usize];
-        let module_key = (key.layout, key.manual_srgb, key.layered, key.shader);
-        let cached = self.shaders.get(&module_key).cloned();
-        let source = match cached {
-            Some(_) => None,
-            None => {
-                let source = forward_shader(layout, key.manual_srgb, key.layered, custom.map(|c| &**c));
-                if custom.is_some() {
-                    validate_custom_wgsl(&source)?;
-                }
-                Some(source)
-            }
-        };
-        // Backend shader translation failures are internal errors, not validation errors.
-        // (Pushed after every early return: the scopes must be popped in reverse order.)
-        let scopes = custom.map(|_| {
-            (
-                device.push_error_scope(wgpu::ErrorFilter::Validation),
-                device.push_error_scope(wgpu::ErrorFilter::Internal),
-            )
-        });
-        let module = match cached {
-            Some(m) => m,
-            None => {
-                let source = source.expect("generated when not cached");
-                let label = custom.map_or(layout.name, |c| c.name.as_str());
-                let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some(label),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
-                });
-                self.shaders.insert(module_key, m.clone());
-                m
-            }
-        };
-        let inst_attrs = instance_attributes(layout);
-        let blend = key.class & CLASS_BLEND != 0;
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(layout.name),
-            layout: Some(&self.layouts_by_texture[key.layered as usize]),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: VERTEX_SIZE,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &VERTEX_ATTRIBUTES,
-                    }),
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: layout.stride as u64,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &inst_attrs,
-                    }),
-                ],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: if key.class & CLASS_DOUBLE_SIDED != 0 {
-                    None
-                } else {
-                    Some(wgpu::Face::Back)
-                },
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(!blend),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: key.samples,
-                ..Default::default()
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: key.format,
-                    blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let Some((validation, internal)) = scopes else {
-            return Ok((pipeline, None));
-        };
-        // Scopes pop innermost first.
-        let (internal, validation) = (internal.pop(), validation.pop());
-        let mut error = Box::pin(async move {
-            match internal.await {
-                Some(e) => Some(e.to_string()),
-                None => validation.await.map(|e| e.to_string()),
-            }
-        });
-        // Native backends resolve the scopes immediately; in the browser the result arrives
-        // later: the pipeline is used meanwhile and replaced if it turns out to be invalid.
-        match futures::FutureExt::now_or_never(&mut error) {
-            Some(Some(e)) => {
-                self.shaders.remove(&module_key);
-                Err(e)
-            }
-            Some(None) => Ok((pipeline, None)),
-            None => Ok((pipeline, Some((module_key, space3d_tasks::spawn(error))))),
-        }
-    }
-
     /// Mip-generation pipeline for a color format, sampling a single-layer (`D2`) or an array
     /// (`D2Array`, layer chosen by the draw's vertex range) source view.
     pub fn blit(
@@ -1276,6 +673,8 @@ impl Pipelines {
 
 #[cfg(test)]
 mod tests {
+    use super::forward::*;
+    use super::instance::*;
     use super::*;
     use crate::instance::*;
     use wgpu::VertexFormat as F;

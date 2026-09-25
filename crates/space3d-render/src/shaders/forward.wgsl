@@ -2,7 +2,7 @@
 // Blinn-Phong with Schlick Fresnel, linear-space lighting, sRGB output.
 //
 // The INSTANCE marker below is replaced by the renderer with an `InstanceInput` struct and
-// accessor functions generated from the instance layout (see `pipeline.rs`); the CONSTS
+// accessor functions generated from the instance layout (see `pipeline/instance.rs`); the CONSTS
 // marker with per-pipeline constants; the TEXTURE marker with the material texture binding
 // (`texture_2d` for single-layer textures, `texture_2d_array` for arrays) and `sample_base`;
 // the VARYINGS marker with extra `VsOut` fields and the HOOKS marker with `vertex_hook` /
