@@ -244,12 +244,13 @@ pub fn load_gltf(bytes: &[u8], ctx: &LoadContext, load_images: bool) -> Result<M
             primitives.push(Primitive {
                 mesh: m,
                 material: prim.material().index(),
-                ..Primitive::default() // STUB(P-MAT): TANGENT, TEXCOORD_1 (PM2)
             });
         }
         meshes.push(ModelMesh {
             name: mesh.name().map(str::to_string),
             primitives,
+            // STUB(P-MAT): TANGENT, TEXCOORD_1 into `extras` (PM2)
+            ..ModelMesh::default()
         });
     }
 

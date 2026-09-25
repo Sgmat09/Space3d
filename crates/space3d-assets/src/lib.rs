@@ -64,8 +64,8 @@ pub use loaders::{
     CubeConvention, CubemapData, GltfLoader, HdrImageLoader, ImageLoader, MeshLoader, ObjLoader, SkyboxLoader,
 };
 pub use model::{
-    AlphaMode, MaterialData, MaterialTextureInfo, ModelData, ModelMesh, NodeData, Primitive, SamplerData, TextureInfo,
-    UvTransformData, WrapMode,
+    AlphaMode, MaterialData, MaterialTextureInfo, ModelData, ModelMesh, NodeData, Primitive, PrimitiveExtras,
+    SamplerData, TextureInfo, UvTransformData, WrapMode,
 };
 pub use par::PAR_ROW_THRESHOLD;
 pub use path::AssetPath;

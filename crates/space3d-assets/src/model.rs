@@ -21,27 +21,62 @@ pub struct ModelData {
 }
 
 /// A named mesh made of primitives (one per material in glTF terms).
+///
+/// Construct it with functional record update (`..Default::default()`): fields may be added.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelMesh {
     /// Optional name from the source file.
     pub name: Option<String>,
     /// Geometry chunks.
     pub primitives: Vec<Primitive>,
+    /// Extra vertex streams of the primitives: `extras[i]` belongs to `primitives[i]` (shorter
+    /// or empty: the rest have none). Code that reorders, splits or removes primitives keeps
+    /// it in step or clears it; a stream whose length is not the primitive's vertex count is
+    /// ignored (see [`ModelMesh::primitive_extras`]).
+    #[serde(default)]
+    pub extras: Vec<PrimitiveExtras>,
+}
+
+impl ModelMesh {
+    /// The extra vertex streams of primitive `index` that match its vertex count (`None`
+    /// without any).
+    pub fn primitive_extras(&self, index: usize) -> Option<PrimitiveExtras> {
+        let n = self.primitives.get(index)?.mesh.positions.len();
+        let extras = self.extras.get(index)?;
+        let tangents = if extras.tangents.len() == n {
+            extras.tangents.clone()
+        } else {
+            Vec::new()
+        };
+        let uvs1 = if extras.uvs1.len() == n {
+            extras.uvs1.clone()
+        } else {
+            Vec::new()
+        };
+        (!tangents.is_empty() || !uvs1.is_empty()).then_some(PrimitiveExtras { tangents, uvs1 })
+    }
 }
 
 /// Geometry with a single material.
+///
+/// Its fields are frozen (code builds it with exhaustive literals); per-vertex data beyond
+/// [`MeshData`] lives in [`ModelMesh::extras`].
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Primitive {
     /// Triangle geometry. `normals` and `uvs` always match `positions` in length.
     pub mesh: MeshData,
     /// Index into [`ModelData::materials`].
     pub material: Option<usize>,
-    /// glTF `TANGENT` `[x, y, z, w]` (w = ±1 bitangent sign), one per vertex; empty when the
-    /// source has none.
-    #[serde(default)]
+}
+
+/// Extra vertex streams of a [`Primitive`] ([`ModelMesh::extras`]), one entry per vertex of
+/// its mesh; empty when the source has none.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrimitiveExtras {
+    /// glTF `TANGENT` `[x, y, z, w]` (w = ±1 bitangent sign).
     pub tangents: Vec<[f32; 4]>,
-    /// glTF `TEXCOORD_1`, one per vertex; empty when the source has none.
-    #[serde(default)]
+    /// glTF `TEXCOORD_1`.
     pub uvs1: Vec<[f32; 2]>,
 }
 
@@ -236,8 +271,8 @@ impl ModelData {
                 primitives: vec![Primitive {
                     mesh,
                     material: Some(0),
-                    ..Default::default()
                 }],
+                ..Default::default()
             }],
             materials: vec![MaterialData::default()],
             images: Vec::new(),
@@ -320,5 +355,45 @@ mod tests {
         let (min, max) = merged.aabb();
         assert_eq!(min, Vec3::new(9.0, -1.0, -1.0));
         assert_eq!(max, Vec3::new(11.0, 6.0, 1.0));
+    }
+
+    /// `Primitive` keeps its 249c874 field set (the game builds `Primitive { mesh, material }`
+    /// literally); its extra vertex streams live in `ModelMesh::extras` and only apply where
+    /// they match the vertex count.
+    #[test]
+    fn primitive_extras_follow_their_primitive() {
+        let quad = MeshData::plane(1.0);
+        let n = quad.positions.len();
+        let mut model = ModelData::from_mesh(quad.clone());
+        let mesh = &mut model.meshes[0];
+        mesh.primitives.push(Primitive {
+            mesh: quad.clone(),
+            material: None,
+        });
+        assert_eq!(mesh.primitive_extras(0), None);
+        mesh.extras = vec![
+            PrimitiveExtras {
+                tangents: vec![[1.0, 0.0, 0.0, 1.0]; n],
+                uvs1: vec![[0.5; 2]; n + 1],
+            },
+            PrimitiveExtras {
+                tangents: vec![[1.0, 0.0, 0.0, 1.0]; n - 1],
+                uvs1: Vec::new(),
+            },
+        ];
+        let first = mesh.primitive_extras(0).unwrap();
+        assert_eq!(
+            (first.tangents.len(), first.uvs1.len()),
+            (n, 0),
+            "mismatched uvs1 dropped"
+        );
+        assert_eq!(mesh.primitive_extras(1), None, "mismatched tangents dropped");
+        assert_eq!(mesh.primitive_extras(2), None);
+        // Serialized data without `extras` (older files) still loads.
+        let legacy: ModelMesh = serde_json::from_str(
+            r#"{"name":null,"primitives":[{"mesh":{"positions":[],"normals":[],"uvs":[],"colors":[],"indices":[]},"material":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!((legacy.primitives[0].material, legacy.extras.len()), (Some(1), 0));
     }
 }

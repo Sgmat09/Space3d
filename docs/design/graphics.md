@@ -38,7 +38,7 @@ post camera's 1×1 exposure texture and `L` the LDR intermediate before FXAA.
 | D7 | **`RenderNode` API:** `&mut Resources`, per-slot `SlotMask`, `DrawContext::slot`, `SceneDepthRef` with a generation, `RenderCapabilities` + `GraphicsCaps`, renderer id / device-lost flag, `mesh()`/`texture()` accessors, prewarm hook. Particles adopt these names. | 2.2.4 |
 | D8 | **Scene depth access:** 1× on RODS attaches depth read-only and samples it. On GL, depth is sampled with no attachment and tested manually. MSAA on RODS with a single scene view resolves depth (min of samples), then runs the 1× pass. Anything else (GL + MSAA, or multi-view MSAA) draws depth readers *in* the MSAA pass with the fade off. No linearize pass, no `R16F`/`R32F` copies, no unresolve blits. | 1.6 |
 | D9 | **Determinism:** all noise is seeded from `Time::frame`. `delta = 0` when `Time::frame` did not advance. Capture replays never advance temporal state. `GpuView` carries no per-frame data. | 4.3 |
-| D10 | **API policy:** new fields are allowed only on `Material`, `MaterialData`, `Primitive` and `RenderStats`. Every other existing struct is frozen. New config structs are plain `pub` field structs with `Default` (FRU-friendly). New enums and read-only info structs are `#[non_exhaustive]`. Prelude additions come from a curated, collision-checked list. | 2.7 |
+| D10 | **API policy:** new fields are allowed only on `Material`, `MaterialData`, `ModelMesh` and `RenderStats` *(amended at the M1 review: `ModelMesh` replaces `Primitive`, which the game builds with exhaustive literals)*. Every other existing struct is frozen. New config structs are plain `pub` field structs with `Default` (FRU-friendly). New enums and read-only info structs are `#[non_exhaustive]`. Prelude additions come from a curated, collision-checked list. | 2.7 |
 | D11 | **Transparent order:** built-in blended meshes (`render_order`, then alpha/premultiplied before additive) → non-depth-reading node slots → depth-reading node slots. Particles use a single node, so their internal order is never split. | 1.7 |
 | D12 | **Budgets:** one tier table (T1 dGPU, T2 Apple M1, T3 WebGL2 iGPU at scale 0.75), one "Battle" scene budget per tier, a WebGL2 preset (`GraphicsQuality::Low`), and wasm CPU and VRAM budgets. Dev-machine (M4 Max) numbers are the CI gates. | 4.4 |
 | D13 | **Infrastructure consolidated:** one caps struct (`GraphicsCaps`), one texture pool (frame), one timestamp system (`GpuTimings`), one stats struct (`RenderStats` + particles' own `ParticleStats`), one HDR image type (`space3d_core::HdrImageData`). | 2.2 |
@@ -1322,7 +1322,11 @@ These are design-materials §3.9, plus the P1-12 helper:
   `metallic_roughness_texture`, `occlusion_texture`, `emissive_texture: Option<usize>`,
   `normal_scale`, `occlusion_strength`, `emissive_strength: f32`, `unlit: bool`,
   `texture_info: MaterialTextureInfo`.
-* `Primitive` *(existing)* gains `tangents: Vec<[f32;4]>` and `uvs1: Vec<[f32;2]>`, both `#[serde(default)]`.
+* `ModelMesh` *(existing)* gains `extras: Vec<PrimitiveExtras>` (`#[serde(default)]`; `extras[i]` belongs to
+  `primitives[i]`), `PrimitiveExtras { tangents: Vec<[f32;4]>, uvs1: Vec<[f32;2]> }` and
+  `ModelMesh::primitive_extras(i)` (the streams whose length matches the primitive's vertex count). *(Amended at
+  the M1 review: F2 had put `tangents`/`uvs1` on `Primitive`, which broke the game's exhaustive
+  `Primitive { mesh, material }` literals (5 × E0063 at the game's a614a02 pin). `Primitive` is frozen.)*
 * New types:
   * `MaterialTextureInfo`, `TextureInfo { tex_coord, transform: Option<UvTransformData>, sampler: SamplerData }`,
     `UvTransformData`, `SamplerData`;
@@ -1496,10 +1500,10 @@ pub(crate) struct TexturePool;   // acquire(desc) → PoolTexture (per-mip views
 | `Renderer` | + methods | Additive. Behaviour in Direct mode is unchanged. |
 | `RenderPlugin` | **unchanged struct**; `build` inits more resources and built-in nodes | The facade literal `RenderPlugin { headless }` still compiles. |
 | `space3d_render::prelude` / `space3d::prelude` | + 8 names (§2.2.10) | Checked against every type name in the game (`prelude_policy.rs` fixture of 793 names) and the workspace preludes. No collision. |
-| `MaterialData`, `Primitive` (assets) | + `#[serde(default)]` fields | FRU-only downstream. Old RON/JSON still deserialize. |
+| `MaterialData`, `ModelMesh` (assets) | + `#[serde(default)]` fields | FRU-only downstream (grep of the game at every pin: never built literally). Old RON/JSON still deserialize. `Primitive` is frozen (the game builds it literally; *amended at the M1 review*). |
 | `space3d-core` | + `HdrImageData` (root export, not prelude) | Additive. |
 | `engine_storybook()` | returns more stories | Additive. |
-| **Frozen, unchanged:** `Camera3d`, `Projection`, `RenderTarget`, `DirectionalLight`, `PointLight`, `AmbientLight`, `MeshData`, `InstancedMesh`, `InstanceLayout`, `RenderSettings`, `RendererConfig`, `RenderCapabilities`, `DrawPath`, `SamplerSettings`, `OverlayTarget` fields, `DefaultPlugins`/`MinimalPlugins` fields, `GltfLoader` | — | New configuration lives in new components/resources (`CameraFrame`, `DirectionalShadow`, `Skybox`, `EnvironmentLight`, `FrameSettings`, `LightingSettings`, `MeshExtras`). |
+| **Frozen, unchanged:** `Camera3d`, `Projection`, `RenderTarget`, `DirectionalLight`, `PointLight`, `AmbientLight`, `MeshData`, `InstancedMesh`, `InstanceLayout`, `RenderSettings`, `RendererConfig`, `RenderCapabilities`, `DrawPath`, `SamplerSettings`, `OverlayTarget` fields, `DefaultPlugins`/`MinimalPlugins` fields, `GltfLoader`, `space3d_assets::Primitive` | — | New configuration lives in new components/resources (`CameraFrame`, `DirectionalShadow`, `Skybox`, `EnvironmentLight`, `FrameSettings`, `LightingSettings`, `MeshExtras`). |
 
 **Behavioural compatibility.**
 * Direct mode is the default. `TransparentSort::None`, `ShadingModel::Classic` and no maps leave the forward
@@ -2354,7 +2358,7 @@ order:
      * ANGLE (9 texture units);
      * wasm.
 2. **PM2 glTF "just lights up" + tangents:**
-   * the new `MaterialData`/`Primitive` fields, the loader (every slot, `texCoord`, `KHR_texture_transform`,
+   * the new `MaterialData` fields and `ModelMesh::extras`, the loader (every slot, `texCoord`, `KHR_texture_transform`,
      `KHR_materials_emissive_strength`, `KHR_materials_unlit`, `TANGENT`, `TEXCOORD_1`);
    * `compute_mikktspace_tangents`;
    * the ext vertex stream (arena slot 2, lockstep growth, WebGL2 rebinding), `MeshExtras`, `add_mesh_with`;
@@ -2520,7 +2524,7 @@ lands during PM3/PM4 → PM5; PA4 after PO5 → I.
 | P1-4 too many view uniforms | one `GpuView`; groups 0 view / 1 scene / 2–3 node | D6, 3.3–3.4 |
 | P1-5 transparent order | meshes → non-reading slots → reading slots; one particle node | D11, 1.7 |
 | P1-6 shadows/IBL frame hooks | depth views (F7), env-keyed view bind groups, `Lighting` contract; skybox as a node; replay skips them | D17, 1.12, 2.6, F7 |
-| P1-7 contradictory API rules | fields only on `Material`, `MaterialData`, `Primitive`, `RenderStats` (evidence-based); FRU config structs; `#[non_exhaustive]` enums/info; curated prelude + fixture test | D10, 2.7 |
+| P1-7 contradictory API rules | fields only on `Material`, `MaterialData`, `ModelMesh`, `RenderStats` (evidence-based; `ModelMesh` replaced `Primitive` at the M1 review); FRU config structs; `#[non_exhaustive]` enums/info; curated prelude + fixture test | D10, 2.7 |
 | P1-8 duplicated infrastructure | `GraphicsCaps`, one `TexturePool`, `GpuTimings`, `RenderStats` counters, `HdrImageData` | D13, 2.2 |
 | P1-9 budgets | one tier table, Battle budget per tier, WebGL2 preset, wasm CPU, VRAM, Dev gates | D12, 4.4 |
 | P1-10 default transparent sort | `TransparentSort::None` default; `PerInstance` opt-in | 2.2.9, PM1 |

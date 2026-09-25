@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 // The game's imports, verbatim (`client/src/game/{additive,env,models}.rs`).
-use space3d::assets::{AlphaMode, MaterialData};
+use space3d::assets::{AlphaMode, MaterialData, ModelData, Primitive};
 use space3d::prelude::*;
 use space3d::render::{AddressMode, RendererConfig, SamplerSettings, TextureSource};
 use space3d::render::{OverlayTarget, OverlayTargetKind, RenderOverlay, RenderOverlays};
@@ -210,6 +210,21 @@ fn hull_material() -> (MaterialData, MaterialData) {
     (data, engine)
 }
 
+/// The game's primitive split (`client/src/game/models.rs` at 2f160d1, which pins a614a02):
+/// exhaustive `Primitive { mesh, material }` literals, no functional record update.
+fn split_primitive(model: &mut ModelData, moved: MeshData, material: usize) {
+    let mut added = Vec::new();
+    if !moved.indices.is_empty() {
+        added.push(Primitive {
+            mesh: moved,
+            material: Some(material),
+        });
+    }
+    let mesh = &mut model.meshes[0];
+    mesh.primitives.retain(|p| !p.mesh.indices.is_empty());
+    mesh.primitives.extend(added);
+}
+
 fn plugins_and_settings() -> (RenderPlugin, RenderSettings, RendererConfig, RenderStats) {
     (
         RenderPlugin { headless: None },
@@ -265,6 +280,11 @@ fn legacy_forms_keep_their_meaning() {
     let (hull, engine) = hull_material();
     assert_eq!(engine.name.as_deref(), Some("SC_Hull"));
     assert_eq!(hull.alpha_mode, AlphaMode::default());
+
+    let mut model = ModelData::from_mesh(MeshData::cube(1.0));
+    split_primitive(&mut model, MeshData::cube(0.5), 0);
+    assert_eq!(model.meshes[0].primitives.len(), 2);
+    assert_eq!(model.meshes[0].primitives[1].material, Some(0));
 
     let (plugin, settings, config, stats) = plugins_and_settings();
     assert_eq!(plugin.headless, None);

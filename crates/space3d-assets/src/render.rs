@@ -99,9 +99,10 @@ impl PreparedModel {
             };
             for (p, prim) in mesh.primitives.iter().enumerate() {
                 let handle = *meshes.entry((mesh_index, p)).or_insert_with(|| {
+                    let streams = mesh.primitive_extras(p).unwrap_or_default();
                     let extras = MeshExtras::new()
-                        .with_tangents(prim.tangents.clone())
-                        .with_uvs1(prim.uvs1.clone());
+                        .with_tangents(streams.tangents)
+                        .with_uvs1(streams.uvs1);
                     assets.add_mesh_with(prim.mesh.clone(), extras)
                 });
                 parts.push(RenderPart {

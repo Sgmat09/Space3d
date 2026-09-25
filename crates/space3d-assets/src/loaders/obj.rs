@@ -222,8 +222,8 @@ pub fn load_obj(bytes: &[u8], ctx: &LoadContext, load_materials: bool) -> Result
             primitives: vec![Primitive {
                 mesh,
                 material: m.material_id.filter(|&i| i < mats.len()),
-                ..Primitive::default()
             }],
+            ..ModelMesh::default()
         });
         nodes.push(NodeData {
             name: (!model.name.is_empty()).then_some(model.name),
