@@ -675,5 +675,22 @@ fn a_lost_device_degrades_instead_of_panicking() {
         let _ = r.capture().block();
         assert!(render_to_image(&mut app).is_none());
         app.run_stage(Stage::Render);
+        // Frames that upload after the loss (moving camera + entities, new mesh and texture
+        // every frame) must degrade too, not only static frames.
+        for i in 0..4 {
+            for t in app.world.query_mut::<&mut Transform>() {
+                t.translation.x += 0.25;
+            }
+            let assets = app.resources.expect_mut::<RenderAssets>();
+            let mesh = assets.add_mesh(MeshData::sphere(0.5 + i as f32 * 0.1, 16, 8));
+            let tex = assets.add_image(ImageData::checker(64, 8, [255; 4], [0, 0, 0, 255]));
+            app.world.spawn((
+                Transform::default(),
+                Mesh3d(mesh),
+                Material::unlit(Vec4::ONE).with_texture(tex),
+            ));
+            app.step_ticks(1);
+        }
+        assert!(render_to_image(&mut app).is_none());
     }
 }

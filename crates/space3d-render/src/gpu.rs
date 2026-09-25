@@ -69,6 +69,8 @@ pub(crate) struct Uploader {
     pub instance_bytes: u64,
     /// GPU buffers (re)allocated this frame.
     pub reallocations: u32,
+    /// Whether the "device lost, skipping uploads" warning was already logged.
+    lost_logged: bool,
 }
 
 impl Uploader {
@@ -85,6 +87,7 @@ impl Uploader {
             bytes: 0,
             instance_bytes: 0,
             reallocations: 0,
+            lost_logged: false,
         }
     }
 
@@ -122,10 +125,16 @@ impl Uploader {
             let size = size as usize;
             let buffer = &self.active[chunk].buffer;
             encoder.copy_buffer_to_buffer(buffer, at, target, offset + done as u64, size as u64);
-            let mut view = buffer
-                .slice(at..at + size as u64)
-                .get_mapped_range_mut()
-                .expect("staging chunk is mapped");
+            let Ok(mut view) = buffer.slice(at..at + size as u64).get_mapped_range_mut() else {
+                // Only a lost device leaves a fresh or recycled chunk unmapped. The copy just
+                // recorded is invalid anyway (the frame is discarded); skip the rest of this
+                // upload instead of crashing. Errors after loss are logged, not raised.
+                if !self.lost_logged {
+                    self.lost_logged = true;
+                    tracing::warn!("staging memory unavailable (GPU device lost); skipping uploads");
+                }
+                return;
+            };
             let mut filled = 0;
             while filled < size {
                 if cur.is_empty() {
