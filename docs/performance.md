@@ -291,3 +291,58 @@ cancels; includes the Metal driver and the GPU wait) do not depend on the load:
 Direct mode costs the same work per frame as before the upgrade, plus a fixed ~11 k
 instructions (a few µs). The ±5 % gate on `benches/instancing.rs` still needs its wall-clock
 re-run on a quiet machine before Phase I records final values.
+
+### M1 review — upload ring, honest HDR bench, GPU gates
+
+**Staging churn (fixed).** `Uploader::recall` trimmed idle staging chunks to twice the recent
+per-frame peak and ignored the chunks still in flight. With frames queued on the GPU (an unpaced
+`App::update` loop), every frame's chunk is still in flight when the next frame allocates, so a
+still HDR scene — whose only upload is the composite's 16 bytes of per-frame dither and grain
+seeds — created and dropped a 4 MiB `MAP_WRITE` chunk every few frames (0.5–1 ms of CPU and an
+`Arc` each: 100–230 per 1200 frames in the review's trace). The ring now also keeps what the
+queue depth needs (the busiest frame times the deepest queue of the last one to two 512-frame
+windows, plus one), so it grows to the depth once and then creates nothing; the chunks of a
+one-off stall are released within two windows. `RenderStats::staging_chunks_created` counts the
+chunks created per frame. `tests/alloc_frame.rs` renders a still Hdr scene the way `App::update`
+does (the frame counter advancing, a GPU wait every 8th frame): 7 chunks created in 1200 frames
+(all while the queue first deepens), 148 allocations per frame (the seed upload's copy and
+re-map inside wgpu; 106 when nothing is uploaded), bound 165.
+
+**The frame bench now uploads the seeds.** `benches/frame.rs` advanced nothing between frames,
+so its Hdr frames uploaded no seeds and hid both the churn and the upload. Its `render` helper now
+advances `Time::frame` like `App::update`. `frame/ab` at load average 9–12 (this machine was
+slower than at F4: Direct CPU 90–98 µs instead of 67–75):
+
+| `frame/ab` (medians, µs) | Direct | Hdr minimal | paired delta | same, seeds not uploaded | gate |
+|---|---|---|---|---|---|
+| cpu | 89.7–98.1 | 118.3–128.5 | +24.2 to +33.2 | +21.5, +21.6 | ≤ +20 µs CPU |
+| throughput | 124.5–130.2 | 182.4–184.4 | +50.3 to +58.1 | +31.9, +35.5 | ≤ +0.10 ms GPU |
+| latency | 295–306 | 395–400 | +84 to +100 | +74 | (upper bound) |
+
+The GPU gate holds with the upload (the 16-byte copy costs about 20 µs of GPU throughput in a
+frame that uploads nothing else; in a frame where anything moves it joins that frame's copies).
+The CPU gate is at its limit: +21.5 µs without the upload on this slower machine state, about
++4 µs more with it (an earlier run, where Direct measured 66 µs, gave +16.0 µs with it). The composite's extra render pass in
+wgpu-hal is most of it (see F3 / F4). Open: uploading the seeds for a window of frames at once
+and selecting them with a dynamic offset would remove the per-frame copy.
+
+**GPU gates (run alone on an idle Dev GPU; not part of `cargo test --workspace` or CI).**
+Hosted CI runners have software or paravirtual GPUs, so these are manual Dev-machine gates; each
+retries a disturbed run (best of 3):
+
+```sh
+cargo test -p space3d-render --lib bloom_gate -- --ignored --nocapture
+cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --nocapture
+```
+
+| gate | measured at the M1 review (GPU shared: 50–60 % device utilization from other apps) | budget |
+|---|---|---|
+| bloom 6 mips @1080p | 0.188–0.265 ms (one of two invocations passed; 0.13–0.16 ms on a quiet GPU) | ≤ 0.20 ms |
+| particles 100k: sim + compaction, nothing else on the GPU | 0.044 ms (in frames that also draw the 100k billboards: 0.084 ms, reported) | ≤ 0.06 ms |
+| particles 100k: draw into the HDR scene texture | 0.350 ms (into Direct's 8-bit target: 0.362 ms, reported) | ≤ 0.40 ms |
+
+**Bloom CPU.** Bloom's render passes cost about 10 µs of wgpu/Metal overhead each (the
+renderer's own work per pass allocates nothing): about 0.11 ms per post group at 1080p and above
+(11 passes), against the spec's Battle-scene line "post ≤ 0.05 ms". Smaller rects now have
+fewer levels (9 passes at 720p, 5 at 180p). The planned fix is a compute chain (one compute pass
+of dependent dispatches on class A backends; the render-pass chain kept for WebGL2).

@@ -18,10 +18,13 @@ the game.
 
 * **Config structs** (`FrameSettings`, `CameraFrame`, `RenderTargetDesc`, `DownlevelOverride`,
   `PostProcess` and its effect structs, `LightingSettings`, `IblSettings`, `DirectionalShadow`,
-  `Skybox`, `EnvironmentLight`, `TextureTransform`, `ParticleSettings`, the particle data model,
-  `ModelUploadOptions`) are plain `pub`-field structs with `Default`. Construct them with
-  functional record update (`..Default::default()`) or the builders: new fields may be added.
-  Exhaustive struct literals of them are not covered by the compatibility guarantee.
+  `TextureTransform`, `ParticleSettings`, the particle data model, `ModelUploadOptions`) are
+  plain `pub`-field structs with `Default`. Construct them with functional record update
+  (`..Default::default()`) or the builders: new fields may be added. Exhaustive struct literals
+  of them are not covered by the compatibility guarantee.
+* **`Skybox` and `EnvironmentLight`** have public fields but no `Default` (they need a cubemap):
+  build them with `Skybox::new(cubemap)` / `EnvironmentLight::new(cubemap)` and the builders, or
+  with functional record update from one of those (`..Skybox::new(cubemap)`).
 * **Enums** added by the upgrade are `#[non_exhaustive]` (new variants may be added): match them
   with a wildcard arm.
 * **Read-only info and context structs** (`GraphicsCaps`, `GpuTimings`, `GpuScope`, `FrameInfo`,
@@ -30,15 +33,24 @@ the game.
   `#[non_exhaustive]`: read their fields, never construct them.
 * **Bit sets** (`SceneReads`, `SlotMask`, `MapMask`) are newtypes with `const`s and `BitOr`.
 * **Existing types that gain fields** — the only ones, and all "FRU-only" downstream:
-  `Material`, `RenderStats`, `space3d_assets::MaterialData`, `space3d_assets::Primitive`. Their
-  new fields default to the legacy behaviour (`MaterialData`/`Primitive` fields are
-  `#[serde(default)]`, so old RON/JSON still loads).
+  `Material`, `RenderStats`, `space3d_assets::MaterialData`, `space3d_assets::ModelMesh`. Their
+  new fields default to the legacy behaviour (`MaterialData`/`ModelMesh` fields are
+  `#[serde(default)]`, so old RON/JSON still loads). The evidence is a grep of the game at
+  revisions 4159bb8, 2f160d1 and 7267c34 (its HEAD at the M1 review, which type-checks against
+  `graphics`): none of them is built with an exhaustive literal.
+* **`space3d_assets::Primitive` stays frozen** (`mesh`, `material`): the game builds it with
+  exhaustive literals (`client/src/game/models.rs`, splitting double-sided panels). Its extra
+  vertex streams (glTF `TANGENT`, `TEXCOORD_1`) live beside it in
+  `ModelMesh::extras: Vec<PrimitiveExtras>` (`extras[i]` belongs to `primitives[i]`; a stream
+  whose length is not the primitive's vertex count is ignored, so code that splits or reorders
+  primitives without touching `extras` gets per-pixel tangents instead of wrong ones).
+  `api_compat_249c874.rs` compiles the game's literal.
 * **Frozen existing types** (unchanged): `Camera3d`, `Projection`, `RenderTarget`,
   `DirectionalLight`, `PointLight`, `AmbientLight`, `MeshData`, `InstancedMesh`,
   `InstanceLayout`, `RenderSettings`, `RendererConfig`, `RenderCapabilities`, `DrawPath`,
   `SamplerSettings`, `OverlayTarget`'s fields, `OverlayTargetKind`, `RenderPlugin`,
-  `DefaultPlugins` / `MinimalPlugins`, `GltfLoader`. New configuration lives in new components and
-  resources.
+  `DefaultPlugins` / `MinimalPlugins`, `GltfLoader`, `space3d_assets::Primitive`. New
+  configuration lives in new components and resources.
 * **Traits**: `RenderOverlay` gains provided methods only (`stage`, `scene_reads`,
   `prepare_scene`): existing impls compile and draw exactly as before (`AfterTonemap`).
 * **Preludes**: `space3d_render::prelude` (and so `space3d::prelude`) gains exactly `PostProcess`,
@@ -115,6 +127,24 @@ Additions made by the foundation since F2 (additive):
     that ran on Metal, Vulkan, DX12 and WebGPU.
   * `FrameLayouts::view` holds binding 0 (`View`) only. The lighting bindings 1–6 of spec §3.4
     join it with the lighting wiring (F7 / P-MAT PM4), and their docs say so.
+
+* Graphics review (visual, perf, compat), all additive:
+  * `space3d_core::App::add_system_ordered(stage, order, name, system)`: a stage's systems run
+    by ascending `order`, ties in registration order (`add_system` / `add_system_named` use 0).
+    `ParticlesPlugin::TICK_ORDER` (1000) runs the particle tick after gameplay.
+  * `PrepareContext::count_compute_passes(n)` (→ `RenderStats::compute_passes`, which the
+    particles' GPU backend now reports).
+  * `Tonemapper::AgXPunchy` (id 5, `S3D_TM_AGX_PUNCHY`): AgX with Sobotka's punchy look. The
+    default stays `AgX`.
+  * `SpriteRender::max_screen_size` (per layer, 0 = the setting);
+    `ParticleSettings::max_screen_size` defaults to 1.0 (was 0.6).
+  * `space3d_assets::{ModelMesh::extras, ModelMesh::primitive_extras, PrimitiveExtras}` replace
+    the `tangents` / `uvs1` fields F2 had added to `Primitive` (that broke the game's exhaustive
+    `Primitive { mesh, material }` literals; `Primitive` is frozen again).
+  * `PostProcess::with_bloom(b)` sets `b` as given: `enabled: false` stays off (it used to force
+    `true`; the presets are enabled, so `with_bloom(Bloom::glow())` is unchanged).
+  * `RenderStats::staging_chunks_created`: staging chunks the upload ring created this frame (0 in
+    the steady state; the ring now keeps what the frames queued on the GPU need).
 
 ## Ownership map (spec §3.6)
 

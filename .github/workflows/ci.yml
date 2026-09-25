@@ -57,7 +57,8 @@ jobs:
           cargo check --target wasm32-unknown-unknown \
             -p space3d-core -p space3d-tasks -p space3d-render -p space3d-platform \
             -p space3d-assets -p space3d-net -p space3d-db -p space3d-audio \
-            -p space3d-physics -p space3d-scene -p space3d-ui -p space3d
+            -p space3d-physics -p space3d-scene -p space3d-ui -p space3d-particles -p space3d
+          cargo check --target wasm32-unknown-unknown -p space3d --features particles
 
   mobile:
     runs-on: macos-latest
