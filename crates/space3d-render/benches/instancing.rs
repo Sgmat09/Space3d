@@ -3,6 +3,8 @@
 //! * `extract_upload/explicit/{100k,1M}`: rewrite every instance of a dynamic buffer, then
 //!   extract + upload + submit one frame (camera looks away, so no draw cost is measured).
 //! * `extract_upload/ecs/100k`: 100k moving ECS entities batched and diff-uploaded.
+//! * `extract_upload/ecs_static_mixed/100k`: 100k static entities, 4 meshes × 8 materials
+//!   spawned round-robin (interleaved batch keys): the cost of an unchanged scene.
 //! * `mesh_arena/upload_1000`: register 1000 meshes and upload them into the arena.
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -100,6 +102,32 @@ fn explicit(c: &mut Criterion) {
                 t.translation.y += 0.01;
             }
             app.step_ticks(1);
+            wait(&app);
+        })
+    });
+
+    let Some(r) = renderer() else { return };
+    let mut app = app_with(r);
+    let meshes: Vec<_> = (0..4)
+        .map(|k| {
+            app.resources
+                .expect_mut::<RenderAssets>()
+                .add_mesh(MeshData::cube(0.1 + 0.02 * k as f32))
+        })
+        .collect();
+    let materials: Vec<_> = (0..8).map(|k| Material::srgb(0.1 * k as f32, 0.5, 0.8)).collect();
+    for i in 0..n {
+        app.world.spawn((
+            Transform::from_xyz(i as f32 * 0.01, 0.0, 0.0),
+            Mesh3d(meshes[i % 4]),
+            materials[(i / 4) % 8].clone(),
+        ));
+    }
+    app.step_ticks(1);
+    wait(&app);
+    group.bench_function("ecs_static_mixed/100k", |b| {
+        b.iter(|| {
+            app.run_stage(Stage::Render);
             wait(&app);
         })
     });

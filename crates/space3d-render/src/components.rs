@@ -1,6 +1,6 @@
 //! ECS components and resources understood by the renderer.
 
-use crate::handles::{MeshHandle, TextureHandle};
+use crate::handles::{MeshHandle, ShaderHandle, TextureHandle};
 use glam::{Mat4, Vec3, Vec4};
 
 /// Renders the entity's mesh with its [`Material`] at its `GlobalTransform`.
@@ -44,7 +44,8 @@ pub fn linear_to_srgb(c: f32) -> f32 {
 pub struct Material {
     /// Linear RGBA multiplier (and alpha when `alpha_blend`).
     pub base_color: Vec4,
-    /// Optional sRGB color texture (sampled as a 2D array; layer selected per instance).
+    /// Optional sRGB color texture. Texture arrays pick their layer per instance
+    /// ([`crate::InstanceSemantic::TextureLayer`]); single-layer textures ignore it.
     pub base_color_texture: Option<TextureHandle>,
     /// 0 = dielectric, 1 = metal.
     pub metallic: f32,
@@ -58,6 +59,9 @@ pub struct Material {
     pub double_sided: bool,
     /// Alpha blending (drawn after opaque geometry, no depth writes).
     pub alpha_blend: bool,
+    /// Custom WGSL hooks ([`crate::CustomShader`], registered with
+    /// [`crate::RenderAssets::add_shader`]); `None` uses the built-in shader only.
+    pub shader: Option<ShaderHandle>,
 }
 
 impl Default for Material {
@@ -71,6 +75,7 @@ impl Default for Material {
             unlit: false,
             double_sided: false,
             alpha_blend: false,
+            shader: None,
         }
     }
 }
@@ -109,6 +114,11 @@ impl Material {
     /// Set emissive radiance (linear).
     pub fn with_emissive(mut self, emissive: Vec3) -> Self {
         self.emissive = emissive;
+        self
+    }
+    /// Draw with a [`crate::CustomShader`] (its hooks run inside the built-in shader).
+    pub fn with_shader(mut self, shader: ShaderHandle) -> Self {
+        self.shader = Some(shader);
         self
     }
 }
@@ -177,13 +187,20 @@ pub enum RenderTarget {
 pub struct Camera3d {
     /// Projection.
     pub projection: Projection,
-    /// Linear clear color; `None` keeps the previous contents (for overlay cameras).
+    /// Linear clear color of the camera's viewport (the whole target without one); `None`
+    /// draws over what cameras with a lower `order` drew into the same target this frame (for
+    /// overlay cameras). The first camera drawing into a target in a frame always starts from
+    /// a cleared target: black wherever its own clear color does not apply.
     pub clear_color: Option<Vec4>,
     /// Render target.
     pub target: RenderTarget,
     /// Cameras render in ascending `order`.
     pub order: i32,
-    /// Normalized viewport `[x, y, width, height]` in 0..1; `None` = full target.
+    /// Normalized viewport `[x, y, width, height]` in 0..1, from the top left; `None` = full
+    /// target. Its edges are rounded to whole pixels (the same on every backend; neighbouring
+    /// viewports share edges exactly); one thinner than a pixel keeps the pixel holding its
+    /// center. The camera clears and draws only inside it, so several cameras can share a
+    /// target (split screen, picture-in-picture, minimaps).
     pub viewport: Option<[f32; 4]>,
     /// Inactive cameras are skipped.
     pub active: bool,

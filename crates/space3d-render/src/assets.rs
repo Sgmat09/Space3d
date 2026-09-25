@@ -7,9 +7,11 @@
 
 use crate::arena::{ArenaAlloc, MeshArena};
 use crate::culling::{Aabb, Sphere};
-use crate::handles::{MeshHandle, SlotMap, TextureHandle};
+use crate::handles::{MeshHandle, ShaderHandle, SlotMap, TextureHandle};
+use crate::shader::CustomShader;
 use glam::Vec3;
 use space3d_core::{ImageData, MeshData};
+use std::sync::Arc;
 
 /// Texture sampling filter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -123,8 +125,10 @@ pub(crate) struct MeshEntry {
 }
 
 pub(crate) struct GpuTexture {
-    /// D2Array view for sampling.
+    /// View for sampling: `D2` for single-layer textures, `D2Array` for arrays (`layered`).
     pub view: wgpu::TextureView,
+    /// More than one layer: sampled as `texture_2d_array` (see `pipeline::sampled_view_dimension`).
+    pub layered: bool,
     pub sampler: wgpu::Sampler,
     /// Single-layer D2 view (render targets).
     pub target_view: Option<wgpu::TextureView>,
@@ -143,11 +147,18 @@ pub(crate) struct TextureEntry {
     pub sampler: SamplerSettings,
 }
 
-/// Resource holding all meshes and textures (CPU registration + GPU storage).
+/// A registered [`CustomShader`]; `version` is bumped by every update (pipelines are rebuilt).
+pub(crate) struct ShaderEntry {
+    pub shader: Arc<CustomShader>,
+    pub version: u32,
+}
+
+/// Resource holding all meshes, textures and custom shaders (CPU registration + GPU storage).
 #[derive(Default)]
 pub struct RenderAssets {
     pub(crate) meshes: SlotMap<MeshEntry>,
     pub(crate) textures: SlotMap<TextureEntry>,
+    pub(crate) shaders: SlotMap<ShaderEntry>,
     pub(crate) pending_meshes: Vec<MeshHandle>,
     pub(crate) pending_textures: Vec<TextureHandle>,
     pub(crate) freed_allocs: Vec<ArenaAlloc>,
@@ -256,7 +267,9 @@ impl RenderAssets {
     }
 
     /// Create a color texture cameras can render into ([`crate::RenderTarget::Texture`]) and
-    /// materials can sample.
+    /// materials can sample. A size past the device's `max_texture_dimension_2d` is logged
+    /// and the target is not created until resized: cameras targeting it are skipped and
+    /// materials sample white.
     pub fn add_render_target(&mut self, width: u32, height: u32) -> TextureHandle {
         let h = TextureHandle::from_raw(self.textures.insert(TextureEntry {
             width: width.max(1),
@@ -274,11 +287,17 @@ impl RenderAssets {
         h
     }
 
-    /// Replace a texture's contents (re-uploaded next frame).
+    /// Replace a sampled texture's contents (re-uploaded next frame). Returns false for stale
+    /// handles and for render targets, whose contents come from their camera — resize those
+    /// with [`Self::resize_render_target`].
     pub fn update_texture(&mut self, handle: TextureHandle, source: TextureSource) -> bool {
         let Some(e) = self.textures.get_mut(handle.raw()) else {
             return false;
         };
+        if e.render_target {
+            tracing::warn!(texture = ?handle, "update_texture on a render target is ignored; use resize_render_target");
+            return false;
+        }
         e.width = source.width;
         e.height = source.height;
         e.sampler = source.sampler;
@@ -287,9 +306,30 @@ impl RenderAssets {
         true
     }
 
-    /// Replace an image texture.
+    /// Replace an image texture (see [`Self::update_texture`]).
     pub fn update_image(&mut self, handle: TextureHandle, image: ImageData) -> bool {
         self.update_texture(handle, TextureSource::from_image(image))
+    }
+
+    /// Resize a render target created with [`Self::add_render_target`]. Its color and depth
+    /// textures are recreated (contents cleared) on the next frame; until then cameras targeting
+    /// it are skipped and materials sample white. Returns false for stale handles and for
+    /// textures that are not render targets.
+    pub fn resize_render_target(&mut self, handle: TextureHandle, width: u32, height: u32) -> bool {
+        let Some(e) = self.textures.get_mut(handle.raw()) else {
+            return false;
+        };
+        if !e.render_target {
+            return false;
+        }
+        let (width, height) = (width.max(1), height.max(1));
+        if (e.width, e.height) != (width, height) {
+            e.width = width;
+            e.height = height;
+            e.gpu = None;
+            self.pending_textures.push(handle);
+        }
+        true
     }
 
     /// Remove a texture.
@@ -310,6 +350,38 @@ impl RenderAssets {
     /// Number of live textures.
     pub fn texture_count(&self) -> usize {
         self.textures.len()
+    }
+
+    /// Register a [`CustomShader`] for materials ([`crate::Material::with_shader`]). Its
+    /// pipelines are built on first use.
+    pub fn add_shader(&mut self, shader: CustomShader) -> ShaderHandle {
+        ShaderHandle::from_raw(self.shaders.insert(ShaderEntry {
+            shader: Arc::new(shader),
+            version: 0,
+        }))
+    }
+
+    /// Replace a custom shader's source (hot reload): its pipelines are rebuilt on next use.
+    /// Returns false for stale handles.
+    pub fn update_shader(&mut self, handle: ShaderHandle, shader: CustomShader) -> bool {
+        let Some(e) = self.shaders.get_mut(handle.raw()) else {
+            return false;
+        };
+        if *e.shader != shader {
+            e.shader = Arc::new(shader);
+            e.version = e.version.wrapping_add(1);
+        }
+        true
+    }
+
+    /// Remove a custom shader; materials still referencing it draw with the built-in shader.
+    pub fn remove_shader(&mut self, handle: ShaderHandle) -> bool {
+        self.shaders.remove(handle.raw()).is_some()
+    }
+
+    /// Whether the handle refers to a live custom shader.
+    pub fn contains_shader(&self, handle: ShaderHandle) -> bool {
+        self.shaders.get(handle.raw()).is_some()
     }
 
     /// Anything waiting for upload.

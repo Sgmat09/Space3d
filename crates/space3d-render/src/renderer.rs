@@ -8,6 +8,8 @@ use crate::stats::{DrawPath, RenderStats};
 use crate::texture::{SamplerCache, create_gpu_texture, format_supported, white_texture};
 use space3d_core::ImageData;
 use space3d_tasks::Task;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Renderer errors.
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +74,12 @@ pub struct RenderCapabilities {
     pub indirect_first_instance: bool,
     /// `multi_draw_indexed_indirect_count` available.
     pub multi_draw_indirect_count: bool,
+    /// Non-zero `base_vertex` in direct indexed draws (`DownlevelFlags::BASE_VERTEX`). Missing
+    /// on WebGL2 and GLES < 3.2, where wgpu does not validate it and the GL backend calls an
+    /// entry point that does not exist (a panic on the web). Without it, direct draws rebind
+    /// the arena's vertex buffer at each mesh's first vertex and draw with `base_vertex = 0`,
+    /// and GPU-driven paths are not offered.
+    pub base_vertex: bool,
     /// BC / ASTC / ETC2 compressed textures.
     pub texture_compression: (bool, bool, bool),
     /// Best draw path for this device.
@@ -80,6 +88,8 @@ pub struct RenderCapabilities {
     pub max_msaa: u32,
     /// Largest storage binding (bounds GPU-culled buffers).
     pub max_storage_binding: u64,
+    /// Largest buffer the device can create (bounds the mesh arena and instance buffers).
+    pub max_buffer_size: u64,
 }
 
 impl RenderCapabilities {
@@ -92,14 +102,10 @@ impl RenderCapabilities {
             && limits.max_compute_workgroup_size_x >= 64
             && limits.max_compute_invocations_per_workgroup >= 64;
         let indirect = dl.flags.contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+        let base_vertex = dl.flags.contains(wgpu::DownlevelFlags::BASE_VERTEX);
         let ifi = features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
         let mdic = features.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
-        let best_draw_path = match (compute && indirect, ifi, mdic) {
-            (true, true, true) => DrawPath::GpuMultiDrawCount,
-            (true, true, false) => DrawPath::GpuMultiDraw,
-            (true, false, _) => DrawPath::GpuIndirect,
-            _ => DrawPath::CpuDirect,
-        };
+        let best_draw_path = best_draw_path(compute && indirect, base_vertex, ifi, mdic);
         let msaa4 = adapter
             .get_texture_format_features(OFFSCREEN_FORMAT)
             .flags
@@ -114,6 +120,7 @@ impl RenderCapabilities {
             indirect,
             indirect_first_instance: ifi,
             multi_draw_indirect_count: mdic,
+            base_vertex,
             texture_compression: (
                 features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
                 features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC),
@@ -121,8 +128,22 @@ impl RenderCapabilities {
             ),
             best_draw_path,
             max_msaa: if msaa4 { 4 } else { 1 },
-            max_storage_binding: limits.max_storage_buffer_binding_size,
+            // Storage bindings must be a multiple of 4 bytes and never exceed the buffer.
+            max_storage_binding: limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) & !3,
+            max_buffer_size: limits.max_buffer_size,
         }
+    }
+}
+
+/// Best draw path for a device. GPU-driven paths need compute + indirect draws, and are only
+/// offered with `BASE_VERTEX`: devices without it (WebGL2, GLES 3.0/3.1) are the downlevel
+/// targets `CpuDirect` exists for, and it is the path whose direct draws emulate `base_vertex`.
+fn best_draw_path(compute_indirect: bool, base_vertex: bool, first_instance: bool, multi_count: bool) -> DrawPath {
+    match (compute_indirect && base_vertex, first_instance, multi_count) {
+        (true, true, true) => DrawPath::GpuMultiDrawCount,
+        (true, true, false) => DrawPath::GpuMultiDraw,
+        (true, false, _) => DrawPath::GpuIndirect,
+        _ => DrawPath::CpuDirect,
     }
 }
 
@@ -206,8 +227,55 @@ impl Attachments {
 pub(crate) struct SurfaceState {
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
+    /// Format of the views frames render into: `config.format`, or its sRGB twin (listed in
+    /// `config.view_formats`) when the surface itself has no sRGB format.
+    pub view_format: wgpu::TextureFormat,
+    /// The shader encodes sRGB itself (no sRGB format or view available).
     pub manual_srgb: bool,
     pub attachments: Attachments,
+    /// A frame was acquired with the current configuration.
+    pub presented: bool,
+}
+
+impl SurfaceState {
+    /// Render without the sRGB view format: reconfigure the surface without it and encode sRGB
+    /// in the shader instead.
+    pub(crate) fn drop_srgb_view(&mut self, device: &wgpu::Device) {
+        self.config.view_formats.clear();
+        self.view_format = self.config.format;
+        self.manual_srgb = !self.view_format.is_srgb();
+        let a = &self.attachments;
+        self.attachments = Attachments::new(device, a.width, a.height, a.samples, self.view_format, false);
+        self.surface.configure(device, &self.config);
+    }
+}
+
+/// Whether a surface that reported `Lost` should be reconfigured without its sRGB view format
+/// instead of being given up. On the web, wgpu reports a canvas configuration the browser
+/// rejected as `Lost` (native wgpu validates view formats when configuring instead), so a
+/// canvas that never produced a frame with a view format may have been refused because of it.
+/// Recreating the surface would configure it the same way again, forever.
+pub(crate) fn retry_without_view_formats(web: bool, presented: bool, config: &wgpu::SurfaceConfiguration) -> bool {
+    web && !presented && !config.view_formats.is_empty()
+}
+
+/// Surface texture format and the format frames are rendered in, from a surface's supported
+/// formats (`None` if there are none). An sRGB format is preferred. Browser WebGPU canvases
+/// offer only `Bgra8Unorm`/`Rgba8Unorm`(/`Rgba16Float`), but allow an sRGB *view* of the
+/// canvas texture: rendering through it keeps blending and MSAA resolves in linear space,
+/// like native sRGB surfaces. Only formats without an sRGB twin (or devices without
+/// `SURFACE_VIEW_FORMATS`) fall back to encoding sRGB in the shader, where blending then
+/// operates on encoded values.
+pub(crate) fn surface_formats(
+    formats: &[wgpu::TextureFormat],
+    view_formats_supported: bool,
+) -> Option<(wgpu::TextureFormat, wgpu::TextureFormat)> {
+    let first = *formats.first()?;
+    if let Some(srgb) = formats.iter().copied().find(|f| f.is_srgb()) {
+        return Some((srgb, srgb));
+    }
+    let view = first.add_srgb_suffix();
+    Some((first, if view_formats_supported { view } else { first }))
 }
 
 /// The GPU renderer. Insert it as a resource (the platform runner does this for windows; use
@@ -232,6 +300,8 @@ pub struct Renderer {
     pub(crate) frame_index: u64,
     /// Snapshot of the `RenderOverlays` resource (see `overlay.rs`).
     pub(crate) overlays: crate::overlay::OverlayCache,
+    /// Uncaptured wgpu errors so far (see [`install_error_handler`]).
+    pub(crate) gpu_errors: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -243,6 +313,69 @@ impl std::fmt::Debug for Renderer {
             .field("draw_path", &self.caps.best_draw_path)
             .finish_non_exhaustive()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `(max_buffer_size, max_storage_buffer_binding_size)` requested instead of the adapter's
+    /// limits (when lower) by renderers created on this thread, so tests run against a device that really
+    /// enforces smaller limits (wgpu validation fails past them) — see
+    /// `frame::tests::limited_app`.
+    pub(crate) static TEST_LIMITS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Route wgpu errors that no error scope captured through `tracing` instead of wgpu's default
+/// handler, which panics. With `panic` (debug builds and tests) the error still panics after
+/// being logged so bugs surface immediately; release builds log and keep running — skipping a
+/// broken command buffer is better than crashing the game. Errors tend to repeat every frame,
+/// so only the first ones and then every 1000th are logged.
+///
+/// Once the device is lost (driver reset, GPU removed, `destroy`), every resource created
+/// afterwards is invalid and each use of one is reported as an error. Those are the expected
+/// consequence of the loss, not bugs, so from the device-lost callback on they are only
+/// logged, in debug builds too: a lost device degrades (captures fail, frames are dropped)
+/// instead of crashing.
+pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> Arc<AtomicU64> {
+    let count = Arc::new(AtomicU64::new(0));
+    let lost = Arc::new(AtomicBool::new(false));
+    let (counter, lost_seen) = (count.clone(), lost.clone());
+    device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
+        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let lost = lost_seen.load(Ordering::Acquire);
+        if n <= 16 || n.is_multiple_of(1000) {
+            if lost {
+                tracing::warn!(occurrences = n, "wgpu error after the device was lost: {err}");
+            } else {
+                tracing::error!(occurrences = n, "wgpu error: {err}");
+            }
+        }
+        if panic && !lost {
+            panic!("wgpu error: {err}");
+        }
+    }));
+    device.set_device_lost_callback(move |reason, message| {
+        lost.store(true, Ordering::Release);
+        match reason {
+            wgpu::DeviceLostReason::Destroyed => tracing::debug!(%message, "GPU device destroyed"),
+            _ => tracing::error!(?reason, %message, "GPU device lost"),
+        }
+    });
+    count
+}
+
+/// Primary target size within `1..=max_dimension` (the device's `max_texture_dimension_2d`):
+/// a larger surface or offscreen texture fails validation, which invalidates the frame's
+/// whole command buffer, every frame. Oversized requests are clamped per axis and logged.
+pub(crate) fn target_size(width: u32, height: u32, max_dimension: u32) -> (u32, u32) {
+    let clamped = (width.clamp(1, max_dimension), height.clamp(1, max_dimension));
+    if clamped.0 < width || clamped.1 < height {
+        tracing::warn!(
+            requested = ?(width, height),
+            used = ?clamped,
+            "primary target larger than the device's max_texture_dimension_2d; clamped"
+        );
+    }
+    clamped
 }
 
 /// Display connection handed to wgpu (needed by GLES on Wayland/X11; unused elsewhere).
@@ -322,18 +455,28 @@ impl Renderer {
             .map_err(|e| RenderError::NoAdapter(e.to_string()))?;
         let wanted = wgpu::Features::INDIRECT_FIRST_INSTANCE
             | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+            | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::TEXTURE_COMPRESSION_ASTC
             | wgpu::Features::TEXTURE_COMPRESSION_ETC2;
+        #[cfg_attr(not(test), expect(unused_mut))]
+        let mut required_limits = adapter.limits();
+        #[cfg(test)]
+        if let Some((buffer, binding)) = TEST_LIMITS.get() {
+            required_limits.max_buffer_size = buffer.min(required_limits.max_buffer_size);
+            required_limits.max_storage_buffer_binding_size =
+                binding.min(required_limits.max_storage_buffer_binding_size);
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("space3d device"),
                 required_features: adapter.features() & wanted,
-                required_limits: adapter.limits(),
+                required_limits,
                 ..Default::default()
             })
             .await
             .map_err(|e| RenderError::Device(e.to_string()))?;
+        let gpu_errors = install_error_handler(&device, cfg!(debug_assertions));
         let caps = RenderCapabilities::detect(&adapter, &device);
         tracing::info!(
             adapter = %caps.adapter.name,
@@ -342,8 +485,8 @@ impl Renderer {
             "space3d renderer initialised"
         );
         config.msaa_samples = if config.msaa_samples > 1 { caps.max_msaa } else { 1 };
-        config.width = config.width.max(1);
-        config.height = config.height.max(1);
+        (config.width, config.height) =
+            target_size(config.width, config.height, device.limits().max_texture_dimension_2d);
         let offscreen = Attachments::new(
             &device,
             config.width,
@@ -376,6 +519,7 @@ impl Renderer {
             stats: RenderStats::default(),
             frame_index: 0,
             overlays: Default::default(),
+            gpu_errors,
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;
@@ -385,10 +529,14 @@ impl Renderer {
 
     fn configure_surface(&mut self, surface: wgpu::Surface<'static>) -> Result<(), RenderError> {
         let caps = surface.get_capabilities(&self.adapter);
-        let Some(&first) = caps.formats.first() else {
+        let view_formats_supported = self
+            .adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS);
+        let Some((format, view_format)) = surface_formats(&caps.formats, view_formats_supported) else {
             return Err(RenderError::Surface("surface not supported by adapter".into()));
         };
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(first);
         let present_mode = if self.config.vsync {
             wgpu::PresentMode::AutoVsync
         } else {
@@ -407,13 +555,17 @@ impl Renderer {
                 .first()
                 .copied()
                 .unwrap_or(wgpu::CompositeAlphaMode::Auto),
-            view_formats: vec![],
+            view_formats: if view_format != format {
+                vec![view_format]
+            } else {
+                vec![]
+            },
         };
         surface.configure(&self.device, &config);
         let samples = if self.config.msaa_samples > 1
             && self
                 .adapter
-                .get_texture_format_features(format)
+                .get_texture_format_features(view_format)
                 .flags
                 .sample_count_supported(self.config.msaa_samples)
         {
@@ -421,12 +573,15 @@ impl Renderer {
         } else {
             1
         };
-        let attachments = Attachments::new(&self.device, config.width, config.height, samples, format, false);
+        // The MSAA and depth attachments are separate textures: they use the view format.
+        let attachments = Attachments::new(&self.device, config.width, config.height, samples, view_format, false);
         self.surface = Some(SurfaceState {
             surface,
-            manual_srgb: !format.is_srgb(),
+            view_format,
+            manual_srgb: !view_format.is_srgb(),
             config,
             attachments,
+            presented: false,
         });
         Ok(())
     }
@@ -453,49 +608,59 @@ impl Renderer {
         self.surface.is_some()
     }
 
-    /// Resize the primary target (surface and offscreen capture target).
+    /// Resize the primary target. The window surface is reconfigured now; the headless
+    /// offscreen target is reallocated by the next frame, so [`Self::capture`] until then
+    /// still returns the last rendered frame. Each side is clamped to the device's
+    /// `max_texture_dimension_2d` (see [`Self::size`]).
     pub fn resize(&mut self, width: u32, height: u32) {
-        let (width, height) = (width.max(1), height.max(1));
+        let (width, height) = target_size(width, height, self.device.limits().max_texture_dimension_2d);
         self.config.width = width;
         self.config.height = height;
         if let Some(s) = &mut self.surface {
             s.config.width = width;
             s.config.height = height;
             s.surface.configure(&self.device, &s.config);
-            s.attachments = Attachments::new(
-                &self.device,
-                width,
-                height,
-                s.attachments.samples,
-                s.config.format,
-                false,
-            );
-        }
-        if (self.offscreen.width, self.offscreen.height) != (width, height) {
-            self.offscreen = Attachments::new(
-                &self.device,
-                width,
-                height,
-                self.offscreen.samples,
-                OFFSCREEN_FORMAT,
-                true,
-            );
+            s.attachments = Attachments::new(&self.device, width, height, s.attachments.samples, s.view_format, false);
         }
     }
 
-    /// Change MSAA sample count (1 or 4; clamped to device support). Recreates attachments.
+    /// Headless: (re)allocate the offscreen target to the configured size and sample count.
+    /// Called at the start of a frame, never between a frame and its capture.
+    pub(crate) fn ensure_offscreen(&mut self) {
+        let windowed = self.surface.is_some();
+        // A test renderer standing in for a window whose surface is lost this frame.
+        #[cfg(test)]
+        let windowed = windowed || self.frame.simulate_surface_loss;
+        if windowed {
+            // Windowed: the offscreen target only serves captures and frames whose surface
+            // was lost, which size it themselves (`size_offscreen`).
+            return;
+        }
+        self.size_offscreen((self.config.width, self.config.height));
+    }
+
+    /// (Re)allocate the offscreen target at `size` with the configured sample count, unless it
+    /// already has them.
+    pub(crate) fn size_offscreen(&mut self, (w, h): (u32, u32)) {
+        let (w, h, samples) = (w.max(1), h.max(1), self.config.msaa_samples);
+        let a = &self.offscreen;
+        if (a.width, a.height, a.samples) != (w, h, samples) {
+            self.offscreen = Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
+        }
+    }
+
+    /// Change MSAA sample count (1 or 4; clamped to device support). Surface attachments are
+    /// recreated now, the headless offscreen target on the next frame.
     pub fn set_msaa_samples(&mut self, samples: u32) {
         let samples = if samples > 1 { self.caps.max_msaa } else { 1 };
         if samples == self.config.msaa_samples {
             return;
         }
         self.config.msaa_samples = samples;
-        let (w, h) = (self.config.width, self.config.height);
-        self.offscreen = Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
         if let Some(s) = &mut self.surface {
             let ok = self
                 .adapter
-                .get_texture_format_features(s.config.format)
+                .get_texture_format_features(s.view_format)
                 .flags
                 .sample_count_supported(samples);
             let samples = if ok { samples } else { 1 };
@@ -504,7 +669,7 @@ impl Renderer {
                 s.config.width,
                 s.config.height,
                 samples,
-                s.config.format,
+                s.view_format,
                 false,
             );
         }
@@ -515,7 +680,7 @@ impl Renderer {
         self.config.msaa_samples
     }
 
-    /// Current primary target size.
+    /// Current primary target size (as requested, within the device's texture size limit).
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
     }
@@ -540,14 +705,31 @@ impl Renderer {
         &self.stats
     }
 
-    /// Surface format when windowed.
+    /// Format frames are rendered in when windowed (for overlays drawing into the same view):
+    /// the surface format, or its sRGB view format where the surface itself has no sRGB format
+    /// (browser WebGPU canvases). It changes if a browser rejects the sRGB view format, so
+    /// overlays should check it every frame.
     pub fn surface_format(&self) -> Option<wgpu::TextureFormat> {
-        self.surface.as_ref().map(|s| s.config.format)
+        self.surface.as_ref().map(|s| s.view_format)
     }
 
-    /// Whether textures of `format` can be uploaded (compressed formats need device features).
+    /// Whether textures of `format` can be uploaded and sampled by materials: compressed
+    /// formats need device features, and the format must be filterable float (integer and
+    /// depth formats never are; 32-bit float only with `FLOAT32_FILTERABLE`).
     pub fn supports_texture_format(&self, format: wgpu::TextureFormat) -> bool {
-        format_supported(&self.device, format)
+        format_supported(&self.adapter, &self.device, format)
+    }
+
+    /// Build error of the current version of a [`crate::CustomShader`], once a draw has used it
+    /// (its draws then use the built-in shader). `None` while it builds fine or is unused.
+    pub fn shader_error(&self, shader: crate::ShaderHandle) -> Option<&str> {
+        self.pipelines.custom_error(shader)
+    }
+
+    /// Number of wgpu errors that reached the uncaptured-error handler so far. Release builds
+    /// log these instead of panicking; tests and tools can assert that it stays 0.
+    pub fn gpu_error_count(&self) -> u64 {
+        self.gpu_errors.load(Ordering::Relaxed)
     }
 
     /// Upload all pending meshes/textures now (normally done at the start of each frame).
@@ -583,6 +765,7 @@ impl Renderer {
                     continue;
                 }
                 match create_gpu_texture(
+                    &self.adapter,
                     &self.device,
                     &self.queue,
                     encoder,
@@ -604,10 +787,9 @@ impl Renderer {
 
     fn upload_meshes(&mut self, encoder: &mut wgpu::CommandEncoder, assets: &mut RenderAssets) {
         let pending = std::mem::take(&mut assets.pending_meshes);
-        // Convert + allocate.
+        // Convert; keep the existing placement when the size is unchanged.
         let scratch = &mut self.frame.mesh_scratch;
         scratch.clear();
-        let mut missing = (0u32, 0u32);
         for &h in &pending {
             let Some(entry) = assets.meshes.get_mut(h.raw()) else {
                 continue;
@@ -619,68 +801,91 @@ impl Renderer {
             let mut i = Vec::new();
             crate::arena::build_vertices(&data, &mut v, &mut i);
             let (vc, ic) = (v.len() as u32, i.len() as u32);
-            // Reuse the existing allocation when the size is unchanged.
             let alloc = match entry.gpu {
                 Some(g) if g.alloc.vertex_count == vc && g.alloc.index_count == ic => Some(g.alloc),
                 Some(g) => {
                     assets.arena.free(g.alloc);
                     entry.gpu = None;
-                    assets.arena.alloc(vc, ic)
+                    None
                 }
-                None => assets.arena.alloc(vc, ic),
+                None => None,
             };
-            if alloc.is_none() {
-                missing.0 += vc;
-                missing.1 += ic;
-            }
-            scratch.push((h, alloc, v, i));
+            scratch.push((h, alloc, v, i, data));
         }
-        let mut fresh = (u32::MAX, u32::MAX);
-        if missing != (0, 0) || assets.arena.vertex.is_none() {
-            let old = assets.arena.grow_capacity(missing.0, missing.1);
-            for (_, alloc, v, i) in scratch.iter_mut() {
-                if alloc.is_none() {
-                    *alloc = assets.arena.alloc(v.len() as u32, i.len() as u32);
-                    debug_assert!(alloc.is_some(), "arena growth must satisfy pending meshes");
+
+        // Allocate, growing only the buffer(s) that are short, until everything fits or the
+        // device's max_buffer_size is reached.
+        let arena = &mut assets.arena;
+        let old = (arena.vertices.capacity(), arena.indices.capacity());
+        if arena.vertex.is_none() || arena.index.is_none() {
+            arena.grow_capacity(0, 0, self.caps.max_buffer_size);
+        }
+        // A mesh larger than a whole buffer can ever be is not worth growing for.
+        let (max_v, max_i) = crate::arena::MeshArena::max_capacity(self.caps.max_buffer_size);
+        let fits = |v: &Vec<_>, i: &Vec<u32>| v.len() as u64 <= max_v as u64 && i.len() as u64 <= max_i as u64;
+        loop {
+            let (mut short_v, mut short_i) = (0u32, 0u32);
+            for (_, alloc, v, i, _) in scratch.iter_mut().filter(|e| e.1.is_none() && fits(&e.2, &e.3)) {
+                match arena.try_alloc(v.len() as u32, i.len() as u32) {
+                    Ok(a) => *alloc = Some(a),
+                    Err(short) => {
+                        if short.vertices {
+                            short_v = short_v.saturating_add(v.len() as u32);
+                        }
+                        if short.indices {
+                            short_i = short_i.saturating_add(i.len() as u32);
+                        }
+                    }
                 }
             }
-            let writes: Vec<_> = scratch
-                .iter()
-                .filter_map(|(_, a, v, i)| {
-                    a.map(|alloc| crate::arena::ArenaWrite {
-                        alloc,
-                        vertices: v,
-                        indices: i,
-                    })
-                })
-                .collect();
-            assets
-                .arena
-                .realloc_gpu(&self.device, encoder, old, &writes, &mut self.uploader);
-            fresh = old;
+            if (short_v, short_i) == (0, 0) {
+                break;
+            }
+            let before = (arena.vertices.capacity(), arena.indices.capacity());
+            arena.grow_capacity(short_v, short_i, self.caps.max_buffer_size);
+            if (arena.vertices.capacity(), arena.indices.capacity()) == before {
+                break; // At the device limit: what is left does not fit.
+            }
         }
-        for (h, alloc, v, i) in scratch.drain(..) {
-            let Some(alloc) = alloc else {
+        if arena.vertex.is_none()
+            || arena.index.is_none()
+            || (arena.vertices.capacity(), arena.indices.capacity()) != old
+        {
+            // Recorded before the writes below, so they land after the old contents' copy.
+            arena.realloc_gpu(&self.device, encoder, old, &mut self.uploader);
+        }
+        arena.write_all(
+            encoder,
+            scratch,
+            |(_, alloc, v, i, _)| {
+                alloc.map(|alloc| crate::arena::ArenaWrite {
+                    alloc,
+                    vertices: v,
+                    indices: i,
+                })
+            },
+            &mut self.uploader,
+        );
+        for (h, alloc, v, i, data) in scratch.drain(..) {
+            let Some(entry) = assets.meshes.get_mut(h.raw()) else {
                 continue;
             };
-            assets.arena.write(
-                encoder,
-                &crate::arena::ArenaWrite {
-                    alloc,
-                    vertices: &v,
-                    indices: &i,
-                },
-                fresh.0,
-                fresh.1,
-                &mut self.uploader,
-            );
-            if let Some(entry) = assets.meshes.get_mut(h.raw()) {
-                entry.gpu = Some(crate::assets::GpuMesh {
-                    alloc,
-                    sphere: entry.sphere,
-                });
-                self.stats.meshes_uploaded += 1;
-            }
+            let Some(alloc) = alloc else {
+                tracing::error!(
+                    mesh = ?h,
+                    vertices = v.len(),
+                    indices = i.len(),
+                    max_buffer_size = self.caps.max_buffer_size,
+                    "mesh does not fit the mesh arena; it is not drawn (update or remove it)"
+                );
+                entry.cpu = Some(data);
+                continue;
+            };
+            entry.gpu = Some(crate::assets::GpuMesh {
+                alloc,
+                sphere: entry.sphere,
+            });
+            self.stats.meshes_uploaded += 1;
         }
     }
 
@@ -689,7 +894,61 @@ impl Renderer {
     /// Headless: copies the offscreen target. Windowed: re-renders the last frame's primary
     /// views into the offscreen target first (surface textures are not readable).
     /// Poll the returned task from a system, `.block()` it in tests, or `.wait().await` it.
+    ///
+    /// Never blocks: on native a background task resolves it with non-blocking device polls
+    /// (each frame's own poll resolves it too). A blocking `device.poll` would hold wgpu's
+    /// device-wide snatch lock for the whole GPU wait, stalling `queue.present` and buffer
+    /// destruction on the main thread until the GPU caught up.
     pub fn capture(&mut self) -> Task<Result<ImageData, RenderError>> {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let (readback, mut rx, _, error) = self.submit_capture();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let device = self.device.clone();
+            space3d_tasks::spawn(async move {
+                if let Some(e) = error.await {
+                    return Err(RenderError::Capture(e));
+                }
+                let mapped = loop {
+                    let _ = device.poll(wgpu::PollType::Poll);
+                    match rx.try_recv() {
+                        Ok(Some(r)) => break Ok(r),
+                        Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+                        Err(_) => break Err(()),
+                    }
+                };
+                readback.read(mapped)
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // The browser (WebGPU) or the per-frame device poll (WebGL) resolves the mapping.
+            space3d_tasks::spawn(async move {
+                if let Some(e) = error.await {
+                    return Err(RenderError::Capture(e));
+                }
+                readback.read(rx.await.map_err(|_| ()))
+            })
+        }
+    }
+
+    /// Record and submit the copy of the offscreen target into a `MAP_READ` buffer; returns
+    /// the readback, the mapping result channel, the submission and the validation error of
+    /// the capture's commands, if any.
+    ///
+    /// The capture runs inside an error scope: its failures are the capture's result, not
+    /// uncaptured errors (which panic in debug builds). This matters once the device is lost —
+    /// after `destroy` the device-lost callback only fires when in-flight work has finished,
+    /// and until then mapping the (invalid) readback buffer is an error.
+    fn submit_capture(
+        &mut self,
+    ) -> (
+        CaptureReadback,
+        MapReceiver,
+        wgpu::SubmissionIndex,
+        impl Future<Output = Option<String>> + use<>,
+    ) {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d capture"),
         });
@@ -731,64 +990,258 @@ impl Renderer {
         encoder.map_buffer_on_submit(&buffer, wgpu::MapMode::Read, .., move |r| {
             let _ = tx.send(r);
         });
-        self.queue.submit([encoder.finish()]);
-
-        let read =
-            move |buffer: wgpu::Buffer, ok: Result<(), wgpu::BufferAsyncError>| -> Result<ImageData, RenderError> {
-                ok.map_err(|e| RenderError::Capture(e.to_string()))?;
-                let view = buffer
-                    .slice(..)
-                    .get_mapped_range()
-                    .map_err(|e| RenderError::Capture(format!("{e:?}")))?;
-                let row = w as usize * 4;
-                let mut pixels = Vec::with_capacity(row * h as usize);
-                for y in 0..h as usize {
-                    let start = y * padded as usize;
-                    pixels.extend_from_slice(&view[start..start + row]);
-                }
-                drop(view);
-                buffer.unmap();
-                Ok(ImageData {
-                    width: w,
-                    height: h,
-                    pixels,
-                })
-            };
-
+        let submission = self.queue.submit([encoder.finish()]);
+        let error = scope.pop();
+        // Native backends resolve the scope immediately; the browser answers asynchronously.
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            let device = self.device.clone();
-            space3d_tasks::spawn_compute(move || {
-                // Off the main thread: wait for the GPU, which fires the map callback.
-                let _ = device.poll(wgpu::PollType::wait_indefinitely());
-                match futures::executor::block_on(rx) {
-                    Ok(r) => read(buffer, r),
-                    Err(_) => Err(RenderError::Capture("map callback dropped".into())),
-                }
-            })
-        }
+        let error = std::future::ready(futures::FutureExt::now_or_never(error).flatten().map(|e| e.to_string()));
         #[cfg(target_arch = "wasm32")]
-        {
-            // The browser (WebGPU) or the per-frame device poll (WebGL) resolves the mapping.
-            space3d_tasks::spawn(async move {
-                match rx.await {
-                    Ok(r) => read(buffer, r),
-                    Err(_) => Err(RenderError::Capture("map callback dropped".into())),
-                }
-            })
-        }
+        let error = async move { error.await.map(|e| e.to_string()) };
+        let readback = CaptureReadback {
+            buffer,
+            size: (w, h),
+            padded,
+        };
+        (readback, rx, submission, error)
     }
 
-    /// [`Self::capture`] and wait for the result (tests/tools only; never from a system).
+    /// [`Self::capture`] and wait for the result on the calling thread (tests/tools only;
+    /// never from a system).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn capture_blocking(&mut self) -> Result<ImageData, RenderError> {
-        self.capture()
-            .block()
-            .unwrap_or_else(|| Err(RenderError::Capture("capture task cancelled".into())))
+        let (readback, mut rx, submission, error) = self.submit_capture();
+        if let Some(e) = futures::FutureExt::now_or_never(error).flatten() {
+            return Err(RenderError::Capture(e));
+        }
+        let mapped = loop {
+            match rx.try_recv() {
+                Ok(Some(r)) => break Ok(r),
+                Ok(None) => {}
+                Err(_) => break Err(()),
+            }
+            let waited = self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission.clone()),
+                timeout: None,
+            });
+            if waited.is_err() {
+                // Device lost: the callback has fired with an error by now, or never will.
+                break rx.try_recv().ok().flatten().ok_or(());
+            }
+        };
+        readback.read(mapped)
     }
 
     /// Non-blocking device poll: fires pending map callbacks (captures, staging recycling).
     pub fn poll(&self) {
         let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+}
+
+/// Receives the result of a capture buffer's mapping.
+type MapReceiver = futures::channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>;
+
+/// A submitted capture copy: `MAP_READ` buffer with rows padded to `padded` bytes.
+struct CaptureReadback {
+    buffer: wgpu::Buffer,
+    size: (u32, u32),
+    padded: u64,
+}
+
+impl CaptureReadback {
+    /// Strip the row padding of the mapped buffer (`Err(())`: the callback was dropped).
+    fn read(self, mapped: Result<Result<(), wgpu::BufferAsyncError>, ()>) -> Result<ImageData, RenderError> {
+        mapped
+            .map_err(|()| RenderError::Capture("map callback dropped".into()))?
+            .map_err(|e| RenderError::Capture(e.to_string()))?;
+        let (w, h) = self.size;
+        let view = self
+            .buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| RenderError::Capture(format!("{e:?}")))?;
+        let row = w as usize * 4;
+        let mut pixels = Vec::with_capacity(row * h as usize);
+        for y in 0..h as usize {
+            let start = y * self.padded as usize;
+            pixels.extend_from_slice(&view[start..start + row]);
+        }
+        drop(view);
+        self.buffer.unmap();
+        Ok(ImageData {
+            width: w,
+            height: h,
+            pixels,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use space3d_core::MeshData;
+
+    fn renderer() -> Option<Renderer> {
+        match pollster::block_on(Renderer::new_headless(16, 16)) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("skipping GPU test: no adapter available ({e})");
+                None
+            }
+        }
+    }
+
+    /// Regression: arena growth doubled vertex and index buffers in lockstep and never looked
+    /// at `max_buffer_size`, so create_buffer failed validation (a panic) long before the data
+    /// reached the limit. Growth is now per buffer, clamped, and meshes that cannot fit are
+    /// reported and kept on the CPU instead.
+    #[test]
+    fn mesh_arena_respects_max_buffer_size() {
+        let Some(mut r) = renderer() else { return };
+        r.caps.max_buffer_size = 36 * 16_384; // 16384 vertices
+        let mut assets = RenderAssets::default();
+        let small: Vec<_> = (0..10).map(|_| assets.add_mesh(MeshData::cube(1.0))).collect();
+        let big = assets.add_mesh(MeshData::sphere(1.0, 200, 100)); // 20301 vertices
+        r.upload_assets(&mut assets);
+        assert!(small.iter().all(|m| assets.is_mesh_uploaded(*m)));
+        assert!(!assets.is_mesh_uploaded(big), "does not fit");
+        assert!(assets.contains_mesh(big));
+        let (v, i) = (
+            assets.arena.vertex.as_ref().unwrap(),
+            assets.arena.index.as_ref().unwrap(),
+        );
+        assert!(v.size() <= r.caps.max_buffer_size && i.size() <= r.caps.max_buffer_size);
+        assert_eq!(v.size(), 4096 * 36, "no growth for the small meshes");
+
+        // Index-heavy meshes grow only the index buffer.
+        let fan = MeshData {
+            indices: (0..9000).map(|k| k % 3).collect(),
+            ..MeshData::plane(1.0)
+        };
+        let m = assets.add_mesh(fan);
+        r.upload_assets(&mut assets);
+        assert!(assets.is_mesh_uploaded(m));
+        assert_eq!(assets.arena.vertex.as_ref().unwrap().size(), 4096 * 36);
+        assert!(assets.arena.index.as_ref().unwrap().size() > 8192 * 4);
+
+        // The rejected mesh fits once the limit allows it.
+        r.caps.max_buffer_size = u32::MAX as u64;
+        assert!(assets.update_mesh(big, MeshData::sphere(1.0, 200, 100)));
+        r.upload_assets(&mut assets);
+        assert!(assets.is_mesh_uploaded(big));
+        assert!(small.iter().all(|m| assets.is_mesh_uploaded(*m)));
+        assert_eq!(r.gpu_error_count(), 0);
+    }
+
+    /// Regression: browser WebGPU canvases offer no sRGB format, so the renderer encoded sRGB in
+    /// the shader and blending/MSAA resolves ran on encoded values (50% white over black gave
+    /// 128 instead of 188). It now renders through an sRGB view of the canvas texture.
+    #[test]
+    fn surfaces_without_srgb_formats_render_through_an_srgb_view() {
+        use wgpu::TextureFormat as F;
+        let webgpu_canvas = [F::Bgra8Unorm, F::Rgba8Unorm, F::Rgba16Float];
+        assert_eq!(
+            surface_formats(&webgpu_canvas, true),
+            Some((F::Bgra8Unorm, F::Bgra8UnormSrgb))
+        );
+        // Without SURFACE_VIEW_FORMATS: in-shader encoding.
+        assert_eq!(
+            surface_formats(&webgpu_canvas, false),
+            Some((F::Bgra8Unorm, F::Bgra8Unorm))
+        );
+        // Native surfaces with an sRGB format use it directly.
+        assert_eq!(
+            surface_formats(&[F::Bgra8Unorm, F::Bgra8UnormSrgb], true),
+            Some((F::Bgra8UnormSrgb, F::Bgra8UnormSrgb))
+        );
+        // Formats without an sRGB twin keep in-shader encoding.
+        assert_eq!(
+            surface_formats(&[F::Rgba16Float], true),
+            Some((F::Rgba16Float, F::Rgba16Float))
+        );
+        assert_eq!(surface_formats(&[], true), None);
+    }
+
+    /// A canvas that rejects the sRGB view format (reported as `Lost` on the web) is
+    /// reconfigured without it once, instead of being recreated with the same configuration
+    /// in a loop. Native surfaces and surfaces that already presented are recreated.
+    #[test]
+    fn rejected_srgb_view_formats_fall_back_to_shader_encoding() {
+        use wgpu::TextureFormat as F;
+        let mut config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: F::Bgra8Unorm,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: 8,
+            height: 8,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![F::Bgra8UnormSrgb],
+        };
+        assert!(retry_without_view_formats(true, false, &config));
+        assert!(!retry_without_view_formats(true, true, &config));
+        assert!(!retry_without_view_formats(false, false, &config));
+        config.view_formats.clear();
+        assert!(!retry_without_view_formats(true, false, &config));
+    }
+
+    /// Without `DownlevelFlags::BASE_VERTEX` (WebGL2, GLES < 3.2) only `CpuDirect` is offered:
+    /// it is the path whose direct draws emulate `base_vertex`.
+    #[test]
+    fn gpu_paths_require_base_vertex() {
+        assert_eq!(best_draw_path(true, true, true, true), DrawPath::GpuMultiDrawCount);
+        assert_eq!(best_draw_path(true, true, true, false), DrawPath::GpuMultiDraw);
+        assert_eq!(best_draw_path(true, true, false, false), DrawPath::GpuIndirect);
+        assert_eq!(best_draw_path(true, false, true, true), DrawPath::CpuDirect);
+        assert_eq!(best_draw_path(false, true, true, true), DrawPath::CpuDirect);
+    }
+
+    fn invalid_buffer(device: &wgpu::Device) {
+        // MAP_READ may only be combined with COPY_DST: a validation error.
+        let _ = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("invalid on purpose"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+    }
+
+    /// Release builds log uncaptured wgpu errors instead of wgpu's default panic; debug builds
+    /// (and tests) still panic so bugs surface.
+    #[test]
+    fn uncaptured_wgpu_errors_are_logged_in_release_and_panic_in_debug() {
+        let Some(r) = renderer() else { return };
+        assert_eq!(r.gpu_error_count(), 0);
+        let count = install_error_handler(&r.device, false);
+        invalid_buffer(&r.device);
+        invalid_buffer(&r.device);
+        assert_eq!(count.load(Ordering::Relaxed), 2, "logged, not panicked");
+
+        let count = install_error_handler(&r.device, true);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invalid_buffer(&r.device)));
+        assert!(panicked.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    /// Once the device is lost every new resource is invalid and each use of one is an error;
+    /// debug builds must log those instead of panicking (the loss is not a bug).
+    #[test]
+    fn errors_after_device_loss_do_not_panic_in_debug() {
+        let Some(r) = renderer() else { return };
+        let count = install_error_handler(&r.device, true);
+        r.device.destroy();
+        // `destroy` loses the device once its in-flight work is done: the callback fires here.
+        let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
+        let buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("after loss"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        assert!(
+            count.load(Ordering::Relaxed) >= 1,
+            "the invalid buffer's error was reported"
+        );
     }
 }

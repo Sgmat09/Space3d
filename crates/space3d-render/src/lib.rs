@@ -11,6 +11,8 @@
 //! * **GPU-driven culling** — compute-shader frustum culling writing indirect args, drawn with
 //!   `multi_draw_indexed_indirect[_count]` where supported; CPU culling + direct draws on
 //!   WebGL2/downlevel ([`DrawPath`]).
+//! * **Custom shaders** — [`CustomShader`] WGSL hooks per [`Material`], with access to custom
+//!   per-instance attributes ([`InstanceSemantic::Custom`]).
 //! * **Headless capture** — [`Renderer::capture`] / [`render_to_image`].
 //! * **Overlays** — [`RenderOverlay`]s registered in [`RenderOverlays`] draw after the 3D scene
 //!   into the final target (window surface or capture target), e.g. the egui UI.
@@ -38,7 +40,9 @@ mod handles;
 mod instance;
 mod overlay;
 mod pipeline;
+mod readback;
 mod renderer;
+mod shader;
 mod stats;
 mod texture;
 
@@ -50,16 +54,17 @@ pub use components::{
 pub use culling::{Aabb, Frustum, Sphere, max_axis_scale};
 pub use dirty::DirtyRanges;
 pub use frame::RenderSettings;
-pub use handles::{InstanceBufferHandle, MeshHandle, TextureHandle};
+pub use handles::{InstanceBufferHandle, MeshHandle, ShaderHandle, TextureHandle};
 pub use instance::{
-    BufferUsage, CullSource, InstanceAttribute, InstanceBuffer, InstanceBuffers, InstanceCompact, InstanceData,
-    InstanceLayout, InstancePacked, InstanceSemantic, InstanceTransform, InstanceTransformColor, InstancedMesh,
-    ScaleKind,
+    BufferUsage, CullFloat, CullSource, InstanceAttribute, InstanceBuffer, InstanceBuffers, InstanceCompact,
+    InstanceData, InstanceHalf, InstanceLayout, InstancePacked, InstanceSemantic, InstanceTransform,
+    InstanceTransformColor, InstancedMesh, MAX_INSTANCE_LOCATIONS, ScaleKind, f16_to_f32, f32_to_f16,
 };
 pub use overlay::{
     OverlayTarget, OverlayTargetKind, RENDER_TARGET_FORMAT, RenderOverlay, RenderOverlays, SharedOverlay, lock_overlay,
 };
 pub use renderer::{DisplayHandle, RenderCapabilities, RenderError, Renderer, RendererConfig};
+pub use shader::CustomShader;
 pub use stats::{DrawPath, RenderStats};
 
 pub use glam;
@@ -112,11 +117,13 @@ impl Plugin for RenderPlugin {
 
 /// The `Stage::Render` system: extract the world and draw a frame if a [`Renderer`] exists.
 pub fn render_system(ctx: &mut SystemCtx) {
-    let Some(mut renderer) = ctx.resources.remove::<Renderer>() else {
+    if !ctx.resources.contains::<Renderer>() {
         return;
-    };
-    renderer.render_frame(ctx.world, ctx.resources);
-    ctx.resources.insert(renderer);
+    }
+    let world = &*ctx.world;
+    // `scope` moves the resource's existing Box out and back: no per-frame allocation.
+    ctx.resources
+        .scope::<Renderer, _>(|resources, renderer| renderer.render_frame(world, resources));
 }
 
 /// Create a headless renderer (blocking on adapter/device creation) and insert it.
@@ -159,9 +166,10 @@ pub fn render_to_image(app: &mut App) -> Option<ImageData> {
 /// Common imports.
 pub mod prelude {
     pub use crate::{
-        AmbientLight, BufferUsage, Camera3d, DirectionalLight, DrawPath, InstanceBuffer, InstanceBuffers,
-        InstanceCompact, InstanceData, InstanceTransform, InstanceTransformColor, InstancedMesh, Material, Mesh3d,
-        MeshHandle, OverlayTarget, PointLight, Projection, RenderAssets, RenderOverlay, RenderOverlays, RenderPlugin,
-        RenderSettings, RenderStats, RenderTarget, Renderer, TextureHandle, Visibility, render_to_image,
+        AmbientLight, BufferUsage, Camera3d, CustomShader, DirectionalLight, DrawPath, InstanceBuffer, InstanceBuffers,
+        InstanceCompact, InstanceData, InstanceHalf, InstanceTransform, InstanceTransformColor, InstancedMesh,
+        Material, Mesh3d, MeshHandle, OverlayTarget, PointLight, Projection, RenderAssets, RenderOverlay,
+        RenderOverlays, RenderPlugin, RenderSettings, RenderStats, RenderTarget, Renderer, ShaderHandle, TextureHandle,
+        Visibility, render_to_image,
     };
 }

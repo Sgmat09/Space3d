@@ -147,13 +147,14 @@ pub fn register_editor_components(r: &mut ComponentRegistry) {
             |r, _| {
                 Some(Material {
                     base_color: r.base_color.into(),
-                    base_color_texture: None,
                     metallic: r.metallic,
                     roughness: r.roughness,
                     emissive: r.emissive.into(),
                     unlit: r.unlit,
                     double_sided: r.double_sided,
                     alpha_blend: r.alpha_blend,
+                    // Session-local GPU handles (texture, custom shader) are not serialized.
+                    ..Default::default()
                 })
             },
         );

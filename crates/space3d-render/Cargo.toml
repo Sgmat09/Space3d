@@ -20,6 +20,8 @@ thiserror.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon.workspace = true
+# Timer of the capture resolver task (runs on space3d-tasks' tokio runtime).
+tokio.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # WebGPU when the browser has it, WebGL2 otherwise. The fragile Send/Sync feature is required

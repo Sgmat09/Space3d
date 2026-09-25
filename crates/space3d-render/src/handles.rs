@@ -57,6 +57,10 @@ define_handle!(
     /// Handle to a type-erased instance buffer stored in [`crate::InstanceBuffers`].
     InstanceBufferHandle
 );
+define_handle!(
+    /// Handle to a [`crate::CustomShader`] stored in [`crate::RenderAssets`].
+    ShaderHandle
+);
 
 /// Untyped generational id used internally by [`SlotMap`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

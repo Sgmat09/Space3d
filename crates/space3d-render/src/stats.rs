@@ -5,7 +5,9 @@
 /// [`crate::RenderSettings::draw_path`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DrawPath {
-    /// CPU frustum culling + `draw_indexed` per batch. Works everywhere (WebGL2, downlevel).
+    /// CPU frustum culling + `draw_indexed` per batch. Works everywhere (WebGL2, downlevel);
+    /// the only path on devices without `DownlevelFlags::BASE_VERTEX`, where its draws bind the
+    /// mesh arena at each mesh instead of passing a `base_vertex`.
     #[default]
     CpuDirect,
     /// Compute-shader culling writing `DrawIndexedIndirectArgs`; one `draw_indexed_indirect`
@@ -44,13 +46,22 @@ pub struct RenderStats {
     pub batches: u32,
     /// Instances submitted for culling (sum over views).
     pub instances: u64,
-    /// Instances issued to the GPU. On GPU paths this is the upper bound (pre-cull count)
-    /// because the visible count only exists on the GPU.
+    /// Instances drawn after culling. Batches culled on the CPU count this frame's visible
+    /// instances. Batches culled on the GPU count the visible instances *of an earlier frame*,
+    /// read back without blocking (see [`Self::gpu_counts_frame`]; normally the previous
+    /// frame, up to 3 frames back when the GPU runs behind); until the first readback arrives
+    /// they count their pre-cull instances (an upper bound).
     pub instances_drawn: u64,
-    /// Instances rejected by CPU frustum culling (whole buffers count all their instances).
+    /// Instances rejected by frustum culling: CPU-culled batches this frame (explicit buffers
+    /// count whole culled blocks), GPU-culled batches as of [`Self::gpu_counts_frame`].
     pub culled: u64,
-    /// Triangles issued (`instances_drawn * mesh triangles`).
+    /// Triangles drawn (`instances_drawn * mesh triangles`, same frames as `instances_drawn`).
     pub triangles: u64,
+    /// Frame whose GPU-culling results are included in `instances_drawn`, `culled` and
+    /// `triangles`. `None` when no batch was culled on the GPU this frame, or before the first
+    /// readback completed (then GPU-culled batches count as fully drawn). The latency is
+    /// `frame - gpu_counts_frame`.
+    pub gpu_counts_frame: Option<u64>,
     /// All bytes copied CPU→GPU this frame (instances, uniforms, meshes, textures, jobs).
     pub bytes_uploaded: u64,
     /// Subset of `bytes_uploaded` that is per-instance data.
@@ -61,6 +72,11 @@ pub struct RenderStats {
     pub cpu_reallocations: u32,
     /// Compute dispatches recorded (GPU culling).
     pub compute_dispatches: u32,
+    /// `set_pipeline` calls in render passes (batches are sorted so that equal pipelines are
+    /// adjacent: at most one per pipeline per view in the steady state).
+    pub pipeline_switches: u32,
+    /// Material bind-group switches in render passes (at most one per material per view).
+    pub material_switches: u32,
     /// Draw path used this frame.
     pub draw_path: DrawPath,
     /// GPU culling active this frame.
