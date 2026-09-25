@@ -1969,6 +1969,7 @@ fn tonemapper_cpu_mirror_matches_gpu() {
         Tonemapper::AcesFitted,
         Tonemapper::AgX,
         Tonemapper::KhronosPbrNeutral,
+        Tonemapper::AgXPunchy,
     ] {
         for exposure in [1.0f32, 0.25] {
             app.resources.expect_mut::<Renderer>().frame.force_output =
@@ -1991,7 +1992,7 @@ fn tonemapper_cpu_mirror_matches_gpu() {
             }
         }
     }
-    assert_eq!(checked, 5 * 2 * 16);
+    assert_eq!(checked, 6 * 2 * 16);
     assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
 }
 
@@ -2615,8 +2616,11 @@ fn hdr_scene_overlay_not_replayed_in_hdr() {
                 .iter()
                 .map(|(e, _)| e)
                 .collect();
+            // No bloom: the yellow square's own glow would tint the pixel checked below.
             for e in cams {
-                app.world.insert_one(e, crate::PostProcess::default()).unwrap();
+                app.world
+                    .insert_one(e, crate::PostProcess::default().without_bloom())
+                    .unwrap();
             }
         }
         let kinds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

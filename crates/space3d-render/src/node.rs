@@ -647,6 +647,12 @@ impl PrepareContext<'_> {
     pub fn count_dispatches(&mut self, n: u32) {
         self.stats.node_dispatches += n;
     }
+
+    /// Add `n` compute passes the node recorded in [`Self::encoder`] to
+    /// `RenderStats::compute_passes`.
+    pub fn count_compute_passes(&mut self, n: u32) {
+        self.stats.compute_passes += n;
+    }
 }
 
 /// Context of [`RenderNode::prepare_view`].

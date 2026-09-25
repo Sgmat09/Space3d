@@ -245,8 +245,10 @@ fn legacy_overlay_unchanged_direct_and_hdr() {
 fn hdr_scene_overlay_format_and_tonemap() {
     let Some(mut app) = headless_app(W, H) else { return };
     let cam = scene(&mut app);
+    // No bloom: the 4.0 fill's own glow would add to the pixels checked below (the test is
+    // about the overlay's format and tonemapping; `post.rs` covers overlays feeding bloom).
     app.world
-        .insert_one(cam, no_dither().with_tonemapper(Tonemapper::AgX))
+        .insert_one(cam, no_dither().with_tonemapper(Tonemapper::AgX).without_bloom())
         .unwrap();
     if app.resources.expect::<Renderer>().graphics_caps().hdr_format.is_none() {
         return;

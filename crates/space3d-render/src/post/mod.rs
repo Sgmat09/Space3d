@@ -418,7 +418,7 @@ impl PostState {
             _ => self.frame_caps.bloom_format,
         }?;
         let rect = clip_rect(group.scene_rect, group.scene_size);
-        let (size, mips) = bloom::chain_size((rect[2], rect[3]), b);
+        let bloom::ChainSize { size, mips, merged } = bloom::chain_size((rect[2], rect[3]), b);
         let first_slot = self.bloom.slots;
         let (params, slot) = (&mut self.bloom.params, self.bloom.slot);
         let mut n = first_slot as usize;
@@ -433,6 +433,7 @@ impl PostState {
             format,
             size,
             mips,
+            merged,
             first_slot,
             scatter: b.scatter.clamp(0.0, 1.0),
         })

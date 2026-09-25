@@ -1351,9 +1351,9 @@ impl Renderer {
     /// ms each): for the pass signatures of the last rendered frame (render one frame of the
     /// scene first) and `request.formats` on primary views (the capture format when windowed),
     /// the forward pipelines of `request.materials` × instance layouts, every render node's
-    /// `prewarm` for the targets its slots draw with, and the composite pipelines of the post
-    /// groups' targets. STUB(P-MAT, P-POST): material variants and post effects join as they
-    /// land.
+    /// `prewarm` for the targets its slots draw with, and the post pipelines of the post groups'
+    /// targets (the composite, FXAA and the bloom chain in both chain formats). STUB(P-MAT):
+    /// material variants join when they land.
     pub fn prewarm(&mut self, request: &PrewarmRequest) {
         self.prewarm_pipelines(request);
     }

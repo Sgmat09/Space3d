@@ -66,14 +66,16 @@ fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
     }
 }
 
-/// Measured maxima (allocations per frame) on the dev machine: 332 with bloom on one post
-/// camera — 226 over the composite-only 106 of `tests/alloc_frame.rs`, about 20 per bloom render
-/// pass — and 617 for two post groups.
-const MEASURED_BLOOM: u64 = 332;
-const MEASURED_SPLIT: u64 = 617;
+/// Measured maxima (allocations per frame) on the dev machine at 320 × 180, where the bloom
+/// chain has 3 levels (5 render passes; `chain_size`): 211 with bloom on one post camera — 105
+/// over the composite-only 106 of `tests/alloc_frame.rs`, about 20 per bloom render pass — and
+/// 380 for two post groups (they were 332 and 617 with the 6-level chain every rect got before
+/// the chain kept the reference heights).
+const MEASURED_BLOOM: u64 = 211;
+const MEASURED_SPLIT: u64 = 380;
 /// `PostProcess::cinematic()` (bloom, FXAA, vignette, chromatic aberration, animated grain) on
 /// one camera: the FXAA pass on top of bloom.
-const MEASURED_CINEMATIC: u64 = 359;
+const MEASURED_CINEMATIC: u64 = 240;
 
 #[test]
 fn bloom_allocates_a_small_constant_amount() {
@@ -153,9 +155,9 @@ fn bloom_allocates_a_small_constant_amount() {
             "{name}: {s:?}"
         );
         let groups = if name == "bloom split" { 2 } else { 1 };
-        // Per group: six levels (prefilter, 5 downsamples, 5 upsamples), the composite (and
-        // FXAA).
-        let passes = if name == "cinematic" { 13 } else { 12 };
+        // Per group (a 320 × 180 or 160 × 180 rect): three levels (prefilter, 2 downsamples, 2
+        // upsamples), the composite (and FXAA).
+        let passes = if name == "cinematic" { 7 } else { 6 };
         assert_eq!(s.post_groups, groups, "{name}");
         assert_eq!(s.post_passes, groups * passes, "{name}");
 

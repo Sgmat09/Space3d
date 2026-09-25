@@ -47,11 +47,16 @@ pub enum Tonemapper {
     AgX,
     /// Khronos PBR Neutral: faithful base colors (UI and product previews).
     KhronosPbrNeutral,
+    /// AgX with Sobotka's "punchy" look (power 1.35, saturation 1.4 in AgX's log space):
+    /// saturated emissives and effects keep their hue (a red laser stays red, blue exhaust
+    /// blue) at the cost of darker mid tones (0.18 → 0.12 display-linear, 0.21 with `AgX`).
+    /// A game-look choice for effect-heavy scenes; `AgX` stays the neutral default.
+    AgXPunchy,
 }
 
 impl Tonemapper {
     /// Operator id of `s3d_tonemap` (`GpuView.output.y`): 0 None, 1 Reinhard, 2 AcesFitted,
-    /// 3 AgX, 4 KhronosPbrNeutral.
+    /// 3 AgX, 4 KhronosPbrNeutral, 5 AgXPunchy.
     pub const fn id(self) -> u32 {
         match self {
             Self::None => 0,
@@ -59,6 +64,7 @@ impl Tonemapper {
             Self::AcesFitted => 2,
             Self::AgX => 3,
             Self::KhronosPbrNeutral => 4,
+            Self::AgXPunchy => 5,
         }
     }
 
@@ -70,8 +76,9 @@ impl Tonemapper {
             Self::None => c.clamp(Vec3::ZERO, Vec3::ONE),
             Self::Reinhard => (c / (1.0 + luma(c))).clamp(Vec3::ZERO, Vec3::ONE),
             Self::AcesFitted => aces_fitted(c),
-            Self::AgX => agx(c),
+            Self::AgX => agx_display(agx_curve(c)),
             Self::KhronosPbrNeutral => pbr_neutral(c),
+            Self::AgXPunchy => agx_punchy(c),
         }
     }
 }
@@ -101,18 +108,13 @@ fn aces_fitted(c: Vec3) -> Vec3 {
     row_mul(r, o).clamp(Vec3::ZERO, Vec3::ONE)
 }
 
-// The literals mirror `s3d_agx` in output.wgsl digit for digit.
+// The literals mirror `s3d_agx_curve` / `s3d_agx_display` in output.wgsl digit for digit.
 #[allow(clippy::excessive_precision)]
-fn agx(c: Vec3) -> Vec3 {
+fn agx_curve(c: Vec3) -> Vec3 {
     let m = Mat3::from_cols(
         Vec3::new(0.842479062253094, 0.0423282422610123, 0.0423756549057051),
         Vec3::new(0.0784335999999992, 0.878468636469772, 0.0784336),
         Vec3::new(0.0792237451477643, 0.0791661274605434, 0.879142973793104),
-    );
-    let mi = Mat3::from_cols(
-        Vec3::new(1.19687900512017, -0.0528968517574562, -0.0529716355144438),
-        Vec3::new(-0.0980208811401368, 1.15190312990417, -0.0980434501171241),
-        Vec3::new(-0.0990297440797205, -0.0989611768448433, 1.15107367264116),
     );
     let (lo, hi) = (-12.47393f32, 4.026069f32);
     let log = (m * c).max(Vec3::splat(1e-10));
@@ -120,9 +122,26 @@ fn agx(c: Vec3) -> Vec3 {
     v = (v - lo) / (hi - lo);
     let v2 = v * v;
     let v4 = v2 * v2;
-    v = 15.5 * v4 * v2 - 40.14 * v4 * v + 31.96 * v4 - 6.868 * v2 * v + 0.4298 * v2 + 0.1191 * v - 0.00232;
+    15.5 * v4 * v2 - 40.14 * v4 * v + 31.96 * v4 - 6.868 * v2 * v + 0.4298 * v2 + 0.1191 * v - 0.00232
+}
+
+#[allow(clippy::excessive_precision)]
+fn agx_display(v: Vec3) -> Vec3 {
+    let mi = Mat3::from_cols(
+        Vec3::new(1.19687900512017, -0.0528968517574562, -0.0529716355144438),
+        Vec3::new(-0.0980208811401368, 1.15190312990417, -0.0980434501171241),
+        Vec3::new(-0.0990297440797205, -0.0989611768448433, 1.15107367264116),
+    );
     let d = (mi * v).max(Vec3::ZERO);
     Vec3::new(d.x.powf(2.2), d.y.powf(2.2), d.z.powf(2.2))
+}
+
+/// `s3d_agx_punchy`: the ASC CDL look (power 1.35, saturation 1.4) between curve and display.
+fn agx_punchy(c: Vec3) -> Vec3 {
+    let v = agx_curve(c).max(Vec3::ZERO);
+    let v = Vec3::new(v.x.powf(1.35), v.y.powf(1.35), v.z.powf(1.35));
+    let l = luma(v);
+    agx_display(Vec3::splat(l) + 1.4 * (v - Vec3::splat(l))).min(Vec3::ONE)
 }
 
 fn pbr_neutral(c_in: Vec3) -> Vec3 {
@@ -171,17 +190,25 @@ pub(crate) const HASH_WGSL: &str = include_str!("shaders/common/hash.wgsl");
 mod tests {
     use super::*;
 
-    const ALL: [Tonemapper; 5] = [
+    const ALL: [Tonemapper; 6] = [
         Tonemapper::None,
         Tonemapper::Reinhard,
         Tonemapper::AcesFitted,
         Tonemapper::AgX,
         Tonemapper::KhronosPbrNeutral,
+        Tonemapper::AgXPunchy,
     ];
 
     #[test]
     fn ids_are_the_shader_constants() {
-        assert_eq!(ALL.map(Tonemapper::id), [0, 1, 2, 3, 4]);
+        assert_eq!(ALL.map(Tonemapper::id), [0, 1, 2, 3, 4, 5]);
+        for (t, name) in [
+            (Tonemapper::AgX, "S3D_TM_AGX: u32 = 3u"),
+            (Tonemapper::KhronosPbrNeutral, "S3D_TM_PBR_NEUTRAL: u32 = 4u"),
+            (Tonemapper::AgXPunchy, "S3D_TM_AGX_PUNCHY: u32 = 5u"),
+        ] {
+            assert!(OUTPUT_WGSL.contains(name), "{t:?}: {name}");
+        }
         assert_eq!(
             [
                 OutputEncoding::Linear,
@@ -227,6 +254,16 @@ mod tests {
         // AgX sends a saturated bright light towards white.
         let a = Tonemapper::AgX.apply(Vec3::new(64.0, 4.0, 1.0));
         assert!(a.min_element() > 0.5, "{a}");
+        // The punchy look keeps saturated emissives saturated (a 2.5× red laser: AgX's pale
+        // pink (234, 187, 179) becomes (246, 162, 149)) and darkens mid grey.
+        let to_u8 = |c: Vec3| c.to_array().map(|x| (crate::linear_to_srgb(x) * 255.0).round() as u8);
+        let red = Vec3::new(2.5, 0.625, 0.5);
+        assert_eq!(to_u8(Tonemapper::AgX.apply(red)), [234, 187, 179]);
+        assert_eq!(to_u8(Tonemapper::AgXPunchy.apply(red)), [246, 162, 149]);
+        let hot = Tonemapper::AgXPunchy.apply(Vec3::new(16.0, 7.2, 1.92));
+        assert!(hot.max_element() <= 1.0 && hot.min_element() > 0.5, "{hot}");
+        let grey = |t: Tonemapper| t.apply(Vec3::splat(0.18)).x;
+        assert!((grey(Tonemapper::AgX) - 0.21).abs() < 0.01 && (grey(Tonemapper::AgXPunchy) - 0.125).abs() < 0.01);
     }
 
     #[test]

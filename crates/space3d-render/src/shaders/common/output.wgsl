@@ -11,6 +11,7 @@ const S3D_TM_REINHARD: u32 = 1u;
 const S3D_TM_ACES: u32 = 2u;
 const S3D_TM_AGX: u32 = 3u;
 const S3D_TM_PBR_NEUTRAL: u32 = 4u;
+const S3D_TM_AGX_PUNCHY: u32 = 5u;
 
 fn s3d_luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -45,17 +46,12 @@ fn s3d_aces_fitted(c: vec3<f32>) -> vec3<f32> {
     return clamp(r * o, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-// AgX (Sobotka; minimal polynomial fit by B. Wrensch), no look; outputs display-linear.
-fn s3d_agx(c: vec3<f32>) -> vec3<f32> {
+// AgX (Sobotka; minimal polynomial fit by B. Wrensch): the inset, log encoding and sigmoid.
+fn s3d_agx_curve(c: vec3<f32>) -> vec3<f32> {
     let m = mat3x3<f32>(
         vec3<f32>(0.842479062253094, 0.0423282422610123, 0.0423756549057051),
         vec3<f32>(0.0784335999999992, 0.878468636469772, 0.0784336),
         vec3<f32>(0.0792237451477643, 0.0791661274605434, 0.879142973793104),
-    );
-    let mi = mat3x3<f32>(
-        vec3<f32>(1.19687900512017, -0.0528968517574562, -0.0529716355144438),
-        vec3<f32>(-0.0980208811401368, 1.15190312990417, -0.0980434501171241),
-        vec3<f32>(-0.0990297440797205, -0.0989611768448433, 1.15107367264116),
     );
     let lo = -12.47393;
     let hi = 4.026069;
@@ -63,8 +59,32 @@ fn s3d_agx(c: vec3<f32>) -> vec3<f32> {
     v = (v - lo) / (hi - lo);
     let v2 = v * v;
     let v4 = v2 * v2;
-    v = 15.5 * v4 * v2 - 40.14 * v4 * v + 31.96 * v4 - 6.868 * v2 * v + 0.4298 * v2 + 0.1191 * v - 0.00232;
+    return 15.5 * v4 * v2 - 40.14 * v4 * v + 31.96 * v4 - 6.868 * v2 * v + 0.4298 * v2 + 0.1191 * v - 0.00232;
+}
+
+// AgX outset and display EOTF (pow 2.2): display-linear.
+fn s3d_agx_display(v: vec3<f32>) -> vec3<f32> {
+    let mi = mat3x3<f32>(
+        vec3<f32>(1.19687900512017, -0.0528968517574562, -0.0529716355144438),
+        vec3<f32>(-0.0980208811401368, 1.15190312990417, -0.0980434501171241),
+        vec3<f32>(-0.0990297440797205, -0.0989611768448433, 1.15107367264116),
+    );
     return pow(max(mi * v, vec3<f32>(0.0)), vec3<f32>(2.2));
+}
+
+// AgX, no look; outputs display-linear.
+fn s3d_agx(c: vec3<f32>) -> vec3<f32> {
+    return s3d_agx_display(s3d_agx_curve(c));
+}
+
+// AgX with Sobotka's "punchy" look: an ASC CDL in the encoded (log) space, power 1.35 then
+// saturation 1.4 around the Rec. 709 luma of the powered value (clamped: the saturation can
+// push a channel past display white). Saturated emissives keep their hue on the way to white,
+// mid grey 0.18 maps to 0.12 instead of 0.21.
+fn s3d_agx_punchy(c: vec3<f32>) -> vec3<f32> {
+    let v = pow(max(s3d_agx_curve(c), vec3<f32>(0.0)), vec3<f32>(1.35));
+    let l = s3d_luma(v);
+    return min(s3d_agx_display(vec3<f32>(l) + 1.4 * (v - vec3<f32>(l))), vec3<f32>(1.0));
 }
 
 // Khronos PBR Neutral (start compression 0.76, desaturation 0.15).
@@ -99,6 +119,9 @@ fn s3d_tonemap(op: u32, c_in: vec3<f32>) -> vec3<f32> {
         }
         case 4u: {
             return s3d_pbr_neutral(c);
+        }
+        case 5u: {
+            return s3d_agx_punchy(c);
         }
         default: {
             return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));

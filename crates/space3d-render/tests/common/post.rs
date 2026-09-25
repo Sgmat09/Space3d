@@ -237,8 +237,9 @@ pub mod cases {
 
     /// Bloom only takes what is above the threshold: a 0.8 quad adds nothing to the chain
     /// (hard knee: bit-identical to no bloom; default knee: a faint halo), an 8.0 quad glows
-    /// well beyond its edges, fading with distance, and in one scene the 0.8 quad changes no
-    /// pixel outside itself.
+    /// beyond its edges, fading with distance, and in one scene the 0.8 quad changes no pixel
+    /// outside itself. The glow spans the same fraction of the frame as at 1080p (the reference
+    /// chain, `chain_size`): in this 64-px-high frame it fades out about 10 px from the quad.
     pub fn bloom_only_above_threshold(make: MakeApp) {
         let Some(mut app) = make(W, H) else { return };
         // 8 × 8 px quads: 0.25 units at 32 px per unit.
@@ -246,8 +247,9 @@ pub mod cases {
         let dim = quad(&mut app, Vec3::splat(0.8), Vec2::new(0.0, 0.0), size);
         let cam = camera(&mut app, 0.0, BLACK, Some(post(hard())));
         let bloomed = render(&mut app);
-        // A 128 × 64 rect: level 0 is 64 × 32, five levels (the last keeps 2 px).
-        assert_eq!(stats(&app).post_passes, 10, "prefilter, 4 down, 4 up, composite");
+        // A 128 × 64 rect: the reference chain's 34-px level (standing for the four finer ones)
+        // and its 17-px level.
+        assert_eq!(stats(&app).post_passes, 4, "prefilter, 1 down, 1 up, composite");
         set_post(&mut app, cam, post(hard()).without_bloom());
         let plain = render(&mut app);
         assert_eq!(stats(&app).post_passes, 1);
@@ -263,8 +265,8 @@ pub mod cases {
         set_post(&mut app, cam, post(hard()));
         let hot = render(&mut app);
         let near = lin(&hot, 58, 32).x;
-        let far = lin(&hot, 40, 32).x;
-        let farther = lin(&hot, 10, 32).x;
+        let far = lin(&hot, 55, 32).x;
+        let farther = lin(&hot, 52, 32).x;
         assert!(near > 0.15, "right next to the 8.0 quad: {near}");
         assert!(
             near > far && far > farther && farther > 0.0,
@@ -397,9 +399,14 @@ pub mod cases {
                         );
                     }
                 }
-                // The bright half glows (well past the quad).
-                let glow_x = if bright_left { W / 2 - 16 } else { W / 2 + 16 };
-                assert!(lin(&img, glow_x, 8).x > 0.01, "scale {scale}: no glow at x {glow_x}");
+                // The bright half glows around the quad (its pixels below the quad's 1.0).
+                let half = if bright_left { 0..W / 2 } else { W / 2..W };
+                let glow = (0..H)
+                    .flat_map(|y| half.clone().map(move |x| (x, y)))
+                    .map(|(x, y)| lin(&img, x, y).x)
+                    .filter(|v| *v < 0.9)
+                    .fold(0.0f32, f32::max);
+                assert!(glow > 0.05, "scale {scale}: no glow around the quad ({glow})");
             }
         }
     }
@@ -438,7 +445,7 @@ pub mod cases {
         quad(&mut app, Vec3::splat(8.0), Vec2::ZERO, Vec2::splat(0.25));
         let cam = camera(&mut app, 0.0, BLACK, Some(post(Bloom::glow())));
         let hdr = render(&mut app);
-        assert_eq!(stats(&app).post_passes, 10);
+        assert_eq!(stats(&app).post_passes, 4);
         assert!(max_outside(&hdr, [60, 28, 8, 8], 0) > 0.05, "Hdr: bloom");
         frame_settings(&mut app).downlevel.no_float_targets = true;
         let ldr = render(&mut app);
@@ -520,8 +527,9 @@ pub mod cases {
         }
         let first = render(&mut app);
         let s = stats(&app);
-        // 64 × 64 rects: level 0 is 32 × 32, five levels (the last keeps 2 px).
-        assert_eq!(s.post_passes, 2 * (2 * 5 - 1 + 1), "{s:?}");
+        // 64 × 64 rects: the reference chain's 540 / 2^4 = 34-px level stands for the four
+        // finer ones, then its 17-px level: two levels.
+        assert_eq!(s.post_passes, 2 * (2 * 2 - 1 + 1), "{s:?}");
         let with_bloom = s.target_bytes;
         set_post(&mut app, left, post(Bloom::glow()).without_bloom());
         set_post(&mut app, right, PostProcess::default().without_bloom());
@@ -529,10 +537,10 @@ pub mod cases {
         let no_bloom = stats(&app).target_bytes;
         set_post(&mut app, left, post(Bloom::glow()));
         set_post(&mut app, right, PostProcess::default());
-        // One shared chain: 32² + 16² + 8² + 4² + 2² = 1364 pixels of 4 (Rg11b10Ufloat) or 8
-        // (Rgba16Float) bytes.
+        // One shared chain: 34² + 17² = 1445 pixels of 4 (Rg11b10Ufloat) or 8 (Rgba16Float)
+        // bytes.
         let chain = with_bloom - no_bloom;
-        assert!(chain == 1364 * 4 || chain == 1364 * 8, "{chain} bytes of bloom chain");
+        assert!(chain == 1445 * 4 || chain == 1445 * 8, "{chain} bytes of bloom chain");
         for _ in 0..4 {
             render(&mut app);
         }
@@ -582,7 +590,7 @@ pub mod cases {
         };
         set_path(&mut app, DrawPath::CpuDirect);
         assert_eq!(render(&mut app), full);
-        assert_eq!(stats(&app).post_passes, 10);
+        assert_eq!(stats(&app).post_passes, 4);
         frame_settings(&mut app).downlevel = DownlevelOverride::webgl2();
         render(&mut app);
         assert_eq!(stats(&app).post_passes, 1, "Ldr fallback: no bloom");
@@ -944,7 +952,7 @@ pub mod cases {
         ));
         camera(&mut app, 0.0, BLACK, None);
         render(&mut app);
-        assert_eq!(stats(&app).post_passes, 9 + 2, "bloom (5 levels), composite, FXAA");
+        assert_eq!(stats(&app).post_passes, 3 + 2, "bloom (2 levels), composite, FXAA");
         let texture = {
             let assets = app.resources.expect::<RenderAssets>();
             assets.render_target_view(rt).unwrap().texture().clone()

@@ -32,6 +32,7 @@ applies the exposure and the tonemapper and writes the display target. Tonemappe
 | `Tonemapper` | look |
 |---|---|
 | `AgX` (default) | saturated lights go to white without hue skew |
+| `AgXPunchy` | AgX with Sobotka's "punchy" look (power 1.35, saturation 1.4 in AgX's log space): saturated emissives and effects keep their hue (a red laser stays red, blue exhaust blue) at the cost of darker mid tones (0.18 → 0.12 display-linear, 0.21 with `AgX`); a game look for effect-heavy scenes |
 | `AcesFitted` | Stephen Hill's filmic ACES fit (contrasty) |
 | `Reinhard` | luminance Reinhard: hue-preserving, never reaches white |
 | `KhronosPbrNeutral` | faithful base colors (UI and product previews) |
@@ -291,7 +292,16 @@ impl RenderOverlay for Additive {
 
 The four steps to draw it into the HDR scene (bloomed and tonemapped with the scene):
 
-1. **Stage.** `fn stage(&self) -> OverlayStage { OverlayStage::HdrScene }`.
+1. **Stage, per instance.** `stage()` takes `&self` and is read every frame, so keep the stage
+   in the overlay and return it: `fn stage(&self) -> OverlayStage { self.stage }`. Construct the
+   in-world copy with `OverlayStage::HdrScene`. **An instance drawn over the UI keeps
+   `OverlayStage::AfterTonemap`**: `HdrScene` draws before post and before every `AfterTonemap`
+   overlay, egui included, so moving it there would put it under the UI. The game registers
+   its `ParticleOverlay` type twice — the world sprites and `UiParticles`
+   (`"fx-additive-ui-particles"`, priority 1100, drawn over egui inside the wiki model viewer's
+   clip rect); only the first becomes `HdrScene`. Steps 2–4 apply to the `HdrScene` instance;
+   the `AfterTonemap` one keeps its 249c874 path (`prepare_scene` is only called for
+   `HdrScene` overlays).
 2. **Encoding from the scene.** Keep what `prepare_scene` says and apply it with `s3d_output`
    from `OUTPUT_WGSL` (`Linear` into float or sRGB scene colors, `ManualSrgb` for an 8-bit
    non-sRGB window in Direct mode, `Tonemapped` with `exposure`/`tonemapper` in the Ldr
@@ -311,8 +321,8 @@ The four steps to draw it into the HDR scene (bloomed and tonemapped with the sc
    format (`Rgba16Float`; `Rg11b10Ufloat` with `HdrMode::Compact`; `Rgba8UnormSrgb` in the Ldr
    fallback). Blend state, depth (none) and sample count (1) stay the same.
 
-Nothing else changes: priorities, the per-kind buffers keyed by `OverlayTarget::kind`, the
-render pass contract. The `Engine/Frame/Overlay Stages` story draws the same sprites both ways
+Nothing else changes: priorities (within each stage), the per-kind buffers keyed by
+`OverlayTarget::kind`, the render pass contract. The `Engine/Frame/Overlay Stages` story draws the same sprites both ways
 (`crates/space3d-stories/src/engine/frame/demo.rs`, `AdditiveSprites`: `migrated` switches the
 four steps). Lasers become particle beams instead (particles area).
 

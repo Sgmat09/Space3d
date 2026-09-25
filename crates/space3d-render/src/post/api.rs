@@ -144,9 +144,10 @@ impl PostProcess {
         self.tonemapper = t;
         self
     }
-    /// Enable bloom with these settings.
+    /// Set [`Self::bloom`] (every field, `enabled` included: `Bloom::glow()`,
+    /// `Bloom::natural()` and `Bloom::default()` are enabled).
     pub fn with_bloom(mut self, b: Bloom) -> Self {
-        self.bloom = Bloom { enabled: true, ..b };
+        self.bloom = b;
         self
     }
     /// Disable bloom.
@@ -711,6 +712,14 @@ mod tests {
             .without_bloom()
             .with_exposure(1.5);
         assert!(q.auto_exposure.enabled && !q.bloom.enabled && q.exposure == 1.5);
+        // `with_bloom` sets every field: presets are enabled, an explicit `enabled: false` stays
+        // off (the `Engine/Post/Bloom` story's `enabled` knob).
+        assert!(q.with_bloom(Bloom::glow()).bloom.enabled && q.with_bloom(Bloom::default()).bloom.enabled);
+        let off = Bloom {
+            enabled: false,
+            ..Bloom::glow()
+        };
+        assert!(!PostProcess::default().with_bloom(off).bloom.enabled);
         let graded = ColorGrading {
             saturation: 0.5,
             ..Default::default()

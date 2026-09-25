@@ -60,13 +60,14 @@ at exposure 0 glows; the same at `with_exposure(-3.0)` (exposed 1.0) does not.
 | `soft_knee` | 0.5 | knee width as a fraction of `threshold` on either side (0 = hard cut) |
 | `scatter` | 0.7 | how much the coarse levels weigh: level k gets (1 − s)·s^k, the last one the rest |
 | `composite` | `Additive` | `Additive` (adds light: glow) or `EnergyConserving` (`mix(scene, bloom, intensity)`: veil) |
-| `mip_count` | 6 | levels of the chain, 1..=8; fewer when the last level would drop below 2 px |
-| `max_mip_height` | 540 | height cap of level 0 (half the rect's height): the cost stays that of 1080p at 1440p and 4K |
+| `mip_count` | 6 | levels of the reference chain, 1..=8 (see "Resolution independence"); fewer when the last level would drop below 2 px |
+| `max_mip_height` | 540 | height of the reference chain's level 0: a rect of twice this height or more gets half its size scaled down to it (the cost stays that of 1080p at 1440p and 4K); smaller rects keep the reference heights |
 
 Presets: `Bloom::glow()` (game emissives: the default) and `Bloom::natural()` (threshold 0,
 energy conserving 0.15, scatter 0.85: a photographic veil that keeps the image's mean
 brightness). `PostProcess::with_quality(GraphicsQuality)` sets `mip_count`/`max_mip_height`
-(Low 4 / 270, Medium 6 / 540, High 7 / 720).
+(Low 4 / 270, Medium 6 / 540, High 7 / 720). `PostProcess::with_bloom(b)` sets `b` as given,
+`enabled` included (`Bloom { enabled: false, .. }` stays off; the presets are enabled).
 
 ### How it works
 
@@ -91,6 +92,39 @@ reads one level view while writing another, which is portable to WebGL2.
 
 The chain is a normalized weighted average: without a threshold its mean equals the scene's, so
 `intensity` is the only gain (tested: energy-conserving bloom keeps the mean within 2 %).
+
+### Resolution independence
+
+A level's blur spans a fixed number of its own texels, so the halo keeps its size relative to
+the frame only if the level heights do not depend on the rect. The chain is therefore defined
+by a **reference chain** of `mip_count` levels of heights `max_mip_height / 2^k` — what a 1080p
+rect gets with the defaults (540, 270, … 17 px). A smaller rect keeps those heights: it drops the
+`n` finest reference levels, where `2^n` is the power of two nearest to
+`max_mip_height / (rect height / 2)`, and its level 0 (resampled from the rect to
+`max_mip_height / 2^n`, within √2 of half the rect, never above the rect's own size) stands for
+them; their weights merge into it (the upsample into level 0 blends with `scatter^(n + 1)`), so
+every level keeps its reference weight. The halo's size and energy relative to the frame are
+the same at 1080p, 720p and 360p (only the tight glow of the merged levels widens), and smaller
+rects cost fewer passes:
+
+| rect | chain (level 0, levels) | bloom-added mean luma, `Engine/Post/Bloom` (before this rule) |
+|---|---|---|
+| 1920 × 1080 | 960 × 540, 6 | +7.6 (+7.6) |
+| 1280 × 720 | 480 × 270, 5 | +7.3 (+9.3) |
+| 640 × 360 | 240 × 135, 4 | +6.6 (+11.7) |
+| 320 × 180 (the goldens) | 121 × 68, 3 | +6.0 (+14.1) |
+
+Below 1080p the added light falls slightly because small bright sources (stars) cover fewer
+scene pixels before the threshold, not because of the chain. Before, level 0 was simply half
+the rect with 6 levels at any size, so a 360p frame (a phone, `render_scale` 0.5) got 1.5× and
+the 180p goldens about 2× the desktop veil.
+
+**Known limitation: sub-pixel shimmer.** The prefilter's soft threshold and Karis weights are
+non-linear, so the light a 2-px source of radiance 10 adds varies by about 10 % (a 4-px source
+of radiance 4 by about 6 %) as it moves by quarter pixels: no fireflies, but small bright
+sources (stars, bolts, sparks) shimmer slightly while the camera pans. Temporal smoothing of the
+prefilter (with the TAA work) is the fix; until then keep emissive sources above ~4 px or their
+radiance moderate.
 
 ### What gets bloomed
 
@@ -132,15 +166,18 @@ unused frames. `RenderStats::target_bytes` counts it once per frame.
 |---|---|---|---|
 | 1920 × 1080 (level 0 960 × 540) | 6 | 2.8 MB | 5.5 MB |
 | 3840 × 2160 (capped to 960 × 540) | 6 | 2.8 MB | 5.5 MB |
+| 1280 × 720 (480 × 270, the 540 level merged) | 5 | 0.7 MB | 1.4 MB |
 | 1440 × 810, `GraphicsQuality::Low` (480 × 270) | 4 | 0.7 MB | 1.4 MB |
 
 ### Cost
 
-Render passes per post group: `2 × mip_count − 1` (11 for the default 6 levels) plus the
-composite. Their uniforms (one 64-byte slot per pass) are written when the settings or the rect
-change: a still scene uploads nothing. The steady state creates no textures and reallocates
-nothing (`tests/post.rs`, `tests/alloc_post.rs`); wgpu-hal on Metal allocates about 20 times per
-render pass (332 allocations per frame with bloom vs 106 for the composite alone).
+Render passes per post group: `2 × levels − 1` (11 for the default 6 levels at 1080p and
+above, 9 at 720p, 5 at 180p) plus the composite. Their uniforms (one 64-byte slot per pass) are
+written when the settings or the rect change: a still scene uploads only the composite's
+16 bytes of per-frame seeds. The steady state creates no textures and reallocates nothing
+(`tests/post.rs`, `tests/alloc_post.rs`); wgpu-hal on Metal allocates about 20 times per render
+pass (211 allocations per frame with bloom at 320 × 180, 5 bloom passes, vs 106 for the
+composite alone).
 
 GPU time on the dev machine (Apple M4 Max, Metal; `bloom_gate_1080p` below): the GPU kept busy
 (command buffers of 5 chains submitted back to back after a warm-up), each timed from the start
@@ -180,7 +217,11 @@ cargo test -p space3d-render --lib bloom_gate -- --ignored --nocapture
 ```
 
 `SPACE3D_PERF_BUDGET_SCALE` relaxes the budget on slower machines; the test skips without
-`TIMESTAMP_QUERY`.
+`TIMESTAMP_QUERY`. Each run takes the best of 40 rounds, and a run disturbed by other GPU work
+is retried (best of 3 runs). The gate is only meaningful on an idle Dev GPU: at the M1 review,
+with other apps holding the shared GPU at 50–60 % device utilization, runs measured 0.188–0.265 ms
+and one of two invocations passed; on a quieter GPU the review measured 0.13–0.16 ms. It is not
+part of `cargo test --workspace` or CI (hosted runners have software or paravirtual GPUs).
 
 ## FXAA
 
@@ -260,7 +301,7 @@ their seeds are hashed once per frame on the CPU (bit-identical to hashing per p
   `lens_effects_do_not_bleed_across_viewports`, `fxaa_ldr_fallback_and_steady_state`,
   `transparent_rt_lens_effects_keep_alpha`; `gl_bloom_matches_default_backend`.
 * `tests/alloc_post.rs`: allocations per frame with bloom on one and on two post groups, and with
-  `PostProcess::cinematic()` (359 on Metal: the FXAA pass on top of bloom's 332).
+  `PostProcess::cinematic()` (240 on Metal at 320 × 180: the FXAA pass on top of bloom's 211).
 * Unit tests in `src/post/`: chain sizing, the soft threshold's CPU mirror, pass uniforms, WGSL
   layouts, FXAA presets and their WGSL for every quality, the pre-hashed seeds, and the GPU-time
   gate (`bloom_gate_1080p`, run alone with `--ignored`).
