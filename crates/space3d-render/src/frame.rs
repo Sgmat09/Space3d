@@ -1388,7 +1388,10 @@ impl Renderer {
                 }
             };
             let (vw, vh) = match cam.camera.viewport {
-                Some([_, _, w, h]) => (size.0 as f32 * w, size.1 as f32 * h),
+                Some(v) => {
+                    let r = viewport_rect(v, size);
+                    (r.w as f32, r.h as f32)
+                }
                 None => (size.0 as f32, size.1 as f32),
             };
             let aspect = (vw / vh.max(1.0)).max(1e-4);
@@ -2205,6 +2208,10 @@ impl Renderer {
 
     /// Record render passes for the prepared views. With `primary_to_offscreen`, only primary
     /// views are re-recorded into the offscreen target (windowed capture).
+    ///
+    /// Views sharing a target (split screen, picture-in-picture, overlays) draw in camera
+    /// order into the same attachments: the first pass into a target in a frame clears it,
+    /// later ones load what the earlier ones drew (see [`Self::encode_pass`]).
     pub(crate) fn encode_views(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -2213,7 +2220,7 @@ impl Renderer {
     ) {
         let views = std::mem::take(&mut self.frame.views);
         let mut presented = false;
-        for view in &views {
+        for (i, view) in views.iter().enumerate() {
             let is_primary = matches!(view.target, ViewTarget::Primary);
             if primary_to_offscreen && !is_primary {
                 continue;
@@ -2273,10 +2280,18 @@ impl Renderer {
                     (color.clone(), None, depth.clone(), OFFSCREEN_FORMAT, 1, false)
                 }
             };
+            // Texture views are never skipped, except all of them in `primary_to_offscreen`.
+            let first = match &view.target {
+                ViewTarget::Primary => !presented,
+                ViewTarget::Texture { handle, .. } => !views[..i]
+                    .iter()
+                    .any(|v| matches!(&v.target, ViewTarget::Texture { handle: h, .. } if h == handle)),
+            };
             presented |= is_primary;
             self.encode_pass(
                 encoder,
                 view,
+                first,
                 &color,
                 resolve.as_ref(),
                 &depth,
@@ -2307,11 +2322,25 @@ impl Renderer {
         self.frame.views = views;
     }
 
+    /// Record one view's render pass. `first`: no earlier pass of this frame drew into the
+    /// view's target.
+    ///
+    /// Color: a view covering its whole target clears it with its clear color (a load op). The
+    /// first pass into a target otherwise clears it to black — never leaving the previous
+    /// frame's content, and never painting a viewport's clear color outside the viewport —
+    /// and later passes load it. A view with a viewport and a clear color then clears only its
+    /// viewport, with a triangle in that color ([`Pipelines::viewport_clear`]). The viewport,
+    /// in whole pixels ([`viewport_rect`]), is also the pass's scissor rect. Depth is per view:
+    /// every pass clears the whole depth attachment (views never test against each other) and
+    /// discards it.
+    ///
+    /// [`Pipelines::viewport_clear`]: crate::pipeline::Pipelines::viewport_clear
     #[allow(clippy::too_many_arguments)]
     fn encode_pass(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         view: &ViewData,
+        first: bool,
         color: &wgpu::TextureView,
         resolve: Option<&wgpu::TextureView>,
         depth: &wgpu::TextureView,
@@ -2319,17 +2348,21 @@ impl Renderer {
         samples: u32,
         manual_srgb: bool,
     ) {
-        let load = match view.clear {
-            Some(c) => {
-                let c = if manual_srgb { linear_to_srgb_color(c) } else { c };
-                wgpu::LoadOp::Clear(wgpu::Color {
-                    r: c.x as f64,
-                    g: c.y as f64,
-                    b: c.z as f64,
-                    a: c.w as f64,
-                })
+        let rect = view.viewport.map(|v| viewport_rect(v, view.size));
+        let full = rect.is_none_or(|r| r.covers(view.size));
+        let clear = view.clear.map(|c| {
+            let c = if manual_srgb { linear_to_srgb_color(c) } else { c };
+            wgpu::Color {
+                r: c.x as f64,
+                g: c.y as f64,
+                b: c.z as f64,
+                a: c.w as f64,
             }
-            None => wgpu::LoadOp::Load,
+        });
+        let (load, rect_clear) = match clear {
+            Some(c) if full => (wgpu::LoadOp::Clear(c), None),
+            _ if first => (wgpu::LoadOp::Clear(wgpu::Color::BLACK), clear),
+            _ => (wgpu::LoadOp::Load, clear),
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("space3d forward"),
@@ -2352,10 +2385,34 @@ impl Renderer {
             }),
             ..Default::default()
         });
-        if let Some([x, y, w, h]) = view.viewport {
-            let (tw, th) = (view.size.0 as f32, view.size.1 as f32);
-            pass.set_viewport(x * tw, y * th, (w * tw).max(1.0), (h * th).max(1.0), 0.0, 1.0);
+        if let Some(r) = rect {
+            pass.set_viewport(r.x as f32, r.y as f32, r.w as f32, r.h as f32, 0.0, 1.0);
+            let [x, y, w, h] = r.scissor(view.size);
+            pass.set_scissor_rect(x, y, w, h);
         }
+        if let Some(c) = rect_clear {
+            pass.set_pipeline(self.pipelines.viewport_clear(&self.device, format, samples));
+            pass.set_blend_constant(c);
+            pass.draw(0..3, 0..1);
+        }
+        self.encode_draws(&mut pass, view, format, samples, manual_srgb);
+        if rect.is_some() && resolve.is_some() {
+            // wgpu's GL backend resolves MSAA with a framebuffer blit at the end of the pass,
+            // and GL clips blits to the scissor rect: only the viewport would be resolved, and
+            // the rest of the target would keep its previous content.
+            pass.set_scissor_rect(0, 0, view.size.0.max(1), view.size.1.max(1));
+        }
+    }
+
+    /// Record a view's draws into its pass.
+    fn encode_draws(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        view: &ViewData,
+        format: wgpu::TextureFormat,
+        samples: u32,
+        manual_srgb: bool,
+    ) {
         let f = &self.frame;
         let (Some((vb, ib)), Some((view_bg, _))) = (&f.arena_buffers, &f.view_bg) else {
             return;
@@ -2490,6 +2547,55 @@ impl Renderer {
         self.encode_views(encoder, None, true);
         self.stats = stats;
     }
+}
+
+/// A view's viewport in whole pixels of its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewportRect {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+impl ViewportRect {
+    /// The rect covers every pixel of a `size` target.
+    fn covers(&self, size: (u32, u32)) -> bool {
+        self.x <= 0
+            && self.y <= 0
+            && self.x as i64 + self.w as i64 >= size.0 as i64
+            && self.y as i64 + self.h as i64 >= size.1 as i64
+    }
+
+    /// `[x, y, width, height]` of the rect's part within a `size` target (at least one pixel,
+    /// as a scissor rect must lie within the target): the scissor rect of the view's pass.
+    fn scissor(&self, size: (u32, u32)) -> [u32; 4] {
+        let axis = |start: i32, len: u32, extent: u32| {
+            let extent = extent.max(1) as i64;
+            let a = (start as i64).clamp(0, extent - 1);
+            let b = (start as i64 + len as i64).clamp(a + 1, extent);
+            (a as u32, (b - a) as u32)
+        };
+        let (x, w) = axis(self.x, self.w, size.0);
+        let (y, h) = axis(self.y, self.h, size.1);
+        [x, y, w, h]
+    }
+}
+
+/// Pixel rect of a normalized viewport `[x, y, width, height]` (top left origin) on a `size`
+/// target: its edges rounded to the nearest pixel boundary, at least one pixel wide and high.
+/// Rounded because GL takes integer viewports (wgpu's GL backend truncates position and size
+/// separately, which would shift fractional viewports and open gaps between neighbours): every
+/// backend draws the same pixels, and neighbouring viewports share their edges exactly.
+fn viewport_rect([x, y, w, h]: [f32; 4], size: (u32, u32)) -> ViewportRect {
+    let axis = |start: f32, len: f32, extent: u32| {
+        let a = (start * extent as f32).round();
+        let b = ((start + len) * extent as f32).round();
+        (a as i32, ((b - a) as i64).max(1) as u32)
+    };
+    let (x, w) = axis(x, w, size.0);
+    let (y, h) = axis(y, h, size.1);
+    ViewportRect { x, y, w, h }
 }
 
 /// Where vertex slot 0 starts in the mesh arena (in vertices) and the `base_vertex` to draw
@@ -2680,35 +2786,62 @@ mod tests {
     /// a scene with 120 small buffers and 13 views took 3121 dispatches (and wgpu-hal's Metal
     /// backend allocates in each). The jobs of all views reading one buffer now share a
     /// dispatch, each job selecting its view's frustum: 70 views (two windows of frustums) ×
-    /// 4 buffers take 2 × 2 × 4 + 1 dispatches, and the image equals CpuDirect's.
+    /// 4 buffers take 2 × 2 × 4 + 1 dispatches.
+    ///
+    /// Every one of the 70 viewports is checked against what its own camera sees — its own
+    /// clear color, its ECS cube and its own uniquely colored explicit instance, and nothing
+    /// else — on every draw path. A view culled with another view's frustum (on the CPU or the
+    /// GPU), drawn with another view's matrix or wiped by a later viewport fails.
     #[test]
     fn culling_dispatches_scale_with_buffers_not_views() {
-        use crate::{Camera3d, InstanceBuffer, InstanceTransform, InstancedMesh, Mesh3d, RenderStats};
-        use space3d_core::{MeshData, Transform};
+        use crate::components::srgb_to_linear;
+        use crate::{Camera3d, InstanceBuffer, InstanceTransformColor, InstancedMesh, Mesh3d, RenderStats};
+        use space3d_core::{ImageData, MeshData, Transform};
         const VIEWS: usize = 70;
-        let Some(mut app) = headless_app(140, 100) else { return };
+        const W: u32 = 140;
+        const H: u32 = 100;
+        let Some(mut app) = headless_app(W, H) else { return };
         let best = app.resources.expect::<Renderer>().capabilities().best_draw_path;
         if best == DrawPath::CpuDirect {
             return;
         }
-        let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.2));
+        let mesh = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(1.2));
+        // View v's camera looks at `center(v)` from 4 units away (its frustum spans ±2.3 units
+        // there); the next view's point is 10 units away, far outside it.
+        let center = |v: usize| Vec3::new((v % 10) as f32 * 10.0, (v / 10) as f32 * 10.0, 0.0);
+        // Seen by no view.
+        let nowhere = |i: usize| Vec3::new(-1000.0 - i as f32 * 2.0, 0.0, 0.0);
+        // sRGB colors of view v: its clear color and its explicit instance's color.
+        let clear_rgb = |v: usize| [(v % 10) as u8 * 6, (v / 10) as u8 * 6, 60];
+        let own_rgb = |v: usize| [40 + (v % 10) as u8 * 20, 40 + (v / 10) as u8 * 30, 200];
+        let linear = |c: [u8; 3]| c.map(|x| srgb_to_linear(x as f32 / 255.0));
+        let linear4 = |c: [u8; 3]| Vec3::from(linear(c)).extend(1.0);
+        // ECS: a white cube left of each view's point, and cubes no view sees.
         for i in 0..300 {
-            let p = Vec3::new((i % 30) as f32 * 0.4 - 6.0, (i / 30) as f32 * 0.4 - 2.0, 0.0);
+            let p = if i < VIEWS {
+                center(i) - Vec3::X * 0.9
+            } else {
+                nowhere(i)
+            };
             app.world.spawn((
                 Transform::from_xyz(p.x, p.y, p.z),
                 Mesh3d(mesh),
-                Material::unlit(Vec4::new(1.0, 0.3, 0.1, 1.0)),
+                Material::unlit(Vec4::ONE),
             ));
         }
+        // Three explicit buffers of 200 instances: view v's cube, right of its point and in its
+        // own color, is instance 8 × (v / 3) of buffer v % 3 (in several culling workgroups);
+        // the other instances are seen by no view.
         for k in 0..3 {
             let data = (0..200)
                 .map(|i| {
-                    let p = Vec3::new(
-                        (i % 40) as f32 * 0.3 - 6.0,
-                        k as f32 * 1.2 - 2.5 + (i / 40) as f32 * 0.2,
-                        -1.0,
-                    );
-                    InstanceTransform::from_trs(p, glam::Quat::IDENTITY, Vec3::ONE)
+                    let v = i / 8 * 3 + k;
+                    let (p, rgb) = if i % 8 == 0 && v < VIEWS {
+                        (center(v) + Vec3::X * 0.9, own_rgb(v))
+                    } else {
+                        (nowhere(300 + 200 * k + i), [255, 255, 255])
+                    };
+                    InstanceTransformColor::new(Mat4::from_translation(p), linear4(rgb))
                 })
                 .collect();
             let instances = app
@@ -2717,29 +2850,58 @@ mod tests {
                 .insert(InstanceBuffer::from_vec(data, crate::BufferUsage::Static));
             app.world.spawn((InstancedMesh {
                 mesh,
-                material: Material::unlit(Vec4::new(0.1, 0.4 + 0.25 * k as f32, 1.0, 1.0)),
+                material: Material::unlit(Vec4::ONE),
                 instances,
             },));
         }
-        // A 10 × 7 grid of viewports; each camera looks at a different part of the scene
-        // through a narrow frustum, so every view culls differently.
+        // A 10 × 7 grid of viewports (14 × 14.3 px), each with its own clear color.
         for v in 0..VIEWS {
             let (col, row) = ((v % 10) as f32, (v / 10) as f32);
+            let c = center(v);
             app.world.spawn((
-                Transform::from_xyz(col * 1.3 - 6.0, row * 0.7 - 2.5, 5.0),
+                Transform::from_xyz(c.x, c.y, 4.0),
                 Camera3d {
                     viewport: Some([col / 10.0, row / 7.0, 0.1, 1.0 / 7.0]),
                     order: v as i32,
-                    ..Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 0.0, 1.0))
+                    ..Camera3d::default().with_clear_color(linear4(clear_rgb(v)))
                 },
             ));
         }
+        // Inside each viewport (1 px margin), every pixel is the view's clear color, its white
+        // ECS cube or its own instance, and each of the three is visible.
+        let check = |img: &ImageData, path: DrawPath| {
+            for v in 0..VIEWS {
+                let (col, row) = ((v % 10) as u32, (v / 10) as u32);
+                let cell_h = H as f32 / 7.0;
+                let ys = (row as f32 * cell_h).ceil() as u32 + 1..((row + 1) as f32 * cell_h).floor() as u32 - 1;
+                let expected = [clear_rgb(v), [255, 255, 255], own_rgb(v)];
+                let mut seen = [0usize; 3];
+                for y in ys {
+                    for x in col * 14 + 1..col * 14 + 13 {
+                        let p = img.get(x, y);
+                        let is = |c: &[u8; 3]| p.iter().zip(c).all(|(a, b)| a.abs_diff(*b) <= 2);
+                        match expected.iter().position(is) {
+                            Some(i) => seen[i] += 1,
+                            None => {
+                                panic!("{path:?}: viewport {v} shows {p:?} at ({x}, {y}), expected one of {expected:?}")
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    seen[0] >= 40 && seen[1] >= 6 && seen[2] >= 6,
+                    "{path:?}: viewport {v}: clear color / ECS cube / own instance cover {seen:?} px"
+                );
+            }
+        };
         set_path(&mut app, DrawPath::CpuDirect);
         let cpu = crate::render_to_image(&mut app).expect("capture");
         assert!(app.resources.expect::<RenderStats>().culled > 0, "views cull");
+        check(&cpu, DrawPath::CpuDirect);
         for path in paths_up_to(best).skip(1) {
             set_path(&mut app, path);
             let img = crate::render_to_image(&mut app).expect("capture");
+            check(&img, path);
             let d = differing_px(&cpu, &img);
             assert_eq!(d, 0, "{path:?} differs from CpuDirect in {d} px");
             let r = app.resources.expect::<Renderer>();
@@ -2752,6 +2914,212 @@ mod tests {
                 "{path:?}: mark + scatter per buffer and frustum window, one scan"
             );
         }
+    }
+
+    /// Viewport rects are whole pixels with rounded edges (neighbours share edges exactly);
+    /// scissors are their part within the target, at least one pixel.
+    #[test]
+    fn viewport_rects_and_scissors() {
+        let rect = |v, size| {
+            let r = viewport_rect(v, size);
+            (r.x, r.y, r.w, r.h)
+        };
+        assert_eq!(rect([0.25, 0.25, 0.375, 0.5], (8, 4)), (2, 1, 3, 2));
+        // Thirds of 100 px: 0..33, 33..67, 67..100.
+        let thirds: Vec<_> = (0..3)
+            .map(|i| rect([i as f32 / 3.0, 0.0, 1.0 / 3.0, 1.0], (100, 10)))
+            .collect();
+        assert_eq!(thirds, [(0, 0, 33, 10), (33, 0, 34, 10), (67, 0, 33, 10)]);
+        // Sevenths of 100 px (the rows of `culling_dispatches_scale_with_buffers_not_views`).
+        let rows: Vec<_> = (0..7)
+            .map(|i| rect([0.0, i as f32 / 7.0, 0.1, 1.0 / 7.0], (140, 100)))
+            .map(|(_, y, _, h)| (y, h))
+            .collect();
+        assert_eq!(
+            rows,
+            [(0, 14), (14, 15), (29, 14), (43, 14), (57, 14), (71, 15), (86, 14)]
+        );
+        let r = viewport_rect([0.25, 0.25, 0.375, 0.5], (8, 4));
+        assert_eq!(r.scissor((8, 4)), [2, 1, 3, 2]);
+        assert!(!r.covers((8, 4)));
+        assert!(viewport_rect([0.0, 0.0, 1.0, 1.0], (8, 4)).covers((8, 4)));
+        assert!(viewport_rect([-0.1, 0.0, 1.2, 1.0], (8, 4)).covers((8, 4)));
+        // Degenerate and out-of-range viewports: at least one pixel, scissor within the target.
+        assert_eq!(rect([0.5, 0.5, 0.0, 0.0], (10, 10)), (5, 5, 1, 1));
+        let outside = viewport_rect([1.0, 1.0, 0.5, 0.5], (10, 10));
+        assert_eq!((outside.x, outside.w), (10, 5));
+        assert_eq!(outside.scissor((10, 10)), [9, 9, 1, 1]);
+        let wide = viewport_rect([-0.5, 0.0, 2.0, 1.0], (10, 10));
+        assert_eq!((wide.x, wide.w), (-5, 20));
+        assert_eq!(wide.scissor((10, 10)), [0, 0, 10, 10]);
+    }
+
+    /// The viewport clear writes its color — the pass's blend constant — into every color
+    /// format a view can render to: sRGB (encoded on store), linear 8- and 10-bit, and HDR
+    /// `Rgba16Float` (not clamped to 1), with 1 and 4 samples (resolved), only inside the
+    /// viewport and its scissor rect.
+    #[test]
+    fn viewport_clear_writes_every_target_format() {
+        use crate::components::linear_to_srgb;
+        use crate::instance::f16_to_f32;
+        use crate::pipeline::DEPTH_FORMAT;
+        use wgpu::TextureFormat as F;
+        const W: u32 = 8;
+        const H: u32 = 4;
+        let Some(mut app) = headless_app(8, 8) else { return };
+        let r = app.resources.expect_mut::<Renderer>();
+        let size = wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        };
+        let rect = viewport_rect([0.25, 0.25, 0.375, 0.5], (W, H));
+        let mut tested = 0;
+        for format in [
+            F::Rgba8UnormSrgb,
+            F::Bgra8UnormSrgb,
+            F::Rgba8Unorm,
+            F::Bgra8Unorm,
+            F::Rgb10a2Unorm,
+            F::Rgba16Float,
+        ] {
+            let features = r.adapter.get_texture_format_features(format);
+            let color = if format == F::Rgba16Float {
+                [2.5, 0.5, 0.125, 1.0]
+            } else {
+                [0.25, 0.5, 0.75, 1.0]
+            };
+            for samples in [1, 4] {
+                let depth_samples = r.adapter.get_texture_format_features(DEPTH_FORMAT).flags;
+                if !features.allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+                    || !features.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE)
+                    || !features.flags.sample_count_supported(samples)
+                    || !depth_samples.sample_count_supported(samples)
+                {
+                    eprintln!("{format:?} ×{samples}: not a blendable render target here, skipped");
+                    continue;
+                }
+                let texture = |format, samples, usage| {
+                    r.device
+                        .create_texture(&wgpu::TextureDescriptor {
+                            label: None,
+                            size,
+                            mip_level_count: 1,
+                            sample_count: samples,
+                            dimension: wgpu::TextureDimension::D2,
+                            format,
+                            usage,
+                            view_formats: &[],
+                        })
+                        .create_view(&Default::default())
+                };
+                use wgpu::TextureUsages as U;
+                let target = texture(format, 1, U::RENDER_ATTACHMENT | U::COPY_SRC);
+                let msaa = (samples > 1).then(|| texture(format, samples, U::RENDER_ATTACHMENT));
+                let depth = texture(DEPTH_FORMAT, samples, U::RENDER_ATTACHMENT);
+                let mut encoder = r.device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: msaa.as_ref().unwrap_or(&target),
+                            depth_slice: None,
+                            resolve_target: msaa.is_some().then_some(&target),
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                    pass.set_viewport(rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32, 0.0, 1.0);
+                    let [x, y, w, h] = rect.scissor((W, H));
+                    pass.set_scissor_rect(x, y, w, h);
+                    pass.set_pipeline(r.pipelines.viewport_clear(&r.device, format, samples));
+                    let [cr, cg, cb, ca] = color.map(f64::from);
+                    pass.set_blend_constant(wgpu::Color {
+                        r: cr,
+                        g: cg,
+                        b: cb,
+                        a: ca,
+                    });
+                    pass.draw(0..3, 0..1);
+                    // As `encode_pass` does: GL clips the MSAA resolve to the scissor rect.
+                    pass.set_scissor_rect(0, 0, W, H);
+                }
+                let texel = format.block_copy_size(None).expect("color format") as usize;
+                let row = align_up((W as usize * texel) as u64, 256) as usize;
+                let buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (row * H as usize) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                encoder.copy_texture_to_buffer(
+                    target.texture().as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(row as u32),
+                            rows_per_image: None,
+                        },
+                    },
+                    size,
+                );
+                r.queue.submit([encoder.finish()]);
+                buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+                r.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+                assert_eq!(r.gpu_error_count(), 0, "{format:?} ×{samples}");
+                let data = buffer.slice(..).get_mapped_range().expect("mapped");
+                // Stored values, normalized (sRGB formats store encoded values).
+                let pixel = |x: usize, y: usize| -> [f32; 4] {
+                    let p = &data[y * row + x * texel..][..texel];
+                    let unorm8 = |i: usize| p[i] as f32 / 255.0;
+                    match format {
+                        F::Rgba8UnormSrgb | F::Rgba8Unorm => [0, 1, 2, 3].map(unorm8),
+                        F::Bgra8UnormSrgb | F::Bgra8Unorm => [2, 1, 0, 3].map(unorm8),
+                        F::Rgb10a2Unorm => {
+                            let v = u32::from_le_bytes(p.try_into().unwrap());
+                            let c = |shift: u32| ((v >> shift) & 1023) as f32 / 1023.0;
+                            [c(0), c(10), c(20), (v >> 30) as f32 / 3.0]
+                        }
+                        F::Rgba16Float => [0, 2, 4, 6].map(|i| f16_to_f32(u16::from_le_bytes([p[i], p[i + 1]]))),
+                        _ => unreachable!(),
+                    }
+                };
+                let stored = color.map(|c| if format.is_srgb() { linear_to_srgb(c) } else { c });
+                let expected = [stored[0], stored[1], stored[2], color[3]];
+                let step = match format {
+                    F::Rgb10a2Unorm => 1.0 / 1023.0,
+                    F::Rgba16Float => 2e-3,
+                    _ => 1.0 / 255.0,
+                };
+                for y in 0..H as usize {
+                    for x in 0..W as usize {
+                        let inside = (2..5).contains(&x) && (1..3).contains(&y);
+                        let want = if inside { expected } else { [0.0, 0.0, 0.0, 1.0] };
+                        let got = pixel(x, y);
+                        let tolerance = |w: f32| step * w.abs().max(1.0) * 1.01;
+                        assert!(
+                            got.iter().zip(want).all(|(g, w)| (g - w).abs() <= tolerance(w)),
+                            "{format:?} ×{samples} at ({x}, {y}): {got:?}, expected {want:?}"
+                        );
+                    }
+                }
+                drop(data);
+                tested += 1;
+            }
+        }
+        assert!(tested >= 6, "only {tested} format/sample combinations tested");
+        assert_eq!(r.gpu_error_count(), 0);
     }
 
     /// Headless app on a device created with these limits, so wgpu's own validation fails past

@@ -127,6 +127,7 @@ const FORWARD_TEMPLATE: &str = include_str!("shaders/forward.wgsl");
 const CULL_SHADER: &str = include_str!("shaders/cull.wgsl");
 const COMPACT_SHADER: &str = include_str!("shaders/compact.wgsl");
 const BLIT_TEMPLATE: &str = include_str!("shaders/blit.wgsl");
+const CLEAR_SHADER: &str = include_str!("shaders/clear.wgsl");
 
 /// Mip-generation blit shader sampling a `texture_2d` or a `texture_2d_array` source.
 pub(crate) fn blit_shader(layered: bool) -> String {
@@ -358,30 +359,69 @@ const TEMPLATE_RESOURCES: [(u32, u32, &str); 4] = [
     (1, 2, "base_sampler"),
 ];
 
-/// [`validate_wgsl`] for a forward shader with a custom shader spliced in, which may declare
-/// no resources of its own. naga accepts such modules, but their pipeline fails validation
-/// against the layout — detected here synchronously, because on browser WebGPU the error
-/// scope around pipeline creation only answers later (see [`Pipelines::poll_pending`]).
+/// [`validate_wgsl`] for a forward shader with a custom shader spliced in, checking what naga
+/// accepts but the forward pipeline cannot run the same way on every backend:
+///
+/// * resources of its own: the pipeline layout has no bindings for them, so the pipeline
+///   fails validation;
+/// * workgroup memory (`var<workgroup>`, used or not): WGSL allows it in compute shaders only,
+///   naga in any stage, and backends disagree about it in the vertex and fragment stages the
+///   hooks run in (Metal accepts it, GL and browsers reject it);
+/// * any other address space but `function` and `private` (immediates, mesh and ray-tracing
+///   payloads: optional capabilities the forward pipeline does not use);
+/// * pipeline constants (`override`) without a default: the forward pipeline sets none, so
+///   creating it fails.
+///
+/// Detected here synchronously, because on browser WebGPU the error scope around pipeline
+/// creation only answers later (see [`Pipelines::poll_pending`]): until then every frame
+/// drawing with the invalid pipeline is lost.
 pub(crate) fn validate_custom_wgsl(src: &str) -> Result<(), String> {
     use wgpu::naga::AddressSpace as A;
     let module = parse_and_validate(src)?;
     for (_, g) in module.global_variables.iter() {
         let name = g.name.as_deref().unwrap_or("<unnamed>");
-        let allowed = match g.space {
-            A::Function | A::Private | A::WorkGroup => true,
-            _ => g
-                .binding
-                .as_ref()
-                .is_some_and(|b| TEMPLATE_RESOURCES.contains(&(b.group, b.binding, name))),
-        };
-        if !allowed {
-            let at = g.binding.as_ref().map_or(String::new(), |b| {
-                format!(" at @group({}) @binding({})", b.group, b.binding)
-            });
+        match g.space {
+            A::Function | A::Private => {}
+            A::WorkGroup => {
+                return Err(format!(
+                    "custom shaders cannot use workgroup memory: `var<workgroup> {name}` exists \
+                     only in compute shaders, and the hooks run in the vertex and fragment stages \
+                     (use `var<private>` for per-invocation state)"
+                ));
+            }
+            A::Uniform | A::Storage { .. } | A::Handle => {
+                let template = g
+                    .binding
+                    .as_ref()
+                    .is_some_and(|b| TEMPLATE_RESOURCES.contains(&(b.group, b.binding, name)));
+                if !template {
+                    let at = g.binding.as_ref().map_or(String::new(), |b| {
+                        format!(" at @group({}) @binding({})", b.group, b.binding)
+                    });
+                    return Err(format!(
+                        "custom shaders cannot declare resources: `{name}` ({:?}){at} is not bound \
+                         by the forward pipeline (only `view`, `material`, `base_tex` and \
+                         `base_sampler` are)",
+                        g.space
+                    ));
+                }
+            }
+            space => {
+                return Err(format!(
+                    "custom shaders cannot declare `{name}` in the {space:?} address space: \
+                     only `var<private>` globals (and the template's resources) are portable to \
+                     every backend"
+                ));
+            }
+        }
+    }
+    for (_, o) in module.overrides.iter() {
+        if o.init.is_none() {
+            let name = o.name.as_deref().unwrap_or("<unnamed>");
             return Err(format!(
-                "custom shaders cannot declare resources: `{name}` ({:?}){at} is not bound by the \
-                 forward pipeline (only `view`, `material`, `base_tex` and `base_sampler` are)",
-                g.space
+                "custom shaders cannot declare pipeline constants without a default: \
+                 `override {name}` needs one (`override {name}: T = value;`), since the forward \
+                 pipeline sets no constants"
             ));
         }
     }
@@ -510,6 +550,11 @@ pub(crate) struct Pipelines {
     blits: [Blit; 2],
     blit: FastMap<(wgpu::TextureFormat, bool), wgpu::RenderPipeline>,
     pub blit_sampler: wgpu::Sampler,
+    /// Viewport clears (see [`Self::viewport_clear`]): shader, bind-group-less layout and the
+    /// pipelines per (target format, sample count).
+    clear_module: wgpu::ShaderModule,
+    clear_layout: wgpu::PipelineLayout,
+    clear: FastMap<(wgpu::TextureFormat, u32), wgpu::RenderPipeline>,
 }
 
 /// Bind group layout entry of a filterable float texture of the given view dimension.
@@ -697,6 +742,15 @@ impl Pipelines {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let clear_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("space3d viewport clear"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CLEAR_SHADER)),
+        });
+        let clear_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("space3d viewport clear"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
         Self {
             view_bgl,
             material_bgls,
@@ -711,6 +765,9 @@ impl Pipelines {
             blits,
             blit: FastMap::default(),
             blit_sampler,
+            clear_module,
+            clear_layout,
+            clear: FastMap::default(),
         }
     }
 
@@ -1049,6 +1106,66 @@ impl Pipelines {
         });
         (p, &blit.bgl)
     }
+
+    /// Pipeline clearing a view's viewport inside a forward pass (see `shaders/clear.wgsl`):
+    /// draw 3 vertices with the clear color as the pass's blend constant. It matches the
+    /// forward pass — target format, sample count and the depth attachment, which it neither
+    /// tests nor writes. Every target a view renders into is blendable (alpha-blended
+    /// materials need that too), so the color needs no buffer or bind group: nothing to update
+    /// per frame, whatever the colors. (HDR colors above 1 need blend constants that are not
+    /// clamped for float targets: tested on Metal and ANGLE.)
+    pub fn viewport_clear(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> &wgpu::RenderPipeline {
+        let (module, layout) = (&self.clear_module, &self.clear_layout);
+        self.clear.entry((format, samples)).or_insert_with(|| {
+            let constant = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Constant,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            };
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("space3d viewport clear"),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: samples,
+                    ..Default::default()
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState {
+                            color: constant,
+                            alpha: constant,
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1119,6 +1236,7 @@ mod tests {
         validate(COMPACT_SHADER);
         validate(&blit_shader(false));
         validate(&blit_shader(true));
+        validate(CLEAR_SHADER);
         // A broken custom shader is rejected with a message, not a panic.
         let broken = CustomShader::new(
             "broken",
@@ -1167,6 +1285,60 @@ mod tests {
             validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, false, layered, Some(&ok)))
                 .unwrap_or_else(|e| panic!("{e}"));
         }
+    }
+
+    /// Regression: `var<workgroup>` passed validation. WGSL allows workgroup memory in compute
+    /// shaders only, but naga accepts it in any stage, and the hooks run in the vertex and
+    /// fragment stages, where backends disagree: Metal ran such a shader, wgpu's GL backend
+    /// failed to translate it ("doesn't support COMPUTE_SHADER" on ANGLE / GLES 3.0), browsers
+    /// reject it (asynchronously: frames drawn with it are lost until then). It is now
+    /// rejected up front on every backend, used or not. So are pipeline constants (`override`)
+    /// without a default: the forward pipeline sets none, so creating it would fail.
+    #[test]
+    fn custom_shaders_cannot_use_workgroup_memory_or_unset_overrides() {
+        let fragment = |body: &str| format!("fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> {{ {body} }}");
+        for (wgsl, expected) in [
+            (
+                format!(
+                    "var<workgroup> tile: array<vec4<f32>, 4>;\n{}",
+                    fragment("tile[0] = c; return tile[0];")
+                ),
+                "`var<workgroup> tile`",
+            ),
+            (
+                "var<workgroup> clip: vec4<f32>;\n\
+                 fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {\n\
+                 \x20   var o = out;\n    clip = o.clip;\n    o.clip = clip * 0.5;\n    return o;\n}\n"
+                    .to_string(),
+                "`var<workgroup> clip`",
+            ),
+            (
+                format!("var<workgroup> unused: u32;\n{}", fragment("return c;")),
+                "`var<workgroup> unused`",
+            ),
+            (
+                format!("override strength: f32;\n{}", fragment("return c * strength;")),
+                "`override strength`",
+            ),
+        ] {
+            let custom = CustomShader::new("portability", wgsl);
+            for layered in [false, true] {
+                let src = forward_shader(InstanceTransform::LAYOUT, false, layered, Some(&custom));
+                validate(&src); // naga alone accepts it
+                let e = validate_custom_wgsl(&src).unwrap_err();
+                assert!(e.contains(expected), "{e}");
+            }
+        }
+        // Private variables and overrides with a default are portable.
+        let ok = CustomShader::new(
+            "ok",
+            format!(
+                "override strength: f32 = 0.5;\nvar<private> k: vec4<f32>;\n{}",
+                fragment("k = c; return k * strength;")
+            ),
+        );
+        validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, false, false, Some(&ok)))
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// The generated accessors read the attributes the layout declares.

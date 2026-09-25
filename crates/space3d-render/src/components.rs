@@ -187,13 +187,19 @@ pub enum RenderTarget {
 pub struct Camera3d {
     /// Projection.
     pub projection: Projection,
-    /// Linear clear color; `None` keeps the previous contents (for overlay cameras).
+    /// Linear clear color of the camera's viewport (the whole target without one); `None`
+    /// draws over what cameras with a lower `order` drew into the same target this frame (for
+    /// overlay cameras). The first camera drawing into a target in a frame always starts from
+    /// a cleared target: black wherever its own clear color does not apply.
     pub clear_color: Option<Vec4>,
     /// Render target.
     pub target: RenderTarget,
     /// Cameras render in ascending `order`.
     pub order: i32,
-    /// Normalized viewport `[x, y, width, height]` in 0..1; `None` = full target.
+    /// Normalized viewport `[x, y, width, height]` in 0..1, from the top left; `None` = full
+    /// target. Its edges are rounded to whole pixels (the same on every backend; neighbouring
+    /// viewports share edges exactly). The camera clears and draws only inside it, so several
+    /// cameras can share a target (split screen, picture-in-picture, minimaps).
     pub viewport: Option<[f32; 4]>,
     /// Inactive cameras are skipped.
     pub active: bool,

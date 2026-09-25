@@ -267,3 +267,25 @@ fn custom_shaders_declaring_their_own_bindings_fall_back() {
     );
     assert_eq!(r.gpu_error_count(), 0);
 }
+
+/// Workgroup memory exists only in compute shaders: naga accepts `var<workgroup>` in the
+/// vertex and fragment hooks, but backends disagree about it (GL rejects it, browsers only
+/// report it asynchronously). It is rejected before any GPU work, like declared bindings, on
+/// every backend — the draws use the built-in shader and `shader_error` says why.
+#[test]
+fn custom_shaders_using_workgroup_memory_fall_back() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let shader = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+        "workgroup",
+        "var<workgroup> tint: vec4<f32>;\n\
+         fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {\n\
+         \x20   tint = vec4<f32>(1.0, 0.0, 0.0, 1.0);\n    return tint;\n}\n",
+    ));
+    scene(&mut app, Material::unlit(Vec4::ONE).with_shader(shader));
+    let img = render_to_image(&mut app).expect("capture");
+    assert_eq!(img.get(20, 32), [255, 255, 255, 255], "built-in shader");
+    let r = app.resources.expect::<Renderer>();
+    let err = r.shader_error(shader).unwrap_or_default();
+    assert!(err.contains("`var<workgroup> tint`"), "{err}");
+    assert_eq!(r.gpu_error_count(), 0);
+}

@@ -199,4 +199,52 @@ fn steady_state_frames_allocate_a_small_constant_amount() {
             "{path:?}: {live_growth} bytes still allocated after {FRAMES} frames"
         );
     }
+
+    // Viewport clears (split screen, picture-in-picture) draw one triangle whose color is the
+    // pass's blend constant: no buffer, bind group or allocation per frame. Two viewport
+    // cameras with clear colors allocate as much as the same cameras without (whose passes
+    // only load the target) — measured exactly equal on Metal; other backends' command
+    // recording may grow its lists once more.
+    let path = best_path(&app);
+    set_path(&mut app, path);
+    let viewports: Vec<Entity> = [[0.6, 0.05, 0.3, 0.3], [0.05, 0.6, 0.3, 0.3]]
+        .into_iter()
+        .enumerate()
+        .map(|(i, viewport)| {
+            app.world.spawn((
+                Transform::from_xyz(0.0, 0.0, 12.0),
+                Camera3d {
+                    order: 1 + i as i32,
+                    viewport: Some(viewport),
+                    clear_color: None,
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect();
+    let mut mean_per_frame = |app: &mut App| {
+        for _ in 0..WARM_UP {
+            step(app);
+        }
+        let live_before = LIVE_BYTES.load(Relaxed);
+        let total: u64 = (0..FRAMES).map(|_| step(app).0).sum();
+        let live_growth = LIVE_BYTES.load(Relaxed) - live_before;
+        assert!(live_growth < 256 << 10, "{live_growth} bytes still allocated");
+        assert_eq!(stats(app).cpu_reallocations, 0);
+        total as f64 / FRAMES as f64
+    };
+    let loading = mean_per_frame(&mut app);
+    for &e in &viewports {
+        app.world.get::<&mut Camera3d>(e).unwrap().clear_color = Some(Vec4::new(1.0, 1.0, 0.0, 1.0));
+    }
+    let clearing = mean_per_frame(&mut app);
+    eprintln!(
+        "{path:?} on {backend:?} + 2 viewport cameras: allocations per frame {loading:.1} without \
+         clear colors, {clearing:.1} with (viewport clears)"
+    );
+    let slack = if backend == wgpu::Backend::Metal { 0.5 } else { 4.0 };
+    assert!(
+        clearing <= loading + slack,
+        "{path:?}: viewport clears allocate: {loading:.1} → {clearing:.1} per frame"
+    );
 }

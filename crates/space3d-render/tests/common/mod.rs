@@ -284,12 +284,48 @@ pub mod scenes {
         &[[255, 0, 0], [0, 255, 0]]
     }
 
-    pub const ALL: [(&str, Scene); 6] = [
+    /// Viewport cameras over a full-screen one: a picture-in-picture with its own clear color
+    /// (cleared with a scissored triangle, not a load op) and an overlay without one. GL's
+    /// viewport and scissor origin is the bottom left; wgpu flips them.
+    pub fn viewports(app: &mut App) -> &'static [[u8; 3]] {
+        camera(app);
+        let cube = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(2.0));
+        let unlit = |r, g, b| Material::unlit(Vec4::new(r, g, b, 1.0));
+        app.world
+            .spawn((Transform::from_xyz(-1.5, 0.0, 0.0), Mesh3d(cube), unlit(1.0, 0.0, 0.0)));
+        app.world
+            .spawn((Transform::from_xyz(50.0, 0.0, 0.0), Mesh3d(cube), unlit(0.0, 1.0, 0.0)));
+        app.world
+            .spawn((Transform::from_xyz(-50.0, 0.0, 0.0), Mesh3d(cube), unlit(1.0, 0.0, 1.0)));
+        // Top right, yellow.
+        app.world.spawn((
+            Transform::from_xyz(50.0, 0.0, 6.0),
+            Camera3d {
+                order: 1,
+                viewport: Some([0.6, 0.1, 0.35, 0.4]),
+                ..Camera3d::default().with_clear_color(Vec4::new(1.0, 1.0, 0.0, 1.0))
+            },
+        ));
+        // Bottom right, no clear color.
+        app.world.spawn((
+            Transform::from_xyz(-50.0, 0.0, 6.0),
+            Camera3d {
+                order: 2,
+                viewport: Some([0.55, 0.55, 0.4, 0.4]),
+                clear_color: None,
+                ..Default::default()
+            },
+        ));
+        &[[0, 0, 255], [255, 0, 0], [255, 255, 0], [0, 255, 0], [255, 0, 255]]
+    }
+
+    pub const ALL: [(&str, Scene); 7] = [
         ("meshes", meshes),
         ("textured", textured),
         ("render_target", render_target),
         ("array_mips", array_mips),
         ("six_layers", six_layers),
         ("bgra_instances", bgra_instances),
+        ("viewports", viewports),
     ];
 }

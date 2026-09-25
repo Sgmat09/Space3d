@@ -21,7 +21,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
 | `dirty.rs` | `DirtyRanges`: sorted, coalescing range set |
 | `stats.rs` | `RenderStats`, `DrawPath` |
-| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl` |
+| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears) |
 
 ## Frame data flow
 
@@ -59,6 +59,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  encoder: [uploads] → copy templates→args → clear counts
           → compute(mark → scan → scatter [+compact]) → copy args → stats readback ring
           → per view: [copy own render target → feedback texture] → render pass
+                      (first pass into a target clears it; viewport: scissor [+ clear triangle])
           → submit → present → staging recall → poll(Poll)
  next frames: read the mapped args copy (visible counts) into RenderStats
 ```
@@ -173,7 +174,8 @@ GPU culling (`shaders/cull.wgsl`):
   (either costs wgpu an allocation per frame). The dispatch count therefore depends on the
   number of source buffers, not on buffers × views: 120 explicit buffers seen by 13 views
   take 241 dispatches (it was 3121 with a mark + scatter dispatch per view and buffer —
-  `frame::tests::culling_dispatches_scale_with_buffers_not_views`).
+  `frame::tests::culling_dispatches_scale_with_buffers_not_views`, which also checks that each
+  of its 70 viewports shows exactly its own camera's objects and clear color on every path).
 * **Order-preserving compaction** in three dispatches, so GPU paths draw visible instances in
   exactly the CPU path's order (alpha blending and equal-depth surfaces are deterministic):
   1. `cull_mark`: 64 instances per workgroup; the frustum test result becomes a 64-bit mask
@@ -213,6 +215,45 @@ pipeline, whatever the spawn order; runs of one material's meshes are contiguous
 multi-draw paths merge them. `RenderStats::pipeline_switches` / `material_switches` count the
 binds (`tests/instancing.rs::batches_are_ordered_by_pipeline_then_material_then_mesh`).
 
+## Cameras and viewports
+Cameras render in ascending `order` (ties: entity id), each in its own render pass. Cameras
+sharing a target (split screen, picture-in-picture, minimaps, overlays) draw into the same
+attachments, so per target and frame:
+
+* The first pass into a target clears it: with the camera's clear color if the camera covers
+  the whole target, otherwise black (never last frame's content — undefined for swapchain
+  images anyway — and never a viewport's clear color outside the viewport). Later passes load
+  what the earlier ones drew; a later camera covering the whole target with a clear color
+  clears it all.
+* A camera's viewport (`[x, y, w, h]`, normalized, top left origin) is rounded to whole
+  pixels — each edge to the nearest pixel boundary, at least one pixel — for its projection's
+  aspect ratio, the pass's viewport and its scissor rect (its part within the target). GL
+  takes integer viewports (wgpu's GL backend truncates position and size separately, which
+  shifted fractional viewports by a pixel and opened gaps between neighbours), so every backend
+  draws the same pixels and neighbouring viewports share their edges exactly. With a clear
+  color the camera then clears just that rectangle by drawing one triangle over the viewport
+  (`Pipelines::viewport_clear`, `shaders/clear.wgsl`): the color is the pass's *blend
+  constant* (blend factors `Constant`/`Zero`), so the pipeline needs no buffer or bind group
+  and one pipeline per (target format, sample count) serves every color — nothing is written
+  or allocated per frame. It uses the pass's color format and sample count and neither tests
+  nor writes depth. The color goes through the same sRGB handling as a clear load op
+  (hardware encoding on sRGB targets, `manual_srgb` encoding on the CPU otherwise), and
+  `Rgba16Float` targets get unclamped HDR colors (checked on Metal and ANGLE).
+* Before a pass with a viewport ends, an MSAA pass resets its scissor rect to the whole
+  target: wgpu's GL backend resolves MSAA with a framebuffer blit at the end of the pass, and
+  GL clips blits to the scissor rect, so only the viewport was resolved and the rest of the
+  target kept the previous frame (caught on ANGLE by
+  `tests/headless.rs::the_first_view_of_a_frame_clears_its_target`).
+* Depth is per camera: every pass clears the whole depth attachment and discards it, so a
+  camera never tests against another's geometry.
+
+This is identical on every draw path (`tests/headless.rs`: split screen with and without MSAA,
+picture-in-picture over a full-screen camera, an overlay without a clear color, the first-pass
+rule across frames, two viewports sharing a render target; `frame::tests::
+viewport_clear_writes_every_target_format` clears sRGB, linear 8/10-bit and `Rgba16Float`
+targets at 1 and 4 samples; the `viewports` portability scene matches the default backend
+on GL in `tests/gl.rs`).
+
 ## Custom shaders
 A `CustomShader` is WGSL spliced into the built-in forward shader, registered with
 `RenderAssets::add_shader` and selected per material with `Material::with_shader`. It defines
@@ -235,17 +276,22 @@ pipelines, cached like the built-in ones; the material's shader is part of its i
 of the batch order. `update_shader` (hot reload) bumps a version that drops the old
 pipelines; `remove_shader` reverts its materials to the built-in shader, and the pipelines of
 removed shaders are released at the next 256-frame sweep. A custom shader is validated with
-naga first (the portable capability set), which includes a check that it declares no
-resources of its own — naga accepts those, but the forward pipeline layout has no bindings for
-them, so their pipeline would be invalid. Its pipeline is then created inside validation and
-internal error scopes, so no error reaches the uncaptured-error handler: a failure is logged
-once, reported by `Renderer::shader_error`, and the draws of that pipeline key fall back to the
-built-in shader. Native backends answer the scopes immediately. In the browser the answer
+naga first (the portable capability set), plus what naga accepts but the forward pipeline
+cannot run alike on every backend: resources of its own (the forward pipeline layout has no
+bindings for them, so their pipeline would be invalid), workgroup memory (`var<workgroup>`,
+used or not: WGSL allows it in compute shaders only, and backends disagree about it in the
+vertex and fragment stages the hooks run in — Metal accepts it, GL and browsers reject it),
+any other address space but `function`/`private`, and `override` constants without a default
+(the pipeline sets none). Its pipeline is then created inside validation and internal error
+scopes, so no error reaches the uncaptured-error handler: a failure is logged once, reported
+by `Renderer::shader_error`, and the draws of that pipeline key fall back to the built-in
+shader. Native backends answer the scopes immediately. In the browser the answer
 arrives asynchronously: the pipeline is used meanwhile, the answer is polled every frame
 (`Pipelines::poll_pending`), and an invalid pipeline is then replaced by the built-in one —
 so an invalid custom pipeline costs at most the few frames until the browser answers
 (`frame::tests::custom_pipelines_rejected_asynchronously_fall_back` injects such an answer;
-`tests/custom_shader.rs::custom_shaders_declaring_their_own_bindings_fall_back`).
+`tests/custom_shader.rs::custom_shaders_declaring_their_own_bindings_fall_back`,
+`custom_shaders_using_workgroup_memory_fall_back`).
 Culling still uses the instance's position and scale (a vertex hook that moves geometry far
 outside the mesh bounds can be culled while visible).
 
@@ -427,7 +473,11 @@ shader allocates 82–86 times per frame on `CpuDirect` and 191–195 on the GPU
 (test profile; 4 batches, 3 pipeline binds and, on GPU paths, 7 compute dispatches —
 wgpu-hal's Metal backend allocates in every dispatch and pipeline bind). The test fails above 95 / 215 (Metal;
 twice that on other backends, whose wgpu-hal code differs), if the second half of 120 frames
-allocates more on average than the first, or if 256 KiB or more stays allocated.
+allocates more on average than the first, or if 256 KiB or more stays allocated. It then adds
+two viewport cameras and checks that giving them clear colors (a viewport-clear draw each, see
+[Cameras and viewports](#cameras-and-viewports)) allocates nothing more: 314.6 per frame with
+and without on `GpuMultiDraw` / Metal, 133.7 on `CpuDirect` / ANGLE (each extra render pass
+itself costs wgpu about 40 on Metal).
 
 ## RenderStats
 `draw_calls`, `indirect_draw_calls`, `multi_draw_calls`, `batches`, `instances`,
@@ -569,5 +619,9 @@ instances, 2 views) are unchanged within noise (25 → 9 dispatches).
   `InstanceBuffer`s anyway.
 * Render targets larger than `max_texture_dimension_2d` are not created, and the primary
   target is clamped to it (see Buffer lifetimes).
-* Custom shaders are hooks inside the forward shader: they cannot declare bindings or replace
-  the lighting model's inputs, and culling ignores vertex displacement.
+* Custom shaders are hooks inside the forward shader: they cannot declare bindings, workgroup
+  memory or unset pipeline constants, or replace the lighting model's inputs, and culling
+  ignores vertex displacement.
+* Viewport clear colors above 1 (HDR) rely on unclamped blend constants (verified on Metal
+  and ANGLE); a GL driver that clamps them, as OpenGL ES 2.0 did, clamps such viewport clears
+  to 1 (whole-target clears are load ops and unaffected).

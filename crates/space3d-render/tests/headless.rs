@@ -694,3 +694,320 @@ fn a_lost_device_degrades_instead_of_panicking() {
         assert!(render_to_image(&mut app).is_none());
     }
 }
+
+// ---- viewport cameras ------------------------------------------------------------------------
+
+const RED: [u8; 3] = [255, 0, 0];
+const GREEN: [u8; 3] = [0, 255, 0];
+const BLUE: [u8; 3] = [0, 0, 255];
+const YELLOW: [u8; 3] = [255, 255, 0];
+const MAGENTA: [u8; 3] = [255, 0, 255];
+const WHITE: [u8; 3] = [255, 255, 255];
+const BLACK: [u8; 3] = [0, 0, 0];
+
+/// Linear color of a 0/255-channel color (exact in sRGB).
+fn linear(rgb: [u8; 3]) -> Vec4 {
+    Vec4::new(rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, 255.0) / 255.0
+}
+
+/// Pixels in columns `xs` × rows `ys` whose RGB is exactly `rgb`.
+fn count_in(img: &ImageData, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>, rgb: [u8; 3]) -> usize {
+    ys.flat_map(|y| xs.clone().map(move |x| (x, y)))
+        .filter(|&(x, y)| img.get(x, y)[..3] == rgb)
+        .count()
+}
+
+/// Unlit ECS cube.
+fn ecs_cube(app: &mut App, mesh: MeshHandle, at: Vec3, rgb: [u8; 3]) {
+    app.world.spawn((
+        Transform::from_xyz(at.x, at.y, at.z),
+        Mesh3d(mesh),
+        Material::unlit(linear(rgb)),
+    ));
+}
+
+/// Unlit cube in an explicit instance buffer (GPU-culled on GPU paths).
+fn instanced_cube(app: &mut App, mesh: MeshHandle, at: Vec3, rgb: [u8; 3]) {
+    let data = vec![InstanceTransform::from_trs(at, Quat::IDENTITY, Vec3::ONE)];
+    let instances = app
+        .resources
+        .expect_mut::<InstanceBuffers>()
+        .insert(InstanceBuffer::from_vec(data, BufferUsage::Static));
+    app.world.spawn((InstancedMesh {
+        mesh,
+        material: Material::unlit(linear(rgb)),
+        instances,
+    },));
+}
+
+/// Camera at `at` looking down -Z.
+fn camera_at(app: &mut App, at: Vec3, order: i32, viewport: Option<[f32; 4]>, clear: Option<[u8; 3]>) -> Entity {
+    app.world.spawn((
+        Transform::from_xyz(at.x, at.y, at.z),
+        Camera3d {
+            order,
+            viewport,
+            clear_color: clear.map(linear),
+            ..Default::default()
+        },
+    ))
+}
+
+/// Headless app with `samples`× MSAA.
+fn msaa_app(width: u32, height: u32, samples: u32) -> Option<App> {
+    let mut app = headless_app(width, height)?;
+    app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+    Some(app)
+}
+
+/// Render on every draw path the adapter has: each must equal the `CpuDirect` image, which is
+/// returned.
+fn render_every_path(app: &mut App) -> ImageData {
+    let best = best_path(app);
+    set_path(app, DrawPath::CpuDirect);
+    let cpu = render_to_image(app).expect("capture");
+    for path in paths_up_to(best).into_iter().skip(1) {
+        set_path(app, path);
+        let img = render_to_image(app).expect("capture");
+        let d = diff_fraction(&cpu, &img, 2);
+        assert_eq!(d, 0.0, "{path:?}: {:.2}% of pixels differ from CpuDirect", d * 100.0);
+    }
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    cpu
+}
+
+/// Regression: every camera with a clear color cleared the whole target, so the second camera
+/// of a split screen wiped the first one's half. Each half now keeps its own clear color and
+/// objects — with and without MSAA, on every draw path.
+#[test]
+fn split_screen_viewports_keep_each_others_pixels() {
+    for samples in [1, 4] {
+        let Some(mut app) = msaa_app(128, 64, samples) else {
+            return;
+        };
+        let cube = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(2.0));
+        // Each player's camera looks at its own object, far from the other one's.
+        ecs_cube(&mut app, cube, Vec3::new(-50.0, 0.0, 0.0), GREEN);
+        instanced_cube(&mut app, cube, Vec3::new(50.0, 0.0, 0.0), MAGENTA);
+        camera_at(
+            &mut app,
+            Vec3::new(-50.0, 0.0, 6.0),
+            0,
+            Some([0.0, 0.0, 0.5, 1.0]),
+            Some(RED),
+        );
+        camera_at(
+            &mut app,
+            Vec3::new(50.0, 0.0, 6.0),
+            1,
+            Some([0.5, 0.0, 0.5, 1.0]),
+            Some(BLUE),
+        );
+        let img = render_every_path(&mut app);
+        for (half, xs, clear, object, others) in [
+            ("left", 0..64, RED, GREEN, [BLUE, MAGENTA]),
+            ("right", 64..128, BLUE, MAGENTA, [RED, GREEN]),
+        ] {
+            let n = |rgb| count_in(&img, xs.clone(), 0..64, rgb);
+            assert!(n(clear) > 3000, "{samples}x: {half} clear color covers {} px", n(clear));
+            assert!(n(object) > 300, "{samples}x: {half} object covers {} px", n(object));
+            for o in others {
+                assert_eq!(n(o), 0, "{samples}x: {half} half shows {o:?}");
+            }
+        }
+    }
+}
+
+/// A picture-in-picture camera (small viewport, drawn after the main camera) clears and draws
+/// only its rectangle; the main camera's image around it survives. Every view starts with a
+/// cleared depth buffer and the viewport clear writes no depth: the PiP scene lies deeper
+/// (in its own camera's space) than the main scene's objects under the rectangle, yet shows.
+#[test]
+fn picture_in_picture_keeps_the_main_view() {
+    for samples in [1, 4] {
+        let Some(mut app) = msaa_app(128, 96, samples) else {
+            return;
+        };
+        let (big, small, huge) = {
+            let a = app.resources.expect_mut::<RenderAssets>();
+            (
+                a.add_mesh(MeshData::cube(3.0)),
+                a.add_mesh(MeshData::cube(1.0)),
+                a.add_mesh(MeshData::cube(16.0)),
+            )
+        };
+        // Main view: a red cube in the middle and a white one close to the camera, under the
+        // PiP.
+        ecs_cube(&mut app, big, Vec3::ZERO, RED);
+        ecs_cube(&mut app, small, Vec3::new(0.87, 0.62, 4.0), WHITE);
+        camera_at(&mut app, Vec3::new(0.0, 0.0, 6.0), 0, None, Some(BLUE));
+        // PiP: a green cube 18 units away, top right (x 80..120, y 6..38).
+        instanced_cube(&mut app, huge, Vec3::new(50.0, 0.0, -20.0), GREEN);
+        camera_at(
+            &mut app,
+            Vec3::new(50.0, 0.0, 6.0),
+            1,
+            Some([0.625, 0.0625, 0.3125, 1.0 / 3.0]),
+            Some(YELLOW),
+        );
+        let img = render_every_path(&mut app);
+        let inside = |rgb| count_in(&img, 81..119, 7..37, rgb);
+        assert!(inside(YELLOW) > 200, "{samples}x: PiP clear: {} px", inside(YELLOW));
+        assert!(inside(GREEN) > 200, "{samples}x: PiP object: {} px", inside(GREEN));
+        for c in [BLUE, RED, WHITE] {
+            assert_eq!(inside(c), 0, "{samples}x: {c:?} inside the PiP");
+        }
+        let all = |rgb| count_in(&img, 0..128, 0..96, rgb);
+        let pip = |rgb| count_in(&img, 80..120, 6..38, rgb);
+        let outside = |rgb| all(rgb) - pip(rgb);
+        assert!(outside(BLUE) > 4000, "{samples}x: main clear: {} px", outside(BLUE));
+        assert!(outside(RED) > 1500, "{samples}x: main red cube: {} px", outside(RED));
+        assert!(
+            outside(WHITE) > 100,
+            "{samples}x: main white cube: {} px",
+            outside(WHITE)
+        );
+        for c in [YELLOW, GREEN] {
+            assert_eq!(outside(c), 0, "{samples}x: {c:?} outside the PiP");
+        }
+    }
+}
+
+/// A viewport camera without a clear color draws over what earlier cameras left in its
+/// rectangle — here the full-screen camera's image, after another viewport camera (with a
+/// clear color) drew the other half.
+#[test]
+fn viewport_without_clear_color_draws_over_earlier_cameras() {
+    for samples in [1, 4] {
+        let Some(mut app) = msaa_app(128, 64, samples) else {
+            return;
+        };
+        let (cube, small) = {
+            let a = app.resources.expect_mut::<RenderAssets>();
+            (a.add_mesh(MeshData::cube(2.0)), a.add_mesh(MeshData::cube(1.5)))
+        };
+        // Full screen: blue, with a red cube in the right half (x 75..89, y 11..25).
+        ecs_cube(&mut app, small, Vec3::new(2.0, 1.5, 0.0), RED);
+        camera_at(&mut app, Vec3::new(0.0, 0.0, 6.0), 0, None, Some(BLUE));
+        // Left half: yellow, with a green cube.
+        ecs_cube(&mut app, cube, Vec3::new(-50.0, 0.0, 0.0), GREEN);
+        camera_at(
+            &mut app,
+            Vec3::new(-50.0, 0.0, 6.0),
+            1,
+            Some([0.0, 0.0, 0.5, 1.0]),
+            Some(YELLOW),
+        );
+        // Right half, no clear color: a magenta cube below the red one (y 39..53).
+        instanced_cube(&mut app, small, Vec3::new(50.0, -1.5, 0.0), MAGENTA);
+        camera_at(&mut app, Vec3::new(50.0, 0.0, 6.0), 2, Some([0.5, 0.0, 0.5, 1.0]), None);
+        let img = render_every_path(&mut app);
+        let left = |rgb| count_in(&img, 0..64, 0..64, rgb);
+        let right = |rgb| count_in(&img, 64..128, 0..64, rgb);
+        assert!(
+            left(YELLOW) > 3000 && left(GREEN) > 300,
+            "{samples}x: {} {}",
+            left(YELLOW),
+            left(GREEN)
+        );
+        for c in [BLUE, RED, MAGENTA] {
+            assert_eq!(left(c), 0, "{samples}x: {c:?} in the left half");
+        }
+        assert!(
+            right(BLUE) > 3000,
+            "{samples}x: earlier camera's clear color kept: {} px",
+            right(BLUE)
+        );
+        assert!(
+            right(RED) > 100,
+            "{samples}x: earlier camera's object kept: {} px",
+            right(RED)
+        );
+        assert!(
+            right(MAGENTA) > 100,
+            "{samples}x: overlay object: {} px",
+            right(MAGENTA)
+        );
+        for c in [YELLOW, GREEN] {
+            assert_eq!(right(c), 0, "{samples}x: {c:?} in the right half");
+        }
+    }
+}
+
+/// The first camera drawing into a target in a frame starts from a cleared target: with its
+/// clear color where it covers the target, otherwise black — never the previous frame's
+/// content, and never its clear color outside its viewport. With MSAA the whole target is
+/// resolved, not only the viewport (wgpu's GL backend clips its resolve blit to the scissor
+/// rect).
+#[test]
+fn the_first_view_of_a_frame_clears_its_target() {
+    for samples in [1, 4] {
+        let Some(mut app) = msaa_app(128, 64, samples) else {
+            return;
+        };
+        let cube = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(2.0));
+        ecs_cube(&mut app, cube, Vec3::new(-50.0, 0.0, 0.0), GREEN);
+        let full = camera_at(&mut app, Vec3::new(0.0, 0.0, 6.0), 0, None, Some(WHITE));
+        let img = render_every_path(&mut app);
+        assert_eq!(count_in(&img, 0..128, 0..64, WHITE), 128 * 64);
+
+        app.world.get::<&mut Camera3d>(full).unwrap().active = false;
+        let left = camera_at(
+            &mut app,
+            Vec3::new(-50.0, 0.0, 6.0),
+            0,
+            Some([0.0, 0.0, 0.5, 1.0]),
+            Some(RED),
+        );
+        let img = render_every_path(&mut app);
+        assert!(count_in(&img, 0..64, 0..64, RED) > 3000, "{samples}x");
+        assert!(count_in(&img, 0..64, 0..64, GREEN) > 300, "{samples}x");
+        assert_eq!(
+            count_in(&img, 64..128, 0..64, BLACK),
+            64 * 64,
+            "{samples}x: outside the viewport"
+        );
+
+        app.world.get::<&mut Camera3d>(left).unwrap().clear_color = None;
+        let img = render_every_path(&mut app);
+        let n = |xs, rgb| count_in(&img, xs, 0..64, rgb);
+        assert!(n(0..64, GREEN) > 300, "{samples}x");
+        assert_eq!(n(0..128, RED) + n(0..128, WHITE), 0, "{samples}x: no stale content");
+        assert_eq!(n(64..128, BLACK), 64 * 64, "{samples}x: no clear color: black");
+        if samples == 1 {
+            assert_eq!(n(0..64, BLACK) + n(0..64, GREEN), 64 * 64, "no clear color: black");
+        }
+    }
+}
+
+/// Viewports work the same in render targets: two cameras fill the halves of one target,
+/// which a monitor in the main view shows.
+#[test]
+fn viewports_share_a_render_target() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let (cube, rt) = {
+        let a = app.resources.expect_mut::<RenderAssets>();
+        (a.add_mesh(MeshData::cube(1.0)), a.add_render_target(32, 32))
+    };
+    app.world.spawn((
+        Transform::default(),
+        Mesh3d(cube),
+        Material::unlit(Vec4::ONE).with_texture(rt),
+    ));
+    for (x, order, clear) in [(0.0, -2, RED), (0.5, -1, GREEN)] {
+        app.world.spawn((
+            Transform::from_xyz(1000.0, 0.0, 0.0),
+            Camera3d {
+                order,
+                target: RenderTarget::Texture(rt),
+                viewport: Some([x, 0.0, 0.5, 1.0]),
+                clear_color: Some(linear(clear)),
+                ..Default::default()
+            },
+        ));
+    }
+    camera_at(&mut app, Vec3::new(0.0, 0.0, 2.5), 0, None, Some(BLUE));
+    let img = render_every_path(&mut app);
+    let n = |rgb| count_in(&img, 0..64, 0..64, rgb);
+    assert!(n(RED) > 150 && n(GREEN) > 150, "red {} green {}", n(RED), n(GREEN));
+}
