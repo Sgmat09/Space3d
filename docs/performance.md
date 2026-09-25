@@ -242,3 +242,22 @@ The SceneRead pass (one render pass) accounts for about 30 of the 43 extra; `cpu
 (load average 5–13, so single runs vary by up to 3×): the quietest pair measured 60.9 µs (F4) and
 60.5 µs (F5/F6); `frame/throughput/direct` 112.0 µs (F4 recorded 113.6 µs). The node and
 overlay-stage bookkeeping is below the measurement noise.
+
+### F-core review — Direct-mode CPU on a loaded machine
+
+A review A/B of `render_frame` (main at eb77fef vs `graphics`, same harness, 1080p headless,
+Direct mode, medians of 120 frames) saw `explicit/200k` on the CPU path at 192 µs vs 206 µs.
+Wall-clock medians are not usable on this shared machine: the same binary measured 198 µs and
+45 µs in consecutive runs (load average 20–110; the process lands on efficiency cores or not).
+Instructions retired per frame (`/usr/bin/time -l`, slope between 1000 and 3000 frames, so setup
+cancels; includes the Metal driver and the GPU wait) do not depend on the load:
+
+| scene (CPU path) | main | graphics | delta |
+|---|---|---|---|
+| 200k explicit instances, 1 batch | 662 k | 657 k | −0.7 % |
+| 10k ECS cubes, 7 batches | 5.30 M | 5.18 M | −2.2 % |
+| empty (camera only) | 548 k | 559 k | +2.0 % (+11 k: plan, nodes, overlay stages, post bookkeeping) |
+
+Direct mode costs the same work per frame as before the upgrade, plus a fixed ~11 k
+instructions (a few µs). The ±5 % gate on `benches/instancing.rs` still needs its wall-clock
+re-run on a quiet machine before Phase I records final values.

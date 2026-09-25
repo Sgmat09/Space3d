@@ -8,9 +8,13 @@ has not implemented the behaviour yet. Stubs never panic.
 ## Semver policy (spec §2.7)
 
 Code written against Space3d 249c874 (what SpaceCorps2027 pins) keeps compiling and renders the
-same pixels by default. `crates/space3d/tests/api_compat_249c874.rs` compiles the game's own forms
-of every touched type; `crates/space3d/tests/prelude_policy.rs` checks the prelude additions
-against every type name of the game.
+same pixels by default — with up to 16 point lights. With more, each view is lit by the 16
+nearest to its camera instead of the first 16 in query order (spec D19, §2.7): a scene with more
+than 16 point lights renders differently (the farthest lights go unlit instead of the last
+queried). Migration notes must say so.
+`crates/space3d/tests/api_compat_249c874.rs` compiles the game's own forms of every touched type;
+`crates/space3d/tests/prelude_policy.rs` checks the prelude additions against every type name of
+the game.
 
 * **Config structs** (`FrameSettings`, `CameraFrame`, `RenderTargetDesc`, `DownlevelOverride`,
   `PostProcess` and its effect structs, `LightingSettings`, `IblSettings`, `DirectionalShadow`,
@@ -92,6 +96,15 @@ Additions made by the foundation since F2 (additive):
   keep working.
 * F5: `frame::extract::material_class(&Material) -> u8` is the one place pipeline class bits
   come from (P-MAT extends it for bits 2..=5; `Renderer::prewarm` uses it).
+* F-core review (spec §1.8, §1.10, §2.2.4, §2.2.5 amended):
+  * `scene_wgsl_for(DepthAccess)` (crate root) and `OverlayScene::{depth_access(), scene_wgsl()}`:
+    HdrScene overlays compose the group-1 module of their pass (`scene_wgsl` needs a
+    `PassTarget`, which only node contexts carry).
+  * `PostState::distortion_target`'s `rect` is the post group's rect in `S` (`D` rect × render
+    scale), as the frame has always passed it; the buffer is half (or all) of that.
+  * Capture replays render the scene views of an intermediate primary group into `S` when the
+    frame skipped them (no surface texture); `GroupTextures::scene_frame` records the frame `S`
+    holds. `capture_scene_hdr` does the same, and errs when the last frame had no primary view.
 
 ## Ownership map (spec §3.6)
 

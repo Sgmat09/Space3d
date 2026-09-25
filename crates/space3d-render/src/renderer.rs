@@ -999,7 +999,10 @@ impl Renderer {
     /// Read back the primary target of the last rendered frame as sRGB RGBA8.
     ///
     /// Headless: copies the offscreen target. Windowed: re-renders the last frame's primary
-    /// views into the offscreen target first (surface textures are not readable).
+    /// views into the offscreen target first (surface textures are not readable). A
+    /// post-processed primary target composites its persisted scene color again, and also
+    /// re-renders its scene views when the frame skipped them (no surface texture: occluded or
+    /// minimized window).
     /// Poll the returned task from a system, `.block()` it in tests, or `.wait().await` it.
     ///
     /// Never blocks: on native a background task resolves it with non-blocking device polls
@@ -1169,7 +1172,10 @@ impl Renderer {
     /// overlays, before post (graphics spec §1.10) — as linear float pixels: `Rgba16Float`
     /// as stored, `Rg11b10Ufloat` with alpha 1, the Ldr fallback's `Rgba8UnormSrgb` decoded.
     /// `Err(RenderError::Capture)` when the primary group rendered in Direct mode (no post
-    /// camera and render scale 1): there is no scene texture. For tests and tools; never blocks.
+    /// camera and render scale 1): there is no scene texture — or when the last frame had no
+    /// primary view. A window whose last frame got no surface texture (occluded, minimized;
+    /// always so in background mode on macOS) skipped its scene views: they are rendered into
+    /// `S` first, like [`Self::capture`]'s replay does. For tests and tools; never blocks.
     pub fn capture_scene_hdr(&mut self) -> Task<Result<space3d_core::HdrImageData, RenderError>> {
         let submitted = self.submit_scene_capture();
         #[cfg(not(target_arch = "wasm32"))]
@@ -1236,22 +1242,42 @@ impl Renderer {
         ),
         RenderError,
     > {
-        let Some(t) = self.frame.intermediate_textures(crate::frame::GroupTarget::Primary) else {
+        let primary = crate::frame::GroupTarget::Primary;
+        let Some(t) = self.frame.intermediate_textures(primary) else {
             return Err(RenderError::Capture(
                 "the primary target rendered in Direct mode (no post camera, render scale 1): there \
                  is no scene texture"
                     .into(),
             ));
         };
-        let texture = t.scene.clone();
-        let format = texture.format();
-        let (w, h) = (texture.width(), texture.height());
-        let texel = format.block_copy_size(None).unwrap_or(4) as u64;
-        let padded = align_up(w as u64 * texel, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
+        // A window whose surface texture was unavailable (occluded, minimized) skipped the scene
+        // views: render them into `S` first, as a capture replay does (the windowed offscreen
+        // target it also composites into only serves captures). Headless frames always render
+        // them, unless the frame had no primary scene view: `S` is then an older frame's.
+        let stale = t.scene_frame != self.frame_index;
+        let rerender = stale && self.capture_replays() && self.frame.plans_primary_scene();
+        if stale && !rerender {
+            return Err(RenderError::Capture(
+                "the last frame rendered no primary scene view: the scene texture is stale".into(),
+            ));
+        }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d scene capture"),
         });
+        if rerender {
+            self.encode_primary_to_offscreen(&mut encoder);
+        }
+        let texture = self
+            .frame
+            .intermediate_textures(primary)
+            .expect("checked above")
+            .scene
+            .clone();
+        let format = texture.format();
+        let (w, h) = (texture.width(), texture.height());
+        let texel = format.block_copy_size(None).unwrap_or(4) as u64;
+        let padded = align_up(w as u64 * texel, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("space3d scene capture readback"),
             size: padded * h as u64,

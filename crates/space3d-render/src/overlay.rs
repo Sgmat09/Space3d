@@ -49,7 +49,7 @@
 
 use crate::assets::RenderAssets;
 use crate::handles::TextureHandle;
-use crate::node::{FrameLayouts, FrameMode, SceneDepthRef, SceneReads, ViewInfo};
+use crate::node::{DepthAccess, FrameLayouts, FrameMode, SceneDepthRef, SceneReads, ViewInfo};
 use crate::output::{OutputEncoding, Tonemapper};
 use crate::pipeline::OFFSCREEN_FORMAT;
 use crate::renderer::Renderer;
@@ -173,6 +173,26 @@ pub struct OverlayScene<'a> {
     pub scene_bind_group: &'a wgpu::BindGroup,
     /// The shared layouts.
     pub layouts: &'a FrameLayouts,
+}
+
+impl OverlayScene<'_> {
+    /// How this pass sees scene depth: `SampledOnly` when [`Self::scene_depth`] is bound in
+    /// group 1 (the overlay pass has no depth attachment: test with `s3d_scene_occluded`),
+    /// else `None` (the far dummy is bound). Key pipelines by it: it can change between frames.
+    pub fn depth_access(&self) -> DepthAccess {
+        if self.scene_depth.is_some() {
+            DepthAccess::SampledOnly
+        } else {
+            DepthAccess::None
+        }
+    }
+
+    /// The group-1 declarations and helpers for this pass (`s3d_scene_depth`,
+    /// `s3d_scene_occluded`, `s3d_soft_fade`, …; [`crate::scene_wgsl`]), after
+    /// [`crate::VIEW_WGSL`].
+    pub fn scene_wgsl(&self) -> &'static str {
+        crate::node::scene_wgsl_for(self.depth_access())
+    }
 }
 
 impl OverlayTarget {
@@ -431,6 +451,7 @@ impl Renderer {
             }
             // Surface frame unavailable (minimized/occluded): nothing to draw into.
             (Some(_), None) => {}
+            (None, _) if self.presents_to_window() => {}
             (None, _) => self.encode_offscreen_overlays(encoder, OverlayTargetKind::Offscreen),
         }
     }

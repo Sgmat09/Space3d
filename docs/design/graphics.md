@@ -207,7 +207,8 @@ Rules:
   the clear-to-black rule.
 * Capture replays (§1.10): AfterTonemap overlays are replayed (`OverlayTargetKind::Capture`), as today. HdrScene
   overlays are replayed only for Direct primary groups. In intermediate mode they are already in `S`, which
-  persists, so they are not called again.
+  persists, so they are not called again — unless the frame skipped its scene views (no surface texture) and the
+  replay renders them into `S` (§1.10): then they are called again (`Capture`).
 
 Game migration of `client/src/game/additive.rs`:
 1. Add `fn stage(&self) -> OverlayStage { OverlayStage::HdrScene }`.
@@ -267,7 +268,10 @@ particles needs OIT (deferred, §6).
 
 * `DB` is per post group and **persistent** (keyed by the settings camera, freed 60 frames after last use, like
   `E`). Format `DISTORTION_FORMAT = Rgba8Unorm` with split signs (R = +x, G = +y, B = −x, A = −y). Size = PG rect
-  / 2 (`DistortionResolution::Half`, default) or full. Cleared to 0 when written.
+  **in `S`** / 2 (`DistortionResolution::Half`, default) or full. Cleared to 0 when written. *(Amended at the
+  F-core review: the rect in `S`, i.e. the `D` rect × render scale, not the `D` rect. The buffer follows the
+  render scale like the scene it distorts, and writers occluding against scene depth (`S`-sized) sample it at a
+  fixed ratio of 2 (or 1) instead of `2 × render_scale`.)*
 * **Distortion phase:** `RenderPhase::Distortion` node slots draw into `DB` right after the settings camera's
   scene pass (and its SceneRead). They use that camera's `ViewInfo`, with `PassTarget { color: Rgba8Unorm,
   samples: 1, depth: None, depth_access: SampledOnly | None }`, blend `One/One` on color and alpha, and viewport =
@@ -330,10 +334,18 @@ Conventions (all normative):
     are only reallocated at the start of the next frame, the same rule as `ensure_offscreen`). The replay re-runs
     `post.encode_group` with `replay = true` (no metering, no adaptation; bloom recomputed from `S`; output =
     offscreen, composite pipeline for `Rgba8UnormSrgb`), then the display views, then nothing else.
+  * **Skipped frame** *(amended at the F-core review)*: a window whose surface texture was unavailable
+    (`Occluded`/`Timeout`: minimized or covered, and every frame of a background-mode window on macOS) draws no
+    primary view, so `S` does not hold the frame. The group's textures record the frame whose scene views `S`
+    holds; when it is not the last frame, the replay first re-records the scene views into `S` (node `draw` with
+    `CaptureReplay`, SceneRead and Distortion passes included, then HdrScene overlays with kind `Capture`), then
+    composites as above.
   * **Both:** AfterTonemap overlays (kind `Capture`).
 * **`Renderer::capture_scene_hdr()`** (new; tests and tools): the primary group's `S` after HdrScene overlays and
   before post, as `HdrImageData`. `Rg11b10` decodes with alpha 1; `Rgba8UnormSrgb` is decoded. It returns
-  `Err(RenderError::Capture(..))` in Direct mode. `S` has `COPY_SRC` usage.
+  `Err(RenderError::Capture(..))` in Direct mode, and when the last frame had no primary scene view (`S` is an
+  older frame's). After a skipped windowed frame it renders the scene views into `S` first, like the replay.
+  `S` has `COPY_SRC` usage.
 
 ### 1.11 Extension API overview
 
@@ -342,7 +354,7 @@ Conventions (all normative):
 | `RenderNode` (`RenderNodes` resource) | Opaque / Skybox / Transparent / Distortion phases of camera views, plus once-per-frame `prepare` (compute allowed) and per-view `prepare_view` | particles, skybox (built-in), distortion meshes (built-in), user draws |
 | `RenderOverlay` (+ `stage()`) | HdrScene (pre-post) or AfterTonemap (post) | egui, game `additive.rs`, gizmos |
 | `CustomShader` hooks (unchanged) + `ColorGrading::shader` (`post_hdr_hook` / `post_ldr_hook`) | forward shader / composite | user materials / grading |
-| WGSL modules: `VIEW_WGSL`, `scene_wgsl()`, `OUTPUT_WGSL`, `FULLSCREEN_WGSL`, `DISTORTION_WGSL` | any node/overlay shader | particles, distortion writers, game overlays |
+| WGSL modules: `VIEW_WGSL`, `scene_wgsl()` (nodes) / `OverlayScene::scene_wgsl()` (overlays), `OUTPUT_WGSL`, `FULLSCREEN_WGSL`, `DISTORTION_WGSL` | any node/overlay shader | particles, distortion writers, game overlays |
 
 `PostEffect` (user full-screen passes) is deferred (D18, §6).
 
@@ -866,6 +878,9 @@ pub const VIEW_WGSL: &str;
 /// `s3d_soft_fade(px, frag_view_depth, softness) -> f32` (1 without depth),
 /// `s3d_scene_occluded(px, frag_device_depth) -> bool` (false without depth), `s3d_exposure_ev() -> f32`.
 pub fn scene_wgsl(target: &PassTarget) -> &'static str;
+/// The same for a depth access (amended at the F-core review, additive): shaders drawn outside node
+/// passes — HdrScene overlays use `OverlayScene::scene_wgsl()` = `scene_wgsl_for(scene.depth_access())`.
+pub fn scene_wgsl_for(access: DepthAccess) -> &'static str;
 /// `struct FullscreenOut { @builtin(position) pos, @location(0) uv }` + `vs_fullscreen(vertex_index)`.
 pub const FULLSCREEN_WGSL: &str;
 ```
@@ -927,6 +942,13 @@ pub struct OverlayScene<'a> {
     pub view_bind_group: &'a wgpu::BindGroup,
     pub scene_bind_group: &'a wgpu::BindGroup,
     pub layouts: &'a FrameLayouts,
+}
+
+impl OverlayScene<'_> {                    // amended at the F-core review (additive)
+    /// `SampledOnly` when `scene_depth` is bound in group 1 (no depth attachment), else `None`.
+    pub fn depth_access(&self) -> DepthAccess;
+    /// `scene_wgsl_for(self.depth_access())`: the group-1 module for this pass's shaders.
+    pub fn scene_wgsl(&self) -> &'static str;
 }
 
 impl OverlayTarget {                       // (existing struct; fields unchanged)

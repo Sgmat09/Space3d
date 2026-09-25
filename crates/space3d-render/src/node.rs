@@ -796,7 +796,13 @@ const SCENE_NO_DEPTH_WGSL: &str = concat!(
 /// without depth), `s3d_scene_occluded(px, frag_device_depth) -> bool` (false without depth),
 /// `s3d_exposure_ev() -> f32`.
 pub fn scene_wgsl(target: &PassTarget) -> &'static str {
-    match target.depth_access {
+    scene_wgsl_for(target.depth_access)
+}
+
+/// [`scene_wgsl`] for a depth access instead of a pass target: for shaders drawn outside
+/// node passes, such as `HdrScene` overlays ([`crate::OverlayScene::scene_wgsl`]).
+pub fn scene_wgsl_for(access: DepthAccess) -> &'static str {
+    match access {
         DepthAccess::None => SCENE_NO_DEPTH_WGSL,
         DepthAccess::ReadOnlyAttached | DepthAccess::SampledOnly => SCENE_DEPTH_WGSL,
     }

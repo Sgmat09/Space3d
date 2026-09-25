@@ -220,6 +220,10 @@ pub(crate) struct FrameState {
     /// Captures take the windowed replay path (`encode_capture_replay`) although headless.
     #[cfg(test)]
     pub(crate) force_capture_replay: bool,
+    /// Test stand-in for an occluded or minimized window: frames get no surface texture, so
+    /// nothing is drawn into the primary target (`Renderer::presents_to_window`).
+    #[cfg(test)]
+    pub(crate) simulate_occluded: bool,
     /// Times the ECS batch order was rebuilt.
     #[cfg(test)]
     pub(crate) ecs_reorders: u64,
@@ -343,6 +347,8 @@ impl FrameState {
             simulate_surface_loss: false,
             #[cfg(test)]
             force_capture_replay: false,
+            #[cfg(test)]
+            simulate_occluded: false,
             #[cfg(test)]
             ecs_reorders: 0,
             #[cfg(test)]
@@ -889,6 +895,8 @@ impl Renderer {
             };
             post.plan_group(world, &plan, &mut cpu_reallocs);
             if pg.distortion {
+                // The group's rect in `S` (spec §1.8 as amended): the buffer follows the render
+                // scale, and scene depth maps onto it at a fixed ratio.
                 let rect = pg.scene_rect.scissor(g.scene_size);
                 post.distortion_target(device, f.cameras[pg.camera].id, rect, pg.settings.distortion.resolution);
             }

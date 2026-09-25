@@ -39,6 +39,10 @@ pub(crate) struct GroupTextures {
     pub(super) bytes: u64,
     /// Mode the group rendered in when last planned.
     pub(super) mode: FrameMode,
+    /// Renderer frame index whose scene views `S` holds (0: none yet). A windowed frame whose
+    /// surface texture was unavailable (occluded, minimized) skips them: captures then render
+    /// them first (graphics spec §1.10).
+    pub(crate) scene_frame: u64,
 }
 
 fn texture_bytes(format: wgpu::TextureFormat, (w, h): (u32, u32), samples: u32) -> u64 {
@@ -118,6 +122,7 @@ impl GroupTextures {
             last_used: 0,
             bytes,
             mode: FrameMode::Direct,
+            scene_frame: 0,
         }
     }
 }
@@ -167,6 +172,14 @@ impl FrameState {
     /// The last frame's textures of `target`'s group, if it rendered through a scene texture.
     pub(crate) fn intermediate_textures(&self, target: GroupTarget) -> Option<&GroupTextures> {
         self.group_textures.get(&target).filter(|t| t.mode != FrameMode::Direct)
+    }
+
+    /// Whether the last frame's plan renders the primary target through a scene texture with
+    /// at least one scene view (what a capture replay can re-render into `S`).
+    pub(crate) fn plans_primary_scene(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|g| g.target == GroupTarget::Primary && g.intermediate() && g.last_scene_view.is_some())
     }
 }
 

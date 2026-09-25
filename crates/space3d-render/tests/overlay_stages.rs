@@ -471,6 +471,193 @@ fn hdr_scene_overlay_scene_depth() {
     }
 }
 
+/// An HdrScene overlay built on the frame's WGSL modules: `VIEW_WGSL`, then the group-1
+/// module `OverlayScene::scene_wgsl` names for its pass, `OUTPUT_WGSL` and `FULLSCREEN_WGSL`,
+/// drawn with the pass's view and scene bind groups. It paints `hit` where
+/// `s3d_scene_occluded(px, 1.0)` (scene geometry at that pixel) and `miss` elsewhere.
+struct DepthOverlay {
+    reads: SceneReads,
+    access: Arc<Mutex<Vec<DepthAccess>>>,
+    /// Shader source, view bind group, its dynamic offset, scene bind group and the layouts.
+    scene: Option<(
+        String,
+        wgpu::BindGroup,
+        u32,
+        wgpu::BindGroup,
+        [wgpu::BindGroupLayout; 2],
+    )>,
+    pipelines: Vec<(String, wgpu::RenderPipeline)>,
+    current: Option<usize>,
+}
+
+impl DepthOverlay {
+    fn new(reads: SceneReads) -> Self {
+        Self {
+            reads,
+            access: Default::default(),
+            scene: None,
+            pipelines: Vec::new(),
+            current: None,
+        }
+    }
+}
+
+impl RenderOverlay for DepthOverlay {
+    fn stage(&self) -> OverlayStage {
+        OverlayStage::HdrScene
+    }
+
+    fn scene_reads(&self) -> SceneReads {
+        self.reads
+    }
+
+    fn prepare_scene(&mut self, scene: &OverlayScene<'_>) {
+        self.access.lock().unwrap().push(scene.depth_access());
+        let (encoding, exposure, op) = (scene.output.id(), scene.exposure, scene.tonemapper.id());
+        let src = format!(
+            "{VIEW_WGSL}\n{}\n{OUTPUT_WGSL}\n{FULLSCREEN_WGSL}\n
+             @fragment fn fs(in: FullscreenOut) -> @location(0) vec4<f32> {{
+                 let hit = s3d_scene_occluded(vec2<i32>(in.pos.xy), 1.0);
+                 let c = select(vec4<f32>(0.0, 0.0, 1.0, 1.0), vec4<f32>(1.0, 0.0, 0.0, 1.0), hit);
+                 return s3d_output(c, {encoding}u, {exposure:?}, {op}u);
+             }}",
+            scene.scene_wgsl()
+        );
+        self.scene = Some((
+            src,
+            scene.view_bind_group.clone(),
+            scene.view.view_offset,
+            scene.scene_bind_group.clone(),
+            [scene.layouts.view.clone(), scene.layouts.scene.clone()],
+        ));
+    }
+
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        _: &wgpu::Queue,
+        _: &mut wgpu::CommandEncoder,
+        target: &OverlayTarget,
+    ) {
+        let Some((src, _, _, _, [view, scene])) = &self.scene else {
+            return;
+        };
+        let key = format!("{:?}{src}", target.format);
+        self.current = Some(match self.pipelines.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("depth overlay"),
+                    source: wgpu::ShaderSource::Wgsl(src.clone().into()),
+                });
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("depth overlay"),
+                    bind_group_layouts: &[Some(view), Some(scene)],
+                    immediate_size: 0,
+                });
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("depth overlay"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs_fullscreen"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(target.format.into())],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                });
+                self.pipelines.push((key, pipeline));
+                self.pipelines.len() - 1
+            }
+        });
+    }
+
+    fn render(&self, pass: &mut wgpu::RenderPass<'static>, _: &OverlayTarget) {
+        let (Some(i), Some((_, view, offset, scene, _))) = (self.current, &self.scene) else {
+            return;
+        };
+        pass.set_pipeline(&self.pipelines[i].1);
+        pass.set_bind_group(0, view, &[*offset]);
+        pass.set_bind_group(1, scene, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+/// Overlays compose the group-1 module of their pass (`OverlayScene::scene_wgsl`, i.e.
+/// `scene_wgsl_for(OverlayScene::depth_access)`), so depth-aware HdrScene overlays can use
+/// `s3d_scene_occluded` and friends: with `SceneReads::DEPTH` the overlay sees exactly the
+/// scene's geometry (Direct and Hdr, with and without MSAA where depth can be resolved: every
+/// pixel it marks is one the scene drew, and no other); without, the far dummy (nothing).
+#[test]
+fn hdr_scene_overlay_composes_scene_wgsl() {
+    for samples in [1, 4] {
+        for post in [false, true] {
+            let Some(mut app) = headless_app(W, H) else { return };
+            app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+            let caps = app.resources.expect::<Renderer>().graphics_caps().clone();
+            let cam = scene(&mut app);
+            if post {
+                app.world.insert_one(cam, no_dither()).unwrap();
+            }
+            let what = format!("×{samples} post {post}");
+            // The scene alone: geometry is wherever the clear color is not.
+            let reference = render(&mut app);
+            let clear = reference.get(0, 0);
+            let geometry: Vec<bool> = (0..H)
+                .flat_map(|y| (0..W).map(move |x| (x, y)))
+                .map(|(x, y)| reference.get(x, y) != clear)
+                .collect();
+            assert!(
+                geometry.iter().filter(|g| **g).count() > 100,
+                "{what}: the cube is drawn"
+            );
+            for reads in [SceneReads::DEPTH, SceneReads::NONE] {
+                let overlay = DepthOverlay::new(reads);
+                let access = overlay.access.clone();
+                overlays(&mut app).insert("depth", 0, overlay);
+                let img = render(&mut app);
+                let has_depth = reads == SceneReads::DEPTH && (samples == 1 || caps.msaa_depth_resolve);
+                let expected = if has_depth {
+                    DepthAccess::SampledOnly
+                } else {
+                    DepthAccess::None
+                };
+                assert_eq!(*access.lock().unwrap(), [expected], "{what} {reads:?}");
+                // Red (hit) or blue (miss), tonemapped with the scene when post runs.
+                let marked: Vec<bool> = (0..H)
+                    .flat_map(|y| (0..W).map(move |x| (x, y)))
+                    .map(|(x, y)| {
+                        let [r, g, b, _] = img.get(x, y);
+                        assert!(
+                            r.abs_diff(b) > 100 && g < r.max(b) / 2,
+                            "{what}: ({x}, {y}) {:?}",
+                            [r, g, b]
+                        );
+                        r > b
+                    })
+                    .collect();
+                if has_depth {
+                    let wrong = marked.iter().zip(&geometry).filter(|(m, g)| m != g).count();
+                    assert_eq!(wrong, 0, "{what}: pixels marked differently from the scene's geometry");
+                } else {
+                    assert!(marked.iter().all(|m| !m), "{what} {reads:?}: nothing is occluded");
+                }
+                overlays(&mut app).remove("depth");
+            }
+        }
+    }
+}
+
 /// `OverlayTarget::shader_encodes_srgb` is the right test for manual encoding: false for float
 /// scene colors (where the legacy `!format.is_srgb()` rule is wrong).
 #[test]

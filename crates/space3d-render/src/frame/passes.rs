@@ -33,6 +33,11 @@ pub(crate) struct GroupEncode {
     scene_started: bool,
     /// The group's post groups were composited into `D`.
     finished: bool,
+    /// Scene views record into `S` in this encode: always in a frame; in a capture replay only
+    /// when `S` does not hold the frame's scene views (the window's surface texture was
+    /// unavailable, so the frame skipped them). Otherwise the replay composites the persisted
+    /// `S` again.
+    render_scene: bool,
 }
 
 /// The display target `D` of a view's group, as attachments.
@@ -122,6 +127,15 @@ impl Renderer {
         let mut state = std::mem::take(&mut self.frame.group_encode);
         state.clear();
         state.resize(self.frame.groups.len(), GroupEncode::default());
+        let frame_index = self.frame_index;
+        for (s, group) in state.iter_mut().zip(&self.frame.groups) {
+            s.render_scene = !primary_to_offscreen
+                || self
+                    .frame
+                    .group_textures
+                    .get(&group.target)
+                    .is_some_and(|t| t.scene_frame != frame_index);
+        }
         let mut presented = false;
         let kind = match (primary_to_offscreen, surface_view.is_some()) {
             (true, _) => OverlayTargetKind::Capture,
@@ -175,12 +189,13 @@ impl Renderer {
             }
             match view.role {
                 ViewRole::Scene => {
-                    // Replays keep `S` from the frame: only its composites run again.
+                    // Replays keep `S` from the frame (only its composites run again), unless
+                    // the frame skipped the scene views.
                     let mut depth = None;
-                    if !primary_to_offscreen {
+                    if state[g].render_scene {
                         let first = !state[g].scene_started;
                         state[g].scene_started = true;
-                        depth = self.encode_scene_view(encoder, i, view, first);
+                        depth = self.encode_scene_view(encoder, i, view, first, primary_to_offscreen);
                     }
                     if last_scene_view == Some(i) {
                         self.finish_group(
@@ -252,7 +267,7 @@ impl Renderer {
                 })
             }
             (ViewTarget::Primary, _) => {
-                if !to_offscreen && self.surface.is_some() {
+                if !to_offscreen && self.presents_to_window() {
                     return None;
                 }
                 let a = &self.offscreen;
@@ -313,13 +328,15 @@ impl Renderer {
     /// A scene view of an intermediate group: its forward pass into the group's `S` (MSAA
     /// resolved into it), with the viewport-clear rules applied to `S`, its SceneRead pass and,
     /// for a post group's settings camera, the Distortion pass. Returns the single-sample depth
-    /// holding the view's depth afterwards, if a consumer needed one.
+    /// holding the view's depth afterwards, if a consumer needed one. `replay`: a capture
+    /// replay re-rendering `S` (node draws get `FrameKind::CaptureReplay`).
     fn encode_scene_view(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         i: usize,
         view: &ViewData,
         first: bool,
+        replay: bool,
     ) -> Option<wgpu::TextureView> {
         let group = &self.frame.groups[view.group];
         let (format, samples) = (group.scene_format, group.samples);
@@ -338,7 +355,7 @@ impl Renderer {
             samples,
             output: view.output,
         };
-        let depth_1x = self.encode_view(encoder, i, view, first, &pass, false);
+        let depth_1x = self.encode_view(encoder, i, view, first, &pass, replay);
         if view.work & work::DISTORTION != 0
             && let Some(pg) = self
                 .frame
@@ -346,7 +363,7 @@ impl Renderer {
                 .iter()
                 .position(|p| p.view == Some(i) && p.distortion)
         {
-            self.encode_distortion(encoder, i, pg, depth_1x.as_ref());
+            self.encode_distortion(encoder, i, pg, depth_1x.as_ref(), replay);
         }
         depth_1x
     }
@@ -387,7 +404,9 @@ impl Renderer {
     /// overlays into `S`, then each post group's composite, in settings-camera order, into `D`
     /// (the first write clears `D`), then the display views that came before the group's last
     /// scene view (`earlier`), in camera order. A capture replay composites again from the
-    /// persisted `S` (no temporal update; HdrScene overlays are already in `S`).
+    /// persisted `S` (no temporal update; HdrScene overlays are already in `S`) — or, when it
+    /// re-rendered `S` (`state.render_scene`), calls the HdrScene overlays again (kind
+    /// `Capture`) first.
     #[allow(clippy::too_many_arguments)]
     fn finish_group(
         &mut self,
@@ -410,11 +429,16 @@ impl Renderer {
             group.post_groups.clone(),
             group.scale,
         );
-        let Some(t) = self.frame.group_textures.get(&target) else {
+        let frame_index = self.frame_index;
+        let Some(t) = self.frame.group_textures.get_mut(&target) else {
             return;
         };
+        if state.render_scene {
+            // `S` now holds this frame's scene views.
+            t.scene_frame = frame_index;
+        }
         let (scene, generation) = (t.scene_view.clone(), t.generation);
-        if !replay && self.frame.hdr_scene_view == Some(last) {
+        if state.render_scene && self.frame.hdr_scene_view == Some(last) {
             let hdr = HdrScenePass {
                 target: &scene,
                 format: scene_format,
@@ -422,7 +446,9 @@ impl Renderer {
                 output: self.frame.view_infos[last].output,
                 mode,
                 depth,
-                kind: if self.surface.is_some() {
+                kind: if replay {
+                    OverlayTargetKind::Capture
+                } else if self.surface.is_some() {
                     OverlayTargetKind::Surface
                 } else {
                     OverlayTargetKind::Offscreen
@@ -766,6 +792,7 @@ impl Renderer {
         i: usize,
         pg: usize,
         depth: Option<&wgpu::TextureView>,
+        replay: bool,
     ) {
         let camera = self.frame.cameras[self.frame.post_groups[pg].camera].id;
         let Some((buffer, size, _)) = self.post.distortion_view(camera) else {
@@ -798,7 +825,7 @@ impl Renderer {
             viewport,
             scissor,
             depth,
-            false,
+            replay,
         );
         drop(pass);
         self.stats.distortion_passes += 1;
@@ -952,6 +979,16 @@ impl Renderer {
         stats.render_passes += 1;
     }
 
+    /// Whether primary frames present to a window (whose surface texture may be unavailable)
+    /// rather than to the offscreen target.
+    pub(crate) fn presents_to_window(&self) -> bool {
+        #[cfg(test)]
+        if self.frame.simulate_occluded {
+            return true;
+        }
+        self.surface.is_some()
+    }
+
     /// Whether a capture re-records the last frame into the offscreen target: windowed
     /// renderers (surface textures are not readable), or a test forcing the windowed path.
     pub(crate) fn capture_replays(&self) -> bool {
@@ -972,7 +1009,8 @@ impl Renderer {
 
     /// Re-record the last frame's primary views into the offscreen target (for capture). The
     /// target gets the size those views were prepared for (their projection and viewports),
-    /// even if the window was resized since.
+    /// even if the window was resized since. An intermediate primary group re-renders its scene
+    /// views into `S` only if the frame skipped them (see `GroupEncode::render_scene`).
     pub(crate) fn encode_primary_to_offscreen(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.size_offscreen(self.frame.last_primary_size);
         // Re-recorded passes are not new draws: keep the frame's pass counters.

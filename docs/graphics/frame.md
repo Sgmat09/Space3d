@@ -197,7 +197,9 @@ no_read_only_depth: true, .. }` forces the WebGL2 rows on any device.
 
 **Distortion.** Distortion slots draw only in the view of a post group's settings camera whose
 `PostProcess::distortion` is enabled, and only when one has work there: into the group's
-persistent half-resolution `DISTORTION_FORMAT` buffer, cleared to 0, blend One/One, writing
+persistent `DISTORTION_FORMAT` buffer — half the group's rect in the scene texture (all of it with
+`DistortionResolution::Full`), so it follows the render scale, and scene depth maps onto it at a
+fixed ratio of 2 (or 1); `DrawContext::target_size` is its size — cleared to 0, blend One/One, writing
 `distortion_encode(offset, weight)` from `DISTORTION_WGSL`, with the view's single-sample depth
 sampled where it exists (`SampledOnly`; `None` with MSAA on GL). The composite binds the buffer;
 applying it is the post area's (PO5). Registering a writer changes nothing by itself.
@@ -228,10 +230,16 @@ stage. `OverlayTarget::kind` still says which frame it is (`Surface`, `Offscreen
 HdrScene overlays also get `prepare_scene` (before `prepare`) with an `OverlayScene`: the last
 primary scene view, the frame mode, the encoding to write (`output`, with `exposure` and
 `tonemapper` for the Ldr fallback's `Tonemapped`), the view's bind groups and layouts, and — if
-`scene_reads()` contains `DEPTH` — that view's single-sample depth. Frames without a primary view
-skip HdrScene overlays. Captures: a Direct primary group calls them again (`Capture`); an
-intermediate one does not (they are already in the scene color, which the capture composites
-again).
+`scene_reads()` contains `DEPTH` — that view's single-sample depth. Build the overlay's shaders from
+`VIEW_WGSL`, `scene.scene_wgsl()` (the group-1 declarations and helpers for this pass:
+`s3d_scene_depth`, `s3d_scene_occluded`, `s3d_soft_fade`, …; `scene.depth_access()` is
+`SampledOnly` with depth, `None` without — key pipelines by it) and `OUTPUT_WGSL`, with
+`scene.layouts.view` / `scene.layouts.scene` as groups 0 and 1 and the view's dynamic offset
+`scene.view.view_offset`; the pass has no depth attachment, so test depth with
+`s3d_scene_occluded`. Frames without a primary view skip HdrScene overlays. Captures: a Direct
+primary group calls them again (`Capture`); an intermediate one does not (they are already in the
+scene color, which the capture composites again) — unless the frame skipped its scene views
+(below), which the capture then renders, HdrScene overlays included (`Capture`).
 
 Use `OverlayTarget::shader_encodes_srgb()` (or `OverlayScene::output`) to decide whether to
 encode sRGB in the shader: the old `!target.format.is_srgb()` test is wrong for float targets.
@@ -289,9 +297,13 @@ four steps). Lasers become particle beams instead (particles area).
 
 * `Renderer::capture()` / `render_to_image` return the final, tonemapped sRGB image in every mode.
   Windowed captures of an intermediate primary group composite again from the last frame's scene
-  texture (no scene pass is re-rendered).
+  texture (no scene pass is re-rendered). A window whose frame got no surface texture (minimized
+  or covered — every frame of a background-mode window on macOS) draws no primary view at all; its
+  captures render the skipped scene views into the scene texture first (nodes see
+  `FrameKind::CaptureReplay`), then composite, so they equal the unoccluded frame.
 * `Renderer::capture_scene_hdr()` returns the primary group's scene texture before post as
-  `space3d_core::HdrImageData` (linear floats; `Err` in Direct mode).
+  `space3d_core::HdrImageData` (linear floats; `Err` in Direct mode or when the last frame had no
+  primary view; after a skipped windowed frame the scene views are rendered first).
 * `RenderStats`: `intermediate_groups`, `post_groups`, `post_passes`, `render_passes`,
   `fullscreen_passes`, `textures_created` (0 in the steady state), `target_bytes`,
   `node_draws`, `node_dispatches`, `scene_read_passes`, `depth_resolves`, `distortion_passes`.

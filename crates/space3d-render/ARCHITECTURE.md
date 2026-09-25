@@ -314,7 +314,15 @@ their group last rendered intermediately (`targets.rs` `GroupTextures`); `Render
 `S` persists until the next frame's plan, so `Renderer::capture_scene_hdr` reads the last frame's
 scene color (as float RGBA; `Err` in Direct mode) and a windowed capture replays an intermediate
 primary group by compositing again from `S` (no scene pass) into the offscreen target, then its
-display views, then the overlays.
+display views, then the overlays. A windowed frame whose surface texture was unavailable
+(`Occluded`/`Timeout`: minimized or covered, and every frame of a background-mode window on
+macOS) skips every primary view, scene views included, so `S` then holds an older frame (or
+zeros): `GroupTextures::scene_frame` records the frame whose scene views `S` holds, and a replay
+(`GroupEncode::render_scene`) or `capture_scene_hdr` whose `S` is not the last frame's renders the
+scene views into it first (node draws as `CaptureReplay`, SceneRead and Distortion passes, the
+HdrScene overlays as `Capture`). `capture_scene_hdr` errs when the last frame had no primary scene
+view. The distortion buffer is sized from the post group's rect in `S` (half, or all of it), so
+it follows the render scale.
 
 The composite (`shaders/post/composite.wgsl`, `post/mod.rs` `PostState::encode_group`) is one
 full-screen triangle per post group, viewport and scissor on the group's rect in `D`. It reads
@@ -342,7 +350,9 @@ at 1 sample, and multisampled only where multisampled depth can be resolved
 Tests: `tests/frame_modes.rs` (modes, exactness of passthrough, tonemapper monotonicity,
 exposure linearity, Ldr-fallback parity, alpha, compact HDR, split screen, gizmo display view,
 PiP, render scale, HDR and MSAA render targets, determinism, lazy resize, steady state, WebGL2
-override parity), `tests/capture_hdr.rs`, `frame::tests::replay_path_equals_frame_output`,
+override parity), `tests/capture_hdr.rs`, `frame::tests::{replay_path_equals_frame_output,
+occluded_window_captures_render_the_skipped_scene_views}` (a `simulate_occluded` renderer stands in
+for the window),
 `tests/alloc_frame.rs` (allocations per mode), `tests/gl.rs` (the portability scenes in Hdr and
 Ldr on ANGLE); `benches/frame.rs` (Direct vs Hdr minimal at 1080p).
 
@@ -393,7 +403,9 @@ start of `finish_group`, into `S` before the composites; one pass, `prepare_scen
 render_scale`. AfterTonemap overlays run where all overlays ran before. Capture replays call
 node `draw`s with `FrameKind::CaptureReplay` (Direct groups: SceneRead passes included) and
 HdrScene overlays only for Direct primary groups (kind `Capture`); intermediate groups
-composite again from `S`, which already holds them.
+composite again from `S`, which already holds them — unless the frame skipped the scene views
+(above). Overlays build shaders on the pass's group 1 with `OverlayScene::scene_wgsl()`
+(`scene_wgsl_for(OverlayScene::depth_access())`: `SampledOnly` with depth, else `None`).
 
 `Renderer::prewarm` walks the last frame's views (and each requested extra format on primary
 views): forward pipelines for the requested materials × instance layouts, every node's `prewarm`
@@ -401,8 +413,10 @@ for its slots' targets, and the composite pipelines of the intermediate groups' 
 
 Tests: `tests/nodes.rs` (order around the built-ins, masks, lifecycle, every depth row against an
 analytic plane, in-pass fallback, Distortion plumbing, renderer id, poisoning, prewarm),
-`tests/overlay_stages.rs`, `frame::tests::{prepare_once_per_frame_not_in_replay,
-distortion_buffer_holds_the_writers_output, hdr_scene_overlay_not_replayed_in_hdr}`,
+`tests/overlay_stages.rs` (incl. `hdr_scene_overlay_composes_scene_wgsl`: occlusion by
+`s3d_scene_occluded` matches the scene's coverage pixel for pixel),
+`frame::tests::{prepare_once_per_frame_not_in_replay, distortion_buffer_holds_the_writers_output,
+distortion_buffer_is_sized_from_the_scene_rect, hdr_scene_overlay_not_replayed_in_hdr}`,
 `tests/alloc_frame.rs` ("nodes"), `tests/gl.rs::gl_backend_reads_scene_depth` (ANGLE).
 
 ## Custom shaders

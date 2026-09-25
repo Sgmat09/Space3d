@@ -88,6 +88,7 @@ pub use node::{
     DepthAccess, DrawContext, FULLSCREEN_WGSL, FrameInfo, FrameKind, FrameLayouts, FrameMode, MESH_VERTEX_LAYOUT,
     MeshRef, PassTarget, PhaseSlot, PrepareContext, RenderNode, RenderNodes, RenderPhase, SceneDepthRef, SceneReads,
     SharedNode, SlotMask, TextureRef, VIEW_WGSL, ViewInfo, ViewPrepareContext, ViewRole, lock_node, scene_wgsl,
+    scene_wgsl_for,
 };
 pub use output::{OUTPUT_WGSL, OutputEncoding, Tonemapper};
 pub use post::api::*;
