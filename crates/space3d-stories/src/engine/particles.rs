@@ -163,14 +163,20 @@ fn heading(dir: Vec3) -> Quat {
     Quat::from_rotation_arc(Vec3::NEG_Z, dir.normalize_or(Vec3::NEG_Z))
 }
 
-/// A ship flying a circle of `radius` at `speed` rad per tick, with two engine exhausts.
-fn circling_ship(app: &mut App, radius: f32, speed: f32, throttle: f32) -> Entity {
+/// The engine color of the stories' ship: an ion-blue flame (`ENGINE_EXHAUST` takes its hue
+/// from the tint; [`circling_ship`] doubles it).
+const ION_BLUE: [f32; 4] = [0.15, 0.45, 1.0, 1.0];
+
+/// A ship flying a circle of `radius` at `speed` rad per tick, with two engine exhausts tinted
+/// `2 × color` (a color knob stays within 0..1; the game's engine colors reach about 2).
+fn circling_ship(app: &mut App, radius: f32, speed: f32, throttle: f32, color: [f32; 4]) -> Entity {
     let ship = hull(app, Transform::from_xyz(radius, 0.0, 0.0));
     for x in [-6.0, 6.0] {
         let e = app.spawn_effect(
             builtin::ENGINE_EXHAUST,
             EffectSpawn::from_transform(Transform::from_xyz(x, 0.0, 21.0))
                 .follow(ship)
+                .tint(Vec4::from_array(color) * Vec4::new(2.0, 2.0, 2.0, 1.0))
                 .keep(),
         );
         if let Ok(mut em) = app.world.get::<&mut ParticleEmitter>(e) {
@@ -259,18 +265,20 @@ fn engine_exhaust(hdr: bool) -> Story {
         plugin(app, ParticleSettings::default());
         lights(app);
         let cam = top_camera(app, 190.0);
-        circling_ship(app, 55.0, 0.03, k.f32("throttle"));
+        circling_ship(app, 55.0, 0.03, k.f32("throttle"), k.color("color"));
         cam
     })
     .description(builtin_description(
         "`builtin::ENGINE_EXHAUST` on two nozzles of a ship flying a circle (the emitters are \
-         children of the hull, `EffectSpawn::follow(ship)`): a blue plume inheriting part of the \
-         ship's velocity, sparks, and a local-space glow riding the nozzle. Emission is spread \
-         over each tick's motion, so the plume never clumps; `throttle` drives \
-         `ParticleEmitter::rate_scale` (0..2).",
+         children of the hull, `EffectSpawn::follow(ship)`): a white-hot plume taking its hue \
+         from the tint (`color` × 2, any faction color), inheriting part of the ship's velocity, \
+         sparks, and a local-space glow riding the nozzle. Emission is spread over each tick's \
+         motion, so the plume never clumps; `throttle` drives `ParticleEmitter::rate_scale` \
+         (0..2).",
         hdr,
     ))
     .knob_f32("throttle", 1.0, 0.0..=2.0)
+    .knob_color("color", ION_BLUE)
     .tag("particles")
     .size(320, 180)
     .ticks(90)
@@ -840,7 +848,7 @@ fn local_vs_world() -> Story {
         plugin(app, ParticleSettings::default());
         lights(app);
         top_camera(app, 240.0);
-        let ship = circling_ship(app, 60.0, 0.03, 0.0);
+        let ship = circling_ship(app, 60.0, 0.03, 0.0, ION_BLUE);
         let glow = |space: SimulationSpace, color: Vec4| ParticleLayer {
             space,
             spawn: Spawn {
@@ -891,7 +899,7 @@ fn cpu_backend() -> Story {
         app.insert_resource(FrameSettings::default().with_downlevel(DownlevelOverride::webgl2()));
         lights(app);
         top_camera(app, 300.0);
-        circling_ship(app, 90.0, 0.03, 1.2);
+        circling_ship(app, 90.0, 0.03, 1.2, ION_BLUE);
         app.spawn_effect(
             builtin::EXPLOSION,
             EffectSpawn::at(Vec3::new(-30.0, 0.0, 10.0)).seed(13),

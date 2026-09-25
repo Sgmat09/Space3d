@@ -78,7 +78,9 @@ pub struct StoryRender {
 pub fn story_app(story: &Story, knobs: &KnobValues, size: Option<(u32, u32)>) -> TestApp {
     let (w, h) = size.unwrap_or(story.size);
     let mut app = TestApp::builder().size(w, h).render_on_demand().build();
-    story.apply(&mut app, knobs);
+    // The renderer is out of the frame loop but present for the setup, as in a live viewer:
+    // stories that size render targets from `Renderer::size` get the capture size.
+    app.with_renderer(|app| story.apply(app, knobs));
     app
 }
 

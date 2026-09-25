@@ -220,3 +220,30 @@ fn storybook_check_reports_every_failure_and_honors_tolerance() {
         }
     });
 }
+
+/// Stories that render their scene into a render target (`Soft Particles`, `Soft Depth`) size
+/// it from the capture: `story_app` applies a story with the renderer present, so
+/// `render_story` at another size than the story's renders the scene at that size instead of
+/// upscaling a 320 × 180 target (M1 review).
+#[test]
+fn screen_targets_follow_the_capture_size() {
+    if !gpu_available() {
+        return;
+    }
+    let book = engine_storybook();
+    for id in ["Engine/Particles/Features/Soft Particles", "Engine/Frame/Soft Depth"] {
+        let story = book.get(id).unwrap_or_else(|| panic!("no story {id}"));
+        let app = story_app(story, &KnobValues::default(), Some((640, 360)));
+        let assets = app.resources.expect::<space3d_render::RenderAssets>();
+        let sizes: Vec<Option<(u32, u32)>> = app
+            .world
+            .query::<&space3d_render::Material>()
+            .iter()
+            .filter_map(|m| m.base_color_texture)
+            .filter(|&t| assets.render_target_desc(t).is_some())
+            .map(|t| assets.texture_size(t))
+            .collect();
+        assert!(!sizes.is_empty(), "{id}: no render target");
+        assert!(sizes.iter().all(|&s| s == Some((640, 360))), "{id}: {sizes:?}");
+    }
+}
