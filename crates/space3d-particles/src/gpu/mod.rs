@@ -107,7 +107,6 @@ pub(crate) struct GpuFrameStats {
     pub dispatches: u32,
     pub bytes: u64,
     pub created: u32,
-    pub compacted: bool,
 }
 
 /// Inputs of [`GpuSim::prepare`] owned by the render node.
@@ -746,7 +745,6 @@ impl GpuSim {
                 pass.dispatch_workgroups(x, y, 1);
                 stats.dispatches += 2;
             }
-            stats.compacted = true;
             stats.created += self.readback.record(
                 ctx.device,
                 ctx.encoder,

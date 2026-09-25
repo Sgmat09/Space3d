@@ -266,8 +266,9 @@ timestamps with frames back to back (`gpu::tests::gpu_100k_within_budget`, the s
 
 | item | measured | gate (graphics spec §4.4) |
 |---|---|---|
-| GPU: 100k alive, one tick of `simulate` + `emit` and the compaction (`mark` + `scatter`) | 0.018–0.020 + 0.024–0.027 = **0.045 ms** | ≤ 0.06 ms |
-| GPU: draw 100k billboards (8–16 px, 12 px average, spread over 1080p: 14.9 M fragments, ≈ 7× overdraw) | **0.36 ms** | ≤ 0.40 ms |
+| GPU: 100k alive, one tick of `simulate` + `emit` and the compaction (`mark` + `scatter`) | 0.018 + 0.028 = **0.046 ms** | ≤ 0.06 ms |
+| GPU: draw 100k billboards (8–16 px, 12 px average, spread over 1080p: 14.9 M fragments, ≈ 7× overdraw; "overdraw 2" cannot hold with 12 px sprites at 1080p, so this is the heavier reading) | **0.36 ms** | ≤ 0.40 ms |
+| GPU backend CPU cost: `prepare` + draw recording, 500 moving layer instances, one tick | 0.14 ms idle machine (0.2–0.3 ms under load) | ≤ 0.1 ms (Battle scene, Phase I) |
 | CPU backend: tick + simulate + pack 16 384 particles, one thread (test profile) | 0.28 ms | ≤ 0.35 ms |
 | `tick_system`, 500 layer instances | 13 µs | ≤ 60 µs |
 | allocations per frame, ~1000 particles, 80–90 draws (wgpu's bookkeeping; our code: 0) | CPU backend 183, GPU backend 304 | pinned +10 % (`tests/alloc.rs`) |
@@ -275,7 +276,12 @@ timestamps with frames back to back (`gpu::tests::gpu_100k_within_budget`, the s
 The simulation gate is measured with the draws of the previous frame out of the way: with the
 camera drawing the 100k billboards every frame, the two particle passes overlap that draw (or
 wait for it before rewriting the instances it reads) and their timestamps span 0.08–0.09 ms.
-Isolated frames let the GPU drop its clocks (about 3× slower).
+Isolated frames let the GPU drop its clocks (about 3× slower). Each figure is the median of 40
+frames, best of up to 3 runs (other GPU work on a shared machine disturbs single runs). The CPU
+cost of `prepare` is not a milestone gate yet; it goes to rebuilding and uploading about 70 KB
+a frame for 500 layer instances (jobs and records ~40 KB, since every spawning ring's tail
+moves each tick; spawn records; the emitter frames that moved) and to wgpu's per-copy and
+per-pass overhead.
 
 ## WebGL2 notes
 

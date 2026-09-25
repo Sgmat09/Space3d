@@ -45,6 +45,8 @@ pub(crate) struct LayerSim {
     pub tinted: bool,
     /// Longest life after emission, delay included (seconds).
     pub window: f32,
+    /// Bound of the particles' distance from the emitter ([`Self::reach`]).
+    pub reach: Reach,
 }
 
 fn pair(r: FloatRange) -> (f32, f32) {
@@ -92,6 +94,69 @@ impl LayerSim {
             blend: l.render.blend,
             tinted: l.tinted,
             window: window_secs(l),
+            reach: Reach::new(l, window_secs(l)),
+        }
+    }
+}
+
+/// The parts of [`LayerSim::reach`] that do not depend on the instance (computed once).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Reach {
+    /// Spawn shape extent plus the offset (× effect scale).
+    shape: f32,
+    /// Largest initial speed (× `scale^speed_exponent`).
+    speed: f32,
+    /// Distance covered per unit of initial speed over the life window (with drag).
+    time: f32,
+    /// Distance covered under gravity and the layer's forces over the life window (infinite
+    /// with world attractors: they can be anywhere).
+    accel: f32,
+}
+
+impl Reach {
+    fn new(l: &ParticleLayer, window: f32) -> Self {
+        let shape = match l.shape {
+            EmitShape::Point => 0.0,
+            EmitShape::Sphere { radius, .. } => radius.abs(),
+            EmitShape::Cone { radius, .. } => radius.abs(),
+            EmitShape::Ring { radius, width, .. } => radius.abs() + 0.5 * width.abs(),
+            EmitShape::Box { half_extents } => half_extents.abs().length(),
+            EmitShape::Line { length } => 0.5 * length.abs(),
+        } + l.offset.length();
+        // One tick more than the life window: extrapolation and the sub-tick pre-aging.
+        let t = window + 0.1;
+        let drag = l.drag.max(0.0);
+        let time = if drag > 1e-6 {
+            (1.0 - (-drag * t).exp()) / drag
+        } else {
+            t
+        };
+        let mut accel = l.gravity.length();
+        for f in &l.forces {
+            accel += match *f {
+                // `attract` caps the inverse square at 1 / 0.01.
+                Force::Attractor { strength, falloff, .. } => {
+                    strength.abs()
+                        * if matches!(falloff, crate::effect::Falloff::InverseSquare) {
+                            100.0
+                        } else {
+                            1.0
+                        }
+                }
+                Force::Vortex { strength, pull, .. } => strength.abs() + pull.abs(),
+                Force::Turbulence { strength, .. } => strength.abs() * 3f32.sqrt(),
+            };
+        }
+        let accel = if l.world_forces != 0 {
+            f32::INFINITY
+        } else {
+            0.5 * accel * t * t
+        };
+        Self {
+            shape,
+            speed: l.speed.min.abs().max(l.speed.max.abs()),
+            time,
+            accel,
         }
     }
 }
@@ -104,47 +169,17 @@ impl LayerSim {
     /// and the layer's forces. Infinite with world attractors (they can be anywhere).
     /// Design-particles §5.1 "extent R".
     pub fn reach(&self, scale: f32, emitter_speed: f32) -> f32 {
-        if self.world_forces != 0 {
-            return f32::INFINITY;
-        }
+        let r = &self.reach;
         let scale = scale.abs();
-        let shape = match self.shape {
-            EmitShape::Point => 0.0,
-            EmitShape::Sphere { radius, .. } => radius.abs(),
-            EmitShape::Cone { radius, .. } => radius.abs(),
-            EmitShape::Ring { radius, width, .. } => radius.abs() + 0.5 * width.abs(),
-            EmitShape::Box { half_extents } => half_extents.abs().length(),
-            EmitShape::Line { length } => 0.5 * length.abs(),
-        } + self.offset.length();
-        let mut speed = self.speed.0.abs().max(self.speed.1.abs()) * scale.powf(self.speed_exponent);
+        let mut speed = r.speed;
+        if self.speed_exponent != 0.0 {
+            speed *= scale.powf(self.speed_exponent);
+        }
         if !self.local {
             speed += self.inherit.abs() * emitter_speed;
         }
-        // One tick more than the life window: extrapolation and the sub-tick pre-aging.
-        let t = self.window + 0.1;
-        let travel = if self.drag > 1e-6 {
-            speed * (1.0 - (-self.drag * t).exp()) / self.drag
-        } else {
-            speed * t
-        };
-        let mut accel = self.gravity.length();
-        for f in self.forces.iter().flatten() {
-            accel += match *f {
-                Force::Attractor { strength, falloff, .. } => {
-                    // `attract` caps the inverse square at 1 / 0.01.
-                    strength.abs()
-                        * if matches!(falloff, crate::effect::Falloff::InverseSquare) {
-                            100.0
-                        } else {
-                            1.0
-                        }
-                }
-                Force::Vortex { strength, pull, .. } => strength.abs() + pull.abs(),
-                Force::Turbulence { strength, .. } => strength.abs() * 3f32.sqrt(),
-            };
-        }
-        let r = shape * scale + travel + 0.5 * accel * t * t;
-        if r.is_finite() { r } else { f32::INFINITY }
+        let out = r.shape * scale + speed * r.time + r.accel;
+        if out.is_finite() { out } else { f32::INFINITY }
     }
 }
 
