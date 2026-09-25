@@ -32,6 +32,23 @@
 /// A shader that fails to compile for a layout is reported once through `tracing` and by
 /// [`crate::Renderer::shader_error`]; its draws fall back to the built-in shader instead of
 /// failing the frame.
+///
+/// **Portability.** Custom shaders are limited to what every backend runs, so a shader that
+/// works on the machine it is written on works everywhere. These are rejected on every backend
+/// (before any GPU work, with a message naming the construct):
+///
+/// | construct | Metal / Vulkan / DX12 / WebGPU | WebGL2, GLES 3.0 (GLSL ES 3.00) |
+/// |---|---|---|
+/// | own bindings (`@group`/`@binding` resources) | not in the pipeline layout | same |
+/// | `var<workgroup>` | Metal only | no |
+/// | `override` without a default | pipeline creation fails | same |
+/// | `countOneBits`, `reverseBits`, `extractBits`, `insertBits`, `firstLeadingBit`, `firstTrailingBit`, `countTrailingZeros`, `ldexp`, `dot4I8Packed`, `dot4U8Packed`, `unpack4xI8`, `unpack4xU8`, `textureGather*` | yes | no (GLSL ES 3.10) |
+/// | `textureNumLevels`, `textureNumSamples`, `pack4x8snorm`, `pack4x8unorm` | yes | no |
+///
+/// Available everywhere (naga polyfills them for GLSL ES 3.00): `frexp`, `modf`, `fma`,
+/// `countLeadingZeros`, `unpack4x8unorm`/`unpack4x8snorm`, `pack2x16unorm`/`pack2x16snorm` and their unpacks,
+/// the `Fine`/`Coarse` derivatives (as the plain ones on GL), `textureDimensions`,
+/// `textureLoad`, `textureSampleLevel`/`Grad`/`Bias`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomShader {
     /// Debug name (shader labels, error messages).

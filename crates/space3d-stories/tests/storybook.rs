@@ -12,6 +12,33 @@ use space3d_stories::*;
 // `crates/space3d-stories/tests/__screenshots__/Engine/**.png`.
 storybook_tests!(engine_storybook);
 
+/// Bit-exact engine goldens: the "exact" gate of the graphics upgrade (engine goldens must not
+/// change by a single channel step while the renderer is restructured). The golden test above
+/// allows a small tolerance so other GPUs pass; this one holds only on the machine that blessed
+/// the goldens, so it is opt-in:
+/// `cargo test -p space3d-stories --test storybook -- --ignored engine_goldens_are_exact`.
+#[test]
+#[ignore = "bit-exact goldens hold only on the machine that blessed them"]
+fn engine_goldens_are_exact() {
+    require_gpu!();
+    let mut book = Storybook::new();
+    for story in engine_storybook().iter() {
+        let mut story = story.clone();
+        story.tolerance = None;
+        book.add(story);
+    }
+    let golden = GoldenDir::for_crate(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"));
+    let options = StorybookTestOptions {
+        compare: CompareOptions::exact(),
+        filter: None,
+        policy: GoldenPolicy {
+            ci: true,
+            ..GoldenPolicy::default()
+        },
+    };
+    assert_storybook_in(&book, &golden, &options);
+}
+
 /// A story that only clears the screen to `color` (sRGB 0..1).
 fn clear_story(id: &str, color: [f32; 3]) -> Story {
     Story::new(id, move |app, _| {

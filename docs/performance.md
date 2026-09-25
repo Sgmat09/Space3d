@@ -124,3 +124,57 @@ codegen-units = 1
 ```
 
 Release web builds additionally run `wasm-opt -Oz` when binaryen is installed.
+
+## Graphics upgrade baselines
+
+Measured values of the graphics upgrade's gates (`docs/design/graphics.md` §4.4). Each gate is
+checked against the numbers recorded here; a gate is relaxed only with a new measurement and a
+reason.
+
+### F — foundation (F0 baseline, Direct mode)
+
+Dev machine: Apple M4 Max, Metal, wgpu 30.0.1, Rust 1.98.1.
+
+`benches/instancing.rs` (`cargo bench -p space3d-render --bench instancing -- --warm-up-time 1
+--measurement-time 3`, bench profile; criterion median and range). The "Direct mode" gate is
+±5 % of these.
+
+| bench | time |
+|---|---|
+| `extract_upload/explicit/100k` | 918 µs (716 µs – 1.30 ms) |
+| `extract_upload/explicit/1000k` | 2.16 ms (2.11 – 2.21 ms) |
+| `extract_upload/ecs/100k` | 1.79 ms (1.76 – 1.84 ms) |
+| `extract_upload/ecs_static_mixed/100k` | 2.18 ms (2.13 – 2.24 ms) |
+| `mesh_arena/upload_1000` | 1.72 ms (1.70 – 1.74 ms) |
+
+Steady-state heap allocations per frame (`tests/alloc.rs`, test profile; all of them inside
+wgpu/wgpu-hal, 0 in the renderer; bounds 95 CPU / 215 GPU paths on Metal):
+
+| path | allocations per frame (min / max / mean) |
+|---|---|
+| `CpuDirect` | 82 / 86 / 83.6 |
+| `GpuIndirect`, `GpuMultiDraw` | 191 / 195 / 192.6 |
+| `GpuMultiDraw` + 2 viewport cameras | 314.6 with or without viewport clears |
+
+Live bytes grow by 0 over 120 frames on every path; `cpu_reallocations` and
+`buffer_reallocations` are 0.
+
+Engine storybook (`cargo run -p space3d-stories --example gallery`, dev profile; setup +
+simulation + capture per story; the first story includes device creation):
+
+| story | ms |
+|---|---|
+| Engine/Basics/Lit Cube | 158.5 |
+| Engine/Materials/Material Grid | 16.2 |
+| Engine/Materials/Single Material | 15.9 |
+| Engine/Instancing/10k Cubes | 63.1 |
+| Engine/Textures/Checker Plane | 67.6 |
+| Engine/Lights/Point Lights | 16.8 |
+| Engine/Camera/Projection | 16.4 |
+| Engine/Transforms/Hierarchy | 16.1 |
+| Engine/Physics/Falling Bodies | 16.9 |
+
+The engine goldens (`crates/space3d-stories/tests/__screenshots__/Engine/`) were already exact
+for the merged renderer at F0 (no re-bless needed): they are the baseline of every
+"bit-identical" claim. `cargo test -p space3d-stories --test storybook -- --ignored
+engine_goldens_are_exact` checks them with tolerance 0.

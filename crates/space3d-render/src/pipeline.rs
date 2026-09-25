@@ -341,13 +341,100 @@ pub(crate) fn validate_wgsl(src: &str) -> Result<(), String> {
     parse_and_validate(src).map(drop)
 }
 
-fn parse_and_validate(src: &str) -> Result<wgpu::naga::Module, String> {
-    use wgpu::naga;
+fn parse_and_validate(src: &str) -> Result<(naga::Module, naga::valid::ModuleInfo), String> {
     let module = naga::front::wgsl::parse_str(src).map_err(|e| e.emit_to_string(src))?;
-    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+    let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
         .validate(&module)
         .map_err(|e| e.emit_to_string(src))?;
-    Ok(module)
+    Ok((module, info))
+}
+
+/// WGSL built-in functions GLSL ES 3.00 — WebGL2, and GLES 3.0 devices through wgpu's GL
+/// backend — lacks: GLSL ES 3.10 brought them. naga's GLSL backend emits them regardless of the
+/// version (it polyfills `frexp`, `countLeadingZeros`, `fma` and the fine/coarse derivatives,
+/// and refuses `pack4x8snorm`/`pack4x8unorm` itself), so the GL driver fails to compile the
+/// shader — only on those devices, and in the browser only once the pipeline is created.
+const GLES3_MISSING: [(naga::MathFunction, &str); 12] = {
+    use naga::MathFunction as M;
+    [
+        (M::CountOneBits, "countOneBits"),
+        (M::ReverseBits, "reverseBits"),
+        (M::ExtractBits, "extractBits"),
+        (M::InsertBits, "insertBits"),
+        (M::FirstTrailingBit, "firstTrailingBit"),
+        (M::FirstLeadingBit, "firstLeadingBit"),
+        (M::CountTrailingZeros, "countTrailingZeros"),
+        (M::Ldexp, "ldexp"),
+        (M::Dot4I8Packed, "dot4I8Packed"),
+        (M::Dot4U8Packed, "dot4U8Packed"),
+        (M::Unpack4xI8, "unpack4xI8"),
+        (M::Unpack4xU8, "unpack4xU8"),
+    ]
+};
+
+/// The first built-in function of [`GLES3_MISSING`] (or `textureGather*`, also GLSL ES 3.10)
+/// any function of `module` calls, used or not.
+fn gles3_missing_builtin(module: &naga::Module) -> Option<&'static str> {
+    let functions = module
+        .functions
+        .iter()
+        .map(|(_, f)| f)
+        .chain(module.entry_points.iter().map(|e| &e.function));
+    for f in functions {
+        for (_, e) in f.expressions.iter() {
+            match *e {
+                naga::Expression::Math { fun, .. } => {
+                    if let Some((_, name)) = GLES3_MISSING.iter().find(|(m, _)| *m == fun) {
+                        return Some(name);
+                    }
+                }
+                naga::Expression::ImageSample { gather: Some(_), .. } => return Some("textureGather"),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Translate the forward entry points (`vs_main`, `fs_main`) to GLSL ES 3.00 the way wgpu's GL
+/// backend does on WebGL2 (overrides at their defaults); the error, if naga refuses (image
+/// queries GLSL ES lacks such as `textureNumLevels`, `pack4x8snorm`, …).
+fn gles3_translation_error(module: &naga::Module, info: &naga::valid::ModuleInfo) -> Option<String> {
+    use naga::back::glsl;
+    let options = glsl::Options {
+        version: glsl::Version::Embedded {
+            version: 300,
+            is_webgl: true,
+        },
+        writer_flags: glsl::WriterFlags::ADJUST_COORDINATE_SPACE | glsl::WriterFlags::FORCE_POINT_SIZE,
+        binding_map: Default::default(),
+        zero_initialize_workgroup_memory: true,
+    };
+    let constants = naga::back::PipelineConstants::default();
+    for (stage, entry_point) in [
+        (naga::ShaderStage::Vertex, "vs_main"),
+        (naga::ShaderStage::Fragment, "fs_main"),
+    ] {
+        let translated =
+            naga::back::pipeline_constants::process_overrides(module, info, Some((stage, entry_point)), &constants)
+                .map_err(|e| e.to_string())
+                .and_then(|(module, info)| {
+                    let pipeline = glsl::PipelineOptions {
+                        shader_stage: stage,
+                        entry_point: entry_point.to_string(),
+                        multiview: None,
+                    };
+                    let mut out = String::new();
+                    let policies = naga::proc::BoundsCheckPolicies::default();
+                    glsl::Writer::new(&mut out, &module, &info, &options, &pipeline, policies)
+                        .and_then(|mut w| w.write().map(drop))
+                        .map_err(|e| e.to_string())
+                });
+        if let Err(e) = translated {
+            return Some(format!("{stage:?} stage: {e}"));
+        }
+    }
+    None
 }
 
 /// Resources the forward template declares, `(group, binding, name)`: the only ones in the
@@ -370,14 +457,20 @@ const TEMPLATE_RESOURCES: [(u32, u32, &str); 4] = [
 /// * any other address space but `function` and `private` (immediates, mesh and ray-tracing
 ///   payloads: optional capabilities the forward pipeline does not use);
 /// * pipeline constants (`override`) without a default: the forward pipeline sets none, so
-///   creating it fails.
+///   creating it fails;
+/// * built-in functions WebGL2 / GLES 3.0 (GLSL ES 3.00) lacks ([`GLES3_MISSING`],
+///   `textureGather*`), and anything else naga cannot translate to GLSL ES 3.00
+///   (`textureNumLevels`, `textureNumSamples`, `pack4x8snorm`, `pack4x8unorm`, …). Metal,
+///   Vulkan, DX12 and WebGPU run them, but a shader that works there would silently fall back to
+///   the built-in shader on WebGL2: they are rejected on every backend, so the problem shows up
+///   on the machine the shader is written on (see [`CustomShader`] for the list).
 ///
 /// Detected here synchronously, because on browser WebGPU the error scope around pipeline
 /// creation only answers later (see [`Pipelines::poll_pending`]): until then every frame
 /// drawing with the invalid pipeline is lost.
 pub(crate) fn validate_custom_wgsl(src: &str) -> Result<(), String> {
-    use wgpu::naga::AddressSpace as A;
-    let module = parse_and_validate(src)?;
+    use naga::AddressSpace as A;
+    let (module, info) = parse_and_validate(src)?;
     for (_, g) in module.global_variables.iter() {
         let name = g.name.as_deref().unwrap_or("<unnamed>");
         match g.space {
@@ -424,6 +517,19 @@ pub(crate) fn validate_custom_wgsl(src: &str) -> Result<(), String> {
                  pipeline sets no constants"
             ));
         }
+    }
+    if let Some(name) = gles3_missing_builtin(&module) {
+        return Err(format!(
+            "custom shaders cannot use `{name}`: WebGL2 and GLES 3.0 devices (GLSL ES 3.00) \
+             lack it, so the shader would not compile there; custom shaders are limited to what \
+             every backend runs"
+        ));
+    }
+    if let Some(e) = gles3_translation_error(&module, &info) {
+        return Err(format!(
+            "custom shader does not translate to GLSL ES 3.00 (WebGL2 / GLES 3.0), so it would \
+             not run there; custom shaders are limited to what every backend runs: {e}"
+        ));
     }
     Ok(())
 }
@@ -1339,6 +1445,106 @@ mod tests {
         );
         validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, false, false, Some(&ok)))
             .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Regression: custom shaders calling WGSL built-ins GLSL ES 3.00 lacks passed validation.
+    /// They ran on Metal, Vulkan, DX12 and WebGPU but did not compile on WebGL2 / GLES 3.0
+    /// devices, where their draws silently used the built-in shader. They are now rejected on
+    /// every backend — used or not — like workgroup memory, while the built-ins naga polyfills
+    /// for GLSL ES 3.00 stay available.
+    #[test]
+    fn custom_shaders_cannot_use_builtins_webgl2_lacks() {
+        let fragment = |body: &str| format!("fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> {{ {body} }}");
+        let cases = [
+            (
+                fragment("return c * f32(countOneBits(u32(c.r * 255.0)));"),
+                "`countOneBits`",
+            ),
+            (fragment("return c * f32(reverseBits(u32(c.g)));"), "`reverseBits`"),
+            (
+                fragment("return c * f32(extractBits(u32(c.g), 1u, 2u));"),
+                "`extractBits`",
+            ),
+            (
+                fragment("return c * f32(insertBits(u32(c.g), 1u, 1u, 2u));"),
+                "`insertBits`",
+            ),
+            (
+                fragment("return c * f32(firstLeadingBit(u32(c.g)));"),
+                "`firstLeadingBit`",
+            ),
+            (
+                fragment("return c * f32(firstTrailingBit(u32(c.g)));"),
+                "`firstTrailingBit`",
+            ),
+            (
+                fragment("return c * f32(countTrailingZeros(u32(c.g)));"),
+                "`countTrailingZeros`",
+            ),
+            (fragment("return c * ldexp(c.r, i32(c.g));"), "`ldexp`"),
+            (fragment("return c * vec4<f32>(unpack4xU8(u32(c.g)));"), "`unpack4xU8`"),
+            (
+                fragment("return c * textureGather(0, base_tex, base_sampler, in.uv);"),
+                "`textureGather`",
+            ),
+            (
+                format!(
+                    "fn my_unused(x: u32) -> u32 {{ return countOneBits(x); }}\n{}",
+                    fragment("return c;")
+                ),
+                "`countOneBits`",
+            ),
+            (fragment("return c * f32(textureNumLevels(base_tex));"), "GLSL ES 3.00"),
+            (fragment("return unpack4x8unorm(pack4x8unorm(c));"), "GLSL ES 3.00"),
+        ];
+        for (wgsl, expected) in cases {
+            let custom = CustomShader::new("gles3", wgsl);
+            let src = forward_shader(InstanceTransform::LAYOUT, false, false, Some(&custom));
+            validate(&src); // naga alone accepts it
+            let e = validate_custom_wgsl(&src).expect_err(expected);
+            assert!(e.contains(expected) && e.contains("GLES 3.0"), "{expected}: {e}");
+        }
+        // Calls on constants are folded to literals by naga: nothing left for GLSL to lack.
+        let folded = CustomShader::new(
+            "folded",
+            fragment("return c * f32(reverseBits(1u) + countOneBits(7u));"),
+        );
+        validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, false, false, Some(&folded)))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Built-ins naga polyfills for GLSL ES 3.00 (or that GLSL ES 3.00 has) are fine.
+        let portable = CustomShader::new(
+            "portable",
+            fragment(
+                "let f = frexp(c.r); let m = modf(c.g);\n\
+                 let bits = f32(countLeadingZeros(4u)) + unpack4x8unorm(7u).x + unpack4x8snorm(9u).y;\n\
+                 let h = unpack2x16unorm(pack2x16unorm(c.xy)) + unpack2x16snorm(pack2x16snorm(c.zw));\n\
+                 let d = dpdxFine(in.uv.x) + fwidthCoarse(in.uv.y) + dpdy(in.uv.x);\n\
+                 return vec4<f32>(fma(c.r, 2.0, 1.0), f.fract + m.fract, bits + d, h.x) + \
+                 textureSampleLevel(base_tex, base_sampler, in.uv, 0.0) * f32(textureDimensions(base_tex).x);",
+            ),
+        );
+        for layered in [false, true] {
+            let custom = if layered {
+                CustomShader::new("portable", portable.wgsl.replace("in.uv, 0.0)", "in.uv, 0, 0.0)"))
+            } else {
+                portable.clone()
+            };
+            validate_custom_wgsl(&forward_shader(
+                InstanceTransform::LAYOUT,
+                false,
+                layered,
+                Some(&custom),
+            ))
+            .unwrap_or_else(|e| panic!("layered {layered}: {e}"));
+        }
+        // The built-in shader itself, for every layout and texture kind.
+        for l in [InstanceTransform::LAYOUT, InstanceHalf::LAYOUT, ATLAS] {
+            for layered in [false, true] {
+                let (module, info) = parse_and_validate(&forward_shader(l, true, layered, None)).unwrap();
+                assert_eq!(gles3_translation_error(&module, &info), None, "{}", l.name);
+                assert_eq!(gles3_missing_builtin(&module), None);
+            }
+        }
     }
 
     /// The generated accessors read the attributes the layout declares.

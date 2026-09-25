@@ -4928,6 +4928,7 @@ dependencies = [
  "futures",
  "glam 0.33.9",
  "image",
+ "naga",
  "pollster",
  "rayon",
  "space3d-core",

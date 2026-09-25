@@ -952,9 +952,8 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d capture"),
         });
-        if self.surface.is_some() {
-            self.encode_primary_to_offscreen(&mut encoder);
-            self.encode_capture_overlays(&mut encoder);
+        if self.capture_replays() {
+            self.encode_capture_replay(&mut encoder);
         }
         let (w, h) = (self.offscreen.width, self.offscreen.height);
         let padded = align_up(w as u64 * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);

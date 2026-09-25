@@ -289,3 +289,43 @@ fn custom_shaders_using_workgroup_memory_fall_back() {
     assert!(err.contains("`var<workgroup> tint`"), "{err}");
     assert_eq!(r.gpu_error_count(), 0);
 }
+
+/// Built-ins WebGL2 / GLES 3.0 (GLSL ES 3.00) lack are rejected on every backend, before any
+/// GPU work: the shader would run on Metal, Vulkan, DX12 and WebGPU but not compile on WebGL2.
+/// Those naga polyfills for GLSL ES 3.00 build on every backend — this test also runs on GL
+/// (`WGPU_BACKEND=gl`, e.g. ANGLE on macOS: GLES 3.0), where the shader really compiles.
+#[test]
+fn custom_shaders_are_limited_to_what_webgl2_compiles() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let rejected = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+        "bits",
+        "fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {\n\
+         \x20   return vec4<f32>(f32(countOneBits(u32(color.r * 3.0))) * 0.5, 0.0, 0.0, 1.0);\n}\n",
+    ));
+    let portable = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+        "portable",
+        "fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {\n\
+         \x20   let f = frexp(4.0);\n\
+         \x20   let lz = f32(countLeadingZeros(1u)) / 31.0;\n\
+         \x20   let g = fma(0.5, 0.5, 0.25) + dpdxFine(in.uv.x) * 0.0 + unpack4x8unorm(0xff00u).y;\n\
+         \x20   return vec4<f32>(f.fract * 2.0 * lz, g - 1.0, 0.0, 1.0);\n}\n",
+    ));
+    let a = scene(&mut app, Material::unlit(Vec4::ONE).with_shader(rejected));
+    let img = render_to_image(&mut app).expect("capture");
+    assert_eq!(img.get(20, 32), [255, 255, 255, 255], "built-in shader");
+    let r = app.resources.expect::<Renderer>();
+    let err = r.shader_error(rejected).unwrap_or_default();
+    assert!(err.contains("`countOneBits`") && err.contains("WebGL2"), "{err}");
+    app.world.get::<&mut InstancedMesh>(a).unwrap().material = Material::unlit(Vec4::ONE).with_shader(portable);
+    let img = render_to_image(&mut app).expect("capture");
+    let r = app.resources.expect::<Renderer>();
+    assert_eq!(r.shader_error(portable), None, "{:?}", r.capabilities().adapter.backend);
+    // frexp(4) = 0.5 · 2³, countLeadingZeros(1) = 31, fma = 0.5, unpack4x8unorm(0xff00).y = 1.
+    assert_eq!(
+        img.get(20, 32),
+        [255, 188, 0, 255],
+        "custom shader on {:?}",
+        r.capabilities().adapter.backend
+    );
+    assert_eq!(r.gpu_error_count(), 0);
+}

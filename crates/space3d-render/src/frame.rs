@@ -260,7 +260,9 @@ pub(crate) enum ViewTarget {
 pub(crate) struct ViewData {
     target: ViewTarget,
     clear: Option<Vec4>,
-    viewport: Option<[f32; 4]>,
+    /// The camera's viewport in whole pixels of the target, as drawn (see
+    /// [`ViewportRect::fitted`]); `None` = the whole target.
+    rect: Option<ViewportRect>,
     size: (u32, u32),
     view_offset: u32,
     draws: Range<usize>,
@@ -649,6 +651,8 @@ pub(crate) struct FrameState {
     /// Largest storage binding, a multiple of 4 and at most `max_buffer_size`.
     max_storage_binding: u64,
     max_buffer_size: u64,
+    /// The device's `max_texture_dimension_2d` (bounds valid viewports).
+    max_texture_2d: u32,
     /// Largest `base_vertex` passed to a direct draw since the last `prepare`.
     #[cfg(test)]
     pub(crate) max_direct_base_vertex: i32,
@@ -657,6 +661,9 @@ pub(crate) struct FrameState {
     /// takes the lost-surface path after preparing its views.
     #[cfg(test)]
     pub(crate) simulate_surface_loss: bool,
+    /// Captures take the windowed replay path (`encode_capture_replay`) although headless.
+    #[cfg(test)]
+    pub(crate) force_capture_replay: bool,
     /// Times the ECS batch order was rebuilt.
     #[cfg(test)]
     pub(crate) ecs_reorders: u64,
@@ -746,10 +753,13 @@ impl FrameState {
             uniform_align: device.limits().min_uniform_buffer_offset_alignment as usize,
             max_storage_binding: caps.max_storage_binding,
             max_buffer_size: caps.max_buffer_size,
+            max_texture_2d: device.limits().max_texture_dimension_2d,
             #[cfg(test)]
             max_direct_base_vertex: 0,
             #[cfg(test)]
             simulate_surface_loss: false,
+            #[cfg(test)]
+            force_capture_replay: false,
             #[cfg(test)]
             ecs_reorders: 0,
         }
@@ -1417,15 +1427,19 @@ impl Renderer {
                     )
                 }
             };
-            let (vw, vh) = match cam.camera.viewport {
-                Some(v) => {
-                    let r = viewport_rect(v, size);
-                    (r.w as f32, r.h as f32)
-                }
-                None => (size.0 as f32, size.1 as f32),
-            };
+            let rect = cam.camera.viewport.map(|v| viewport_rect(v, size));
+            let (vw, vh) = rect.map_or((size.0 as f32, size.1 as f32), |r| (r.w as f32, r.h as f32));
             let aspect = (vw / vh.max(1.0)).max(1e-4);
-            let view_proj = cam.camera.projection.matrix(aspect) * cam.transform.inverse();
+            // A viewport past wgpu's viewport limits is drawn through its part within the target,
+            // with a projection showing the same pixels there.
+            let (rect, fit) = match rect {
+                Some(r) => {
+                    let (r, fit) = r.fitted(size, f.max_texture_2d);
+                    (Some(r), fit)
+                }
+                None => (None, Mat4::IDENTITY),
+            };
+            let view_proj = fit * cam.camera.projection.matrix(aspect) * cam.transform.inverse();
             let frustum = Frustum::from_view_proj(&view_proj);
             let view_offset = f.views.len() * view_stride;
             let gv = GpuView {
@@ -1707,7 +1721,7 @@ impl Renderer {
             f.views.push(ViewData {
                 target,
                 clear: cam.camera.clear_color,
-                viewport: cam.camera.viewport,
+                rect,
                 size,
                 view_offset: view_offset as u32,
                 draws: draws_start..f.draws.len(),
@@ -2379,7 +2393,7 @@ impl Renderer {
         samples: u32,
         manual_srgb: bool,
     ) {
-        let rect = view.viewport.map(|v| viewport_rect(v, view.size));
+        let rect = view.rect;
         let full = rect.is_none_or(|r| r.covers(view.size));
         // Scissor rects must lie within the attachment itself. It has the size the view was
         // prepared for on every path (see `surface_lost`); should that ever not hold, a scissor
@@ -2567,6 +2581,24 @@ impl Renderer {
         }
     }
 
+    /// Whether a capture re-records the last frame into the offscreen target: windowed
+    /// renderers (surface textures are not readable), or a test forcing the windowed path.
+    pub(crate) fn capture_replays(&self) -> bool {
+        #[cfg(test)]
+        if self.frame.force_capture_replay {
+            return true;
+        }
+        self.surface.is_some()
+    }
+
+    /// Windowed capture: re-record the last frame's primary views into the offscreen target,
+    /// then the overlays ([`crate::OverlayTargetKind::Capture`]) on top of them — in that
+    /// order, as in a frame (overlays recorded first would be painted over by the views).
+    pub(crate) fn encode_capture_replay(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_primary_to_offscreen(encoder);
+        self.encode_capture_overlays(encoder);
+    }
+
     /// Re-record the last frame's primary views into the offscreen target (for capture). The
     /// target gets the size those views were prepared for (their projection and viewports),
     /// even if the window was resized since.
@@ -2595,6 +2627,57 @@ impl ViewportRect {
             && self.y <= 0
             && self.x as i64 + self.w as i64 >= size.0 as i64
             && self.y as i64 + self.h as i64 >= size.1 as i64
+    }
+
+    /// The rect to draw with, and a clip-space correction to apply after the projection.
+    ///
+    /// wgpu rejects viewports wider or higher than `max_texture_dimension_2d`, or reaching
+    /// further than twice that from the origin: a validation error that loses the frame's
+    /// commands. Camera viewports can be anything (`[-50.0, -50.0, 101.0, 101.0]` zooms into
+    /// the center of a 101× larger image; non-finite values end up far outside). A rect within
+    /// the limits is returned as is, with no correction — every in-range viewport draws exactly
+    /// as before. Any other rect is drawn through its part within the target, with the
+    /// projection remapped so that every pixel there shows exactly what the whole rect would
+    /// (only the float rounding differs); a rect entirely outside the target draws nothing
+    /// (a 1×1 rect just past the target's corner).
+    fn fitted(self, size: (u32, u32), max_dimension: u32) -> (ViewportRect, Mat4) {
+        let max = max_dimension as i64;
+        let (x, y, w, h) = (self.x as i64, self.y as i64, self.w as i64, self.h as i64);
+        let valid = w <= max && h <= max && x >= -2 * max && y >= -2 * max && x + w < 2 * max && y + h < 2 * max;
+        if valid {
+            return (self, Mat4::IDENTITY);
+        }
+        let (tw, th) = (size.0.max(1) as i64, size.1.max(1) as i64);
+        let (x0, y0) = (x.clamp(0, tw), y.clamp(0, th));
+        let (x1, y1) = ((x + w).clamp(0, tw), (y + h).clamp(0, th));
+        if x1 <= x0 || y1 <= y0 {
+            let outside = ViewportRect {
+                x: tw as i32,
+                y: th as i32,
+                w: 1,
+                h: 1,
+            };
+            return (outside, Mat4::IDENTITY);
+        }
+        let clip = ViewportRect {
+            x: x0 as i32,
+            y: y0 as i32,
+            w: (x1 - x0) as u32,
+            h: (y1 - y0) as u32,
+        };
+        // NDC of the full rect → NDC of `clip` for the same pixel (y points up in NDC, down in
+        // pixels).
+        let (cw, ch) = ((x1 - x0) as f64, (y1 - y0) as f64);
+        let (sx, sy) = (w as f64 / cw, h as f64 / ch);
+        let tx = (2.0 * (x - x0) as f64 + w as f64 - cw) / cw;
+        let ty = (ch - h as f64 - 2.0 * (y - y0) as f64) / ch;
+        let fit = Mat4::from_cols(
+            Vec4::new(sx as f32, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, sy as f32, 0.0, 0.0),
+            Vec4::Z,
+            Vec4::new(tx as f32, ty as f32, 0.0, 1.0),
+        );
+        (clip, fit)
     }
 
     /// `[x, y, width, height]` of the rect's part within a `size` target (at least one pixel,
@@ -2832,18 +2915,27 @@ mod tests {
     /// a scene with 120 small buffers and 13 views took 3121 dispatches (and wgpu-hal's Metal
     /// backend allocates in each). The jobs of all views reading one buffer now share a
     /// dispatch, each job selecting its view's frustum: 70 views (two windows of frustums) ×
-    /// 4 buffers take 2 × 2 × 4 + 1 dispatches.
+    /// 74 buffers take 2 × 2 × 74 + 1 dispatches (not 70 × 74 × 2).
     ///
     /// Every one of the 70 viewports is checked against what its own camera sees — its own
-    /// clear color, its ECS cube and its own uniquely colored explicit instance, and nothing
-    /// else — on every draw path. A view culled with another view's frustum (on the CPU or the
-    /// GPU), drawn with another view's matrix or wiped by a later viewport fails.
+    /// clear color, its ECS cube, its own uniquely colored instance in a shared explicit buffer,
+    /// its own marker cube in a single-instance explicit buffer, and nothing else — on every
+    /// draw path. A view culled with another view's frustum (on the CPU or the GPU), drawn with
+    /// another view's matrix or wiped by a later viewport fails.
+    ///
+    /// The marker buffers are what catches a wrong frustum in the CPU culling of *explicit*
+    /// buffers: that path culls whole blocks of `CULL_BLOCK` instances, and each shared
+    /// buffer's single block spans every view, so it is drawn in every view whatever frustum
+    /// tests it. A marker buffer's block holds only its view's cube: tested against another
+    /// view's frustum it is culled (the marker vanishes), and skipping the test altogether
+    /// changes the exact `culled` count checked on `CpuDirect`.
     #[test]
     fn culling_dispatches_scale_with_buffers_not_views() {
         use crate::components::srgb_to_linear;
         use crate::{Camera3d, InstanceBuffer, InstanceTransformColor, InstancedMesh, Mesh3d, RenderStats};
         use space3d_core::{ImageData, MeshData, Transform};
         const VIEWS: usize = 70;
+        const ECS: usize = 300;
         const W: u32 = 140;
         const H: u32 = 100;
         let Some(mut app) = headless_app(W, H) else { return };
@@ -2857,13 +2949,14 @@ mod tests {
         let center = |v: usize| Vec3::new((v % 10) as f32 * 10.0, (v / 10) as f32 * 10.0, 0.0);
         // Seen by no view.
         let nowhere = |i: usize| Vec3::new(-1000.0 - i as f32 * 2.0, 0.0, 0.0);
-        // sRGB colors of view v: its clear color and its explicit instance's color.
+        // sRGB colors of view v: its clear color, its shared-buffer instance and its marker.
         let clear_rgb = |v: usize| [(v % 10) as u8 * 6, (v / 10) as u8 * 6, 60];
         let own_rgb = |v: usize| [40 + (v % 10) as u8 * 20, 40 + (v / 10) as u8 * 30, 200];
+        let mark_rgb = |v: usize| [255, 120 + (v % 10) as u8 * 12, (v / 10) as u8 * 20];
         let linear = |c: [u8; 3]| c.map(|x| srgb_to_linear(x as f32 / 255.0));
         let linear4 = |c: [u8; 3]| Vec3::from(linear(c)).extend(1.0);
         // ECS: a white cube left of each view's point, and cubes no view sees.
-        for i in 0..300 {
+        for i in 0..ECS {
             let p = if i < VIEWS {
                 center(i) - Vec3::X * 0.9
             } else {
@@ -2875,6 +2968,17 @@ mod tests {
                 Material::unlit(Vec4::ONE),
             ));
         }
+        let instanced = |app: &mut space3d_core::App, data: Vec<InstanceTransformColor>| {
+            let instances = app
+                .resources
+                .expect_mut::<InstanceBuffers>()
+                .insert(InstanceBuffer::from_vec(data, crate::BufferUsage::Static));
+            app.world.spawn((InstancedMesh {
+                mesh,
+                material: Material::unlit(Vec4::ONE),
+                instances,
+            },));
+        };
         // Three explicit buffers of 200 instances: view v's cube, right of its point and in its
         // own color, is instance 8 × (v / 3) of buffer v % 3 (in several culling workgroups);
         // the other instances are seen by no view.
@@ -2885,20 +2989,24 @@ mod tests {
                     let (p, rgb) = if i % 8 == 0 && v < VIEWS {
                         (center(v) + Vec3::X * 0.9, own_rgb(v))
                     } else {
-                        (nowhere(300 + 200 * k + i), [255, 255, 255])
+                        (nowhere(ECS + 200 * k + i), [255, 255, 255])
                     };
                     InstanceTransformColor::new(Mat4::from_translation(p), linear4(rgb))
                 })
                 .collect();
-            let instances = app
-                .resources
-                .expect_mut::<InstanceBuffers>()
-                .insert(InstanceBuffer::from_vec(data, crate::BufferUsage::Static));
-            app.world.spawn((InstancedMesh {
-                mesh,
-                material: Material::unlit(Vec4::ONE),
-                instances,
-            },));
+            instanced(&mut app, data);
+        }
+        // One single-instance buffer per view: its marker cube, above its point (clear of the
+        // other two cubes).
+        for v in 0..VIEWS {
+            let p = center(v) + Vec3::Y * 1.25;
+            instanced(
+                &mut app,
+                vec![InstanceTransformColor::new(
+                    Mat4::from_translation(p),
+                    linear4(mark_rgb(v)),
+                )],
+            );
         }
         // A 10 × 7 grid of viewports (14 × 14.3 px), each with its own clear color.
         for v in 0..VIEWS {
@@ -2914,14 +3022,14 @@ mod tests {
             ));
         }
         // Inside each viewport (1 px margin), every pixel is the view's clear color, its white
-        // ECS cube or its own instance, and each of the three is visible.
+        // ECS cube, its own instance or its marker, and each of the four is visible.
         let check = |img: &ImageData, path: DrawPath| {
             for v in 0..VIEWS {
                 let (col, row) = ((v % 10) as u32, (v / 10) as u32);
                 let cell_h = H as f32 / 7.0;
                 let ys = (row as f32 * cell_h).ceil() as u32 + 1..((row + 1) as f32 * cell_h).floor() as u32 - 1;
-                let expected = [clear_rgb(v), [255, 255, 255], own_rgb(v)];
-                let mut seen = [0usize; 3];
+                let expected = [clear_rgb(v), [255, 255, 255], own_rgb(v), mark_rgb(v)];
+                let mut seen = [0usize; 4];
                 for y in ys {
                     for x in col * 14 + 1..col * 14 + 13 {
                         let p = img.get(x, y);
@@ -2935,15 +3043,23 @@ mod tests {
                     }
                 }
                 assert!(
-                    seen[0] >= 40 && seen[1] >= 6 && seen[2] >= 6,
-                    "{path:?}: viewport {v}: clear color / ECS cube / own instance cover {seen:?} px"
+                    seen[0] >= 40 && seen[1] >= 6 && seen[2] >= 6 && seen[3] >= 6,
+                    "{path:?}: viewport {v}: clear color / ECS cube / own instance / marker cover {seen:?} px"
                 );
             }
         };
         set_path(&mut app, DrawPath::CpuDirect);
         let cpu = crate::render_to_image(&mut app).expect("capture");
-        assert!(app.resources.expect::<RenderStats>().culled > 0, "views cull");
         check(&cpu, DrawPath::CpuDirect);
+        // Each view sees one ECS cube and one marker buffer; the shared buffers' blocks span
+        // every view and are never culled.
+        let stats = app.resources.expect::<RenderStats>();
+        assert_eq!(
+            stats.culled,
+            (VIEWS * (ECS - 1) + VIEWS * (VIEWS - 1)) as u64,
+            "CPU culling of every view with its own frustum"
+        );
+        assert_eq!(stats.instances_drawn, (VIEWS * (1 + 3 * 200 + 1)) as u64);
         for path in paths_up_to(best).skip(1) {
             set_path(&mut app, path);
             let img = crate::render_to_image(&mut app).expect("capture");
@@ -2952,11 +3068,12 @@ mod tests {
             assert_eq!(d, 0, "{path:?} differs from CpuDirect in {d} px");
             let r = app.resources.expect::<Renderer>();
             assert_eq!(r.gpu_error_count(), 0, "{path:?}");
-            assert_eq!(r.frame.jobs.len(), VIEWS * 4, "{path:?}: every source GPU-culled");
+            let buffers = 1 + 3 + VIEWS;
+            assert_eq!(r.frame.jobs.len(), VIEWS * buffers, "{path:?}: every source GPU-culled");
             let compact = u32::from(path == DrawPath::GpuMultiDrawCount);
             assert_eq!(
                 app.resources.expect::<RenderStats>().compute_dispatches,
-                2 * 2 * 4 + 1 + compact,
+                2 * 2 * buffers as u32 + 1 + compact,
                 "{path:?}: mark + scatter per buffer and frustum window, one scan"
             );
         }
@@ -3150,6 +3267,239 @@ mod tests {
             let error = pollster::block_on(scope.pop());
             assert!(error.is_none(), "×{samples}: {error:?}");
             assert_eq!(r.gpu_error_count(), 0);
+        }
+    }
+
+    /// A yellow rectangle overlay (fullscreen triangle + scissor) recording the kinds of the
+    /// targets it was prepared for.
+    struct RectOverlay {
+        rect: [u32; 4],
+        pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+        kinds: std::sync::Arc<std::sync::Mutex<Vec<crate::OverlayTargetKind>>>,
+    }
+
+    impl crate::RenderOverlay for RectOverlay {
+        fn prepare(
+            &mut self,
+            device: &wgpu::Device,
+            _: &wgpu::Queue,
+            _: &mut wgpu::CommandEncoder,
+            target: &crate::OverlayTarget,
+        ) {
+            self.kinds.lock().unwrap().push(target.kind);
+            if self.pipeline.as_ref().is_some_and(|(f, _)| *f == target.format) {
+                return;
+            }
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rect overlay"),
+                source: wgpu::ShaderSource::Wgsl(
+                    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                         let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+                         return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+                     }
+                     @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 1.0, 0.0, 1.0); }"
+                        .into(),
+                ),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("rect overlay"),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(target.format.into())],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.pipeline = Some((target.format, pipeline));
+        }
+
+        fn render(&self, pass: &mut wgpu::RenderPass<'static>, _: &crate::OverlayTarget) {
+            let Some((_, pipeline)) = &self.pipeline else { return };
+            let [x, y, w, h] = self.rect;
+            pass.set_scissor_rect(x, y, w, h);
+            pass.set_pipeline(pipeline);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// A windowed capture re-records the last frame's primary views into the offscreen target
+    /// and runs the overlays after them (kind `Capture`): the capture is the frame, overlays on
+    /// top — with and without MSAA. (Recorded the other way round, the replayed views would
+    /// paint over the overlays.)
+    #[test]
+    fn capture_replay_draws_overlays_after_the_views() {
+        for samples in [1, 4] {
+            let Some(mut app) = split_screen_app(64, 48, samples) else {
+                return;
+            };
+            let kinds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            app.resources.expect_mut::<crate::RenderOverlays>().insert(
+                "rect",
+                0,
+                RectOverlay {
+                    rect: [24, 16, 16, 16],
+                    pipeline: None,
+                    kinds: kinds.clone(),
+                },
+            );
+            let frame = crate::render_to_image(&mut app).expect("capture");
+            assert_eq!(
+                frame.get(30, 20)[..3],
+                [255, 255, 0],
+                "overlay over the scene ×{samples}"
+            );
+            assert_eq!(frame.get(4, 4)[..3], [255, 0, 0], "left view ×{samples}");
+            let r = app.resources.expect_mut::<Renderer>();
+            r.frame.force_capture_replay = true;
+            let replayed = r.capture_blocking().expect("replayed capture");
+            assert_eq!(r.gpu_error_count(), 0);
+            assert!(
+                frame.pixels == replayed.pixels,
+                "×{samples}: the replay differs from the frame"
+            );
+            use crate::OverlayTargetKind as K;
+            assert_eq!(*kinds.lock().unwrap(), [K::Offscreen, K::Capture], "×{samples}");
+        }
+    }
+
+    /// Viewports within wgpu's limits are drawn as they are; others through their part within
+    /// the target, remapped so each pixel shows what the whole viewport would.
+    #[test]
+    fn out_of_range_viewport_rects_are_fitted_to_the_target() {
+        // In range (incl. partly or entirely outside the target): unchanged, no correction.
+        for (v, size) in [
+            ([0.25, 0.25, 0.375, 0.5], (8, 4)),
+            ([-0.5, 0.0, 2.0, 1.0], (10, 10)),
+            ([1.0, 1.0, 0.5, 0.5], (10, 10)),
+            ([0.0, 0.0, 1.0, 1.0], (8192, 8192)),
+        ] {
+            let r = viewport_rect(v, size);
+            assert_eq!(r.fitted(size, 8192), (r, Mat4::IDENTITY), "{v:?}");
+        }
+        // 101× the target, centered (6464 × 4848 px > 2048): the target itself, remapped.
+        let size = (64, 48);
+        let big = viewport_rect([-50.0, -50.0, 101.0, 101.0], size);
+        assert_eq!((big.x, big.y, big.w, big.h), (-3200, -2400, 6464, 4848));
+        let (fit_rect, fit) = big.fitted(size, 2048);
+        assert_eq!((fit_rect.x, fit_rect.y, fit_rect.w, fit_rect.h), (0, 0, 64, 48));
+        // A clip-space point lands on the same pixel either way.
+        let pixel = |r: ViewportRect, clip: Vec4| {
+            let n = clip / clip.w;
+            (
+                r.x as f64 + (n.x as f64 + 1.0) / 2.0 * r.w as f64,
+                r.y as f64 + (1.0 - n.y as f64) / 2.0 * r.h as f64,
+            )
+        };
+        for clip in [
+            Vec4::new(0.0, 0.0, 0.5, 1.0),
+            Vec4::new(0.004, -0.007, 0.5, 1.0),
+            Vec4::new(-0.018, 0.012, 0.4, 2.0),
+        ] {
+            let (a, b) = (pixel(big, clip), pixel(fit_rect, fit * clip));
+            assert!(
+                (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3,
+                "{clip}: {a:?} vs {b:?}"
+            );
+        }
+        // Off-center and partly outside: the visible part only.
+        let wide = viewport_rect([0.5, 0.0, 1000.0, 1.0], size);
+        let (r, fit) = wide.fitted(size, 2048);
+        assert_eq!((r.x, r.y, r.w, r.h), (32, 0, 32, 48));
+        let clip = Vec4::new(-0.9999, 0.25, 0.5, 1.0);
+        let (a, b) = (pixel(wide, clip), pixel(r, fit * clip));
+        assert!((a.0 - b.0).abs() < 1e-2 && (a.1 - b.1).abs() < 1e-3, "{a:?} vs {b:?}");
+        // Entirely outside or non-finite: whatever is drawn is valid for wgpu.
+        for v in [
+            [2e5, 0.0, 1.0, 1.0],
+            [-2e5, -2e5, 1.0, 1.0],
+            [f32::INFINITY, 0.0, 1.0, 1.0],
+            [f32::NEG_INFINITY, 0.0, 1.0, 1.0],
+            [0.0, 0.0, f32::INFINITY, 1.0],
+            [0.0, f32::NEG_INFINITY, 1.0, f32::INFINITY],
+            [f32::NAN; 4],
+        ] {
+            let (r, fit) = viewport_rect(v, size).fitted(size, 2048);
+            let (x, y, w, h) = (r.x as i64, r.y as i64, r.w as i64, r.h as i64);
+            assert!(
+                w <= 2048 && h <= 2048 && x >= -4096 && y >= -4096 && x + w < 4096 && y + h < 4096,
+                "{v:?}: {r:?}"
+            );
+            assert!(fit.is_finite(), "{v:?}: {fit}");
+        }
+    }
+
+    /// Regression: a camera viewport past wgpu's viewport limits (larger than the device's
+    /// `max_texture_dimension_2d`, or far outside the target, e.g. from non-finite values)
+    /// failed `set_viewport` validation, which loses the frame's whole command buffer (a panic
+    /// in debug builds). Such viewports now draw their part within the target: a viewport 101
+    /// times the target's size centered on it shows the central 1/101 of its image — what a
+    /// full-target camera with a 101 times narrower field of view shows — on every draw path,
+    /// with and without MSAA.
+    #[test]
+    fn out_of_range_viewports_draw_their_visible_part() {
+        use crate::{Camera3d, Mesh3d, Projection};
+        use space3d_core::{MeshData, Transform};
+        let narrow = 30f32.to_radians();
+        let wide = 2.0 * (101.0 * (narrow / 2.0).tan()).atan();
+        let camera = |fov_y: f32, viewport: Option<[f32; 4]>| Camera3d {
+            viewport,
+            clear_color: Some(Vec4::new(0.0, 0.0, 1.0, 1.0)),
+            ..Camera3d::default().with_projection(Projection::Perspective {
+                fov_y,
+                near: 0.1,
+                far: 100.0,
+            })
+        };
+        for samples in [1, 4] {
+            let Some(mut app) = headless_app(64, 48) else { return };
+            app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+            let best = app.resources.expect::<Renderer>().capabilities().best_draw_path;
+            let cube = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(1.0));
+            app.world.spawn((
+                Transform::from_xyz(0.3, -0.2, 0.0).with_rotation(glam::Quat::from_rotation_y(0.6)),
+                Mesh3d(cube),
+                Material::unlit(Vec4::new(1.0, 0.5, 0.0, 1.0)),
+            ));
+            let cam = app
+                .world
+                .spawn((Transform::from_xyz(0.0, 0.0, 4.0), camera(narrow, None)));
+            let reference = crate::render_to_image(&mut app).expect("capture");
+            let orange = reference.pixels.chunks(4).filter(|p| p[0] == 255 && p[2] == 0).count();
+            assert!(orange > 200, "the cube fills part of the view: {orange} px");
+            for path in [DrawPath::CpuDirect, best] {
+                set_path(&mut app, path);
+                *app.world.get::<&mut Camera3d>(cam).unwrap() = camera(wide, Some([-50.0, -50.0, 101.0, 101.0]));
+                let zoomed = crate::render_to_image(&mut app).expect("capture");
+                let d = differing_px(&reference, &zoomed);
+                assert!(d <= 16, "{path:?} ×{samples}: {d} px differ from the narrow camera");
+                // Far outside, or not finite: nothing drawn (the first pass clears to black),
+                // and no validation error.
+                for v in [
+                    [2e5, 0.0, 1.0, 1.0],
+                    [f32::INFINITY, 0.0, 1.0, 1.0],
+                    [0.0, 0.0, f32::INFINITY, 1.0],
+                ] {
+                    *app.world.get::<&mut Camera3d>(cam).unwrap() = camera(narrow, Some(v));
+                    let img = crate::render_to_image(&mut app).expect("capture");
+                    let black = img.pixels.chunks(4).filter(|p| p[..3] == [0, 0, 0]).count();
+                    if v[2].is_finite() {
+                        assert_eq!(black, 64 * 48, "{v:?}: {path:?} ×{samples}");
+                    }
+                }
+                assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+            }
         }
     }
 

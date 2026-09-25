@@ -260,8 +260,22 @@ impl OverlayCache {
     }
 }
 
+/// Overlay target of a surface frame. Its format is the one frames render into — the surface's
+/// sRGB *view* format where the surface texture itself has none (browser WebGPU canvases) —
+/// never `config.format`: an overlay pipeline built for the texture's own format would not
+/// match the pass, a validation error that loses the frame.
+fn surface_target(config: &wgpu::SurfaceConfiguration, view_format: wgpu::TextureFormat, scale: f32) -> OverlayTarget {
+    OverlayTarget {
+        size: (config.width, config.height),
+        format: view_format,
+        scale_factor: scale,
+        kind: OverlayTargetKind::Surface,
+    }
+}
+
 impl Renderer {
     /// Overlays of a regular frame: surface when windowed, offscreen target when headless.
+    /// Called after every view of the frame is encoded (overlays draw on top of them).
     pub(crate) fn encode_frame_overlays(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -272,12 +286,7 @@ impl Renderer {
         }
         match (&self.surface, surface_view) {
             (Some(s), Some(view)) => {
-                let target = OverlayTarget {
-                    size: (s.config.width, s.config.height),
-                    format: s.config.format,
-                    scale_factor: self.overlays.scale_factor,
-                    kind: OverlayTargetKind::Surface,
-                };
+                let target = surface_target(&s.config, s.view_format, self.overlays.scale_factor);
                 // The renderer already cleared the surface if no camera drew to it.
                 self.encode_overlays(encoder, view, &target, false);
             }
@@ -287,7 +296,9 @@ impl Renderer {
         }
     }
 
-    /// Overlays replayed into the offscreen target for a windowed capture.
+    /// Overlays replayed into the offscreen target for a windowed capture. They run after the
+    /// replayed views ([`Renderer::encode_capture_replay`]): drawn before them, the re-recorded
+    /// scene would paint over them.
     pub(crate) fn encode_capture_overlays(&mut self, encoder: &mut wgpu::CommandEncoder) {
         if !self.overlays.list.is_empty() {
             self.encode_offscreen_overlays(encoder, OverlayTargetKind::Capture);
@@ -389,5 +400,28 @@ mod tests {
         assert_eq!(cache.list.len(), 2);
         cache.sync(None);
         assert!(cache.list.is_empty());
+    }
+
+    /// Regression: surface overlays got the surface texture's format while frames render
+    /// through its sRGB view format (browser WebGPU canvases): egui's pipeline then did not
+    /// match the pass. They now get the view format, like the frame's own passes.
+    #[test]
+    fn surface_overlays_get_the_view_format() {
+        use wgpu::TextureFormat as F;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: F::Bgra8Unorm,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: 640,
+            height: 360,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![F::Bgra8UnormSrgb],
+        };
+        let target = surface_target(&config, F::Bgra8UnormSrgb, 2.0);
+        assert_eq!(target.format, F::Bgra8UnormSrgb);
+        assert_eq!((target.size, target.scale_factor), ((640, 360), 2.0));
+        assert_eq!(target.kind, OverlayTargetKind::Surface);
     }
 }
