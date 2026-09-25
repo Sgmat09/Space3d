@@ -282,43 +282,51 @@ pub async fn login(
     let username = req.username.trim().to_ascii_lowercase();
     // Per-username budgets are charged only by *failed* logins, and per address prefix first:
     // other addresses' wrong guesses do not lock the owner out (only a sustained, distributed
-    // attack that exhausts the 4× username-wide backstop does).
+    // attack that exhausts the 4× username-wide backstop does). Every attempt reserves a token
+    // from both before the password check (which awaits) and a success gives them back:
+    // checking first and charging only after a failure let a burst of concurrent guesses all
+    // pass the check before the first failure was counted.
     let pair = (username.clone(), rate_key(meta.ip));
     {
         let mut limits = svc.limits.lock();
         let now = svc.limiter_now();
-        if !limits.login_ip.check(&rate_key(meta.ip), now)
-            || !limits.login_user_ip.available(&pair, now)
-            || !limits.login_user.available(&username, now)
-        {
+        let reserved = limits.login_ip.check(&rate_key(meta.ip), now)
+            && limits.login_user_ip.check(&pair, now)
+            && (limits.login_user.check(&username, now) || {
+                limits.login_user_ip.refund(&pair);
+                false
+            });
+        if !reserved {
             svc.metrics.login("password", "rate_limited");
             tracing::warn!(event = "login_rate_limited", ip = %meta.ip, "login attempts limited");
             return Err(limited(60_000));
         }
     }
+    let refund = || {
+        let mut limits = svc.limits.lock();
+        limits.login_user_ip.refund(&pair);
+        limits.login_user.refund(&pair.0);
+    };
     let found = svc
         .store
         .by_username(username)
         .wait()
         .await
-        .ok_or_else(|| api_err(500, "internal", "worker gone"))?
-        .map_err(store_err)?;
+        .ok_or_else(|| api_err(500, "internal", "worker gone"))
+        .and_then(|r| r.map_err(store_err))
+        .inspect_err(|_| refund())?;
     // Unknown users cost the same argon2 verification as known ones.
     let phc = found.as_ref().map_or_else(pw::dummy, |(_, p)| p.clone());
     let ok = pw::verify(req.password, phc).await;
     match found {
         Some((account, _)) if ok => {
+            // Only failures count against the username.
+            refund();
             check_banned(svc, &account)?;
             svc.metrics.login("password", "ok");
             finish(svc, account, None).await
         }
         _ => {
-            {
-                let mut limits = svc.limits.lock();
-                let now = svc.limiter_now();
-                limits.login_user_ip.check(&pair, now);
-                limits.login_user.check(&pair.0, now);
-            }
             svc.metrics.login("password", "bad_credentials");
             Err(api_err(401, "bad_credentials", "wrong username or password"))
         }

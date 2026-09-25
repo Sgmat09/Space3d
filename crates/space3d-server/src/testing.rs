@@ -591,7 +591,7 @@ impl TestCluster {
         let node = &mut self.nodes[i];
         let mut crashed = 0;
         node.rooms.retain(|id, room| {
-            let _span = tracing::error_span!("room", room_id = %id, server_id = %room.env.server_id).entered();
+            let _span = crate::logging::room_tick_span(&room.app, &room.env.server_id, *id).entered();
             if let Err(why) = run_tick_guarded(&mut room.app, room.step) {
                 crashed += 1;
                 // The shards' path: rebuild from the in-memory checkpoint, or close the room

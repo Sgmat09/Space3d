@@ -463,10 +463,12 @@ clients per room.
 - Draining a game server removes it from allocation.
 - Match rooms run to completion within `drain_timeout`. A player who rejoins meanwhile goes back
   to the same room on the draining server (a match is never forked onto a second server).
-- Persistent rooms checkpoint at once and warn clients (`Notice::Reconnect`). When that
-  checkpoint is stored, the room closes with `Disconnect(ServerShutdown)`; clients rejoin
-  through the PS (`POST /v1/sessions/rejoin`) and the room is restored on another server from
-  exactly that state. The example client rejoins on any disconnect.
+- Persistent rooms warn clients (`Notice::Reconnect`) and freeze: clients get
+  `Disconnect(ServerShutdown)` and the final checkpoint is captured in the same tick, so it
+  holds everything the players saw. Clients rejoin through the PS
+  (`POST /v1/sessions/rejoin`); the rejoin waits (up to 10 s) until that checkpoint is stored,
+  then the room is restored on another server from exactly that state. The example client
+  rejoins on any disconnect.
 - When the drain completes the server deregisters (the PS stops counting it at once).
 - Set `terminationGracePeriodSeconds ≥ drain_timeout + 30 s`.
 
@@ -478,6 +480,7 @@ clients per room.
 | Room panic | Build with `--profile server`, which uses `panic = "unwind"`. The room is rebuilt from its last checkpoint and players rejoin. Three crashes in 5 minutes close the room. |
 | Game server lost | The lease expires in `lease_ttl`. Rejoin restores the room from the PS-stored checkpoint on another server of the same game and schema hash. With `RecoveryPolicy::Abandon` the room is voided instead (audit `match_void`); rejoin answers 404 and players queue again. |
 | Player service down | Rooms keep playing, results queue in the game servers' durable outbox, and `/readyz` stays ready (`space3d_fleet_connected` shows the link). Logins and matchmaking pause until the PS returns; the outbox then flushes. |
+| Game server cut off from the PS (PS up) for longer than `lease_ttl` | The game server keeps playing its rooms, but the PS counts it as lost: a player who rejoins meanwhile gets the room restored elsewhere, and that copy is the one that counts. When the link is back, the PS closes the stale copy (`Disconnect(ServerShutdown)`); its players rejoin the live copy and lose what they did in the stale one. |
 
 **Limits of v1.**
 
@@ -512,9 +515,9 @@ This is `tests/acceptance.rs`:
 
 | measurement | result |
 |---|---|
-| Remote pawns: drawn position vs the server's position at the client's render tick | p50 0 mm, p95 0 mm, p99 0.40 m, max 1.9 m. The tail is TCP stalls: at most 100 ms of extrapolation, then hold. |
-| Own pawn: predicted vs authoritative, all ticks | 95.5 % exact, p99 1.7 m. Mispredictions happen only when an input stalled behind a lost segment and the server repeated the previous one. This affected 7.6 % of client ticks. |
-| Own pawn after reconciliation (the server had the inputs) | **100 % exact** (1446 samples), no snaps |
+| Remote pawns: drawn position vs the server's position at the client's render tick | p50 0 mm, p95 0 mm, p99 0.49 m, max 1.9 m. The tail is TCP stalls: at most 100 ms of extrapolation, then hold. |
+| Own pawn: predicted vs authoritative, all ticks | 94.2 % exact, p99 1.85 m. Mispredictions happen only when an input stalled behind a lost segment and the server repeated the previous one. This affected 7.5 % of client ticks (171 of 2295). |
+| Own pawn after reconciliation (the server had the inputs) | **100 % exact** (1356 samples), no snaps |
 | What the player sees (smoothed correction) | p95 0.07 m |
 | After input stops | every client within 1 mm of the server |
 | Session resume after a 3 s blackout | same slot, same pawn and `NetId`, on a fresh link |

@@ -910,14 +910,30 @@ fn a_hitch_behind_held_snapshots_never_applies_inputs_twice() {
 /// Regression: on datagram links a spawn record delayed (or duplicated) past the despawn of a
 /// short-lived entity recreated it on the client, and nothing ever removed it (the server had
 /// its despawn acked). The client now remembers despawned `NetId`s.
+///
+/// Second regression (lifetimes past the RTO): a spawn delayed past the RTO was presumed lost,
+/// which reset its "sent" mark, so when the entity then went away no despawn was sent at all —
+/// and the late spawn created a ghost with no tombstone to stop it. A despawn now follows every
+/// entity that was ever put on the wire.
 #[test]
 fn reordered_spawns_never_resurrect_despawned_entities() {
-    for seed in 0..4u64 {
+    for (seed, lifetime, reorder_ms) in [
+        (0u64, 4u32, 120u64),
+        (1, 4, 120),
+        (2, 4, 120),
+        (3, 4, 120),
+        (0, 6, 120),
+        (1, 6, 120),
+        (2, 6, 120),
+        (3, 6, 120),
+        (0, 12, 250),
+        (1, 12, 250),
+    ] {
         let down = LinkConditions {
             latency: Duration::from_millis(20),
             jitter: Duration::from_millis(4),
             reorder: 0.3,
-            reorder_delay: Duration::from_millis(120),
+            reorder_delay: Duration::from_millis(reorder_ms),
             duplicate: 0.1,
             ..LinkConditions::perfect()
         };
@@ -932,7 +948,7 @@ fn reordered_spawns_never_resurrect_despawned_entities() {
         });
         let a = observer(&mut h, "alice");
         assert!(h.run_until(900, |h| h.client_net(a).is_connected()));
-        // A projectile every 3 ticks, each living 4 ticks.
+        // A projectile every 3 ticks, each living `lifetime` ticks.
         let mut live: Vec<(Entity, u32)> = Vec::new();
         for t in 0..600u32 {
             if t % 3 == 0 {
@@ -940,7 +956,7 @@ fn reordered_spawns_never_resurrect_despawned_entities() {
                     .server_mut()
                     .world
                     .spawn((Replicated, Transform::from_xyz(t as f32, 0.0, 0.0), Health(1)));
-                live.push((e, t + 4));
+                live.push((e, t + lifetime));
             }
             let (dead, keep): (Vec<_>, Vec<_>) = live.into_iter().partition(|(_, until)| *until <= t);
             live = keep;
@@ -956,7 +972,7 @@ fn reordered_spawns_never_resurrect_despawned_entities() {
         let ok = h.run_until(1200, |h| h.assert_converged(a).is_ok());
         assert!(
             ok,
-            "seed {seed}: {:?} (client entities {})",
+            "seed {seed}, lifetime {lifetime}, reorder {reorder_ms} ms: {:?} (client entities {})",
             h.assert_converged(a),
             h.client_net(a).net_ids().len()
         );
@@ -1152,6 +1168,58 @@ fn a_stream_stall_neither_rewinds_the_render_clock_nor_jumps_prediction() {
     }
 }
 
+/// Regression: after a lasting RTT increase (one-way 20 → 130 ms) the stall-resistant path RTT
+/// kept its old value until most of its 16-sample window had turned over (~3 s), and the
+/// jitter — the spread of the window around its median — counted the step itself as jitter
+/// while the window straddled it. The clock-based resync then jumped the prediction forward
+/// and back, and inputs went missing again in the 4th second. The path RTT now follows a
+/// lasting rise after ~1.25 s and the jitter comes from consecutive samples.
+#[test]
+fn a_lasting_rtt_increase_is_followed_without_a_relapse() {
+    for (up_ms, down_ms) in [(130u64, 130u64), (130, 20)] {
+        let mut missing = [0u64; 8];
+        for seed in 1..=4u64 {
+            let lat = |ms: u64| LinkConditions {
+                latency: Duration::from_millis(ms),
+                jitter: Duration::from_millis(2),
+                ..LinkConditions::perfect()
+            };
+            let mut h = with_rules(HarnessConfig {
+                seed,
+                semantics: Semantics::Stream,
+                link: LinkProfile::symmetric(lat(20)),
+                ..Default::default()
+            });
+            let w = h.add_client(ClientSpec::named("walker"), |app| {
+                app.add_plugin(TestProtocol);
+                space3d_replication::bots::install_bot(
+                    app,
+                    space3d_replication::bots::scripted(|_t: Tick| Move { x: 1, z: 0 }),
+                );
+            });
+            assert!(h.run_until(900, |h| h.client_net(w).is_connected()));
+            h.step_ticks(600);
+            h.set_link(
+                w,
+                LinkProfile {
+                    up: lat(up_ms),
+                    down: lat(down_ms),
+                },
+            );
+            for second in &mut missing {
+                let before = h.server_net().room_stats().inputs_missing;
+                h.step_ticks(60);
+                *second += h.server_net().room_stats().inputs_missing - before;
+            }
+        }
+        let settled = missing.iter().position(|m| *m == 0).unwrap_or(missing.len());
+        assert!(
+            settled <= 2 && missing[settled..].iter().all(|m| *m == 0),
+            "up {up_ms} ms, down {down_ms} ms: missing inputs per second (4 seeds) {missing:?}"
+        );
+    }
+}
+
 // ---- late inputs are counted -------------------------------------------------------------------
 
 /// Regression: `inputs_late` / `NetStats::input_late` stayed 0 even when many inputs arrived
@@ -1188,4 +1256,88 @@ fn late_inputs_are_counted() {
     assert!(room.inputs_late <= room.inputs_missing, "{room:?}");
     let slot = h.server_net().stats(h.client_net(w).client_id().unwrap()).unwrap();
     assert_eq!(slot.input_late, room.inputs_late);
+}
+
+/// Regression: a resync (the clock-based hard resync after a long hitch, or the pacer's
+/// `Resync`) moved the predicted tick but left the world at the old timeline's state whenever
+/// the prediction for the newest confirmed tick was right: a forward jump skipped ticks (the
+/// pawn fell behind) and a backward one simulated ticks a second time (inputs applied twice).
+/// The backward jumps came from the hitch's fixed-step backlog running on top of the jump.
+/// With a constant input every simulated tick — fresh or replayed — must equal the server's
+/// state at that tick, and the predicted tick never moves backwards after the hitch.
+#[test]
+fn a_hitch_resync_rebuilds_the_timeline_without_skipping_or_repeating_ticks() {
+    for latency_ms in [60u64, 100, 150] {
+        for hitch_ms in [200u64, 400] {
+            for fps in [60u32, 144] {
+                for seed in 1..=3u64 {
+                    let mut h = with_rules(HarnessConfig {
+                        seed,
+                        semantics: Semantics::Stream,
+                        link: LinkProfile::symmetric(LinkConditions {
+                            latency: Duration::from_millis(latency_ms),
+                            jitter: Duration::from_millis(latency_ms / 5),
+                            ..LinkConditions::perfect()
+                        }),
+                        ..Default::default()
+                    });
+                    let sims: Arc<Mutex<Vec<(u32, bool, f32)>>> = Default::default();
+                    let record = sims.clone();
+                    let w = h.add_client(
+                        ClientSpec::named("walker").with_frame_dt(Duration::from_secs_f64(1.0 / f64::from(fps))),
+                        |app| {
+                            app.add_plugin(TestProtocol);
+                            app.add_sim_system("test::record", move |ctx| {
+                                let time = *ctx.resources.expect::<SimTime>();
+                                for (t, _) in ctx.world.query_mut::<(&Transform, &space3d_replication::Controlled)>() {
+                                    record
+                                        .lock()
+                                        .unwrap()
+                                        .push((time.tick.0, time.resimulating, t.translation.x));
+                                }
+                            });
+                            space3d_replication::bots::install_bot(
+                                app,
+                                space3d_replication::bots::scripted(|_t: Tick| Move { x: 1, z: 0 }),
+                            );
+                        },
+                    );
+                    assert!(h.run_until(900, |h| h.client_net(w).is_connected()
+                        && controlled(h.client(w)).is_some()));
+                    h.step_ticks(300);
+                    sims.lock().unwrap().clear();
+                    let sp = pawn(h.server(), h.player(w)).unwrap();
+                    let mut server_x = std::collections::HashMap::new();
+                    let mut previous = None;
+                    for t in 0..240u32 {
+                        if t == 60 {
+                            h.stall(w, Duration::from_millis(hitch_ms));
+                        }
+                        h.step();
+                        let st = h.server_net().tick().0;
+                        server_x.insert(st, h.server().world.get::<&Transform>(sp).unwrap().translation.x);
+                        let next = h.client_net(w).predicted_tick().unwrap();
+                        assert!(
+                            previous.is_none_or(|p| next >= p),
+                            "latency {latency_ms} ms, hitch {hitch_ms} ms, {fps} fps, seed {seed}: \
+                             predicted tick went back from {previous:?} to {next:?} (t = {t})"
+                        );
+                        previous = Some(next);
+                    }
+                    let sims = sims.lock().unwrap();
+                    let mut compared = 0;
+                    for &(tick, resimulating, x) in sims.iter() {
+                        let Some(sx) = server_x.get(&tick) else { continue };
+                        compared += 1;
+                        assert!(
+                            (x - sx).abs() < 1e-3,
+                            "latency {latency_ms} ms, hitch {hitch_ms} ms, {fps} fps, seed {seed}: tick {tick} \
+                             (resimulating: {resimulating}) predicted x = {x:.3}, server {sx:.3}"
+                        );
+                    }
+                    assert!(compared > 150, "{compared}");
+                }
+            }
+        }
+    }
 }

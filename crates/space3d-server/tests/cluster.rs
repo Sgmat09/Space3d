@@ -506,9 +506,13 @@ fn draining_hands_a_persistent_room_to_another_server() {
         c.client_net(cb).state()
     );
     assert!(warned, "clients were told the room moves");
-    assert!(c.room(room).is_none(), "no live copy left on the draining server");
+    // The frozen room closes once its final checkpoint is stored.
+    let handed_off = run_until_bg(&mut c, 900, |c| {
+        c.room(room).is_none() && c.player_service().fleet.lock().room(room).is_some_and(|e| e.orphaned)
+    });
+    assert!(handed_off, "no live copy left on the draining server");
     let entry = c.player_service().fleet.lock().room(room).cloned().expect("room kept");
-    assert!(entry.orphaned, "kept restorable");
+    assert!(entry.orphaned && !entry.moving, "kept restorable");
 
     let mut target = None;
     for (client, tokens) in [(ca, &alice), (cb, &bob)] {
@@ -529,6 +533,185 @@ fn draining_hands_a_persistent_room_to_another_server() {
         "the drain checkpoint's state"
     );
     assert!(c.run_until(300, |c| healths(c.client(ca)) == vec![9, 100]));
+}
+
+/// Regression: the drain handoff kept a persistent room playable while its drain checkpoint
+/// uploaded, then restored that earlier capture, so every change made during the upload — which
+/// the players had seen — was lost. The room now freezes (clients disconnected) at the capture,
+/// and the player service holds rejoins until that capture is stored.
+#[test]
+fn a_drain_handoff_keeps_every_change_the_players_saw() {
+    let mut c = persistent_cluster(2);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let a = c.quick_play(&alice, "world").expect("quick play");
+    let b = c.quick_play(&bob, "world").expect("quick play");
+    let (room, host) = (a.room_id, a.server_id.clone());
+    let ca = c.connect(&a, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    let cb = c.connect(&b, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    assert!(c.run_until(600, |c| {
+        c.client_net(ca).is_connected() && c.client_net(cb).is_connected() && remote_count(c.client(ca)) == 2
+    }));
+    c.step_ticks(30);
+    let (status, _) = admin(&c, &host, "POST", "/admin/v1/drain", None, true);
+    assert_eq!(status, 202);
+    // Alice changes her pawn every tick, as fast as the room accepts it, until the room moves.
+    let mut last_in_room = 0;
+    let mut last_seen = 0;
+    for _ in 0..3000 {
+        if c.client_net(ca).is_connected() {
+            let seen = healths(c.client(ca)).into_iter().max().unwrap_or(0);
+            last_seen = last_seen.max(seen);
+            send(&mut c, ca, &SetHealth(seen + 1));
+        }
+        if let Some(app) = c.room(room) {
+            last_in_room = pawn_health(app, player(&alice)).unwrap_or(last_in_room);
+        }
+        if c.room(room).is_none() && c.player_service().fleet.lock().room(room).is_some_and(|e| e.orphaned) {
+            break;
+        }
+        c.step();
+    }
+    assert!(c.room(room).is_none(), "handed off");
+    assert!(last_seen > 100, "alice changed her pawn during the drain");
+    let target = c.rejoin(&alice).unwrap().expect("the world can be restored");
+    assert_ne!(target.server_id, host);
+    c.reconnect(ca, &target);
+    assert!(c.run_until(600, |c| c.client_net(ca).is_connected()));
+    let restored = pawn_health(c.room(room).unwrap(), player(&alice)).unwrap();
+    assert_eq!(
+        restored, last_in_room,
+        "restored {restored}, but the old room reached {last_in_room} (alice saw {last_seen})"
+    );
+    assert!(restored >= last_seen);
+}
+
+/// A rejoin that arrives while a persistent room is frozen for its handoff waits until the
+/// final checkpoint is stored, then restores the room elsewhere (it neither goes back to the
+/// frozen room nor restores an older checkpoint).
+#[test]
+fn a_rejoin_during_a_handoff_waits_for_the_final_checkpoint() {
+    let mut c = persistent_cluster(2);
+    let alice = c.guest("alice");
+    let a = c.quick_play(&alice, "world").expect("quick play");
+    let (room, host) = (a.room_id, a.server_id.clone());
+    let ca = c.connect(&a, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    assert!(c.run_until(600, |c| c.client_net(ca).is_connected()));
+    c.step_ticks(30);
+    send(&mut c, ca, &SetHealth(42));
+    assert!(c.run_until(120, |c| pawn_health(c.room(room).unwrap(), player(&alice)) == Some(42)));
+    let (status, _) = admin(&c, &host, "POST", "/admin/v1/drain", None, true);
+    assert_eq!(status, 202);
+    let moving = c.run_until(600, |c| {
+        c.player_service().fleet.lock().room(room).is_some_and(|e| e.moving)
+    });
+    assert!(moving, "the player service knows the room is moving");
+    assert!(c.run_until(120, |c| failed_with(c, ca, DisconnectCode::ServerShutdown)));
+    // The room only closes when the test steps it: the rejoin must wait meanwhile.
+    let api = c.api(&alice);
+    let rejoin = std::thread::spawn(move || api.rejoin().block());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!rejoin.is_finished(), "the rejoin waits for the handoff");
+    assert!(
+        run_until_bg(&mut c, 900, |_| rejoin.is_finished()),
+        "answered after the handoff"
+    );
+    let target = rejoin
+        .join()
+        .unwrap()
+        .expect("task")
+        .expect("rejoin")
+        .expect("restorable");
+    assert_eq!(target.room_id, room);
+    assert_ne!(target.server_id, host, "restored on another server");
+    c.reconnect(ca, &target);
+    assert!(c.run_until(600, |c| c.client_net(ca).is_connected()));
+    assert_eq!(pawn_health(c.room(room).unwrap(), player(&alice)), Some(42));
+}
+
+/// Regression (split brain): a game server whose fleet link was cut for longer than its lease
+/// keeps running its rooms, so a player who rejoined meanwhile got the room restored on another
+/// server — and once the link healed, the stale copy kept running forever (its heartbeats even
+/// flipped the room's entry back and forth). The player service now closes the stale copy
+/// (`RoomSuperseded`) as soon as its server is heard from again, and its players rejoin the
+/// live one.
+#[test]
+fn a_partitioned_server_closes_its_stale_copy_of_a_restored_room() {
+    let mut c = cluster(2);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let (ca, cb, room) = connected_pair(&mut c, &alice, &bob);
+    let stale = c.room_server(room).unwrap().to_owned();
+    send(&mut c, cb, &SetHealth(7));
+    assert!(c.run_until(120, |c| pawn_health(c.room(room).unwrap(), player(&bob)) == Some(7)));
+    let set_at = c.unix_clock_ms();
+    let stored = c.run_until(600, |c| {
+        c.player_service()
+            .store
+            .get_checkpoint(room)
+            .block()
+            .unwrap()
+            .unwrap()
+            .is_some_and(|(saved, _)| saved > set_at)
+    });
+    assert!(stored, "checkpoint stored");
+
+    c.set_fleet_outage(&stale, true);
+    let lease = c.player_service().config.fleet.lease_ttl;
+    let dead = c.run_until((lease.as_secs_f64() * 60.0) as u64 + 180, |c| {
+        c.player_service()
+            .fleet
+            .lock()
+            .server(&stale)
+            .is_none_or(|s| s.state == ServerState::Dead)
+    });
+    assert!(dead, "lease expired");
+    assert!(
+        c.rooms_of(&stale).contains(&room),
+        "the partitioned server still runs the room"
+    );
+    // Bob's client restarted: the player service restores the room elsewhere.
+    let moved = c.rejoin(&bob).unwrap().expect("restorable");
+    assert_ne!(moved.server_id, stale);
+    c.reconnect(cb, &moved);
+    assert!(c.run_until(600, |c| c.client_net(cb).is_connected()));
+    // Alice plays on in the stale copy until the partition heals.
+    send(&mut c, ca, &SetHealth(55));
+    c.step_ticks(60);
+    c.set_fleet_outage(&stale, false);
+    let closed = c.run_until(600, |c| !c.rooms_of(&stale).contains(&room));
+    assert!(closed, "the stale copy was closed");
+    assert!(
+        c.run_until(120, |c| failed_with(c, ca, DisconnectCode::ServerShutdown)),
+        "{:?}",
+        c.client_net(ca).state()
+    );
+    let fleet = c.player_service().fleet.lock().room(room).cloned().unwrap();
+    assert_eq!(fleet.server, moved.server_id, "the entry stays with the live copy");
+    let back = c.run_until(600, |c| {
+        c.player_service()
+            .fleet
+            .lock()
+            .server(&stale)
+            .is_some_and(|s| s.state == ServerState::Ready)
+    });
+    assert!(back, "the partitioned server registered again");
+    let a = c.rejoin(&alice).unwrap().expect("rejoin");
+    assert_eq!((a.room_id, a.server_id.as_str()), (room, moved.server_id.as_str()));
+    c.reconnect(ca, &a);
+    let one = c.run_until(600, |c| {
+        c.client_net(ca).is_connected()
+            && healths(c.client(ca)) == healths(c.client(cb))
+            && healths(c.client(ca)).len() == 2
+    });
+    assert!(one, "{:?} vs {:?}", healths(c.client(ca)), healths(c.client(cb)));
+    assert_eq!(c.rooms_of(&stale), Vec::<RoomId>::new());
 }
 
 /// Regression: a rejoin while the hosting server drains goes back to the match that still

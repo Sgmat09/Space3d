@@ -218,6 +218,20 @@ impl GsState {
                         let _ = h.command(RoomCommand::Close { reason });
                     }
                 }
+                FleetDown::RoomSuperseded { room_id } => {
+                    if let Some(h) = self.rt.rooms.get(room_id) {
+                        tracing::warn!(room = %room_id, "room restored on another server during a fleet partition; closing this copy");
+                        let _ = h.command(RoomCommand::Superseded);
+                    }
+                }
+                FleetDown::Reregister if !self.deregistered => {
+                    tracing::warn!("the player service asked for a new registration");
+                    let _ = self.rt.fleet.send(FleetUp::Register(self.rt.registration.clone()));
+                    // Right behind it: the rooms (stale copies get closed) and the drain state
+                    // (a registration alone reads as ready for new rooms).
+                    self.heartbeat();
+                }
+                FleetDown::Reregister => {}
                 FleetDown::Kick { player, reason } => self.rt.rooms.kick_everywhere(player, &reason),
                 FleetDown::Ban(ban) => {
                     let ip = matches!(ban.target, crate::security::bans::BanTarget::Ip(_));

@@ -213,6 +213,59 @@ fn wrong_guesses_from_other_addresses_do_not_lock_the_owner_out() {
     );
 }
 
+/// Regression: the per-username budgets were only *checked* before the (awaited) password
+/// verification and charged after a failure, so a burst of concurrent wrong guesses from many
+/// addresses all passed the check: 32 of 100 concurrent guesses were verified against a
+/// username-wide backstop of 20. Each attempt now reserves its tokens up front.
+#[cfg(feature = "password-auth")]
+#[test]
+fn concurrent_wrong_guesses_stay_within_the_username_backstop() {
+    use space3d_replication::api::RegisterRequest;
+    let node = start(Role::PlayerService, &["admin-token-0123456789"], |c| {
+        c.player_service.login_attempts_per_min = 5;
+        c.security.trusted_proxies = vec!["127.0.0.1/32".into()];
+    });
+    let owner = node.api();
+    owner
+        .login_guest(&DeviceCredentials::generate(), Some("target"))
+        .block()
+        .unwrap()
+        .unwrap();
+    owner
+        .register(&RegisterRequest {
+            username: "target".into(),
+            password: "correct horse battery".into(),
+            display_name: "Target".into(),
+        })
+        .block()
+        .unwrap()
+        .unwrap();
+    let body = serde_json::json!({ "username": "target", "password": "wrong guess" }).to_string();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(48));
+    let guesses: Vec<_> = (0..48u32)
+        .map(|i| {
+            let (addr, body, barrier) = (node.addr, body.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                let request = format!(
+                    "POST /v1/auth/login HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 198.51.100.{i}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                barrier.wait();
+                raw_status(addr, &request)
+            })
+        })
+        .collect();
+    let statuses: Vec<u16> = guesses.into_iter().map(|g| g.join().unwrap()).collect();
+    let verified = statuses.iter().filter(|s| **s == 401).count();
+    let limited = statuses.iter().filter(|s| **s == 429).count();
+    assert_eq!(verified + limited, statuses.len(), "{statuses:?}");
+    assert!(
+        verified <= 20,
+        "{verified} guesses verified against a backstop of 4 × 5 = 20: {statuses:?}"
+    );
+    assert!(verified >= 15, "{statuses:?}");
+}
+
 /// Regression (CSRF): the open dev admin API (loopback, no token) accepted cross-site "simple"
 /// POSTs, so any web page could drain, ban or kick on a developer's local server.
 #[test]

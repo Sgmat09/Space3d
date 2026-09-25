@@ -255,6 +255,28 @@ mod tests {
     }
 
     #[test]
+    fn a_long_frame_backlog_can_be_discarded_from_pre_update() {
+        let mut app = App::new().with_tickrate(50.0);
+        app.init_resource::<Counter>();
+        app.add_system(Stage::FixedUpdate, |c| c.resources.expect_mut::<Counter>().fixed += 1);
+        app.add_system(Stage::PreUpdate, |c| {
+            let t = c.resources.expect_mut::<Time>();
+            let pending = t.pending_steps();
+            if pending > 2 {
+                assert_eq!(t.discard_backlog(1), pending - 1);
+                assert_eq!(t.pending_steps(), 1);
+            }
+        });
+        // 110 ms = 5 steps (+10 ms): only one runs, the fraction stays for the next frame.
+        app.update(Duration::from_millis(110));
+        assert_eq!(app.resources.expect::<Counter>().fixed, 1);
+        assert!((app.resources.expect::<Time>().alpha - 0.5).abs() < 1e-3);
+        app.update(Duration::from_millis(10));
+        assert_eq!(app.resources.expect::<Counter>().fixed, 2);
+        assert_eq!(app.resources.expect::<Time>().dropped_ticks, 0);
+    }
+
+    #[test]
     fn startup_once_and_exit() {
         let mut app = App::new();
         app.init_resource::<Counter>();

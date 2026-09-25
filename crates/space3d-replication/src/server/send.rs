@@ -37,6 +37,10 @@ pub struct ClientEntity {
     /// Last tick included in a packet (a datagram spawn in flight is not resent before its
     /// ack or loss).
     pub last_sent_tick: Tick,
+    /// A record for it was put on the wire at least once. Loss detection resets
+    /// `last_sent_tick`, but a datagram presumed lost may only be late: when the entity goes
+    /// away, a despawn must follow anything ever sent (the client then drops the late spawn).
+    pub on_wire: bool,
     /// Priority accumulator.
     pub acc: f32,
     /// Out of the leave radius since (interest hysteresis).
@@ -432,7 +436,7 @@ fn build_snapshot(
     gone.sort_unstable();
     for id in gone {
         let ce = slot.view.entities.remove(&id).expect("key");
-        let ever_sent = ce.spawned || ce.last_sent_tick > Tick::ZERO;
+        let ever_sent = ce.spawned || ce.on_wire || ce.last_sent_tick > Tick::ZERO;
         if ever_sent {
             let out_of_scope = cache.get(id).is_some();
             if datagram {
@@ -891,6 +895,7 @@ fn send_datagram(
                 rec.baselines.push(p.baseline);
                 if let Some(ce) = slot.view.entities.get_mut(&p.net_id) {
                     ce.last_sent_tick = tick;
+                    ce.on_wire = true;
                 }
             }
             rec.despawns = desp.iter().map(|d| d.net_id).collect();

@@ -364,6 +364,21 @@ pub struct PlayerDataLoaded {
     pub entries: Vec<space3d_replication::api::PlayerDataEntry>,
 }
 
+/// Drain handoff of a persistent room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handoff {
+    /// Not handing off.
+    None,
+    /// Drain received: freeze at the end of this tick ([`freeze_for_handoff`]).
+    Freeze,
+    /// Frozen at `at_ms` (clients gone, final capture taken): close once a checkpoint captured
+    /// at or after it is stored.
+    Frozen {
+        /// Freeze time (unix ms).
+        at_ms: i64,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Closing {
     Close(String),
@@ -373,6 +388,10 @@ enum Closing {
     /// A draining persistent room whose drain checkpoint reached the store: close it and let
     /// the player service restore it elsewhere when its players rejoin.
     Handoff,
+    /// The room was restored on another server while this server's lease had lapsed (fleet
+    /// partition): this copy is stale. Its checkpoints are refused (older epoch) and the stored
+    /// one belongs to the live copy, so nothing is uploaded or deleted.
+    Superseded,
 }
 
 /// Resource: the room's operational state (internal; inserted by [`build_room_app`]).
@@ -398,9 +417,10 @@ pub struct RoomRuntime {
     uploading_ms: Option<i64>,
     /// Capture time of the newest checkpoint the store confirmed.
     uploaded_ms: Option<i64>,
-    /// Draining persistent room: hand off once a checkpoint captured at or after this time
-    /// (unix ms) is stored.
-    handoff_from_ms: Option<i64>,
+    /// Drain handoff of a persistent room (see [`Handoff`]).
+    handoff: Handoff,
+    /// Ticks until a failed handoff upload is retried.
+    handoff_retry_in: u32,
     resumed: EventReader,
     bans_seen: u64,
     ticks_since_checkpoint: u32,
@@ -446,7 +466,8 @@ impl RoomRuntime {
             retired: Arc::new(AtomicBool::new(false)),
             uploading_ms: None,
             uploaded_ms: None,
-            handoff_from_ms: None,
+            handoff: Handoff::None,
+            handoff_retry_in: 0,
             resumed: EventReader::default(),
             bans_seen: u64::MAX,
             ticks_since_checkpoint: 0,
@@ -481,9 +502,18 @@ impl RoomRuntime {
     }
 
     fn request_checkpoint(&mut self) {
-        if self.env.checkpoints.enabled() {
+        // A frozen room keeps exactly its freeze capture (later state was never observed, and
+        // the game may already have removed the departed players' pawns); a superseded copy's
+        // checkpoints are refused anyway.
+        let frozen = matches!(self.handoff, Handoff::Frozen { .. });
+        if self.env.checkpoints.enabled() && !frozen && !matches!(self.closing, Some(Closing::Superseded)) {
             self.want_checkpoint = true;
         }
+    }
+
+    /// Frozen for a handoff and the freeze capture is not stored yet.
+    fn handoff_pending(&self) -> bool {
+        matches!(self.handoff, Handoff::Frozen { at_ms } if self.uploaded_ms.is_none_or(|saved| saved < at_ms))
     }
 
     fn next_op_id(&mut self) -> String {
@@ -542,9 +572,9 @@ impl RoomRuntime {
         let saved = self.uploading_ms.take();
         if ok {
             self.uploaded_ms = self.uploaded_ms.max(saved);
-        } else if self.handoff_from_ms.is_some() && self.queued_upload.is_none() {
-            // The handoff needs a stored checkpoint: try again in a second.
-            self.ticks_since_checkpoint = self.checkpoint_every.saturating_sub(self.ticks_per_second);
+        } else if self.handoff_pending() && self.queued_upload.is_none() {
+            // The handoff needs its freeze capture stored: upload it again in a second.
+            self.handoff_retry_in = self.ticks_per_second;
         }
         self.upload = None;
         if let Some(next) = self.queued_upload.take() {
@@ -635,16 +665,19 @@ fn apply_command(
             let net = res.expect_mut::<NetServer>();
             net.set_joinable(false);
             net.notice(Target::All, Notice::ShuttingDown { in_ms });
-            if rt.spec.persistent && rt.env.checkpoints.enabled() {
-                // Persistent worlds move: checkpoint now; once that checkpoint is stored the room
-                // closes (`Disconnect(ServerShutdown)`, `RoomClosed { restorable }`) and its
-                // players' rejoin restores it on another server from exactly that state. Until
-                // then it keeps running here (a rejoin in the meantime comes back to it).
+            if rt.spec.persistent && rt.env.checkpoints.enabled() && rt.handoff == Handoff::None {
+                // Persistent worlds move: the room freezes at the end of this tick (see
+                // `freeze_for_handoff`) and closes once its freeze capture is stored; its
+                // players' rejoin then restores it on another server from exactly that state.
                 net.notice(Target::All, Notice::Reconnect);
-                rt.handoff_from_ms.get_or_insert(rt.env.unix.now_ms());
-                rt.request_checkpoint();
+                rt.handoff = Handoff::Freeze;
             }
             rt.set_phase(RoomPhase::Ending);
+        }
+        RoomCommand::Superseded => {
+            rt.want_checkpoint = false;
+            rt.queued_upload = None;
+            rt.closing = Some(Closing::Superseded);
         }
         RoomCommand::Checkpoint => rt.request_checkpoint(),
         RoomCommand::SetJoinable(yes) => {
@@ -700,11 +733,25 @@ fn room_ops(ctx: &mut SystemCtx) {
         forward_requests(res, rt);
         let arrived = presence(res, rt);
         enforce_bans(res, rt, arrived);
+        if rt.handoff == Handoff::Freeze {
+            freeze_for_handoff(res, rt);
+        }
         rt.poll_upload();
-        if rt.closing.is_none()
-            && let Some(from) = rt.handoff_from_ms
-            && rt.uploaded_ms.is_some_and(|saved| saved >= from)
+        if let Handoff::Frozen { at_ms } = rt.handoff
+            && rt.handoff_pending()
+            && !rt.uploading()
+            && !rt.want_checkpoint
         {
+            // Retry the freeze capture itself (a new capture would miss the players' pawns
+            // once the game handled their departure).
+            rt.handoff_retry_in = rt.handoff_retry_in.saturating_sub(1);
+            if rt.handoff_retry_in == 0
+                && let Some(cp) = rt.last_checkpoint.clone().filter(|cp| cp.saved_ms >= at_ms)
+            {
+                rt.start_upload(cp);
+            }
+        }
+        if rt.closing.is_none() && matches!(rt.handoff, Handoff::Frozen { .. }) && !rt.handoff_pending() {
             rt.closing = Some(Closing::Handoff);
         }
         if rt.env.checkpoints.enabled() {
@@ -788,6 +835,12 @@ fn forward_requests(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
                 rt.request_checkpoint();
                 true
             }
+            RoomRequest::Close(reason) if rt.handoff != Handoff::None => {
+                // Game code closing a room whose players the handoff just moved out (e.g. "last
+                // player left") would delete the checkpoint that carries the world over.
+                tracing::debug!(room = %rt.spec.room_id, %reason, "close request ignored during a handoff");
+                true
+            }
             RoomRequest::Close(reason) => {
                 rt.closing.get_or_insert(Closing::Close(reason.clone()));
                 true
@@ -801,6 +854,30 @@ fn forward_requests(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
         tracing::warn!(room = %rt.spec.room_id, n = retry.len(), "outbox full; retrying next tick");
         res.expect_mut::<RoomControl>().pending.extend(retry);
     }
+}
+
+/// Freeze a draining persistent room for its handoff (end of the drain tick, after this tick's
+/// snapshot went out): its clients are disconnected (`Disconnect(ServerShutdown)`, "rejoin"),
+/// so from here on nobody can change or observe it, and the capture taken right after this
+/// tick holds everything its players saw. The player service holds their rejoins
+/// (`FleetUp::RoomMoving`) until that capture is stored and the room closes
+/// (`RoomClosed { restorable }`). Keeping the room playable during the upload lost every change
+/// made in that window: the restore used the earlier capture.
+fn freeze_for_handoff(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
+    res.expect_mut::<NetServer>().disconnect_all(
+        DisconnectCode::ServerShutdown,
+        "room moved to another server; rejoin",
+        false,
+    );
+    rt.uplink(FleetUp::RoomMoving {
+        room_id: rt.spec.room_id,
+    });
+    rt.want_checkpoint = true;
+    rt.queued_upload = None;
+    rt.handoff = Handoff::Frozen {
+        at_ms: rt.env.unix.now_ms(),
+    };
+    tracing::info!(room = %rt.spec.room_id, "room frozen for a handoff; storing its final checkpoint");
 }
 
 /// Players who joined or resumed this tick (the ban check looks at them).
@@ -824,8 +901,11 @@ fn presence(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) -> Vec<Play
             rt.set_phase(RoomPhase::Running);
         }
     }
-    for player in left {
-        rt.uplink(FleetUp::PlayerLeft { room_id, player });
+    // A frozen room's players are in transit to its next server, not leaving it.
+    if rt.handoff == Handoff::None {
+        for player in left {
+            rt.uplink(FleetUp::PlayerLeft { room_id, player });
+        }
     }
     arrived
 }
@@ -869,14 +949,14 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     let (code, reason, keep_checkpoint) = match closing {
         Closing::Close(reason) => (DisconnectCode::RoomClosed, reason, false),
         Closing::Shutdown { waited } => {
-            let busy = rt.want_checkpoint || rt.uploading();
+            let busy = rt.want_checkpoint || rt.uploading() || rt.handoff_pending();
             if busy && waited < SHUTDOWN_UPLOAD_WAIT_S * rt.ticks_per_second {
                 rt.closing = Some(Closing::Shutdown { waited: waited + 1 });
                 return;
             }
             (DisconnectCode::ServerShutdown, "server shutting down".to_owned(), true)
         }
-        Closing::Handoff => (
+        Closing::Handoff | Closing::Superseded => (
             DisconnectCode::ServerShutdown,
             "room moved to another server; rejoin".to_owned(),
             true,

@@ -122,6 +122,9 @@ pub struct RoomEntry {
     pub status: Option<RoomStatus>,
     /// The hosting server died; the room awaits rejoin + restore.
     pub orphaned: bool,
+    /// A draining server froze the room for a handoff and is storing its final checkpoint
+    /// (`FleetUp::RoomMoving`); cleared when it is stored (`RoomClosed { restorable }`).
+    pub moving: bool,
     /// When the entry was created / orphaned (unix ms).
     pub since_ms: i64,
 }
@@ -257,9 +260,24 @@ impl FleetRegistry {
                 }]
             }
             FleetUp::Heartbeat(hb) => {
+                // Rooms this server still runs that were restored elsewhere while its lease
+                // had lapsed (a fleet-link partition): that copy is stale — close it, and never
+                // let it take the room's entry or presence back.
+                let mut effects = self.supersede_moved(server_id, hb.rooms.iter().map(|r| r.room_id));
                 let Some(rec) = self.servers.get_mut(server_id).filter(|r| !r.left) else {
-                    return Vec::new();
+                    if !self.servers.contains_key(server_id) {
+                        // Forgotten after its lease expired (the link outlived the partition):
+                        // ask it to register again instead of ignoring it forever.
+                        effects.push(FleetEffect::Send {
+                            server: server_id.to_owned(),
+                            msg: FleetDown::Reregister,
+                        });
+                    }
+                    return effects;
                 };
+                if rec.state == ServerState::Dead {
+                    tracing::warn!(server = %server_id, "heartbeat from a server whose lease had expired; reinstated");
+                }
                 rec.last_seen_ms = now_ms;
                 rec.state = if hb.draining {
                     ServerState::Draining
@@ -269,12 +287,16 @@ impl FleetRegistry {
                 let reported: Vec<RoomId> = hb.rooms.iter().map(|r| r.room_id).collect();
                 let build = Build::of(&rec.registration);
                 for status in &hb.rooms {
+                    if self.moved_away(status.room_id, server_id) {
+                        continue;
+                    }
                     let entry = self.rooms.entry(status.room_id).or_insert_with(|| RoomEntry {
                         server: server_id.to_owned(),
                         build: build.clone(),
                         spec: None,
                         status: None,
                         orphaned: false,
+                        moving: false,
                         since_ms: now_ms,
                     });
                     entry.server = server_id.to_owned();
@@ -308,9 +330,13 @@ impl FleetRegistry {
                     rec.heartbeat = hb;
                 }
                 self.recount_reserved();
-                Vec::new()
+                effects
             }
             FleetUp::RoomOpened { room_id, spec } => {
+                if self.moved_away(room_id, server_id) {
+                    // Opened from a stale ticket after the room moved to another server.
+                    return self.supersede_moved(server_id, [room_id]);
+                }
                 let build = self
                     .servers
                     .get(server_id)
@@ -322,6 +348,7 @@ impl FleetRegistry {
                     spec: None,
                     status: None,
                     orphaned: false,
+                    moving: false,
                     since_ms: now_ms,
                 });
                 entry.server = server_id.to_owned();
@@ -338,6 +365,7 @@ impl FleetRegistry {
                         // the players' rejoin restores the room on another server.
                         if let Some(e) = self.rooms.get_mut(&room_id) {
                             e.orphaned = true;
+                            e.moving = false;
                             e.status = None;
                             e.since_ms = now_ms;
                         }
@@ -349,12 +377,24 @@ impl FleetRegistry {
                 }
                 Vec::new()
             }
+            FleetUp::RoomMoving { room_id } => {
+                if let Some(e) = self.rooms.get_mut(&room_id).filter(|e| e.server == server_id) {
+                    e.moving = true;
+                }
+                Vec::new()
+            }
             FleetUp::Deregister { reason } => {
                 tracing::info!(server = %server_id, %reason, "game server deregistered");
                 if let Some(rec) = self.servers.get_mut(server_id) {
                     rec.left = true;
                 }
                 self.kill_server(server_id, now_ms).into_iter().collect()
+            }
+            FleetUp::PlayerJoined { room_id, .. } | FleetUp::PlayerLeft { room_id, .. }
+                if self.moved_away(room_id, server_id) =>
+            {
+                // Presence in a stale copy (see `supersede_moved`) is not presence.
+                Vec::new()
             }
             FleetUp::PlayerJoined { room_id, player } => {
                 // A rejoin (resume / new link) is not a new seat.
@@ -397,6 +437,37 @@ impl FleetRegistry {
         }
     }
 
+    /// Whether `room` is known to live on a server other than `server_id` (it was restored
+    /// or re-placed there): a copy `server_id` reports is stale.
+    fn moved_away(&self, room: RoomId, server_id: &str) -> bool {
+        self.rooms.get(&room).is_some_and(|e| e.server != server_id)
+    }
+
+    /// `FleetDown::RoomSuperseded` for every room in `rooms` that moved away from `server_id`.
+    /// A game server whose lease lapsed during a fleet-link partition keeps running its rooms
+    /// (a player-service outage must not end matches), so a player who rejoined meanwhile got
+    /// the room restored elsewhere; the restored copy is authoritative (its epoch is newer and
+    /// only its checkpoints are stored), and the stale one closes as soon as its server is
+    /// heard from again (its clients are told to rejoin, which brings them to the live copy).
+    fn supersede_moved(&self, server_id: &str, rooms: impl IntoIterator<Item = RoomId>) -> Vec<FleetEffect> {
+        rooms
+            .into_iter()
+            .filter(|room| self.moved_away(*room, server_id))
+            .map(|room_id| {
+                tracing::warn!(
+                    room = %room_id,
+                    stale = %server_id,
+                    live = %self.rooms[&room_id].server,
+                    "stale copy of a room that was restored elsewhere; closing it"
+                );
+                FleetEffect::Send {
+                    server: server_id.to_owned(),
+                    msg: FleetDown::RoomSuperseded { room_id },
+                }
+            })
+            .collect()
+    }
+
     /// Void an orphaned room (`RecoveryPolicy::Abandon`): forget it, its presence and its
     /// reservations. Returns its entry.
     pub fn abandon_room(&mut self, id: RoomId) -> Option<RoomEntry> {
@@ -422,6 +493,7 @@ impl FleetRegistry {
         let mut orphaned = Vec::new();
         for (room, e) in self.rooms.iter_mut().filter(|(_, e)| e.server == id && !e.orphaned) {
             e.orphaned = true;
+            e.moving = false;
             e.since_ms = now_ms;
             orphaned.push(*room);
         }
@@ -574,6 +646,7 @@ impl FleetRegistry {
                 spec: Some(spec.clone()),
                 status: None,
                 orphaned: false,
+                moving: false,
                 since_ms: now_ms,
             },
         );
@@ -667,6 +740,7 @@ impl FleetRegistry {
         if let Some(e) = self.rooms.get_mut(&room) {
             e.server = server.to_owned();
             e.orphaned = false;
+            e.moving = false;
             e.status = None;
             e.since_ms = now_ms;
         }
@@ -943,6 +1017,100 @@ mod tests {
             f.room(RoomId(5)).is_none(),
             "never reported by gs-2: pending entry expired"
         );
+    }
+
+    /// Regression (split brain): after a fleet-link partition longer than the lease, the
+    /// stale copy's heartbeats flipped the room's entry back to it; it was never closed, and a
+    /// forgotten server's heartbeats were ignored forever.
+    #[test]
+    fn a_stale_copy_is_superseded_and_never_takes_the_room_back() {
+        let status = |player: u64| RoomStatus {
+            room_id: RoomId(1),
+            mode: "duel".into(),
+            players: 1,
+            max_players: 2,
+            player_ids: vec![PlayerId(player)],
+            ..Default::default()
+        };
+        let superseded = |effects: &[FleetEffect], server: &str| {
+            effects.iter().any(|e| {
+                matches!(e, FleetEffect::Send { server: s, msg: FleetDown::RoomSuperseded { room_id } }
+                    if s == server && *room_id == RoomId(1))
+            })
+        };
+        let mut f = FleetRegistry::new(10_000, 300_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        f.on_message("gs-2", reg("gs-2", "eu", 100), 0);
+        f.note_room(&spec(1, "duel", 2), "gs-1", 0);
+        f.on_message("gs-1", hb(2, vec![status(10), status(20)]), 1_000);
+        f.on_message("gs-2", hb(0, vec![]), 1_000);
+        // gs-1's link is cut: its lease expires, the room is orphaned; a rejoin moves it.
+        f.on_message("gs-2", hb(0, vec![]), 11_500);
+        f.sweep(11_500, 10_000);
+        assert_eq!(f.server("gs-1").unwrap().state, ServerState::Dead);
+        f.reassign(RoomId(1), "gs-2", 12_000);
+        f.on_message("gs-2", hb(1, vec![status(20)]), 13_000);
+        // Still alive: gs-1 reports the room again. Its copy is closed, the entry stays.
+        let effects = f.on_message("gs-1", hb(2, vec![status(10)]), 14_000);
+        assert!(superseded(&effects, "gs-1"), "{effects:?}");
+        assert_eq!(f.room(RoomId(1)).unwrap().server, "gs-2");
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, FleetEffect::Send { server, .. } if server == "gs-2"))
+        );
+        // Presence and openings from the stale copy are ignored too.
+        f.on_message(
+            "gs-1",
+            FleetUp::PlayerLeft {
+                room_id: RoomId(1),
+                player: PlayerId(20),
+            },
+            14_100,
+        );
+        assert_eq!(f.room_of(PlayerId(20)), Some((RoomId(1), "gs-2".into())));
+        let effects = f.on_message(
+            "gs-1",
+            FleetUp::RoomOpened {
+                room_id: RoomId(1),
+                spec: spec(1, "duel", 2),
+            },
+            14_200,
+        );
+        assert!(superseded(&effects, "gs-1"));
+        assert_eq!(f.room(RoomId(1)).unwrap().server, "gs-2");
+        // A server forgotten after its lease expired is asked to register again.
+        let mut forgotten = FleetRegistry::new(10_000, 300_000);
+        let effects = forgotten.on_message("gs-9", hb(0, vec![]), 0);
+        assert_eq!(
+            effects,
+            vec![FleetEffect::Send {
+                server: "gs-9".into(),
+                msg: FleetDown::Reregister
+            }]
+        );
+    }
+
+    #[test]
+    fn a_frozen_room_is_moving_until_its_checkpoint_is_stored() {
+        let mut f = FleetRegistry::new(10_000, 300_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        f.note_room(&spec(1, "world", 8), "gs-1", 0);
+        f.on_message("gs-2", FleetUp::RoomMoving { room_id: RoomId(1) }, 10);
+        assert!(!f.room(RoomId(1)).unwrap().moving, "only the host moves its room");
+        f.on_message("gs-1", FleetUp::RoomMoving { room_id: RoomId(1) }, 20);
+        assert!(f.room(RoomId(1)).unwrap().moving);
+        f.on_message(
+            "gs-1",
+            FleetUp::RoomClosed {
+                room_id: RoomId(1),
+                reason: "handoff".into(),
+                restorable: true,
+            },
+            30,
+        );
+        let e = f.room(RoomId(1)).unwrap();
+        assert!(e.orphaned && !e.moving);
     }
 
     #[test]

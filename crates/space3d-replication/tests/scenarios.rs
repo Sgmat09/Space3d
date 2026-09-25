@@ -953,42 +953,62 @@ fn server_bot_drives_its_pawn_and_is_replicated() {
 }
 
 /// Under 50 ± 15 ms jitter the server-tick estimate stays within a couple of ticks, the pacer
-/// keeps inputs arriving before they are needed, and prediction stays exact.
+/// keeps (nearly) every input arriving before it is needed, and prediction only corrects
+/// where an input arrived late.
 #[test]
 fn clock_sync_and_pacing_hold_under_jitter() {
-    let jittery = LinkConditions {
-        latency: Duration::from_millis(50),
-        jitter: Duration::from_millis(15),
-        ..LinkConditions::perfect()
-    };
-    let mut h = with_rules(HarnessConfig {
-        seed: 39,
-        link: LinkProfile::symmetric(jittery),
-        ..Default::default()
-    });
-    let a = walker(&mut h, "alice", |t| Move {
-        x: if (t.0 / 60) % 2 == 0 { 1 } else { -1 },
-        z: 0,
-    });
-    connect(&mut h, a);
-    h.step_ticks(180);
-    let missing0 = h.server_net().room_stats().inputs_missing;
-    let mut mis_r = EventReader::default();
-    let _ = read::<Mispredicted>(h.client(a), &mut mis_r);
-    let mut worst = 0.0f64;
-    let mut mispredicted = 0;
-    for _ in 0..600 {
-        h.step();
-        let est = h.client_net(a).server_tick_estimate().unwrap();
-        worst = worst.max((est - f64::from(h.server_net().tick().0)).abs());
-        mispredicted += read::<Mispredicted>(h.client(a), &mut mis_r).len();
+    // Several seeds: how many inputs a jittery link makes late depends on the draw, so a single
+    // seed only tests that draw (the estimators are compared on the aggregate).
+    let (mut total_missing, mut worst_missing, mut worst_estimate) = (0u64, (0u64, 0u64), 0.0f64);
+    for seed in 0..8u64 {
+        let jittery = LinkConditions {
+            latency: Duration::from_millis(50),
+            jitter: Duration::from_millis(15),
+            ..LinkConditions::perfect()
+        };
+        let mut h = with_rules(HarnessConfig {
+            seed,
+            link: LinkProfile::symmetric(jittery),
+            ..Default::default()
+        });
+        let a = walker(&mut h, "alice", |t| Move {
+            x: if (t.0 / 60) % 2 == 0 { 1 } else { -1 },
+            z: 0,
+        });
+        connect(&mut h, a);
+        h.step_ticks(180);
+        let missing0 = h.server_net().room_stats().inputs_missing;
+        let mut mis_r = EventReader::default();
+        let _ = read::<Mispredicted>(h.client(a), &mut mis_r);
+        let mut mispredicted = 0;
+        for _ in 0..600 {
+            h.step();
+            let est = h.client_net(a).server_tick_estimate().unwrap();
+            worst_estimate = worst_estimate.max((est - f64::from(h.server_net().tick().0)).abs());
+            mispredicted += read::<Mispredicted>(h.client(a), &mut mis_r).len();
+        }
+        let missing = h.server_net().room_stats().inputs_missing - missing0;
+        assert!(
+            mispredicted as u64 <= missing,
+            "seed {seed}: {mispredicted} corrections for {missing} late inputs"
+        );
+        total_missing += missing;
+        worst_missing = worst_missing.max((missing, seed));
+        let stats = h.client_net(a).stats();
+        assert!((0.95..=1.05).contains(&stats.tick_scale), "seed {seed}: {stats:?}");
     }
-    assert!(worst <= 2.0, "server tick estimate off by {worst:.2} ticks");
-    let missing = h.server_net().room_stats().inputs_missing - missing0;
-    assert!(missing <= 6, "{missing} inputs missing in 600 ticks");
-    assert_eq!(mispredicted, 0);
-    let stats = h.client_net(a).stats();
-    assert!((0.95..=1.05).contains(&stats.tick_scale), "{stats:?}");
+    assert!(
+        worst_estimate <= 2.0,
+        "server tick estimate off by {worst_estimate:.2} ticks"
+    );
+    // At most 1 % of the inputs late overall, 2 % in any one run.
+    assert!(total_missing <= 48, "{total_missing} of 4800 inputs missing");
+    assert!(
+        worst_missing.0 <= 12,
+        "{} of 600 inputs missing (seed {})",
+        worst_missing.0,
+        worst_missing.1
+    );
 }
 
 // --- Property test: random world edits replicate exactly ----------------------------------

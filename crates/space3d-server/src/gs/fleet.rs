@@ -109,6 +109,14 @@ pub enum FleetUp {
         #[serde(default)]
         restorable: bool,
     },
+    /// A draining server froze a persistent room for a handoff: its clients were disconnected
+    /// and its final checkpoint is uploading (`RoomClosed { restorable: true }` follows once it
+    /// is stored). A rejoin meanwhile waits for that instead of going back to the frozen room
+    /// or restoring an older checkpoint.
+    RoomMoving {
+        /// Room.
+        room_id: RoomId,
+    },
     /// The server is leaving the fleet (drain finished): the player service marks it dead
     /// at once instead of waiting for its lease to expire.
     Deregister {
@@ -189,6 +197,17 @@ pub enum FleetDown {
         /// Reason.
         reason: String,
     },
+    /// This server's copy of a room is stale: the room was restored on another server while
+    /// this server's lease had lapsed (a fleet-link partition). Close it without touching the
+    /// stored checkpoint (it belongs to the live copy); its clients get
+    /// `Disconnect(ServerShutdown)` and rejoin, which brings them to the live copy.
+    RoomSuperseded {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// The player service no longer knows this server (it was forgotten after its lease
+    /// expired while the link stayed up): send `Register` again.
+    Reregister,
     /// Kick a player wherever they are on this server.
     Kick {
         /// Player.
@@ -267,6 +286,7 @@ impl FleetUp {
             FleetUp::Heartbeat(_) => "heartbeat",
             FleetUp::RoomOpened { .. } => "room_opened",
             FleetUp::RoomClosed { .. } => "room_closed",
+            FleetUp::RoomMoving { .. } => "room_moving",
             FleetUp::Deregister { .. } => "deregister",
             FleetUp::PlayerJoined { .. } => "player_joined",
             FleetUp::PlayerLeft { .. } => "player_left",

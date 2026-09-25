@@ -72,6 +72,12 @@ impl TokenBucket {
     pub fn tokens(&self) -> f64 {
         self.tokens
     }
+
+    /// Give back `n` tokens taken for an attempt that turned out not to count (capped at the
+    /// burst).
+    pub fn refund(&mut self, n: f64) {
+        self.tokens = (self.tokens + n).min(self.burst);
+    }
 }
 
 /// Per-link inbound limits (internal to the replication builder).

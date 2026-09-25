@@ -493,11 +493,44 @@ async fn quick_play(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, bo
     )))
 }
 
+/// Longest a rejoin waits for a persistent room that its draining server froze for a handoff
+/// (`FleetUp::RoomMoving`) until the room's final checkpoint is stored.
+const HANDOFF_REJOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait (bounded, real time) while `player`'s room is being handed off: going back to the
+/// frozen room would fail, and restoring it now would use an older checkpoint.
+async fn wait_for_handoff(svc: &PlayerService, player: PlayerId) -> Result<(), ApiErr> {
+    let started = std::time::Instant::now();
+    loop {
+        let moving = {
+            let fleet = svc.fleet.lock();
+            fleet.room_of(player).is_some_and(|(room, server)| {
+                fleet.room(room).is_some_and(|e| e.moving && !e.orphaned)
+                    && fleet
+                        .server(&server)
+                        .is_some_and(|s| s.state != super::fleet::ServerState::Dead)
+            })
+        };
+        if !moving {
+            return Ok(());
+        }
+        if started.elapsed() >= HANDOFF_REJOIN_WAIT {
+            return Err(api_err(
+                503,
+                "room_moving",
+                "the room is moving to another server; retry",
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res<Assignment> {
     let who = require(&svc, &meta)?;
     let account = account_of(&svc, who.player()).await?;
     let now = svc.now_ms();
     let reserve = svc.config.player_service.join_ticket_ttl.as_millis() as i64;
+    wait_for_handoff(&svc, account.id).await?;
     let mut abandoned: Option<(RoomId, Option<space3d_replication::MatchId>)> = None;
     let placed = {
         let mut fleet = svc.fleet.lock();
@@ -519,8 +552,12 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
             .map(|t| t as u16);
         // The hosting server still runs the room (it is in its heartbeat, even while it
         // drains): the rejoin goes back to that same room — a match finishes where it runs.
-        // Only a room whose server was lost, or that a draining server handed off (checkpoint
-        // stored, `RoomClosed { restorable }`), is restored elsewhere: never two live copies.
+        // Only a room whose server was lost (its lease expired), or that a draining server
+        // handed off (checkpoint stored, `RoomClosed { restorable }`), is restored elsewhere.
+        // A lease also expires when only the fleet link is cut while the server keeps running
+        // its rooms (a player-service outage must not end matches): the restored copy is then
+        // the authoritative one, and the stale copy is closed as soon as its server is heard
+        // from again (`FleetDown::RoomSuperseded`).
         let host = fleet
             .server(&server_id)
             .filter(|s| s.state != super::fleet::ServerState::Dead)

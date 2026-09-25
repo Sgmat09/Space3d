@@ -89,6 +89,10 @@ pub enum RoomCommand {
     /// Server shutdown (drain deadline reached): final checkpoint (kept for restore
     /// elsewhere), `Disconnect(ServerShutdown)`, remove.
     Shutdown,
+    /// Another server hosts the live copy of this room (`FleetDown::RoomSuperseded`): stop
+    /// uploading checkpoints, `Disconnect(ServerShutdown)` ("rejoin"), keep the stored
+    /// checkpoint, remove.
+    Superseded,
     /// Checkpoint now.
     Checkpoint,
     /// Accept/refuse new joins.

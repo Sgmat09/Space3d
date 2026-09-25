@@ -65,15 +65,12 @@ impl<K: Hash + Eq + Clone> KeyedLimiter<K> {
         ok
     }
 
-    /// Whether `key` has a whole token at `now`, **without** taking it (unknown keys start
-    /// full). Pair with [`Self::check`] to charge only some outcomes (e.g. failed logins).
-    pub fn available(&mut self, key: &K, now: Duration) -> bool {
-        match self.buckets.get_mut(key) {
-            Some((bucket, _)) => {
-                bucket.take(now, 0.0);
-                bucket.tokens() >= 1.0
-            }
-            None => self.burst >= 1.0,
+    /// Give back one token taken by [`Self::check`] for `key` (an attempt that turned out not
+    /// to count, e.g. a successful login). Charging up front and refunding keeps concurrent
+    /// attempts within the budget, which checking first and charging after an `await` does not.
+    pub fn refund(&mut self, key: &K) {
+        if let Some((bucket, _)) = self.buckets.get_mut(key) {
+            bucket.refund(1.0);
         }
     }
 
@@ -172,6 +169,24 @@ mod tests {
         assert!(!l.check(&k, MS(500)));
         assert!(l.check(&k, MS(1_600)), "refilled one token");
         assert!(l.check(&"other".to_owned(), MS(1_600)), "keys are independent");
+    }
+
+    #[test]
+    fn refunds_give_a_reserved_token_back_up_to_the_burst() {
+        let mut l = KeyedLimiter::new(0.001, 2.0, 16);
+        let k = 7u32;
+        assert!(l.check(&k, MS(0)));
+        assert!(l.check(&k, MS(0)));
+        assert!(!l.check(&k, MS(0)));
+        l.refund(&k);
+        assert!(l.check(&k, MS(1)), "the refunded token");
+        l.refund(&k);
+        l.refund(&k);
+        l.refund(&k);
+        assert!(l.check(&k, MS(2)) && l.check(&k, MS(2)));
+        assert!(!l.check(&k, MS(2)), "never above the burst");
+        l.refund(&99);
+        assert_eq!(l.len(), 1, "refunding an unknown key tracks nothing");
     }
 
     #[test]

@@ -130,7 +130,11 @@ pub struct Story {
 
 impl std::fmt::Debug for Story {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Story").field("id", &self.id).field("size", &self.size).field("ticks", &self.ticks).finish()
+        f.debug_struct("Story")
+            .field("id", &self.id)
+            .field("size", &self.size)
+            .field("ticks", &self.ticks)
+            .finish()
     }
 }
 
@@ -178,17 +182,35 @@ impl Story {
         self.tags.iter().any(|x| x == t)
     }
     pub fn knob(mut self, name: impl Into<String>, kind: KnobKind, default: KnobValue) -> Self {
-        self.knobs.push(Knob { name: name.into(), kind, default });
+        self.knobs.push(Knob {
+            name: name.into(),
+            kind,
+            default,
+        });
         self
     }
     pub fn knob_bool(self, name: &str, default: bool) -> Self {
         self.knob(name, KnobKind::Bool, KnobValue::Bool(default))
     }
     pub fn knob_f32(self, name: &str, default: f32, range: RangeInclusive<f32>) -> Self {
-        self.knob(name, KnobKind::Float { min: *range.start(), max: *range.end() }, KnobValue::Float(default))
+        self.knob(
+            name,
+            KnobKind::Float {
+                min: *range.start(),
+                max: *range.end(),
+            },
+            KnobValue::Float(default),
+        )
     }
     pub fn knob_i64(self, name: &str, default: i64, range: RangeInclusive<i64>) -> Self {
-        self.knob(name, KnobKind::Int { min: *range.start(), max: *range.end() }, KnobValue::Int(default))
+        self.knob(
+            name,
+            KnobKind::Int {
+                min: *range.start(),
+                max: *range.end(),
+            },
+            KnobValue::Int(default),
+        )
     }
     pub fn knob_color(self, name: &str, default: [f32; 4]) -> Self {
         self.knob(name, KnobKind::Color, KnobValue::Color(default))
@@ -274,7 +296,8 @@ mod tests {
     #[test]
     fn knobs_defaults_and_overrides() {
         let s = Story::new("A/B/C", |app, k| {
-            app.resources.insert(k.f32("x") + if k.bool("flag") { 100.0 } else { 0.0 });
+            app.resources
+                .insert(k.f32("x") + if k.bool("flag") { 100.0 } else { 0.0 });
         })
         .knob_f32("x", 1.5, 0.0..=10.0)
         .knob_bool("flag", false);

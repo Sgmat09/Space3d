@@ -21,7 +21,7 @@ use crate::wire::Writer;
 use crate::{Controlled, FastMap, NetEntity, NetId, Predicted, Tick};
 use smallvec::SmallVec;
 use space3d_core::glam::{Quat, Vec3};
-use space3d_core::{Entity, SystemCtx, TickRate, Transform, World};
+use space3d_core::{Entity, SystemCtx, TickRate, Time, Transform, World};
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -121,6 +121,11 @@ pub(crate) struct PredictionState {
     pub(crate) next_tick: Option<Tick>,
     pub(crate) inputs: InputHistory,
     pub(crate) rollback_from: Option<Tick>,
+    /// A resync moved `next_tick`: the world holds the state after the *old* timeline's last
+    /// tick, so the next `client_tick` must rebuild the state before `next_tick` from the newest
+    /// confirmation even when the prediction for that tick was right (otherwise a forward jump
+    /// skips ticks and a backward one applies their inputs a second time).
+    pub(crate) rebuild: bool,
     pub(crate) confirmed: FastMap<NetId, Confirmed>,
     pub(crate) nominal_hz: f64,
     pub(crate) scale: f64,
@@ -148,6 +153,7 @@ impl PredictionState {
     pub(crate) fn stop(&mut self) {
         self.next_tick = None;
         self.rollback_from = None;
+        self.rebuild = false;
         self.snap_floor = None;
         self.feedback_after = None;
         self.inputs.entries.clear();
@@ -226,6 +232,7 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
     let hard = conn.pacer.config().hard_resync_ticks;
     let prediction = &mut net.prediction;
     prediction.nominal_hz = hz;
+    let mut realigned = false;
     match prediction.next_tick {
         None => {
             prediction.next_tick = Some(Tick(target.round().max(1.0) as u32));
@@ -250,6 +257,7 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
                 // The clock says we are far off (stall, clock jump): jump.
                 resync(prediction, Tick(target.round().max(1.0) as u32));
                 conn.pacer.reset();
+                realigned = true;
             }
         }
     }
@@ -262,6 +270,13 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
             rate.hz = want;
         }
     }
+    if realigned && let Some(time) = ctx.resources.get_mut::<Time>() {
+        // The jump already covers the time a long frame (a hitch) left in the fixed-step
+        // backlog: running that backlog on top of it would put the prediction up to
+        // `max_steps_per_frame` ticks too far ahead (and a later backward resync would replay
+        // ticks the player already saw). This frame runs at most one step, as usual.
+        time.discard_backlog(1);
+    }
 }
 
 fn resync(p: &mut PredictionState, to: Tick) {
@@ -270,12 +285,19 @@ fn resync(p: &mut PredictionState, to: Tick) {
     // on the server, which the pacer answers with a speed-up, never another jump). The input
     // history is kept: the rebuild below replays the recorded ticks and repeats the last input
     // over the skipped ones, exactly like the server, instead of snapping.
+    if p.next_tick == Some(to) {
+        return;
+    }
     p.next_tick = Some(to);
     p.feedback_after = Some(to);
     p.scale = 1.0;
-    // Rebuild from the newest confirmed state.
+    // Rebuild the state before `to` from the newest confirmed state (always: the world still
+    // holds the old timeline's state, whether or not its prediction was right).
     let newest = p.confirmed.values().map(|c| c.tick).max();
-    p.rollback_from = newest;
+    if let Some(newest) = newest {
+        p.rollback_from = Some(newest);
+        p.rebuild = true;
+    }
 }
 
 /// Predicted entities: `(entity, net id)`.
@@ -352,7 +374,7 @@ pub(crate) fn client_tick(ctx: &mut SystemCtx) {
         if !registry.is_frozen() {
             return;
         }
-        let (tick, rollback, dt) = {
+        let (tick, rollback, rebuild, dt) = {
             let net = res.expect_mut::<NetClient>();
             if !net.config.prediction.enabled
                 || !matches!(net.state, ConnectionState::Syncing | ConnectionState::Connected)
@@ -361,12 +383,13 @@ pub(crate) fn client_tick(ctx: &mut SystemCtx) {
             }
             let Some(tick) = net.prediction.next_tick else { return };
             let dt = Duration::from_secs_f64(1.0 / net.prediction.nominal_hz.max(1.0));
-            (tick, net.prediction.rollback_from.take(), dt)
+            let rebuild = std::mem::take(&mut net.prediction.rebuild);
+            (tick, net.prediction.rollback_from.take(), rebuild, dt)
         };
         let tick = match rollback {
             // A confirmation at or past `tick` moves the timeline forward (see
             // `rollback_and_replay`): simulate the tick after it instead.
-            Some(from) => rollback_and_replay(world, res, registry, from, tick, dt).unwrap_or(tick),
+            Some(from) => rollback_and_replay(world, res, registry, from, tick, rebuild, dt).unwrap_or(tick),
             None if cfg!(debug_assertions) => {
                 let net = res.expect_mut::<NetClient>();
                 check_sim_discipline(world, registry, net, tick);
@@ -487,21 +510,27 @@ fn newest_confirmation(world: &World, registry: &ReplicationRegistry, net: &NetC
 /// newest confirmation is at or past `next` (the client fell behind snapshots it already holds —
 /// a frame hitch on a low-latency link), so the confirmed state already includes ticks
 /// `next ..= from` and simulating them again would apply their inputs twice.
+///
+/// `rebuild` (after a resync moved `next`): the world holds the state after the old
+/// timeline's last tick, not `next − 1`, so the state is rebuilt even when the prediction for
+/// the newest confirmed tick was right.
+#[allow(clippy::too_many_arguments)]
 fn rollback_and_replay(
     world: &mut World,
     res: &mut space3d_core::Resources,
     registry: &ReplicationRegistry,
     from: Tick,
     next: Tick,
+    rebuild: bool,
     dt: Duration,
 ) -> Option<Tick> {
     // Only the newest confirmed values are kept, so the replay starts from their tick: a
     // mismatch at an older tick (several snapshots arriving together after a stall) is
     // superseded by the newest one, and if our prediction for the newest confirmed tick was
-    // right there is nothing to correct.
+    // right there is nothing to correct (unless a resync moved the timeline).
     let from = match newest_confirmation(world, registry, res.expect::<NetClient>()) {
-        Some((_, true)) => return None,
-        Some((newest, false)) => newest.max(from),
+        Some((_, true)) if !rebuild => return None,
+        Some((newest, _)) => newest.max(from),
         None => from,
     };
     let before = visual(world);

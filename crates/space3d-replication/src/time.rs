@@ -165,8 +165,14 @@ pub struct ServerClock {
     tick_hz: f64,
     /// `estimate(now) = offset_ticks + now · tick_hz`.
     offset_ticks: Option<f64>,
-    samples: Vec<(f64, Duration)>,
+    /// `(offset_ticks, rtt, received_at)`.
+    samples: Vec<(f64, Duration, Duration)>,
     last_update: Duration,
+    /// Since when the last [`Self::RECENT`] samples have all been above the long-window path
+    /// RTT (see [`Self::path_rtt`]).
+    raised_since: Option<Duration>,
+    /// Path RTT as of the last sample.
+    path: Option<Duration>,
 }
 
 impl ServerClock {
@@ -184,6 +190,8 @@ impl ServerClock {
             offset_ticks: None,
             samples: Vec::new(),
             last_update: Duration::ZERO,
+            raised_since: None,
+            path: None,
         }
     }
 
@@ -201,10 +209,12 @@ impl ServerClock {
         let server_now = f64::from(pong.server_tick.0)
             + f64::from(pong.tick_frac) / 65536.0
             + rtt.as_secs_f64() / 2.0 * self.tick_hz;
-        self.samples.push((server_now - now.as_secs_f64() * self.tick_hz, rtt));
+        self.samples
+            .push((server_now - now.as_secs_f64() * self.tick_hz, rtt, now));
         if self.samples.len() > Self::WINDOW {
             self.samples.remove(0);
         }
+        self.path = self.update_path(now);
         let mut by_rtt = self.samples.clone();
         by_rtt.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.total_cmp(&b.0)));
         by_rtt.truncate(by_rtt.len().div_ceil(2));
@@ -227,32 +237,68 @@ impl ServerClock {
         self.last_update = now;
     }
 
-    /// Round-trip time of the path, stall-resistant: the median RTT of the lowest-RTT half of
-    /// the window (the samples the offset uses). A head-of-line stall on a stream only adds a
-    /// few high samples, which this ignores, where the RFC 6298 `srtt` jumps several-fold —
-    /// pacing and the render clock use this, not `srtt`.
+    /// Consecutive samples that must all be clearly higher before [`Self::path_rtt`] follows
+    /// an RTT increase (and then for a hold, see there).
+    pub const RECENT: usize = 3;
+    /// Smallest RTT rise [`Self::path_rtt`] follows early (smaller ones are left to the
+    /// pacer's feedback loop).
+    pub const MIN_RISE: Duration = Duration::from_millis(5);
+
+    /// Round-trip time of the path, stall-resistant. Normally the median RTT of the lowest-RTT
+    /// half of the window (the samples the offset uses): a head-of-line stall on a stream only
+    /// adds a burst of high samples (the pings sent during the stall, released together),
+    /// which this ignores, where the RFC 6298 `srtt` jumps several-fold. A lasting increase
+    /// raises every new sample: once the last [`Self::RECENT`] samples have all stayed clearly
+    /// above it (by 3 × jitter, at least [`Self::MIN_RISE`]) for two ping intervals plus one
+    /// path RTT — longer than a stall's burst lasts before the
+    /// first fresh (fast) sample follows it — their lowest is used instead, so pacing follows
+    /// in about 1.25 s rather than once most of the 16-sample window (4 s) has turned over.
+    /// Pacing and the render clock use this, not `srtt`.
     pub fn path_rtt(&self) -> Option<Duration> {
-        let mut rtts: Vec<Duration> = self.samples.iter().map(|s| s.1).collect();
-        if rtts.is_empty() {
-            return None;
-        }
-        rtts.sort_unstable();
-        rtts.truncate(rtts.len().div_ceil(2));
-        Some(rtts[rtts.len() / 2])
+        self.path
     }
 
-    /// Jitter, stall-resistant: the median absolute deviation of the window's RTTs (a stall's
-    /// few outliers do not move it). Zero without samples.
+    fn update_path(&mut self, now: Duration) -> Option<Duration> {
+        let mut rtts: Vec<Duration> = self.samples.iter().map(|s| s.1).collect();
+        if rtts.is_empty() {
+            self.raised_since = None;
+            return None;
+        }
+        let recent = (rtts.len() >= Self::RECENT).then(|| rtts.iter().rev().take(Self::RECENT).min().copied());
+        rtts.sort_unstable();
+        rtts.truncate(rtts.len().div_ceil(2));
+        let low = rtts[rtts.len() / 2];
+        // Only a clear rise counts (noise keeps the recent floor a hair above the median).
+        let margin = (self.jitter() * 3).max(Self::MIN_RISE);
+        let Some(Some(recent)) = recent.filter(|r| r.is_some_and(|r| r > low + margin)) else {
+            self.raised_since = None;
+            return Some(low);
+        };
+        let since = *self.raised_since.get_or_insert(now);
+        // Ping spacing: the median gap between arrivals (a burst's zero gaps are a minority).
+        let mut gaps: Vec<Duration> = self.samples.windows(2).map(|w| w[1].2.saturating_sub(w[0].2)).collect();
+        gaps.sort_unstable();
+        let spacing = gaps.get(gaps.len() / 2).copied().unwrap_or_default();
+        let hold = spacing * 2 + low;
+        Some(if now.saturating_sub(since) >= hold { recent } else { low })
+    }
+
+    /// Jitter, stall-resistant: the median change between consecutive RTT samples, over √2
+    /// (for Gaussian noise that equals the median absolute deviation). A stall's burst adds
+    /// only a few large changes, and a lasting RTT step only one — which the median ignores;
+    /// the spread of the window's samples around their median counted the step as jitter for
+    /// as long as the window straddled it. Zero without two samples.
     pub fn jitter(&self) -> Duration {
-        let mut rtts: Vec<f64> = self.samples.iter().map(|s| s.1.as_secs_f64()).collect();
-        if rtts.len() < 2 {
+        if self.samples.len() < 2 {
             return Duration::ZERO;
         }
-        rtts.sort_by(f64::total_cmp);
-        let median = rtts[rtts.len() / 2];
-        let mut dev: Vec<f64> = rtts.iter().map(|r| (r - median).abs()).collect();
-        dev.sort_by(f64::total_cmp);
-        Duration::from_secs_f64(dev[dev.len() / 2])
+        let mut steps: Vec<f64> = self
+            .samples
+            .windows(2)
+            .map(|w| (w[1].1.as_secs_f64() - w[0].1.as_secs_f64()).abs())
+            .collect();
+        steps.sort_by(f64::total_cmp);
+        Duration::from_secs_f64(steps[steps.len() / 2] / std::f64::consts::SQRT_2)
     }
 
     /// Server tick (fractional) the server is simulating at local time `now`.
@@ -274,6 +320,8 @@ impl ServerClock {
     pub fn reset(&mut self) {
         self.offset_ticks = None;
         self.samples.clear();
+        self.raised_since = None;
+        self.path = None;
     }
 }
 
@@ -598,6 +646,70 @@ mod tests {
             }
         }
         assert!(max_err_after_3s <= 1.0, "error {max_err_after_3s} ticks");
+    }
+
+    /// Regression: the path RTT (median of the lowest half of 16 samples) took ~12 samples
+    /// (3 s) to follow a lasting RTT increase, and the jitter (spread around the window's
+    /// median) counted the step as jitter while the window straddled it; together they made
+    /// the clock-based resync jump the prediction forward and back again, ~2 s of late inputs.
+    #[test]
+    fn path_rtt_ignores_stall_bursts_but_follows_lasting_changes_within_a_second() {
+        let mut c = ServerClock::new(60.0);
+        let mut t = 0u64;
+        let mut feed = |c: &mut ServerClock, rtt_ms: u64| {
+            t += 250_000;
+            let pong = Pong {
+                id: 0,
+                client_time_us: t,
+                server_tick: Tick(100),
+                tick_frac: 0,
+                hold_us: 0,
+            };
+            c.on_pong(&pong, Duration::from_micros(t + rtt_ms * 1000));
+        };
+        for i in 0..16 {
+            feed(&mut c, 40 + i % 3);
+        }
+        assert!(c.path_rtt().unwrap() <= Duration::from_millis(42));
+        let quiet = c.jitter();
+        assert!(quiet <= Duration::from_millis(2), "{quiet:?}");
+        // A 900 ms head-of-line stall: the pings sent during it come back late, together.
+        for extra in [900, 650, 400, 150] {
+            feed(&mut c, 40 + extra);
+            assert!(
+                c.path_rtt().unwrap() <= Duration::from_millis(42),
+                "stall burst ignored"
+            );
+        }
+        feed(&mut c, 41);
+        assert!(c.path_rtt().unwrap() <= Duration::from_millis(42));
+        assert!(c.jitter() <= Duration::from_millis(5), "{:?}", c.jitter());
+        // The path gets slower for good: followed once `RECENT` slow samples have held for
+        // two ping intervals plus a path RTT (1.25 s after the change here, not 3+ s).
+        for i in 0..ServerClock::RECENT + 2 {
+            feed(&mut c, 260 + (i as u64 % 3));
+            assert!(c.path_rtt().unwrap() <= Duration::from_millis(42), "not yet: {i}");
+        }
+        feed(&mut c, 260);
+        assert!(c.path_rtt().unwrap() >= Duration::from_millis(260));
+        for i in 0..16 {
+            feed(&mut c, 260 + i % 3);
+            assert!(
+                c.jitter() <= Duration::from_millis(5),
+                "a level shift is not jitter: {:?}",
+                c.jitter()
+            );
+        }
+        // And faster again (the lowest half of the window follows after 5 fast samples).
+        for i in 0..5 {
+            feed(&mut c, 40 + (i as u64 % 3));
+        }
+        assert!(c.path_rtt().unwrap() <= Duration::from_millis(42));
+        // Real jitter is still seen.
+        for i in 0..16u64 {
+            feed(&mut c, if i % 2 == 0 { 30 } else { 70 });
+        }
+        assert!(c.jitter() >= Duration::from_millis(20), "{:?}", c.jitter());
     }
 
     #[test]

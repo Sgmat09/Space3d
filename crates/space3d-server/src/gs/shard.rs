@@ -146,11 +146,16 @@ pub fn default_shards() -> usize {
 impl ShardPool {
     /// Start `n` shard threads (`space3d-shard-N`).
     pub fn start(n: usize, health: &HealthState, metrics: GameServerMetrics, max_catchup_ticks: u32) -> Self {
-        // Shard threads log inside the caller's span (the process span: server_id, role).
+        // Shard threads log inside the caller's span (the process span: server_id, role) and
+        // to the caller's subscriber (a scoped one in tests; the global one otherwise — a
+        // no-op default is not captured, so a subscriber installed later still applies).
         let parent = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        let dispatch = (!dispatch.is::<tracing::subscriber::NoSubscriber>()).then_some(dispatch);
         let shards = (0..n.max(1))
             .map(|i| {
                 let parent = parent.clone();
+                let dispatch = dispatch.clone();
                 let (tx, rx) = crossbeam_channel::unbounded();
                 let load = Arc::new(AtomicU64::new(0));
                 let rooms = Arc::new(AtomicUsize::new(0));
@@ -173,8 +178,14 @@ impl ShardPool {
                 let thread = std::thread::Builder::new()
                     .name(format!("space3d-shard-{i}"))
                     .spawn(move || {
-                        let _span = parent.enter();
-                        shard.run();
+                        let run = move || {
+                            let _span = parent.enter();
+                            shard.run();
+                        };
+                        match dispatch {
+                            Some(d) => tracing::dispatcher::with_default(&d, run),
+                            None => run(),
+                        }
                     })
                     .expect("spawn shard thread");
                 ShardHandle {
@@ -265,8 +276,6 @@ struct Hosted {
     epoch: u32,
     crashes: CrashGuard,
     hosted_at: Instant,
-    /// `room` span (room_id, epoch, tick) every tick of this room runs in.
-    span: tracing::Span,
     tick_us: Vec<u32>,
     window_start: Instant,
     cost_us: f64,
@@ -368,7 +377,6 @@ fn host(build: RoomBuild) -> Option<Hosted> {
             Some(Hosted {
                 id,
                 epoch,
-                span: tracing::error_span!("room", room_id = %id, epoch, tick = tracing::field::Empty),
                 app,
                 step,
                 next_at: Instant::now(),
@@ -412,7 +420,6 @@ impl Hosted {
         );
         if alive {
             self.epoch = epoch_of(&self.app);
-            self.span.record("epoch", self.epoch);
         }
         alive
     }
@@ -535,14 +542,12 @@ impl Shard {
         let mut i = 0;
         while i < rooms.len() {
             let room = &mut rooms[i];
-            let span = room.span.clone();
-            let _span = span.enter();
             let mut rounds = 0;
             let mut alive = true;
             while Instant::now() >= room.next_at && rounds < self.max_catchup {
-                if let Some(net) = room.app.resources.get::<NetServer>() {
-                    room.span.record("tick", net.tick().0);
-                }
+                // A fresh span per tick: `record`ing the tick on one long-lived span appends
+                // to its formatted fields in the text formatter (unbounded growth).
+                let _span = crate::logging::room_tick_span(&room.app, &room.env.server_id, room.id).entered();
                 let started = Instant::now();
                 let result = run_tick_guarded(&mut room.app, room.step);
                 let us = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
