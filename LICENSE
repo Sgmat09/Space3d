@@ -1,0 +1,37 @@
+SpaceCorps Proprietary License — Space3d
+
+Copyright (c) 2026 SpaceCorps. All rights reserved.
+
+This repository and everything in it — source code, object code, algorithms, numerical methods,
+data, documentation, benchmarks and any other material (the "Software") — is the confidential
+and proprietary property of SpaceCorps.
+
+1. No license. Except as expressly granted by SpaceCorps in a separate written agreement signed
+   by an authorized representative, no right or license of any kind is granted, whether by
+   implication, estoppel or otherwise. Merely having access to the Software grants no rights.
+
+2. Restrictions. Without such a written agreement you may not, in whole or in part: use, run,
+   copy, reproduce, modify, translate, adapt or create derivative works of the Software;
+   distribute, publish, sublicense, sell, lease, lend, host or otherwise make it available to
+   any third party, including as a network service; decompile, disassemble or reverse-engineer
+   it or its outputs to derive its algorithms or methods; use it, or any knowledge of its
+   internals, to develop a competing product or to train or evaluate machine-learning models;
+   or remove or alter any proprietary notice.
+
+3. Confidentiality. The Software, including its structure, algorithms and performance
+   characteristics, is a trade secret of SpaceCorps. Anyone given access must keep it
+   confidential, use it only as expressly permitted in writing, and protect it with at least
+   reasonable care.
+
+4. Third-party components. Third-party dependencies remain under their own licenses; nothing
+   here restricts rights those licenses grant for those components alone.
+
+5. Termination. Any breach immediately terminates any permission you may have been given. On
+   termination you must stop all use and destroy every copy in your possession or control.
+
+6. No warranty; limitation of liability. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+   ANY KIND, EXPRESS OR IMPLIED. IN NO EVENT SHALL SPACECORPS BE LIABLE FOR ANY CLAIM, DAMAGES
+   OR OTHER LIABILITY ARISING FROM OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+Unauthorized use, copying or distribution may result in civil and criminal liability.
+Licensing enquiries: SpaceCorps.
