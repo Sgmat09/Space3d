@@ -57,13 +57,16 @@ const FRAMES: usize = 100;
 /// draw path) plus ~10 %; other backends get twice the headroom. Measured: Direct 76; Hdr, Ldr
 /// and passthrough 106 each — one render pass (the composite) more, and wgpu-hal's Metal backend
 /// allocates about 30 times per render pass; nodes 119–120 (Direct + one SceneRead pass
-/// and three node draws); Hdr with its per-frame post seeds uploaded (16 bytes: one staging
-/// copy, as in `App::update`, where the frame counter advances) 150.
+/// and three node draws); a still Hdr scene whose frame counter advances (as in `App::update`)
+/// with frames queued on the GPU 136 (150 while it uploaded its post seeds every frame; now a
+/// window of 64 frames' seeds goes up every 64th frame); 400 moving cubes in a loop that never
+/// waits for the GPU (three frames in flight) 148.
 fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
     let metal = match mode {
         "direct" => 84,
         "nodes" => 132,
         "hdr_seeds" => 165,
+        "hdr_moving" => 167,
         _ => 117,
     };
     if backend == wgpu::Backend::Metal {
@@ -197,17 +200,18 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
     }
 
     // A still Hdr scene the way `App::update` renders it: the frame counter advances (the post
-    // seeds, 16 bytes, are uploaded every frame) and frames queue up on the GPU (waited for
-    // every 8th). Regression (review): the staging ring trimmed the chunks still in flight and
-    // created and dropped a 4 MiB chunk every few frames (0.5–1 ms each, an `Arc` per chunk:
-    // 100–230 per 1200 frames). Now it grows to the queue's depth (at most 8 chunks here, each
-    // created once, when the GPU first falls that far behind) and keeps them.
+    // seeds change every frame: a window of 64 frames' seeds is uploaded at once) and frames
+    // queue up on the GPU (waited for every 8th). Regression (review): the staging ring trimmed
+    // the chunks still in flight and created and dropped a 4 MiB chunk every few frames
+    // (0.5–1 ms each, an `Arc` per chunk: 100–230 per 1200 frames). Now it grows to the queue's
+    // depth (each chunk created once, when the GPU first falls that far behind) and keeps them.
     let _ = app.world.remove_one::<PostProcess>(cam);
     *app.resources.expect_mut::<FrameSettings>() = FrameSettings::default();
     app.world
         .insert_one(cam, PostProcess::default().without_bloom())
         .unwrap();
     let (mut max, mut sum, mut counted_frames, mut reallocs, mut chunks, mut bytes) = (0, 0, 0, 0, 0, 0);
+    let mut uploading = 0;
     for i in 0..1200u32 {
         app.resources.expect_mut::<Time>().frame += 1;
         let a0 = ALLOCS.load(Relaxed);
@@ -219,6 +223,7 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
         if i >= 16 {
             reallocs += s.buffer_reallocations + s.cpu_reallocations + s.textures_created;
             bytes = bytes.max(s.bytes_uploaded);
+            uploading += u32::from(s.bytes_uploaded > 0);
             if created == 0 {
                 max = max.max(counted);
                 sum += counted;
@@ -235,22 +240,69 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
     }
     let mean = sum as f64 / counted_frames.max(1) as f64;
     eprintln!(
-        "hdr still, frames queued: allocations per frame mean {mean:.1} max {max}, {chunks} staging chunks created in 1200 frames and {reallocs} other buffers or textures after the first 16, up to {bytes} B uploaded"
+        "hdr still, frames queued: allocations per frame mean {mean:.1} max {max}, {chunks} staging chunks created in 1200 frames and {reallocs} other buffers or textures after the first 16, {uploading} frames uploading, up to {bytes} B"
     );
     assert!(chunks <= 10, "{chunks} staging chunks created: the staging ring churns");
     assert_eq!(reallocs, 0, "nothing else is created for a still scene");
-    assert!(bytes <= 16, "a still post group uploads its seeds only: {bytes} B");
+    // A still post group uploads nothing but its seed window: 64 frames × one aligned slot,
+    // every 64th frame (it uploaded its 16 bytes of seeds every frame).
+    assert!(
+        bytes <= 64 * 256,
+        "a still post group uploads its seed window only: {bytes} B"
+    );
+    assert!(uploading <= 1184 / 64 + 1, "{uploading} of 1184 frames uploaded");
     // wgpu retires queued submissions in batches (the frame after a wait retires eight): those
     // frames may allocate more; the mean stays the waited-for frame's.
-    let bound = bound("hdr_seeds", backend);
+    let seeds_bound = bound("hdr_seeds", backend);
     assert!(
-        mean <= bound as f64,
-        "hdr queued: {mean:.1} allocations per frame (bound {bound})"
+        mean <= seeds_bound as f64,
+        "hdr queued: {mean:.1} allocations per frame (bound {seeds_bound})"
     );
     assert!(
-        max <= 2 * bound,
+        max <= 2 * seeds_bound,
         "hdr queued: up to {max} allocations per frame (bound {})",
-        2 * bound
+        2 * seeds_bound
+    );
+
+    // The same scene, cubes moving (their instances uploaded every frame), rendered in a loop
+    // that never waits for the GPU — `App::update` / `step_ticks` without a window, the engine's
+    // test pattern and headless batch renders. Regression (review): nothing paced the frames,
+    // the queue deepened without bound (Metal accepts 4096 command buffers) and the staging
+    // ring followed it, creating a 4 MiB chunk every few dozen frames (137 by frame 2400) while
+    // the process grew by gigabytes. `render_frame` keeps at most three frames in flight now.
+    let (mut late_chunks, mut chunks, mut max, mut sum) = (0, 0, 0, 0);
+    let frames = 1500u32;
+    for i in 0..frames {
+        app.resources.expect_mut::<Time>().frame += 1;
+        let dy = if i.is_multiple_of(2) { 0.01 } else { -0.01 };
+        for &e in &movers {
+            app.world.get::<&mut Transform>(e).unwrap().translation.y += dy;
+        }
+        space3d_core::transform::propagate_transforms(&mut app.world);
+        let a0 = ALLOCS.load(Relaxed);
+        app.run_stage(Stage::Render);
+        let counted = ALLOCS.load(Relaxed) - a0;
+        let s = stats(&app);
+        chunks += s.staging_chunks_created;
+        if i >= 100 {
+            late_chunks += s.staging_chunks_created;
+            max = max.max(counted);
+            sum += counted;
+        }
+    }
+    let mean = sum as f64 / (frames - 100) as f64;
+    eprintln!(
+        "hdr moving, unpaced: allocations per frame mean {mean:.1} max {max}, {chunks} staging chunks created in {frames} frames ({late_chunks} after the first 100)"
+    );
+    assert_eq!(late_chunks, 0, "the staging ring follows an unbounded queue");
+    assert!(
+        chunks <= 6,
+        "{chunks} staging chunks for at most three frames in flight"
+    );
+    let bound = bound("hdr_moving", backend);
+    assert!(
+        mean <= bound as f64,
+        "hdr unpaced: {mean:.1} allocations per frame (bound {bound})"
     );
     assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
 }

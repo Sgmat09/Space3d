@@ -339,6 +339,9 @@ pub struct Renderer {
     pub(crate) nodes: crate::frame::NodeCache,
     /// Scene-input bind groups (group 1 of node and overlay passes) and depth resolves.
     pub(crate) scene_inputs: crate::frame::SceneInputs,
+    /// Submissions of the last [`crate::frame::MAX_FRAMES_IN_FLIGHT`] frames (slot: frame index
+    /// modulo the count): `render_frame` waits for the oldest before it is replaced.
+    pub(crate) in_flight: [Option<wgpu::SubmissionIndex>; crate::frame::MAX_FRAMES_IN_FLIGHT],
 }
 
 /// What [`Renderer::prewarm`] builds, in addition to the post pipelines of the current post
@@ -602,6 +605,7 @@ impl Renderer {
             plan_warnings: Default::default(),
             nodes: Default::default(),
             scene_inputs,
+            in_flight: Default::default(),
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;

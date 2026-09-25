@@ -173,8 +173,9 @@ unused frames. `RenderStats::target_bytes` counts it once per frame.
 
 Render passes per post group: `2 × levels − 1` (11 for the default 6 levels at 1080p and
 above, 9 at 720p, 5 at 180p) plus the composite. Their uniforms (one 64-byte slot per pass) are
-written when the settings or the rect change: a still scene uploads only the composite's
-16 bytes of per-frame seeds. The steady state creates no textures and reallocates nothing
+written when the settings or the rect change, and the per-frame seeds of grain and dither a
+window of 64 frames at a time: a still scene uploads nothing except that window (16 KiB per post
+group, every 64th frame). The steady state creates no textures and reallocates nothing
 (`tests/post.rs`, `tests/alloc_post.rs`); wgpu-hal on Metal allocates about 20 times per render
 pass (211 allocations per frame with bloom at 320 × 180, 5 bloom passes, vs 106 for the
 composite alone).
@@ -270,9 +271,10 @@ clamped to the rect. Off in `GraphicsQuality::Low`.
 `intensity` fading in the highlights with `luminance_response` (1: no grain on white). It is
 seeded (spec §4.3): `animated` grain uses `pcg(seed ^ Time::frame)` — a new pattern each frame,
 the same pattern for the same frame (`render_to_image` twice is identical, capture replays
-repeat it) — and still grain (`animated: false`) always `seed` (use it for goldens). Animated
-grain and dither upload 16 bytes per post group per frame; everything else of a still scene
-uploads nothing.
+repeat it) — and still grain (`animated: false`) always `seed` (use it for goldens). The seeds
+of animated grain and dither are uploaded for 64 frames at once (one aligned uniform slot per
+frame and post group, selected with a dynamic offset); everything else of a still scene uploads
+nothing.
 
 ## Display-space effects and overlays
 
@@ -287,7 +289,8 @@ without post) never applies them.
 Bloom has no temporal state and no noise: the same scene gives bit-identical chains (tested with
 `render_to_image` twice). Capture replays re-run the chain from the scene texture. Grain and
 dither are seeded from `Time::frame` (never the wall clock or the renderer's own frame count);
-their seeds are hashed once per frame on the CPU (bit-identical to hashing per pixel).
+their seeds are hashed on the CPU (bit-identical to hashing per pixel), a window of frames at a
+time — each frame's seed is still a pure function of that frame.
 
 ## Tests and stories
 

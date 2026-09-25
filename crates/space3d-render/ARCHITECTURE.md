@@ -67,7 +67,8 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
                       [→ depth resolve → SceneRead pass] [→ Distortion pass]
           → [HdrScene overlays] → post groups' composites → display views
           → AfterTonemap overlays
-          → submit → present → staging recall → poll(Poll)
+          → submit → present → staging recall
+          → wait for the frame submitted 3 frames earlier (at most 3 in flight; native), else poll(Poll)
  next frames: read the mapped args copy (visible counts) into RenderStats
 ```
 
@@ -333,8 +334,10 @@ Hdr, 1 in Ldr), applies the tonemapper (Hdr; `None` otherwise), dithers (±1 LSB
 the encoded space, seed `pcg(0x9E3779B9 ^ frame)` with `frame = Time::frame`), encodes for `D`
 (hardware sRGB, manual sRGB for 8-bit non-sRGB surfaces, linear for float) and re-premultiplies
 (alpha is always kept). Its parameters (`post/chain.rs` `GpuPost`, one 256-byte slot per post
-group) are shadow-diffed like every renderer buffer: a still scene uploads nothing, and only the
-16-byte seed vector when dither reseeds each frame. Pipelines are per (output format, output
+group) are shadow-diffed like every renderer buffer and hold nothing per-frame; the dither and
+animated-grain seeds, which change every frame, are uploaded 64 frames at a time (`SeedWindow`:
+one aligned 16-byte slot per frame and group, bound with a second dynamic offset), so a still
+scene uploads nothing in 63 of 64 frames. Pipelines are per (output format, output
 kind) (`S3D_POST_OUT` override); the input bind group per scene texture generation. Effects
 (bloom, auto exposure, FXAA, lens, grading, distortion) are the post area's slots in the same
 shader and chain.
@@ -481,8 +484,12 @@ and reused only once the map callback reports the GPU is done with them, so it i
 frame-in-flight-aware ring: no write-after-read hazards, and no staging allocation in the
 steady state. Writes larger than a chunk are split into chunk-sized pieces (recorded in order,
 so ordering against other commands is unchanged). Every chunk is therefore interchangeable,
-and idle chunks beyond twice the busiest frame of the last 128–256 recalls are released: the
-ring follows the actual upload volume. (`wgpu::util::StagingBelt` was replaced because it never
+and idle chunks beyond what recent frames needed (twice the busiest frame, or the busiest frame
+for every frame still queued plus one) are released: the ring follows the actual upload volume.
+`render_frame` keeps at most three frames in flight (`frame::MAX_FRAMES_IN_FLIGHT`: it waits for
+the frame submitted three frames earlier, native only), so without a window to pace it — an
+unpaced `App::update` loop, a headless batch render — the queue, and the ring with it, stays
+bounded instead of following the GPU's backlog (Metal accepts 4096 command buffers). (`wgpu::util::StagingBelt` was replaced because it never
 frees a chunk and creates one of exactly the request size whenever a write is larger than every
 chunk it has, so a growing upload leaked one mapped chunk per frame. `queue.write_buffer_with`
 was rejected: it allocates a fresh staging buffer per call in wgpu-core and runs before the

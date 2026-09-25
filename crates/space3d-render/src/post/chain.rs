@@ -26,8 +26,9 @@ pub(crate) mod bits {
     pub const EXACT: u32 = 2048;
 }
 
-/// Matches `PostParams` in composite.wgsl: one 256-byte uniform slot per post group. Only
-/// `frame` varies per frame (animated grain, dither), so still scenes with those off upload
+/// Matches `PostParams` in composite.wgsl: one 256-byte uniform slot per post group. Nothing in
+/// it varies per frame: the per-frame seeds (animated grain, dither) are uploaded a window of
+/// frames at a time ([`SeedKey`], `SeedWindow` in post/mod.rs), so a still scene uploads
 /// nothing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -51,7 +52,7 @@ pub(crate) struct GpuPost {
     pub gain_lut: [f32; 4],
     /// Effect bits ([`bits`]), tonemapper id, -, -.
     pub flags: [u32; 4],
-    /// Grain seed, dither seed, -, -.
+    /// Reserved (zero): the seeds moved to the seed window (`post_seeds` in composite.wgsl).
     pub frame: [u32; 4],
 }
 
@@ -63,20 +64,17 @@ pub(crate) fn dither_seed(frame: u64) -> u32 {
 /// Second dither hash seed (`s3d_hash01(px, seed) − s3d_hash01(px, seed ^ DITHER_SECOND)`).
 const DITHER_SECOND: u32 = 0x68E3_1DA4;
 
-/// Grain seed of frame `frame` (graphics spec §4.3): `animated ? pcg(seed ^ frame) : seed`.
-pub(crate) fn grain_seed(grain: &FilmGrain, frame: u64) -> u32 {
-    if grain.animated {
-        pcg(grain.seed ^ frame as u32)
-    } else {
-        grain.seed
-    }
+/// Grain seed of frame `frame` (graphics spec §4.3) for a grain of `seed`: `animated ?
+/// pcg(seed ^ frame) : seed`.
+pub(crate) fn grain_seed(seed: u32, animated: bool, frame: u64) -> u32 {
+    if animated { pcg(seed ^ frame as u32) } else { seed }
 }
 
 impl GpuPost {
     /// Parameters of one post group; `bloom`: its bloom chain is recorded this frame; `fxaa`:
     /// the composite writes the LDR intermediate and the FXAA pass finishes (grain, dither,
-    /// encoding).
-    pub(crate) fn new(plan: &PostGroupPlan, frame: u64, bloom: bool, fxaa: bool) -> Self {
+    /// encoding). Its seeds: [`SeedKey::of`].
+    pub(crate) fn new(plan: &PostGroupPlan, bloom: bool, fxaa: bool) -> Self {
         let s = &plan.settings;
         // The passthrough group is a plain copy and upscale: no effect.
         let effects = !plan.passthrough;
@@ -157,27 +155,41 @@ impl GpuPost {
         }
         p.grade_matrix = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
         p.flags = [flags, tonemapper.id(), u32::from(!fxaa), 0];
-        // Seeds are hashed once here (`s3d_pcg(seed)`), not per pixel: the shader's
-        // `post_hash01(p, pcg(seed))` equals `s3d_hash01(p, seed)` bit for bit.
-        p.frame = [
-            if flags & bits::GRAIN != 0 {
-                pcg(grain_seed(g, frame))
-            } else {
-                0
-            },
-            if flags & bits::DITHER != 0 {
-                pcg(dither_seed(frame))
-            } else {
-                0
-            },
-            if flags & bits::DITHER != 0 {
-                pcg(dither_seed(frame) ^ DITHER_SECOND)
-            } else {
-                0
-            },
-            0,
-        ];
         p
+    }
+}
+
+/// What a post group's per-frame seeds depend on besides the frame: whether it applies grain
+/// (with the grain's seed and animation) and dither (its `GpuPost` flags).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SeedKey {
+    grain: Option<(u32, bool)>,
+    dither: bool,
+}
+
+impl SeedKey {
+    /// The key of a group with effect bits `flags` and film grain `g`.
+    pub(crate) fn of(flags: u32, g: &FilmGrain) -> Self {
+        Self {
+            grain: (flags & bits::GRAIN != 0).then_some((g.seed, g.animated)),
+            dither: flags & bits::DITHER != 0,
+        }
+    }
+
+    /// The group's seeds at `frame` (`post_seeds` in composite.wgsl: grain, dither, second
+    /// dither, 0), hashed once here (`s3d_pcg(seed)`), not per pixel: the shader's
+    /// `post_hash01(p, pcg(seed))` equals `s3d_hash01(p, seed)` bit for bit. Graphics spec
+    /// §4.3's seeds, a pure function of the frame.
+    pub(crate) fn seeds(&self, frame: u64) -> [u32; 4] {
+        let grain = self
+            .grain
+            .map_or(0, |(seed, animated)| pcg(grain_seed(seed, animated, frame)));
+        let (dither, second) = if self.dither {
+            (pcg(dither_seed(frame)), pcg(dither_seed(frame) ^ DITHER_SECOND))
+        } else {
+            (0, 0)
+        };
+        [grain, dither, second, 0]
     }
 }
 
@@ -232,13 +244,43 @@ mod tests {
             seed: 42,
             ..FilmGrain::default()
         };
-        assert_eq!((grain_seed(&still, 1), grain_seed(&still, 2)), (42, 42));
+        let seed = |g: &FilmGrain, frame| grain_seed(g.seed, g.animated, frame);
+        assert_eq!((seed(&still, 1), seed(&still, 2)), (42, 42));
         let animated = FilmGrain {
             animated: true,
             ..still
         };
-        assert_eq!(grain_seed(&animated, 7), pcg(42 ^ 7));
-        assert_ne!(grain_seed(&animated, 7), grain_seed(&animated, 8));
+        assert_eq!(seed(&animated, 7), pcg(42 ^ 7));
+        assert_ne!(seed(&animated, 7), seed(&animated, 8));
+    }
+
+    /// A group's window seeds are the spec's per-frame seeds (§4.3), pre-hashed, for any frame.
+    #[test]
+    fn seed_keys_give_the_spec_seeds() {
+        let grain = FilmGrain {
+            animated: true,
+            seed: 9,
+            ..FilmGrain::default()
+        };
+        let all = SeedKey::of(bits::GRAIN | bits::DITHER, &grain);
+        for frame in [0, 1, 63, 64, 1 << 33] {
+            assert_eq!(
+                all.seeds(frame),
+                [
+                    pcg(grain_seed(9, true, frame)),
+                    pcg(dither_seed(frame)),
+                    pcg(dither_seed(frame) ^ DITHER_SECOND),
+                    0
+                ]
+            );
+        }
+        let still = FilmGrain {
+            animated: false,
+            ..grain
+        };
+        assert_eq!(SeedKey::of(bits::GRAIN, &still).seeds(5), [pcg(9), 0, 0, 0]);
+        assert_eq!(SeedKey::of(bits::BLOOM, &grain).seeds(5), [0; 4], "no grain, no dither");
+        assert_ne!(SeedKey::of(bits::GRAIN, &grain), SeedKey::of(bits::GRAIN, &still));
     }
 
     #[test]

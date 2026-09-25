@@ -60,6 +60,10 @@ impl Default for RenderSettings {
 const ARGS_SIZE: u64 = 20;
 const WORKGROUP: u32 = 64;
 
+/// Frames the GPU may still be executing when `render_frame` returns (like a triple-buffered
+/// swapchain; see `Renderer::pace_frames`).
+pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 3;
+
 /// What to do after trying to acquire the next surface texture.
 pub(crate) enum SurfaceAcquire {
     Present(wgpu::SurfaceTexture),
@@ -686,13 +690,15 @@ impl Renderer {
         self.encode_frame_overlays(&mut encoder, surface_view.as_ref());
 
         self.uploader.finish();
-        self.queue.submit([encoder.finish()]);
+        let submission = self.queue.submit([encoder.finish()]);
         self.uploader.recall();
         if let Some(t) = surface_tex {
             self.queue.present(t);
         }
-        // Non-blocking: fires staging-chunk recycling and capture callbacks.
-        let _ = self.device.poll(wgpu::PollType::Poll);
+        if !self.pace_frames(submission) {
+            // Non-blocking: fires staging-chunk recycling and capture callbacks.
+            let _ = self.device.poll(wgpu::PollType::Poll);
+        }
 
         self.post.end_frame(&mut self.stats);
         self.scene_inputs.evict();
@@ -720,6 +726,31 @@ impl Renderer {
                 resources.insert(self.stats.clone());
             }
         }
+    }
+
+    /// Keep at most [`MAX_FRAMES_IN_FLIGHT`] frames queued on the GPU: wait for the frame
+    /// submitted that many frames ago (native; the browser paces its frames and cannot block).
+    /// A window's presentation already paces frames and the wait returns at once; without one
+    /// (headless renderers, an unpaced `App::update` / `step_ticks` loop) recording ran ahead of
+    /// the GPU without bound — Metal queues up to 4096 command buffers — and every queued frame
+    /// kept its staging chunks and command memory (gigabytes after a few thousand frames).
+    /// Returns whether it waited (the wait fired the map callbacks a poll would).
+    fn pace_frames(&mut self, submission: wgpu::SubmissionIndex) -> bool {
+        let slot = (self.frame_index % MAX_FRAMES_IN_FLIGHT as u64) as usize;
+        let oldest = self.in_flight[slot].replace(submission);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(oldest) = oldest {
+            // An error is a lost device (reported through the device-lost flag); a timeout is
+            // a GPU that stalled for seconds: the frame goes on either way.
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(oldest),
+                timeout: Some(std::time::Duration::from_secs(2)),
+            });
+            return true;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = oldest;
+        false
     }
 
     /// The presentation surface is gone (`SurfaceAcquire::Recreate`) after this frame's views

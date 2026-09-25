@@ -28,7 +28,7 @@ use crate::settings::FrameSettings;
 use crate::stats::RenderStats;
 use api::{AntiAliasing, BloomComposite, DISTORTION_FORMAT, DistortionResolution, FxaaQuality, PostProcess};
 use bloom::{BloomPlan, BloomState};
-use chain::GpuPost;
+use chain::{GpuPost, SeedKey};
 use fxaa::{FxaaModules, LDR_FORMAT};
 use space3d_core::{Entity, World};
 use std::borrow::Cow;
@@ -204,7 +204,10 @@ pub(crate) struct PostState {
     sampler: wgpu::Sampler,
     /// 1×1 black stand-in for inputs a group does not have (bloom, exposure = 0 EV, LUT, …).
     dummy: wgpu::TextureView,
-    params_bg: Option<(wgpu::BindGroup, u32)>,
+    /// The params bind group, with the params and seed buffers' generations it was made for.
+    params_bg: Option<(wgpu::BindGroup, u32, u64)>,
+    /// The post groups' per-frame seeds, a window of frames at a time.
+    seeds: SeedWindow,
     /// Input bind groups by (scene-texture generation, distortion-buffer generation or 0,
     /// bloom-chain generation or 0), with the frame they were last used.
     inputs_bgs: FastMap<(u64, u64, u64), (wgpu::BindGroup, u64)>,
@@ -250,6 +253,90 @@ fn clip_rect(rect: [i32; 4], size: (u32, u32)) -> [u32; 4] {
     [x, y, w, h]
 }
 
+/// Frames of post seeds uploaded at once.
+const SEED_WINDOW: u64 = 64;
+/// Bytes of one post group's seeds (`post_seeds` in composite.wgsl).
+const SEED_BYTES: u64 = 16;
+
+/// The per-frame seeds (graphics spec §4.3: animated grain, dither) of every post group for a
+/// window of [`SEED_WINDOW`] frames: slot `group × SEED_WINDOW + frame % SEED_WINDOW`, one
+/// aligned uniform each, bound with a dynamic offset. Written when a window starts, the frame
+/// leaves it, or the groups' [`SeedKey`]s change; a still scene uploads nothing in between. (It
+/// uploaded each group's 16 bytes every frame: a staging copy costing about 4 µs of CPU and
+/// 20–40 µs of GPU throughput in an otherwise idle frame.)
+struct SeedWindow {
+    align: u64,
+    buffer: Option<wgpu::Buffer>,
+    generation: u64,
+    /// First frame of the uploaded window.
+    start: Option<u64>,
+    /// The keys the window was written for, and this frame's (plan order).
+    keys: Vec<SeedKey>,
+    current: Vec<SeedKey>,
+    bytes: Vec<u8>,
+    /// Collections that grew (`RenderStats::cpu_reallocations` at `end_frame`).
+    reallocations: u32,
+}
+
+impl SeedWindow {
+    fn new(align: u64) -> Self {
+        Self {
+            align: align.max(SEED_BYTES),
+            buffer: None,
+            generation: 0,
+            start: None,
+            keys: Vec::new(),
+            current: Vec::new(),
+            bytes: Vec::new(),
+            reallocations: 0,
+        }
+    }
+
+    /// Upload the window starting at `frame` unless the uploaded one covers it for the same
+    /// keys.
+    fn flush(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, up: &mut Uploader, frame: u64) {
+        if self.current.is_empty() {
+            return;
+        }
+        let need = self.current.len() as u64 * SEED_WINDOW * self.align;
+        if self.buffer.as_ref().is_none_or(|b| b.size() < need) {
+            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("space3d post seeds"),
+                size: need,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.generation += 1;
+            self.start = None;
+            up.reallocations += 1;
+        }
+        let covered = self.start.is_some_and(|s| (s..s + SEED_WINDOW).contains(&frame));
+        if covered && self.keys == self.current {
+            return;
+        }
+        let capacities = (self.bytes.capacity(), self.keys.capacity());
+        self.bytes.clear();
+        self.bytes.resize(need as usize, 0);
+        for (g, key) in self.current.iter().enumerate() {
+            for f in frame..frame + SEED_WINDOW {
+                let at = self.offset(g, f) as usize;
+                self.bytes[at..at + SEED_BYTES as usize].copy_from_slice(bytemuck::cast_slice(&key.seeds(f)));
+            }
+        }
+        if let Some(buffer) = &self.buffer {
+            up.write(encoder, buffer, 0, &self.bytes);
+        }
+        self.keys.clone_from(&self.current);
+        self.start = Some(frame);
+        self.reallocations += u32::from((self.bytes.capacity(), self.keys.capacity()) != capacities);
+    }
+
+    /// Dynamic offset of post group `group`'s seeds at `frame`.
+    fn offset(&self, group: usize, frame: u64) -> u32 {
+        ((group as u64 * SEED_WINDOW + frame % SEED_WINDOW) * self.align) as u32
+    }
+}
+
 impl PostState {
     pub fn new(device: &wgpu::Device, caps: &GraphicsCaps) -> Self {
         let params_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -267,6 +354,7 @@ impl PostState {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                crate::pipeline::uniform_entry(2, wgpu::ShaderStages::FRAGMENT, true, SEED_BYTES),
             ],
         });
         let texture = |binding, filterable| wgpu::BindGroupLayoutEntry {
@@ -336,6 +424,7 @@ impl PostState {
             sampler,
             dummy,
             params_bg: None,
+            seeds: SeedWindow::new(align as u64),
             inputs_bgs: FastMap::default(),
             composite: FastMap::default(),
             fxaa_modules: FxaaModules::default(),
@@ -358,6 +447,7 @@ impl PostState {
         self.frame = frame.frame;
         self.planned = 0;
         self.params.begin();
+        self.seeds.current.clear();
         self.groups.clear();
         self.counted.clear();
         self.bloom.params.begin();
@@ -377,13 +467,15 @@ impl PostState {
         let capacity = self.groups.capacity();
         self.groups.push(GroupPost { bloom, fxaa });
         *reallocs += u32::from(self.groups.capacity() != capacity);
-        let params = GpuPost::new(group, self.frame, bloom.is_some(), fxaa.is_some());
-        // Two writes: only the per-frame seeds (the last 16 bytes) change in a still scene,
-        // and a write marks all of its bytes when any of them changed.
-        let bytes = bytemuck::bytes_of(&params);
-        let (at, split) = (self.planned * self.slot, std::mem::offset_of!(GpuPost, frame));
-        self.params.write_at(at, &bytes[..split], reallocs);
-        self.params.write_at(at + split, &bytes[split..], reallocs);
+        let params = GpuPost::new(group, bloom.is_some(), fxaa.is_some());
+        // Nothing in it changes per frame: a still scene uploads nothing.
+        self.params
+            .write_at(self.planned * self.slot, bytemuck::bytes_of(&params), reallocs);
+        let capacity = self.seeds.current.capacity();
+        self.seeds
+            .current
+            .push(SeedKey::of(params.flags[0], &group.settings.film_grain));
+        *reallocs += u32::from(self.seeds.current.capacity() != capacity);
         self.planned += 1;
         PostGroupNeeds {
             bloom: bloom.is_some(),
@@ -448,8 +540,17 @@ impl PostState {
         let mut reallocs = 0;
         self.params.ensure_len(std::mem::size_of::<GpuPost>(), &mut reallocs);
         self.params.flush(device, encoder, up);
+        self.seeds.flush(device, encoder, up, self.frame);
         let generation = self.params.gpu.generation;
-        if self.params_bg.as_ref().is_none_or(|(_, g)| *g != generation) {
+        let seeds_generation = self.seeds.generation;
+        let Some(seeds) = &self.seeds.buffer else {
+            return;
+        };
+        if self
+            .params_bg
+            .as_ref()
+            .is_none_or(|(_, g, sg)| *g != generation || *sg != seeds_generation)
+        {
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("space3d post params"),
                 layout: &self.params_bgl,
@@ -466,9 +567,17 @@ impl PostState {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: seeds,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(SEED_BYTES),
+                        }),
+                    },
                 ],
             });
-            self.params_bg = Some((bg, generation));
+            self.params_bg = Some((bg, generation, seeds_generation));
         }
         self.bloom.flush(device, encoder, up, &self.sampler);
     }
@@ -588,7 +697,7 @@ impl PostState {
         if let Some(q) = group.fxaa {
             self.fxaa_pipeline(cx.device, q, input.output_format, kind);
         }
-        let Some((params_bg, _)) = &self.params_bg else {
+        let Some((params_bg, _, _)) = &self.params_bg else {
             return;
         };
         let frame = self.frame;
@@ -628,7 +737,7 @@ impl PostState {
         } else {
             wgpu::LoadOp::Load
         };
-        let offset = (input.index * self.slot) as u32;
+        let offsets = [(input.index * self.slot) as u32, self.seeds.offset(input.index, frame)];
         let (composite_target, composite_load) = match &ldr {
             Some((view, _)) => (view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)),
             None => (input.output, output_load),
@@ -641,7 +750,7 @@ impl PostState {
             viewport: input.output_viewport,
             scissor: input.output_rect,
         };
-        pass.draw(cx, pipeline, params_bg, offset, &inputs.0);
+        pass.draw(cx, pipeline, params_bg, offsets, &inputs.0);
         let (Some(q), Some((view, generation))) = (group.fxaa, &ldr) else {
             return;
         };
@@ -669,7 +778,7 @@ impl PostState {
             viewport: input.output_viewport,
             scissor: input.output_rect,
         };
-        pass.draw(cx, pipeline, params_bg, offset, &fxaa_bg.0);
+        pass.draw(cx, pipeline, params_bg, offsets, &fxaa_bg.0);
     }
 
     /// Count a pooled texture's memory in `RenderStats::target_bytes` once per frame (post
@@ -686,6 +795,7 @@ impl PostState {
 
     pub fn end_frame(&mut self, stats: &mut RenderStats) {
         stats.textures_created += std::mem::take(&mut self.created);
+        stats.cpu_reallocations += std::mem::take(&mut self.seeds.reallocations);
         let frame = self.frame;
         self.distortion.retain(|_, t| t.last_used + 60 > frame);
         // Bind groups of scene textures no longer composited (replaced or freed).
@@ -721,14 +831,14 @@ struct FullscreenPass<'a> {
 }
 
 impl FullscreenPass<'_> {
-    /// Record the pass: one full-screen triangle with the group's parameters (`offset`) and
-    /// `inputs`.
+    /// Record the pass: one full-screen triangle with the group's parameters and seeds
+    /// (`offsets`) and `inputs`.
     fn draw(
         &self,
         cx: &mut PostEncode<'_>,
         pipeline: &wgpu::RenderPipeline,
         params: &wgpu::BindGroup,
-        offset: u32,
+        offsets: [u32; 2],
         inputs: &wgpu::BindGroup,
     ) {
         let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -749,7 +859,7 @@ impl FullscreenPass<'_> {
         let [sx, sy, sw, sh] = self.scissor;
         pass.set_scissor_rect(sx, sy, sw, sh);
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, params, &[offset]);
+        pass.set_bind_group(0, params, &offsets);
         pass.set_bind_group(1, inputs, &[]);
         pass.draw(0..3, 0..1);
         drop(pass);

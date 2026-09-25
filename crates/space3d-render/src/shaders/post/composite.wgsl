@@ -42,11 +42,15 @@ struct PostParams {
     gamma_lut: vec4<f32>,
     gain_lut: vec4<f32>,
     flags: vec4<u32>,           // x effect bits, y tonemapper id, z 1 = last pass (0: FXAA follows), w -
-    frame: vec4<u32>,           // pre-hashed seeds (s3d_pcg(seed)): x grain, y dither, z dither (second)
+    frame: vec4<u32>,           // reserved (0): the seeds are `post_seeds`
 }
 
 @group(0) @binding(0) var<uniform> post: PostParams;
 @group(0) @binding(1) var post_sampler: sampler;
+// This frame's pre-hashed seeds (s3d_pcg(seed)): x grain, y dither, z dither (second). A window
+// of frames is uploaded at once and the frame's slot bound with a dynamic offset (post/mod.rs
+// `SeedWindow`), so a still frame uploads nothing.
+@group(0) @binding(2) var<uniform> post_seeds: vec4<u32>;
 @group(1) @binding(0) var scene_tex: texture_2d<f32>;
 @group(1) @binding(1) var bloom_tex: texture_2d<f32>;
 @group(1) @binding(2) var exposure_tex: texture_2d<f32>;
@@ -134,7 +138,7 @@ fn post_grain(e: vec3<f32>, px: vec2<f32>) -> vec3<f32> {
     let i = vec2<u32>(floor(g));
     let f = fract(g);
     let u = f * f * (3.0 - 2.0 * f);
-    let seed = post.frame.x;
+    let seed = post_seeds.x;
     let a = post_hash01(i, seed);
     let b = post_hash01(i + vec2<u32>(1u, 0u), seed);
     let c = post_hash01(i + vec2<u32>(0u, 1u), seed);
@@ -163,7 +167,7 @@ fn post_finish(rgb_in: vec3<f32>, px_f: vec2<f32>) -> vec3<f32> {
     }
     if (dither) {
         let px = vec2<u32>(px_f);
-        e = e + vec3<f32>((post_hash01(px, post.frame.y) - post_hash01(px, post.frame.z)) / 255.0);
+        e = e + vec3<f32>((post_hash01(px, post_seeds.y) - post_hash01(px, post_seeds.z)) / 255.0);
     }
     e = clamp(e, vec3<f32>(0.0), vec3<f32>(1.0));
     if (S3D_POST_OUT == 1u) {

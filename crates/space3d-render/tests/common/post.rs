@@ -687,9 +687,9 @@ pub mod cases {
         advance_frame(&mut app);
         let f2 = render(&mut app);
         assert_ne!(f2, f1, "animated grain, next frame");
-        // A still scene with animated grain uploads the 16 per-frame bytes of the group's
-        // parameters (the seeds), nothing else (spec §4.4).
-        assert_eq!(stats(&app).bytes_uploaded, 16);
+        // A still scene with animated grain uploads nothing (spec §4.4): the seeds of 64 frames
+        // went up at once when the grain changed (it uploaded 16 bytes every frame).
+        assert_eq!(stats(&app).bytes_uploaded, 0);
         // Highlights: response 1 keeps white clean.
         let white = FilmGrain {
             luminance_response: 1.0,

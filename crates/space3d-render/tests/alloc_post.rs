@@ -2,7 +2,9 @@
 //! "Passes and wgpu allocations"): bloom on one post camera, on two split-screen post cameras
 //! sharing one pooled chain, and every PO1/PO3 effect (`PostProcess::cinematic()`). The renderer's own work allocates nothing (`cpu_reallocations == 0`,
 //! `textures_created == 0`); what remains is wgpu's bookkeeping, about 20 allocations per render
-//! pass on Metal. Each mode is pinned to its measured bound (+10 %) and must not grow over time.
+//! pass on Metal. Each mode is pinned to its measured bound (+10 %) and must not grow over time,
+//! at 320 × 180 (a 3-level bloom chain) and at 1920 × 1080 (the 6-level chain of 1080p and
+//! above).
 //!
 //! The only test in this binary: the counter is global.
 
@@ -57,6 +59,7 @@ fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
     let metal = match mode {
         "bloom" => MEASURED_BLOOM * 11 / 10,
         "cinematic" => MEASURED_CINEMATIC * 11 / 10,
+        "bloom 1080p" => MEASURED_BLOOM_1080P * 11 / 10,
         _ => MEASURED_SPLIT * 11 / 10,
     };
     if backend == wgpu::Backend::Metal {
@@ -76,6 +79,9 @@ const MEASURED_SPLIT: u64 = 380;
 /// `PostProcess::cinematic()` (bloom, FXAA, vignette, chromatic aberration, animated grain) on
 /// one camera: the FXAA pass on top of bloom.
 const MEASURED_CINEMATIC: u64 = 240;
+/// Bloom on one camera at 1920 × 1080: the chain every rect of 1080p or more gets, 6 levels
+/// (11 render passes).
+const MEASURED_BLOOM_1080P: u64 = 332;
 
 #[test]
 fn bloom_allocates_a_small_constant_amount() {
@@ -115,7 +121,7 @@ fn bloom_allocates_a_small_constant_amount() {
         counted
     };
     type Setup = fn(&mut App, Entity, Entity);
-    let modes: [(&str, Setup); 3] = [
+    let modes: [(&str, Setup); 4] = [
         ("bloom", |app, cam, _| {
             app.world.insert_one(cam, PostProcess::default()).unwrap();
         }),
@@ -134,6 +140,10 @@ fn bloom_allocates_a_small_constant_amount() {
             c.viewport = None;
             drop(c);
             app.world.insert_one(cam, PostProcess::cinematic()).unwrap();
+        }),
+        ("bloom 1080p", |app, cam, _| {
+            app.world.insert_one(cam, PostProcess::default()).unwrap();
+            app.resources.expect_mut::<Renderer>().resize(1920, 1080);
         }),
     ];
     let mut per_frame = Vec::with_capacity(FRAMES);
@@ -156,8 +166,12 @@ fn bloom_allocates_a_small_constant_amount() {
         );
         let groups = if name == "bloom split" { 2 } else { 1 };
         // Per group (a 320 × 180 or 160 × 180 rect): three levels (prefilter, 2 downsamples, 2
-        // upsamples), the composite (and FXAA).
-        let passes = if name == "cinematic" { 7 } else { 6 };
+        // upsamples), the composite (and FXAA); at 1080p six levels (11 bloom passes).
+        let passes = match name {
+            "cinematic" => 7,
+            "bloom 1080p" => 12,
+            _ => 6,
+        };
         assert_eq!(s.post_groups, groups, "{name}");
         assert_eq!(s.post_passes, groups * passes, "{name}");
 

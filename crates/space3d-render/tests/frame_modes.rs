@@ -592,7 +592,7 @@ fn resize_is_lazy() {
 }
 
 /// After warm-up no mode reallocates CPU scratch or creates textures, and a still scene
-/// uploads nothing (dither reseeding adds 16 bytes per post group when frames advance).
+/// uploads nothing (when frames advance, the dither seeds of 64 frames go up at once).
 #[test]
 fn steady_state_in_every_mode() {
     let Some(mut app) = headless_app(W, H) else { return };
