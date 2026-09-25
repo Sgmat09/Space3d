@@ -312,7 +312,7 @@ rayon (spawn_compute): argon2, checkpoint serialization, optional per-client pac
 1. Apply `ShardCmd` (`Create`, `Remove`, `Stop`).
 2. For each due room, run up to `max_catchup_ticks` rounds of `catch_unwind(app.update(step))`, one tick each, observing `tick_seconds` every round.
    - If the room is still behind, record `ticks_skipped` and set `next_at = now + step`.
-   - On panic, mark the room `Crashed`, increment `room_crashes`, and rebuild it from its last checkpoint (epoch + 1). After 3 crashes in 5 minutes, close it.
+   - On panic, mark the room `Crashed`, increment `room_crashes`, and rebuild it from its last checkpoint at the next epoch of its placement (`gs::room::rebuilt_epoch`: the low 16 bits count rebuilds, the high bits placements, so a stale copy's rebuilds never reach the epoch of a copy restored elsewhere from its checkpoint). After 3 crashes in 5 minutes, close it.
 3. Store the heartbeat.
 4. `select` on the command channel with a deadline of `min(next_at)`.
 
@@ -445,7 +445,7 @@ Entity     := varu32 net_id_delta (ascending; first absolute)
 Despawns   := varu32 n · n × varu32 (net_id_delta << 1 | out_of_scope)
 ```
 
-**Invariant:** an entity written for a client includes **every** component whose `changed_tick` is newer than that client's ack tick for the entity (datagram records too are written against the acked baseline, never an unacked one, so each record supersedes every older in-flight one). Loss and reordering are therefore harmless. `DEFERRED` marks a record whose changes the byte budget held back for at least one earlier snapshot (the client must not read the gap as rest; §9.4). Protocol version 2 added it. The client skips a record whose tick is at or below the entity's `last_applied_tick`. A client's own predicted entities are written in **every** snapshot with all their `Predict*` components, because reconciliation needs a confirmation even when nothing changed (for example when the server rejected a move).
+**Invariant:** an entity written for a client includes **every** component whose `changed_tick` is newer than that client's ack tick for the entity (datagram records too are written against the acked baseline, never an unacked one, so each record supersedes every older in-flight one). Presence follows the same rule: `removed_mask` covers every component the client may hold (the newest acked record's, plus whatever a record still in flight may have inserted), and every allowed component the client may lack (missing from the acked record or from one still in flight) is written, so a client that applied a record holds exactly its present set whichever in-flight records it applied before (`server::send::ClientEntity::{maybe_present, surely_present}`). Loss and reordering are therefore harmless. `DEFERRED` marks a record whose changes the byte budget held back for at least one earlier snapshot (the client must not read the gap as rest; §9.4). Protocol version 2 added it. The client skips a record whose tick is at or below the entity's `last_applied_tick`. A client's own predicted entities are written in **every** snapshot with all their `Predict*` components, because reconciliation needs a confirmation even when nothing changed (for example when the server rejected a move).
 
 **Example cost:** one moving player with the default `TransformCodec` (1 mm, 10-bit smallest-three, scale omitted) costs about 1 B id + 1 B op + 1 B mask + 1 B len + 12–14 B = **16–18 B**.
 
@@ -473,7 +473,7 @@ Run         := varu16 repeat · varu32 len · postcard(I)
 4. `ServerReplicationPlugin { config: game.room_net_config(spec, base) }`.
 5. `RoomPlugin`.
 6. `game.build_room(app, spec)` for server rules and level spawning.
-7. If restoring: `full_state::restore` plus server-only scene restore, with `room_epoch + 1`, and the tick continues from the checkpoint.
+7. If restoring: `full_state::restore` plus server-only scene restore, at the first epoch of the next placement (`gs::room::restored_epoch`), and the tick continues from the checkpoint.
 
 **One `app.update(step)` is exactly one fixed tick**, the same as `step_ticks(1)`. The room tick is `NetServer::tick()`, owned by the plugin, not `Time.tick`, so restored rooms continue their numbering.
 
@@ -802,7 +802,7 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
 | failure | detection | recovery |
 |---|---|---|
 | client network blip | close / idle 10 s | resume within 20 s: same slot, `FULL_RESET`, no pop-in |
-| room panic | `catch_unwind` (`--profile server`) | rebuild from the last checkpoint, epoch + 1, `Disconnect(RoomCrashed)` (clients rejoin); the rebuilt room continues the drain it was in (joinability, deadline, handoff, move notice, pending close: `gs::room::{take_for_rebuild, adopt_carried}`); crash-loop guard (3 in 5 min → close; `gs::shard::recover_crashed`, shared by the shards and `TestCluster`) |
+| room panic | `catch_unwind` (`--profile server`) | rebuild from the last checkpoint at the next epoch of its placement (`gs::room::rebuilt_epoch`), `Disconnect(RoomCrashed)` (clients rejoin); the rebuilt room continues the drain it was in (joinability, deadline, handoff, move notice, pending close: `gs::room::{take_for_rebuild, adopt_carried}`); crash-loop guard (3 in 5 min → close; `gs::shard::recover_crashed`, shared by the shards and `TestCluster`) |
 | shard stall | heartbeat older than 5 s → `/healthz` 503 | orchestrator restart → server-loss path |
 | GS crash or node loss | PS lease expiry (10 s) | rooms orphaned; clients' resume fails → `POST /v1/sessions/rejoin` → PS allocates a new GS of the room's build with `restore_from` checkpoint (no server with room: `503 no_capacity` with `retry_after_ms`). Clients stop resuming when the resume window (`Welcome::resume_window_s`) is over, not after the whole reconnect schedule; the example client asks the PS every 2 s while a reconnect keeps failing and follows the room to its new server, about `lease_ttl` + 2 s after the loss. A quick play into the mode of a lost persistent room restores it the same way. `RecoveryPolicy::Abandon` (reported in `RoomStatus::abandon_on_loss`): the PS voids the room (audit `match_void`, `space3d_matches_void_total`) and rejoin answers 404, so clients queue again |
 | PS unavailable | fleet link down | rooms keep running; outbox buffers; new logins and matchmaking unavailable; GS `/readyz` stays ready (registration latch; `space3d_fleet_connected` = 0) |

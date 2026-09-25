@@ -1148,8 +1148,16 @@ fn replay_ops(ops: &[Op], semantics: Semantics, lossy: bool, seed: u64) -> Resul
     }
 }
 
+/// 24 cases per run by default; `PROPTEST_CASES` raises it for soak runs.
+fn prop_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: prop_cases(), ..ProptestConfig::default() })]
 
     /// Any sequence of spawns, inserts, removes, reparenting, value changes and despawns ends
     /// with the client holding exactly the server's replicated state (byte-identical encodings,

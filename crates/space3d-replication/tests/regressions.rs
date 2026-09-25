@@ -1679,3 +1679,118 @@ fn a_late_despawn_ack_from_an_earlier_stay_never_confirms_a_later_despawn() {
         h.assert_converged(a)
     );
 }
+
+// ---- datagram component presence while records are in flight ---------------------------------
+
+/// A datagram client whose uplink (its acks) can be cut (`link(up_loss)`) and one entity,
+/// synced and acked: `(harness, client, entity, link)`.
+fn held_acks() -> (NetHarness, ClientHandle, Entity, impl Fn(f32) -> LinkProfile) {
+    let link = |up_loss: f32| LinkProfile {
+        up: LinkConditions {
+            latency: Duration::from_millis(30),
+            loss: up_loss,
+            ..LinkConditions::perfect()
+        },
+        down: LinkConditions {
+            latency: Duration::from_millis(30),
+            ..LinkConditions::perfect()
+        },
+    };
+    let mut h = with_rules(HarnessConfig {
+        seed: 11,
+        semantics: Semantics::Datagram,
+        link: link(0.0),
+        ..Default::default()
+    });
+    let a = observer(&mut h, "alice");
+    assert!(h.run_until(900, |h| h.client_net(a).is_connected()));
+    let e = h
+        .server_mut()
+        .world
+        .spawn((Replicated, Transform::from_xyz(1.0, 0.0, 0.0), Health(5)));
+    h.step_ticks(120);
+    assert!(h.client_entity(a, e).is_some());
+    (h, a, e, link)
+}
+
+/// Regression (found by `prop_random_world_edits_replicate_exactly`, saved seed): the removal
+/// mask of a datagram record only covered the components the client was *known* to have (the
+/// newest acked record). A component inserted and removed again while its insert record was
+/// still unacked was therefore not removed by the next record: the client applied the insert,
+/// then the next record, and kept the component. When the acks of both came back together, the
+/// server took the newer record's presence as the client's and never sent the removal: the
+/// component stayed on the client forever. Removals now cover every component a record still
+/// in flight may have delivered.
+#[test]
+fn a_component_removed_before_its_insert_is_acked_is_removed_on_the_client() {
+    let (mut h, a, e, link) = held_acks();
+    let ce = h.client_entity(a, e).unwrap();
+    // The client's acks are lost for a while: the insert arrives, its ack does not.
+    h.set_link(a, link(1.0));
+    h.server_mut().world.insert_one(e, Name("crate".into())).unwrap();
+    assert!(
+        h.run_until(30, |h| h.client(a).world.satisfies::<&Name>(ce)),
+        "insert delivered"
+    );
+    // Removed again while another component changes: the next record carries Health, and
+    // must also carry the removal although the insert is not acked yet.
+    h.server_mut().world.remove_one::<Name>(e).unwrap();
+    h.server_mut().world.get::<&mut Health>(e).unwrap().0 = 6;
+    assert!(
+        h.run_until(30, |h| h.client(a).world.get::<&Health>(ce).is_ok_and(|hp| hp.0 == 6)),
+        "change delivered"
+    );
+    // One ack packet then acknowledges both records.
+    h.set_link(a, link(0.0));
+    h.step_ticks(240);
+    assert!(
+        !h.client(a).world.satisfies::<&Name>(ce),
+        "the removed component stayed on the client"
+    );
+    assert!(
+        h.run_until(300, |h| h.assert_converged(a).is_ok()),
+        "{:?}",
+        h.assert_converged(a)
+    );
+}
+
+/// The insert side of the same regression: a component the client lost through a record
+/// still unacked (its audience excluded the client for a moment) was not written again when
+/// the audience came back, because the newest *acked* record said the client had it. Once the
+/// acks came back the server believed the client held it, and it never arrived.
+#[test]
+fn a_component_regained_before_its_removal_is_acked_is_resent() {
+    let (mut h, a, e, link) = held_acks();
+    let (alice, mallory) = (h.player(a), PlayerIdentity::dev("mallory").player);
+    let ce = h.client_entity(a, e).unwrap();
+    h.server_mut().world.insert(e, (Owner(alice), Ammo(7))).unwrap();
+    // Owner-only Ammo delivered and acked.
+    h.step_ticks(120);
+    assert_eq!(h.client(a).world.get::<&Ammo>(ce).map(|x| x.0).ok(), Some(7));
+    // Ownership moves away (the client drops Ammo; that ack is lost) and comes back while
+    // Health changes.
+    h.set_link(a, link(1.0));
+    h.server_mut().world.insert_one(e, Owner(mallory)).unwrap();
+    assert!(
+        h.run_until(30, |h| !h.client(a).world.satisfies::<&Ammo>(ce)),
+        "removal delivered"
+    );
+    h.server_mut().world.insert_one(e, Owner(alice)).unwrap();
+    h.server_mut().world.get::<&mut Health>(e).unwrap().0 = 6;
+    assert!(
+        h.run_until(30, |h| h.client(a).world.get::<&Health>(ce).is_ok_and(|hp| hp.0 == 6)),
+        "change delivered"
+    );
+    h.set_link(a, link(0.0));
+    h.step_ticks(240);
+    assert_eq!(
+        h.client(a).world.get::<&Ammo>(ce).map(|x| x.0).ok(),
+        Some(7),
+        "the regained component never came back"
+    );
+    assert!(
+        h.run_until(300, |h| h.assert_converged(a).is_ok()),
+        "{:?}",
+        h.assert_converged(a)
+    );
+}

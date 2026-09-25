@@ -25,6 +25,9 @@
 //! the entity is included (on datagram links too: records are written against the acked
 //! baseline, never against an unacked one, so a newer record supersedes every older one). Locally predicted entities are written to their controller in every
 //! snapshot with all `Predict*` components (reconciliation needs a confirmation each time).
+//! Presence follows the same rule: `removed_mask` covers every component the client may hold
+//! (acked, or delivered by a record still in flight), and every allowed component the client
+//! may lack is written, so after applying a record the client holds exactly its present set.
 
 use crate::NetId;
 use crate::wire::{DecodeError, Reader, Writer};

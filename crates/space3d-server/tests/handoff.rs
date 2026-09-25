@@ -460,7 +460,7 @@ fn a_moving_room_keeps_its_clients_until_the_player_service_acknowledged_the_mov
 }
 
 /// A tick of the room that panics (the shard's crash path: `catch_unwind` → rebuild from the
-/// in-memory checkpoint, epoch + 1). Returns whether the room is still alive.
+/// in-memory checkpoint at its next epoch). Returns whether the room is still alive.
 fn crash(r: &mut Room, guard: &mut CrashGuard, at: Duration) -> bool {
     r.app
         .add_system(Stage::Update, |_| panic!("handoff test: injected panic"));
@@ -548,4 +548,117 @@ fn a_crash_loop_delete_is_not_undone_by_an_earlier_incarnation_s_upload() {
         r.store.0.lock().stored.is_none(),
         "the crash-looping room's checkpoint came back"
     );
+}
+
+/// Regression: a room that panicked while closing restorable at shutdown (waiting for its
+/// final capture to be stored) was rebuilt with the pending close but without anything to
+/// wait for: its first tick closed it with `RoomClosed { restorable: true }` while its shutdown
+/// capture was never stored (the crashed incarnation's upload was still on its way, and is
+/// abandoned with it). A rejoin then restored an older checkpoint — everything since lost. The
+/// rebuilt room now stores its state (rebuilt from exactly that capture) before it reports
+/// itself restorable.
+#[test]
+fn a_crash_during_a_restorable_shutdown_close_stores_the_shutdown_capture_first() {
+    let mut r = Room::new();
+    for _ in 0..30 {
+        r.tick(17);
+    }
+    // An earlier checkpoint is stored.
+    r.commands.send(RoomCommand::Checkpoint).unwrap();
+    assert!(
+        r.tick_until(300, |r| r.store.stored().is_some()),
+        "early checkpoint stored"
+    );
+    let early = restored_health(&r.env, r.store.stored().unwrap());
+    for _ in 0..60 {
+        r.tick(17);
+    }
+    // Shutdown: the final capture is taken; its upload hangs.
+    r.store.set(Mode::Hold);
+    r.commands.send(RoomCommand::Shutdown).unwrap();
+    r.tick(17);
+    let at_shutdown = r.health();
+    assert!(at_shutdown > early);
+    assert!(
+        r.tick_until(60, |r| r.store.held() == 1),
+        "the shutdown capture is uploading"
+    );
+    for _ in 0..5 {
+        r.tick(17);
+    }
+    assert!(!r.closed(), "waiting for the shutdown capture");
+    // The room panics meanwhile and is rebuilt from that capture.
+    let mut guard = CrashGuard::default();
+    assert!(crash(&mut r, &mut guard, Duration::from_secs(1)), "rebuilt");
+    r.store.set(Mode::Up);
+    assert!(r.tick_until(600, |r| r.closed()), "the rebuilt room closes");
+    assert!(r.reported_restorable());
+    let cp = r.store.stored().expect("stored");
+    assert_eq!(
+        restored_health(&r.env, cp),
+        at_shutdown,
+        "reported restorable with an older checkpoint stored (the shutdown capture was lost)"
+    );
+}
+
+/// The same gap without a crash: a shutdown whose final upload failed (the store briefly
+/// unreachable) had nothing left to wait for and closed at once as restorable, with an older
+/// checkpoint stored. The final capture is now retried (within the shutdown wait; after it,
+/// it goes to the local rescue store).
+#[test]
+fn a_failed_final_upload_at_shutdown_is_retried_before_the_room_reports_itself_restorable() {
+    let mut r = Room::new();
+    for _ in 0..30 {
+        r.tick(17);
+    }
+    r.commands.send(RoomCommand::Checkpoint).unwrap();
+    assert!(
+        r.tick_until(300, |r| r.store.stored().is_some()),
+        "early checkpoint stored"
+    );
+    for _ in 0..60 {
+        r.tick(17);
+    }
+    r.store.set(Mode::Down);
+    r.commands.send(RoomCommand::Shutdown).unwrap();
+    r.tick(17);
+    let at_shutdown = r.health();
+    assert!(
+        !r.tick_until(120, |r| r.closed()),
+        "closed restorable while its final capture was not stored"
+    );
+    assert!(!r.reported_restorable());
+    r.store.set(Mode::Up);
+    assert!(
+        r.tick_until(300, |r| r.closed()),
+        "closes once the final capture is stored"
+    );
+    assert!(r.reported_restorable());
+    assert_eq!(restored_health(&r.env, r.store.stored().unwrap()), at_shutdown);
+}
+
+/// A room frozen for its drain handoff that also got `Shutdown` and then crashed keeps
+/// handing off exactly its freeze capture: the rebuilt room's restorable close does not take
+/// (and store) a capture of its own over it.
+#[test]
+fn a_crash_while_frozen_and_shutting_down_still_stores_exactly_the_freeze_capture() {
+    let mut r = Room::new();
+    for _ in 0..30 {
+        r.tick(17);
+    }
+    r.store.set(Mode::Down);
+    let frozen_at = r.drain_and_freeze();
+    r.commands.send(RoomCommand::Shutdown).unwrap();
+    r.tick(17);
+    let mut guard = CrashGuard::default();
+    assert!(crash(&mut r, &mut guard, Duration::from_secs(1)), "rebuilt");
+    r.store.set(Mode::Up);
+    assert!(
+        r.tick_until(600, |r| r.closed()),
+        "the rebuilt room finishes the handoff"
+    );
+    assert!(r.reported_restorable());
+    let cp = r.store.stored().expect("freeze capture stored");
+    assert_eq!(cp.epoch, 1, "a capture of the rebuilt room replaced the freeze capture");
+    assert_eq!(restored_health(&r.env, cp), frozen_at, "exactly the freeze capture");
 }

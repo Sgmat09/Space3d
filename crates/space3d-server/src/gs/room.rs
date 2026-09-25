@@ -4,7 +4,8 @@
 //! resources (`NetInbox`, `SecretSource` (getrandom), `NetClockHandle`, `Metrics`,
 //! [`RoomContext`], [`RoomControl`]) → `game.protocol(app)` → `ServerReplicationPlugin`
 //! (config from `game.room_net_config`) → [`RoomPlugin`] → `game.build_room(app, spec)` →
-//! `full_state::restore` + server-only restore if a checkpoint is given (epoch + 1).
+//! `full_state::restore` + server-only restore if a checkpoint is given (a new placement's
+//! epoch, [`restored_epoch`]; a crash rebuild continues its placement, [`rebuilt_epoch`]).
 //!
 //! `RoomPlugin` systems: PreUpdate `room::commands` (apply [`RoomCommand`]s: kick, broadcast,
 //! close, drain, shutdown, checkpoint, joinable, inspect, player data); Last `room::ops`
@@ -52,9 +53,41 @@ pub struct RoomBuild {
     pub restore: Option<Checkpoint>,
     /// Creation time (unix ms).
     pub created_ms: i64,
-    /// Forced room epoch (a crash rebuild without a checkpoint bumps it so old resume tokens
-    /// die); a restore uses `checkpoint epoch + 1`.
+    /// Forced room epoch: a crash rebuild continues its placement ([`rebuilt_epoch`] of the
+    /// crashed incarnation's epoch, so old resume tokens die). Otherwise a restore starts a new
+    /// placement ([`restored_epoch`] of the checkpoint's epoch) and a fresh room uses the
+    /// replication config's epoch.
     pub epoch: Option<u32>,
+}
+
+/// Low bits of a room epoch that count crash rebuilds within one placement of the room; the
+/// high bits count placements (see [`restored_epoch`]).
+pub const EPOCH_REBUILD_BITS: u32 = 16;
+
+/// Epoch of a room restored from a checkpoint captured at `checkpoint_epoch`: the first epoch
+/// of the next placement. A restore puts the room on a server while the copy the checkpoint
+/// came from may still run behind a fleet partition (a stale copy); crash rebuilds of that
+/// copy only count up within its own placement ([`rebuilt_epoch`]), so the restored copy's
+/// epoch stays above every epoch the stale copy can reach: the stores keep the restored copy's
+/// checkpoints over the stale copy's, and the stale copy's epoch-fenced delete
+/// (`CheckpointStore::delete(room, through_epoch)`) never removes them. (With one counter for
+/// both, a stale copy rebuilt after a crash took exactly the live copy's epoch.)
+pub fn restored_epoch(checkpoint_epoch: u32) -> u32 {
+    let placement = checkpoint_epoch >> EPOCH_REBUILD_BITS;
+    if placement >= u32::MAX >> EPOCH_REBUILD_BITS {
+        // 65 535 placements used up: keep counting (degenerate).
+        return checkpoint_epoch.saturating_add(1);
+    }
+    (placement + 1) << EPOCH_REBUILD_BITS
+}
+
+/// Epoch of a room rebuilt after a crash at `epoch` (on the same server, from its in-memory
+/// checkpoint): the next epoch of the same placement. Once a placement's rebuild range is used
+/// up the epoch stays (a room's own checkpoints of one epoch are still ordered by capture
+/// time); it never spills into the next placement.
+pub fn rebuilt_epoch(epoch: u32) -> u32 {
+    let mask = (1u32 << EPOCH_REBUILD_BITS) - 1;
+    if epoch & mask == mask { epoch } else { epoch + 1 }
 }
 
 /// Build a room `App` (call on the thread that will run it). Game code runs here, so callers
@@ -94,11 +127,11 @@ pub fn build_room_app(build: RoomBuild) -> Result<App, RoomError> {
     if spec.max_players > 0 {
         net.max_clients = spec.max_players;
     }
-    let room_epoch = restore
-        .as_ref()
-        .map(|cp| cp.state.epoch.wrapping_add(1))
-        .or(epoch)
-        .unwrap_or(net.room_epoch);
+    let room_epoch = match (epoch, &restore) {
+        (Some(forced), _) => forced,
+        (None, Some(cp)) => restored_epoch(cp.state.epoch),
+        (None, None) => net.room_epoch,
+    };
     net.room_epoch = room_epoch;
     app.add_plugin(ServerReplicationPlugin { config: net });
     app.insert_resource(RoomRuntime::new(
@@ -113,6 +146,9 @@ pub fn build_room_app(build: RoomBuild) -> Result<App, RoomError> {
     env.game.build_room(&mut app, &spec);
     if let Some(cp) = &restore {
         full_state::restore(&mut app, &cp.state).map_err(|e| RoomError::Build(format!("restore: {e}")))?;
+        // `full_state::restore` continues at the checkpoint's epoch + 1; this room's epoch
+        // follows the placement rules above.
+        app.resources.expect_mut::<NetServer>().config_mut().room_epoch = room_epoch;
         if let (Some(json), Some(registry)) = (&cp.server_only, env.game.checkpoint_registry()) {
             space3d_scene::Scene::from_json(json)
                 .and_then(|scene| scene.spawn_into(&mut app.world, &registry))
@@ -542,8 +578,8 @@ impl Carried {
 
 /// A crashed room's parts for its rebuild: the command receiver, its latest in-memory
 /// checkpoint and what the rebuilt room carries over ([`Carried`]). Removes the `RoomRuntime`.
-/// A queued upload is abandoned (the rebuilt room, epoch + 1, uploads its own; stores refuse
-/// older epochs anyway).
+/// A queued upload is abandoned (the rebuilt room, at the next epoch, uploads its own; stores
+/// refuse older epochs anyway).
 pub fn take_for_rebuild(
     app: &mut App,
 ) -> Option<(crossbeam_channel::Receiver<RoomCommand>, Option<Checkpoint>, Carried)> {
@@ -595,7 +631,6 @@ pub fn adopt_carried(app: &mut App, carried: Carried) {
     if matches!(phase, RoomPhase::Running | RoomPhase::Ending) {
         rt.phase = phase;
     }
-    rt.closing = closing;
     rt.uploaded_ms = uploaded_ms;
     rt.move_notice = move_notice;
     rt.handoff = match handoff {
@@ -603,6 +638,19 @@ pub fn adopt_carried(app: &mut App, carried: Carried) {
         Handoff::Frozen { .. } => {
             rt.move_notice = MoveNotice::Done;
             Handoff::Freeze
+        }
+        other => other,
+    };
+    rt.closing = match closing {
+        // Closing restorable at shutdown: the crashed incarnation's final capture may not be
+        // stored (its upload in flight is abandoned with it), and the rebuilt room has nothing
+        // of its own on the way. It stores its state — rebuilt from exactly that capture — and
+        // only then reports itself restorable (with a full wait for the upload). A room frozen
+        // for its handoff takes no capture (`request_checkpoint`): it stores exactly its
+        // freeze capture, as above.
+        Some(Closing::Shutdown { .. }) => {
+            rt.request_checkpoint();
+            Some(Closing::Shutdown { waited: 0 })
         }
         other => other,
     };
@@ -645,8 +693,9 @@ pub struct RoomRuntime {
     /// Uploads that earlier incarnations of this room (replaced by crash rebuilds) had in
     /// flight: deleting the stored checkpoint waits for them too.
     earlier_uploads: Vec<Upload>,
-    /// Ticks until a failed handoff upload is retried.
-    handoff_retry_in: u32,
+    /// Ticks until a failed upload the room waits for (its freeze capture, or its final
+    /// capture while closing restorable at shutdown) is retried.
+    upload_retry_in: u32,
     resumed: EventReader,
     bans_seen: u64,
     ticks_since_checkpoint: u32,
@@ -697,7 +746,7 @@ impl RoomRuntime {
             move_notice: MoveNotice::None,
             move_ack_wait_ticks: ticks(MOVE_ACK_WAIT),
             earlier_uploads: Vec::new(),
-            handoff_retry_in: 0,
+            upload_retry_in: 0,
             resumed: EventReader::default(),
             bans_seen: u64::MAX,
             ticks_since_checkpoint: 0,
@@ -768,6 +817,14 @@ impl RoomRuntime {
             Handoff::Freeze => true,
             Handoff::Frozen { capture } => capture.is_none_or(|at| self.uploaded_ms.is_none_or(|saved| saved < at)),
         }
+    }
+
+    /// Whether the room's newest capture is confirmed stored (a room with no capture has
+    /// nothing stored of its own).
+    fn final_capture_stored(&self) -> bool {
+        self.last_checkpoint
+            .as_ref()
+            .is_some_and(|cp| self.uploaded_ms.is_some_and(|saved| saved >= cp.saved_ms))
     }
 
     /// The freeze capture of a room frozen for a handoff (once taken).
@@ -847,9 +904,12 @@ impl RoomRuntime {
         let saved = self.uploading_ms.take();
         if ok {
             self.uploaded_ms = self.uploaded_ms.max(saved);
-        } else if self.handoff_pending() && self.queued_upload.is_none() {
-            // The handoff needs its freeze capture stored: upload it again in a second.
-            self.handoff_retry_in = self.ticks_per_second;
+        } else if (self.handoff_pending() || matches!(self.closing, Some(Closing::Shutdown { .. })))
+            && self.queued_upload.is_none()
+        {
+            // The handoff needs its freeze capture stored, a restorable close its final
+            // capture: upload it again in a second.
+            self.upload_retry_in = self.ticks_per_second;
         }
         self.upload = None;
         if let Some(next) = self.queued_upload.take() {
@@ -1049,8 +1109,8 @@ fn room_ops(ctx: &mut SystemCtx) {
             // Retry the freeze capture itself (a new capture would miss the players' pawns
             // once the game handled their departure) — for as long as the process runs: the
             // room is not reported restorable before that capture is stored.
-            rt.handoff_retry_in = rt.handoff_retry_in.saturating_sub(1);
-            if rt.handoff_retry_in == 0 {
+            rt.upload_retry_in = rt.upload_retry_in.saturating_sub(1);
+            if rt.upload_retry_in == 0 {
                 match rt.freeze_capture() {
                     Some(cp) => rt.start_upload(cp),
                     // The freeze capture itself failed: take it again.
@@ -1277,10 +1337,24 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
             return;
         }
         Closing::Shutdown { waited } => {
-            let busy = rt.want_checkpoint || rt.uploading();
+            let unstored = rt.env.checkpoints.enabled() && !rt.final_capture_stored();
+            let busy = rt.want_checkpoint || rt.uploading() || unstored;
             // The clients go once the player service holds their rejoins (bounded by
             // `MOVE_ACK_WAIT`), and the final capture is stored (bounded).
             if (busy && waited < SHUTDOWN_UPLOAD_WAIT_S * rt.ticks_per_second) || rt.awaiting_move_ack() {
+                if unstored && !rt.want_checkpoint && !rt.uploading() {
+                    // Its upload failed: try again every second (a room reports itself
+                    // restorable once its final state is stored; after the wait, the capture
+                    // goes to the local rescue store below).
+                    rt.upload_retry_in = rt.upload_retry_in.saturating_sub(1);
+                    if rt.upload_retry_in == 0 {
+                        rt.upload_retry_in = rt.ticks_per_second;
+                        match rt.last_checkpoint.clone() {
+                            Some(cp) => rt.start_upload(cp),
+                            None => rt.request_checkpoint(),
+                        }
+                    }
+                }
                 rt.closing = Some(Closing::Shutdown { waited: waited + 1 });
                 return;
             }
@@ -1430,5 +1504,33 @@ pub fn notice_level(s: &str) -> NoticeLevel {
         NoticeLevel::Warn
     } else {
         NoticeLevel::Info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restores_start_placements_that_rebuilds_never_reach() {
+        let placement = 1u32 << EPOCH_REBUILD_BITS;
+        // A fresh room (epoch 1) restored elsewhere; the copy left behind keeps crashing.
+        let live = restored_epoch(1);
+        assert_eq!(live, placement);
+        let mut stale = 1;
+        for _ in 0..10_000 {
+            stale = rebuilt_epoch(stale);
+        }
+        assert!(stale < live);
+        // Rebuilds of the restored copy stay above anything restored before, below the next
+        // placement.
+        assert_eq!(rebuilt_epoch(live), live + 1);
+        assert_eq!(restored_epoch(live + 7), 2 * placement);
+        // A placement's rebuild range saturates instead of spilling into the next placement.
+        let last = 2 * placement - 1;
+        assert_eq!(rebuilt_epoch(last), last);
+        assert!(restored_epoch(last) > last);
+        // The last placement degenerates to counting.
+        assert_eq!(restored_epoch(u32::MAX - 3), u32::MAX - 2);
     }
 }

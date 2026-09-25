@@ -7,7 +7,7 @@
 //!   for each due room: up to max_catchup_ticks × { catch_unwind(app.update(step)); observe tick time }
 //!                      still behind → skip (ticks_skipped), next_at = now + step
 //!                      panic → phase Crashed, room_crashes += 1, rebuild from last checkpoint
-//!                              (epoch + 1; ≤ 3 crashes / 5 min, then Close)
+//!                              (next epoch; ≤ 3 crashes / 5 min, then Close)
 //!   heartbeat (HealthState shard slot)
 //!   park until min(next_at) or a command (crossbeam select with deadline)
 //! }
@@ -99,7 +99,7 @@ impl CrashGuard {
 }
 
 /// A room's tick panicked: count it, then rebuild the room from its latest in-memory
-/// checkpoint (epoch + 1, [`rebuild_crashed`]) — unless it is crash-looping, in which case its
+/// checkpoint (next epoch of its placement, [`rebuild_crashed`]) — unless it is crash-looping, in which case its
 /// clients get `Disconnect(RoomCrashed)` and the room closes (`RoomClosed` to the fleet).
 /// Returns `false` when the room is gone.
 #[allow(clippy::too_many_arguments)]
@@ -311,7 +311,8 @@ fn epoch_of(app: &App) -> u32 {
 
 /// Rebuild a room whose tick panicked, in place: disconnect its clients (`RoomCrashed`, no
 /// resume: they rejoin through the player service), then build a fresh `App` from the room's
-/// latest **in-memory** checkpoint with `epoch + 1`, reusing its inbox and command channel.
+/// latest **in-memory** checkpoint at the next epoch of its placement
+/// ([`super::room::rebuilt_epoch`]), reusing its inbox and command channel.
 /// Shared by the shard threads and `TestCluster`. `Err` = the room must be closed (the reason).
 pub fn rebuild_crashed(
     app: &mut App,
@@ -342,7 +343,7 @@ pub fn rebuild_crashed(
         status: status.clone(),
         restore: last,
         created_ms,
-        epoch: Some(epoch.wrapping_add(1)),
+        epoch: Some(super::room::rebuilt_epoch(epoch)),
     };
     match catch_unwind(AssertUnwindSafe(|| build_room_app(build))) {
         Ok(Ok(fresh)) => {
@@ -410,7 +411,7 @@ fn host(build: RoomBuild) -> Option<Hosted> {
 }
 
 impl Hosted {
-    /// A tick panicked: rebuild from the last in-memory checkpoint (epoch + 1) unless the room
+    /// A tick panicked: rebuild from the last in-memory checkpoint (next epoch) unless the room
     /// is crash-looping. Returns `false` when the room is gone.
     fn recover(&mut self, why: &str) -> bool {
         let alive = recover_crashed(

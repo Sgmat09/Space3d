@@ -269,6 +269,10 @@ fn a_draining_game_server_hands_its_persistent_room_to_another_over_real_process
 /// good. Now the moving room refuses such a ticket as transient (`ServerDraining` with a retry
 /// delay) and the player service holds a quick play into a moving world until it has moved:
 /// bots that start while the world moves end up in it with the others.
+///
+/// (Test fix: the one-world check used to list the rooms after the bots had left on their own,
+/// when the world reported 0 players, so it failed most runs; it now checks the room list seen
+/// at the moment all four bots were in the moved world.)
 #[test]
 fn players_who_quick_play_during_a_handoff_join_the_moved_room_over_real_processes() {
     let mut split = Split::start(&[]);
@@ -290,17 +294,24 @@ fn players_who_quick_play_during_a_handoff_join_the_moved_room_over_real_process
         "drained game server exit {status}:\n{}",
         split.game_servers[host].proc.output()
     );
-    wait_for("the world restored with all four bots", Duration::from_secs(15), || {
-        rooms(split.game_servers[other].admin)
-            .contains(&(room.clone(), 4))
-            .then_some(())
+    // Observed while the bots are in it (they leave on their own a few seconds later): the
+    // game server's whole room list at the moment all four are in the moved world.
+    let listed = wait_for("the world restored with all four bots", Duration::from_secs(15), || {
+        let listed = rooms(split.game_servers[other].admin);
+        listed.contains(&(room.clone(), 4)).then_some(listed)
     });
-    assert_bots_play_on(&mut bots, 4);
     assert_eq!(
-        rooms(split.game_servers[other].admin),
-        vec![(room, 4)],
+        listed,
+        vec![(room.clone(), 4)],
         "one world, not a second copy next to it"
     );
+    assert_bots_play_on(&mut bots, 4);
+    // Still that one world once they left (by id: its player count drops as they go).
+    let ids: Vec<String> = rooms(split.game_servers[other].admin)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, vec![room], "one world after the bots left");
     split.stop(&[other]);
     split.assert_no_errors();
 }

@@ -1427,3 +1427,111 @@ fn a_stale_copy_closing_during_a_partition_keeps_the_live_copy_s_checkpoint() {
         "the live copy's checkpoint survives the stale copy's close"
     );
 }
+
+/// Regression (split brain, follow-up to the stale-copy delete): the epoch fences assume every
+/// copy of a room has an epoch of its own, but a crash rebuild bumped the epoch by one just as
+/// a restore does. A stale copy at epoch e (behind a fleet partition) that crashed was rebuilt
+/// at e + 1 — the epoch of the live copy restored elsewhere from its last stored checkpoint
+/// (epoch e). Its checkpoints then replaced the live copy's (same epoch, later capture), and
+/// its normal close deleted the live copy's checkpoint (`through_epoch` = e + 1). A restore now
+/// starts a new placement of the room (epoch generation) that crash rebuilds of an earlier one
+/// never reach.
+#[test]
+fn a_stale_copy_rebuilt_after_a_crash_never_takes_the_live_copy_s_epoch() {
+    use space3d_replication::server::NetServer;
+    use space3d_server::gs::rooms::RoomCommand;
+    let stored = |c: &TestCluster, room: RoomId| {
+        c.player_service()
+            .store
+            .get_checkpoint(room)
+            .block()
+            .unwrap()
+            .unwrap()
+            .map(|(_, bytes)| Checkpoint::from_bytes(&bytes).unwrap())
+    };
+    let stored_epoch = |c: &TestCluster, room: RoomId| stored(c, room).map(|cp| cp.epoch);
+    // The stale copy's state: a pawn at health 55 (the live copy never saw it).
+    let holds_55 = |cp: &Checkpoint| {
+        let v = postcard::to_stdvec(&55u16).unwrap();
+        cp.state
+            .entities
+            .iter()
+            .any(|(_, comps)| comps.iter().any(|(name, bytes)| name == "duel.health" && *bytes == v))
+    };
+    let mut c = cluster(2);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let (ca, cb, room) = connected_pair(&mut c, &alice, &bob);
+    let stale = c.room_server(room).unwrap().to_owned();
+    assert!(
+        c.run_until(600, |c| stored_epoch(c, room).is_some()),
+        "checkpoint stored"
+    );
+    let stale_epoch = stored_epoch(&c, room).unwrap();
+
+    c.set_fleet_outage(&stale, true);
+    let lease = c.player_service().config.fleet.lease_ttl;
+    let dead = c.run_until((lease.as_secs_f64() * 60.0) as u64 + 180, |c| {
+        c.player_service()
+            .fleet
+            .lock()
+            .server(&stale)
+            .is_none_or(|s| s.state == ServerState::Dead)
+    });
+    assert!(dead, "lease expired");
+    let moved = c.rejoin(&bob).unwrap().expect("restorable");
+    assert_ne!(moved.server_id, stale);
+    c.reconnect(cb, &moved);
+    assert!(c.run_until(600, |c| c.client_net(cb).is_connected()));
+    let live = run_until_bg(&mut c, 900, |c| stored_epoch(c, room).is_some_and(|e| e > stale_epoch));
+    assert!(live, "the live copy stored its own checkpoint");
+    let live_epoch = stored_epoch(&c, room).unwrap();
+
+    // Alice plays on in the stale copy, which captures that state, then crashes and is rebuilt
+    // from it (still partitioned).
+    send(&mut c, ca, &SetHealth(55));
+    assert!(c.run_until(120, |c| {
+        c.room_on(&stale, room)
+            .is_some_and(|app| pawn_health(app, player(&alice)) == Some(55))
+    }));
+    let stale_room = c.game_server(&stale).unwrap().rooms.get(room).expect("stale copy");
+    stale_room.command(RoomCommand::Checkpoint).unwrap();
+    c.step_ticks(2);
+    c.crash_room_on(&stale, room);
+    assert!(c.run_until(60, |c| c.room_crashes() == 1), "the stale copy crashed");
+    let rebuilt_epoch = c
+        .room_on(&stale, room)
+        .expect("the stale copy was rebuilt")
+        .resources
+        .expect::<NetServer>()
+        .config()
+        .room_epoch;
+    assert!(
+        rebuilt_epoch > stale_epoch && rebuilt_epoch < live_epoch,
+        "rebuilt stale copy at epoch {rebuilt_epoch}: between its own ({stale_epoch}) and the live copy's ({live_epoch})"
+    );
+    // Its checkpoints never replace the live copy's.
+    stale_room.command(RoomCommand::Checkpoint).unwrap();
+    c.step_ticks(2);
+    let _ = c.settle(Duration::from_millis(500), |_| false);
+    let cp = stored(&c, room).expect("stored");
+    assert!(
+        cp.epoch >= live_epoch && !holds_55(&cp),
+        "the stale copy's checkpoint (epoch {}) replaced the live copy's",
+        cp.epoch
+    );
+    // Its normal close keeps the live copy's checkpoint.
+    stale_room
+        .command(RoomCommand::Close {
+            reason: "match over".into(),
+        })
+        .unwrap();
+    assert!(c.run_until(120, |c| !c.rooms_of(&stale).contains(&room)));
+    let _ = c.settle(Duration::from_millis(500), |_| false);
+    let cp = stored(&c, room);
+    assert!(
+        cp.as_ref().is_some_and(|cp| cp.epoch >= live_epoch && !holds_55(cp)),
+        "the live copy's checkpoint survives the rebuilt stale copy's close: {:?}",
+        cp.map(|cp| cp.key())
+    );
+}

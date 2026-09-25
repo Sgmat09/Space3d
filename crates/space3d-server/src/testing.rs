@@ -644,6 +644,21 @@ impl TestCluster {
             .map(|r| &mut r.app)
     }
 
+    /// The copy of a room on game server `server_id` (after a partition, a room can have a
+    /// stale copy on one server and the live one on another).
+    pub fn room_on(&self, server_id: &str, id: RoomId) -> Option<&App> {
+        self.node(server_id).rooms.get(&id).map(|r| &r.app)
+    }
+
+    /// [`Self::room_on`], mutable.
+    pub fn room_on_mut(&mut self, server_id: &str, id: RoomId) -> Option<&mut App> {
+        self.nodes
+            .iter_mut()
+            .find(|n| n.id == server_id)
+            .and_then(|n| n.rooms.get_mut(&id))
+            .map(|r| &mut r.app)
+    }
+
     /// Id of the live game server hosting a room.
     pub fn room_server(&self, id: RoomId) -> Option<&str> {
         self.live().find(|n| n.rooms.contains_key(&id)).map(|n| n.id.as_str())
@@ -660,9 +675,19 @@ impl TestCluster {
     }
 
     /// Make a room's next tick panic (exercises `catch_unwind` + rebuild from the room's
-    /// in-memory checkpoint with epoch + 1; clients are disconnected and rejoin).
+    /// in-memory checkpoint at its next epoch; clients are disconnected and rejoin).
     pub fn crash_room(&mut self, id: RoomId) {
         let app = self.room_mut(id).unwrap_or_else(|| panic!("no room {id}"));
+        app.add_system_named(Stage::Update, "test::crash_room", |_| {
+            panic!("TestCluster::crash_room: injected panic")
+        });
+    }
+
+    /// [`Self::crash_room`] for the copy of a room on game server `server_id`.
+    pub fn crash_room_on(&mut self, server_id: &str, id: RoomId) {
+        let app = self
+            .room_on_mut(server_id, id)
+            .unwrap_or_else(|| panic!("no room {id} on {server_id}"));
         app.add_system_named(Stage::Update, "test::crash_room", |_| {
             panic!("TestCluster::crash_room: injected panic")
         });

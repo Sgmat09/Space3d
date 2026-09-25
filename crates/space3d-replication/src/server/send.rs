@@ -22,6 +22,7 @@ use crate::stats::RoomNetStats;
 use crate::transport::{Lane, LinkTx};
 use crate::wire::Writer;
 use crate::{FastMap, NetClientId, NetId, PlayerId, Tick};
+use smallvec::SmallVec;
 use space3d_core::glam::Vec3;
 use space3d_core::{SystemCtx, World};
 use std::sync::Arc;
@@ -49,6 +50,11 @@ pub struct ClientEntity {
     pub known_present: u64,
     /// Tick of the record that set `known_present`.
     pub known_tick: Tick,
+    /// Datagram: presence written in records newer than `known_tick` (still in flight, or
+    /// presumed lost but maybe only late), as runs in send order. The client may apply any of
+    /// them before the next record, so removals cover their union and re-inserts their
+    /// intersection (see [`Self::maybe_present`] and [`Self::surely_present`]).
+    pub in_flight: SmallVec<[PresenceRun; PRESENCE_RUNS]>,
     /// Consecutive snapshots in which the entity had due changes that the budget deferred.
     pub misses: u16,
     /// Controlled entity: snapshots since its unchanged predicted components were last
@@ -60,6 +66,21 @@ pub struct ClientEntity {
     pub scope: u32,
 }
 
+/// Presence written in one or more consecutive datagram records of an entity
+/// ([`ClientEntity::in_flight`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresenceRun {
+    /// Newest record tick in the run (the run is dropped once a record this new is acked).
+    pub tick: Tick,
+    /// Components present in any of its records.
+    pub any: u64,
+    /// Components present in all of its records.
+    pub all: u64,
+}
+
+/// Runs kept per entity (inline, no allocation); older ones are merged beyond this.
+const PRESENCE_RUNS: usize = 3;
+
 impl ClientEntity {
     /// Datagram ack of a record written at `tick` against `baseline`. Records are written
     /// against the acked baseline (every change after `ack_tick`), so a record acked while
@@ -67,6 +88,57 @@ impl ClientEntity {
     pub(crate) fn on_record_acked(&mut self, baseline: Tick, tick: Tick) {
         if tick > self.ack_tick && baseline <= self.ack_tick {
             self.ack_tick = tick;
+        }
+    }
+
+    /// Components the client may hold: the acked presence, plus whatever a record newer than
+    /// the ack may have delivered. A record's removal mask must cover all of them: the client
+    /// can apply such a record (inserting a component the server removed since) right before
+    /// the one being written, and after both acks the server would otherwise believe the
+    /// client matches it.
+    pub fn maybe_present(&self) -> u64 {
+        self.in_flight.iter().fold(self.known_present, |m, r| m | r.any)
+    }
+
+    /// Components the client certainly holds, whichever records newer than the ack it applied
+    /// first: a component missing from one of them (it left the client's audience for a
+    /// while) must be written again even though the ack says the client has it.
+    pub fn surely_present(&self) -> u64 {
+        self.in_flight.iter().fold(self.known_present, |m, r| m & r.all)
+    }
+
+    /// Datagram: a record with presence `present` was put on the wire at `tick`.
+    pub(crate) fn on_record_sent(&mut self, tick: Tick, present: u64) {
+        if let Some(last) = self.in_flight.last_mut()
+            && last.any == present
+            && last.all == present
+        {
+            last.tick = last.tick.max(tick);
+            return;
+        }
+        if self.in_flight.len() >= PRESENCE_RUNS {
+            // Merged runs only stay longer (until their newest record is acked): conservative.
+            let first = self.in_flight.remove(0);
+            let next = &mut self.in_flight[0];
+            next.any |= first.any;
+            next.all &= first.all;
+            next.tick = next.tick.max(first.tick);
+        }
+        self.in_flight.push(PresenceRun {
+            tick,
+            any: present,
+            all: present,
+        });
+    }
+
+    /// Datagram: the record written at `tick` with presence `present` was acked. The newest
+    /// acked record defines what the client holds; older records it may still receive are
+    /// skipped as stale, so only runs newer than it still matter.
+    pub(crate) fn on_presence_acked(&mut self, tick: Tick, present: u64) {
+        if tick >= self.known_tick {
+            self.known_present = present;
+            self.known_tick = tick;
+            self.in_flight.retain(|r| r.tick > tick);
         }
     }
 }
@@ -520,7 +592,7 @@ fn build_snapshot(
                     due |= bit;
                 }
             }
-            due |= allowed & !ce.known_present;
+            due |= allowed & !ce.surely_present();
             if controlled {
                 // Predicted components are confirmed every snapshot (the client compares them
                 // with its prediction), changed or not — except while the budget is in debt,
@@ -533,7 +605,7 @@ fn build_snapshot(
                     ce.confirm_skipped += 1;
                 }
             }
-            (due, ce.known_present & !allowed, false)
+            (due, ce.maybe_present() & !allowed, false)
         };
         if comps == 0 && removed == 0 && !spawn {
             continue;
@@ -919,6 +991,7 @@ fn send_datagram(
                 if let Some(ce) = slot.view.entities.get_mut(&p.net_id) {
                     ce.last_sent_tick = tick;
                     ce.on_wire = true;
+                    ce.on_record_sent(tick, p.allowed);
                 }
             }
             rec.despawns = desp.iter().map(|d| d.net_id).collect();
@@ -1005,10 +1078,7 @@ pub(crate) fn on_ack(server: &mut NetServer, client: NetClientId, ack: AckField,
                 if r.spawns[i] {
                     ce.spawned = true;
                 }
-                if r.tick >= ce.known_tick {
-                    ce.known_present = r.present[i];
-                    ce.known_tick = r.tick;
-                }
+                ce.on_presence_acked(r.tick, r.present[i]);
             }
         }
         for (id, scope) in r.despawns.iter().zip(&r.despawn_scopes) {
@@ -1034,6 +1104,40 @@ mod tests {
         assert_eq!(ce.ack_tick, Tick(12), "older acks are ignored");
         ce.on_record_acked(Tick(12), Tick(20));
         assert_eq!(ce.ack_tick, Tick(20));
+    }
+
+    #[test]
+    fn presence_covers_every_record_newer_than_the_ack() {
+        let (a, b, c) = (0b001u64, 0b010u64, 0b100u64);
+        let mut ce = ClientEntity {
+            spawned: true,
+            known_present: a | b,
+            known_tick: Tick(10),
+            ..Default::default()
+        };
+        // b removed and c inserted at 12, c removed again at 14: both still in flight.
+        ce.on_record_sent(Tick(12), a | c);
+        ce.on_record_sent(Tick(14), a);
+        assert_eq!(ce.maybe_present(), a | b | c, "removals cover all of them");
+        assert_eq!(ce.surely_present(), a, "inserts are written until acked");
+        // An older record's ack changes nothing; the newest one's settles it.
+        ce.on_presence_acked(Tick(8), a | b | c);
+        assert_eq!(ce.maybe_present(), a | b | c);
+        ce.on_presence_acked(Tick(12), a | c);
+        assert_eq!((ce.maybe_present(), ce.surely_present()), (a | c, a));
+        ce.on_presence_acked(Tick(14), a);
+        assert_eq!((ce.maybe_present(), ce.surely_present()), (a, a));
+        assert!(ce.in_flight.is_empty());
+        // Equal presence extends a run; beyond the cap the oldest runs merge conservatively.
+        for t in 0..20u32 {
+            ce.on_record_sent(Tick(20 + t), if t % 2 == 0 { a } else { b });
+        }
+        assert_eq!(ce.in_flight.len(), PRESENCE_RUNS);
+        assert_eq!(ce.maybe_present(), a | b);
+        assert_eq!(ce.surely_present(), 0);
+        ce.on_presence_acked(Tick(39), b);
+        assert!(ce.in_flight.is_empty());
+        assert_eq!((ce.maybe_present(), ce.surely_present()), (b, b));
     }
 
     #[test]
