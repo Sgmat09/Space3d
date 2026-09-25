@@ -103,7 +103,22 @@ fn mip_renderable(adapter: &wgpu::Adapter, device: &wgpu::Device, format: wgpu::
             .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
 }
 
+/// What render targets can be created with on this device (from `GraphicsCaps`, masked by
+/// `FrameSettings::downlevel` as of the last frame).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TargetCaps {
+    /// Format of `RenderTargetFormat::Hdr` targets (LDR without one).
+    pub hdr_format: Option<wgpu::TextureFormat>,
+    /// `hdr_format` can be multisampled.
+    pub hdr_msaa: bool,
+    /// Largest sample count (1 or 4).
+    pub max_msaa: u32,
+    /// Multisampled depth can be sampled (`GraphicsCaps::msaa_depth_resolve`).
+    pub msaa_depth_binding: bool,
+}
+
 /// Create the GPU texture for an entry. Returns bytes uploaded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_gpu_texture(
     adapter: &wgpu::Adapter,
     device: &wgpu::Device,
@@ -111,6 +126,7 @@ pub(crate) fn create_gpu_texture(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &mut Pipelines,
     samplers: &mut SamplerCache,
+    targets: TargetCaps,
     entry: &mut TextureEntry,
 ) -> Result<u64, String> {
     let sampler = samplers.get(device, entry.sampler);
@@ -130,27 +146,61 @@ pub(crate) fn create_gpu_texture(
             height: entry.height,
             depth_or_array_layers: 1,
         };
+        let desc = entry.target_desc.unwrap_or_default();
+        // `RenderTargetDesc::hdr()`: linear float where the device renders it (graphics spec
+        // D16), else LDR.
+        let hdr = match desc.format {
+            crate::settings::RenderTargetFormat::Hdr => targets.hdr_format,
+            _ => None,
+        };
+        let format = hdr.unwrap_or(OFFSCREEN_FORMAT);
+        let msaa_ok = hdr.is_none() || targets.hdr_msaa;
+        let samples = if desc.samples > 1 && msaa_ok {
+            targets.max_msaa.max(1)
+        } else {
+            1
+        };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("space3d render target"),
             size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: OFFSCREEN_FORMAT,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
+        let msaa_view = (samples > 1).then(|| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("space3d render target (msaa)"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: samples,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        });
+        // Sampleable by scene-depth readers (graphics spec §1.6): 1 sample always,
+        // multisampled only where it can be resolved.
+        let depth_usage = if samples == 1 || targets.msaa_depth_binding {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
         let depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("space3d render target depth"),
             size,
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            // Sampleable: scene-depth readers (graphics spec §1.6).
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: depth_usage,
             view_formats: &[],
         });
         // One D2 view serves as color attachment and for sampling.
@@ -163,8 +213,10 @@ pub(crate) fn create_gpu_texture(
             layered: false,
             target_view: Some(view),
             depth_view: Some(depth.create_view(&Default::default())),
+            msaa_view,
+            samples,
             sampler,
-            format: OFFSCREEN_FORMAT,
+            format,
             layers: 1,
         });
         entry.version = entry.version.wrapping_add(1);
@@ -312,6 +364,8 @@ fn upload_source(
             sampler,
             target_view: None,
             depth_view: None,
+            msaa_view: None,
+            samples: 1,
             format,
             layers: src.layers,
         },

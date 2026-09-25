@@ -143,10 +143,6 @@ fn pbr_neutral(c_in: Vec3) -> Vec3 {
 
 /// PCG hash (`s3d_pcg` in `shaders/common/hash.wgsl`, bit-identical): the seed of every noise
 /// (dither, grain, particles) — see graphics spec §4.3.
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-)]
 pub(crate) fn pcg(v: u32) -> u32 {
     let s = v.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
     let w = ((s >> ((s >> 28) + 4)) ^ s).wrapping_mul(277_803_737);
@@ -169,10 +165,6 @@ pub(crate) fn hash01(p: [u32; 2], seed: u32) -> f32 {
 pub const OUTPUT_WGSL: &str = include_str!("shaders/common/output.wgsl");
 
 /// `s3d_pcg`, `s3d_hash01` (crate-internal; post and particles copy them).
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-)]
 pub(crate) const HASH_WGSL: &str = include_str!("shaders/common/hash.wgsl");
 
 #[cfg(test)]

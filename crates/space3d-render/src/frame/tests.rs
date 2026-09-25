@@ -2097,3 +2097,109 @@ fn point_lights_over_16_pick_nearest_per_view() {
     );
     assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
 }
+
+/// The windowed-capture replay of an intermediate primary group (spec §1.10) re-runs only its
+/// composites from the persisted scene texture, then its display views and the overlays: the
+/// capture equals the frame, for an Hdr group (post camera + PiP post camera + gizmo display
+/// view, dither on) and an Ldr passthrough group (render scale), with and without MSAA. The
+/// offscreen target is painted magenta first, so everything the capture shows was replayed.
+#[test]
+fn replay_path_equals_frame_output() {
+    use crate::components::{Camera3d, Mesh3d, Projection};
+    use crate::post::api::PostProcess;
+    use space3d_core::{Transform, prelude::MeshData};
+    for (samples, scale, post) in [(1, 1.0, true), (4, 1.0, true), (1, 0.5, false), (4, 0.75, false)] {
+        let Some(mut app) = headless_app(64, 48) else { return };
+        app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+        app.resources.expect_mut::<crate::FrameSettings>().render_scale = scale;
+        let (cube, quad) = {
+            let a = app.resources.expect_mut::<RenderAssets>();
+            (a.add_mesh(MeshData::cube(1.0)), a.add_mesh(MeshData::plane(0.5)))
+        };
+        app.world.spawn((
+            Transform::from_xyz(0.0, 0.0, 0.0).with_rotation(glam::Quat::from_rotation_y(0.6)),
+            Mesh3d(cube),
+            Material::unlit(Vec4::new(3.0, 1.0, 0.2, 1.0)),
+        ));
+        app.world.spawn((
+            Transform::from_xyz(0.8, 0.6, 1.0).with_rotation(glam::Quat::from_rotation_x(1.2)),
+            Mesh3d(quad),
+            Material::unlit(Vec4::new(0.2, 0.9, 0.3, 1.0)),
+        ));
+        let ortho = Projection::Orthographic {
+            height: 3.0,
+            near: 0.1,
+            far: 100.0,
+        };
+        let camera = |order: i32, viewport: Option<[f32; 4]>, clear: Option<Vec4>| {
+            (
+                Transform::from_xyz(0.0, 0.0, 5.0),
+                Camera3d {
+                    order,
+                    viewport,
+                    clear_color: clear,
+                    projection: ortho,
+                    ..Default::default()
+                },
+            )
+        };
+        let main = app.world.spawn(camera(0, None, Some(Vec4::new(0.05, 0.05, 0.1, 1.0))));
+        if post {
+            app.world.insert_one(main, PostProcess::default()).unwrap();
+            let pip = app.world.spawn(camera(
+                1,
+                Some([0.6, 0.05, 0.35, 0.35]),
+                Some(Vec4::new(0.3, 0.0, 0.0, 1.0)),
+            ));
+            app.world
+                .insert_one(pip, PostProcess::default().with_exposure(1.5))
+                .unwrap();
+            app.world.spawn(camera(10, Some([0.0, 0.5, 0.5, 0.5]), None));
+        }
+        let kinds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        app.resources.expect_mut::<crate::RenderOverlays>().insert(
+            "rect",
+            0,
+            RectOverlay {
+                rect: [2, 2, 6, 6],
+                pipeline: None,
+                kinds: kinds.clone(),
+            },
+        );
+        let frame = crate::render_to_image(&mut app).expect("capture");
+        let r = app.resources.expect_mut::<Renderer>();
+        assert_eq!(r.stats.intermediate_groups, 1);
+        assert_eq!(r.stats.post_groups, if post { 2 } else { 0 });
+        // Paint the offscreen target magenta: the replay must redraw every pixel.
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: r.offscreen.color_view.as_ref().unwrap(),
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 1.0,
+                        g: 0.0,
+                        b: 1.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        r.queue.submit([encoder.finish()]);
+        r.frame.force_capture_replay = true;
+        let replayed = r.capture_blocking().expect("replayed capture");
+        assert_eq!(r.gpu_error_count(), 0);
+        assert!(
+            frame.pixels == replayed.pixels,
+            "×{samples} scale {scale} post {post}: the replay differs from the frame ({} px)",
+            differing_px(&frame, &replayed)
+        );
+        use crate::OverlayTargetKind as K;
+        assert_eq!(*kinds.lock().unwrap(), [K::Offscreen, K::Capture]);
+    }
+}

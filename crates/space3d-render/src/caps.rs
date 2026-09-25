@@ -106,10 +106,6 @@ impl GraphicsCaps {
     }
 
     /// These capabilities with `downlevel`'s pretended absences removed (never adds any).
-    #[allow(
-        dead_code,
-        reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-    )]
     pub(crate) fn masked(&self, downlevel: DownlevelOverride) -> Self {
         let mut c = self.clone();
         if downlevel.no_float_targets {

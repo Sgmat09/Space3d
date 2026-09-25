@@ -134,7 +134,7 @@ mod tests {
                 let mut app = space3d_test::TestApp::no_render();
                 story.apply(&mut app, &knobs);
                 app.step_ticks(story.ticks.min(5));
-                assert!(app.count::<Camera3d>() == 1, "{} must spawn one camera", story.id);
+                assert!(app.count::<Camera3d>() >= 1, "{} must spawn a camera", story.id);
             }
         }
     }

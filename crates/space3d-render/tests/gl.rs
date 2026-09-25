@@ -54,11 +54,40 @@ fn gl_app(width: u32, height: u32) -> Option<App> {
     }
 }
 
-fn render(mut app: App, scene: scenes::Scene) -> (Vec<[u8; 3]>, ImageData) {
+/// How a portability scene is rendered: as written (Direct), with every camera a post camera
+/// (passthrough post: the HDR scene texture and the composite), or post with float targets
+/// forced off (the Ldr fallback).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    Direct,
+    Hdr,
+    Ldr,
+}
+
+fn render_in(mut app: App, scene: scenes::Scene, mode: Mode) -> (Vec<[u8; 3]>, ImageData) {
     let colors = scene(&mut app).to_vec();
+    if mode != Mode::Direct {
+        let cameras: Vec<Entity> = app
+            .world
+            .query::<(Entity, &Camera3d)>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in cameras {
+            app.world.insert_one(e, PostProcess::passthrough()).unwrap();
+        }
+        app.resources.expect_mut::<FrameSettings>().downlevel.no_float_targets = mode == Mode::Ldr;
+    }
     let img = render_to_image(&mut app).expect("capture");
-    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    let r = app.resources.expect::<Renderer>();
+    assert_eq!(r.gpu_error_count(), 0);
+    let intermediate = app.resources.expect::<RenderStats>().intermediate_groups;
+    assert_eq!(intermediate > 0, mode != Mode::Direct, "{mode:?}");
     (colors, img)
+}
+
+fn render(app: App, scene: scenes::Scene) -> (Vec<[u8; 3]>, ImageData) {
+    render_in(app, scene, Mode::Direct)
 }
 
 #[test]
@@ -80,6 +109,41 @@ fn gl_backend_renders_like_the_default_backend() {
                 "{name}: {:.2}% of pixels differ from the default backend",
                 d * 100.0
             );
+        }
+    }
+}
+
+/// The same scenes through the HDR scene texture and the composite (every camera with
+/// passthrough post), and through the Ldr fallback (float targets forced off): GL renders them
+/// like the default backend, and like Direct mode.
+#[test]
+fn gl_backend_renders_frame_modes_like_the_default_backend() {
+    if gl_app(8, 8).is_none() {
+        return;
+    }
+    for mode in [Mode::Hdr, Mode::Ldr] {
+        for (name, scene) in scenes::ALL {
+            let (colors, gl) = render_in(gl_app(96, 64).expect("GL adapter"), scene, mode);
+            for c in &colors {
+                let n = count_rgb(&gl, *c);
+                assert!(n >= 16, "{name} {mode:?}: color {c:?} covers {n} px on GL");
+            }
+            let (_, direct) = render(gl_app(96, 64).expect("GL adapter"), scene);
+            let d = diff_fraction(&gl, &direct, 1);
+            assert!(
+                d < 0.01,
+                "{name} {mode:?}: {:.2}% of pixels differ from Direct on GL",
+                d * 100.0
+            );
+            if let Some(app) = headless_app(96, 64) {
+                let (_, reference) = render_in(app, scene, mode);
+                let d = diff_fraction(&gl, &reference, 8);
+                assert!(
+                    d < 0.01,
+                    "{name} {mode:?}: {:.2}% of pixels differ from the default backend",
+                    d * 100.0
+                );
+            }
         }
     }
 }

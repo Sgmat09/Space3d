@@ -67,6 +67,17 @@ stub bodies: `lighting::Lighting` (+ `DepthViewRequest`, `ViewResources`, `Light
 `post::PostState` (+ `PostGroupInput`, `PostGroupPlan`, `PostGroupNeeds`, `PostEncode`),
 `frame::extract::source_casts`, `frame::targets::TexturePool`.
 
+Additions made by the foundation since F2 (additive):
+
+* F4: `PostState` has a working composite-only chain (exposure, tonemapper, dither,
+  alpha, rect mapping, upscale). `PostState::plan_group(world, plan, reallocs)` writes the
+  group's `GpuPost` slot (in call order) and `PostState::flush(device, encoder, uploader)`
+  uploads the slots before any `encode_group`. `PostGroupPlan` carries unclipped `[i32; 4]`
+  rects plus `scene_size`, `output_size`, `scene_alpha`, `transparent` and `passthrough`.
+  `PostGroupInput` adds `index` (the plan slot), `scene_generation` (bind-group cache key) and
+  `output_viewport` (the drawn rect; `output_rect` is its scissor). `PostEncode` adds `pool`
+  (the frame's `TexturePool`, released after each group).
+
 ## Ownership map (spec §3.6)
 
 A builder edits only the files it owns; everything else goes through the foundation maintainer

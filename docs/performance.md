@@ -178,3 +178,44 @@ The engine goldens (`crates/space3d-stories/tests/__screenshots__/Engine/`) were
 for the merged renderer at F0 (no re-bless needed): they are the baseline of every
 "bit-identical" claim. `cargo test -p space3d-stories --test storybook -- --ignored
 engine_goldens_are_exact` checks them with tolerance 0.
+
+### F3 / F4 — output tail, `GpuView`, HDR frame modes
+
+`GpuView` grew to its frozen 1312 bytes (1536-byte stride); forward modules no longer depend on the
+output encoding (an override). Direct mode is unchanged: the engine goldens are bit-exact, and the
+steady-state allocations of `tests/alloc.rs` are identical to F0 (82–86 CPU path, 191–195 GPU
+paths, 314.6 with two viewport cameras).
+
+`benches/instancing.rs` after F4 (same command as F0; the machine was shared with other builds,
+load average 6–18, so the ranges are wide): `explicit/100k` 581 µs, `explicit/1000k` 1.77 ms,
+`ecs/100k` 1.69 ms, `ecs_static_mixed/100k` 2.68 ms (2.14 – 3.87 ms), `mesh_arena/upload_1000`
+2.10 ms (1.88 – 2.45 ms). The medians of the first three are below F0; the last two overlap F0
+within their noise ranges.
+
+Gate "Hdr minimal (composite only) over Direct" (`benches/frame.rs`, 1080p headless, a lit
+ground plane with 400 cubes; `cargo bench -p space3d-render --bench frame -- --warm-up-time 3
+--measurement-time 8`):
+
+| bench | Direct | Hdr minimal | delta | gate |
+|---|---|---|---|---|
+| `frame/cpu/*` (render stage on the CPU) | 58.9–63.6 µs | 70.6–78.4 µs | +10 to +15 µs | ≤ +20 µs |
+| `frame/throughput/*` (frames back to back; GPU-bound) | 113.6 µs | 138.5 µs | +25 µs (incl. the CPU delta) | ≤ +0.10 ms GPU |
+| `frame/gpu/*` (one frame, CPU + GPU latency) | 304 µs | 373 µs | +69 µs | (upper bound) |
+
+The per-frame GPU latency (`frame/gpu`) is the noisiest under load (runs between 0.3 and 1.2 ms
+were seen); the throughput numbers and the quiet run above are the recorded values. GPU
+timestamps per pass arrive with `GpuTimings` (F8).
+
+Allocations per frame by mode (`tests/alloc_frame.rs`: 400 moving lit cubes, CPU draw path,
+320×180; all inside wgpu/wgpu-hal; bounds +10 %):
+
+| mode | allocations per frame | bound |
+|---|---|---|
+| Direct | 76 | 84 |
+| Hdr (post camera) | 106 | 117 |
+| Ldr fallback (`no_float_targets`) | 106 | 117 |
+| Ldr passthrough (render scale 0.75) | 106 | 117 |
+
+The one extra render pass (the composite) costs 30 wgpu-hal allocations on Metal; the renderer
+itself allocates nothing, creates no textures after the first frame and uploads nothing for a
+still scene (only the 16-byte dither seed of each post group when frames advance).

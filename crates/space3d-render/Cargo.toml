@@ -39,7 +39,13 @@ wgpu = { workspace = true, features = ["webgl", "fragile-send-sync-non-atomic-wa
 pollster.workspace = true
 criterion.workspace = true
 image.workspace = true
+# Image comparison (`CompareOptions::perceptual`) in the integration tests.
+space3d-test.workspace = true
 
 [[bench]]
 name = "instancing"
+harness = false
+
+[[bench]]
+name = "frame"
 harness = false

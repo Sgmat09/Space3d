@@ -9,7 +9,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | module | role |
 |---|---|
 | `renderer.rs` | `Renderer`: instance/adapter/device/queue, capability detection, surfaces, offscreen target, asset upload, `capture()` |
-| `frame/` | per-frame work: `mod.rs` (`render_frame` orchestration, `FrameState`, `RenderSettings`, uploads), `plan.rs` (cameras, viewport rects), `extract.rs` (ECS/explicit extraction, batching, material interning), `views.rs` (lights, `GpuView`s, draw commands, CPU culling, GPU culling jobs/dispatches), `draws.rs` (material bind groups, `encode_draws`), `passes.rs` (view passes, capture replay), `targets.rs` (render-target feedback copies), `tests.rs` |
+| `frame/` | per-frame work: `mod.rs` (`render_frame` orchestration, `FrameState`, `RenderSettings`, uploads, frame facts), `plan.rs` (cameras, viewport rects, the frame plan: target groups, modes, post groups, view roles), `extract.rs` (ECS/explicit extraction, batching, material interning), `views.rs` (lights, `GpuView`s, draw commands, CPU culling, GPU culling jobs/dispatches), `draws.rs` (material bind groups, `encode_draws`), `passes.rs` (view passes, group finish: composites and display views, capture replay), `targets.rs` (scene textures of intermediate groups, render-target feedback copies, the texture pool), `tests.rs` |
 | `instance.rs` | `InstanceData` trait, `InstanceLayout`/semantics, built-in formats, `InstanceBuffer<T>`, `InstanceBuffers`, `InstancedMesh` |
 | `gpu.rs` | `Uploader` (staging ring), `GrowBuffer`, `TrackedBuffer` (shadow-diffed uploads), parallel staging copies |
 | `arena.rs` | mesh arena: shared vertex/index buffers, first-fit range allocator, GPU-side growth |
@@ -23,7 +23,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
 | `dirty.rs` | `DirtyRanges`: sorted, coalescing range set |
 | `stats.rs` | `RenderStats`, `DrawPath` |
-| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `post/distortion.wgsl` |
+| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `post/composite.wgsl` (scene texture → display target), `post/distortion.wgsl` |
 
 ## Frame data flow
 
@@ -278,6 +278,68 @@ target, viewports thinner than a pixel at the target's edges; `frame::tests::
 viewport_clear_writes_every_target_format` clears sRGB, linear 8/10-bit and `Rgba16Float`
 targets at 1 and 4 samples; the `viewports` portability scene matches the default backend
 on GL in `tests/gl.rs`).
+
+## Frame modes, scene textures and the composite
+Cameras are grouped by render target (a *target group*); each group renders in one mode per
+frame, chosen from components and settings only (graphics spec §1.2–§1.3, `frame/plan.rs`):
+
+| mode | when | scene color | fragments write | display target `D` written by |
+|---|---|---|---|---|
+| Direct (default) | no post camera, render scale 1 | none | `Linear` (or `ManualSrgb`) into `D` | the camera passes (everything above) |
+| Hdr | a post camera (`PostProcess` enabled, `FrameSettings::post`), float targets, lead's `HdrMode` not `Ldr` | `Rgba16Float` (`Rg11b10Ufloat` for `HdrMode::Compact` on an opaque-cleared, single-sample primary target) | `Linear`, unclamped | the composite, then display views |
+| Ldr | post camera without float targets (or `HdrMode::Ldr`): *fallback*; no post camera and render scale < 1: *passthrough* | `Rgba8UnormSrgb` | fallback: `Tonemapped` (exposure × tonemapper per fragment, clears tonemapped on the CPU with `Tonemapper::apply`); passthrough: `Linear` | the composite, then display views |
+
+A group's *lead camera* (its highest-order post camera, else its first) sets its `HdrMode` and
+render scale (`CameraFrame`, else `FrameSettings::render_scale` for the primary target; clamped
+to 0.25–1; HDR render targets always render Direct at scale 1 and ignore post). Every distinct
+viewport rect with a post camera is a *post group*: its settings come from the rect's
+highest-order post camera, and the views on that rect up to it are its *scene views*, which
+render into the group's scene texture `S` (at the scaled size, with the group's samples and a
+group depth; the viewport-clear rules above apply to `S`). Every other view of the group (a
+gizmo camera after a post camera on its rect, a minimap without post) is a *display view*.
+After the group's last scene view (`passes.rs` `finish_group`), each post group is
+composited into `D` in settings-camera order — the first composite into `D` clears it, drawing
+only its rect — and then the display views draw into `D` at 1 sample with the group's display
+depth, LDR, in camera order. A passthrough group has one implicit full-target post group.
+
+`S`, its multisampled twin, the group depth and the display depth are created while planning a
+frame whose key (scene size, format, samples, display size) changed, and freed 3 frames after
+their group last rendered intermediately (`targets.rs` `GroupTextures`); `RenderStats::
+{textures_created, target_bytes, intermediate_groups, post_groups, post_passes}` report them.
+`S` persists until the next frame's plan, so `Renderer::capture_scene_hdr` reads the last frame's
+scene color (as float RGBA; `Err` in Direct mode) and a windowed capture replays an intermediate
+primary group by compositing again from `S` (no scene pass) into the offscreen target, then its
+display views, then the overlays.
+
+The composite (`shaders/post/composite.wgsl`, `post/mod.rs` `PostState::encode_group`) is one
+full-screen triangle per post group, viewport and scissor on the group's rect in `D`. It reads
+`S` at the rect (a texel load when the rects have the same size — render scale 1 is exact —
+otherwise bilinear with every tap clamped inside the rect, so split screens never bleed),
+un-premultiplies transparent render-target groups, multiplies by the exposure (`2^stops` in
+Hdr, 1 in Ldr), applies the tonemapper (Hdr; `None` otherwise), dithers (±1 LSB triangular in
+the encoded space, seed `pcg(0x9E3779B9 ^ frame)` with `frame = Time::frame`), encodes for `D`
+(hardware sRGB, manual sRGB for 8-bit non-sRGB surfaces, linear for float) and re-premultiplies
+(alpha is always kept). Its parameters (`post/chain.rs` `GpuPost`, one 256-byte slot per post
+group) are shadow-diffed like every renderer buffer: a still scene uploads nothing, and only the
+16-byte seed vector when dither reseeds each frame. Pipelines are per (output format, output
+kind) (`S3D_POST_OUT` override); the input bind group per scene texture generation. Effects
+(bloom, auto exposure, FXAA, lens, grading, distortion) are the post area's slots in the same
+shader and chain.
+
+Render targets take a `RenderTargetDesc` (`RenderAssets::add_render_target_with`): `Hdr` creates
+them in `GraphicsCaps::hdr_format` (linear radiance; sampling materials read it unclamped and
+their camera's post tonemaps it), `samples > 1` gives them a multisampled color and depth
+(resolved into the texture) for Direct passes. Depth textures are sampleable (`TEXTURE_BINDING`)
+at 1 sample, and multisampled only where multisampled depth can be resolved
+(`GraphicsCaps::msaa_depth_resolve`: not on GL, where a sampled multisampled texture needs GLES
+3.1).
+
+Tests: `tests/frame_modes.rs` (modes, exactness of passthrough, tonemapper monotonicity,
+exposure linearity, Ldr-fallback parity, alpha, compact HDR, split screen, gizmo display view,
+PiP, render scale, HDR and MSAA render targets, determinism, lazy resize, steady state, WebGL2
+override parity), `tests/capture_hdr.rs`, `frame::tests::replay_path_equals_frame_output`,
+`tests/alloc_frame.rs` (allocations per mode), `tests/gl.rs` (the portability scenes in Hdr and
+Ldr on ANGLE); `benches/frame.rs` (Direct vs Hdr minimal at 1080p).
 
 ## Custom shaders
 A `CustomShader` is WGSL spliced into the built-in forward shader, registered with

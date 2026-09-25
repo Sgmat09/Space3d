@@ -329,3 +329,76 @@ fn custom_shaders_are_limited_to_what_webgl2_compiles() {
     );
     assert_eq!(r.gpu_error_count(), 0);
 }
+
+/// Every custom-shader fixture of this file renders in every frame mode — Direct, the HDR scene
+/// texture (`Linear` output), the Ldr fallback (`Tonemapped` output) and render-scale
+/// passthrough — with MSAA on and off, and never falls back to the built-in shader (graphics
+/// spec §3.2; the unit test of the same name builds every pipeline permutation).
+#[test]
+fn custom_shaders_compile_against_every_permutation() {
+    let Some(mut app) = headless_app(32, 32) else { return };
+    let fixtures = [
+        TINT,
+        "fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {
+             if (MANUAL_SRGB) { return color; }
+             return vec4<f32>(s3d_tonemap(view.output.y, color.rgb * view.exposure.x), color.a);
+         }",
+        "fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {
+             var o = out;
+             o.clip = view.proj * view.view * vec4<f32>(o.world_pos, 1.0);
+             return o;
+         }",
+    ];
+    let shaders: Vec<ShaderHandle> = fixtures
+        .iter()
+        .enumerate()
+        .map(|(i, wgsl)| {
+            app.resources
+                .expect_mut::<RenderAssets>()
+                .add_shader(CustomShader::new(format!("fixture {i}"), *wgsl))
+        })
+        .collect();
+    let camera = {
+        let mut q = app.world.query::<(Entity, &Camera3d)>();
+        q.iter().next().map(|(e, _)| e)
+    };
+    let camera = camera.unwrap_or_else(|| spawn_camera(&mut app, 4.0));
+    let mut entities = Vec::new();
+    for &shader in &shaders {
+        entities.push(scene(&mut app, Material::color(Vec4::splat(0.5)).with_shader(shader)));
+    }
+    type Setup = fn(&mut App, Entity);
+    let modes: [(&str, Setup); 4] = [
+        ("direct", |_, _| {}),
+        ("hdr", |app, cam| {
+            app.world.insert_one(cam, PostProcess::default()).unwrap()
+        }),
+        ("ldr", |app, cam| {
+            app.world.insert_one(cam, PostProcess::default()).unwrap();
+            app.resources.expect_mut::<FrameSettings>().downlevel.no_float_targets = true;
+        }),
+        ("passthrough", |app, _| {
+            app.resources.expect_mut::<FrameSettings>().render_scale = 0.5
+        }),
+    ];
+    for (name, setup) in modes {
+        for samples in [1, 4] {
+            let _ = app.world.remove_one::<PostProcess>(camera);
+            *app.resources.expect_mut::<FrameSettings>() = FrameSettings::default();
+            app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+            setup(&mut app, camera);
+            render_to_image(&mut app).expect("capture");
+            let r = app.resources.expect::<Renderer>();
+            for &shader in &shaders {
+                assert_eq!(r.shader_error(shader), None, "{name} ×{samples}");
+            }
+            assert_eq!(r.gpu_error_count(), 0, "{name} ×{samples}");
+            assert_eq!(
+                stats(&app).intermediate_groups,
+                u32::from(name != "direct"),
+                "{name} ×{samples}"
+            );
+        }
+    }
+    let _ = entities;
+}

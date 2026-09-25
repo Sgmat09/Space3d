@@ -2,9 +2,10 @@
 //! [`PostProcess`] camera component and its effect settings. Re-exported from the crate root.
 //!
 //! Config structs are plain `pub`-field `Copy` structs with `Default` (functional record update
-//! works); enums are `#[non_exhaustive]`. Rendering lands with the frame milestone F4 (HDR,
-//! composite) and the post milestones PO1–PO6; until then cameras with `PostProcess` render as
-//! before.
+//! works); enums are `#[non_exhaustive]`. A camera with an enabled `PostProcess` renders through
+//! its target group's scene texture (HDR, or the Ldr fallback) and the composite: exposure
+//! (manual), the tonemapper and dither work since the frame milestone F4; bloom, auto exposure,
+//! FXAA, lens effects, grading and distortion arrive with the post milestones PO1–PO6.
 
 use crate::assets::{AddressMode, FilterMode, SamplerSettings, TextureSource};
 use crate::handles::{ShaderHandle, TextureHandle};

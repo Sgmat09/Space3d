@@ -4947,6 +4947,7 @@ dependencies = [
  "rayon",
  "space3d-core",
  "space3d-tasks",
+ "space3d-test",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

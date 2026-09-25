@@ -329,3 +329,53 @@ pub mod scenes {
         ("viewports", viewports),
     ];
 }
+
+/// Read back a whole 2D texture (single sample, `COPY_SRC`) as linear float RGBA, blocking
+/// (tests only). sRGB formats are decoded; `Rgba16Float` is widened.
+pub fn read_texture(renderer: &Renderer, texture: &wgpu::Texture) -> Vec<[f32; 4]> {
+    let (device, queue) = (renderer.device(), renderer.queue());
+    let format = texture.format();
+    let texel = format.block_copy_size(None).expect("color format") as usize;
+    let (w, h) = (texture.width() as usize, texture.height() as usize);
+    let row = (w * texel).next_multiple_of(256);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test readback"),
+        size: (row * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row as u32),
+                rows_per_image: None,
+            },
+        },
+        texture.size(),
+    );
+    queue.submit([encoder.finish()]);
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    let data = buffer.slice(..).get_mapped_range().expect("mapped");
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = &data[y * row + x * texel..][..texel];
+            out.push(match format {
+                wgpu::TextureFormat::Rgba16Float => {
+                    [0, 2, 4, 6].map(|i| f16_to_f32(u16::from_le_bytes([p[i], p[i + 1]])))
+                }
+                f if f.is_srgb() => {
+                    let c = |i: usize| srgb_to_linear(p[i] as f32 / 255.0);
+                    [c(0), c(1), c(2), p[3] as f32 / 255.0]
+                }
+                _ => [0, 1, 2, 3].map(|i| p[i] as f32 / 255.0),
+            });
+        }
+    }
+    out
+}

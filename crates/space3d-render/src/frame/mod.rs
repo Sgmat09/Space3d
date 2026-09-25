@@ -10,7 +10,6 @@ use crate::gpu::{GrowBuffer, TrackedBuffer, Uploader};
 use crate::handles::FastMap;
 use crate::handles::{MeshHandle, TextureHandle};
 use crate::instance::InstanceBuffers;
-use crate::output::OutputEncoding;
 use crate::pipeline::{
     GpuCompactParams, GpuCullJob, GpuCullParams, GpuFrustum, GpuMaterial, GpuPointLight, GpuView, Pipelines,
 };
@@ -31,8 +30,10 @@ mod views;
 
 use draws::{DrawCmd, DrawKind, VertexSource};
 use extract::{GpuInstances, KeyBuckets, MaterialTable, Source, SourceBuffer};
-use plan::CameraItem;
-use targets::Feedback;
+use plan::{CameraItem, CameraPlan, FramePostGroup, PrimaryDisplay, TargetGroup};
+pub(crate) use plan::{GroupTarget, PlanWarnings};
+pub(crate) use targets::TexturePool;
+use targets::{Feedback, GroupTextures};
 use views::{Dispatch, SceneLights, ViewData, ViewTarget};
 
 /// Runtime render options (resource).
@@ -151,6 +152,20 @@ pub(crate) struct FrameState {
     point_lights: Vec<GpuPointLight>,
     /// Scratch of the per-view point-light selection: (squared distance, light index).
     light_order: Vec<(f32, u32)>,
+    /// The frame plan (graphics spec §1.3): target groups, post groups and every camera's
+    /// group and role (parallel to `cameras`). Kept until the next frame (capture replays).
+    groups: Vec<TargetGroup>,
+    post_groups: Vec<FramePostGroup>,
+    camera_plans: Vec<CameraPlan>,
+    /// Scene textures of intermediate groups, by target (freed 3 frames after last use).
+    group_textures: FastMap<GroupTarget, GroupTextures>,
+    texture_generation: u64,
+    /// Per-group encode state of `encode_views` (reused scratch).
+    group_encode: Vec<passes::GroupEncode>,
+    /// The one texture pool of the frame (spec §2.6), for post chains.
+    pub(crate) pool: TexturePool,
+    /// Deterministic facts of the current frame (graphics spec §4.3).
+    pub(crate) info: crate::node::FrameInfo,
     views: Vec<ViewData>,
     draws: Vec<DrawCmd>,
     jobs: Vec<(SourceBuffer, GpuCullJob)>,
@@ -198,7 +213,7 @@ pub(crate) struct FrameState {
     pub(crate) ecs_reorders: u64,
     /// Every view renders with this output encoding, linear exposure and tonemapper.
     #[cfg(test)]
-    pub(crate) force_output: Option<(OutputEncoding, f32, crate::output::Tonemapper)>,
+    pub(crate) force_output: Option<(crate::output::OutputEncoding, f32, crate::output::Tonemapper)>,
 }
 
 fn strided(size: usize, align: usize) -> usize {
@@ -267,6 +282,23 @@ impl FrameState {
             cameras: Vec::new(),
             point_lights: Vec::new(),
             light_order: Vec::new(),
+            groups: Vec::new(),
+            post_groups: Vec::new(),
+            camera_plans: Vec::new(),
+            group_textures: FastMap::default(),
+            texture_generation: 0,
+            group_encode: Vec::new(),
+            pool: TexturePool::default(),
+            info: crate::node::FrameInfo {
+                frame: 0,
+                tick: 0,
+                alpha: 0.0,
+                time: 0.0,
+                delta: 0.0,
+                kind: crate::node::FrameKind::Frame,
+                renderer: 0,
+                device_lost: false,
+            },
             views: Vec::new(),
             draws: Vec::new(),
             jobs: Vec::new(),
@@ -317,7 +349,7 @@ impl FrameState {
     }
 
     /// Capacity snapshot of scratch vectors (to count CPU reallocations).
-    fn capacities(&self) -> [usize; 22] {
+    fn capacities(&self) -> [usize; 26] {
         [
             self.ecs_keys.capacity(),
             self.ecs_rows.capacity(),
@@ -341,6 +373,10 @@ impl FrameState {
             self.cull_planes.capacity(),
             self.point_lights.capacity(),
             self.light_order.capacity(),
+            self.groups.capacity(),
+            self.post_groups.capacity(),
+            self.camera_plans.capacity(),
+            self.group_encode.capacity(),
         ]
     }
 }
@@ -451,6 +487,14 @@ impl Renderer {
         self.stats.reset(self.frame_index, path);
         self.uploader.reset_counters();
         self.frame.path = path;
+        let frame_settings = resources
+            .get::<crate::settings::FrameSettings>()
+            .cloned()
+            .unwrap_or_default();
+        self.frame_graphics = self.graphics.masked(frame_settings.downlevel);
+        self.update_frame_info(resources.get::<space3d_core::Time>());
+        self.post.begin_frame(&self.frame.info, &frame_settings);
+        self.frame.pool.begin_frame(self.frame_index);
 
         // Move the asset/instance registries out without re-boxing resources.
         let mut assets = resources
@@ -473,7 +517,15 @@ impl Renderer {
             let gone = SourceBuffer::Explicit(h.index());
             self.frame.cull_bgs.retain(|(b, _), _| *b != gone);
         }
-        self.prepare(world, &assets, &mut buffers, ambient, &settings, &mut encoder);
+        self.prepare(
+            world,
+            &assets,
+            &mut buffers,
+            ambient,
+            &settings,
+            &frame_settings,
+            &mut encoder,
+        );
         self.encode_compute(&mut encoder);
         self.apply_gpu_cull_counts();
 
@@ -527,6 +579,10 @@ impl Renderer {
         // Non-blocking: fires staging-chunk recycling and capture callbacks.
         let _ = self.device.poll(wgpu::PollType::Poll);
 
+        self.post.end_frame(&mut self.stats);
+        self.frame.pool.release_all();
+        self.frame.pool.evict();
+        self.stats.textures_created += self.frame.pool.take_created();
         self.stats.bytes_uploaded = self.uploader.bytes;
         self.stats.instance_bytes_uploaded = self.uploader.instance_bytes;
         self.stats.buffer_reallocations = self.uploader.reallocations;
@@ -562,13 +618,52 @@ impl Renderer {
         self.size_offscreen(self.frame.last_primary_size);
     }
 
-    fn primary_size(&self) -> (u32, u32) {
+    /// The primary target of this frame: the surface (windowed) or the offscreen target.
+    fn primary_display(&self) -> PrimaryDisplay {
         match &self.surface {
-            Some(s) => (s.config.width, s.config.height),
-            None => (self.config.width, self.config.height),
+            Some(s) => PrimaryDisplay {
+                size: (s.config.width, s.config.height),
+                format: s.view_format,
+                samples: s.attachments.samples,
+                manual_srgb: s.manual_srgb,
+            },
+            None => PrimaryDisplay {
+                size: (self.config.width, self.config.height),
+                format: crate::pipeline::OFFSCREEN_FORMAT,
+                samples: self.config.msaa_samples,
+                manual_srgb: false,
+            },
         }
     }
 
+    /// Frame facts (graphics spec §4.3): `Time::frame` (the renderer's frame count without
+    /// `Time`), the fixed tick and alpha, render time `(tick + alpha) × fixed_delta`, and
+    /// `delta` only when `Time::frame` advanced since this renderer's previous frame.
+    fn update_frame_info(&mut self, time: Option<&space3d_core::Time>) {
+        let previous = self.frame.info;
+        let info = &mut self.frame.info;
+        info.kind = crate::node::FrameKind::Frame;
+        info.renderer = self.id;
+        match time {
+            Some(t) => {
+                let advanced = self.frame_index == 1 || t.frame != previous.frame;
+                info.frame = t.frame;
+                info.tick = t.tick;
+                info.alpha = t.alpha;
+                info.time = (t.tick as f64 + t.alpha as f64) * t.fixed_delta.as_secs_f64();
+                info.delta = if advanced { t.delta_secs() } else { 0.0 };
+            }
+            None => {
+                info.frame = self.frame_index;
+                info.tick = 0;
+                info.alpha = 0.0;
+                info.time = 0.0;
+                info.delta = 0.0;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &mut self,
         world: &World,
@@ -576,15 +671,14 @@ impl Renderer {
         buffers: &mut InstanceBuffers,
         ambient: AmbientLight,
         settings: &RenderSettings,
+        frame_settings: &crate::settings::FrameSettings,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        let primary_size = self.primary_size();
-        let primary_output = match &self.surface {
-            Some(s) if s.manual_srgb => OutputEncoding::ManualSrgb,
-            _ => OutputEncoding::Linear,
-        };
-        self.frame.last_primary_size = primary_size;
+        let primary = self.primary_display();
+        self.frame.last_primary_size = primary.size;
         let frame_index = self.frame_index;
+        let max_msaa = self.caps.max_msaa;
+        let msaa_depth_binding = self.graphics.msaa_depth_resolve;
         let Renderer {
             device,
             frame: f,
@@ -593,6 +687,9 @@ impl Renderer {
             stats,
             white,
             white_sampler,
+            post,
+            plan_warnings,
+            frame_graphics,
             ..
         } = self;
         let caps_before = f.capacities();
@@ -605,6 +702,18 @@ impl Renderer {
 
         let lights = SceneLights::collect(world, &mut f.point_lights);
         f.collect_cameras(world);
+        // The frame plan (spec §1.4 step 3): groups, modes, post groups, roles, group textures.
+        f.plan_frame(assets, primary, frame_settings, frame_graphics, max_msaa, plan_warnings);
+        f.prepare_group_textures(device, frame_index, msaa_depth_binding, stats);
+        for g in &f.groups {
+            if g.intermediate() {
+                stats.intermediate_groups += 1;
+                stats.post_groups += f.post_groups[g.post_groups.clone()]
+                    .iter()
+                    .filter(|p| !p.passthrough)
+                    .count() as u32;
+            }
+        }
         f.extract(
             world,
             assets,
@@ -622,14 +731,31 @@ impl Renderer {
             buffers,
             &lights,
             ambient,
-            primary_size,
-            primary_output,
             settings.frustum_culling,
             stats,
             &mut cpu_reallocs,
         );
+        // Post groups (spec §1.4 step 6): their composite parameters, in plan order.
+        for pg in &f.post_groups {
+            let g = &f.groups[pg.group];
+            let rect = |r: plan::ViewportRect| [r.x, r.y, r.w as i32, r.h as i32];
+            let plan = crate::post::PostGroupPlan {
+                camera: f.cameras[pg.camera].id,
+                settings: pg.settings,
+                mode: g.mode,
+                scene_rect: rect(pg.scene_rect),
+                output_rect: rect(pg.display_rect),
+                scene_size: g.scene_size,
+                output_size: g.display_size,
+                scene_alpha: g.scene_format != wgpu::TextureFormat::Rg11b10Ufloat,
+                transparent: g.transparent,
+                passthrough: pg.passthrough,
+            };
+            post.plan_group(world, &plan, &mut cpu_reallocs);
+        }
         let wg_word = f.prepare_dispatches(&mut cpu_reallocs);
         f.upload(device, encoder, up, out_cursor, wg_word, &mut cpu_reallocs);
+        post.flush(device, encoder, up);
 
         // Custom-shader pipelines whose (asynchronous, browser) validation failed since the
         // last frame fall back to the built-in shader before anything is drawn with them.

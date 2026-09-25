@@ -169,8 +169,12 @@ pub(crate) struct GpuTexture {
     pub sampler: wgpu::Sampler,
     /// Single-layer D2 view (render targets).
     pub target_view: Option<wgpu::TextureView>,
-    /// Depth for render targets.
+    /// Depth for render targets (with `samples` samples).
     pub depth_view: Option<wgpu::TextureView>,
+    /// Multisampled color of a render target with `samples > 1` (resolved into the texture).
+    pub msaa_view: Option<wgpu::TextureView>,
+    /// Samples of the cameras rendering into a render target (1 otherwise).
+    pub samples: u32,
     /// Color format of the GPU texture.
     pub format: wgpu::TextureFormat,
     /// Array layers (as registered; GL may allocate one more, see `texture.rs`).
@@ -338,10 +342,14 @@ impl RenderAssets {
         self.add_render_target_with(width, height, crate::settings::RenderTargetDesc::default())
     }
 
-    /// A render target with options ([`crate::RenderTargetDesc`]: HDR format, MSAA). Until the
-    /// frame renders HDR targets (graphics milestone F4) every target is created as
-    /// [`RENDER_TARGET_FORMAT`](crate::RENDER_TARGET_FORMAT) with one sample; the description is
-    /// kept ([`Self::render_target_desc`]).
+    /// A render target with options ([`crate::RenderTargetDesc`]): `RenderTargetFormat::Hdr`
+    /// creates it in [`crate::GraphicsCaps::hdr_format`] (linear, unclamped radiance; cameras
+    /// rendering into it render in Direct mode and ignore `PostProcess`) where the device has one
+    /// (else [`RENDER_TARGET_FORMAT`](crate::RENDER_TARGET_FORMAT)); `samples > 1` multisamples
+    /// the cameras rendering into it (resolved into the texture; clamped to the device, and 1
+    /// for HDR targets whose format cannot be multisampled). The description is kept
+    /// ([`Self::render_target_desc`]). The format is chosen when the target is created (the
+    /// frame after this call, with the `FrameSettings::downlevel` of that time).
     pub fn add_render_target_with(
         &mut self,
         width: u32,

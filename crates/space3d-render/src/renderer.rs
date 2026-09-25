@@ -318,7 +318,8 @@ pub struct Renderer {
     pub(crate) overlays: crate::overlay::OverlayCache,
     /// Uncaptured wgpu errors so far (see [`install_error_handler`]).
     pub(crate) gpu_errors: Arc<AtomicU64>,
-    /// Graphics capabilities (unmasked; see [`Renderer::graphics_caps`]).
+    /// Graphics capabilities of the device, unmasked (`frame_graphics` is what
+    /// [`Renderer::graphics_caps`] reports).
     pub(crate) graphics: crate::caps::GraphicsCaps,
     /// Shared node / overlay layouts.
     pub(crate) layouts: crate::node::FrameLayouts,
@@ -326,6 +327,12 @@ pub struct Renderer {
     pub(crate) id: u64,
     /// GPU pass timings (see [`Renderer::gpu_timings`]).
     pub(crate) gpu_timings: crate::timing::GpuTimings,
+    /// `graphics` masked by the last frame's `FrameSettings::downlevel`.
+    pub(crate) frame_graphics: crate::caps::GraphicsCaps,
+    /// Post-processing state: composite pipelines, per-camera history.
+    pub(crate) post: crate::post::PostState,
+    /// Frame-plan warnings already logged.
+    pub(crate) plan_warnings: crate::frame::PlanWarnings,
 }
 
 /// What [`Renderer::prewarm`] builds, in addition to the post pipelines of the current post
@@ -551,6 +558,7 @@ impl Renderer {
             supported: graphics.timestamps,
             ..Default::default()
         };
+        let post = crate::post::PostState::new(&device, &graphics);
         let mut renderer = Self {
             instance,
             adapter,
@@ -570,10 +578,13 @@ impl Renderer {
             frame_index: 0,
             overlays: Default::default(),
             gpu_errors,
-            graphics,
             layouts,
             id: next_renderer_id(),
             gpu_timings,
+            frame_graphics: graphics.clone(),
+            graphics,
+            post,
+            plan_warnings: Default::default(),
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;
@@ -843,6 +854,12 @@ impl Renderer {
                 if entry.render_target && entry.gpu.is_some() {
                     continue;
                 }
+                let targets = crate::texture::TargetCaps {
+                    hdr_format: self.frame_graphics.hdr_format,
+                    hdr_msaa: self.frame_graphics.hdr_msaa,
+                    max_msaa: self.caps.max_msaa,
+                    msaa_depth_binding: self.graphics.msaa_depth_resolve,
+                };
                 match create_gpu_texture(
                     &self.adapter,
                     &self.device,
@@ -850,6 +867,7 @@ impl Renderer {
                     encoder,
                     &mut self.pipelines,
                     &mut self.samplers,
+                    targets,
                     entry,
                 ) {
                     Ok(bytes) => {
@@ -1114,10 +1132,11 @@ impl Renderer {
         let _ = self.device.poll(wgpu::PollType::Poll);
     }
 
-    /// Graphics capabilities of the device (one probe for every graphics feature). The frame
-    /// masks them with [`crate::FrameSettings::downlevel`] each frame.
+    /// Graphics capabilities of the device (one probe for every graphics feature), masked by
+    /// [`crate::FrameSettings::downlevel`] as of the last rendered frame (unmasked before the
+    /// first frame).
     pub fn graphics_caps(&self) -> &crate::caps::GraphicsCaps {
-        &self.graphics
+        &self.frame_graphics
     }
 
     /// Shared layouts for render nodes and overlays (renderer lifetime).
@@ -1136,37 +1155,143 @@ impl Renderer {
         &self.gpu_timings
     }
 
-    /// The primary target group's scene color before post (after `HdrScene` overlays), as
-    /// linear float pixels. `Err(RenderError::Capture)` in Direct mode — every frame until the
-    /// frame renders intermediate groups (graphics milestone F4).
+    /// The primary target group's scene color `S` of the last frame — after `HdrScene`
+    /// overlays, before post (graphics spec §1.10) — as linear float pixels: `Rgba16Float`
+    /// as stored, `Rg11b10Ufloat` with alpha 1, the Ldr fallback's `Rgba8UnormSrgb` decoded.
+    /// `Err(RenderError::Capture)` when the primary group rendered in Direct mode (no post
+    /// camera and render scale 1): there is no scene texture. For tests and tools; never blocks.
     pub fn capture_scene_hdr(&mut self) -> Task<Result<space3d_core::HdrImageData, RenderError>> {
-        let result = self.scene_hdr_unavailable();
-        space3d_tasks::spawn(async move { result })
+        let submitted = self.submit_scene_capture();
+        #[cfg(not(target_arch = "wasm32"))]
+        let device = self.device.clone();
+        space3d_tasks::spawn(async move {
+            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+            let (readback, mut rx, _, error) = submitted?;
+            if let Some(e) = error.await {
+                return Err(RenderError::Capture(e));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let mapped = loop {
+                let _ = device.poll(wgpu::PollType::Poll);
+                match rx.try_recv() {
+                    Ok(Some(r)) => break Ok(r),
+                    Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+                    Err(_) => break Err(()),
+                }
+            };
+            #[cfg(target_arch = "wasm32")]
+            let mapped = rx.await.map_err(|_| ());
+            readback.read(mapped)
+        })
     }
 
     /// [`Self::capture_scene_hdr`], waiting on the calling thread (tests and tools only).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn capture_scene_hdr_blocking(&mut self) -> Result<space3d_core::HdrImageData, RenderError> {
-        self.scene_hdr_unavailable()
+        let (readback, mut rx, submission, error) = self.submit_scene_capture()?;
+        if let Some(e) = futures::FutureExt::now_or_never(error).flatten() {
+            return Err(RenderError::Capture(e));
+        }
+        let mapped = loop {
+            match rx.try_recv() {
+                Ok(Some(r)) => break Ok(r),
+                Ok(None) => {}
+                Err(_) => break Err(()),
+            }
+            if self
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission.clone()),
+                    timeout: None,
+                })
+                .is_err()
+            {
+                break rx.try_recv().ok().flatten().ok_or(());
+            }
+        };
+        readback.read(mapped)
     }
 
-    fn scene_hdr_unavailable(&self) -> Result<space3d_core::HdrImageData, RenderError> {
-        // STUB(F4): intermediate groups keep their scene texture for this readback.
-        Err(RenderError::Capture(
-            "the primary target renders in Direct mode: there is no scene texture".into(),
-        ))
+    /// Record and submit the copy of the primary group's `S` into a `MAP_READ` buffer (inside a
+    /// validation error scope, like [`Self::submit_capture`]).
+    #[allow(clippy::type_complexity)]
+    fn submit_scene_capture(
+        &mut self,
+    ) -> Result<
+        (
+            SceneReadback,
+            MapReceiver,
+            wgpu::SubmissionIndex,
+            impl Future<Output = Option<String>> + use<>,
+        ),
+        RenderError,
+    > {
+        let Some(t) = self.frame.intermediate_textures(crate::frame::GroupTarget::Primary) else {
+            return Err(RenderError::Capture(
+                "the primary target rendered in Direct mode (no post camera, render scale 1): there \
+                 is no scene texture"
+                    .into(),
+            ));
+        };
+        let texture = t.scene.clone();
+        let format = texture.format();
+        let (w, h) = (texture.width(), texture.height());
+        let texel = format.block_copy_size(None).unwrap_or(4) as u64;
+        let padded = align_up(w as u64 * texel, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("space3d scene capture"),
+        });
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("space3d scene capture readback"),
+            size: padded * h as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let (tx, rx) = futures::channel::oneshot::channel();
+        encoder.map_buffer_on_submit(&buffer, wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        let submission = self.queue.submit([encoder.finish()]);
+        let error = scope.pop();
+        #[cfg(not(target_arch = "wasm32"))]
+        let error = std::future::ready(futures::FutureExt::now_or_never(error).flatten().map(|e| e.to_string()));
+        #[cfg(target_arch = "wasm32")]
+        let error = async move { error.await.map(|e| e.to_string()) };
+        let readback = SceneReadback {
+            buffer,
+            size: (w, h),
+            padded,
+            format,
+        };
+        Ok((readback, rx, submission, error))
     }
 
     /// Last read-back exposure (stops, incl. compensation) of a post camera
     /// ([`crate::FrameSettings::read_exposure`]).
     pub fn camera_exposure(&self, camera: space3d_core::Entity) -> Option<f32> {
-        let _ = camera; // STUB(P-POST)
-        None
+        self.post.camera_exposure(camera)
     }
 
     /// Forget a camera's temporal post history (auto exposure snaps next frame).
     pub fn reset_post_history(&mut self, camera: space3d_core::Entity) {
-        let _ = camera; // STUB(P-POST)
+        self.post.reset_history(camera);
     }
 
     /// Build pipelines ahead of use (loading screens: WebGL2 links programs at creation, 50–150
@@ -1220,10 +1345,100 @@ impl CaptureReadback {
     }
 }
 
+/// A submitted copy of a scene texture: `MAP_READ` buffer with rows padded to `padded` bytes.
+struct SceneReadback {
+    buffer: wgpu::Buffer,
+    size: (u32, u32),
+    padded: u64,
+    format: wgpu::TextureFormat,
+}
+
+impl SceneReadback {
+    /// Decode the mapped rows into linear float RGBA.
+    fn read(
+        self,
+        mapped: Result<Result<(), wgpu::BufferAsyncError>, ()>,
+    ) -> Result<space3d_core::HdrImageData, RenderError> {
+        mapped
+            .map_err(|()| RenderError::Capture("map callback dropped".into()))?
+            .map_err(|e| RenderError::Capture(e.to_string()))?;
+        let (w, h) = self.size;
+        let view = self
+            .buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| RenderError::Capture(format!("{e:?}")))?;
+        let texel = self.format.block_copy_size(None).unwrap_or(4) as usize;
+        let mut pixels = Vec::with_capacity(w as usize * h as usize);
+        for y in 0..h as usize {
+            let row = &view[y * self.padded as usize..][..w as usize * texel];
+            for p in row.chunks_exact(texel) {
+                pixels.push(decode_texel(self.format, p));
+            }
+        }
+        drop(view);
+        self.buffer.unmap();
+        Ok(space3d_core::HdrImageData::new(w, h, pixels))
+    }
+}
+
+/// Linear RGBA of one texel of a scene-texture format.
+pub(crate) fn decode_texel(format: wgpu::TextureFormat, p: &[u8]) -> [f32; 4] {
+    use crate::instance::f16_to_f32;
+    match format {
+        wgpu::TextureFormat::Rgba16Float => [0, 2, 4, 6].map(|i| f16_to_f32(u16::from_le_bytes([p[i], p[i + 1]]))),
+        wgpu::TextureFormat::Rg11b10Ufloat => {
+            let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+            // Unsigned floats: 5-bit exponent (bias 15), 6- or 5-bit mantissa.
+            let small = |bits: u32, mantissa_bits: u32| {
+                let m = bits & ((1 << mantissa_bits) - 1);
+                let e = bits >> mantissa_bits;
+                let scale = (1u32 << mantissa_bits) as f32;
+                match e {
+                    0 => m as f32 / scale * 2f32.powi(-14),
+                    31 => f32::INFINITY,
+                    e => 2f32.powi(e as i32 - 15) * (1.0 + m as f32 / scale),
+                }
+            };
+            [small(v & 0x7ff, 6), small((v >> 11) & 0x7ff, 6), small(v >> 22, 5), 1.0]
+        }
+        wgpu::TextureFormat::Rgba32Float => {
+            [0, 4, 8, 12].map(|i| f32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]))
+        }
+        f if f.is_srgb() => {
+            let c = |i: usize| crate::components::srgb_to_linear(p[i] as f32 / 255.0);
+            [c(0), c(1), c(2), p[3] as f32 / 255.0]
+        }
+        _ => [0, 1, 2, 3].map(|i| p[i] as f32 / 255.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use space3d_core::MeshData;
+
+    #[test]
+    fn scene_texels_decode() {
+        use crate::instance::f32_to_f16;
+        let half: Vec<u8> = [8.0f32, 0.5, 0.0, 1.0]
+            .iter()
+            .flat_map(|v| f32_to_f16(*v).to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_texel(wgpu::TextureFormat::Rgba16Float, &half),
+            [8.0, 0.5, 0.0, 1.0]
+        );
+        // Rg11b10: 1.0 = exponent 15, mantissa 0; 8.0 = exponent 18; 0.5 = exponent 14.
+        let packed = (15u32 << 6) | ((18u32 << 6) << 11) | ((14u32 << 5) << 22);
+        assert_eq!(
+            decode_texel(wgpu::TextureFormat::Rg11b10Ufloat, &packed.to_le_bytes()),
+            [1.0, 8.0, 0.5, 1.0]
+        );
+        let srgb = decode_texel(wgpu::TextureFormat::Rgba8UnormSrgb, &[255, 0, 188, 128]);
+        assert!((srgb[0] - 1.0).abs() < 1e-6 && srgb[1] == 0.0 && (srgb[2] - 0.5).abs() < 0.01);
+        assert!((srgb[3] - 128.0 / 255.0).abs() < 1e-6);
+    }
 
     fn renderer() -> Option<Renderer> {
         match pollster::block_on(Renderer::new_headless(16, 16)) {

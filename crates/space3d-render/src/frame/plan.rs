@@ -1,18 +1,29 @@
-//! Frame planning: the frame's cameras in render order and their viewports in whole pixels.
-//!
-//! Grows into target groups, frame modes, post groups and view roles (graphics spec §1.3).
+//! Frame planning (graphics spec §1.3): the frame's cameras in render order, their viewports in
+//! whole pixels, and the frame plan — target groups, frame modes, post groups and view roles.
 
 use super::FrameState;
-use crate::components::Camera3d;
+use crate::assets::RenderAssets;
+use crate::caps::GraphicsCaps;
+use crate::components::{Camera3d, RenderTarget};
+use crate::handles::TextureHandle;
+use crate::node::{FrameMode, ViewRole};
+use crate::output::{OutputEncoding, Tonemapper};
+use crate::post::api::PostProcess;
+use crate::settings::{CameraFrame, FrameSettings, HdrMode, RenderTargetFormat};
 use glam::{Mat4, Vec4};
 use space3d_core::{Entity, GlobalTransform, World};
+use std::ops::Range;
 
 #[derive(Clone, Copy)]
 pub(super) struct CameraItem {
     pub(super) order: i32,
     pub(super) entity: u64,
+    pub(super) id: Entity,
     pub(super) camera: Camera3d,
     pub(super) transform: Mat4,
+    /// The camera's `PostProcess`, when it has one that is enabled.
+    pub(super) post: Option<PostProcess>,
+    pub(super) frame: Option<CameraFrame>,
 }
 
 impl FrameState {
@@ -20,17 +31,395 @@ impl FrameState {
     pub(super) fn collect_cameras(&mut self, world: &World) {
         let f = self;
         f.cameras.clear();
-        for (e, cam, gt) in world.query::<(Entity, &Camera3d, &GlobalTransform)>().iter() {
+        let mut query = world.query::<(
+            Entity,
+            &Camera3d,
+            &GlobalTransform,
+            Option<&PostProcess>,
+            Option<&CameraFrame>,
+        )>();
+        for (e, cam, gt, post, frame) in query.iter() {
             if cam.active {
                 f.cameras.push(CameraItem {
                     order: cam.order,
                     entity: e.to_bits().get(),
+                    id: e,
                     camera: *cam,
                     transform: gt.0,
+                    post: post.filter(|p| p.enabled).copied(),
+                    frame: frame.copied(),
                 });
             }
         }
         f.cameras.sort_unstable_by_key(|c| (c.order, c.entity));
+    }
+}
+
+/// What a target group renders into: the primary target (window or offscreen) or a render
+/// target texture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GroupTarget {
+    Primary,
+    Texture(TextureHandle),
+}
+
+/// The display target `D` of the primary group this frame.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PrimaryDisplay {
+    pub(super) size: (u32, u32),
+    pub(super) format: wgpu::TextureFormat,
+    pub(super) samples: u32,
+    /// The target has no sRGB format or view: shaders encode sRGB themselves.
+    pub(super) manual_srgb: bool,
+}
+
+/// All views of one render target this frame (graphics spec §1.3).
+#[derive(Clone, Debug)]
+pub(crate) struct TargetGroup {
+    pub(super) target: GroupTarget,
+    pub(super) mode: FrameMode,
+    /// Index (in `FrameState::cameras`) of the lead camera: the highest-order post camera, else
+    /// the group's first camera.
+    pub(super) lead: usize,
+    /// The display target `D`: size, color format, samples of its own attachments, and whether
+    /// shaders encode sRGB into it.
+    pub(super) display_size: (u32, u32),
+    pub(super) display_format: wgpu::TextureFormat,
+    pub(super) display_samples: u32,
+    pub(super) manual_srgb: bool,
+    /// Scene color `S` of intermediate groups (`display_*` in Direct mode).
+    pub(super) scene_format: wgpu::TextureFormat,
+    pub(super) scene_size: (u32, u32),
+    /// Samples of the scene passes (into `S`, or into `D` in Direct mode).
+    pub(super) samples: u32,
+    pub(super) scale: f32,
+    /// Render-target group whose lead clears with alpha below 1: the composite keeps alpha.
+    pub(super) transparent: bool,
+    /// This frame's post groups (`FrameState::post_groups`), in settings-camera order.
+    pub(super) post_groups: Range<usize>,
+    /// Some view of the group is a display view.
+    pub(super) display_views: bool,
+    /// The view (index in `FrameState::views`) after whose pass the group is finished: its
+    /// last scene view.
+    pub(super) last_scene_view: Option<usize>,
+}
+
+impl TargetGroup {
+    pub(super) fn intermediate(&self) -> bool {
+        self.mode != FrameMode::Direct
+    }
+}
+
+/// One post group (graphics spec §1.3): a rect of an intermediate target group with a post
+/// camera, or the implicit full-target group of an Ldr passthrough group.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FramePostGroup {
+    pub(super) group: usize,
+    /// Settings camera (index in `FrameState::cameras`).
+    pub(super) camera: usize,
+    pub(super) settings: PostProcess,
+    pub(super) passthrough: bool,
+    /// The rect in `D` and in `S`, unclipped.
+    pub(super) display_rect: ViewportRect,
+    pub(super) scene_rect: ViewportRect,
+    /// How the group's scene views encode their color into `S`.
+    pub(super) scene_output: OutputEncoding,
+    /// For `Tonemapped` scene views: linear exposure multiplier and operator.
+    pub(super) exposure: f32,
+    pub(super) tonemapper: Tonemapper,
+}
+
+/// Plan of one camera this frame.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CameraPlan {
+    /// Index in `FrameState::groups`, `None` for a camera that is skipped (its render target is
+    /// not created).
+    pub(super) group: Option<usize>,
+    pub(super) role: ViewRole,
+    /// The post group a scene view renders for.
+    pub(super) post_group: Option<usize>,
+}
+
+/// Warnings logged once per renderer.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PlanWarnings {
+    hdr_target_post: bool,
+    camera_frame_ignored: bool,
+    hdr_msaa: bool,
+}
+
+/// The display target of a render-target camera: `(size, format, samples)`, `None` while the
+/// target is not created.
+fn texture_display(assets: &RenderAssets, h: TextureHandle) -> Option<((u32, u32), wgpu::TextureFormat, u32, bool)> {
+    let e = assets.textures.get(h.raw())?;
+    let g = e.gpu.as_ref()?;
+    g.target_view.as_ref()?;
+    g.depth_view.as_ref()?;
+    let hdr = e.target_desc.is_some_and(|d| d.format == RenderTargetFormat::Hdr) && !g.format.is_srgb();
+    Some(((e.width, e.height), g.format, g.samples, hdr))
+}
+
+/// The full rect of a `size` target.
+pub(super) fn full_rect(size: (u32, u32)) -> ViewportRect {
+    ViewportRect {
+        x: 0,
+        y: 0,
+        w: size.0,
+        h: size.1,
+    }
+}
+
+/// A camera's rect on a `size` target (the whole target without a viewport).
+pub(super) fn camera_rect(camera: &Camera3d, size: (u32, u32)) -> ViewportRect {
+    camera.viewport.map_or(full_rect(size), |v| viewport_rect(v, size))
+}
+
+/// Scene size of a `display` target at render scale `scale`.
+pub(super) fn scaled_size(display: (u32, u32), scale: f32) -> (u32, u32) {
+    if scale >= 1.0 {
+        return display;
+    }
+    let s = |v: u32| ((v as f32 * scale).round() as u32).max(1);
+    (s(display.0), s(display.1))
+}
+
+impl FrameState {
+    /// Plan the frame (graphics spec §1.3): assign every camera to its target group, choose each
+    /// group's mode, scene format, samples and render scale, build the post groups and give
+    /// every camera its role. Reuses the plan vectors (no allocation in the steady state).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_frame(
+        &mut self,
+        assets: &RenderAssets,
+        primary: PrimaryDisplay,
+        settings: &FrameSettings,
+        graphics: &GraphicsCaps,
+        max_msaa: u32,
+        warnings: &mut PlanWarnings,
+    ) {
+        let f = self;
+        f.groups.clear();
+        f.post_groups.clear();
+        f.camera_plans.clear();
+        // Groups in order of their first camera; every camera's group.
+        for ci in 0..f.cameras.len() {
+            let target = match f.cameras[ci].camera.target {
+                RenderTarget::Primary => Some((
+                    GroupTarget::Primary,
+                    primary.size,
+                    primary.format,
+                    primary.samples,
+                    false,
+                )),
+                RenderTarget::Texture(h) => texture_display(assets, h)
+                    .map(|(size, format, samples, hdr)| (GroupTarget::Texture(h), size, format, samples, hdr)),
+            };
+            let Some((target, size, format, samples, hdr)) = target else {
+                f.camera_plans.push(CameraPlan {
+                    group: None,
+                    role: ViewRole::Scene,
+                    post_group: None,
+                });
+                continue;
+            };
+            let group = match f.groups.iter().position(|g| g.target == target) {
+                Some(g) => g,
+                None => {
+                    f.groups.push(TargetGroup {
+                        target,
+                        mode: FrameMode::Direct,
+                        lead: ci,
+                        display_size: size,
+                        display_format: format,
+                        display_samples: samples,
+                        manual_srgb: target == GroupTarget::Primary && primary.manual_srgb,
+                        scene_format: format,
+                        scene_size: size,
+                        samples,
+                        scale: 1.0,
+                        transparent: false,
+                        post_groups: 0..0,
+                        display_views: false,
+                        last_scene_view: None,
+                    });
+                    f.groups.len() - 1
+                }
+            };
+            // Post on cameras rendering into HDR render targets is ignored (graphics spec D16).
+            if hdr && f.cameras[ci].post.is_some() {
+                if !warnings.hdr_target_post {
+                    warnings.hdr_target_post = true;
+                    tracing::warn!(
+                        "PostProcess on a camera rendering into an HDR render target is ignored: HDR \
+                         targets keep linear radiance (post runs in the camera that samples them)"
+                    );
+                }
+                f.cameras[ci].post = None;
+            }
+            if !settings.post {
+                f.cameras[ci].post = None;
+            }
+            // The highest-order post camera leads its group.
+            if f.cameras[ci].post.is_some() {
+                f.groups[group].lead = ci;
+            }
+            f.camera_plans.push(CameraPlan {
+                group: Some(group),
+                role: ViewRole::Scene,
+                post_group: None,
+            });
+        }
+
+        for g in 0..f.groups.len() {
+            let lead = f.cameras[f.groups[g].lead];
+            let primary_group = f.groups[g].target == GroupTarget::Primary;
+            let hdr_target = match f.groups[g].target {
+                GroupTarget::Texture(h) => texture_display(assets, h).is_some_and(|t| t.3),
+                GroupTarget::Primary => false,
+            };
+            // Differing `CameraFrame`s of other cameras of the group are ignored.
+            if !warnings.camera_frame_ignored {
+                let ignored = (0..f.cameras.len()).any(|c| {
+                    f.camera_plans[c].group == Some(g)
+                        && c != f.groups[g].lead
+                        && f.cameras[c].frame.is_some_and(|fr| Some(fr) != lead.frame)
+                });
+                if ignored {
+                    warnings.camera_frame_ignored = true;
+                    tracing::warn!(
+                        "a CameraFrame differs from its target group's lead camera (the highest-order \
+                         post camera, else the first): only the lead's applies"
+                    );
+                }
+            }
+            let has_post =
+                (0..f.cameras.len()).any(|c| f.camera_plans[c].group == Some(g) && f.cameras[c].post.is_some());
+            let scale = match lead.frame.and_then(|fr| fr.render_scale) {
+                Some(s) => s,
+                None if primary_group => settings.render_scale,
+                None => 1.0,
+            };
+            let scale = if hdr_target || !scale.is_finite() {
+                1.0
+            } else {
+                scale.clamp(0.25, 1.0)
+            };
+            let hdr_mode = lead.frame.map_or(HdrMode::Auto, |fr| fr.hdr);
+            let lead_alpha = lead.camera.clear_color.map_or(1.0, |c| c.w);
+            let group = &mut f.groups[g];
+            group.scale = scale;
+            group.transparent = !primary_group && lead_alpha < 1.0;
+            let mut samples = group.display_samples.min(max_msaa.max(1));
+            let (mode, format) = if !has_post && scale >= 1.0 {
+                (FrameMode::Direct, group.display_format)
+            } else if !has_post {
+                (FrameMode::Ldr, wgpu::TextureFormat::Rgba8UnormSrgb)
+            } else if hdr_mode != HdrMode::Ldr
+                && let Some(hdr) = graphics.hdr_format
+            {
+                if samples > 1 && !graphics.hdr_msaa {
+                    if !warnings.hdr_msaa {
+                        warnings.hdr_msaa = true;
+                        tracing::warn!(
+                            "the HDR scene format cannot be multisampled on this device: HDR groups \
+                             render with 1 sample"
+                        );
+                    }
+                    samples = 1;
+                }
+                // Compact HDR has no alpha: opaque-cleared primary targets only, and single-sample
+                // (its multisampling is not probed).
+                let compact = hdr_mode == HdrMode::Compact && primary_group && lead_alpha >= 1.0 && samples == 1;
+                match graphics.compact_hdr_format {
+                    Some(c) if compact => (FrameMode::Hdr, c),
+                    _ => (FrameMode::Hdr, hdr),
+                }
+            } else {
+                (FrameMode::Ldr, wgpu::TextureFormat::Rgba8UnormSrgb)
+            };
+            group.mode = mode;
+            if mode == FrameMode::Direct {
+                continue;
+            }
+            group.scene_format = format;
+            group.scene_size = scaled_size(group.display_size, scale);
+            group.samples = samples;
+            // Post groups: one per distinct rect with a post camera, its settings camera the
+            // rect's highest-order post camera; in settings-camera order.
+            let start = f.post_groups.len();
+            let (display_size, scene_size) = (group.display_size, group.scene_size);
+            if !has_post {
+                // Ldr passthrough: one implicit full-target group, every view a scene view.
+                let lead_index = group.lead;
+                f.post_groups.push(FramePostGroup {
+                    group: g,
+                    camera: lead_index,
+                    settings: PostProcess::passthrough(),
+                    passthrough: true,
+                    display_rect: full_rect(display_size),
+                    scene_rect: full_rect(scene_size),
+                    scene_output: OutputEncoding::Linear,
+                    exposure: 1.0,
+                    tonemapper: Tonemapper::None,
+                });
+            } else {
+                for c in 0..f.cameras.len() {
+                    if f.camera_plans[c].group != Some(g) {
+                        continue;
+                    }
+                    let Some(post) = f.cameras[c].post else { continue };
+                    let display_rect = camera_rect(&f.cameras[c].camera, display_size);
+                    let (scene_output, exposure, tonemapper) = if mode == FrameMode::Hdr {
+                        (OutputEncoding::Linear, 1.0, post.tonemapper)
+                    } else {
+                        (OutputEncoding::Tonemapped, post.exposure.exp2(), post.tonemapper)
+                    };
+                    let pg = FramePostGroup {
+                        group: g,
+                        camera: c,
+                        settings: post,
+                        passthrough: false,
+                        display_rect,
+                        scene_rect: camera_rect(&f.cameras[c].camera, scene_size),
+                        scene_output,
+                        exposure,
+                        tonemapper,
+                    };
+                    match f.post_groups[start..]
+                        .iter_mut()
+                        .find(|p| p.display_rect == display_rect)
+                    {
+                        Some(existing) => *existing = pg,
+                        None => f.post_groups.push(pg),
+                    }
+                }
+                f.post_groups[start..].sort_unstable_by_key(|p| p.camera);
+            }
+            let end = f.post_groups.len();
+            f.groups[g].post_groups = start..end;
+            // Roles: a view of a post group's rect up to its settings camera renders into `S`
+            // for it; every other view of the group is a display view.
+            for c in 0..f.cameras.len() {
+                if f.camera_plans[c].group != Some(g) {
+                    continue;
+                }
+                let rect = camera_rect(&f.cameras[c].camera, display_size);
+                let pg = (start..end).find(|&p| {
+                    let p = &f.post_groups[p];
+                    p.passthrough || (p.display_rect == rect && c <= p.camera)
+                });
+                let plan = &mut f.camera_plans[c];
+                plan.post_group = pg;
+                plan.role = if pg.is_some() {
+                    ViewRole::Scene
+                } else {
+                    ViewRole::Display
+                };
+                if pg.is_none() {
+                    f.groups[g].display_views = true;
+                }
+            }
+        }
     }
 }
 

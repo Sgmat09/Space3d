@@ -1,17 +1,181 @@
-//! Frame-owned textures: copies of render targets that views sample while drawing into them.
-//!
-//! Grows into the per-group scene targets and the texture pool (graphics spec §2.6).
+//! Frame-owned textures: the scene textures of intermediate target groups (graphics spec
+//! §1.3), copies of render targets that views sample while drawing into them, and the texture
+//! pool (§2.6).
 
+use super::plan::GroupTarget;
 use super::views::ViewTarget;
 use super::{FrameState, uniform_binding};
 use crate::assets::RenderAssets;
-use crate::pipeline::{GpuMaterial, OFFSCREEN_FORMAT, Pipelines};
+use crate::node::FrameMode;
+use crate::pipeline::{DEPTH_FORMAT, GpuMaterial, Pipelines};
+use crate::stats::RenderStats;
+
+/// What an intermediate group's textures are made for: equal keys reuse the textures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct GroupKey {
+    pub(super) scene_size: (u32, u32),
+    pub(super) format: wgpu::TextureFormat,
+    pub(super) samples: u32,
+    /// Size of the 1-sample depth of display views, if the group has any.
+    pub(super) display: Option<(u32, u32)>,
+}
+
+/// Textures of an intermediate target group: the scene color `S` (1 sample, sampled by the
+/// composite, `COPY_SRC` for `capture_scene_hdr`), its multisampled twin, the group depth
+/// (scene size and samples) and the 1-sample depth display views draw with into `D`. They are
+/// (re)created only while planning a frame whose key changed, so a capture between frames reads
+/// the last frame's `S`.
+pub(crate) struct GroupTextures {
+    pub(super) key: GroupKey,
+    pub(crate) scene: wgpu::Texture,
+    pub(super) scene_view: wgpu::TextureView,
+    pub(super) scene_msaa: Option<wgpu::TextureView>,
+    pub(super) depth: wgpu::TextureView,
+    pub(super) display_depth: Option<wgpu::TextureView>,
+    /// Unique per creation: bind groups sampling `S` are cached by it.
+    pub(super) generation: u64,
+    pub(super) last_used: u64,
+    /// Bytes of all these textures.
+    pub(super) bytes: u64,
+    /// Mode the group rendered in when last planned.
+    pub(super) mode: FrameMode,
+}
+
+fn texture_bytes(format: wgpu::TextureFormat, (w, h): (u32, u32), samples: u32) -> u64 {
+    let texel = format.block_copy_size(None).unwrap_or(4) as u64;
+    texel * w as u64 * h as u64 * samples as u64
+}
+
+impl GroupTextures {
+    fn new(device: &wgpu::Device, key: GroupKey, msaa_depth_binding: bool, generation: u64) -> Self {
+        use wgpu::TextureUsages as U;
+        let texture = |label, format, (width, height): (u32, u32), samples, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let size = key.scene_size;
+        let scene = texture(
+            "space3d scene color",
+            key.format,
+            size,
+            1,
+            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING | U::COPY_SRC,
+        );
+        let scene_msaa = (key.samples > 1).then(|| {
+            texture(
+                "space3d scene color (msaa)",
+                key.format,
+                size,
+                key.samples,
+                U::RENDER_ATTACHMENT,
+            )
+            .create_view(&Default::default())
+        });
+        // Sampleable at 1 sample, multisampled only where it can be resolved (spec §1.6).
+        let depth_usage = if key.samples == 1 || msaa_depth_binding {
+            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING
+        } else {
+            U::RENDER_ATTACHMENT
+        };
+        let depth = texture("space3d scene depth", DEPTH_FORMAT, size, key.samples, depth_usage);
+        let display_depth = key.display.map(|d| {
+            texture(
+                "space3d display depth",
+                DEPTH_FORMAT,
+                d,
+                1,
+                U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+            )
+            .create_view(&Default::default())
+        });
+        let mut bytes = texture_bytes(key.format, size, 1) + texture_bytes(DEPTH_FORMAT, size, key.samples);
+        if key.samples > 1 {
+            bytes += texture_bytes(key.format, size, key.samples);
+        }
+        if let Some(d) = key.display {
+            bytes += texture_bytes(DEPTH_FORMAT, d, 1);
+        }
+        Self {
+            key,
+            scene_view: scene.create_view(&Default::default()),
+            scene,
+            scene_msaa,
+            depth: depth.create_view(&Default::default()),
+            display_depth,
+            generation,
+            last_used: 0,
+            bytes,
+            mode: FrameMode::Direct,
+        }
+    }
+}
+
+impl FrameState {
+    /// The textures of every intermediate group of this frame's plan, created where missing or
+    /// made for another key (only here, at the start of a frame). Textures of groups not
+    /// planned for 3 frames are freed. Counts `textures_created` and `target_bytes`.
+    pub(super) fn prepare_group_textures(
+        &mut self,
+        device: &wgpu::Device,
+        frame_index: u64,
+        msaa_depth_binding: bool,
+        stats: &mut RenderStats,
+    ) {
+        let f = self;
+        for g in &f.groups {
+            if let Some(t) = f.group_textures.get_mut(&g.target)
+                && !g.intermediate()
+            {
+                t.mode = FrameMode::Direct;
+            }
+            if !g.intermediate() {
+                continue;
+            }
+            let key = GroupKey {
+                scene_size: g.scene_size,
+                format: g.scene_format,
+                samples: g.samples,
+                display: g.display_views.then_some(g.display_size),
+            };
+            let entry = f.group_textures.get(&g.target);
+            if entry.is_none_or(|t| t.key != key) {
+                f.texture_generation += 1;
+                let t = GroupTextures::new(device, key, msaa_depth_binding, f.texture_generation);
+                stats.textures_created += 2 + (key.samples > 1) as u32 + key.display.is_some() as u32;
+                f.group_textures.insert(g.target, t);
+            }
+            let t = f.group_textures.get_mut(&g.target).expect("inserted");
+            t.last_used = frame_index;
+            t.mode = g.mode;
+            stats.target_bytes += t.bytes;
+        }
+        f.group_textures.retain(|_, t| t.last_used + 3 > frame_index);
+    }
+
+    /// The last frame's textures of `target`'s group, if it rendered through a scene texture.
+    pub(crate) fn intermediate_textures(&self, target: GroupTarget) -> Option<&GroupTextures> {
+        self.group_textures.get(&target).filter(|t| t.mode != FrameMode::Direct)
+    }
+}
 
 /// Copy of a render target sampled by materials drawn into that same target.
 pub(super) struct Feedback {
     /// `TextureEntry::version` of the render target it was created for.
     pub(super) version: u32,
     pub(super) size: (u32, u32),
+    pub(super) format: wgpu::TextureFormat,
     pub(super) texture: wgpu::Texture,
     pub(super) view: wgpu::TextureView,
     /// Material bind group sampling `view` (and the materials buffer generation it binds).
@@ -48,7 +212,7 @@ impl FrameState {
             let size = (e.width, e.height);
             let fb = match f.feedback.entry(handle) {
                 std::collections::hash_map::Entry::Occupied(o)
-                    if o.get().version == e.version && o.get().size == size =>
+                    if o.get().version == e.version && o.get().size == size && o.get().format == g.format =>
                 {
                     o.into_mut()
                 }
@@ -63,7 +227,7 @@ impl FrameState {
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
-                        format: OFFSCREEN_FORMAT,
+                        format: g.format,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                         view_formats: &[],
                     });
@@ -74,6 +238,7 @@ impl FrameState {
                     let fresh = Feedback {
                         version: e.version,
                         size,
+                        format: g.format,
                         texture,
                         view,
                         bind_group: None,
@@ -155,10 +320,6 @@ struct PoolEntry {
 /// post group that acquired them and evicted after 3 frames without use. The steady state
 /// creates none.
 #[derive(Default)]
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-)]
 pub(crate) struct TexturePool {
     entries: Vec<PoolEntry>,
     frame: u64,

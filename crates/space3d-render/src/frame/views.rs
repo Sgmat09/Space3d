@@ -11,6 +11,7 @@ use crate::culling::{Aabb, Frustum, Sphere};
 use crate::gpu::align_up;
 use crate::handles::TextureHandle;
 use crate::instance::{CULL_BLOCK, CullBounds, CullFloat, CullSource, InstanceBuffers, ScaleKind};
+use crate::node::ViewRole;
 use crate::output::{OutputEncoding, Tonemapper};
 use crate::pipeline::{
     CULL_VIEWS, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuFrustum, GpuPointLight, GpuView,
@@ -88,25 +89,38 @@ pub(super) fn select_point_lights(
 }
 
 #[derive(Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "kept in the reused `FrameState::views`: boxing would allocate every frame"
+)]
 pub(crate) enum ViewTarget {
     Primary,
     Texture {
         handle: TextureHandle,
         color: wgpu::TextureView,
         depth: wgpu::TextureView,
+        /// Multisampled color resolved into `color` (`RenderTargetDesc::samples > 1`).
+        msaa: Option<wgpu::TextureView>,
+        format: wgpu::TextureFormat,
+        samples: u32,
     },
 }
 
 #[derive(Clone)]
 pub(crate) struct ViewData {
     pub(super) target: ViewTarget,
+    /// The view's target group (`FrameState::groups`) and its role there.
+    pub(super) group: usize,
+    pub(super) role: ViewRole,
     /// How the view's fragments encode their color (the pipelines' `S3D_OUTPUT`). A capture
     /// replay into the offscreen target draws `ManualSrgb` views as `Linear`.
     pub(super) output: OutputEncoding,
     pub(super) clear: Option<Vec4>,
-    /// The camera's viewport in whole pixels of the target, as drawn (see
-    /// [`ViewportRect::fitted`]); `None` = the whole target.
+    /// The camera's viewport in whole pixels of the texture the view renders into (`S` for
+    /// scene views of intermediate groups, else `D`), as drawn (see [`ViewportRect::fitted`]);
+    /// `None` = the whole texture.
     pub(super) rect: Option<ViewportRect>,
+    /// Size of that texture.
     pub(super) size: (u32, u32),
     pub(super) view_offset: u32,
     pub(super) draws: Range<usize>,
@@ -290,8 +304,6 @@ impl FrameState {
         buffers: &mut InstanceBuffers,
         lights: &SceneLights,
         ambient: AmbientLight,
-        primary_size: (u32, u32),
-        primary_output: OutputEncoding,
         culling: bool,
         stats: &mut RenderStats,
         reallocs: &mut u32,
@@ -332,31 +344,46 @@ impl FrameState {
 
         for ci in 0..f.cameras.len() {
             let cam = f.cameras[ci];
-            let (target, size) = match cam.camera.target {
-                RenderTarget::Primary => (ViewTarget::Primary, primary_size),
+            let plan = f.camera_plans[ci];
+            let Some(gi) = plan.group else {
+                continue;
+            };
+            let target = match cam.camera.target {
+                RenderTarget::Primary => ViewTarget::Primary,
                 RenderTarget::Texture(h) => {
-                    let Some(e) = assets.textures.get(h.raw()) else {
-                        continue;
-                    };
-                    let Some(gpu) = &e.gpu else {
+                    let Some(gpu) = assets.textures.get(h.raw()).and_then(|e| e.gpu.as_ref()) else {
                         continue;
                     };
                     let (Some(color), Some(depth)) = (&gpu.target_view, &gpu.depth_view) else {
                         continue;
                     };
-                    (
-                        ViewTarget::Texture {
-                            handle: h,
-                            color: color.clone(),
-                            depth: depth.clone(),
-                        },
-                        (e.width, e.height),
-                    )
+                    ViewTarget::Texture {
+                        handle: h,
+                        color: color.clone(),
+                        depth: depth.clone(),
+                        msaa: gpu.msaa_view.clone(),
+                        format: gpu.format,
+                        samples: gpu.samples,
+                    }
                 }
             };
-            let rect = cam.camera.viewport.map(|v| viewport_rect(v, size));
-            let (vw, vh) = rect.map_or((size.0 as f32, size.1 as f32), |r| (r.w as f32, r.h as f32));
+            let group = &f.groups[gi];
+            let display_size = group.display_size;
+            // Scene views of intermediate groups render into the group's scene texture `S`;
+            // Direct views and display views into the display target `D`.
+            let scene = group.intermediate() && plan.role == ViewRole::Scene;
+            let size = if scene { group.scene_size } else { display_size };
+            // The aspect of the view's rect in `D` (`S` is stretched back onto it).
+            let display_rect = cam.camera.viewport.map(|v| viewport_rect(v, display_size));
+            let (vw, vh) = display_rect.map_or((display_size.0 as f32, display_size.1 as f32), |r| {
+                (r.w as f32, r.h as f32)
+            });
             let aspect = (vw / vh.max(1.0)).max(1e-4);
+            let rect = if scene {
+                cam.camera.viewport.map(|v| viewport_rect(v, size))
+            } else {
+                display_rect
+            };
             // A viewport past wgpu's viewport limits is drawn through its part within the target,
             // with a projection showing the same pixels there.
             let (rect, fit) = match rect {
@@ -371,14 +398,24 @@ impl FrameState {
             let view_proj = proj * camera_view;
             let frustum = Frustum::from_view_proj(&view_proj);
             let view_offset = f.views.len() * view_stride;
-            let output = match target {
-                ViewTarget::Primary => primary_output,
-                ViewTarget::Texture { .. } => OutputEncoding::Linear,
+            // How fragments encode their color, and the clear color in that encoding.
+            let pg = plan.post_group.filter(|_| scene).map(|p| f.post_groups[p]);
+            let (output, exposure, tonemapper) = match pg {
+                Some(pg) => (pg.scene_output, pg.exposure, pg.tonemapper),
+                None if group.manual_srgb => (OutputEncoding::ManualSrgb, 1.0, Tonemapper::None),
+                None => (OutputEncoding::Linear, 1.0, Tonemapper::None),
+            };
+            let clear = match cam.camera.clear_color {
+                // The Ldr fallback tonemaps per fragment: so do clears, on the CPU.
+                Some(c) if output == OutputEncoding::Tonemapped => {
+                    Some(tonemapper.apply(c.truncate() * exposure).extend(c.w))
+                }
+                c => c,
             };
             #[cfg(test)]
-            let (output, forced) = match f.force_output {
-                Some((o, exposure, tonemapper)) => (o, Some((exposure, tonemapper))),
-                None => (output, None),
+            let (output, exposure, tonemapper) = match f.force_output {
+                Some(forced) => forced,
+                None => (output, exposure, tonemapper),
             };
             let mut gv = GpuView::zeroed();
             gv.view_proj = view_proj.to_cols_array_2d();
@@ -393,8 +430,7 @@ impl FrameState {
             );
             gv.counts = [nd as u32, np as u32, 0, 0];
             write_view_info(&mut gv, &cam.camera.projection, camera_view, proj, rect, size, output);
-            #[cfg(test)]
-            if let Some((exposure, tonemapper)) = forced {
+            if output == OutputEncoding::Tonemapped {
                 gv.exposure = [exposure, exposure.log2(), 0.0, 0.0];
                 gv.output[1] = tonemapper.id();
             }
@@ -660,16 +696,22 @@ impl FrameState {
                 }
             }
 
+            // (Scene views write `S`: they sample their render target directly.)
             let feedback = match &target {
-                ViewTarget::Texture { handle, .. } => f.draws[draws_start..]
+                ViewTarget::Texture { handle, .. } if !scene => f.draws[draws_start..]
                     .iter()
                     .any(|d| f.materials.texture(d.material) == Some(*handle)),
-                ViewTarget::Primary => false,
+                _ => false,
             };
+            if scene {
+                f.groups[gi].last_scene_view = Some(f.views.len());
+            }
             f.views.push(ViewData {
                 target,
+                group: gi,
+                role: plan.role,
                 output,
-                clear: cam.camera.clear_color,
+                clear,
                 rect,
                 size,
                 view_offset: view_offset as u32,
