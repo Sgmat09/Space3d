@@ -19,7 +19,7 @@ use space3d::render::{FrameSettings, HdrMode, RenderTargetDesc};
 app.world.spawn((
     Transform::from_xyz(0.0, 2.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
     Camera3d::default(),
-    PostProcess::default()            // AgX, exposure 0, dither on
+    PostProcess::default()            // AgX, exposure 0, Bloom::glow(), dither on
         .with_exposure(0.5)           // stops: radiance × 2^0.5
         .with_tonemapper(Tonemapper::AcesFitted),
 ));
@@ -45,9 +45,12 @@ Switches: `PostProcess::enabled` per camera, `FrameSettings::post` for all camer
 menus, A/B comparisons). With either off the camera renders as if it had no `PostProcess`.
 
 The composite dithers by default (±1 LSB, seeded by `Time::frame`: `render_to_image` twice gives
-the same image; `dither: false` turns it off). Bloom, auto exposure, FXAA, vignette, chromatic
-aberration, film grain, color grading and distortion are configured on the same `PostProcess`
-and arrive with the post milestones.
+the same image; `dither: false` turns it off). Bloom (`Bloom::glow()` by default), FXAA,
+vignette, chromatic aberration and film grain are configured on the same `PostProcess`
+(`docs/graphics/post.md`); auto exposure, color grading and distortion arrive with the remaining
+post milestones. Whatever is drawn into the HDR scene texture feeds bloom: emissive materials,
+render nodes in the scene phases, `OverlayStage::HdrScene` overlays and particles (the
+`Engine/Frame/Particles Bloom` story: additive sprites above the threshold glow, dim ones do not).
 
 ## Scene storage: `CameraFrame::hdr`
 

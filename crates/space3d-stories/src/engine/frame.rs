@@ -1,9 +1,12 @@
 //! Frame stories (`Engine/Frame/*`): HDR and tonemapping, render scale, multiple cameras, the LDR
-//! fallback, node phases, scene depth and overlay stages.
+//! fallback, node phases, scene depth, overlay stages and (feature `particles`) particles feeding
+//! bloom.
 //!
 //! Owner: F (graphics spec §3.6).
 
 mod demo;
+#[cfg(feature = "particles")]
+mod particle_bloom;
 
 use super::{ambient, mesh, palette, sun};
 use crate::{KnobValues, Story};
@@ -17,7 +20,8 @@ use space3d_render::{
 
 /// This area's stories, in registry order.
 pub(crate) fn stories() -> Vec<Story> {
-    vec![
+    #[allow(unused_mut)]
+    let mut stories = vec![
         hdr_tonemapping(),
         render_scale(),
         multi_camera(),
@@ -25,7 +29,10 @@ pub(crate) fn stories() -> Vec<Story> {
         node_phases(),
         soft_depth(),
         overlay_stages(),
-    ]
+    ];
+    #[cfg(feature = "particles")]
+    stories.push(particle_bloom::particles_bloom());
+    stories
 }
 
 const TONEMAPPERS: [&str; 5] = [
