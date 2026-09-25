@@ -560,6 +560,10 @@ pub struct SpriteRender {
     pub order: i16,
     /// Color or distortion. Default `Color`.
     pub target: SpriteTarget,
+    /// Largest on-screen size of a sprite, as a fraction of the viewport height; 0 (the
+    /// default) uses `ParticleSettings::max_screen_size`. For intentionally huge sprites (a
+    /// warp vortex) whose size and timing must not depend on the camera's zoom.
+    pub max_screen_size: f32,
 }
 
 impl Default for SpriteRender {
@@ -577,6 +581,7 @@ impl Default for SpriteRender {
             sort: SortMode::Auto,
             order: 0,
             target: SpriteTarget::Color,
+            max_screen_size: 0.0,
         }
     }
 }

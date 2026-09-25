@@ -16,7 +16,8 @@
 //! `space3d::particles::prelude::*`.
 //!
 //! How it works (design-particles §3, §5):
-//! * [`tick_system`] runs on the fixed tick: it follows every [`ParticleEmitter`] (its `Transform`
+//! * [`tick_system`] runs on the fixed tick, after the tick's gameplay systems
+//!   ([`ParticlesPlugin::TICK_ORDER`]): it follows every [`ParticleEmitter`] (its `Transform`
 //!   through the `Parent` chain), decides the emission of the tick (exact rate accumulators,
 //!   bursts with their sub-tick time) and records it in a tick log. Emission never depends on the
 //!   frame rate.
@@ -70,8 +71,9 @@ pub struct ParticlesPlugin {
     pub settings: ParticleSettings,
     /// Register the built-in effect library (`builtin::*`). Default true.
     pub builtins: bool,
-    /// Register [`tick_system`] in `Stage::FixedUpdate`. Default true; false to place it
-    /// yourself (e.g. after gameplay systems that move emitters).
+    /// Register [`tick_system`] in `Stage::FixedUpdate` at [`Self::TICK_ORDER`] (after the
+    /// gameplay systems of the tick, whenever they were added). Default true; false to place it
+    /// yourself.
     pub tick_system: bool,
 }
 
@@ -86,6 +88,13 @@ impl Default for ParticlesPlugin {
 }
 
 impl ParticlesPlugin {
+    /// Order of [`tick_system`] in `Stage::FixedUpdate` (`App::add_system_ordered`): after the
+    /// systems added with `add_system` / `add_system_named` (order 0), so emission follows every
+    /// emitter to where gameplay moved it this tick. Run earlier, the world-space layers of a
+    /// moving emitter (a bolt's trail) would be laid one tick behind its local-space layers and
+    /// meshes (the bolt's head glow), which draw at the render-time pose.
+    pub const TICK_ORDER: i32 = 1000;
+
     /// The defaults.
     pub fn new() -> Self {
         Self::default()
@@ -124,7 +133,7 @@ impl Plugin for ParticlesPlugin {
             }
         }
         if self.tick_system {
-            app.add_system_named(Stage::FixedUpdate, "particles::tick", tick_system);
+            app.add_system_ordered(Stage::FixedUpdate, Self::TICK_ORDER, "particles::tick", tick_system);
         }
         // The render node (the frame's `RenderNodes` exists with or without a renderer; a
         // `RenderPlugin` added later keeps it).
@@ -252,7 +261,10 @@ pub struct ParticleSettings {
     pub soft_particles: bool,
     /// `1 − e^−x` per channel in `FrameMode::Direct` (no tonemapper there). Default true.
     pub direct_soft_clip: bool,
-    /// Sprite size clamp, as a fraction of the viewport height. Default 0.6.
+    /// Sprite size clamp (fill-rate guard), as a fraction of the viewport height; a layer's
+    /// `SpriteRender::max_screen_size` overrides it. Default 1.0: the built-ins' big layers
+    /// (explosion flash, warp flash) stay unclamped at the top-down framings they are designed
+    /// for, so their size and timing do not change with the zoom.
     pub max_screen_size: f32,
     /// Mixed into every emitter seed (replays, variety). Default 0.
     pub seed: u32,
@@ -275,7 +287,7 @@ impl Default for ParticleSettings {
             extrapolate: true,
             soft_particles: true,
             direct_soft_clip: true,
-            max_screen_size: 0.6,
+            max_screen_size: 1.0,
             seed: 0,
         }
     }
@@ -366,6 +378,69 @@ mod tests {
         let mut app = App::new();
         app.add_plugin(manual);
         assert!(!app.system_names(Stage::FixedUpdate).contains(&"particles::tick"));
+    }
+
+    /// The tick follows emitters to where gameplay systems moved them this tick, even when those
+    /// were added after the plugin (the laser trail's world-space glows end at its local-space
+    /// head instead of one tick behind it).
+    #[test]
+    fn tick_runs_after_gameplay_systems() {
+        let mut app = App::new();
+        app.add_plugin(ParticlesPlugin::default());
+        let bolt = app.world.spawn((Transform::IDENTITY,));
+        app.spawn_effect(builtin::LASER_TRAIL, EffectSpawn::at(Vec3::ZERO).follow(bolt));
+        app.add_system(Stage::FixedUpdate, move |ctx: &mut SystemCtx| {
+            let x = ctx.time().tick as f32 * 25.0 + 25.0;
+            if let Ok(mut t) = ctx.world.get::<&mut Transform>(bolt) {
+                t.translation.x = x;
+            }
+        });
+        assert_eq!(
+            app.system_names(Stage::FixedUpdate).last(),
+            Some(&"particles::tick"),
+            "the tick runs last"
+        );
+        app.step_ticks(4);
+        let bolt_x = app.world.get::<&Transform>(bolt).unwrap().translation.x;
+        assert_eq!(bolt_x, 100.0);
+        let rt = &app.resources.expect::<ParticleRuntime>().rt;
+        let inst = rt
+            .instances
+            .iter()
+            .find(|i| i.live && i.entity != bolt)
+            .expect("instance");
+        assert_eq!(inst.pos.x, bolt_x, "emission follows this tick's pose");
+        assert_eq!(inst.prev_pos.x, bolt_x - 25.0);
+    }
+
+    /// An emitter whose handle has no effect data (a stale handle, `EffectHandle::INVALID`, or
+    /// `builtin::LASER_BEAM` before PA3) plays nothing and finishes: its event is sent once and
+    /// its `FinishAction` runs, so `spawn_effect` entities do not leak.
+    #[test]
+    fn unknown_effect_handles_finish() {
+        let mut app = App::new();
+        app.add_plugin(ParticlesPlugin::default());
+        let beam = app.spawn_effect(builtin::LASER_BEAM, Vec3::ZERO);
+        let invalid = app.spawn_effect(EffectHandle::INVALID, Vec3::ZERO);
+        let kept = app.spawn_effect(builtin::LASER_BEAM, EffectSpawn::at(Vec3::ZERO).keep());
+        let mut reader = EventReader::default();
+        app.step_ticks(1);
+        let finished: Vec<Entity> = reader
+            .read(app.resources.expect::<Events<ParticleEffectFinished>>())
+            .map(|f| f.entity)
+            .collect();
+        assert_eq!(finished.len(), 3, "{finished:?}");
+        assert!(!app.world.contains(beam) && !app.world.contains(invalid));
+        assert!(app.world.contains(kept));
+        let state = app.resources.expect::<ParticleRuntime>().state(kept).unwrap();
+        assert!(state.finished && !state.emitting && state.reserved == 0);
+        app.step_ticks(30);
+        let again = reader
+            .read(app.resources.expect::<Events<ParticleEffectFinished>>())
+            .count();
+        assert_eq!(again, 0, "finished once");
+        assert!(app.world.contains(kept));
+        assert_eq!(app.resources.expect::<ParticleStats>().effects, 0);
     }
 
     #[test]

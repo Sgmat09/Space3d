@@ -110,7 +110,7 @@ place; a changed structure restarts running instances (their old particles drain
 | life | `lifetime`, `particle_delay` (appear later, staggered bursts) |
 | look | `size` + `size_over_life`, `aspect`, `rotation` + `angular_velocity`, `random_mirror`, `color_over_life` (linear HDR gradient), `start_color` (random between two), `alpha_over_life`, `coverage` + `coverage_over_life` (premultiplied), `intensity`, `flicker`, `tinted` |
 | quality | `lod` (quality and distance LOD may reduce counts; bursts keep ≥ 1) |
-| render | `SpriteRender { shape, blend, facing, soft_distance, near_fade, order, sort, target }` |
+| render | `SpriteRender { shape, blend, facing, soft_distance, near_fade, order, sort, target, max_screen_size }` |
 
 Random ranges read `1.0` or `(0.5, 1.0)`. Curves: `Constant`, `Linear(a, b)`, `Keys([...])`,
 `Smooth([...])` (Catmull-Rom) and `Preset(FadeCurve)` — the game's fades `Linear`, `Out`,
@@ -121,10 +121,15 @@ the vertex shader reads, so the CPU never evaluates them per particle.
 
 * **Shapes** (analytic, no textures, crisp at any size — the game's `additive.rs` kinds as
   data): `Glow { core, hardness }` (soft halo, hard disc, white-hot core), `Streak { core, taper }`
-  (a capsule; pair it with `VelocityStretched`), `Ring { thickness, focus, fill }` (focus
-  sharpens it toward the sprite's +X: shield arcs), `Smoke { breakup, hot_core }`,
-  `Vortex { arms, twist }`. `Texture` and flipbooks arrive with PA3 (drawn as a soft glow until
-  then, with a warning).
+  (a capsule whose width and brightness taper toward its tail, with a hot head; pair it with
+  `VelocityStretched`), `Ring { thickness, focus, fill }` (focus sharpens it toward the sprite's
+  +X: shield arcs; the band sits inside the rim, which fades over 1.5 pixels),
+  `Smoke { breakup, hot_core }` (four noise octaves), `Vortex { arms, twist }`. `Texture` and
+  flipbooks arrive with PA3 (drawn as a soft glow until then, with a warning).
+* **Size clamp**: a sprite is at most `ParticleSettings::max_screen_size` of the viewport high
+  (default 1.0, a fill-rate guard); `SpriteRender::max_screen_size` (0 = the setting) raises or
+  lowers it per layer — the warp vortices use 4.0, so their collapse keeps its size and timing
+  at any zoom.
 * **Blends**: one premultiplied equation (`One, OneMinusSrcAlpha`). `Additive` adds light
   (alpha 0), `Alpha` covers by its opacity, `Premultiplied` adds its light *and* covers by a
   separate coverage curve (fire turning into smoke). `ParticleBlend::from_blend_mode` maps the
@@ -162,6 +167,17 @@ values above 1 feed bloom), tonemapped per fragment in the Ldr fallback, sRGB-en
 target needs it. Direct mode has no tonemapper: there each sprite soft-clips with `1 − e^−x`
 (`ParticleSettings::direct_soft_clip`, default on), the game's current look.
 
+**Authoring for HDR.** The built-ins are calibrated for the HDR frame a game with `PostProcess`
+renders (AgX + `Bloom::glow()`, threshold 1): what should glow is authored well above 1 (laser
+trail 5× and head 10× the tint, explosion flash 5, sparks and embers up to 15, fireball 4.5), so
+it blooms and reaches white, and colors keep low off-channels (a red tint of `(1, 0.1, 0.05)`,
+shield blue `(0.12, 0.55, 2.8)`) so AgX desaturates them toward white only where they are
+hottest. Plumes and trails are soft glows without cores or rims (`core` only on heads and
+nozzles), so overlapping chains read as one beam or flame instead of beads. For more saturation
+and contrast in effect-heavy scenes, `Tonemapper::AgXPunchy` (post.md) keeps saturated
+emissives saturated. `Engine/Particles/HDR/*` shows every built-in through `PostProcess::default()`
+(with a `tonemapper` knob); `Engine/Particles/Builtin/*` the same scenes in Direct mode.
+
 ## Built-in effects
 
 `builtin::*` handles are reserved (registered when `ParticlesPlugin::builtins`); the data is RON
@@ -174,18 +190,28 @@ in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's
 | `SHIELD_RIPPLE` | focused arc toward −Z, faint bubble, surface flash, streaks; local-space | `.facing(-bolt_dir).scale(radius / 20).follow(ship)` |
 | `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash, two rings | `EffectSpawn::at(portal)` |
 | `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow; `rate_scale` = throttle | emitter child behind the hull |
-| `LASER_TRAIL` | looping head glow + trail laid per unit of distance | `.follow(bolt).tint(color)` |
-| `LASER_BEAM` | reserved: beams arrive with PA3 | |
+| `LASER_TRAIL` | looping white-hot head + a continuous beam laid per unit of distance | `.follow(bolt).tint(color)` (a saturated tint: `(1, 0.1, 0.05)`) |
+| `LASER_BEAM` | reserved: beams arrive with PA3 (until then an emitter with it plays nothing and finishes at once, warned once) | |
 
-Stories: `Engine/Particles/Builtin/*`, `Engine/Particles/Features/*` and
-`Engine/Particles/Stress/100k` (tag `perf`: 100 000 particles on the GPU backend) in the engine
-storybook (`space3d stories`, the editor's storybook viewer, golden tests).
+An emitter whose handle has no effect data — a removed effect, `EffectHandle::INVALID`, or
+`LASER_BEAM` before PA3 — plays nothing and finishes on its first tick (warned once per
+handle): the `ParticleEffectFinished` event is sent and its `FinishAction` runs, so a
+`spawn_effect` entity is despawned instead of staying forever.
+
+Stories: `Engine/Particles/Builtin/*` (Direct mode), `Engine/Particles/HDR/*` (the same through
+`PostProcess::default()`), `Engine/Particles/Features/*` and `Engine/Particles/Stress/100k` (tag
+`perf`: 100 000 particles on the GPU backend) in the engine storybook (`space3d stories`, the
+editor's storybook viewer, golden tests).
 
 ## Time model and determinism
 
-* `tick_system` runs in `Stage::FixedUpdate` (register it yourself with
-  `ParticlesPlugin { tick_system: false, .. }` to order it after gameplay). It follows emitters,
-  decides each tick's emission — exact 32.32 fixed-point rate accumulators (10/s at 60 Hz is
+* `tick_system` runs in `Stage::FixedUpdate` at `ParticlesPlugin::TICK_ORDER` (1000, through
+  `App::add_system_ordered`): after every system added with `add_system` / `add_system_named`,
+  whenever they were added, so it sees where gameplay moved each emitter this tick. (Run before
+  the movement, a fast emitter's world-space layers would be laid one tick behind its
+  local-space layers and meshes, which draw at the render-time pose: a bolt's head floating
+  25 units ahead of its trail at 1500 units/s.) `ParticlesPlugin { tick_system: false, .. }`
+  leaves the placement to you. It follows emitters, decides each tick's emission — exact 32.32 fixed-point rate accumulators (10/s at 60 Hz is
   exactly 100 particles in 600 ticks), bursts on the tick that contains them with their sub-tick
   time, emission spread over the emitter's motion within the tick — and records it in a tick log.
 * The render node replays the pending ticks inside the render frame. Particle *k* of a layer
@@ -221,6 +247,8 @@ storybook (`space3d stories`, the editor's storybook viewer, golden tests).
   pool capacity / reserved, alive particles (CPU: this frame; GPU: read back from the draw
   arguments 1–3 frames late, `alive_frame` says which), ticks replayed, catch-up resets,
   compute dispatches, draw calls, bytes uploaded, `cpu_reallocations` (0 in the steady state).
+  The frame's `RenderStats` counts the GPU backend's compute passes (`compute_passes`, reported
+  with `PrepareContext::count_compute_passes`) and dispatches (`node_dispatches`).
 
 ### The GPU backend
 
@@ -262,8 +290,10 @@ reset give identical images on either backend (`tests/determinism.rs`).
 
 Measured on the Dev machine (Apple M4 Max, Metal, wgpu 30.0.1); the GPU gates use GPU
 timestamps with frames back to back (`gpu::tests::gpu_100k_within_budget`, the stress scene of
-`Engine/Particles/Stress/100k` at 1920×1080). The GPU gate is ignored by default, because the
-other GPU tests of the lib binary run in parallel with it; run it alone:
+`Engine/Particles/Stress/100k` at 1920×1080). The GPU gate is ignored by default: the other GPU
+tests of the lib binary run in parallel with it, and the hosted CI runners (software or
+paravirtual GPUs) cannot measure Dev-machine budgets. Run it alone on an idle Dev machine
+(`SPACE3D_PERF_BUDGET_SCALE` relaxes it elsewhere):
 
 ```sh
 cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --nocapture
@@ -272,16 +302,24 @@ cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --noca
 
 | item | measured | gate (graphics spec §4.4) |
 |---|---|---|
-| GPU: 100k alive, one tick of `simulate` + `emit` and the compaction (`mark` + `scatter`) | 0.018 + 0.028 = **0.046 ms** | ≤ 0.06 ms |
-| GPU: draw 100k billboards (8–16 px, 12 px average, spread over 1080p: 14.9 M fragments, ≈ 7× overdraw; "overdraw 2" cannot hold with 12 px sprites at 1080p, so this is the heavier reading) | **0.36 ms** | ≤ 0.40 ms |
+| GPU: 100k alive, one tick of `simulate` + `emit` and the compaction (`mark` + `scatter`), nothing else on the GPU | 0.018 + 0.028 = **0.046 ms** | ≤ 0.06 ms |
+| the same inside frames that also draw the 100k billboards (reported, not gated: see below) | 0.08–0.09 ms | — |
+| GPU: draw 100k billboards into the HDR scene texture (8–16 px, 12 px average, spread over 1080p: 14.9 M fragments, ≈ 7× overdraw; "overdraw 2" cannot hold with 12 px sprites at 1080p, so this is the heavier reading) | **0.35 ms** | ≤ 0.40 ms |
+| the same draws into Direct mode's 8-bit sRGB target (reported) | 0.37–0.44 ms idle, up to 0.8 ms with other GPU load | — |
 | GPU backend CPU cost: `prepare` + draw recording, 500 moving layer instances, one tick | 0.14 ms idle machine (0.2–0.3 ms under load) | ≤ 0.1 ms (Battle scene, Phase I) |
 | CPU backend: tick + simulate + pack 16 384 particles, one thread (test profile) | 0.28 ms | ≤ 0.35 ms |
 | `tick_system`, 500 layer instances | 13 µs | ≤ 60 µs |
 | allocations per frame, ~1000 particles, 80–90 draws (wgpu's bookkeeping; our code: 0) | CPU backend 183, GPU backend 304 | pinned +10 % (`tests/alloc.rs`) |
 
-The simulation gate is measured with the draws of the previous frame out of the way: with the
-camera drawing the 100k billboards every frame, the two particle passes overlap that draw (or
-wait for it before rewriting the instances it reads) and their timestamps span 0.08–0.09 ms.
+**Gate caveats, plainly.** The simulation gate is measured with the draws of the previous frame
+out of the way. With the camera drawing the 100k billboards every frame, the two particle
+passes overlap that draw (or wait for it before rewriting the instances it reads) and their
+timestamps span 0.08–0.09 ms — over the 0.06 ms line; the test reports that figure as
+`in frames that draw`. What a frame pays for the whole particle system (simulation, compaction
+and the draws) is about 0.2 ms of throughput, within the two gates' sum (0.46 ms). The draw
+gate is measured into the HDR scene texture, where the Battle scene draws particles (they feed
+bloom); into Direct mode's 8-bit target the same draws are fill-bound and swing with other GPU
+load (reported).
 Isolated frames let the GPU drop its clocks (about 3× slower). Each figure is the median of 40
 frames, best of up to 3 runs (other GPU work on a shared machine disturbs single runs). The CPU
 cost of `prepare` is not a milestone gate yet; it goes to rebuilding and uploading about 70 KB
@@ -309,7 +347,7 @@ and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 | `Sprite::alpha > 0` (smoke that darkens) | `ParticleBlend::Premultiplied` with `coverage` |
 | `fx::particles::Fade` | `Curve::Preset(FadeCurve::…)` (`Flicker` = `Linear` + `Flicker`) |
 | `fx::Effect::Explosion { at, scale }` | `spawn_effect(builtin::EXPLOSION, EffectSpawn::at(at).scale(scale))` |
-| `fx::Effect::Impact { at, dir, color }` | `spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(at).facing(-dir).tint(color))` |
+| `fx::Effect::Impact { at, dir, color }` | `spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(at).facing(-dir).tint(color.extend(1.0)))` (the game's `color` is a `Vec3`; `tint` takes linear RGBA) |
 | `fx::Effect::ShieldHit { center, radius, dir }` | `spawn_effect(builtin::SHIELD_RIPPLE, EffectSpawn::at(center).facing(-dir).scale(radius / 20.0).follow(ship))` |
 | warp / portal jumps | `builtin::WARP_IN` / `WARP_OUT` |
 | engine trails and nozzle flames | `ParticleEmitter::new(builtin::ENGINE_EXHAUST)` per nozzle, `rate_scale` = throttle |

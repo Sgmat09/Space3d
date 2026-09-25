@@ -25,7 +25,8 @@ struct S3dpDraw {
     shape: vec4<f32>,
     // x: seconds of velocity, y: minimum stretch, z: maximum stretch, w: soft distance.
     stretch: vec4<f32>,
-    // x, y: near fade (invisible at x, full at y; off when y <= x).
+    // x, y: near fade (invisible at x, full at y; off when y <= x); z: the layer's largest
+    // sprite as a fraction of the viewport height (0: the view's).
     fade: vec4<f32>,
 }
 
@@ -109,8 +110,10 @@ fn vs_sprite(in: S3dpIn) -> S3dpOut {
     let clip_center = view.view_proj * vec4<f32>(center, 1.0);
     let w = max(clip_center.w, 1e-4);
     let p11 = view.proj[1][1];
-    // Fill-rate guard: at most `max screen size` of the viewport height.
-    let size = min(abs(in.pos_size.w) * curves.x, s3dp_view.params.x * 2.0 * w / p11);
+    // Fill-rate guard: at most `max screen size` of the viewport height (the layer's, else the
+    // settings').
+    let max_screen = select(s3dp_view.params.x, s3dp_draw.fade.z, s3dp_draw.fade.z > 0.0);
+    let size = min(abs(in.pos_size.w) * curves.x, max_screen * 2.0 * w / p11);
     var half = 0.5 * size;
     let px_per_unit = 0.5 * view.viewport.w * p11 / w;
     var px = half * px_per_unit;
@@ -187,28 +190,36 @@ fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32) -> vec3<f32> {
     let p = s3dp_draw.shape;
     switch s3dp_draw.mode.z {
         case 1u: {
-            // Streak: a capsule along +y (the velocity), tapering toward its tail.
+            // Streak: a capsule along +y (the velocity) whose width and brightness taper toward
+            // the tail by p.y (taper 1: a quarter of the head's width, dark), with a white-hot
+            // head of p.x. Brightness falls with the square of the distance from the head, so
+            // tonemapping keeps a hot head and a thin fading tail instead of an even rod.
             let along = uv.y * stretch;
+            let t = clamp((along + stretch) / (2.0 * stretch), 0.0, 1.0);
+            let width = mix(1.0 - 0.75 * p.y, 1.0, t);
             let dy = max(abs(along) - (stretch - 1.0), 0.0);
-            let d = length(vec2<f32>(uv.x, dy));
+            let d = length(vec2<f32>(uv.x / width, dy));
             if (d >= 1.0) {
                 return vec3<f32>(0.0);
             }
             let body = exp(-d * d * 4.0) * (1.0 - d * d);
-            let t = clamp((along + stretch) / (2.0 * stretch), 0.0, 1.0);
-            let k = mix(1.0 - p.y, 1.0, t);
-            return vec3<f32>(body * k, exp(-d * d * 28.0) * p.x * k, body * k);
+            let k = mix(1.0 - p.y, 1.0, t * t);
+            let hot = mix(1.0, t * t * t, p.y);
+            return vec3<f32>(body * k, exp(-d * d * 28.0) * p.x * hot, body * k);
         }
         case 2u: {
             // Ring of thickness p.x (fraction of the radius), focused toward +x by p.y, filled
-            // faintly by p.z.
+            // faintly by p.z. The band sits 1.5 thicknesses inside the rim (0.4 % of its peak
+            // there) and the rim fades over 1.5 pixels: no hard, stair-stepped outer edge.
             let r = length(uv);
-            if (r > 1.0) {
+            if (r >= 1.0) {
                 return vec3<f32>(0.0);
             }
             let th = max(p.x, 0.004);
-            let x = (r - (1.0 - th)) / th;
-            var ring = exp(-x * x * 2.5) + p.z * r * r * (1.0 - smoothstep(0.85, 1.0, r));
+            let x = (r - (1.0 - 1.5 * th)) / th;
+            let aa = clamp(1.5 / max(px, 1e-3), 0.0, 1.0);
+            let rim = 1.0 - smoothstep(1.0 - aa, 1.0, r);
+            var ring = (exp(-x * x * 2.5) + p.z * r * r * (1.0 - smoothstep(0.85, 1.0, r))) * rim;
             if (p.y > 0.0) {
                 let c = uv.x / max(r, 1e-4) * 0.5 + 0.5;
                 ring = ring * pow(max(c, 0.0), p.y);
@@ -216,11 +227,14 @@ fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32) -> vec3<f32> {
             return vec3<f32>(ring, 0.0, ring);
         }
         case 3u: {
-            // Smoke: a noisy puff (breakup p.x), its light gathered in the middle (p.y).
+            // Smoke: a noisy puff (breakup p.x), its light gathered in the middle (p.y). Four
+            // value-noise octaves (the two finest give billow edges detail at 720p and above)
+            // and a coverage edge 0.5 wide (it was 0.8: blurry puffs).
             let seed = vec2<f32>(f32(bits & 0xffffu), f32(bits >> 16u)) * (40.0 / 65536.0);
             let d = length(uv);
-            let n = s3dp_noise(uv * 2.3 + seed) * 0.65 + s3dp_noise(uv * 5.1 + seed.yx) * 0.35;
-            let cov = 1.0 - smoothstep(0.2, 1.0, d + (n - 0.5) * p.x);
+            let n = s3dp_noise(uv * 2.3 + seed) * 0.5 + s3dp_noise(uv * 5.1 + seed.yx) * 0.25
+                + s3dp_noise(uv * 11.0 + seed * 1.7) * 0.15 + s3dp_noise(uv * 23.0 + seed.yx * 2.3) * 0.1;
+            let cov = 1.0 - smoothstep(0.35, 0.85, d + (n - 0.5) * p.x);
             if (cov <= 0.001) {
                 return vec3<f32>(0.0);
             }

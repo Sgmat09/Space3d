@@ -105,6 +105,8 @@ impl Buf {
 pub(crate) struct GpuFrameStats {
     pub ticks: u32,
     pub dispatches: u32,
+    /// Compute passes recorded (`RenderStats::compute_passes`).
+    pub passes: u32,
     pub bytes: u64,
     pub created: u32,
 }
@@ -675,6 +677,7 @@ impl GpuSim {
                     label: Some("particles.sim"),
                     timestamp_writes: writes(&stamp),
                 });
+                stats.passes += 1;
                 pass.set_bind_group(0, self.sim_bind.as_ref(), &[offset]);
                 if simulate {
                     pass.set_pipeline(&self.simulate);
@@ -706,6 +709,7 @@ impl GpuSim {
                         label: Some("particles.emit"),
                         timestamp_writes: None,
                     });
+                    stats.passes += 1;
                     pass.set_bind_group(0, self.sim_bind.as_ref(), &[offset]);
                     pass.set_pipeline(&self.emit);
                     let (x, y) = grid(tick.b[3].div_ceil(LANES));
@@ -738,6 +742,7 @@ impl GpuSim {
                     label: Some("particles.compact"),
                     timestamp_writes: writes(&stamp),
                 });
+                stats.passes += 1;
                 pass.set_bind_group(0, self.compact_bind.as_ref(), &[]);
                 pass.set_pipeline(&self.mark);
                 pass.dispatch_workgroups(x, y, 1);
@@ -755,6 +760,7 @@ impl GpuSim {
             );
         }
         ctx.count_dispatches(stats.dispatches);
+        ctx.count_compute_passes(stats.passes);
         self.stats = stats;
     }
 

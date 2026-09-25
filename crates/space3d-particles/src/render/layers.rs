@@ -105,7 +105,7 @@ impl RenderLayers {
                     mode: [blend, facing, kind, 0],
                     shape,
                     stretch: [stretch[0], stretch[1], stretch[2], r.soft_distance.max(0.0)],
-                    fade: [r.near_fade.0, r.near_fade.1, 0.0, 0.0],
+                    fade: [r.near_fade.0, r.near_fade.1, r.max_screen_size.max(0.0), 0.0],
                 });
                 let extent = 0.5 * layer.size_over_life.max_value().max(0.0) * layer.aspect.max(1.0).max(stretch[2]);
                 let additive = r.blend == ParticleBlend::Additive;

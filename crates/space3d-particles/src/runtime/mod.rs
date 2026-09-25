@@ -191,6 +191,7 @@ pub(crate) struct Runtime {
     /// Collections that grew since the last render.
     pub reallocations: u32,
     warned_refused: Vec<EffectHandle>,
+    warned_unknown: Vec<EffectHandle>,
 }
 
 /// World position and rotation of an entity with `t` and `parent`, through the `Parent` chain
@@ -553,6 +554,11 @@ impl Runtime {
             None
         };
 
+        // What an emitter whose handle has no effect data plays: nothing, finished at once.
+        let nothing = ParticleEffect {
+            duration: 0.0,
+            ..ParticleEffect::default()
+        };
         let mut query = world.query::<(
             Entity,
             &ParticleEmitter,
@@ -573,8 +579,22 @@ impl Runtime {
             let i = match found {
                 Some(i) => i,
                 None => {
-                    let Some(effect) = effects.get(em.effect) else {
-                        continue;
+                    let effect = match effects.get(em.effect) {
+                        Some(effect) => effect,
+                        None => {
+                            // A stale handle, one never issued, or a reserved built-in with no
+                            // data (`builtin::LASER_BEAM` before PA3): play nothing and finish
+                            // this tick, so the event is sent and the `FinishAction` runs (a
+                            // `spawn_effect` entity despawns instead of staying forever).
+                            if !self.warned_unknown.contains(&em.effect) {
+                                self.warned_unknown.push(em.effect);
+                                tracing::warn!(
+                                    handle = em.effect.index(),
+                                    "particle emitter with an unknown effect handle: it plays nothing and finishes"
+                                );
+                            }
+                            &nothing
+                        }
                     };
                     let i = self.create(entity, em, em.effect, effect, pos, rot, settings);
                     if em.prewarm > 0.0 && dt > 0.0 {
@@ -591,9 +611,12 @@ impl Runtime {
             inst.finish = em.finish;
             inst.on_remove = em.on_remove;
             inst.hidden = vis == Some(&Visibility::Hidden);
-            if inst.finished && em.playing && !inst.playing {
+            if inst.finished
+                && em.playing
+                && !inst.playing
+                && let Some(effect) = effects.get(em.effect)
+            {
                 // Played again after it finished (stopped, then restarted by `playing`).
-                let effect = effects.get(em.effect).expect("checked above");
                 inst.finished = false;
                 inst.time = 0.0;
                 inst.created_tick = t;

@@ -319,29 +319,23 @@ struct Measured {
     dispatches: u32,
     sim: f64,
     compact: f64,
-    /// `sim + compact`, per frame.
+    /// `sim + compact`, per frame, with nothing else drawn (the gate).
     total: f64,
     /// First to last stamp of a frame's particle passes.
     span: f64,
+    /// `sim + compact` inside frames that also draw the 100k billboards (reported: the draws
+    /// of the previous frame overlap the compute passes, which read about 40 % slower).
+    in_frame: f64,
     draws: u32,
-    draw: f64,
+    /// The draws into the HDR scene texture (`Rgba16Float`: particles feeding bloom, the
+    /// Battle configuration): the gate.
+    draw_hdr: f64,
+    /// The same draws into Direct mode's 8-bit sRGB target (reported).
+    draw_direct: f64,
 }
 
-fn measure_100k(w: u32, h: u32) -> Option<Measured> {
-    let mut app = stress_app(w, h)?;
-    // Warm up with the draws (the pool fills, pipelines build, clocks rise), then time the
-    // simulation without them: nothing competes with it or makes it wait.
-    app.step_ticks(60);
-    let cameras: Vec<space3d_core::Entity> = app
-        .world
-        .query::<(space3d_core::Entity, &space3d_render::Camera3d)>()
-        .iter()
-        .map(|(e, _)| e)
-        .collect();
-    for c in cameras {
-        let _ = app.world.despawn(c);
-    }
-    const FRAMES: u32 = 40;
+/// `(sim, compact, total, span)` medians of `frames` ticks, each rendered.
+fn time_ticks(app: &mut space3d_core::App, frames: u32) -> (f64, f64, f64, f64) {
     let node = app.resources.expect::<crate::testing::NodeHandle>().0.clone();
     let (device, queue) = {
         let r = app.resources.expect::<space3d_render::Renderer>();
@@ -350,16 +344,15 @@ fn measure_100k(w: u32, h: u32) -> Option<Measured> {
     let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
         label: Some("particles perf"),
         ty: wgpu::QueryType::Timestamp,
-        count: 4 * FRAMES,
+        count: 4 * frames,
     });
-    for f in 0..FRAMES {
+    for f in 0..frames {
         node.lock().unwrap().gpu_sim().expect("GPU backend").test_timing = Some((queries.clone(), 4 * f));
         app.step_ticks(1);
     }
     node.lock().unwrap().gpu_sim().unwrap().test_timing = None;
-    let stats = app.resources.expect::<crate::ParticleStats>().clone();
-    let t = read_timestamps(&device, &queue, &queries, 4 * FRAMES);
-    let frames = 0..FRAMES as usize;
+    let t = read_timestamps(&device, &queue, &queries, 4 * frames);
+    let frames = 0..frames as usize;
     let sim = median(frames.clone().map(|f| t[4 * f + 1] - t[4 * f]).collect());
     let compact = median(frames.clone().map(|f| t[4 * f + 3] - t[4 * f + 2]).collect());
     let total = median(
@@ -369,28 +362,77 @@ fn measure_100k(w: u32, h: u32) -> Option<Measured> {
             .collect(),
     );
     let span = median(frames.map(|f| t[4 * f + 3] - t[4 * f]).collect());
+    (sim, compact, total, span)
+}
 
-    // The particle draws alone, back to back.
-    stress_camera(&mut app, h);
-    app.step_ticks(20);
+/// `(draw calls, median ms)` of `frames` recordings of the particle draws alone, back to back,
+/// into the pass target of the last rendered frame.
+fn time_draws(app: &mut space3d_core::App, frames: u32, size: (u32, u32)) -> (u32, f64) {
+    let node = app.resources.expect::<crate::testing::NodeHandle>().0.clone();
+    let (device, queue) = {
+        let r = app.resources.expect::<space3d_render::Renderer>();
+        (r.device().clone(), r.queue().clone())
+    };
     let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
         label: Some("particles perf draws"),
         ty: wgpu::QueryType::Timestamp,
-        count: 2 * FRAMES,
+        count: 2 * frames,
     });
     let mut encoder = device.create_command_encoder(&Default::default());
     let mut draws = 0;
     {
         let mut n = node.lock().unwrap();
-        for f in 0..FRAMES {
+        for f in 0..frames {
             draws = n
-                .record_timed_draws(&device, &mut encoder, &queries, 2 * f, (w, h))
+                .record_timed_draws(&device, &mut encoder, &queries, 2 * f, size)
                 .expect("drawn");
         }
     }
     queue.submit([encoder.finish()]);
-    let t = read_timestamps(&device, &queue, &queries, 2 * FRAMES);
-    let draw = median((0..FRAMES as usize).map(|f| t[2 * f + 1] - t[2 * f]).collect());
+    let t = read_timestamps(&device, &queue, &queries, 2 * frames);
+    (
+        draws,
+        median((0..frames as usize).map(|f| t[2 * f + 1] - t[2 * f]).collect()),
+    )
+}
+
+fn measure_100k(w: u32, h: u32) -> Option<Measured> {
+    let mut app = stress_app(w, h)?;
+    const FRAMES: u32 = 40;
+    // Warm up with the draws (the pool fills, pipelines build, clocks rise); time the
+    // simulation inside such frames (reported), then without them: nothing competes with it or
+    // makes it wait (the gate).
+    app.step_ticks(60);
+    let (_, _, in_frame, _) = time_ticks(&mut app, FRAMES);
+    let cameras: Vec<space3d_core::Entity> = app
+        .world
+        .query::<(space3d_core::Entity, &space3d_render::Camera3d)>()
+        .iter()
+        .map(|(e, _)| e)
+        .collect();
+    for c in cameras {
+        let _ = app.world.despawn(c);
+    }
+    let (sim, compact, total, span) = time_ticks(&mut app, FRAMES);
+    let stats = app.resources.expect::<crate::ParticleStats>().clone();
+
+    // The particle draws alone, back to back: into Direct mode's target, then into the HDR
+    // scene texture of a post camera.
+    stress_camera(&mut app, h);
+    app.step_ticks(20);
+    let (draws, draw_direct) = time_draws(&mut app, FRAMES, (w, h));
+    let cam = app
+        .world
+        .query::<(space3d_core::Entity, &space3d_render::Camera3d)>()
+        .iter()
+        .map(|(e, _)| e)
+        .next()
+        .expect("camera");
+    app.world
+        .insert_one(cam, space3d_render::PostProcess::default().without_bloom())
+        .unwrap();
+    app.step_ticks(20);
+    let (_, draw_hdr) = time_draws(&mut app, FRAMES, (w, h));
     assert_eq!(app.resources.expect::<space3d_render::Renderer>().gpu_error_count(), 0);
     Some(Measured {
         alive: stats.alive,
@@ -399,8 +441,10 @@ fn measure_100k(w: u32, h: u32) -> Option<Measured> {
         compact,
         total,
         span,
+        in_frame,
         draws,
-        draw,
+        draw_hdr,
+        draw_direct,
     })
 }
 
@@ -408,11 +452,21 @@ fn measure_100k(w: u32, h: u32) -> Option<Measured> {
 /// back: 100k alive particles simulated (one tick) and compacted in ≤ 0.06 ms, and drawn in
 /// ≤ 0.40 ms — 100k billboards of 8–16 px (12 px on average) over the whole 1080p frame, hard:
 /// 14.9 M fragments, about 7× overdraw (the spec's "overdraw 2" cannot hold with 12 px sprites
-/// at 1080p; this is the heavier reading). Each figure is the median of 40 frames; a run
-/// disturbed by other GPU work on the machine is retried (best of 3 runs). Ignored by default
-/// (like `bloom_gate_1080p`): the other GPU tests of this binary run in parallel and push the
-/// draw past its gate; run it alone:
-/// `cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --nocapture`.
+/// at 1080p; this is the heavier reading).
+///
+/// What is gated, and what is only reported (docs/performance.md):
+/// * sim + compaction with nothing else on the GPU (the gate); inside frames that also draw the
+///   100k billboards the same passes read about 40 % slower (0.08–0.09 ms: the previous frame's
+///   draws overlap them), reported as `in frame`;
+/// * the draws into the HDR scene texture, where the Battle scene draws particles (they feed
+///   bloom): the gate; into Direct mode's 8-bit target they are fill-bound and swing with other
+///   GPU load on the machine (0.37–0.80 ms under load), reported.
+///
+/// Each figure is the median of 40 frames; a run disturbed by other GPU work on the machine is
+/// retried (best of 3 runs). Ignored by default (like `bloom_gate_1080p`): the other GPU tests
+/// of this binary run in parallel and push the draw past its gate, and the hosted CI runners
+/// (software or paravirtual GPUs) cannot measure M4 Max budgets. Run it alone on an idle Dev
+/// machine: `cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --nocapture`.
 #[test]
 #[ignore = "perf gate: run alone with --ignored"]
 fn gpu_100k_within_budget() {
@@ -427,22 +481,24 @@ fn gpu_100k_within_budget() {
             compact,
             total,
             span,
+            in_frame,
             draws,
-            draw,
+            draw_hdr,
+            draw_direct,
         }) = measure_100k(w, h)
         else {
             eprintln!("skipping: no GPU adapter with compute and timestamps");
             return;
         };
         eprintln!(
-            "run {run}: GPU backend, {alive} alive, {dispatches} dispatches: sim {sim:.4} ms + compaction {compact:.4} ms = {total:.4} ms per tick (gate {:.2}; first to last stamp {span:.4}); {draws} draw call(s) {draw:.4} ms at {w}×{h} (gate {:.2})",
+            "run {run}: GPU backend, {alive} alive, {dispatches} dispatches: sim {sim:.4} ms + compaction {compact:.4} ms = {total:.4} ms per tick (gate {:.2}; first to last stamp {span:.4}; in frames that draw: {in_frame:.4}); {draws} draw call(s) at {w}×{h}: {draw_hdr:.4} ms into the HDR scene texture (gate {:.2}), {draw_direct:.4} ms into Direct's target",
             0.06 * scale,
             0.40 * scale
         );
         assert!(alive >= 95_000, "{alive} alive");
         assert_eq!(dispatches, 4, "simulate, emit, mark, scatter");
         best_total = best_total.min(total);
-        best_draw = best_draw.min(draw);
+        best_draw = best_draw.min(draw_hdr);
         if best_total <= 0.06 * scale && best_draw <= 0.40 * scale {
             break;
         }

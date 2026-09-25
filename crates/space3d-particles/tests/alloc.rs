@@ -159,6 +159,10 @@ fn steady_state_allocations() {
             // extra tick.
             assert_eq!(stats.ticks_simulated, 1);
             assert!(stats.dispatches <= 5, "{stats:?}");
+            // The node reports its compute passes (the tick's simulate + emit pass and the
+            // compaction pass) and dispatches in the frame's `RenderStats`.
+            assert_eq!(render.compute_passes, 2, "{render:?}");
+            assert_eq!(render.node_dispatches, stats.dispatches, "{render:?}");
             let renderer = app.resources.remove::<Renderer>().unwrap();
             app.step_ticks(3);
             app.resources.insert(renderer);
@@ -166,6 +170,8 @@ fn steady_state_allocations() {
             let s = app.resources.expect::<ParticleStats>().clone();
             assert_eq!(s.ticks_simulated, 3);
             assert!(s.dispatches <= 5 + 2 * 2, "{s:?}");
+            let r = app.resources.expect::<RenderStats>();
+            assert!((3..=5).contains(&r.compute_passes), "{r:?}");
         }
         assert_eq!(gpu_errors(&app), 0);
     }
