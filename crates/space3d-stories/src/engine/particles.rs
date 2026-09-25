@@ -1,5 +1,6 @@
-//! Particle stories (`Engine/Particles/*`): the built-in effects and the particle features, all on
-//! the CPU simulation backend (graphics spec §5.2 PA1).
+//! Particle stories (`Engine/Particles/*`): the built-in effects, the particle features and a
+//! 100k-particle stress scene (graphics spec §5.2 PA1, PA2). They run on the default backend (the
+//! GPU backend where compute exists; `Features/CPU Backend` forces the CPU one).
 //!
 //! Owner: P-PART (graphics spec §3.6). Compiled with the `particles` feature (part of
 //! `engine`). Effects are driven by the fixed tick only, so every story is deterministic for its
@@ -10,7 +11,7 @@ use crate::Story;
 use space3d_core::prelude::*;
 use space3d_particles::prelude::*;
 use space3d_particles::{
-    Curve, EmitDirection, EmitShape, Facing, FadeCurve, FloatRange, Gradient, ParticleBackend, ParticleBlend,
+    Curve, EmitDirection, EmitShape, Facing, FadeCurve, FloatRange, Force, Gradient, ParticleBackend, ParticleBlend,
     SimulationSpace, Spawn, SpriteRender, SpriteShape,
 };
 use space3d_render::{
@@ -35,6 +36,7 @@ pub(crate) fn stories() -> Vec<Story> {
         facing(),
         local_vs_world(),
         cpu_backend(),
+        stress_100k(),
     ]
 }
 
@@ -864,6 +866,75 @@ fn cpu_backend() -> Story {
     .ticks(24)
 }
 
+fn stress_100k() -> Story {
+    Story::new("Engine/Particles/Stress/100k", |app, _| {
+        plugin(app, ParticleSettings::default());
+        app.world.spawn((
+            Name("camera".into()),
+            Transform::from_xyz(0.0, 150.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
+            Camera3d::default().with_clear_color(SPACE),
+        ));
+        // Two emitters sweeping round, 180° apart, each streaming 12 500 glows a second from an
+        // arc into an outward spiral (a vortex turns them as they fly): 4 s lives, 100k alive.
+        let arm = ParticleLayer {
+            lod: false,
+            shape: EmitShape::Ring {
+                radius: 6.0,
+                width: 4.0,
+                arc: 0.9,
+            },
+            flatten: 1.0,
+            spread: 0.15,
+            speed: FloatRange::new(9.0, 16.0),
+            forces: vec![Force::Vortex {
+                axis: Vec3::Y,
+                strength: 1.6,
+                pull: 0.0,
+            }],
+            drag: 0.1,
+            size: FloatRange::new(0.8, 1.6),
+            color_over_life: Gradient::linear(Vec4::new(0.3, 0.16, 0.06, 1.0), Vec4::new(0.02, 0.05, 0.2, 1.0)),
+            alpha_over_life: Curve::Preset(FadeCurve::InOut),
+            render: SpriteRender::additive(SpriteShape::Glow {
+                core: 0.2,
+                hardness: 0.0,
+            }),
+            ..ParticleLayer::continuous(12_500.0, 4.0)
+        };
+        let fx = app
+            .resources
+            .expect_mut::<ParticleEffects>()
+            .add(ParticleEffect {
+                looping: true,
+                ..ParticleEffect::new("stress 100k").layer(arm)
+            })
+            .expect("valid");
+        let arms: Vec<Entity> = (0..2)
+            .map(|i| app.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).seed(15 + i).keep()))
+            .collect();
+        app.add_system(Stage::FixedUpdate, move |ctx: &mut SystemCtx| {
+            let a = ctx.time().tick as f32 * 0.03;
+            for (i, &e) in arms.iter().enumerate() {
+                if let Ok(mut t) = ctx.world.get::<&mut Transform>(e) {
+                    t.rotation = Quat::from_rotation_y(a + i as f32 * std::f32::consts::PI);
+                }
+            }
+        });
+    })
+    .description(
+        "100 000 particles on the GPU backend: two emitters sweeping round, each streaming 12 500 \
+         additive glows a second into an outward spiral (a vortex turns them as they fly), 4 s \
+         lives. The pool, the simulation (one `simulate` and one `emit` dispatch per tick) and \
+         the compaction into the instance stream (`mark`, `scatter`) stay on the GPU, and the \
+         frame draws them with one indirect draw. The CPU backend (WebGL2) has a 16k budget and \
+         refuses most of it.",
+    )
+    .tag("particles")
+    .tag("perf")
+    .size(256, 256)
+    .ticks(240)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::space3d_test::screenshot::GoldenDir;
@@ -880,12 +951,18 @@ mod tests {
             return;
         };
         let mut book = Storybook::new();
+        let gl = gpu.backend.eq_ignore_ascii_case("gl");
         for story in super::stories() {
+            // The GL backend (WebGL2 class) runs particles on the CPU backend, whose budget
+            // (16k) does not hold the stress scene.
+            if gl && story.has_tag("perf") {
+                continue;
+            }
             book.add(story);
         }
         let golden = GoldenDir::for_crate(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"));
         let options = StorybookTestOptions {
-            compare: if gpu.backend.eq_ignore_ascii_case("gl") {
+            compare: if gl {
                 CompareOptions::perceptual()
             } else {
                 CompareOptions::default()

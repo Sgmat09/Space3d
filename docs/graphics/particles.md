@@ -5,10 +5,10 @@ laser trails — simulated on the fixed tick and drawn by a render node that mat
 HDR, tonemapping and scene depth in every mode. The normative design is
 [`docs/design/graphics.md`](../design/graphics.md) §2.5 (with the area design it amends).
 
-Status: milestones PA0 (runtime, CPU simulation, effect library) and PA1 (CPU backend rendering,
-prefabs) are in. The GPU compute backend (PA2), ribbons, beams, flipbooks and light flashes (PA3),
-distortion layers, per-particle sorting and LOD calibration (PA4) follow; the API below does not
-change for them.
+Status: milestones PA0 (runtime, CPU simulation, effect library), PA1 (CPU backend rendering,
+prefabs) and PA2 (the GPU compute backend: 100k+ particles, budgets, parity with the CPU
+backend) are in. Ribbons, beams, flipbooks and light flashes (PA3), distortion layers,
+per-particle sorting and LOD calibration (PA4) follow; the API below does not change for them.
 
 ## Quick start
 
@@ -177,8 +177,9 @@ in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's
 | `LASER_TRAIL` | looping head glow + trail laid per unit of distance | `.follow(bolt).tint(color)` |
 | `LASER_BEAM` | reserved: beams arrive with PA3 | |
 
-Stories: `Engine/Particles/Builtin/*` and `Engine/Particles/Features/*` in the engine storybook
-(`space3d stories`, the editor's storybook viewer, golden tests).
+Stories: `Engine/Particles/Builtin/*`, `Engine/Particles/Features/*` and
+`Engine/Particles/Stress/100k` (tag `perf`: 100 000 particles on the GPU backend) in the engine
+storybook (`space3d stories`, the editor's storybook viewer, golden tests).
 
 ## Time model and determinism
 
@@ -201,30 +202,89 @@ Stories: `Engine/Particles/Builtin/*` and `Engine/Particles/Features/*` in the e
 
 ## Backends, budgets, stats
 
-* `ParticleBackend::Auto` (default) and `Cpu` simulate on the CPU today; `Gpu` (compute
-  simulation and compaction) arrives with PA2 and `Auto` will pick it when the device has
-  culling-class compute and indirect draws. The CPU backend is the WebGL2 / GLES 3.0 path: the
-  same tick log, ring slots, RNG, 40-byte instance stream and render pipeline; the vertex shader
-  reads no storage buffers.
-* Budget: `ParticleSettings::max_particles_cpu` (16 384 native, 8 192 on the web). Each layer
-  instance reserves a ring sized from its rates, bursts and life (§5.1 of the area design); over
-  the budget rings shrink to 1/8 before a layer instance is refused (`ParticleStats::{shrunk,
-  refused}`, logged once per effect). `EffectPriority::Low` stops at 75 % of the pool, `Normal`
-  at 90 %.
+* `ParticleBackend::Auto` (default) picks the GPU backend when the device has culling-class
+  compute and indirect draws (`GraphicsCaps::compute`, masked by
+  `DownlevelOverride::no_compute`), else the CPU backend. `Gpu` asks for it explicitly (and falls
+  back to the CPU with a warning without compute); `Cpu` forces the CPU backend, the WebGL2 /
+  GLES 3.0 path. Both run the same tick log, ring slots, RNG streams, 40-byte instance stream
+  and render pipeline (the vertex shader reads no storage buffers): switching changes
+  performance, not the look. A switch at runtime carries the CPU pool over to the GPU; the other
+  way the live particles are dropped (the GPU pool is not read back).
+* Budgets: `ParticleSettings::max_particles` (GPU: 262 144, 65 536 on Android and iOS, within
+  the device's storage binding and buffer limits) and `max_particles_cpu` (16 384 native, 8 192
+  on the web). The tick system uses the budget of the backend the renderer resolves to. Each
+  layer instance reserves a ring sized from its rates, bursts and life (§5.1 of the area
+  design); over the budget rings shrink to 1/8 before a layer instance is refused
+  (`ParticleStats::{shrunk, refused}`, logged once per effect). `EffectPriority::Low` stops at
+  75 % of the pool, `Normal` at 90 %, `High` may use it all.
 * `ParticleStats` (resource, per rendered frame): backend, live effects and layer instances,
-  pool capacity / reserved, alive particles, ticks replayed, catch-up resets, draw calls, bytes
-  uploaded, `cpu_reallocations` (0 in the steady state).
-* Measured (Apple M4 Max, test profile): the CPU backend ticks, simulates and packs 16 384
-  particles in 0.28 ms on one thread (gate 0.35 ms); `tick_system` handles 500 layer instances
-  in 13 µs (gate 60 µs); a frame with ~1000 live particles in 80 draws allocates only wgpu's
-  bookkeeping (185 allocations, pinned), our code nothing. `docs/performance.md` collects the
-  figures in Phase I.
+  pool capacity / reserved, alive particles (CPU: this frame; GPU: read back from the draw
+  arguments 1–3 frames late, `alive_frame` says which), ticks replayed, catch-up resets,
+  compute dispatches, draw calls, bytes uploaded, `cpu_reallocations` (0 in the steady state).
+
+### The GPU backend
+
+The pool lives in a storage buffer (48 bytes a particle) that grows 1.5× as rings are reserved
+(the old contents are copied on the GPU); `prepare` records everything into the frame's encoder
+before the view passes:
+
+| step | when | work |
+|---|---|---|
+| uploads | changed | entry table (a layer instance's parameters, 384 B) when entries change; the pending ticks' spawn records and tick uniforms; the emitter frames that moved (per tick); the draws' jobs and records when they change |
+| `simulate` | per tick | a thread per pool slot below the high-water mark: age, death (`age >= life`), gravity, drag, the layer's forces and world attractors, every substep |
+| `emit` | per tick with spawns | a thread per new particle: ring slot `base + index mod capacity`, shape, direction, speed, lifetime and delay, sub-tick pre-aging |
+| `mark` | per frame, when anything changed | a workgroup per 64 ring positions of a drawn layer instance: the mask of visible particles, its count, added to its block's total and its draw's `DrawIndirectArgs` |
+| `scatter` | same | each visible particle writes its 40-byte instance at `draw start + earlier blocks + earlier records + bits below it` |
+
+That is 4 dispatches for a frame with one tick and 2 more per extra tick (budget: 5 + 2), with
+`@workgroup_size(64)` and at most 4 storage buffers per kernel (the GLES 3.1 / WebGPU minimum).
+Draws are indirect (one per unsorted additive layer, one per sorted layer instance), bound at
+their region of the instance buffer, so neither `BASE_VERTEX` nor `INDIRECT_FIRST_INSTANCE` is
+needed. The frame's culling uses conservative bounds for GPU draws: the emitter's path over the
+life window (kept by the tick system in 8 buckets) grown by the layer's reach (spawn shape,
+initial speed with drag, gravity and forces over the life window, the largest sprite); layers
+under world attractors are never culled.
+
+**Parity with the CPU backend** (`tests/parity.rs`): the kernels mirror the Rust simulation
+operation for operation. Integer parts (RNG, ring slots, sub-tick emission times, quantized to
+1/16384 of a tick) are bit-identical, and the values that decide births and deaths are computed
+exactly on both (lifetimes and delays with one fused multiply-add, ages as sums of the tick's
+`dt`), so both backends hold the same particles in the same slots with identical ages and
+lifetimes; positions and velocities agree within 1e-5 relative (1e-3 asserted) and images within
+the golden tolerance. The draw order is the same too: instances oldest first per ring, draws
+sorted by a center both backends compute from the emitter path.
+
+**Determinism**: output positions come from prefix sums over bit masks and integer sums, never
+from the order of atomics; rendering every tick, rendering once after `n` ticks and a catch-up
+reset give identical images on either backend (`tests/determinism.rs`).
+
+## Performance
+
+Measured on the Dev machine (Apple M4 Max, Metal, wgpu 30.0.1); the GPU gates use GPU
+timestamps with frames back to back (`gpu::tests::gpu_100k_within_budget`, the stress scene of
+`Engine/Particles/Stress/100k` at 1920×1080):
+
+| item | measured | gate (graphics spec §4.4) |
+|---|---|---|
+| GPU: 100k alive, one tick of `simulate` + `emit` and the compaction (`mark` + `scatter`) | 0.018–0.020 + 0.024–0.027 = **0.045 ms** | ≤ 0.06 ms |
+| GPU: draw 100k billboards (8–16 px, 12 px average, spread over 1080p: 14.9 M fragments, ≈ 7× overdraw) | **0.36 ms** | ≤ 0.40 ms |
+| CPU backend: tick + simulate + pack 16 384 particles, one thread (test profile) | 0.28 ms | ≤ 0.35 ms |
+| `tick_system`, 500 layer instances | 13 µs | ≤ 60 µs |
+| allocations per frame, ~1000 particles, 80–90 draws (wgpu's bookkeeping; our code: 0) | CPU backend 183, GPU backend 304 | pinned +10 % (`tests/alloc.rs`) |
+
+The simulation gate is measured with the draws of the previous frame out of the way: with the
+camera drawing the 100k billboards every frame, the two particle passes overlap that draw (or
+wait for it before rewriting the instances it reads) and their timestamps span 0.08–0.09 ms.
+Isolated frames let the GPU drop its clocks (about 3× slower).
 
 ## WebGL2 notes
 
-Vertex formats `Float32x4`, `Float16x4`, `Uint32x2` only; ≤ 4 bind groups (view, scene, the
-particles' LUT and uniforms); the LUT is `Rgba16Float` sampled with `textureLod` in the vertex
-shader; the sprite shader translates to GLSL ES 3.00 (tested) and needs no `f16` capability. On
+WebGL2 and GLES 3.0 have no compute shaders: particles run on the CPU backend there (the GPU
+kernels translate to GLSL ES 3.10 for GLES 3.1 devices, tested, and pack half floats with integer
+arithmetic, so they need no `f16` capability either). Vertex formats `Float32x4`, `Float16x4`,
+`Uint32x2` only; ≤ 4 bind groups (view, scene, the particles' LUT and uniforms); the LUT is
+`Rgba16Float` sampled with `textureLod` in the vertex shader; the sprite shader translates to
+GLSL ES 3.00 (tested) and needs no `f16` capability. On
 GL scene depth is sampled without an attachment and tested in the shader; with MSAA on GL there
 is no soft fade (hard test only). The GL backend (ANGLE, GLES 3.0) renders the particle scenes
 and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
