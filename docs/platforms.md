@@ -60,7 +60,9 @@ the canvas' real size.
 Web specifics: the renderer is created asynchronously (WebGPU when available, WebGL2 otherwise —
 WebGL2 uses the CPU draw path); assets are fetched over HTTP relative to the page; the database
 uses `localStorage` (KV, save slots, leaderboards; raw SQL returns `Unsupported`); WebSocket and
-HTTP clients use the browser APIs; servers are native-only; audio starts after a user gesture.
+HTTP clients use the browser APIs; servers are native-only; audio starts after a user gesture;
+browsers have no on-device AI model, so `space3d-ai` games use its scripted backend there
+([ai.md](ai.md#web)).
 
 ## Android
 
@@ -87,6 +89,11 @@ lives in `[package.metadata.android]` of `mobile/Cargo.toml`. Rendering uses Vul
 fallback); touch input arrives as multi-touch `Touch`es and `Binding::TouchRegion` maps screen
 areas to actions. When the app is backgrounded the surface is dropped and recreated on resume —
 meshes and textures survive.
+
+On-device AI (Gemini Nano, the `ai` feature) needs a Gradle-built host app instead of
+`cargo apk`: the open-android-models AAR and ML Kit bring code and manifest entries that
+cargo-apk cannot merge. See [ai-android.md](ai-android.md); `examples/ai_tavern/android` is the
+template (it builds an APK but has not yet run on a Gemini Nano device).
 
 ## iOS
 
@@ -125,6 +132,10 @@ xcodebuild -project ios/<game>.xcodeproj -scheme <game> -sdk iphonesimulator \
 xcrun simctl install booted target/xcode/Build/Products/Debug-iphonesimulator/<game>.app
 xcrun simctl launch booted <bundle id>
 ```
+
+On-device AI (Apple Foundation Models, the `ai-apple-ffi` feature) additionally links
+open-apple-models' `OpenAppleModelsFFI` into the Xcode project and needs a minimum deployment
+target of 27.0; see [ai.md](ai.md#apple-macos-ios-visionos-27).
 
 ## CI and releases
 

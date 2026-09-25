@@ -54,8 +54,27 @@
 //! assert_eq!(turn.tool_calls[0].output, ToolOutput::Json(json!({"stock": 3})));
 //! ```
 //!
-//! See `docs/ai.md` (overview, Apple linking, scripted models) and `docs/ai-android.md` (the
-//! Gradle host app Android needs).
+//! ## Cargo features
+//!
+//! | feature | effect |
+//! |---|---|
+//! | `apple-ffi` | links open-apple-models' C ABI (`libOpenAppleModelsFFI`) so [`AppleBackend`] drives Apple's on-device model: on macOS set `OAM_APPLE_LIB_DIR`, on iOS Xcode links the library. Without it `AppleBackend` compiles everywhere and reports `Unsupported`. |
+//! | `android-jvm` | test-only: also compiles `AndroidBackend` on desktop hosts, to test it against open-android-models' real `OamJni` in a JVM |
+//!
+//! Games usually enable the crate through the `space3d` facade: feature `ai` (re-exported as
+//! `space3d::ai`, common types in `space3d::prelude`) or `ai-apple-ffi`.
+//!
+//! ## Status
+//!
+//! The Android backend has been built into an APK and tested against the real `OamJni` in a
+//! desktop JVM, but has not yet run on a Gemini Nano device. iOS linking is documented but
+//! untested.
+//!
+//! ## Guides
+//!
+//! `docs/ai.md` in the Space3d repository covers the `Ai` resource, tools, events, backend
+//! selection, scripted models, Apple linking, errors and testing; `docs/ai-android.md` covers
+//! the Gradle host app Android needs.
 //!
 //! [open-apple-models]: https://github.com/SpaceCorps/open-apple-models
 //! [open-android-models]: https://github.com/SpaceCorps/open-android-models

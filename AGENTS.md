@@ -45,5 +45,6 @@ Rust cross-platform game engine (desktop, web/wasm, Android, iOS). Cargo workspa
 | `space3d-editor` | scene inspector, texture editor, model editor |
 | `space3d-stories` | storybook: registry + viewer + batch screenshotting |
 | `space3d-test` | test harness: headless app, input simulation, golden screenshot diffing |
+| `space3d-ai` | on-device AI (Apple Foundation Models via FFI, Gemini Nano via JNI, scripted backend): sessions, NPCs, decisions, engine-side tools; guide in `docs/ai.md` |
 | `space3d-cli` | `space3d` binary: new/run/build/test/stories/snapshot/publish |
 | `space3d` | facade + prelude |

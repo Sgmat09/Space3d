@@ -59,6 +59,11 @@ space3d::main!(build);
   thumbnails, leaderboards) with a `localStorage` fallback on the web.
 * **Physics, audio, scenes.** rapier rigid bodies/colliders/raycasts on the fixed tick; kira
   audio with spatial emitters; RON/JSON scenes, prefabs and world snapshots.
+* **On-device AI.** Agent sessions, NPC dialogue with streamed lines, enum-constrained decisions
+  and schema-shaped content on the player's own device: Apple Foundation Models (macOS, iOS and
+  visionOS 27) and Gemini Nano (Android). The model's tool calls run as Rust closures on the
+  engine thread with full ECS access; a pure-Rust scripted backend runs everywhere, including
+  the web and CI. Optional `ai` feature; see [docs/ai.md](docs/ai.md).
 * **UI and tools.** egui integration with a debug overlay (F3), profiler (F4) and console;
   scene inspector, texture and model editors; a storybook for isolated, parameterized scenes.
 * **Testing.** Headless `TestApp`, tick-accurate keyboard/mouse/touch/gamepad simulation and
@@ -83,6 +88,7 @@ space3d::main!(build);
 │  ui ──────── egui overlay · debug overlay · profiler · console        editor ── inspectors    │
 │  assets ──── asset server · loaders · hot reload · texture/mesh editing                       │
 │  physics (rapier) · audio (kira) · scene (RON) · net (HTTP/WS) · db (SQLite/localStorage)     │
+│  ai ──────── on-device models (Apple Foundation Models · Gemini Nano · scripted), ECS tools   │
 │  stories ─── storybook, gallery      test ── TestApp, input sim, goldens      github ── CI    │
 │                                                                                               │
 │  tasks ───── spawn / spawn_compute / Task::poll / AsyncQueue   (tokio · rayon · wasm futures) │
@@ -112,6 +118,7 @@ Frame:  Startup (once) → PreUpdate (task completions, input, network inbox)
 | [`space3d-stories`](crates/space3d-stories) | storybook |
 | [`space3d-test`](crates/space3d-test) | test harness |
 | [`space3d-github`](crates/space3d-github) | GitHub REST, update checker, crash reporter, CI templates |
+| [`space3d-ai`](crates/space3d-ai) | on-device AI: sessions, NPCs, decisions, engine-side tools ([guide](docs/ai.md)) |
 | [`space3d-cli`](crates/space3d-cli) | the `space3d` command |
 
 ## Quickstart
@@ -153,8 +160,11 @@ Other commands: `space3d build --target desktop|web|android|ios [--release]`,
 | HTTP / WebSocket client | ✓ | ✓ | ✓ | ✓ (fetch / WebSocket) | ✓ | ✓ |
 | HTTP / WebSocket server | ✓ | ✓ | ✓ | — | ✓ | ✓ |
 | hot reload | ✓ | ✓ | ✓ | — | — | — |
+| on-device AI (`ai`) | scripted models | Foundation Models (macOS 27) | scripted models | scripted models | Gemini Nano (Gradle host app) | Foundation Models (iOS 27) |
 
-Details and per-platform setup: [docs/platforms.md](docs/platforms.md).
+Details and per-platform setup: [docs/platforms.md](docs/platforms.md). On-device AI:
+[docs/ai.md](docs/ai.md) and, for Android's Gradle host app, [docs/ai-android.md](docs/ai-android.md);
+the Android and iOS model backends have not yet run on a device.
 
 ## Testing and screenshots
 
@@ -242,12 +252,14 @@ the debug overlay (F3) shows it live. More: [docs/performance.md](docs/performan
 | [`save_game`](examples/save_game) | SQLite save slots + key/value settings |
 | [`async_loading`](examples/async_loading) | assets over HTTP + compute-pool meshes while the frame keeps ticking |
 | [`web_demo`](examples/web_demo) | a browser-first scene built with `space3d::main!` |
+| [`ai_tavern`](examples/ai_tavern) | an on-device-AI innkeeper whose tools read and write ECS state (Apple, Gemini Nano or scripted) |
 
 ```sh
 cargo run -p hello_cube
 cargo run -p instancing_million --release
 SPACE3D_EXIT_AFTER_FRAMES=120 cargo run -p physics_playground   # smoke test: quit after 120 frames
 SPACE3D_HEADLESS=1 SPACE3D_EXIT_AFTER_FRAMES=60 cargo run -p hello_cube   # no window at all
+cargo run -p ai_tavern                                            # scripted innkeeper; Apple/Android: docs/ai.md
 ```
 
 ## Dependency policy: latest stable only

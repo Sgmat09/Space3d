@@ -116,11 +116,12 @@ Environment switches understood by both:
 
 Default: `render`, `platform`, `assets`, `audio`, `physics`, `scene`, `net`, `db`, `ui`.
 Optional: `editor`, `github`, `stories`, `test` (generated projects enable `stories` and
-`editor`, plus `test` for their tests). A dedicated server can use
+`editor`, plus `test` for their tests), and `ai` for on-device AI (`ai-apple-ffi` also links
+Apple's Foundation Models bridge; see [On-device AI](ai.md)). A dedicated server can use
 `space3d = { …, default-features = false, features = ["net"] }` (see
 `examples/multiplayer_chat`).
 
 ## Next
 
 * [Testing](testing.md) · [Storybook](storybook.md) · [Platforms](platforms.md) ·
-  [Networking](networking.md) · [Performance](performance.md)
+  [Networking](networking.md) · [Performance](performance.md) · [On-device AI](ai.md)
