@@ -54,8 +54,8 @@ impl AppleBackend {
     #[cfg(not(oam_apple_linked))]
     fn not_linked() -> AiError {
         AiError::unsupported(
-            "AppleBackend is not linked: build space3d-ai with the `apple-ffi` feature on an Apple target \
-             (and OAM_APPLE_LIB_DIR on macOS; see docs/ai.md).",
+            "AppleBackend is not linked: build space3d-ai with the `apple-ffi` feature on an Apple target, \
+             with OAM_APPLE_LIB_DIR set to the folder of libOpenAppleModelsFFI.dylib on macOS (see docs/ai.md).",
         )
     }
 }

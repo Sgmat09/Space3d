@@ -4,11 +4,11 @@
 //!   `libOpenAppleModelsFFI.a` (iOS, when linking from Cargo instead of Xcode).
 //! * `OAM_APPLE_LIB_KIND` — `dylib` (default on macOS) or `static`.
 //!
-//! On macOS the variable is required (the build fails with instructions otherwise) and an
-//! rpath to the folder is added for this package's own tests and examples. On iOS the library
-//! is normally linked by Xcode from the XCFramework, so the variable is optional there.
-//! Without the feature, or on other targets, nothing is linked and `AppleBackend` reports
-//! `Unsupported`.
+//! On macOS an rpath to the folder is added for this package's own tests and examples; without
+//! the variable nothing is linked (a build warning explains how to fix it) and `AppleBackend`
+//! reports `Unsupported`, so `--all-features` builds still work. On iOS the library is normally
+//! linked by Xcode from the XCFramework, so the variable is optional there. Without the
+//! feature, or on other targets, nothing is linked and `AppleBackend` reports `Unsupported`.
 
 use std::env;
 
@@ -23,14 +23,12 @@ fn main() {
     if !feature || vendor != "apple" {
         return;
     }
-    // The symbols are available to the final link (Cargo or Xcode) from here on.
-    println!("cargo::rustc-cfg=oam_apple_linked");
-
     let dir = env::var("OAM_APPLE_LIB_DIR").ok().filter(|d| !d.trim().is_empty());
     let default_kind = if os == "macos" { "dylib" } else { "static" };
     let kind = env::var("OAM_APPLE_LIB_KIND").unwrap_or_else(|_| default_kind.to_owned());
     match dir {
         Some(dir) => {
+            println!("cargo::rustc-cfg=oam_apple_linked");
             println!("cargo::rustc-link-search=native={dir}");
             println!("cargo::rustc-link-lib={kind}=OpenAppleModelsFFI");
             if kind == "dylib" {
@@ -39,12 +37,12 @@ fn main() {
                 println!("cargo::rustc-link-arg=-Wl,-rpath,{dir}");
             }
         }
-        None if os == "macos" => panic!(
-            "space3d-ai: the `apple-ffi` feature needs OAM_APPLE_LIB_DIR, the folder containing \
-             libOpenAppleModelsFFI.dylib. Build it with:\n  cd open-apple-models && swift build -c release \
-             --product OpenAppleModelsFFI\nthen export OAM_APPLE_LIB_DIR=$PWD/.build/release"
+        None if os == "macos" => println!(
+            "cargo::warning=space3d-ai: `apple-ffi` is enabled but OAM_APPLE_LIB_DIR is not set, so Apple's bridge \
+             is not linked and AppleBackend reports Unsupported. Build it with `swift build -c release --product \
+             OpenAppleModelsFFI` in open-apple-models and set OAM_APPLE_LIB_DIR to its .build/release folder."
         ),
         // iOS / visionOS: Xcode links OpenAppleModelsFFI (static XCFramework) into the app.
-        None => {}
+        None => println!("cargo::rustc-cfg=oam_apple_linked"),
     }
 }

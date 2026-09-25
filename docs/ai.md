@@ -218,8 +218,9 @@ cargo run -p ai_tavern --features apple               # the example (space3d/ai-
 cargo test -p space3d-ai --features apple-ffi         # includes tests/apple_live.rs
 ```
 
-- `build.rs` links `OpenAppleModelsFFI` from `OAM_APPLE_LIB_DIR` (`OAM_APPLE_LIB_KIND=static` for a `.a`). It fails
-  with instructions when the feature is on and the variable is missing.
+- `build.rs` links `OpenAppleModelsFFI` from `OAM_APPLE_LIB_DIR` (`OAM_APPLE_LIB_KIND=static` for a `.a`). With the
+  feature on but no variable, it builds anyway, prints a build warning with instructions, and `AppleBackend`
+  reports `Unsupported`. `--all-features` builds therefore still work.
 - The dylib's install name is `@rpath/libOpenAppleModelsFFI.dylib`. `space3d-ai`'s own tests get an rpath
   automatically. Your binary needs one too: add `println!("cargo::rustc-link-arg=-Wl,-rpath,{dir}")` in its
   `build.rs` (as `examples/ai_tavern/build.rs` does), or ship the dylib in `Contents/Frameworks` of the app bundle
