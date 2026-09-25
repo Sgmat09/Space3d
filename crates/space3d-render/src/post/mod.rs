@@ -6,10 +6,12 @@
 //! [`PostState::encode_group`] and owns the pass slot (targets, formats, capture replay); post
 //! owns the composite and its effects. The frame milestone F4 wrote the composite-only chain
 //! (exposure, tonemapping, dither, alpha, rect mapping, upscale; `chain.rs`,
-//! `shaders/post/composite.wgsl`); effects are the post area's (`STUB(P-POST)`). Distortion
-//! buffers are real (the frame's Distortion phase plumbing, F5, clears and writes them).
+//! `shaders/post/composite.wgsl`); the post milestones add the effects: bloom (PO1,
+//! `bloom.rs`), the rest are `STUB(P-POST)` until PO2–PO5. Distortion buffers are real (the
+//! frame's Distortion phase plumbing, F5, clears and writes them).
 
 pub(crate) mod api;
+mod bloom;
 mod chain;
 mod distortion_mesh;
 
@@ -20,7 +22,8 @@ use crate::node::{FULLSCREEN_WGSL, FrameInfo, FrameMode, RenderNodes};
 use crate::output::{HASH_WGSL, OUTPUT_WGSL, OutputEncoding};
 use crate::settings::FrameSettings;
 use crate::stats::RenderStats;
-use api::{DISTORTION_FORMAT, DistortionResolution, PostProcess};
+use api::{BloomComposite, DISTORTION_FORMAT, DistortionResolution, PostProcess};
+use bloom::{BloomPlan, BloomState};
 use chain::GpuPost;
 use space3d_core::{Entity, World};
 use std::borrow::Cow;
@@ -197,18 +200,47 @@ pub(crate) struct PostState {
     /// 1×1 black stand-in for inputs a group does not have (bloom, exposure = 0 EV, LUT, …).
     dummy: wgpu::TextureView,
     params_bg: Option<(wgpu::BindGroup, u32)>,
-    /// Input bind groups by (scene-texture generation, distortion-buffer generation or 0),
-    /// with the frame they were last used.
-    inputs_bgs: FastMap<(u64, u64), (wgpu::BindGroup, u64)>,
+    /// Input bind groups by (scene-texture generation, distortion-buffer generation or 0,
+    /// bloom-chain generation or 0), with the frame they were last used.
+    inputs_bgs: FastMap<(u64, u64, u64), (wgpu::BindGroup, u64)>,
     /// Distortion buffers created (generation counter) and created since `end_frame`.
     distortion_generation: u64,
     created: u32,
     composite: FastMap<(wgpu::TextureFormat, OutputKind), wgpu::RenderPipeline>,
+    /// Device capabilities, and this frame's (masked by `FrameSettings::downlevel`).
+    caps: GraphicsCaps,
+    frame_caps: GraphicsCaps,
+    /// What each post group planned this frame needs (index = plan order = `PostGroupInput::index`).
+    groups: Vec<GroupPost>,
+    bloom: BloomState,
+    /// Pooled textures whose memory `RenderStats::target_bytes` counts this frame.
+    counted: Vec<u64>,
+    /// Warned (once) that bloom is off in the Ldr fallback.
+    warned_ldr_bloom: bool,
+}
+
+/// What a planned post group records this frame besides the composite.
+#[derive(Clone, Copy, Debug, Default)]
+struct GroupPost {
+    bloom: Option<BloomPlan>,
+}
+
+/// The part of `rect` (pixels, unclipped) inside a `size` texture, at least 1×1: `[x, y, w, h]`
+/// (the frame's `ViewportRect::scissor`).
+fn clip_rect(rect: [i32; 4], size: (u32, u32)) -> [u32; 4] {
+    let axis = |start: i32, len: i32, extent: u32| {
+        let extent = extent.max(1) as i64;
+        let a = (start as i64).clamp(0, extent - 1);
+        let b = (start as i64 + len.max(0) as i64).clamp(a + 1, extent);
+        (a as u32, (b - a) as u32)
+    };
+    let (x, w) = axis(rect[0], rect[2], size.0);
+    let (y, h) = axis(rect[1], rect[3], size.1);
+    [x, y, w, h]
 }
 
 impl PostState {
     pub fn new(device: &wgpu::Device, caps: &GraphicsCaps) -> Self {
-        let _ = caps; // STUB(P-POST): bloom / exposure formats and paths
         let params_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("space3d post params"),
             entries: &[
@@ -279,6 +311,7 @@ impl PostState {
             })
             .create_view(&Default::default());
         let align = device.limits().min_uniform_buffer_offset_alignment as usize;
+        let bloom = BloomState::new(device, align);
         Self {
             frame: 0,
             distortion: FastMap::default(),
@@ -296,21 +329,36 @@ impl PostState {
             composite: FastMap::default(),
             distortion_generation: 0,
             created: 0,
+            caps: caps.clone(),
+            frame_caps: caps.clone(),
+            groups: Vec::new(),
+            bloom,
+            counted: Vec::new(),
+            warned_ldr_bloom: false,
         }
     }
 
     pub fn begin_frame(&mut self, frame: &FrameInfo, settings: &FrameSettings) {
-        let _ = settings; // STUB(P-POST): read_exposure, gpu_timing, downlevel paths
+        // STUB(P-POST): read_exposure, gpu_timing (PO2, PO6).
+        self.frame_caps = self.caps.masked(settings.downlevel);
         self.frame = frame.frame;
         self.planned = 0;
         self.params.begin();
+        self.groups.clear();
+        self.counted.clear();
+        self.bloom.params.begin();
+        self.bloom.slots = 0;
     }
 
     /// Step 6: what a post group needs (bloom, auto exposure, FXAA, distortion, depth). Writes
     /// the group's composite parameters (slot = call order this frame).
     pub fn plan_group(&mut self, world: &World, group: &PostGroupPlan, reallocs: &mut u32) -> PostGroupNeeds {
         let _ = world; // STUB(P-POST): distortion writers, auto exposure history
-        let params = GpuPost::new(group, self.frame);
+        let bloom = self.plan_bloom(group, reallocs);
+        let capacity = self.groups.capacity();
+        self.groups.push(GroupPost { bloom });
+        *reallocs += u32::from(self.groups.capacity() != capacity);
+        let params = GpuPost::new(group, self.frame, bloom.is_some());
         // Two writes: only the per-frame seeds (the last 16 bytes) change in a still scene,
         // and a write marks all of its bytes when any of them changed.
         let bytes = bytemuck::bytes_of(&params);
@@ -319,9 +367,55 @@ impl PostState {
         self.params.write_at(at + split, &bytes[split..], reallocs);
         self.planned += 1;
         PostGroupNeeds {
+            bloom: bloom.is_some(),
             distortion: !group.passthrough && group.settings.enabled && group.settings.distortion.enabled,
             ..Default::default()
         }
+    }
+
+    /// The bloom chain of a post group this frame, its pass uniforms written: bloom enabled
+    /// with a non-zero intensity, in Hdr mode (off in the Ldr fallback, warned once; never in
+    /// the passthrough group) where `GraphicsCaps::bloom_format` exists.
+    fn plan_bloom(&mut self, group: &PostGroupPlan, reallocs: &mut u32) -> Option<BloomPlan> {
+        let s = &group.settings;
+        let b = &s.bloom;
+        if group.passthrough || !s.enabled || !b.enabled || b.intensity <= 0.0 {
+            return None;
+        }
+        if group.mode != FrameMode::Hdr {
+            if !self.warned_ldr_bloom {
+                self.warned_ldr_bloom = true;
+                tracing::warn!("bloom is off in the Ldr fallback (no float render targets or HdrMode::Ldr)");
+            }
+            return None;
+        }
+        // The energy-conserving composite promises the scene's mean: its chain is
+        // `Rgba16Float`. `Rg11b10Ufloat` (5–6 mantissa bits) converts by truncation on some GPUs
+        // (Apple), which over the chain's ~9 writes loses about 5 % of the energy (and more of
+        // blue) — invisible in an additive glow, whose chain keeps the compact format.
+        let format = match b.composite {
+            BloomComposite::EnergyConserving => self.frame_caps.hdr_format,
+            _ => self.frame_caps.bloom_format,
+        }?;
+        let rect = clip_rect(group.scene_rect, group.scene_size);
+        let (size, mips) = bloom::chain_size((rect[2], rect[3]), b);
+        let first_slot = self.bloom.slots;
+        let (params, slot) = (&mut self.bloom.params, self.bloom.slot);
+        let mut n = first_slot as usize;
+        // STUB(P-POST) PO2: with auto exposure the prefilter also multiplies by 2^E.
+        let exposure = (s.exposure.exp2(), false);
+        bloom::passes(group.scene_size, rect, (size, mips), b, exposure, |p| {
+            params.write_at(n * slot, bytemuck::bytes_of(&p), reallocs);
+            n += 1;
+        });
+        self.bloom.slots = n as u32;
+        Some(BloomPlan {
+            format,
+            size,
+            mips,
+            first_slot,
+            scatter: b.scatter.clamp(0.0, 1.0),
+        })
     }
 
     /// Upload this frame's parameters (after every [`Self::plan_group`], before any
@@ -355,6 +449,7 @@ impl PostState {
             });
             self.params_bg = Some((bg, generation));
         }
+        self.bloom.flush(device, encoder, up, &self.sampler);
     }
 
     /// The persistent distortion buffer of a post group (created on demand; freed 60 frames
@@ -396,6 +491,10 @@ impl PostState {
     pub fn prewarm(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, manual_srgb: bool) {
         let kind = OutputKind::of(format, manual_srgb);
         self.composite_pipeline(device, format, kind);
+        // The additive chain's format and the energy-conserving one's (see `plan_bloom`).
+        for format in [self.caps.bloom_format, self.caps.hdr_format].into_iter().flatten() {
+            self.bloom.pipelines(device, format);
+        }
     }
 
     /// The composite pipeline for `format` and `kind` (created on first use).
@@ -436,11 +535,24 @@ impl PostState {
     }
 
     /// Record meter → bloom → composite (→ FXAA) for one post group into the frame encoder.
-    /// F4: the composite (STUB(P-POST): metering, bloom, FXAA and the other effects).
+    /// Bloom (PO1) and the composite; STUB(P-POST): metering (PO2), FXAA (PO3).
     pub fn encode_group(&mut self, cx: &mut PostEncode<'_>, input: &PostGroupInput<'_>) {
         if self.params_bg.is_none() {
             return;
         }
+        let plan = self.groups.get(input.index).and_then(|g| g.bloom);
+        let bloom = plan.and_then(|plan| {
+            let scene = (input.scene, input.scene_generation);
+            let (view, generation) = self.bloom.encode(cx, scene, &plan, &self.dummy, self.frame, None)?;
+            // Groups of one size share a pooled chain: count its memory once per frame.
+            if !input.replay && !self.counted.contains(&generation) {
+                let capacity = self.counted.capacity();
+                self.counted.push(generation);
+                cx.stats.cpu_reallocations += u32::from(self.counted.capacity() != capacity);
+                cx.stats.target_bytes += plan.bytes();
+            }
+            Some((view, generation))
+        });
         let kind = OutputKind::of(input.output_format, input.output_manual_srgb);
         self.composite_pipeline(cx.device, input.output_format, kind);
         let Some((params_bg, _)) = &self.params_bg else {
@@ -453,7 +565,11 @@ impl PostState {
             .distortion
             .and_then(|_| self.distortion.get(&input.camera))
             .map_or(0, |t| t.generation);
-        let key = (input.scene_generation, distortion);
+        let key = (
+            input.scene_generation,
+            distortion,
+            bloom.as_ref().map_or(0, |(_, g)| *g),
+        );
         let inputs = &mut self.inputs_bgs.entry(key).or_insert_with(|| {
             let entry = |binding, view| wgpu::BindGroupEntry {
                 binding,
@@ -464,7 +580,7 @@ impl PostState {
                 layout: inputs_bgl,
                 entries: &[
                     entry(0, input.scene),
-                    entry(1, dummy),
+                    entry(1, bloom.as_ref().map_or(dummy, |(view, _)| view)),
                     entry(2, dummy),
                     entry(3, dummy),
                     entry(4, input.distortion.unwrap_or(dummy)),
@@ -511,6 +627,7 @@ impl PostState {
         self.distortion.retain(|_, t| t.last_used + 60 > frame);
         // Bind groups of scene textures no longer composited (replaced or freed).
         self.inputs_bgs.retain(|_, (_, used)| *used + 3 > frame);
+        self.bloom.sources.retain(|_, (_, used)| *used + 3 > frame);
     }
 
     /// Register the built-in post nodes (`"space3d/distortion-meshes"`).

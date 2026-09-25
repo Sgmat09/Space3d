@@ -4,6 +4,7 @@
 //! upscale) and grown by the post area (PO1–PO6).
 
 use super::PostGroupPlan;
+use super::api::BloomComposite;
 use crate::node::FrameMode;
 use crate::output::{Tonemapper, pcg};
 use bytemuck::{Pod, Zeroable};
@@ -60,8 +61,8 @@ pub(crate) fn dither_seed(frame: u64) -> u32 {
 }
 
 impl GpuPost {
-    /// Parameters of one post group (the composite-only chain of F4).
-    pub(crate) fn new(plan: &PostGroupPlan, frame: u64) -> Self {
+    /// Parameters of one post group; `bloom`: its bloom chain is recorded this frame.
+    pub(crate) fn new(plan: &PostGroupPlan, frame: u64, bloom: bool) -> Self {
         let s = &plan.settings;
         let mut flags = 0;
         if s.dither && !plan.passthrough {
@@ -96,6 +97,16 @@ impl GpuPost {
         p.src_rect = rect(plan.scene_rect);
         p.src_texel = [1.0 / sw, 1.0 / sh, out[2] / out[3].max(1.0), plan.output_size.1 as f32];
         p.exposure = [exposure, 0.0, 0.0, 0.0];
+        if bloom {
+            flags |= bits::BLOOM;
+            let energy = s.bloom.composite == BloomComposite::EnergyConserving;
+            p.exposure[2] = if energy {
+                s.bloom.intensity.clamp(0.0, 1.0)
+            } else {
+                s.bloom.intensity.max(0.0)
+            };
+            p.exposure[3] = f32::from(u8::from(energy));
+        }
         p.grade_matrix = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
         p.flags = [flags, tonemapper.id(), 0, 0];
         p.frame = [

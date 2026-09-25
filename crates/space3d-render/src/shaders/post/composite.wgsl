@@ -31,7 +31,7 @@ struct PostParams {
     out_rect: vec4<f32>,        // the group's rect in D pixels (x, y, w, h), unclipped
     src_rect: vec4<f32>,        // its rect in S pixels, unclipped
     src_texel: vec4<f32>,       // 1/S.w, 1/S.h, rect aspect (w/h), D height
-    exposure: vec4<f32>,        // linear multiplier, -, bloom intensity, bloom mode
+    exposure: vec4<f32>,        // linear multiplier, -, bloom intensity, bloom mode (0 add, 1 mix)
     vignette: vec4<f32>,
     vignette_color: vec4<f32>,
     lens: vec4<f32>,
@@ -56,20 +56,41 @@ fn post_has(bit: u32) -> bool {
     return (post.flags.x & bit) != 0u;
 }
 
-// The scene color at D pixel center `px`: a texel load when S and D rects have the same size
-// (render scale 1: exact), else bilinear with every tap inside the rect (split screens never
-// bleed into each other).
-fn post_scene(px: vec2<f32>) -> vec4<f32> {
+// The position in S (pixels) of D pixel center `px`: the same offset when S and D rects have the
+// same size (render scale 1), else the rect mapped onto the rect.
+fn post_scene_pos(px: vec2<f32>) -> vec2<f32> {
     if (post_has(S3D_POST_EXACT)) {
-        let p = vec2<i32>(floor(px - post.out_rect.xy + post.src_rect.xy));
-        return textureLoad(scene_tex, p, 0);
+        return px - post.out_rect.xy + post.src_rect.xy;
     }
-    let size = 1.0 / post.src_texel.xy;
     let uv = (px - post.out_rect.xy) / post.out_rect.zw;
-    let lo = max(post.src_rect.xy, vec2<f32>(0.0)) + 0.5;
-    let hi = min(post.src_rect.xy + post.src_rect.zw, size) - 0.5;
-    let s = clamp(post.src_rect.xy + uv * post.src_rect.zw, lo, max(lo, hi));
+    return post.src_rect.xy + uv * post.src_rect.zw;
+}
+
+// The rect's part inside S (pixels): lo, hi.
+fn post_scene_clip() -> vec4<f32> {
+    let size = 1.0 / post.src_texel.xy;
+    let lo = max(post.src_rect.xy, vec2<f32>(0.0));
+    let hi = min(post.src_rect.xy + post.src_rect.zw, size);
+    return vec4<f32>(lo, max(lo, hi));
+}
+
+// The scene color at S position `s`: a texel load at render scale 1 (exact), else bilinear with
+// every tap inside the rect (split screens never bleed into each other).
+fn post_scene(s_in: vec2<f32>) -> vec4<f32> {
+    if (post_has(S3D_POST_EXACT)) {
+        return textureLoad(scene_tex, vec2<i32>(floor(s_in)), 0);
+    }
+    let clip = post_scene_clip();
+    let s = clamp(s_in, clip.xy + 0.5, max(clip.xy + 0.5, clip.zw - 0.5));
     return textureSampleLevel(scene_tex, post_sampler, s * post.src_texel.xy, 0.0);
+}
+
+// Bloom level 0 at S position `s` (already exposed and thresholded). The chain covers the
+// rect's part inside S.
+fn post_bloom(s: vec2<f32>) -> vec3<f32> {
+    let clip = post_scene_clip();
+    let uv = (s - clip.xy) / max(clip.zw - clip.xy, vec2<f32>(1.0));
+    return textureSampleLevel(bloom_tex, post_sampler, uv, 0.0).rgb;
 }
 
 // Last-pass finish: dither (triangular, ±1 LSB in the encoded space) and encoding for D.
@@ -94,7 +115,8 @@ fn post_finish(rgb_in: vec3<f32>, px: vec2<u32>) -> vec3<f32> {
 
 @fragment
 fn fs_composite(in: FullscreenOut) -> @location(0) vec4<f32> {
-    let c = post_scene(in.pos.xy);
+    let s = post_scene_pos(in.pos.xy);
+    let c = post_scene(s);
     let a = select(1.0, c.a, post_has(S3D_POST_SCENE_ALPHA));
     var rgb = c.rgb;
     let transparent = post_has(S3D_POST_TRANSPARENT);
@@ -102,6 +124,16 @@ fn fs_composite(in: FullscreenOut) -> @location(0) vec4<f32> {
         rgb = rgb / a;
     }
     rgb = rgb * post.exposure.x;
+    // Bloom is in exposed units (the prefilter exposed it): added after exposure, never exposed
+    // twice. Transparent groups weight it by alpha below (no haze where nothing was drawn).
+    if (post_has(S3D_POST_BLOOM)) {
+        let b = post_bloom(s);
+        if (post.exposure.w > 0.5) {
+            rgb = mix(rgb, b, post.exposure.z);
+        } else {
+            rgb = rgb + b * post.exposure.z;
+        }
+    }
     rgb = s3d_tonemap(post.flags.y, rgb);
     rgb = post_finish(rgb, vec2<u32>(in.pos.xy));
     if (transparent) {
