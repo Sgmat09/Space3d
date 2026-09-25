@@ -1011,3 +1011,72 @@ fn viewports_share_a_render_target() {
     let n = |rgb| count_in(&img, 0..64, 0..64, rgb);
     assert!(n(RED) > 150 && n(GREEN) > 150, "red {} green {}", n(RED), n(GREEN));
 }
+
+/// The first-pass rule holds for render targets too: a render target whose only camera has a
+/// viewport starts the frame black outside it — not with last frame's content (here a
+/// full-target red camera's). A monitor filling the main view shows the target.
+#[test]
+fn the_first_view_of_a_frame_clears_a_render_target() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let (cube, rt) = {
+        let a = app.resources.expect_mut::<RenderAssets>();
+        (a.add_mesh(MeshData::cube(3.4)), a.add_render_target(32, 32))
+    };
+    app.world.spawn((
+        Transform::default(),
+        Mesh3d(cube),
+        Material::unlit(Vec4::ONE).with_texture(rt),
+    ));
+    camera_at(&mut app, Vec3::new(0.0, 0.0, 3.0), 0, None, Some(BLUE));
+    let rt_camera = |app: &mut App, order, viewport, clear| {
+        app.world.spawn((
+            Transform::from_xyz(100.0, 0.0, 5.0),
+            Camera3d {
+                order,
+                target: RenderTarget::Texture(rt),
+                viewport,
+                clear_color: Some(linear(clear)),
+                ..Default::default()
+            },
+        ))
+    };
+    let full = rt_camera(&mut app, -2, None, RED);
+    let img = render_every_path(&mut app);
+    assert!(count_in(&img, 0..64, 0..64, RED) > 2000, "the monitor shows the target");
+
+    app.world.get::<&mut Camera3d>(full).unwrap().active = false;
+    rt_camera(&mut app, -1, Some([0.0, 0.0, 0.5, 1.0]), GREEN);
+    let img = render_every_path(&mut app);
+    let n = |rgb| count_in(&img, 0..64, 0..64, rgb);
+    assert_eq!(n(RED), 0, "last frame's content in the render target");
+    assert!(
+        n(GREEN) > 500 && n(BLACK) > 500,
+        "green {} black {}",
+        n(GREEN),
+        n(BLACK)
+    );
+}
+
+/// A viewport thinner than a pixel keeps the pixel holding its center; at the right or bottom
+/// edge of the target that pixel is the last column or row (growing the far edge to one pixel
+/// used to push it just outside the target, where nothing was drawn).
+#[test]
+fn viewports_thinner_than_a_pixel_keep_one_pixel_of_the_target() {
+    for samples in [1, 4] {
+        for (viewport, xs, ys) in [
+            ([0.999, 0.0, 0.001, 1.0], 96..97, 0..61),
+            ([0.0, 0.999, 1.0, 0.001], 0..97, 60..61),
+            ([0.0, 0.0, 0.001, 1.0], 0..1, 0..61),
+        ] {
+            let Some(mut app) = msaa_app(97, 61, samples) else {
+                return;
+            };
+            camera_at(&mut app, Vec3::new(0.0, 0.0, 5.0), 0, None, Some(BLUE));
+            camera_at(&mut app, Vec3::new(0.0, 0.0, 5.0), 1, Some(viewport), Some(RED));
+            let img = render_every_path(&mut app);
+            let line = xs.len() * ys.len();
+            assert_eq!(count_in(&img, xs, ys, RED), line, "{viewport:?} ×{samples}");
+            assert_eq!(count_in(&img, 0..97, 0..61, RED), line, "{viewport:?} ×{samples}");
+        }
+    }
+}

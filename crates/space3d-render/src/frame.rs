@@ -652,6 +652,11 @@ pub(crate) struct FrameState {
     /// Largest `base_vertex` passed to a direct draw since the last `prepare`.
     #[cfg(test)]
     pub(crate) max_direct_base_vertex: i32,
+    /// Test stand-in for a window whose surface is lost at the next frame's acquire: the
+    /// renderer leaves its offscreen target alone like a windowed one, and the next frame
+    /// takes the lost-surface path after preparing its views.
+    #[cfg(test)]
+    pub(crate) simulate_surface_loss: bool,
     /// Times the ECS batch order was rebuilt.
     #[cfg(test)]
     pub(crate) ecs_reorders: u64,
@@ -743,6 +748,8 @@ impl FrameState {
             max_buffer_size: caps.max_buffer_size,
             #[cfg(test)]
             max_direct_base_vertex: 0,
+            #[cfg(test)]
+            simulate_surface_loss: false,
             #[cfg(test)]
             ecs_reorders: 0,
         }
@@ -954,6 +961,7 @@ impl Renderer {
 
         // Acquire the surface only when something presents.
         let mut surface_tex = None;
+        let mut lost = false;
         if let Some(s) = &mut self.surface {
             match SurfaceAcquire::from_current(s.surface.get_current_texture()) {
                 SurfaceAcquire::Present(t) => {
@@ -971,14 +979,16 @@ impl Renderer {
                     tracing::warn!("the canvas rejected its sRGB view format; encoding sRGB in the shader instead");
                     s.drop_srgb_view(&self.device);
                 }
-                SurfaceAcquire::Recreate => {
-                    // `has_surface()` turns false: the platform layer attaches a new surface
-                    // with `set_surface`. Until then frames render offscreen.
-                    tracing::warn!("presentation surface lost; dropping it until a new one is attached");
-                    self.surface = None;
-                }
+                SurfaceAcquire::Recreate => lost = true,
                 SurfaceAcquire::Skip => {}
             }
+        }
+        #[cfg(test)]
+        {
+            lost |= std::mem::take(&mut self.frame.simulate_surface_loss);
+        }
+        if lost {
+            self.surface_lost();
         }
         let surface_view = surface_tex.as_ref().map(|t| {
             t.texture.create_view(&wgpu::TextureViewDescriptor {
@@ -1017,6 +1027,19 @@ impl Renderer {
                 resources.insert(self.stats.clone());
             }
         }
+    }
+
+    /// The presentation surface is gone (`SurfaceAcquire::Recreate`) after this frame's views
+    /// were prepared for it. `has_surface()` turns false: the platform layer attaches a new
+    /// surface with `set_surface`. Until then frames render offscreen, this one included — into
+    /// an offscreen target of the size its primary views were prepared for. A windowed
+    /// renderer sizes that target only for captures, so it may still have an older window
+    /// size, and a viewport's scissor rect outside it would fail validation, losing the
+    /// frame's commands and with them its uploads.
+    fn surface_lost(&mut self) {
+        tracing::warn!("presentation surface lost; dropping it until a new one is attached");
+        self.surface = None;
+        self.size_offscreen(self.frame.last_primary_size);
     }
 
     fn primary_size(&self) -> (u32, u32) {
@@ -2330,7 +2353,8 @@ impl Renderer {
     /// frame's content, and never painting a viewport's clear color outside the viewport —
     /// and later passes load it. A view with a viewport and a clear color then clears only its
     /// viewport, with a triangle in that color ([`Pipelines::viewport_clear`]). The viewport,
-    /// in whole pixels ([`viewport_rect`]), is also the pass's scissor rect. Depth is per view:
+    /// in whole pixels ([`viewport_rect`]), also sets the pass's scissor rect (its part within
+    /// the attachment). Depth is per view:
     /// every pass clears the whole depth attachment (views never test against each other) and
     /// discards it.
     ///
@@ -2350,6 +2374,10 @@ impl Renderer {
     ) {
         let rect = view.viewport.map(|v| viewport_rect(v, view.size));
         let full = rect.is_none_or(|r| r.covers(view.size));
+        // Scissor rects must lie within the attachment itself. It has the size the view was
+        // prepared for on every path (see `surface_lost`); should that ever not hold, a scissor
+        // rect outside it would fail validation and lose the whole frame's commands.
+        let extent = (color.texture().width(), color.texture().height());
         let clear = view.clear.map(|c| {
             let c = if manual_srgb { linear_to_srgb_color(c) } else { c };
             wgpu::Color {
@@ -2387,7 +2415,7 @@ impl Renderer {
         });
         if let Some(r) = rect {
             pass.set_viewport(r.x as f32, r.y as f32, r.w as f32, r.h as f32, 0.0, 1.0);
-            let [x, y, w, h] = r.scissor(view.size);
+            let [x, y, w, h] = r.scissor(extent);
             pass.set_scissor_rect(x, y, w, h);
         }
         if let Some(c) = rect_clear {
@@ -2400,7 +2428,7 @@ impl Renderer {
             // wgpu's GL backend resolves MSAA with a framebuffer blit at the end of the pass,
             // and GL clips blits to the scissor rect: only the viewport would be resolved, and
             // the rest of the target would keep its previous content.
-            pass.set_scissor_rect(0, 0, view.size.0.max(1), view.size.1.max(1));
+            pass.set_scissor_rect(0, 0, extent.0, extent.1);
         }
     }
 
@@ -2536,12 +2564,7 @@ impl Renderer {
     /// target gets the size those views were prepared for (their projection and viewports),
     /// even if the window was resized since.
     pub(crate) fn encode_primary_to_offscreen(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        let (w, h) = self.frame.last_primary_size;
-        let (w, h) = (w.max(1), h.max(1));
-        let samples = self.config.msaa_samples;
-        if (self.offscreen.width, self.offscreen.height, self.offscreen.samples) != (w, h, samples) {
-            self.offscreen = crate::renderer::Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
-        }
+        self.size_offscreen(self.frame.last_primary_size);
         // Re-recorded passes are not new draws: keep the frame's pass counters.
         let stats = self.stats.clone();
         self.encode_views(encoder, None, true);
@@ -2587,11 +2610,27 @@ impl ViewportRect {
 /// Rounded because GL takes integer viewports (wgpu's GL backend truncates position and size
 /// separately, which would shift fractional viewports and open gaps between neighbours): every
 /// backend draws the same pixels, and neighbouring viewports share their edges exactly.
+///
+/// A viewport whose edges round to the same boundary (thinner than about a pixel) gets the
+/// pixel holding its center, kept within the target when the viewport overlaps the target:
+/// growing its far edge instead would push a viewport in the last half pixel of the target
+/// entirely outside it.
 fn viewport_rect([x, y, w, h]: [f32; 4], size: (u32, u32)) -> ViewportRect {
     let axis = |start: f32, len: f32, extent: u32| {
-        let a = (start * extent as f32).round();
-        let b = ((start + len) * extent as f32).round();
-        (a as i32, ((b - a) as i64).max(1) as u32)
+        let e = extent as f32;
+        let a = (start * e).round();
+        let b = ((start + len) * e).round();
+        if b > a {
+            return (a as i32, (b - a) as u32);
+        }
+        let center = ((start + 0.5 * len) * e).floor();
+        let overlaps = start.min(start + len) < 1.0 && start.max(start + len) > 0.0;
+        let p = if overlaps {
+            center.clamp(0.0, (e - 1.0).max(0.0))
+        } else {
+            center
+        };
+        (p as i32, 1)
     };
     let (x, w) = axis(x, w, size.0);
     let (y, h) = axis(y, h, size.1);
@@ -2946,12 +2985,165 @@ mod tests {
         assert!(viewport_rect([-0.1, 0.0, 1.2, 1.0], (8, 4)).covers((8, 4)));
         // Degenerate and out-of-range viewports: at least one pixel, scissor within the target.
         assert_eq!(rect([0.5, 0.5, 0.0, 0.0], (10, 10)), (5, 5, 1, 1));
+        // Thinner than a pixel: the pixel holding the center, inside the target at its edges
+        // (the far edge used to grow past the target: x = 97, nothing drawn).
+        assert_eq!(rect([0.999, 0.0, 0.001, 1.0], (97, 61)), (96, 0, 1, 61));
+        assert_eq!(rect([0.0, 0.999, 1.0, 0.001], (97, 61)), (0, 60, 97, 1));
+        assert_eq!(rect([0.0, 0.0, 1e-6, 1e-6], (97, 61)), (0, 0, 1, 1));
+        assert_eq!(rect([0.9999, 0.0, 0.001, 1.0], (97, 61)), (96, 0, 1, 61));
+        assert_eq!(rect([0.52, 0.0, 0.001, 1.0], (10, 10)), (5, 0, 1, 10));
+        assert_eq!(rect([0.3, 0.0, -0.1, 1.0], (10, 10)), (2, 0, 1, 10));
+        // Entirely outside the target, it stays outside (nothing is drawn).
+        assert_eq!(rect([1.0, 1.0, 0.0, 0.0], (10, 10)), (10, 10, 1, 1));
+        assert_eq!(rect([-0.5, 0.0, 0.01, 1.0], (10, 10)), (-5, 0, 1, 10));
+        // Viewports within 0..1 stay within the target.
+        for size in [(1, 1), (2, 3), (97, 61), (1920, 1080)] {
+            for x in [0.0f32, 0.1, 0.5, 0.97, 0.999, 0.9999, 1.0 - f32::EPSILON] {
+                for w in [0.0f32, 1e-6, 1e-4, 1e-3, 0.01, 0.5, 1.0]
+                    .into_iter()
+                    .filter(|w| x + w <= 1.0)
+                {
+                    let r = viewport_rect([x, 0.0, w, 1.0], size);
+                    let [sx, _, sw, _] = r.scissor(size);
+                    assert!(r.x >= 0 && r.x as u32 + r.w <= size.0, "{x} {w} {size:?}: {r:?}");
+                    assert_eq!((sx, sw), (r.x as u32, r.w), "{x} {w} {size:?}");
+                }
+            }
+        }
         let outside = viewport_rect([1.0, 1.0, 0.5, 0.5], (10, 10));
         assert_eq!((outside.x, outside.w), (10, 5));
         assert_eq!(outside.scissor((10, 10)), [9, 9, 1, 1]);
         let wide = viewport_rect([-0.5, 0.0, 2.0, 1.0], (10, 10));
         assert_eq!((wide.x, wide.w), (-5, 20));
         assert_eq!(wide.scissor((10, 10)), [0, 0, 10, 10]);
+    }
+
+    /// Split screen for the surface-loss tests: a green cube in the left camera's view (red
+    /// clear color), a magenta one in the right camera's (blue).
+    fn split_screen_app(w: u32, h: u32, samples: u32) -> Option<space3d_core::App> {
+        use crate::{Camera3d, Mesh3d};
+        use space3d_core::{MeshData, Transform};
+        let mut app = headless_app(w, h)?;
+        app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+        let cube = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(2.0));
+        for (order, (x, color, vp, clear)) in [
+            (-50.0, Vec4::new(0.0, 1.0, 0.0, 1.0), 0.0, Vec4::new(1.0, 0.0, 0.0, 1.0)),
+            (50.0, Vec4::new(1.0, 0.0, 1.0, 1.0), 0.5, Vec4::new(0.0, 0.0, 1.0, 1.0)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.world
+                .spawn((Transform::from_xyz(x, 0.0, 0.0), Mesh3d(cube), Material::unlit(color)));
+            app.world.spawn((
+                Transform::from_xyz(x, 0.0, 6.0),
+                Camera3d {
+                    order: order as i32,
+                    viewport: Some([vp, 0.0, 0.5, 1.0]),
+                    clear_color: Some(clear),
+                    ..Default::default()
+                },
+            ));
+        }
+        Some(app)
+    }
+
+    /// Regression: when the presentation surface was lost after a frame's views had been
+    /// prepared for it (`SurfaceAcquire::Recreate`), that frame drew its primary views into
+    /// the offscreen target, which a windowed renderer sizes only for captures — it could
+    /// still have the window's first size. After the window had grown, the right viewport's
+    /// scissor rect lay outside it: a validation error that lost the frame's command encoder,
+    /// uploads included (a panic in debug builds). The frame now renders offscreen at the size
+    /// its views were prepared for, on every draw path, like the frames after it.
+    #[test]
+    fn a_surface_lost_mid_frame_renders_offscreen_at_the_prepared_size() {
+        const RED: [u8; 3] = [255, 0, 0];
+        const GREEN: [u8; 3] = [0, 255, 0];
+        const BLUE: [u8; 3] = [0, 0, 255];
+        const MAGENTA: [u8; 3] = [255, 0, 255];
+        for samples in [1, 4] {
+            let Some(mut app) = split_screen_app(64, 48, samples) else {
+                return;
+            };
+            let best = app.resources.expect::<Renderer>().capabilities().best_draw_path;
+            let mut reference = None;
+            for path in [
+                DrawPath::CpuDirect,
+                DrawPath::GpuIndirect,
+                DrawPath::GpuMultiDraw,
+                DrawPath::GpuMultiDrawCount,
+            ] {
+                if path > best {
+                    continue;
+                }
+                set_path(&mut app, path);
+                {
+                    let r = app.resources.expect_mut::<Renderer>();
+                    r.frame.simulate_surface_loss = false;
+                    r.resize(64, 48);
+                }
+                let img = crate::render_to_image(&mut app).expect("capture");
+                assert_eq!((img.width, img.height), (64, 48));
+                {
+                    // The window grows; its surface is lost at the next frame's acquire.
+                    let r = app.resources.expect_mut::<Renderer>();
+                    r.frame.simulate_surface_loss = true;
+                    r.resize(128, 96);
+                    assert_eq!((r.offscreen.width, r.offscreen.height), (64, 48));
+                }
+                let img = crate::render_to_image(&mut app).expect("capture");
+                let r = app.resources.expect::<Renderer>();
+                assert!(!r.frame.simulate_surface_loss, "the lost-surface path ran");
+                assert_eq!(r.gpu_error_count(), 0, "{path:?} ×{samples}");
+                assert_eq!((img.width, img.height), (128, 96), "{path:?} ×{samples}");
+                let n = |xs: std::ops::Range<u32>, rgb: [u8; 3]| {
+                    xs.flat_map(|x| (0..96).map(move |y| (x, y)))
+                        .filter(|&(x, y)| img.get(x, y)[..3] == rgb)
+                        .count()
+                };
+                assert!(
+                    n(0..64, RED) > 3000 && n(0..64, GREEN) > 300,
+                    "{path:?} ×{samples}: left"
+                );
+                assert!(
+                    n(64..128, BLUE) > 3000 && n(64..128, MAGENTA) > 300,
+                    "{path:?} ×{samples}: right"
+                );
+                assert_eq!(
+                    n(0..64, BLUE) + n(0..64, MAGENTA) + n(64..128, RED) + n(64..128, GREEN),
+                    0
+                );
+                match &reference {
+                    None => reference = Some(img),
+                    Some(cpu) => assert_eq!(differing_px(cpu, &img), 0, "{path:?} ×{samples} differs from CpuDirect"),
+                }
+            }
+        }
+    }
+
+    /// A pass's scissor rects stay within its attachment even if the attachment does not have
+    /// the size the view was prepared for (which `surface_lost` prevents): a scissor rect
+    /// outside it would fail validation and lose the frame's commands.
+    #[test]
+    fn scissor_rects_stay_within_the_attachment() {
+        for samples in [1, 4] {
+            let Some(mut app) = split_screen_app(64, 48, samples) else {
+                return;
+            };
+            crate::render_to_image(&mut app).expect("capture");
+            let r = app.resources.expect_mut::<Renderer>();
+            assert_eq!(r.frame.last_primary_size, (64, 48));
+            // Re-record the frame's primary views into a smaller target.
+            let samples = r.config.msaa_samples;
+            r.offscreen = crate::renderer::Attachments::new(&r.device, 40, 30, samples, OFFSCREEN_FORMAT, true);
+            let scope = r.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let mut encoder = r.device.create_command_encoder(&Default::default());
+            r.encode_views(&mut encoder, None, true);
+            r.queue.submit([encoder.finish()]);
+            let error = pollster::block_on(scope.pop());
+            assert!(error.is_none(), "×{samples}: {error:?}");
+            assert_eq!(r.gpu_error_count(), 0);
+        }
     }
 
     /// The viewport clear writes its color — the pass's blend constant — into every color

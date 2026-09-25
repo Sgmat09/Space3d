@@ -226,8 +226,10 @@ attachments, so per target and frame:
   what the earlier ones drew; a later camera covering the whole target with a clear color
   clears it all.
 * A camera's viewport (`[x, y, w, h]`, normalized, top left origin) is rounded to whole
-  pixels — each edge to the nearest pixel boundary, at least one pixel — for its projection's
-  aspect ratio, the pass's viewport and its scissor rect (its part within the target). GL
+  pixels — each edge to the nearest pixel boundary; a viewport thinner than that gets the
+  pixel holding its center, within the target if it overlaps it (growing the far edge would
+  push one in the last half pixel just outside) — for its projection's aspect ratio, the
+  pass's viewport and its scissor rect (its part within the attachment). GL
   takes integer viewports (wgpu's GL backend truncates position and size separately, which
   shifted fractional viewports by a pixel and opened gaps between neighbours), so every backend
   draws the same pixels and neighbouring viewports share their edges exactly. With a clear
@@ -246,10 +248,20 @@ attachments, so per target and frame:
   `tests/headless.rs::the_first_view_of_a_frame_clears_its_target`).
 * Depth is per camera: every pass clears the whole depth attachment and discards it, so a
   camera never tests against another's geometry.
+* A pass's attachments have the size its views were prepared for on every path. When the
+  window's surface is lost after a frame's views were prepared (`SurfaceAcquire::Recreate`),
+  the frame's primary views are drawn offscreen, like the frames until a new surface is
+  attached, so the offscreen target — which a windowed renderer otherwise sizes only for
+  captures — is sized for them first (`Renderer::surface_lost`); a scissor rect outside the
+  attachment would fail validation and lose the frame's commands, uploads included. Scissor
+  rects are also clamped to the attachment's own size
+  (`frame::tests::a_surface_lost_mid_frame_renders_offscreen_at_the_prepared_size`,
+  `scissor_rects_stay_within_the_attachment`).
 
 This is identical on every draw path (`tests/headless.rs`: split screen with and without MSAA,
 picture-in-picture over a full-screen camera, an overlay without a clear color, the first-pass
-rule across frames, two viewports sharing a render target; `frame::tests::
+rule across frames in the window and in a render target, two viewports sharing a render
+target, viewports thinner than a pixel at the target's edges; `frame::tests::
 viewport_clear_writes_every_target_format` clears sRGB, linear 8/10-bit and `Rgba16Float`
 targets at 1 and 4 samples; the `viewports` portability scene matches the default backend
 on GL in `tests/gl.rs`).
@@ -530,8 +542,9 @@ once in-flight work has finished. A lost device thus degrades (captures fail, fr
 dropped) instead of crashing (`tests/headless.rs::a_lost_device_degrades_instead_of_panicking`,
 `renderer::tests::errors_after_device_loss_do_not_panic_in_debug`). On `CurrentSurfaceTexture::Outdated` the
 surface is reconfigured; on `Lost` it is dropped (`has_surface()` turns false, frames render
-offscreen) because a lost surface must be recreated from the window with `set_surface`, and
-reconfiguring it fails validation.
+offscreen — that frame included, at the size its views were prepared for: see [Cameras and
+viewports](#cameras-and-viewports)) because a lost surface must be recreated from the window
+with `set_surface`, and reconfiguring it fails validation.
 
 Surfaces prefer an sRGB format. Browser WebGPU canvases have none (`Bgra8Unorm`/
 `Rgba8Unorm`), so the canvas is configured with its sRGB twin as a view format and frames

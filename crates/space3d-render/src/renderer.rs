@@ -624,11 +624,22 @@ impl Renderer {
     /// Headless: (re)allocate the offscreen target to the configured size and sample count.
     /// Called at the start of a frame, never between a frame and its capture.
     pub(crate) fn ensure_offscreen(&mut self) {
-        if self.surface.is_some() {
-            // Windowed: the offscreen target only serves captures, which size it themselves.
+        let windowed = self.surface.is_some();
+        // A test renderer standing in for a window whose surface is lost this frame.
+        #[cfg(test)]
+        let windowed = windowed || self.frame.simulate_surface_loss;
+        if windowed {
+            // Windowed: the offscreen target only serves captures and frames whose surface
+            // was lost, which size it themselves (`size_offscreen`).
             return;
         }
-        let (w, h, samples) = (self.config.width, self.config.height, self.config.msaa_samples);
+        self.size_offscreen((self.config.width, self.config.height));
+    }
+
+    /// (Re)allocate the offscreen target at `size` with the configured sample count, unless it
+    /// already has them.
+    pub(crate) fn size_offscreen(&mut self, (w, h): (u32, u32)) {
+        let (w, h, samples) = (w.max(1), h.max(1), self.config.msaa_samples);
         let a = &self.offscreen;
         if (a.width, a.height, a.samples) != (w, h, samples) {
             self.offscreen = Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);

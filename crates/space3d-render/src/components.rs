@@ -198,8 +198,9 @@ pub struct Camera3d {
     pub order: i32,
     /// Normalized viewport `[x, y, width, height]` in 0..1, from the top left; `None` = full
     /// target. Its edges are rounded to whole pixels (the same on every backend; neighbouring
-    /// viewports share edges exactly). The camera clears and draws only inside it, so several
-    /// cameras can share a target (split screen, picture-in-picture, minimaps).
+    /// viewports share edges exactly); one thinner than a pixel keeps the pixel holding its
+    /// center. The camera clears and draws only inside it, so several cameras can share a
+    /// target (split screen, picture-in-picture, minimaps).
     pub viewport: Option<[f32; 4]>,
     /// Inactive cameras are skipped.
     pub active: bool,
