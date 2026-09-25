@@ -4726,6 +4726,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "space3d-ai"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "jni",
+ "ndk-context",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "space3d-core",
+ "space3d-tasks",
+ "thiserror 2.0.21",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
 name = "space3d-assets"
 version = "0.1.0"
 dependencies = [

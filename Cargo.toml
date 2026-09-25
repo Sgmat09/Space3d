@@ -33,6 +33,7 @@ space3d-ui = { path = "crates/space3d-ui" }
 space3d-editor = { path = "crates/space3d-editor" }
 space3d-stories = { path = "crates/space3d-stories" }
 space3d-test = { path = "crates/space3d-test" }
+space3d-ai = { path = "crates/space3d-ai" }
 
 # core / ecs / math
 hecs = "0.11.1"
@@ -108,6 +109,10 @@ web-sys = "0.3.105"
 js-sys = "0.3.105"
 console_error_panic_hook = "0.1.7"
 tracing-wasm = "0.2.1"
+
+# on-device AI (space3d-ai): JNI into the open-android-models AAR, Android context lookup
+jni = "0.22.4"
+ndk-context = "0.1.1"
 
 # testing / bench
 criterion = "0.8.2"

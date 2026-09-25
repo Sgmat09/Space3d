@@ -1,0 +1,35 @@
+[package]
+name = "space3d-ai"
+description = "Space3d on-device AI: agent sessions, NPC dialogue, decisions and engine-side tools over the open-apple-models / open-android-models JSON-RPC bridge, with an injectable backend (Apple FFI, Android JNI, scripted)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+## Link open-apple-models' C ABI (`libOpenAppleModelsFFI`) so `AppleBackend` can drive Apple's on-device
+## Foundation Models. macOS: set `OAM_APPLE_LIB_DIR` to the folder with `libOpenAppleModelsFFI.dylib`.
+## iOS: link the static library/XCFramework in Xcode (see docs/ai.md). Without the feature
+## `AppleBackend` compiles everywhere and reports `Unsupported`.
+apple-ffi = []
+
+[dependencies]
+space3d-core.workspace = true
+space3d-tasks.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+web-time.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni.workspace = true
+ndk-context.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
