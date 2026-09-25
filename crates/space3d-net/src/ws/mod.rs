@@ -115,7 +115,7 @@ pub enum WsState {
 pub struct ConnectionId(pub u64);
 
 /// Connection options.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct WsConfig {
     /// Reconnect automatically after the connection drops or an attempt fails.
     pub reconnect: Option<ReconnectPolicy>,
@@ -124,6 +124,10 @@ pub struct WsConfig {
     /// Largest accepted inbound message in bytes; a bigger one closes the connection
     /// (`1009` on the web). `None` keeps the backend default (64 MiB natively, unlimited on the web).
     pub max_message_size: Option<usize>,
+    /// Extra upgrade-request headers (e.g. `Authorization`), sent on every attempt. Native
+    /// only: browsers cannot set WebSocket headers, so the web backend ignores them. Values
+    /// are redacted in `Debug`.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Default for WsConfig {
@@ -132,7 +136,22 @@ impl Default for WsConfig {
             reconnect: None,
             connect_timeout: Some(Duration::from_secs(10)),
             max_message_size: None,
+            headers: Vec::new(),
         }
+    }
+}
+
+impl std::fmt::Debug for WsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsConfig")
+            .field("reconnect", &self.reconnect)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("max_message_size", &self.max_message_size)
+            .field(
+                "headers",
+                &self.headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -150,6 +169,11 @@ impl WsConfig {
     /// Cap the size of inbound messages (and frames) in bytes.
     pub fn max_message_size(mut self, bytes: usize) -> Self {
         self.max_message_size = Some(bytes);
+        self
+    }
+    /// Add an upgrade-request header (native only; see [`WsConfig::headers`]).
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 }
@@ -469,7 +493,7 @@ impl Driver {
             self.set_state(WsState::Connecting);
             let connect = rt::timeout(
                 self.config.connect_timeout,
-                Socket::connect(&self.url, self.config.max_message_size),
+                Socket::connect(&self.url, self.config.max_message_size, &self.config.headers),
             );
             let (reason, was_open) = match rt::race(connect, self.close.recv()).await {
                 rt::Race::Stopped => return self.finish(CLOSED_BY_CLIENT.into()),

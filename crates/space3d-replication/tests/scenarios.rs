@@ -1,5 +1,6 @@
 //! Harness scenarios beyond the basics in `harness.rs`: session lifecycle (resume expiry,
-//! supersede), prediction snaps, spatial interest hysteresis, bandwidth budget and starvation,
+//! supersede), prediction snaps, spatial interest hysteresis, bandwidth budget and starvation
+//! (2000 entities),
 //! flow control on a slow stream, render-timed components and messages, server-side bots,
 //! time sync, and a property test replaying random world edits through the whole pipeline.
 
@@ -20,6 +21,43 @@ use space3d_replication::server::{InterestPolicy, SlotState};
 use space3d_replication::transport::conditioner::{LinkConditions, LinkProfile, Semantics};
 use space3d_replication::{InterestSource, Owner};
 use std::time::Duration;
+
+/// Counts heap allocations per thread (the harness runs server and clients on the test
+/// thread), for the allocation assertions of the CI smoke load.
+struct CountingAlloc;
+
+thread_local! {
+    static ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count_alloc() {
+    let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+}
+
+fn allocations() -> u64 {
+    ALLOCS.with(|c| c.get())
+}
+
+// SAFETY: forwards to the system allocator; the counter is a plain thread-local cell.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_alloc();
+        // SAFETY: same contract as the caller's.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: same contract as the caller's.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count_alloc();
+        // SAFETY: same contract as the caller's.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
 
 fn with_rules(config: HarnessConfig) -> NetHarness {
     NetHarness::new(config, |app| {
@@ -364,7 +402,7 @@ fn spatial_interest_enters_leaves_with_hysteresis_and_never_flickers() {
     converged(&mut h, a, 60);
 }
 
-/// 400 entities changing every tick against a 16 KiB/s budget: the downstream stays within
+/// 2000 entities changing every tick against a 16 KiB/s budget: the downstream stays within
 /// the cap (+5 %) and priority accumulation keeps every entity fresh (no starvation).
 #[test]
 fn bandwidth_budget_is_respected_without_starvation() {
@@ -376,11 +414,11 @@ fn bandwidth_budget_is_respected_without_starvation() {
     };
     config.server.client_bandwidth = CAP;
     let mut h = with_rules(config);
-    let crates: Vec<Entity> = (0..400)
+    let crates: Vec<Entity> = (0..2000)
         .map(|i| {
             h.server_mut().world.spawn((
                 Replicated,
-                Transform::from_xyz((i % 20) as f32, 0.0, (i / 20) as f32),
+                Transform::from_xyz((i % 50) as f32, 0.0, (i / 50) as f32),
                 Health(0),
             ))
         })
@@ -422,8 +460,8 @@ fn bandwidth_budget_is_respected_without_starvation() {
         "downstream {rate:.0} B/s over the {CAP} B/s cap"
     );
     assert!(rate >= f64::from(CAP) * 0.8, "budget underused: {rate:.0} B/s");
-    // ≈ 80 of 400 entities fit per snapshot → each is refreshed every ~5 snapshots.
-    assert!(worst_age <= 30, "an entity went {worst_age} ticks without an update");
+    // ≈ 70 of 2000 entities fit per snapshot → each is refreshed every ~30 snapshots.
+    assert!(worst_age <= 120, "an entity went {worst_age} ticks without an update");
     let client_id = h.client_net(a).client_id().unwrap();
     let stats = h.server_net().stats(client_id).unwrap();
     assert!(stats.starved_entities > 0, "budget should be binding");
@@ -724,8 +762,9 @@ fn snapshot_burst_after_a_stall_replays_from_the_newest_confirmation() {
 }
 
 /// CI smoke load: 50 walking bots in one room for 10 s on broadband links. Everyone stays
-/// connected and converged, every client's downstream stays within its budget and inputs
-/// arrive on time. (Bytes and counts, not timing.)
+/// connected and converged, every client's downstream stays within its budget, inputs arrive
+/// on time and steady-state allocations stay bounded. (Bytes, counts and allocations, not
+/// timing.)
 #[test]
 fn fifty_bots_in_one_room() {
     let mut h = with_rules(HarnessConfig {
@@ -761,7 +800,12 @@ fn fifty_bots_in_one_room() {
     h.step_ticks(120);
     let bytes0: Vec<u64> = clients.iter().map(|c| h.client_net(*c).stats().bytes_in).collect();
     let stats0 = h.server_net().room_stats().clone();
+    let allocs0 = allocations();
     h.step_ticks(600);
+    // Allocations per tick over the room, 50 client apps and the memory network (≈ 46 per app
+    // and tick today): a regression guard against per-entity / per-client allocation growth.
+    let per_app_tick = (allocations() - allocs0) as f64 / 600.0 / 51.0;
+    assert!(per_app_tick < 100.0, "{per_app_tick:.1} allocations per app per tick");
     let stats = h.server_net().room_stats().clone();
     let budget = f64::from(space3d_replication::server::ServerNetConfig::default().client_bandwidth);
     for (i, c) in clients.iter().enumerate() {

@@ -279,6 +279,40 @@ pub enum DisconnectCode {
     ServerShutdown,
 }
 
+impl DisconnectCode {
+    /// Every code, in wire order.
+    pub const ALL: [DisconnectCode; 11] = [
+        DisconnectCode::Leave,
+        DisconnectCode::Kicked,
+        DisconnectCode::Banned,
+        DisconnectCode::ProtocolViolation,
+        DisconnectCode::RateLimited,
+        DisconnectCode::SlowConsumer,
+        DisconnectCode::Timeout,
+        DisconnectCode::Superseded,
+        DisconnectCode::RoomClosed,
+        DisconnectCode::RoomCrashed,
+        DisconnectCode::ServerShutdown,
+    ];
+
+    /// Stable snake_case label (metrics, logs).
+    pub fn label(self) -> &'static str {
+        match self {
+            DisconnectCode::Leave => "leave",
+            DisconnectCode::Kicked => "kicked",
+            DisconnectCode::Banned => "banned",
+            DisconnectCode::ProtocolViolation => "protocol_violation",
+            DisconnectCode::RateLimited => "rate_limited",
+            DisconnectCode::SlowConsumer => "slow_consumer",
+            DisconnectCode::Timeout => "timeout",
+            DisconnectCode::Superseded => "superseded",
+            DisconnectCode::RoomClosed => "room_closed",
+            DisconnectCode::RoomCrashed => "room_crashed",
+            DisconnectCode::ServerShutdown => "server_shutdown",
+        }
+    }
+}
+
 /// Orderly disconnect (both directions), followed by a close.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Disconnect {

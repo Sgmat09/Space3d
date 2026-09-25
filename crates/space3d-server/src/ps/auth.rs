@@ -7,6 +7,7 @@
 use super::PlayerService;
 use super::routes::{ApiErr, RequestMeta, api_err, parse_json, store_err};
 use super::store::{Account, Rotation};
+use crate::security::netaddr::rate_key;
 use crate::security::token::{SessionClaims, sign, verify};
 use sha2::{Digest, Sha256};
 use space3d_net::server::axum::body::Bytes;
@@ -209,7 +210,7 @@ pub async fn guest_login(
     if !svc.config.player_service.guest_auth {
         return Err(api_err(403, "disabled", "guest accounts are disabled"));
     }
-    if !svc.limits.lock().guest_ip.check(&meta.ip, svc.limiter_now()) {
+    if !svc.limits.lock().guest_ip.check(&rate_key(meta.ip), svc.limiter_now()) {
         svc.metrics.login("guest", "rate_limited");
         return Err(limited(15_000));
     }
@@ -242,7 +243,7 @@ pub async fn register(
     req: RegisterRequest,
 ) -> Result<Json<SessionTokens>, ApiErr> {
     password_enabled(svc)?;
-    if !svc.limits.lock().login_ip.check(&meta.ip, svc.limiter_now()) {
+    if !svc.limits.lock().login_ip.check(&rate_key(meta.ip), svc.limiter_now()) {
         return Err(limited(60_000));
     }
     let username = req.username.trim().to_ascii_lowercase();
@@ -282,7 +283,7 @@ pub async fn login(
     {
         let mut limits = svc.limits.lock();
         let now = svc.limiter_now();
-        if !limits.login_ip.check(&meta.ip, now) || !limits.login_user.check(&username, now) {
+        if !limits.login_ip.check(&rate_key(meta.ip), now) || !limits.login_user.check(&username, now) {
             svc.metrics.login("password", "rate_limited");
             tracing::warn!(event = "login_rate_limited", ip = %meta.ip, "login attempts limited");
             return Err(limited(60_000));
@@ -369,7 +370,7 @@ pub async fn refresh(
     meta: &RequestMeta,
     req: RefreshRequest,
 ) -> Result<Json<SessionTokens>, ApiErr> {
-    if !svc.limits.lock().guest_ip.check(&meta.ip, svc.limiter_now()) {
+    if !svc.limits.lock().guest_ip.check(&rate_key(meta.ip), svc.limiter_now()) {
         return Err(limited(15_000));
     }
     let old = sha256(req.refresh_token.as_bytes());

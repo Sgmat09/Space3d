@@ -257,9 +257,44 @@ impl PlayerService {
         match_id: Option<MatchId>,
         params: BTreeMap<String, String>,
     ) -> Option<(fleet::ServerRecord, RoomSpec)> {
+        self.allocate_room_for(
+            region,
+            mode,
+            max_players,
+            seats,
+            teams,
+            match_id,
+            params,
+            &fleet::Build::default(),
+        )
+    }
+
+    /// [`Self::allocate_room`] on a game server that can host `build`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_room_for(
+        &self,
+        region: &str,
+        mode: &str,
+        max_players: u16,
+        seats: u32,
+        teams: Vec<Vec<PlayerId>>,
+        match_id: Option<MatchId>,
+        params: BTreeMap<String, String>,
+        build: &fleet::Build,
+    ) -> Option<(fleet::ServerRecord, RoomSpec)> {
         let allocated = {
             let mut fleet = self.fleet.lock();
-            self.allocate_room_in(&mut fleet, region, mode, max_players, seats, teams, match_id, params)
+            self.allocate_room_in(
+                &mut fleet,
+                region,
+                mode,
+                max_players,
+                seats,
+                teams,
+                match_id,
+                params,
+                build,
+            )
         };
         let (server, spec) = allocated?;
         self.prepare_room(&server, &spec);
@@ -270,12 +305,17 @@ impl PlayerService {
     /// and params from the queue with that mode). Finding and allocating happen under one
     /// fleet lock, so concurrent quick plays fill one new room instead of each opening their
     /// own.
-    pub fn quick_play_room(&self, region: &str, mode: &str) -> Option<(fleet::ServerRecord, RoomSpec)> {
+    pub fn quick_play_room(
+        &self,
+        region: &str,
+        mode: &str,
+        build: &fleet::Build,
+    ) -> Option<(fleet::ServerRecord, RoomSpec)> {
         let now = self.now_ms();
         let reserve = self.ticket_reserve_ms();
         let (found, fresh) = {
             let mut fleet = self.fleet.lock();
-            match fleet.open_room(mode, 1, now, reserve) {
+            match fleet.open_room_for(mode, build, 1, now, reserve) {
                 Some(open) => (open, false),
                 None => {
                     let params = self
@@ -288,7 +328,7 @@ impl PlayerService {
                         .unwrap_or_default();
                     let capacity = self.mode_capacity(mode);
                     let room =
-                        self.allocate_room_in(&mut fleet, region, mode, capacity, 1, Vec::new(), None, params)?;
+                        self.allocate_room_in(&mut fleet, region, mode, capacity, 1, Vec::new(), None, params, build)?;
                     (room, true)
                 }
             }
@@ -310,10 +350,22 @@ impl PlayerService {
         teams: Vec<Vec<PlayerId>>,
         match_id: Option<MatchId>,
         params: BTreeMap<String, String>,
+        build: &fleet::Build,
     ) -> Option<(fleet::ServerRecord, RoomSpec)> {
         let now = self.now_ms();
-        let game_id = params.get("game_id").cloned().unwrap_or_default();
-        let server = fleet.allocate(region, &game_id, 0, seats, now, self.ticket_reserve_ms())?;
+        // A queue may pin the game (`params.game_id`); the client's build narrows it further.
+        let mut build = build.clone();
+        if build.game_id.is_empty() {
+            build.game_id = params.get("game_id").cloned().unwrap_or_default();
+        }
+        let server = fleet.allocate(
+            region,
+            &build.game_id,
+            build.schema_hash,
+            seats,
+            now,
+            self.ticket_reserve_ms(),
+        )?;
         let spec = RoomSpec {
             room_id: random_room_id(),
             mode: mode.to_owned(),
@@ -361,13 +413,45 @@ pub struct FleetHub {
     local: Vec<InProcessFleetPeer>,
     /// Connection → registered server id.
     conns: BTreeMap<Conn, Option<String>>,
+    /// WS connections not registered yet → when they connected (unix ms).
+    unregistered_since: BTreeMap<ClientId, i64>,
 }
 
 impl FleetHub {
     /// Hub over the internal WS endpoint and in-process peers.
     pub fn new(ws: Option<WsServer>, local: Vec<InProcessFleetPeer>) -> Self {
         let conns = (0..local.len()).map(|i| (Conn::Local(i), None)).collect();
-        Self { ws, local, conns }
+        Self {
+            ws,
+            local,
+            conns,
+            unregistered_since: BTreeMap::new(),
+        }
+    }
+
+    /// Close WS connections that did not register within
+    /// [`crate::gs::fleet::FLEET_REGISTER_DEADLINE`]; returns how many.
+    pub fn expire_unregistered(&mut self, now_ms: i64) -> usize {
+        let deadline = crate::gs::fleet::FLEET_REGISTER_DEADLINE.as_millis() as i64;
+        let expired: Vec<ClientId> = self
+            .unregistered_since
+            .iter()
+            .filter(|(_, since)| now_ms.saturating_sub(**since) >= deadline)
+            .map(|(c, _)| *c)
+            .collect();
+        for client in &expired {
+            self.unregistered_since.remove(client);
+            if let Some(ws) = &self.ws {
+                ws.disconnect_with(*client, 1008, "fleet registration timeout");
+            }
+            tracing::warn!(event = "fleet_register_timeout", client = client.0, "fleet link closed");
+        }
+        expired.len()
+    }
+
+    /// Fleet connections that have not registered yet.
+    pub fn unregistered(&self) -> usize {
+        self.unregistered_since.len()
     }
 
     /// Attach another in-process game server (tests and embedders running several game
@@ -399,15 +483,17 @@ impl FleetHub {
     }
 
     /// Inbound messages: `(connection, message)`; handles connects/disconnects.
-    fn poll(&mut self) -> Vec<(Conn, FleetUp)> {
+    fn poll(&mut self, now_ms: i64) -> Vec<(Conn, FleetUp)> {
         let mut out = Vec::new();
         if let Some(ws) = &self.ws {
             for ev in ws.drain() {
                 match ev {
                     ServerEvent::Connected { client, .. } => {
                         self.conns.insert(Conn::Ws(client), None);
+                        self.unregistered_since.insert(client, now_ms);
                     }
                     ServerEvent::Disconnected { client, reason } => {
+                        self.unregistered_since.remove(&client);
                         if let Some(Some(id)) = self.conns.remove(&Conn::Ws(client)) {
                             tracing::warn!(server = %id, %reason, "fleet link closed");
                         }
@@ -457,6 +543,8 @@ impl space3d_core::Plugin for PlayerServicePlugin {
         let svc = self.service.clone();
         app.insert_resource(FleetHub::new(self.fleet_ws.clone(), self.local_fleet.clone()));
         let mut last_mm = i64::MIN;
+        let mut last_sessions = i64::MIN;
+        let mut sessions: Option<space3d_tasks::Task<Result<u64, store::StoreError>>> = None;
         app.add_system_named(Stage::Update, "ps::supervisor", move |ctx| {
             let now = svc.now_ms();
             ctx.resources.scope::<FleetHub, _>(|_, hub| fleet_io(&svc, hub, now));
@@ -466,6 +554,23 @@ impl space3d_core::Plugin for PlayerServicePlugin {
                 run_matchmaking(&svc, now);
                 run_lobbies(&svc, now);
                 publish_metrics(&svc);
+            }
+            // Active sessions: a COUNT on the store every 10 s (polled, never awaited here).
+            if let Some(task) = &mut sessions {
+                match task.state() {
+                    space3d_tasks::TaskState::Pending => {}
+                    space3d_tasks::TaskState::Ready => {
+                        if let Some(Ok(n)) = task.poll() {
+                            svc.metrics.set_sessions_active(n);
+                        }
+                        sessions = None;
+                    }
+                    space3d_tasks::TaskState::Cancelled => sessions = None,
+                }
+            }
+            if sessions.is_none() && now.saturating_sub(last_sessions) >= SESSIONS_METRIC_EVERY_MS {
+                last_sessions = now;
+                sessions = Some(svc.store.active_sessions(now));
             }
             let out = std::mem::take(&mut *svc.fleet_out.lock());
             let hub = ctx.resources.expect::<FleetHub>();
@@ -486,7 +591,8 @@ impl space3d_core::Plugin for PlayerServicePlugin {
 }
 
 fn fleet_io(svc: &Arc<PlayerService>, hub: &mut FleetHub, now: i64) {
-    for (conn, msg) in hub.poll() {
+    hub.expire_unregistered(now);
+    for (conn, msg) in hub.poll(now) {
         let registered = hub.conns.get(&conn).cloned().flatten();
         let server = match (&registered, &msg) {
             (_, FleetUp::Register(reg)) => {
@@ -496,6 +602,9 @@ fn fleet_io(svc: &Arc<PlayerService>, hub: &mut FleetHub, now: i64) {
                     continue;
                 }
                 hub.conns.insert(conn, Some(reg.server_id.clone()));
+                if let Conn::Ws(client) = conn {
+                    hub.unregistered_since.remove(&client);
+                }
                 tracing::info!(server = %reg.server_id, region = %reg.region, url = %reg.public_url, "game server registered");
                 reg.server_id.clone()
             }
@@ -613,7 +722,10 @@ fn run_matchmaking(svc: &Arc<PlayerService>, now: i64) {
             continue;
         }
         for entry in svc.matchmaker.lock().searching(q) {
-            let room = svc.fleet.lock().open_room(&cfg.mode, 1, now, svc.ticket_reserve_ms());
+            let room = svc
+                .fleet
+                .lock()
+                .open_room_for(&cfg.mode, &entry.build, 1, now, svc.ticket_reserve_ms());
             let Some((server, spec)) = room else { break };
             let a = svc.issue_ticket(
                 entry.player,
@@ -640,7 +752,9 @@ fn run_matchmaking(svc: &Arc<PlayerService>, now: i64) {
         let capacity = cfg.teams.saturating_mul(cfg.team_size).max(seats as u16);
         let teams: Vec<Vec<PlayerId>> = m.teams.iter().map(|t| t.iter().map(|e| e.player).collect()).collect();
         let match_id = MatchId(u64::from_le_bytes(crate::security::random_bytes::<8>()));
-        let Some((server, spec)) = svc.allocate_room(
+        // Matched players share one build (the matchmaker groups by it).
+        let build = m.players().next().map(|(_, e)| e.build.clone()).unwrap_or_default();
+        let Some((server, spec)) = svc.allocate_room_for(
             &m.region,
             &m.mode,
             capacity,
@@ -648,6 +762,7 @@ fn run_matchmaking(svc: &Arc<PlayerService>, now: i64) {
             teams,
             Some(match_id),
             cfg.params.clone(),
+            &build,
         ) else {
             tracing::warn!(queue = %m.queue, "no game server capacity; requeueing");
             svc.matchmaker.lock().requeue(m);
@@ -675,7 +790,16 @@ fn run_lobbies(svc: &Arc<PlayerService>, now: i64) {
     for l in starting {
         let seats = l.members.len() as u32;
         let members: Vec<PlayerId> = l.members.iter().map(|m| m.player_id).collect();
-        match svc.allocate_room("", &l.mode, l.max_players, seats, vec![members], None, BTreeMap::new()) {
+        match svc.allocate_room_for(
+            "",
+            &l.mode,
+            l.max_players,
+            seats,
+            vec![members],
+            None,
+            BTreeMap::new(),
+            &l.build,
+        ) {
             Some((server, spec)) => {
                 let assignments = l
                     .members
@@ -702,7 +826,11 @@ fn run_lobbies(svc: &Arc<PlayerService>, now: i64) {
     svc.lobbies.lock().prune(now);
 }
 
+/// Period of the `space3d_sessions_active` refresh.
+const SESSIONS_METRIC_EVERY_MS: i64 = 10_000;
+
 fn publish_metrics(svc: &Arc<PlayerService>) {
+    svc.metrics.set_db_queue_depth(svc.db.queue_depth());
     for ((queue, region), n) in svc.matchmaker.lock().queue_sizes() {
         svc.metrics.queue_size(&queue, &region, n);
     }

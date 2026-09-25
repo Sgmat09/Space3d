@@ -5,7 +5,7 @@
 use crate::clock::{SystemUnixClock, UnixClock};
 use crate::security::bans::BanList;
 use crate::security::netaddr::{Cidr, resolve_client_ip};
-use space3d_net::{ClientId, ConnectMeta, Message, NetError, ServerEvent, WsServer, WsServerConfig};
+use space3d_net::{ClientId, ClientSender, ConnectMeta, Message, NetError, ServerEvent, WsServer, WsServerConfig};
 use space3d_replication::LinkId;
 use space3d_replication::transport::{CloseCode, Lane, LinkEvent, LinkTx, PeerInfo, TransportCaps, TransportError};
 use std::sync::Arc;
@@ -83,8 +83,10 @@ pub fn origin_allowed(allowed: &[String], origin: Option<&str>) -> bool {
 
 impl WsServerTransport {
     /// Create with limits (`max_message_size` = the inbound packet cap; text frames rejected).
+    /// Links advertise [`MAX_OUTBOUND_PACKET`] as their send cap: that is what clients accept,
+    /// and a single large entity record must fit (the 16 KiB cap only applies inbound).
     pub fn new(config: WsServerConfig) -> Self {
-        let caps = TransportCaps::stream(config.max_message_size);
+        let caps = TransportCaps::stream(MAX_OUTBOUND_PACKET.max(config.max_message_size));
         Self {
             ws: WsServer::with_config(config.accept_text(false)),
             caps,
@@ -164,7 +166,7 @@ impl WsServerTransport {
                     link: Self::link_id(client),
                     peer,
                     tx: Arc::new(WsLinkTx {
-                        ws: self.ws.clone(),
+                        sender: self.ws.client_sender(client),
                         client,
                         caps: self.caps,
                     }),
@@ -190,12 +192,22 @@ impl WsServerTransport {
     }
 }
 
-/// Sender for one WS client.
+/// Sender for one WS client. Holds the client's own queue handle ([`ClientSender`]), so room
+/// ticks on shard threads never take the `WsServer`-wide client lock to send, check the
+/// backlog or check liveness.
 #[derive(Debug)]
 pub struct WsLinkTx {
-    ws: WsServer,
+    /// `None`: the client was already gone when its link was announced.
+    sender: Option<ClientSender>,
     client: ClientId,
     caps: TransportCaps,
+}
+
+impl WsLinkTx {
+    /// The WS client behind this link.
+    pub fn client(&self) -> ClientId {
+        self.client
+    }
 }
 
 impl LinkTx for WsLinkTx {
@@ -210,24 +222,32 @@ impl LinkTx for WsLinkTx {
                 max: MAX_OUTBOUND_PACKET,
             });
         }
-        match self.ws.send(self.client, Message::Binary(packet)) {
+        let Some(sender) = &self.sender else {
+            return Err(TransportError::Closed);
+        };
+        match sender.send(Message::Binary(packet)) {
             Ok(()) => Ok(()),
             // Over the outbound byte cap: the socket task closes the client with 1008.
-            Err(NetError::Closed) if self.ws.is_connected(self.client) => Err(TransportError::Backpressure),
+            Err(NetError::Closed) if sender.is_connected() => Err(TransportError::Backpressure),
             Err(_) => Err(TransportError::Closed),
         }
     }
 
     fn backlog_bytes(&self) -> usize {
-        self.ws.backlog_bytes(self.client).unwrap_or(0)
+        self.sender
+            .as_ref()
+            .filter(|s| s.is_connected())
+            .map_or(0, ClientSender::backlog_bytes)
     }
 
     fn close(&self, code: CloseCode, reason: &str) {
-        self.ws.disconnect_with(self.client, code.0, reason);
+        if let Some(s) = &self.sender {
+            s.close_with(code.0, reason);
+        }
     }
 
     fn is_open(&self) -> bool {
-        self.ws.is_connected(self.client)
+        self.sender.as_ref().is_some_and(ClientSender::is_connected)
     }
 }
 
@@ -266,6 +286,7 @@ mod tests {
             origin: origin.map(str::to_owned),
             forwarded_for: xff.map(str::to_owned),
             user_agent: None,
+            authorization: None,
         };
         assert_eq!(policy.check(&meta("203.0.113.5:1", None, None)), Err(403));
         assert_eq!(policy.check(&meta("198.51.100.5:1", None, None)), Ok(()));

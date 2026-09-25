@@ -13,6 +13,7 @@
 //!                         bit1 HAS_REMOVED
 //!                         bit2 CONTROLLED (ControlledBy == receiving player)
 //!                         bit3 OWNED (Owner/ControlledBy == receiving player)
+//!                         bit4 DEFERRED (changes were held back by the budget before)
 //!               · varu64 present_mask (bit i = ComponentKind(i) payload follows)
 //!               · [HAS_REMOVED] varu64 removed_mask
 //!               · for each set bit of present_mask, ascending: varu32 len · codec bytes
@@ -21,7 +22,8 @@
 //!
 //! **Invariant** (makes loss and reordering harmless): whenever an entity is written for a
 //! client, *every* component whose `changed_tick` is newer than that client's acked tick for
-//! the entity is included. Locally predicted entities are written to their controller in every
+//! the entity is included (on datagram links too: records are written against the acked
+//! baseline, never against an unacked one, so a newer record supersedes every older one). Locally predicted entities are written to their controller in every
 //! snapshot with all `Predict*` components (reconciliation needs a confirmation each time).
 
 use crate::NetId;
@@ -47,6 +49,9 @@ pub mod op {
     pub const CONTROLLED: u8 = 0x04;
     /// Owned by the receiving player.
     pub const OWNED: u8 = 0x08;
+    /// The byte budget held this entity's changes back for at least one earlier snapshot: the
+    /// gap since its previous record is not a period of rest (clients interpolate across it).
+    pub const DEFERRED: u8 = 0x10;
 }
 
 /// Parsed snapshot header.
@@ -247,7 +252,7 @@ impl<'a> SnapshotView<'a> {
             };
             last = Some(id);
             let op_bits = r.u8()?;
-            if op_bits & !(op::SPAWN | op::HAS_REMOVED | op::CONTROLLED | op::OWNED) != 0 {
+            if op_bits & !(op::SPAWN | op::HAS_REMOVED | op::CONTROLLED | op::OWNED | op::DEFERRED) != 0 {
                 return Err(DecodeError::Invalid("entity op bits"));
             }
             let present = r.varu64()?;

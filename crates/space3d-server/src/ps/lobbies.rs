@@ -19,6 +19,8 @@ pub fn random_code() -> String {
 
 #[derive(Debug)]
 struct Lobby {
+    /// Build of the host (allocation filter).
+    build: crate::ps::fleet::Build,
     version: u64,
     state: LobbyState,
     assignments: BTreeMap<PlayerId, Assignment>,
@@ -30,6 +32,8 @@ struct Lobby {
 pub struct StartingLobby {
     /// Lobby id.
     pub lobby_id: String,
+    /// Build of the host: the room goes to a compatible game server.
+    pub build: crate::ps::fleet::Build,
     /// Mode.
     pub mode: String,
     /// Capacity.
@@ -89,6 +93,7 @@ impl Lobbies {
         self.lobbies.insert(
             lobby_id,
             Lobby {
+                build: Default::default(),
                 version: 1,
                 state: state.clone(),
                 assignments: BTreeMap::new(),
@@ -191,11 +196,19 @@ impl Lobbies {
             .filter(|l| l.state.phase == LobbyPhase::Starting)
             .map(|l| StartingLobby {
                 lobby_id: l.state.lobby_id.clone(),
+                build: l.build.clone(),
                 mode: l.state.mode.clone(),
                 max_players: l.state.max_players,
                 members: l.state.members.clone(),
             })
             .collect()
+    }
+
+    /// Record the host's build (allocation filter for the lobby's room).
+    pub fn set_build(&mut self, lobby_id: &str, build: crate::ps::fleet::Build) {
+        if let Some(l) = self.lobbies.get_mut(lobby_id) {
+            l.build = build;
+        }
     }
 
     /// Allocation succeeded: per-member assignments, phase → InGame.

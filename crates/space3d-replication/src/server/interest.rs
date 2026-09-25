@@ -133,12 +133,78 @@ pub(crate) struct Viewer<'a> {
     pub(crate) current: &'a dyn Fn(NetId) -> bool,
 }
 
+/// Per-player visibility overrides (`NetServer::set_visibility`), indexed by entity too so a
+/// despawned entity or a player who left is forgotten without scanning the whole map.
+#[derive(Debug, Default)]
+pub(crate) struct VisibilityOverrides {
+    map: FastMap<(PlayerId, Entity), Visibility>,
+    by_entity: FastMap<Entity, smallvec::SmallVec<[PlayerId; 2]>>,
+}
+
+impl VisibilityOverrides {
+    /// Override of `(player, entity)`.
+    pub(crate) fn get(&self, key: &(PlayerId, Entity)) -> Option<&Visibility> {
+        self.map.get(key)
+    }
+
+    /// Set (or, with `Visibility::Default`, clear) an override.
+    pub(crate) fn set(&mut self, player: PlayerId, entity: Entity, visibility: Visibility) {
+        if visibility == Visibility::Default {
+            if self.map.remove(&(player, entity)).is_some()
+                && let Some(players) = self.by_entity.get_mut(&entity)
+            {
+                players.retain(|p| *p != player);
+                if players.is_empty() {
+                    self.by_entity.remove(&entity);
+                }
+            }
+        } else if self.map.insert((player, entity), visibility).is_none() {
+            self.by_entity.entry(entity).or_default().push(player);
+        }
+    }
+
+    /// Forget every override of `entity` (despawned / no longer replicated).
+    pub(crate) fn forget_entity(&mut self, entity: Entity) {
+        if let Some(players) = self.by_entity.remove(&entity) {
+            for p in players {
+                self.map.remove(&(p, entity));
+            }
+        }
+    }
+
+    /// Forget every override of `player` (left the room).
+    pub(crate) fn forget_player(&mut self, player: PlayerId) {
+        if self.map.is_empty() {
+            return;
+        }
+        self.map.retain(|(p, _), _| *p != player);
+        self.by_entity.retain(|_, players| {
+            players.retain(|p| *p != player);
+            !players.is_empty()
+        });
+    }
+
+    /// Forget overrides of entities for which `alive` is false (entities that were never
+    /// replicated, so no record retirement reports them).
+    pub(crate) fn retain_entities(&mut self, alive: impl Fn(Entity) -> bool) {
+        let dead: Vec<Entity> = self.by_entity.keys().copied().filter(|e| !alive(*e)).collect();
+        for e in dead {
+            self.forget_entity(e);
+        }
+    }
+
+    /// Overrides tracked.
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 /// Compute the relevant set (ascending `NetId`s) for one viewer.
 pub(crate) fn relevant_set(
     cache: &ChangeCache,
     policy: InterestPolicy,
     viewer: &Viewer<'_>,
-    overrides: &FastMap<(PlayerId, Entity), Visibility>,
+    overrides: &VisibilityOverrides,
     rules: &[Box<dyn VisibilityRule>],
     world: &World,
 ) -> Vec<NetId> {
@@ -182,7 +248,7 @@ fn decide(
     rec: &EntityRecord,
     policy: InterestPolicy,
     viewer: &Viewer<'_>,
-    overrides: &FastMap<(PlayerId, Entity), Visibility>,
+    overrides: &VisibilityOverrides,
     rules: &[Box<dyn VisibilityRule>],
     world: &World,
     spatial_hits: Option<&[u32]>,

@@ -25,7 +25,7 @@
 
 mod ws;
 
-pub use ws::{AcceptHook, ClientId, ConnectMeta, ServerEvent, WsServer, WsServerConfig};
+pub use ws::{AcceptHook, ClientId, ClientSender, ConnectMeta, ServerEvent, WsServer, WsServerConfig};
 
 use crate::NetError;
 use axum::Router;

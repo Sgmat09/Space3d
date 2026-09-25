@@ -1,20 +1,25 @@
 //! Rate limiting with injected time (deterministic in tests).
 
+use super::netaddr::rate_key;
 pub use space3d_replication::server::receive::TokenBucket;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::net::IpAddr;
 use std::time::Duration;
 
 /// Token buckets per key (IP, username, route), bounded so a key flood cannot grow memory:
-/// when `capacity` keys are tracked, buckets idle long enough to have refilled completely
-/// (indistinguishable from a fresh bucket) are dropped first, then the least recently used.
+/// when `capacity` keys are tracked, the least recently used key is dropped (O(log n); an idle
+/// bucket that refilled completely is indistinguishable from a fresh one, and LRU order drops
+/// those first).
 #[derive(Debug)]
 pub struct KeyedLimiter<K: Hash + Eq + Clone> {
     rate: f64,
     burst: f64,
     capacity: usize,
-    buckets: HashMap<K, (TokenBucket, Duration)>,
+    buckets: HashMap<K, (TokenBucket, u64)>,
+    /// Recency order: sequence number of the last use → key.
+    order: BTreeMap<u64, K>,
+    seq: u64,
 }
 
 impl<K: Hash + Eq + Clone> KeyedLimiter<K> {
@@ -25,6 +30,8 @@ impl<K: Hash + Eq + Clone> KeyedLimiter<K> {
             burst,
             capacity: capacity.max(1),
             buckets: Default::default(),
+            order: BTreeMap::new(),
+            seq: 0,
         }
     }
 
@@ -35,41 +42,27 @@ impl<K: Hash + Eq + Clone> KeyedLimiter<K> {
 
     /// Take `n` tokens for `key` at `now`.
     pub fn check_n(&mut self, key: &K, now: Duration, n: f64) -> bool {
-        if !self.buckets.contains_key(key) && self.buckets.len() >= self.capacity {
-            self.evict(now);
+        self.seq += 1;
+        let seq = self.seq;
+        if let Some((bucket, last)) = self.buckets.get_mut(key) {
+            self.order.remove(last);
+            *last = seq;
+            self.order.insert(seq, key.clone());
+            return bucket.take(now, n);
         }
-        let (rate, burst) = (self.rate, self.burst);
-        let (bucket, last) = self.buckets.entry(key.clone()).or_insert_with(|| {
-            let mut b = TokenBucket::new(rate, burst);
-            // Anchor the bucket's clock at `now` (it starts full).
-            b.take(now, 0.0);
-            (b, now)
-        });
-        *last = now;
-        bucket.take(now, n)
-    }
-
-    /// Seconds after which an idle bucket is full again.
-    fn refill_time(&self) -> Duration {
-        if self.rate <= 0.0 {
-            return Duration::MAX;
+        while self.buckets.len() >= self.capacity {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            self.buckets.remove(&oldest);
         }
-        Duration::try_from_secs_f64(self.burst / self.rate).unwrap_or(Duration::MAX)
-    }
-
-    fn evict(&mut self, now: Duration) {
-        let refill = self.refill_time();
-        self.buckets.retain(|_, (_, last)| now.saturating_sub(*last) < refill);
-        if self.buckets.len() >= self.capacity {
-            let oldest = self
-                .buckets
-                .iter()
-                .min_by_key(|(_, (_, last))| *last)
-                .map(|(k, _)| k.clone());
-            if let Some(k) = oldest {
-                self.buckets.remove(&k);
-            }
-        }
+        let mut bucket = TokenBucket::new(self.rate, self.burst);
+        // Anchor the bucket's clock at `now` (it starts full).
+        bucket.take(now, 0.0);
+        let ok = bucket.take(now, n);
+        self.buckets.insert(key.clone(), (bucket, seq));
+        self.order.insert(seq, key.clone());
+        ok
     }
 
     /// Keys currently tracked.
@@ -120,8 +113,9 @@ impl ConnectionLimiter {
         self.try_open(ip, now).is_ok()
     }
 
-    /// Like [`Self::on_open`] with the reason.
+    /// Like [`Self::on_open`] with the reason. IPv6 addresses count per /64 ([`rate_key`]).
     pub fn try_open(&mut self, ip: IpAddr, now: Duration) -> Result<(), ConnRefusal> {
+        let ip = rate_key(ip);
         let open = self.open.get(&ip).copied().unwrap_or(0);
         if open >= self.max_per_ip {
             return Err(ConnRefusal::TooManyConnections);
@@ -135,6 +129,7 @@ impl ConnectionLimiter {
 
     /// A counted connection from `ip` closed.
     pub fn on_close(&mut self, ip: IpAddr) {
+        let ip = rate_key(ip);
         if let Some(n) = self.open.get_mut(&ip) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -145,7 +140,7 @@ impl ConnectionLimiter {
 
     /// Open connections from `ip`.
     pub fn open_from(&self, ip: IpAddr) -> u32 {
-        self.open.get(&ip).copied().unwrap_or(0)
+        self.open.get(&rate_key(ip)).copied().unwrap_or(0)
     }
 }
 
@@ -181,6 +176,43 @@ mod tests {
         assert!(l.check(&1u32, MS(2)));
         assert!(l.check(&2u32, MS(3)), "evicts the LRU key");
         assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn keyed_limiter_evicts_least_recently_used() {
+        let mut l = KeyedLimiter::new(0.001, 1.0, 3);
+        for k in 0..3u32 {
+            assert!(l.check(&k, MS(u64::from(k))));
+        }
+        // Touch 0: 1 is now the least recently used.
+        assert!(!l.check(&0u32, MS(10)), "0 is empty");
+        assert!(l.check(&3u32, MS(11)));
+        assert_eq!(l.len(), 3);
+        assert!(!l.check(&0u32, MS(12)), "0 kept its (empty) bucket");
+        assert!(l.check(&1u32, MS(13)), "1 was evicted: fresh bucket");
+        // A full table stays cheap per new key (LRU pop, not a scan): churn through many keys.
+        let mut big = KeyedLimiter::new(20.0 / 60.0, 20.0, 50_000);
+        for i in 0..200_000u32 {
+            big.check(&i, MS(u64::from(i)));
+        }
+        assert_eq!(big.len(), 50_000);
+    }
+
+    #[test]
+    fn ipv6_connections_count_per_slash_64() {
+        let mut c = ConnectionLimiter::new(8, 10_000);
+        let mut admitted = 0;
+        for i in 0..1000u32 {
+            let ip: IpAddr = format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap();
+            if c.try_open(ip, MS(u64::from(i))).is_ok() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 8, "one /64 shares the per-IP cap");
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(c.try_open(other, MS(2_000)).is_ok());
+        c.on_close("2001:db8:1:2::abcd".parse().unwrap());
+        assert_eq!(c.open_from("2001:db8:1:2::1".parse().unwrap()), 7);
     }
 
     #[test]

@@ -288,6 +288,7 @@ fn matchmaking_tickets_and_lobbies_over_http() {
         mode: "duel".into(),
         max_players: 2,
         private: true,
+        ..Default::default()
     }));
     assert_eq!(lobby.code.len(), 6);
     assert_eq!(lobby.phase, LobbyPhase::Open);
@@ -327,4 +328,116 @@ fn accounts_and_data_survive_a_restart() {
     assert_eq!(t.profile.player_id, id);
     assert_eq!(t.profile.display_name, "persisted");
     assert_eq!(ok(c.get_data("settings")).value, serde_json::json!({ "volume": 7 }));
+}
+
+/// Internal routes answer 429 / 401 from a middleware **before** the body is read: an
+/// anonymous client announcing a 16 MiB checkpoint upload gets 401 right after its headers,
+/// without the server buffering anything.
+#[test]
+fn internal_routes_refuse_before_reading_the_body() {
+    use std::io::{Read, Write};
+    let ps = Ps::start(
+        |c| c.player_service.http_rps_per_ip = 1_000,
+        space3d_db::Db::open_in_memory(),
+    );
+    let addr = ps.url.trim_start_matches("http://").to_owned();
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    write!(
+        s,
+        "PUT /internal/v1/rooms/1/checkpoint HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/octet-stream\r\nContent-Length: 16000000\r\n\r\n"
+    )
+    .unwrap();
+    s.write_all(&[0u8; 1024]).unwrap();
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).expect("answered before the body was sent");
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+
+    // With the fleet token a checkpoint round-trips.
+    let auth = |r: HttpRequest| r.header("authorization", "Bearer fleet");
+    let room = space3d_replication::RoomId(7);
+    let url = format!("{}/internal/v1/rooms/{room}/checkpoint", ps.url);
+    let (status, body) = ps.raw(auth(HttpRequest::put(url.clone())).body(vec![1, 2, 3]));
+    assert_eq!(status, 204, "{body}");
+    let (status, _) = ps.raw(auth(HttpRequest::get(url)));
+    assert_eq!(status, 200);
+}
+
+/// The per-IP request limit covers unauthenticated internal requests; game servers holding the
+/// fleet token are not throttled by it (they upload a checkpoint per room and interval).
+#[test]
+fn internal_routes_are_rate_limited_per_ip() {
+    let ps = Ps::start(
+        |c| c.player_service.http_rps_per_ip = 5,
+        space3d_db::Db::open_in_memory(),
+    );
+    let url = format!("{}/internal/v1/checkpoints", ps.url);
+    let statuses: Vec<u16> = (0..20).map(|_| ps.raw(HttpRequest::get(url.clone())).0).collect();
+    assert!(statuses.contains(&401), "{statuses:?}");
+    assert!(statuses.contains(&429), "{statuses:?}");
+    let fleet: Vec<u16> = (0..40)
+        .map(|_| {
+            ps.raw(HttpRequest::get(url.clone()).header("authorization", "Bearer fleet"))
+                .0
+        })
+        .collect();
+    assert!(fleet.iter().all(|s| *s == 200), "{fleet:?}");
+}
+
+/// The fleet WebSocket authenticates the upgrade (no socket without the fleet token) and closes
+/// an authenticated connection that never registers.
+#[test]
+fn fleet_socket_requires_the_token_and_a_prompt_register() {
+    use space3d_net::{WsClient, WsConfig, WsState};
+    let mut ps = Ps::start(|_| {}, space3d_db::Db::open_in_memory());
+    let url = format!("{}/internal/v1/fleet", ps.url.replacen("http://", "ws://", 1));
+    let wait = |ps: &mut Ps, conn: &space3d_net::WsConnection, want: fn(&WsState) -> bool| {
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < end {
+            ps.app.update(Duration::from_millis(10));
+            if want(&conn.state()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    };
+    let anonymous = WsClient::connect(url.clone());
+    assert!(
+        wait(&mut ps, &anonymous, |s| matches!(s, WsState::Closed(_))),
+        "no socket without the token"
+    );
+    let wrong = WsClient::connect_with(url.clone(), WsConfig::default().header("authorization", "Bearer nope"));
+    assert!(wait(&mut ps, &wrong, |s| matches!(s, WsState::Closed(_))));
+    let silent = WsClient::connect_with(url, WsConfig::default().header("authorization", "Bearer fleet"));
+    assert!(wait(&mut ps, &silent, |s| *s == WsState::Open), "token accepted");
+    ps.clock.advance_ms(11_000);
+    assert!(
+        wait(&mut ps, &silent, |s| matches!(s, WsState::Closed(_))),
+        "unregistered connection closed after the deadline"
+    );
+}
+
+/// `space3d_sessions_active` counts live refresh families; `space3d_db_queue_depth` is exported.
+#[test]
+fn session_and_db_queue_metrics_are_exported() {
+    let mut ps = Ps::start(|_| {}, space3d_db::Db::open_in_memory());
+    for name in ["a", "b"] {
+        ok(ps.client().login_guest(&DeviceCredentials::generate(), Some(name)));
+    }
+    let metrics = ps.app.resources.expect::<space3d_server::metrics::Metrics>().clone();
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let mut text = String::new();
+    while std::time::Instant::now() < end {
+        ps.clock.advance_ms(1_000);
+        ps.app.update(Duration::from_millis(100));
+        text = metrics.render();
+        if text.contains("space3d_sessions_active 2") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(text.contains("space3d_sessions_active 2"), "{text}");
+    assert!(text.contains("space3d_db_queue_depth "), "{text}");
 }

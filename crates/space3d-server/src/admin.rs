@@ -191,6 +191,7 @@ async fn status(State(state): State<AdminState>) -> Json<serde_json::Value> {
         "ready": state.health.is_ready(now, state.needs_registration),
         "draining": state.health.is_draining(),
         "registered": state.health.is_registered(),
+        "fleet_connected": state.health.is_fleet_connected(),
         "rooms": rooms.len(),
         "players": players,
         "tick_p99_us": tick_p99,

@@ -2,11 +2,13 @@
 //!
 //! Per client per send tick: `budget = min(client_bandwidth, cap) / send_rate` (token bucket,
 //! 2× burst; 4× during initial sync). Always first: despawns, removals, reliable messages,
-//! the client's own entities. Then every relevant entity with pending changes accumulates
+//! the client's controlled (predicted) entities. Then every relevant entity with pending
+//! changes (the client's other own entities with a 4× boost) accumulates
 //! `acc += rule_priority × NetPriority × distance_falloff × Δticks`; the top entries by `acc`
-//! (`select_nth_unstable`) are written while the budget allows (trying up to 8 smaller ones
-//! after the first miss); written entities reset `acc = 0`, the rest keep growing, so nothing
-//! starves.
+//! are written while the budget allows (trying up to 8 smaller ones after the first miss);
+//! written entities reset `acc = 0`, the rest keep growing. Nothing starves: a full bucket
+//! lets the top entry through even when it does not fit (the budget goes into debt), and a
+//! top entry deferred several snapshots in a row holds lower priorities back until it goes.
 
 use std::time::Duration;
 
@@ -36,6 +38,11 @@ impl ByteBudget {
     /// Bytes available now.
     pub fn available(&self) -> usize {
         self.tokens.max(0.0) as usize
+    }
+
+    /// Whether the bucket is full (nothing was spent for a whole burst's worth of refills).
+    pub fn is_full(&self) -> bool {
+        self.tokens >= f64::from(self.burst)
     }
 
     /// Consume `n` bytes (may go negative once; the next refill pays it back).

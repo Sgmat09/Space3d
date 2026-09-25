@@ -27,8 +27,12 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Default memory-link packet cap (matches the WS gateway's inbound cap).
+/// Default memory-link packet cap client → server (matches the WS gateway's inbound cap).
 pub const DEFAULT_MEMORY_MAX_PACKET: usize = 16 * 1024;
+
+/// Default memory-link packet cap server → client (matches the WS gateway's outbound cap and
+/// the client's 1 MiB inbound cap).
+pub const DEFAULT_MEMORY_MAX_DOWN_PACKET: usize = 1 << 20;
 
 /// Unreliable packet cap of memory links with [`Semantics::Datagram`] (a QUIC datagram).
 pub const MEMORY_MAX_DATAGRAM: usize = 1200;
@@ -51,7 +55,10 @@ struct LinkShared {
     server_close_at: Option<(Duration, String)>,
     server_close_emitted: bool,
     partitioned_until: Option<Duration>,
-    caps: TransportCaps,
+    /// Client-side (client → server) caps.
+    client_caps: TransportCaps,
+    /// Server-side (server → client) caps.
+    server_caps: TransportCaps,
     client_stats: TransportStats,
     server_stats: TransportStats,
     tx: Option<Arc<dyn LinkTx>>,
@@ -327,6 +334,7 @@ impl MemoryNetwork {
             net: self.clone(),
             profile,
             max_packet: DEFAULT_MEMORY_MAX_PACKET,
+            max_down_packet: DEFAULT_MEMORY_MAX_DOWN_PACKET,
         }
     }
 
@@ -382,12 +390,19 @@ pub struct MemoryConnector {
     net: MemoryNetwork,
     profile: LinkProfile,
     max_packet: usize,
+    max_down_packet: usize,
 }
 
 impl MemoryConnector {
-    /// Override the packet cap.
+    /// Override the client → server packet cap.
     pub fn max_packet(mut self, bytes: usize) -> Self {
         self.max_packet = bytes;
+        self
+    }
+
+    /// Override the server → client packet cap.
+    pub fn max_down_packet(mut self, bytes: usize) -> Self {
+        self.max_down_packet = bytes;
         self
     }
 
@@ -399,10 +414,11 @@ impl MemoryConnector {
         let now = s.clock.now();
         let seed = s.seed ^ id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let semantics = s.semantics;
-        let caps = match semantics {
-            Semantics::Stream => TransportCaps::stream(self.max_packet),
-            Semantics::Datagram => TransportCaps::datagram(MEMORY_MAX_DATAGRAM.min(self.max_packet), self.max_packet),
+        let caps_of = |max: usize| match semantics {
+            Semantics::Stream => TransportCaps::stream(max),
+            Semantics::Datagram => TransportCaps::datagram(MEMORY_MAX_DATAGRAM.min(max), max),
         };
+        let (client_caps, server_caps) = (caps_of(self.max_packet), caps_of(self.max_down_packet));
         let server_open_at = now + self.profile.up.latency;
         let link = Arc::new(Mutex::new(LinkShared {
             id,
@@ -419,7 +435,8 @@ impl MemoryConnector {
             server_close_at: None,
             server_close_emitted: false,
             partitioned_until: None,
-            caps,
+            client_caps,
+            server_caps,
             client_stats: TransportStats::default(),
             server_stats: TransportStats::default(),
             tx: None,
@@ -458,7 +475,7 @@ impl MemoryClientTransport {
 
 impl ClientTransport for MemoryClientTransport {
     fn caps(&self) -> TransportCaps {
-        self.link.lock().caps
+        self.link.lock().client_caps
     }
 
     fn state(&self) -> LinkState {
@@ -472,8 +489,8 @@ impl ClientTransport for MemoryClientTransport {
             return Err(TransportError::Closed);
         }
         let max = match lane {
-            Lane::Reliable => l.caps.max_reliable,
-            Lane::Unreliable => l.caps.max_unreliable,
+            Lane::Reliable => l.client_caps.max_reliable,
+            Lane::Unreliable => l.client_caps.max_unreliable,
         };
         if packet.len() > max {
             return Err(TransportError::TooLarge { len: packet.len(), max });
@@ -529,7 +546,7 @@ pub struct MemoryLinkTx {
 
 impl LinkTx for MemoryLinkTx {
     fn caps(&self) -> TransportCaps {
-        self.link.lock().caps
+        self.link.lock().server_caps
     }
 
     fn send(&self, lane: Lane, packet: Vec<u8>) -> Result<(), TransportError> {
@@ -539,8 +556,8 @@ impl LinkTx for MemoryLinkTx {
             return Err(TransportError::Closed);
         }
         let max = match lane {
-            Lane::Reliable => l.caps.max_reliable,
-            Lane::Unreliable => l.caps.max_unreliable,
+            Lane::Reliable => l.server_caps.max_reliable,
+            Lane::Unreliable => l.server_caps.max_unreliable,
         };
         if packet.len() > max {
             return Err(TransportError::TooLarge { len: packet.len(), max });

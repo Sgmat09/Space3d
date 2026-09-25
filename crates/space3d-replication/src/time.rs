@@ -138,8 +138,16 @@ impl RttEstimator {
         self.min_rtt
     }
 
-    /// `srtt + 4 · rttvar` (loss timeout for acked policies), at least 30 ms.
+    /// RTO before the first sample (RFC 6298 §2.1): conservative, so a long path cannot make
+    /// every packet look lost before any RTT was measured.
+    pub const INITIAL_RTO: Duration = Duration::from_secs(1);
+
+    /// `srtt + 4 · rttvar` (loss timeout for acked policies), at least 30 ms;
+    /// [`Self::INITIAL_RTO`] before the first sample.
     pub fn rto(&self) -> Duration {
+        if self.srtt.is_none() {
+            return Self::INITIAL_RTO;
+        }
         (self.srtt() + self.rttvar * 4).max(Duration::from_millis(30))
     }
 
@@ -497,7 +505,7 @@ mod tests {
     #[test]
     fn rtt_estimator_follows_rfc6298() {
         let mut r = RttEstimator::default();
-        assert_eq!(r.rto(), Duration::from_millis(30));
+        assert_eq!(r.rto(), RttEstimator::INITIAL_RTO, "conservative before any sample");
         r.sample(Duration::from_millis(100));
         assert_eq!(r.srtt(), Duration::from_millis(100));
         assert_eq!(r.rttvar(), Duration::from_millis(50));

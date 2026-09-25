@@ -32,7 +32,7 @@ use serde::Serialize;
 use smallvec::SmallVec;
 
 /// Protocol version carried in `Hello`; bump on any wire-incompatible change.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// `Hello::magic`.
 pub const MAGIC: [u8; 4] = *b"S3DN";
@@ -185,7 +185,9 @@ pub struct WireLimits {
     pub max_input_bytes: u32,
     /// Default per-message cap for messages without their own (default 1 KiB).
     pub max_message_bytes: u32,
-    /// Input packets per second per client (token bucket; default 90, burst 30).
+    /// Input packets per second per client (default 90; the room's packet bucket adds 30/s
+    /// for pings / control, so 120/s with a burst of 60, and never less than 1.5 × the tick
+    /// rate for inputs).
     pub input_packets_per_sec: u32,
     /// Messages per second per client over all types (default 30, burst 60).
     pub messages_per_sec: u32,

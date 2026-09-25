@@ -82,7 +82,7 @@ pub use registry::{
 pub use sim::{SimRole, SimSchedule, SimTime};
 
 use space3d_core::hecs::Component;
-use space3d_core::{App, Plugin, SystemCtx};
+use space3d_core::{App, Plugin, Stage, SystemCtx};
 
 /// Deterministic fast hash map (fixed-key aHash: iteration order is reproducible across runs,
 /// which the harness' byte-level determinism relies on). Keys are server-assigned ids, so
@@ -137,6 +137,52 @@ impl Plugin for ReplicationPlugin {
             );
         }
         app.add_system_named(space3d_core::Stage::Startup, "replication::freeze", freeze_registry);
+    }
+}
+
+/// Name prefixes of engine systems that may be registered before a replication plugin.
+const ENGINE_SYSTEM_PREFIXES: &[&str] = &[
+    "replication::",
+    "tasks::",
+    "net::",
+    "assets::",
+    "scene::",
+    "input::",
+    "physics::",
+    "core::",
+    "room::",
+    "server::",
+    "ui::",
+    "render::",
+    "audio::",
+    "platform::",
+];
+
+/// Game (non-engine) systems already registered in `PreUpdate` or `FixedUpdate`, i.e. before a
+/// replication plugin that is being added now. They would run before `replication::*_receive`
+/// / `*_tick` (reading last frame's inputs and messages, or simulating outside the sim
+/// schedule): replication plugins must be added before game plugins. The plugins warn about
+/// them in debug builds.
+pub fn systems_before_replication(app: &App) -> Vec<&'static str> {
+    [Stage::PreUpdate, Stage::FixedUpdate]
+        .into_iter()
+        .flat_map(|stage| app.system_names(stage))
+        .filter(|name| !ENGINE_SYSTEM_PREFIXES.iter().any(|p| name.starts_with(p)))
+        .collect()
+}
+
+/// Debug builds: warn about [`systems_before_replication`].
+pub(crate) fn check_plugin_order(app: &App, plugin: &str) {
+    if cfg!(debug_assertions) {
+        let early = systems_before_replication(app);
+        if !early.is_empty() {
+            tracing::warn!(
+                plugin,
+                systems = ?early,
+                "game systems registered before the replication plugin run before it; add the \
+                 replication plugin before game plugins"
+            );
+        }
     }
 }
 

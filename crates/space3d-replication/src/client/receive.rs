@@ -7,7 +7,8 @@
 //! * Per-entity `last_applied_tick`: a record older than or equal to it is skipped (safe under
 //!   reordering thanks to the snapshot invariant).
 //! * Component values with unresolved entity references are parked in [`PendingRefs`] and
-//!   retried after each snapshot (dropped after 1 s or when the holder despawns).
+//!   retried after each snapshot (dropped after 1 s, when the holder despawns, or when a newer
+//!   value or a removal of the same component arrives).
 
 use super::connection::{Connection, lost};
 use super::{ConnectionEvent, ConnectionState, FailReason, Mispredicted, NetClient, RemoteDespawned};
@@ -22,11 +23,22 @@ use crate::{Controlled, Interpolated, NetEntity, NetId, Predicted, Remote, Simul
 use space3d_core::{Entity, Events, Resources, SystemCtx, TickRate, World};
 use std::time::Duration;
 
-/// Parked component values waiting for referenced entities.
+/// Parked component values waiting for referenced entities. At most one value per
+/// `(holder, kind)`: a newer value (applied, parked or removed) replaces it, so a parked value
+/// is always the newest the server sent for that component.
 #[derive(Default)]
 pub struct PendingRefs {
     /// `(holder, kind, bytes, first seen)`.
     pub entries: Vec<(NetId, u16, Vec<u8>, Tick)>,
+}
+
+impl PendingRefs {
+    /// Drop the parked value of `(holder, kind)`, if any.
+    pub fn forget(&mut self, holder: NetId, kind: u16) {
+        if !self.entries.is_empty() {
+            self.entries.retain(|(h, k, _, _)| !(*h == holder && *k == kind));
+        }
+    }
 }
 
 /// Client-side replication metadata of one entity.
@@ -217,6 +229,29 @@ fn on_reject(net: &mut NetClient, conn: &mut Connection, now: Duration, r: Rejec
         net.state = ConnectionState::Reconnecting { attempt: conn.attempt };
         return;
     }
+    // Transient refusals (server busy, rate limited) that name a retry delay are retried with
+    // credentials that can be presented again: a resume token within its window, or dev auth.
+    let transient = r.retry_after_ms.is_some() && matches!(r.code, RejectCode::RoomFull | RejectCode::RateLimited);
+    let reusable = conn.resuming || matches!(conn.auth, HelloAuth::Dev { .. });
+    let policy = net.config.reconnect;
+    if transient && reusable && policy.max_attempts.is_none_or(|m| conn.attempt < m) {
+        if let Some(mut t) = conn.transport.take() {
+            t.close(crate::transport::CloseCode::NORMAL, "rejected (retrying)");
+        }
+        conn.hello_sent = false;
+        let wait = Duration::from_millis(u64::from(r.retry_after_ms.unwrap_or(1_000)));
+        conn.retry_at = Some(now + wait.max(policy.backoff.delay(conn.attempt)));
+        conn.attempt += 1;
+        tracing::debug!(code = ?r.code, attempt = conn.attempt, "transient reject; retrying");
+        if conn.welcome.is_some() {
+            net.state = ConnectionState::Reconnecting { attempt: conn.attempt };
+            net.events.push(ConnectionEvent::Reconnecting { attempt: conn.attempt });
+        } else {
+            net.state = ConnectionState::Connecting { attempt: conn.attempt };
+            net.events.push(ConnectionEvent::Connecting);
+        }
+        return;
+    }
     if let Some(mut t) = conn.transport.take() {
         t.close(crate::transport::CloseCode::NORMAL, "rejected");
     }
@@ -396,6 +431,11 @@ fn apply_snapshot(
                     entry.ops.remove(world, entity);
                 }
             }
+            // Parked values of components this full state does not list are gone too.
+            let present = rec.present;
+            net.pending_refs
+                .entries
+                .retain(|(h, k, _, _)| *h != rec.net_id || present & (1u64 << *k) != 0);
         }
         let mut removed = rec.removed;
         while removed != 0 {
@@ -405,6 +445,8 @@ fn apply_snapshot(
                 entry.ops.remove(world, entity);
             }
             net.prediction.forget_kind(rec.net_id, kind);
+            // A parked (older) value must not re-insert a removed component.
+            net.pending_refs.forget(rec.net_id, kind);
         }
         // Markers.
         let controlled = rec.op & op::CONTROLLED != 0;
@@ -460,20 +502,23 @@ fn apply_snapshot(
             } else {
                 match entry.mode {
                     ClientMode::Apply | ClientMode::Predict => entry.ops.apply(world, entity, bytes, &mut ctx),
-                    ClientMode::Interpolate | ClientMode::PredictAndInterpolate => {
-                        entry
-                            .ops
-                            .push_sample(world, entity, tick, bytes, &mut ctx, send_interval)
-                    }
+                    ClientMode::Interpolate | ClientMode::PredictAndInterpolate => entry.ops.push_sample(
+                        world,
+                        entity,
+                        tick,
+                        bytes,
+                        &mut ctx,
+                        send_interval,
+                        rec.op & op::DEFERRED != 0,
+                    ),
                     ClientMode::Delayed => entry.ops.push_delayed(world, entity, tick, bytes, &mut ctx),
                 }
             };
             match result {
-                Ok(()) => {}
+                // A newer value supersedes any parked one (it must never be re-applied later).
+                Ok(()) => net.pending_refs.forget(rec.net_id, *kind),
                 Err(DecodeError::Unresolved) => {
-                    net.pending_refs
-                        .entries
-                        .retain(|(h, k, _, _)| !(*h == rec.net_id && *k == *kind));
+                    net.pending_refs.forget(rec.net_id, *kind);
                     net.pending_refs.entries.push((rec.net_id, *kind, bytes.to_vec(), tick));
                 }
                 Err(e) => tracing::warn!(%e, component = entry.name, "bad component from server"),
@@ -553,6 +598,65 @@ pub(crate) fn emit_mispredicted(res: &mut Resources, ev: Mispredicted) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ClientConfig;
+    use crate::transport::{ClientTransport, Connector, TransportError};
+    use std::sync::Arc;
+
+    struct NoConnect;
+
+    impl Connector for NoConnect {
+        fn connect(&self, _url: &str) -> Result<Box<dyn ClientTransport>, TransportError> {
+            Err(TransportError::Connect("offline".into()))
+        }
+    }
+
+    fn handshaking(auth: HelloAuth, resuming: bool) -> (NetClient, Connection) {
+        let mut net = NetClient::new(ClientConfig::default());
+        let mut conn = Connection::new(Arc::new(NoConnect), "mem://gs".into(), auth, &net.config);
+        conn.resuming = resuming;
+        if resuming {
+            conn.resume_token = Some(vec![1, 2, 3]);
+        }
+        net.state = ConnectionState::Handshaking;
+        (net, conn)
+    }
+
+    fn busy() -> Reject {
+        Reject {
+            code: RejectCode::RoomFull,
+            message: "room busy".into(),
+            retry_after_ms: Some(1_000),
+        }
+    }
+
+    /// A resume refused as busy (with a retry delay) is retried, not treated as terminal.
+    #[test]
+    fn transient_reject_of_a_resume_retries_after_the_delay() {
+        let now = Duration::from_secs(10);
+        let (mut net, mut conn) = handshaking(HelloAuth::Ticket("t".into()), true);
+        on_reject(&mut net, &mut conn, now, busy());
+        assert!(
+            matches!(
+                net.state,
+                ConnectionState::Connecting { .. } | ConnectionState::Reconnecting { .. }
+            ),
+            "{:?}",
+            net.state
+        );
+        assert!(conn.retry_at.is_some_and(|t| t >= now + Duration::from_secs(1)));
+        // Not transient: fails.
+        let (mut net, mut conn) = handshaking(HelloAuth::Ticket("t".into()), true);
+        on_reject(&mut net, &mut conn, now, Reject::new(RejectCode::BadTicket, "no"));
+        assert!(matches!(net.state, ConnectionState::Failed(_)));
+        // A single-use ticket (not a resume) cannot be presented again: fails.
+        let (mut net, mut conn) = handshaking(HelloAuth::Ticket("t".into()), false);
+        on_reject(&mut net, &mut conn, now, busy());
+        assert!(matches!(net.state, ConnectionState::Failed(_)));
+        // Dev credentials are reusable.
+        let (mut net, mut conn) = handshaking(HelloAuth::Dev { name: "a".into() }, false);
+        on_reject(&mut net, &mut conn, now, busy());
+        assert!(!matches!(net.state, ConnectionState::Failed(_)));
+    }
 
     #[test]
     fn ack_window() {

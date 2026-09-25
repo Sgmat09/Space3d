@@ -358,11 +358,25 @@ impl Claims for SessionClaims {
     }
 }
 
-/// Seen `jti`s until their expiry (bounded; oldest evicted first — eviction can only let an
-/// already-expired ticket through the cache, which the `exp` check then rejects).
+/// Result of [`NonceCache::insert`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonceCheck {
+    /// First use: recorded until its expiry.
+    Fresh,
+    /// Seen before and not expired: a replay.
+    Replayed,
+    /// The cache is full of unexpired nonces: refuse (fail closed, retryable). Evicting a live
+    /// nonce would let that ticket be replayed until it expires.
+    Full,
+}
+
+/// Seen `jti`s until their expiry. Bounded: expired entries are pruned in expiry order
+/// (O(log n) each); when `capacity` unexpired nonces are held, new tickets are refused with
+/// [`NonceCheck::Full`] instead of evicting a live one.
 #[derive(Debug, Default)]
 pub struct NonceCache {
     seen: std::collections::HashMap<[u8; 16], i64>,
+    by_expiry: std::collections::BTreeSet<(i64, [u8; 16])>,
     capacity: usize,
 }
 
@@ -371,27 +385,30 @@ impl NonceCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             seen: Default::default(),
+            by_expiry: Default::default(),
             capacity,
         }
     }
 
-    /// Record `jti` (valid until `exp_ms`); `false` if it was already seen.
-    pub fn insert(&mut self, jti: [u8; 16], exp_ms: i64, now_ms: i64) -> bool {
-        if let Some(&until) = self.seen.get(&jti)
-            && until >= now_ms
-        {
-            return false;
+    /// Record `jti` (valid until `exp_ms`) at `now_ms`.
+    pub fn insert(&mut self, jti: [u8; 16], exp_ms: i64, now_ms: i64) -> NonceCheck {
+        // Prune everything expired (oldest expiry first).
+        while let Some(&(until, old)) = self.by_expiry.first() {
+            if until >= now_ms {
+                break;
+            }
+            self.by_expiry.pop_first();
+            self.seen.remove(&old);
+        }
+        if self.seen.contains_key(&jti) {
+            return NonceCheck::Replayed;
         }
         if self.seen.len() >= self.capacity.max(1) {
-            self.seen.retain(|_, until| *until >= now_ms);
-            if self.seen.len() >= self.capacity.max(1)
-                && let Some(oldest) = self.seen.iter().min_by_key(|(_, until)| **until).map(|(k, _)| *k)
-            {
-                self.seen.remove(&oldest);
-            }
+            return NonceCheck::Full;
         }
         self.seen.insert(jti, exp_ms);
-        true
+        self.by_expiry.insert((exp_ms, jti));
+        NonceCheck::Fresh
     }
 
     /// Nonces tracked.
@@ -554,17 +571,22 @@ mod tests {
     #[test]
     fn nonce_cache_detects_replay_and_stays_bounded() {
         let mut c = NonceCache::new(3);
-        assert!(c.insert([1; 16], 100, 0));
-        assert!(!c.insert([1; 16], 100, 50), "replay");
-        assert!(c.insert([2; 16], 200, 50));
-        assert!(c.insert([3; 16], 300, 50));
-        assert!(c.insert([4; 16], 400, 150), "expired [1] is purged to make room");
-        assert_eq!(c.len(), 3);
-        assert!(!c.insert([4; 16], 400, 160));
-        assert!(
-            c.insert([5; 16], 500, 160),
-            "evicts the oldest expiry when all are live"
+        assert_eq!(c.insert([1; 16], 100, 0), NonceCheck::Fresh);
+        assert_eq!(c.insert([1; 16], 100, 50), NonceCheck::Replayed);
+        assert_eq!(c.insert([2; 16], 200, 50), NonceCheck::Fresh);
+        assert_eq!(c.insert([3; 16], 300, 50), NonceCheck::Fresh);
+        assert_eq!(
+            c.insert([4; 16], 400, 150),
+            NonceCheck::Fresh,
+            "expired [1] is purged to make room"
         );
-        assert!(c.len() <= 3);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.insert([4; 16], 400, 160), NonceCheck::Replayed);
+        // Full of live nonces: a new ticket is refused, and no live nonce is evicted.
+        assert_eq!(c.insert([5; 16], 500, 160), NonceCheck::Full);
+        assert_eq!(c.insert([2; 16], 200, 170), NonceCheck::Replayed, "live nonce kept");
+        assert_eq!(c.len(), 3);
+        // Once one expires there is room again.
+        assert_eq!(c.insert([5; 16], 500, 201), NonceCheck::Fresh);
     }
 }

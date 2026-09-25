@@ -99,6 +99,8 @@ pub struct ChangeCache {
     pub last_collect: Tick,
     /// Spatial grid of positioned records (XZ).
     pub(crate) grid: super::interest::SpatialGrid,
+    /// Entities whose records the last collect retired (despawned / no longer replicated).
+    pub(crate) retired: Vec<Entity>,
     generation: u64,
     scratch: Writer,
 }
@@ -245,7 +247,9 @@ impl ChangeCache {
         if self.records.len() != before {
             self.reindex();
         }
+        self.retired.clear();
         for (id, entity, pos) in gone {
+            self.retired.push(entity);
             ids.remove(entity);
             self.grid.update(id.0, pos, None);
             self.tombstones.push((id, tick));
@@ -325,6 +329,13 @@ pub(crate) fn server_collect(ctx: &mut SystemCtx) {
         if server.tick.0.is_multiple_of(interval) {
             let tick = server.tick;
             server.cache.collect(tick, world, registry, &mut server.ids);
+            for e in &server.cache.retired {
+                server.visibility.forget_entity(*e);
+            }
+            // Overrides of entities that were never replicated (despawned before a collect).
+            if server.visibility.len() > 0 && (tick.0 / interval).is_multiple_of(64) {
+                server.visibility.retain_entities(|e| world.contains(e));
+            }
             let window = (server.config.resume_window.as_secs_f64() * server.tick_hz().max(1.0)) as u32;
             server.cache.prune_tombstones(tick.saturating_sub(window));
         }

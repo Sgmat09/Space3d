@@ -130,6 +130,9 @@ pub(crate) struct PredictionState {
     /// After a resync to tick T, the server's slack feedback describes the old timeline until
     /// it consumed an input for T or later: feedback is ignored until then.
     pub(crate) feedback_after: Option<Tick>,
+    /// Debug builds: predicted component changes made outside the sim (between two predicted
+    /// ticks) — they are invisible to rollback and mispredict (see [`check_sim_discipline`]).
+    pub(crate) outside_sim_changes: u64,
 }
 
 impl PredictionState {
@@ -358,8 +361,13 @@ pub(crate) fn client_tick(ctx: &mut SystemCtx) {
             let dt = Duration::from_secs_f64(1.0 / net.prediction.nominal_hz.max(1.0));
             (tick, net.prediction.rollback_from.take(), dt)
         };
-        if let Some(from) = rollback {
-            rollback_and_replay(world, res, registry, from, tick, dt);
+        match rollback {
+            Some(from) => rollback_and_replay(world, res, registry, from, tick, dt),
+            None if cfg!(debug_assertions) => {
+                let net = res.expect_mut::<NetClient>();
+                check_sim_discipline(world, registry, net, tick);
+            }
+            None => {}
         }
         // Sample and simulate the next tick.
         let value = match registry.input() {
@@ -392,6 +400,57 @@ pub(crate) fn client_tick(ctx: &mut SystemCtx) {
         }
         net.prediction.next_tick = Some(tick.next());
     });
+}
+
+/// Debug check of `SimSchedule` discipline: a predicted component must only change inside the
+/// sim. Before simulating `tick`, every predicted component of a predicted entity must still
+/// hold what the sim recorded for `tick − 1`; anything else was written by a system outside
+/// `add_sim_system` (the change is lost on the next rollback and causes mispredictions).
+/// Counted in `NetClient::sim_discipline_violations`, warned once per session.
+fn check_sim_discipline(world: &World, registry: &ReplicationRegistry, net: &mut NetClient, tick: Tick) {
+    let Some(prev) = tick.0.checked_sub(1).map(Tick) else {
+        return;
+    };
+    let enc = EncodeCtx::client(&net.map);
+    let mut scratch = Writer::new();
+    let mut found: Option<(NetId, &'static str)> = None;
+    let mut n = 0u64;
+    for (e, id) in predicted_entities(world) {
+        let Ok(history) = world.get::<&PredictionHistory>(e) else {
+            continue;
+        };
+        if history.entries.back().is_none_or(|(t, _)| *t != prev) {
+            continue;
+        }
+        for entry in registry.components().iter().filter(|c| c.mode.is_predicted()) {
+            let kind = entry.kind.expect("frozen").0;
+            let Some(recorded) = history.get(prev, kind) else {
+                continue;
+            };
+            scratch.clear();
+            if entry.ops.encode(world, e, &mut scratch, &enc)
+                && entry
+                    .ops
+                    .differs(recorded, scratch.as_slice(), &mut DecodeCtx::new(&net.map))
+            {
+                n += 1;
+                found.get_or_insert((id, entry.name));
+            }
+        }
+    }
+    if n > 0 {
+        if net.prediction.outside_sim_changes == 0
+            && let Some((id, name)) = found
+        {
+            tracing::warn!(
+                net_id = ?id,
+                component = name,
+                "a predicted component changed outside the sim: move that logic into add_sim_system \
+                 (it is lost on rollback and mispredicts)"
+            );
+        }
+        net.prediction.outside_sim_changes += n;
+    }
 }
 
 /// Newest confirmed tick over the predicted entities, and whether the recorded prediction for

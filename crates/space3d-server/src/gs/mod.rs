@@ -165,10 +165,18 @@ impl GsState {
                 }
                 FleetDown::Kick { player, reason } => self.kick(player, &reason),
                 FleetDown::Ban(ban) => {
-                    if let crate::security::bans::BanTarget::Player(p) = ban.target {
+                    let player = match ban.target {
+                        crate::security::bans::BanTarget::Player(p) => Some(p),
+                        crate::security::bans::BanTarget::Ip(_) => None,
+                    };
+                    if let Some(p) = player {
                         self.kick(p, &ban.reason);
                     }
                     self.rt.bans.upsert(ban);
+                    if player.is_none() {
+                        // Connected clients in the banned range go now (not at their next join).
+                        self.rt.gate.lock().enforce_ip_bans(self.rt.unix.now_ms());
+                    }
                 }
                 FleetDown::Unban { ban_id } => {
                     self.rt.bans.remove(ban_id);
@@ -262,9 +270,18 @@ impl GsState {
             rooms,
         };
         let _ = self.rt.fleet.send(FleetUp::Heartbeat(hb));
-        if !self.rt.fleet.is_connected() {
-            self.rt.health.set_registered(false);
-        }
+        // Registration is a readiness latch; the live link state is reported separately.
+        let connected = self.rt.fleet.is_connected();
+        self.rt.health.set_fleet_connected(connected);
+        self.rt
+            .metrics
+            .registry
+            .gauge(
+                "space3d_fleet_connected",
+                "1 while the fleet link to the player service is up.",
+                &[],
+            )
+            .set(if connected { 1.0 } else { 0.0 });
     }
 
     fn metrics(&self) {
@@ -320,7 +337,14 @@ impl GsState {
         if phase == Phase::Stopped && !self.stopped {
             self.stopped = true;
             if let Some(shards) = &self.rt.shards {
-                shards.stop();
+                if self.rt.lifecycle.requests() >= 2 {
+                    // Second signal: no graceful close happened; checkpoint every room to the
+                    // local store and disconnect its clients before the process exits.
+                    tracing::warn!("forced stop: local checkpoints");
+                    shards.force_stop();
+                } else {
+                    shards.stop();
+                }
             }
         }
     }

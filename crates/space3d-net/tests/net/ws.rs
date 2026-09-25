@@ -330,3 +330,46 @@ fn async_recv_and_inbound_bound() {
     assert_eq!(msgs, 2);
     assert_eq!(ws.inbound_len(), 0);
 }
+
+#[test]
+fn upgrade_headers_reach_the_accept_hook() {
+    let ws = WsServer::with_config(WsServerConfig::default().accept(|meta| {
+        if meta.authorization.as_deref() == Some("Bearer s3cret") {
+            Ok(())
+        } else {
+            Err(401)
+        }
+    }));
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let anonymous = WsClient::connect(handle.ws_url("/"));
+    wait_until("anonymous refused", || anonymous.is_closed());
+    let authed = WsClient::connect_with(
+        handle.ws_url("/"),
+        WsConfig::default().header("authorization", "Bearer s3cret"),
+    );
+    wait_until("token accepted", || authed.is_open() && ws.client_count() == 1);
+    let meta = ws.client_meta(ws.clients()[0]).unwrap();
+    assert!(!format!("{meta:?}").contains("s3cret"), "redacted in Debug");
+    assert!(!format!("{:?}", WsConfig::default().header("authorization", "x-secret")).contains("x-secret"));
+}
+
+/// A `ClientSender` sends, reports its backlog and liveness, and closes without the server's
+/// client table.
+#[test]
+fn client_sender_works_without_the_client_table() {
+    let ws = WsServer::new();
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let conn = WsClient::connect(handle.ws_url("/"));
+    wait_until("connected", || conn.is_open() && ws.client_count() == 1);
+    let id = ws.clients()[0];
+    let sender = ws.client_sender(id).expect("connected client");
+    assert!(sender.is_connected());
+    sender.send(vec![7u8, 8]).unwrap();
+    wait_until("delivered", || conn.drain().contains(&Message::Binary(vec![7, 8])));
+    assert_eq!(sender.backlog_bytes(), 0);
+    sender.close_with(1008, "bye");
+    assert!(!sender.is_connected(), "closing at once (no send after a queued close)");
+    wait_until("closed", || conn.is_closed() && ws.client_count() == 0);
+    assert_eq!(sender.send(vec![1u8]), Err(NetError::Closed));
+    assert!(ws.client_sender(id).is_none(), "gone from the table");
+}

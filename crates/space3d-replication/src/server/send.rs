@@ -12,7 +12,7 @@ use super::change::{ChangeCache, EntityRecord};
 use super::interest::{Viewer, dist_xz, relevant_set};
 use super::priority::{ByteBudget, distance_falloff};
 use super::slots::{OutBlock, Slot};
-use super::{InterestPolicy, NetServer, ServerNetConfig, SlotState, Visibility};
+use super::{InterestPolicy, NetServer, ServerNetConfig, SlotState};
 use crate::protocol::control::{Pong, TimeMsg};
 use crate::protocol::handshake::DisconnectCode;
 use crate::protocol::snapshot::{DespawnRecord, SnapshotHeader, SnapshotWriter, flags as sflags, op};
@@ -23,7 +23,7 @@ use crate::transport::{Lane, LinkTx};
 use crate::wire::Writer;
 use crate::{FastMap, NetClientId, NetId, PlayerId, Tick};
 use space3d_core::glam::Vec3;
-use space3d_core::{Entity, SystemCtx, World};
+use space3d_core::{SystemCtx, World};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +34,8 @@ pub struct ClientEntity {
     pub spawned: bool,
     /// Client holds every component change up to this tick.
     pub ack_tick: Tick,
-    /// Last tick included in a packet (avoids resending while an ack is outstanding).
+    /// Last tick included in a packet (a datagram spawn in flight is not resent before its
+    /// ack or loss).
     pub last_sent_tick: Tick,
     /// Priority accumulator.
     pub acc: f32,
@@ -44,41 +45,17 @@ pub struct ClientEntity {
     pub known_present: u64,
     /// Tick of the record that set `known_present`.
     pub known_tick: Tick,
-    /// Datagram: acked records that could not advance `ack_tick` yet, as `(baseline, tick)`.
-    /// A record written against baseline B holds every change in `(B, tick]`, so it advances
-    /// `ack_tick` only once `ack_tick >= B` (an earlier packet may still be lost).
-    pub acked_ahead: smallvec::SmallVec<[(Tick, Tick); 2]>,
+    /// Consecutive snapshots in which the entity had due changes that the budget deferred.
+    pub misses: u16,
 }
 
 impl ClientEntity {
-    /// Datagram ack of a record written at `tick` against `baseline`.
+    /// Datagram ack of a record written at `tick` against `baseline`. Records are written
+    /// against the acked baseline (every change after `ack_tick`), so a record acked while
+    /// its baseline is still covered advances `ack_tick` to its tick.
     pub(crate) fn on_record_acked(&mut self, baseline: Tick, tick: Tick) {
-        if tick <= self.ack_tick {
-            return;
-        }
-        if baseline <= self.ack_tick {
+        if tick > self.ack_tick && baseline <= self.ack_tick {
             self.ack_tick = tick;
-        } else {
-            self.acked_ahead.push((baseline, tick));
-        }
-        // Chain records whose baseline is now covered.
-        loop {
-            let ack = self.ack_tick;
-            let Some(next) = self
-                .acked_ahead
-                .iter()
-                .filter(|(b, t)| *b <= ack && *t > ack)
-                .map(|(_, t)| *t)
-                .max()
-            else {
-                break;
-            };
-            self.ack_tick = next;
-        }
-        let ack = self.ack_tick;
-        self.acked_ahead.retain(|(_, t)| *t > ack);
-        while self.acked_ahead.len() > 8 {
-            self.acked_ahead.remove(0);
         }
     }
 }
@@ -102,6 +79,9 @@ pub struct SentRecord {
     pub baselines: Vec<Tick>,
     /// Send time (loss detection, RTT).
     pub sent_at: Duration,
+    /// Presumed lost (its entities became due again); a late ack still credits it and samples
+    /// the RTT, so a long RTT raises the RTO instead of looking like permanent loss.
+    pub lost: bool,
 }
 
 /// Per-client view (internal to the replication builder).
@@ -146,6 +126,15 @@ impl ClientView {
 
 /// Maximum `SentRecord`s kept per client.
 const SENT_RING: usize = 256;
+/// Stream packets (and snapshot parts) are cut at this size; a single entity record larger
+/// than this still goes out alone, up to the link's `max_reliable`.
+pub const STREAM_PACKET_BYTES: usize = 16 * 1024;
+/// A top-priority candidate deferred this many snapshots in a row reserves the budget: lower
+/// priorities wait until it fits (or the bucket is full and it goes out anyway), so an entity
+/// larger than what the budget refills per snapshot is never starved by smaller ones.
+const STARVE_RESERVE: u16 = 3;
+/// Priority boost of the client's own (not controlled) entities.
+const OWNED_WEIGHT: f32 = 4.0;
 /// Datagram packet header allowance (header byte, seq, tick) plus block header.
 const DATAGRAM_OVERHEAD: usize = 16;
 /// Backlog above `backlog_kick_bytes` for this long → `SlowConsumer`.
@@ -225,6 +214,9 @@ struct Pick {
     /// The record holds every due change after this tick.
     baseline: Tick,
 }
+
+/// One snapshot part: encoded block, its entities, its despawns.
+type Part = (Vec<u8>, Vec<Pick>, Vec<DespawnRecord>);
 
 fn send_client(
     server: &mut NetServer,
@@ -308,12 +300,15 @@ fn send_client(
         slot.out_unreliable.clear();
     }
     let reliable: Vec<OutBlock> = std::mem::take(&mut slot.out_reliable);
-    let mut snapshots: Vec<(Vec<u8>, Vec<Pick>, Vec<DespawnRecord>)> = Vec::new();
+    let mut snapshots: Vec<Part> = Vec::new();
     if snapshot_due {
         let max_block = if slot.datagram {
             caps.max_unreliable.saturating_sub(DATAGRAM_OVERHEAD).max(64)
         } else {
-            caps.max_reliable.saturating_sub(DATAGRAM_OVERHEAD).max(64)
+            caps.max_reliable
+                .min(STREAM_PACKET_BYTES)
+                .saturating_sub(DATAGRAM_OVERHEAD)
+                .max(64)
         };
         let other = reliable
             .iter()
@@ -358,14 +353,14 @@ fn build_snapshot(
     config: &ServerNetConfig,
     registry: &ReplicationRegistry,
     world: &World,
-    visibility: &FastMap<(PlayerId, Entity), Visibility>,
+    visibility: &super::interest::VisibilityOverrides,
     rules: &[Box<dyn super::interest::VisibilityRule>],
     tick: Tick,
     dticks: u32,
     hz: f64,
     max_block: usize,
     other_bytes: usize,
-) -> Vec<(Vec<u8>, Vec<Pick>, Vec<DespawnRecord>)> {
+) -> Vec<Part> {
     let player = slot.identity.player;
     let team = slot.identity.team;
     let datagram = slot.datagram;
@@ -473,11 +468,10 @@ fn build_snapshot(
         let allowed = audience_mask(rec, registry, player, team, world);
         let own = rec.is_owned_by(player);
         let controlled = rec.controller == Some(player);
-        let baseline = if datagram {
-            ce.ack_tick.max(ce.last_sent_tick)
-        } else {
-            ce.ack_tick
-        };
+        // Always against the acked state: a datagram record then holds every change after
+        // the ack, so it supersedes any older record still in flight (the client may skip a
+        // reordered older record without losing anything).
+        let baseline = ce.ack_tick;
         let (comps, removed, spawn) = if !ce.spawned {
             all_spawned = false;
             if datagram && ce.last_sent_tick > ce.ack_tick {
@@ -518,7 +512,10 @@ fn build_snapshot(
             baseline: if spawn { Tick::ZERO } else { baseline },
         };
         let size = entity_size(rec, comps, removed);
-        if own || (removed != 0 && comps == 0) {
+        // Outside the budget: the controlled (predicted) entities, which need a confirmation
+        // every snapshot, and bare removals. Everything else, the client's other own entities
+        // included (boosted), competes for the budget.
+        if controlled || (removed != 0 && comps == 0) {
             always.push(pick);
         } else {
             let weight = rec
@@ -527,7 +524,8 @@ fn build_snapshot(
                 .filter(|c| comps & (1u64 << c.kind) != 0)
                 .filter_map(|c| registry.component(c.kind))
                 .map(|e| e.priority)
-                .fold(if spawn { 1.0f32 } else { 0.0 }, f32::max);
+                .fold(if spawn { 1.0f32 } else { 0.0 }, f32::max)
+                * if own { OWNED_WEIGHT } else { 1.0 };
             let falloff = match (rec.pos, sources.is_empty()) {
                 (Some(p), false) => sources
                     .iter()
@@ -549,6 +547,9 @@ fn build_snapshot(
     budget.set_rate(slot.down_rate, (per_snapshot * mult).max(256.0) as u32);
     budget.refill(Duration::from_secs_f64(f64::from(dticks) / hz));
     let available = budget.available();
+    // A full bucket lets the top candidate through even if it does not fit (the budget goes
+    // into debt and the next refills pay it back): nothing is too large to ever be sent.
+    let full = budget.is_full();
     let mut used = other_bytes + 8 + despawns.len() * 3;
     let mut picks: Vec<Pick> = Vec::new();
     for p in always {
@@ -560,19 +561,37 @@ fn build_snapshot(
     let mut misses = 0;
     let mut written_candidates = 0usize;
     let total_candidates = candidates.len();
-    for (_, pick, size) in candidates {
-        if used + size <= available || (written_candidates == 0 && picks.is_empty() && available > 0) {
+    let mut rest = candidates.into_iter();
+    for (_, mut pick, size) in rest.by_ref() {
+        let top = written_candidates == 0 && misses == 0;
+        let fits = used + size <= available;
+        let forced = top && (full || (picks.is_empty() && available > 0));
+        let Some(ce) = slot.view.entities.get_mut(&pick.net_id) else {
+            continue;
+        };
+        if fits || forced {
             used += size;
             written_candidates += 1;
-            if let Some(ce) = slot.view.entities.get_mut(&pick.net_id) {
-                ce.acc = 0.0;
+            ce.acc = 0.0;
+            if ce.misses > 0 && !pick.spawn {
+                // Changes were held back by the budget: the client must not treat the gap as
+                // the entity having been at rest.
+                pick.op |= op::DEFERRED;
             }
+            ce.misses = 0;
             picks.push(pick);
         } else {
+            ce.misses = ce.misses.saturating_add(1);
+            let reserve = top && ce.misses > STARVE_RESERVE;
             misses += 1;
-            if misses > 8 {
+            if misses > 8 || reserve {
                 break;
             }
+        }
+    }
+    for (_, pick, _) in rest {
+        if let Some(ce) = slot.view.entities.get_mut(&pick.net_id) {
+            ce.misses = ce.misses.saturating_add(1);
         }
     }
     budget.consume(used);
@@ -709,28 +728,42 @@ fn send_stream(
     tick: Tick,
     reliable: Vec<OutBlock>,
     unreliable: Vec<OutBlock>,
-    snapshots: Vec<(Vec<u8>, Vec<Pick>, Vec<DespawnRecord>)>,
+    snapshots: Vec<Part>,
     stats: &mut RoomNetStats,
 ) -> usize {
     let max = tx.caps().max_reliable;
+    // Packets are cut at `STREAM_PACKET_BYTES`; only a single block larger than that (one big
+    // entity) makes a bigger packet, up to the link's cap.
+    let cut = max.min(STREAM_PACKET_BYTES);
     let mut packets: Vec<Vec<u8>> = Vec::new();
     let mut dw = DataWriter::new(None, None, tick);
+    let mut dropped_parts: Vec<usize> = Vec::new();
     let blocks = reliable
         .iter()
-        .map(|(c, b)| (*c, &b[..]))
-        .chain(unreliable.iter().map(|(c, b)| (*c, &b[..])))
-        .chain(snapshots.iter().map(|s| (ChannelId::Snapshot, &s.0[..])));
-    for (ch, payload) in blocks {
+        .map(|(c, b)| (*c, &b[..], None))
+        .chain(unreliable.iter().map(|(c, b)| (*c, &b[..], None)))
+        .chain(
+            snapshots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (ChannelId::Snapshot, &s.0[..], Some(i))),
+        );
+    for (ch, payload, part) in blocks {
         let need = block_overhead(payload.len()) + payload.len();
-        if !dw.is_empty() && dw.len() + need > max {
+        if !dw.is_empty() && dw.len() + need > cut {
             packets.push(std::mem::replace(&mut dw, DataWriter::new(None, None, tick)).finish());
         }
         if dw.len() + need > max {
-            tracing::warn!(
+            tracing::error!(
+                room_client = ?slot.client,
                 len = payload.len(),
                 max,
-                "dropping block larger than the link's packet cap"
+                "dropping a block larger than the link's packet cap"
             );
+            stats.oversize_dropped += 1;
+            if let Some(i) = part {
+                dropped_parts.push(i);
+            }
             continue;
         }
         dw.block_bytes(ch, payload);
@@ -749,8 +782,15 @@ fn send_stream(
         }
     }
     // Optimistic acks: the stream delivers everything or the link dies (then resume resends).
+    // Entities of a dropped part were never sent: they stay due (and unspawned).
     if ok {
-        for (bytes, picks, _) in &snapshots {
+        for (i, (bytes, picks, _)) in snapshots.iter().enumerate() {
+            if dropped_parts.contains(&i) {
+                if picks.iter().any(|p| p.spawn) {
+                    slot.view.sync_complete = false;
+                }
+                continue;
+            }
             stats.snapshot_bytes += bytes.len() as u64;
             for p in picks {
                 if let Some(ce) = slot.view.entities.get_mut(&p.net_id) {
@@ -773,7 +813,7 @@ fn send_datagram(
     tick: Tick,
     reliable: Vec<OutBlock>,
     unreliable: Vec<OutBlock>,
-    snapshots: Vec<(Vec<u8>, Vec<Pick>, Vec<DespawnRecord>)>,
+    snapshots: Vec<Part>,
     now: Duration,
     stats: &mut RoomNetStats,
 ) -> usize {
@@ -857,18 +897,21 @@ fn send_datagram(
 }
 
 /// Datagram: packets unacked for longer than the RTO are presumed lost; their entities become
-/// due again (with current values, never stale bytes).
+/// due again (with current values, never stale bytes). Lost records stay in the ring (marked)
+/// so a late ack still counts and samples the RTT.
 fn detect_losses(slot: &mut Slot, now: Duration) {
     let rto = slot.rtt.rto().max(Duration::from_millis(50)) + Duration::from_millis(20);
-    let (lost, keep): (Vec<SentRecord>, Vec<SentRecord>) = std::mem::take(&mut slot.view.sent)
-        .into_iter()
-        .partition(|r| now.saturating_sub(r.sent_at) > rto);
-    slot.view.sent = keep;
-    for r in lost {
+    let Slot { view, .. } = slot;
+    for r in view.sent.iter_mut().filter(|r| !r.lost) {
+        if now.saturating_sub(r.sent_at) <= rto {
+            continue;
+        }
+        r.lost = true;
         for id in &r.entities {
-            // The lost changes are not covered by `ack_tick`: resend everything since then
-            // (with current values), even if a later packet already carried newer changes.
-            if let Some(ce) = slot.view.entities.get_mut(id)
+            // The lost changes are not covered by `ack_tick`: the next record carries every
+            // change since then (records are written against the ack), and an unacked spawn
+            // may be sent again.
+            if let Some(ce) = view.entities.get_mut(id)
                 && ce.ack_tick < r.tick
             {
                 ce.last_sent_tick = ce.ack_tick;
@@ -922,19 +965,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn datagram_acks_chain_through_baselines() {
+    fn datagram_acks_advance_from_the_acked_baseline() {
         let mut ce = ClientEntity::default();
-        // P1 (tick 10, baseline 0) is in flight; P2 (tick 12) only holds changes after 10.
-        ce.on_record_acked(Tick(10), Tick(12));
-        assert_eq!(ce.ack_tick, Tick(0), "P2 alone must not cover P1's changes");
-        // P1 arrives late: the chain advances through P2.
+        // Written against the ack (0): an ack advances directly, in any order.
+        ce.on_record_acked(Tick(0), Tick(12));
+        assert_eq!(ce.ack_tick, Tick(12));
         ce.on_record_acked(Tick(0), Tick(10));
-        assert_eq!(ce.ack_tick, Tick(12));
-        assert!(ce.acked_ahead.is_empty());
-        // Older / duplicate acks are ignored.
-        ce.on_record_acked(Tick(0), Tick(8));
-        assert_eq!(ce.ack_tick, Tick(12));
-        // A full resend (baseline = ack) advances directly.
+        assert_eq!(ce.ack_tick, Tick(12), "older acks are ignored");
         ce.on_record_acked(Tick(12), Tick(20));
         assert_eq!(ce.ack_tick, Tick(20));
     }
@@ -972,9 +1009,10 @@ mod tests {
                 ..Default::default()
             });
         }
-        // Both presumed lost: everything since the ack becomes due again.
+        // Both presumed lost: everything since the ack becomes due again; the records stay
+        // (marked) so a late ack still counts.
         detect_losses(&mut slot, Duration::from_secs(5));
-        assert!(slot.view.sent.is_empty());
+        assert!(slot.view.sent.iter().all(|r| r.lost));
         assert_eq!(slot.view.entities[&id].last_sent_tick, Tick(4));
     }
 }

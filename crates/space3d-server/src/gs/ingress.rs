@@ -1,7 +1,9 @@
 //! The ingress task (tokio): `WsServerTransport::next_event().await` → `Gatekeeper::handle`
-//! → `RoomManager::get_or_create` → `RoomSender::try_send`. On `InboxFull`: unreliable-only
-//! packets are dropped (metric), anything else closes the link (`1008`). Also runs
-//! `Gatekeeper::sweep` every 250 ms and applies the drain state.
+//! (per-link packet budget: one client cannot fill the shared room inbox) →
+//! `RoomManager::get_or_create` → `RoomSender::try_send`. On `InboxFull`: unreliable-only
+//! packets are dropped (metric), anything else closes the link (`1008`; the client resumes, and
+//! a resume refused as busy carries a retry delay it honours). Also runs `Gatekeeper::sweep`
+//! and IP-ban enforcement every 250 ms and applies the drain state.
 //!
 //! [`dispatch`] is the sans-IO half, shared with `TestCluster` (which feeds memory-network
 //! events synchronously).
@@ -138,7 +140,11 @@ pub fn handle_event(
     metrics: &GameServerMetrics,
 ) {
     let mut g = gate.lock();
+    let dropped = g.dropped_packets();
     let outcome = g.handle(event, now, now_ms);
+    if g.dropped_packets() > dropped {
+        metrics.rate_limited("link_packets");
+    }
     dispatch(&mut g, rooms, outcome, metrics);
 }
 
@@ -185,6 +191,7 @@ pub fn spawn_until(ingress: Ingress, stop: async_channel::Receiver<()>) -> space
                     if closed > 0 {
                         metrics.handshake("timeout");
                     }
+                    g.enforce_ip_bans(unix.now_ms());
                 }
             }
         }

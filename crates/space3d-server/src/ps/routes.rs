@@ -2,13 +2,17 @@
 //! `/internal/v1/*` (fleet token: `WS /internal/v1/fleet`, `PUT|GET|DELETE
 //! /internal/v1/rooms/{id}/checkpoint` ≤ 16 MiB, `GET /internal/v1/checkpoints?since=`).
 //! Body limit `player_service.max_body_bytes`, CORS allowlist, per-IP request rate
-//! (`http_rps_per_ip`), JSON errors (`api::ApiError`), request metrics.
+//! (`http_rps_per_ip`), JSON errors (`api::ApiError`), request metrics. Internal routes check
+//! the per-IP rate and the fleet token in a middleware before any body is read, and bound
+//! the upload time of a checkpoint body.
 
 use super::PlayerService;
 use super::auth::{profile, require, sanitize_name};
+use super::fleet::Build;
 use super::matchmaker::{MatchmakingError, QueueEntry, TicketState};
 use super::store::StoreError;
 use crate::gs::fleet::DataWrite;
+use crate::security::netaddr::rate_key;
 use space3d_net::server::axum::body::Bytes;
 use space3d_net::server::axum::extract::{
     ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, Request, State,
@@ -119,7 +123,7 @@ async fn guard(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, req: Re
         .extensions()
         .get::<space3d_net::server::axum::extract::MatchedPath>()
         .map_or_else(|| "unmatched".to_owned(), |p| p.as_str().to_owned());
-    if !svc.limits.lock().http.check(&meta.ip, svc.limiter_now()) {
+    if !svc.limits.lock().http.check(&rate_key(meta.ip), svc.limiter_now()) {
         svc.metrics.http(&route, 429, 0.0);
         let mut e = api_err(429, "rate_limited", "too many requests");
         e.1.retry_after_ms = Some(1_000);
@@ -170,7 +174,35 @@ pub fn public_router(svc: Arc<PlayerService>) -> Router {
     router
 }
 
-/// Internal (fleet-token) checkpoint routes. The fleet WebSocket is mounted by [`mount`].
+/// Slowest accepted upload of an internal request body (checkpoints ≤ 16 MiB).
+pub const INTERNAL_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Guard of every internal route, run **before** any body is read. Requests with the fleet
+/// token pass (game servers upload a checkpoint per room and interval: they must not share the
+/// anonymous per-IP budget); anything else counts against the per-IP request rate (429) and is
+/// refused (401), without the server buffering its body.
+async fn internal_guard(
+    State(svc): State<Arc<PlayerService>>,
+    meta: RequestMeta,
+    req: Request,
+    next: Next,
+) -> Response {
+    if fleet_token_ok(&svc, &meta) {
+        return next.run(req).await;
+    }
+    if !svc.limits.lock().http.check(&rate_key(meta.ip), svc.limiter_now()) {
+        let mut e = api_err(429, "rate_limited", "too many requests");
+        e.1.retry_after_ms = Some(1_000);
+        return e.into_response();
+    }
+    match fleet_auth(&svc, &meta) {
+        Ok(()) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Internal (fleet-token) checkpoint routes. The fleet WebSocket is mounted by [`mount`] and
+/// authenticated at the upgrade (`gs::fleet::fleet_upgrade_authorized`).
 pub fn internal_router(svc: Arc<PlayerService>) -> Router {
     Router::new()
         .route(
@@ -178,8 +210,9 @@ pub fn internal_router(svc: Arc<PlayerService>) -> Router {
             put(cp_put).get(cp_get).delete(cp_delete),
         )
         .route("/internal/v1/checkpoints", get(cp_recent))
-        .with_state(svc)
+        .with_state(svc.clone())
         .layer(DefaultBodyLimit::max(crate::gs::checkpoint::MAX_CHECKPOINT_BYTES))
+        .layer(middleware::from_fn_with_state(svc, internal_guard))
 }
 
 /// Mount the whole player-service API on `server`: public `/v1/*`, internal checkpoints and
@@ -195,13 +228,18 @@ pub fn mount(server: HttpServer, svc: Arc<PlayerService>, fleet_ws: &WsServer) -
 
 type Res<T> = Result<Json<T>, ApiErr>;
 
-fn fleet_auth(svc: &PlayerService, meta: &RequestMeta) -> Result<(), ApiErr> {
+/// Whether the request carries the fleet token (constant-time compare, no logging).
+fn fleet_token_ok(svc: &PlayerService, meta: &RequestMeta) -> bool {
     let token = meta
         .authorization
         .as_deref()
         .and_then(|h| h.strip_prefix("Bearer "))
         .unwrap_or_default();
-    if svc.fleet_token.is_empty() || !crate::security::ct_eq(token.as_bytes(), svc.fleet_token.as_bytes()) {
+    !svc.fleet_token.is_empty() && crate::security::ct_eq(token.as_bytes(), svc.fleet_token.as_bytes())
+}
+
+fn fleet_auth(svc: &PlayerService, meta: &RequestMeta) -> Result<(), ApiErr> {
+    if !fleet_token_ok(svc, meta) {
         tracing::warn!(event = "bad_fleet_token", ip = %meta.ip, "internal endpoint refused");
         return Err(api_err(401, "unauthorized", "fleet token required"));
     }
@@ -311,6 +349,7 @@ async fn mm_create(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, bod
         rating: account.rating,
         region_pings: clean_pings(req.region_pings),
         enqueued_ms: svc.now_ms(),
+        build: Build::new(&req.game_id, req.schema_hash),
     };
     match svc.matchmaker.lock().enqueue(&req.queue, entry) {
         Ok(()) => Ok(Json(MatchmakeResponse { ticket_id: ticket })),
@@ -395,8 +434,9 @@ async fn quick_play(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, bo
     }
     let account = account_of(&svc, who.player()).await?;
     let extra = serde_json::json!({ "rating": account.rating });
+    let build = Build::new(&req.game_id, req.schema_hash);
     let (server, spec) = svc
-        .quick_play_room(&best_region(&req.region_pings), &req.mode)
+        .quick_play_room(&best_region(&req.region_pings), &req.mode, &build)
         .ok_or_else(|| {
             let mut e = api_err(503, "no_capacity", "no game server available");
             e.1.retry_after_ms = Some(5_000);
@@ -417,7 +457,8 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
     let account = account_of(&svc, who.player()).await?;
     let now = svc.now_ms();
     let reserve = svc.config.player_service.join_ticket_ttl.as_millis() as i64;
-    let (server, spec, team) = {
+    let mut abandoned: Option<(RoomId, Option<space3d_replication::MatchId>)> = None;
+    let placed = {
         let mut fleet = svc.fleet.lock();
         let (room, server_id) = fleet
             .room_of(account.id)
@@ -438,27 +479,49 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
         let alive = fleet
             .server(&server_id)
             .is_some_and(|s| s.state == super::fleet::ServerState::Ready && !s.heartbeat.draining);
+        let abandon = entry.status.as_ref().is_some_and(|s| s.abandon_on_loss);
         if alive && !entry.orphaned {
-            (fleet.server(&server_id).cloned().expect("checked"), spec, team)
+            Some((fleet.server(&server_id).cloned().expect("checked"), spec, team))
+        } else if entry.orphaned && abandon {
+            // `RecoveryPolicy::Abandon`: void the room; clients go back to matchmaking.
+            fleet.abandon_room(room);
+            abandoned = Some((room, spec.match_id));
+            None
         } else {
-            // Server lost or draining: restore the room elsewhere from its checkpoint.
+            // Server lost or draining: restore the room elsewhere from its checkpoint, on a
+            // server of the same game and schema (it must be able to load the checkpoint).
             let region = fleet
                 .server(&server_id)
                 .map(|s| s.registration.region.clone())
                 .unwrap_or_default();
             let seats = u32::from(spec.max_players.max(1));
             let target = fleet
-                .allocate(&region, "", 0, seats, now, reserve)
-                .ok_or_else(|| api_err(503, "no_capacity", "no game server available"))?;
+                .allocate(
+                    &region,
+                    &entry.build.game_id,
+                    entry.build.schema_hash,
+                    seats,
+                    now,
+                    reserve,
+                )
+                .ok_or_else(|| api_err(503, "no_capacity", "no compatible game server available"))?;
             fleet.reassign(room, &target.registration.server_id, now);
             tracing::info!(room = %room, from = %server_id, to = %target.registration.server_id, "room moved for rejoin");
             svc.send_fleet(
                 &target.registration.server_id,
                 crate::gs::fleet::FleetDown::PrepareRoom { spec: spec.clone() },
             );
-            (target, spec, team)
+            Some((target, spec, team))
         }
     };
+    if let Some((room, match_id)) = abandoned {
+        tracing::info!(room = %room, ?match_id, "orphaned room abandoned (recovery policy); match void");
+        let detail = serde_json::json!({ "room": room, "match_id": match_id, "reason": "server lost" });
+        let _ = wait(svc.store.audit("system".into(), "match_void".into(), detail, now)).await;
+        svc.metrics.match_void();
+        return Err(api_err(404, "abandoned", "the match was voided; queue again"));
+    }
+    let (server, spec, team) = placed.ok_or_else(|| api_err(404, "not_found", "no room to rejoin"))?;
     let extra = serde_json::json!({ "rating": account.rating });
     Ok(Json(svc.issue_ticket(
         account.id,
@@ -486,7 +549,8 @@ async fn lobby_create(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, 
     let req: CreateLobbyRequest = parse_json(&body)?;
     let account = account_of(&svc, who.player()).await?;
     let code = super::lobbies::random_code();
-    let state = svc.lobbies.lock().create(
+    let mut lobbies = svc.lobbies.lock();
+    let state = lobbies.create(
         account.id,
         &account.display_name,
         &req.mode,
@@ -495,6 +559,8 @@ async fn lobby_create(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, 
         code,
         svc.now_ms(),
     );
+    lobbies.set_build(&state.lobby_id, Build::new(&req.game_id, req.schema_hash));
+    drop(lobbies);
     Ok(Json(state))
 }
 
@@ -656,10 +722,18 @@ async fn cp_put(
     State(svc): State<Arc<PlayerService>>,
     meta: RequestMeta,
     Path(id): Path<String>,
-    body: Bytes,
+    body: space3d_net::server::axum::body::Body,
 ) -> Result<StatusCode, ApiErr> {
     fleet_auth(&svc, &meta)?;
     let room: RoomId = id.parse().map_err(|_| api_err(400, "bad_request", "room id"))?;
+    let limit = crate::gs::checkpoint::MAX_CHECKPOINT_BYTES;
+    let body = tokio::time::timeout(
+        INTERNAL_BODY_TIMEOUT,
+        space3d_net::server::axum::body::to_bytes(body, limit),
+    )
+    .await
+    .map_err(|_| api_err(408, "timeout", "request body too slow"))?
+    .map_err(|_| api_err(413, "too_large", "checkpoint too large"))?;
     wait(svc.store.put_checkpoint(room, body.to_vec(), svc.now_ms())).await?;
     Ok(StatusCode::NO_CONTENT)
 }

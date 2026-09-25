@@ -85,7 +85,7 @@ impl Slot {
             stats: NetStats::default(),
             view: Default::default(),
             inputs: Default::default(),
-            limits: super::receive::LinkLimiter::new(&config.limits, now),
+            limits: super::receive::LinkLimiter::new(&config.limits, 60.0, now),
             brain: None,
             out_reliable: Vec::new(),
             out_unreliable: Vec::new(),

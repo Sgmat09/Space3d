@@ -179,6 +179,104 @@ fn all_in_one_quick_play_three_clients_then_drain_checkpoints_and_closes() {
     assert!(cp.is_some(), "the shutdown checkpoint was stored for restore elsewhere");
 }
 
+/// A second signal (forced stop) skips the graceful drain but loses nothing: every room is
+/// captured into the game server's local database and its clients get
+/// `Disconnect(ServerShutdown)`; the next start moves those checkpoints into the configured
+/// store, from where a rejoin restores them.
+#[test]
+fn second_signal_checkpoints_rooms_locally_and_disconnects_clients() {
+    use space3d_server::gs::checkpoint::{Checkpoint, CheckpointStore, LocalCheckpoints};
+    let dir = tempfile::tempdir().unwrap();
+    let config = all_in_one(dir.path());
+    let build = |config: ServerConfig| {
+        ServerMain::with_config(common::DuelGame, config)
+            .options(BuildOptions {
+                secrets: Some(Secrets::for_tests("fleet", &["admin"])),
+                ..Default::default()
+            })
+            .build()
+            .expect("server starts")
+    };
+    let mut server = build(config.clone());
+    let health = server.resources.expect::<HealthState>().clone();
+    assert!(pump_until(&mut server, &mut [], Duration::from_secs(5), |_, _| health
+        .is_registered()));
+    let gs = server.resources.expect::<GameServerHandle>().clone();
+    let mut clients: Vec<App> = ["ann", "ben"]
+        .iter()
+        .map(|name| {
+            let mut app = client();
+            app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Dev {
+                url: gs.play_url("/play"),
+                name: (*name).into(),
+            });
+            app
+        })
+        .collect();
+    let everyone = pump_until(&mut server, &mut clients, Duration::from_secs(10), |_, cs| {
+        cs.iter()
+            .all(|c| c.resources.expect::<NetClient>().is_connected() && remote_count(c) == 2)
+    });
+    assert!(everyone, "two dev clients in the dev room");
+    let room = RoomId(1);
+    let mut readers: Vec<EventReader> = clients.iter().map(|_| EventReader::default()).collect();
+    let mut closed = vec![false; clients.len()];
+    let lifecycle = server.resources.expect::<LifecycleHandle>().clone();
+    lifecycle.drain();
+    lifecycle.drain();
+    let exited = pump_until(&mut server, &mut clients, Duration::from_secs(20), |s, cs| {
+        for (i, c) in cs.iter().enumerate() {
+            if let Some(events) = c.resources.get::<Events<ConnectionEvent>>() {
+                for e in readers[i].read(events) {
+                    if matches!(e, ConnectionEvent::Disconnected { code, .. } if *code == Some(DisconnectCode::ServerShutdown))
+                    {
+                        closed[i] = true;
+                    }
+                }
+            }
+        }
+        s.should_exit() && closed.iter().all(|c| *c)
+    });
+    assert!(exited, "forced stop exits; clients told: {closed:?}");
+    assert_eq!(
+        *server.resources.expect::<space3d_server::lifecycle::ExitStatus>(),
+        space3d_server::lifecycle::ExitStatus(1)
+    );
+    drop(clients);
+    drop(server);
+
+    // The room was checkpointed into the game server's own database.
+    let db = space3d_db::Db::open(&config.player_service.db_path);
+    let local = LocalCheckpoints::open(db.clone(), Arc::new(space3d_server::clock::SystemUnixClock))
+        .block()
+        .unwrap()
+        .unwrap();
+    let bytes = local
+        .get(room)
+        .block()
+        .unwrap()
+        .unwrap()
+        .expect("local rescue checkpoint");
+    let rescued = Checkpoint::from_bytes(&bytes).unwrap();
+    assert_eq!(rescued.room_id, room);
+    drop(local);
+    drop(db);
+
+    // Next start: the rescue checkpoint moves to the configured (player-service) store.
+    let mut server = build(config);
+    let ps = server.resources.expect::<PlayerServiceHandle>().clone();
+    let moved = pump_until(&mut server, &mut [], Duration::from_secs(5), |_, _| {
+        ps.service
+            .store
+            .get_checkpoint(room)
+            .block()
+            .unwrap()
+            .unwrap()
+            .is_some_and(|(_, b)| Checkpoint::from_bytes(&b).is_ok_and(|c| c.saved_ms == rescued.saved_ms))
+    });
+    assert!(moved, "rescue checkpoint uploaded on the next start");
+}
+
 #[test]
 fn load_test_smoke_over_real_sockets() {
     let dir = tempfile::tempdir().unwrap();

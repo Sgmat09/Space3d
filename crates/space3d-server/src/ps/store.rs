@@ -147,6 +147,12 @@ pub trait PlayerStore: Send + Sync + 'static {
     fn revoke_token(&self, token_hash: [u8; 32]) -> Task<Result<Option<[u8; 16]>, StoreError>>;
     /// Revoked families with unexpired tokens (warms the access-token revocation cache).
     fn revoked_families(&self, now_ms: i64) -> Task<Result<Vec<[u8; 16]>, StoreError>>;
+    /// Active sessions: refresh families with an unexpired, unrotated, unrevoked token
+    /// (`space3d_sessions_active`).
+    fn active_sessions(&self, now_ms: i64) -> Task<Result<u64, StoreError>> {
+        let _ = now_ms;
+        space3d_tasks::spawn(async { Ok(0) })
+    }
     /// Player data by keys (missing keys are absent).
     fn get_data(&self, player: PlayerId, keys: Vec<String>) -> Task<Result<Vec<PlayerDataEntry>, StoreError>>;
     /// Idempotent data writes (op id). `expected_version`: `None` = last writer wins,
@@ -569,6 +575,18 @@ impl PlayerStore for SqliteStore {
                 .query_map([now_ms], |r| r.get::<_, Vec<u8>>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows.into_iter().map(family_of).collect())
+        })
+    }
+
+    fn active_sessions(&self, now_ms: i64) -> Task<Result<u64, StoreError>> {
+        self.tx(move |c| {
+            let n: i64 = c
+                .prepare_cached(
+                    "SELECT COUNT(DISTINCT family) FROM refresh_tokens \
+                     WHERE revoked = 0 AND rotated = 0 AND expires_ms > ?1",
+                )?
+                .query_row([now_ms], |r| r.get(0))?;
+            Ok(n.max(0) as u64)
         })
     }
 

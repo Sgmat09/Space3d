@@ -485,7 +485,10 @@ pub(crate) trait ComponentOps: Send + Sync + 'static {
     /// Misprediction test between two encodings (`rollback_when` or byte inequality).
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
     fn differs(&self, a: &[u8], b: &[u8], ctx: &mut DecodeCtx<'_>) -> bool;
+    /// Buffer an interpolation sample. `deferred`: the server's budget held this entity back
+    /// (the gap since the previous sample is not rest; see `SnapshotBuffer::push_sample`).
     #[cfg(feature = "client")]
+    #[allow(clippy::too_many_arguments)]
     fn push_sample(
         &self,
         world: &mut World,
@@ -494,6 +497,7 @@ pub(crate) trait ComponentOps: Send + Sync + 'static {
         bytes: &[u8],
         ctx: &mut DecodeCtx<'_>,
         send_interval: u8,
+        deferred: bool,
     ) -> Result<(), DecodeError>;
     #[cfg(feature = "client")]
     /// Write interpolated values at `render_tick`. Extrapolation past the newest sample (at most
@@ -622,14 +626,15 @@ impl<T: Component + Clone> ComponentOps for TypedComponent<T> {
         bytes: &[u8],
         ctx: &mut DecodeCtx<'_>,
         send_interval: u8,
+        deferred: bool,
     ) -> Result<(), DecodeError> {
         let v = self.decode(bytes, ctx)?;
         if let Ok(mut buf) = world.get::<&mut InterpBuffer<T>>(e) {
-            buf.0.push(tick, v, send_interval);
+            buf.0.push_sample(tick, v, send_interval, deferred);
             return Ok(());
         }
         let mut buf = crate::client::interpolation::SnapshotBuffer::default();
-        buf.push(tick, v.clone(), send_interval);
+        buf.push_sample(tick, v.clone(), send_interval, deferred);
         let has_value = world.satisfies::<&T>(e);
         let res = if has_value {
             world.insert_one(e, InterpBuffer(buf))
@@ -651,11 +656,14 @@ impl<T: Component + Clone> ComponentOps for TypedComponent<T> {
         {
             let current = buf.0.newest().is_some_and(|(t, _)| *t >= newest_snapshot);
             let max_ext = if current { max_extrapolate_ticks } else { 0.0 };
-            if let Some(v) = buf.0.sample_with(render_tick, lerp, extrapolate, max_ext) {
+            // Entities the budget updates less often than every snapshot are drawn further
+            // in the past (their own observed update gap), so they stay between two samples.
+            let render = render_tick - buf.0.lag();
+            if let Some(v) = buf.0.sample_with(render, lerp, extrapolate, max_ext) {
                 *value = v;
             }
             // Keep one sample before the render tick for the next lerp.
-            buf.0.prune(Tick(render_tick.max(0.0).floor() as u32));
+            buf.0.prune(Tick(render.max(0.0).floor() as u32));
         }
     }
 

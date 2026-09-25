@@ -161,6 +161,14 @@ pub struct MatchmakeRequest {
     /// Measured RTT (ms) per region (clients ping each region's `/ping`).
     #[serde(default)]
     pub region_pings: BTreeMap<String, u32>,
+    /// Game build of the client: only game servers registered with this `game_id` host its
+    /// room (empty = any).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub game_id: String,
+    /// Replication schema hash of the client build (`ReplicationRegistry::schema_hash`): only
+    /// game servers with the same hash host its room (0 = any).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schema_hash: u64,
 }
 
 /// Matchmaking ticket id.
@@ -220,10 +228,18 @@ pub struct QuickPlayRequest {
     /// Region RTTs.
     #[serde(default)]
     pub region_pings: BTreeMap<String, u32>,
+    /// Game build of the client: only game servers registered with this `game_id` host its
+    /// room (empty = any).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub game_id: String,
+    /// Replication schema hash of the client build (`ReplicationRegistry::schema_hash`): only
+    /// game servers with the same hash host its room (0 = any).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schema_hash: u64,
 }
 
 /// `POST /v1/lobbies`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateLobbyRequest {
     /// Game mode.
     pub mode: String,
@@ -232,6 +248,18 @@ pub struct CreateLobbyRequest {
     /// Hidden from the lobby browser.
     #[serde(default)]
     pub private: bool,
+    /// Game build of the client: only game servers registered with this `game_id` host its
+    /// room (empty = any).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub game_id: String,
+    /// Replication schema hash of the client build (`ReplicationRegistry::schema_hash`): only
+    /// game servers with the same hash host its room (0 = any).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schema_hash: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// `POST /v1/lobbies/join`.

@@ -3,7 +3,9 @@
 //! * `GET /healthz` → 200 while the supervisor ticks and every shard heartbeat is younger than
 //!   5 s (a stuck room tick fails liveness → the orchestrator restarts the pod).
 //! * `GET /readyz` → 200 only if: not draining, DB ready, registered with the player service
-//!   (game-server role), shards alive. 503 otherwise (load balancers stop routing).
+//!   once (game-server role; a later player-service outage keeps the server ready: rooms keep
+//!   running and resumes keep working), shards alive. 503 otherwise (load balancers stop
+//!   routing).
 //!
 //! Served on the admin port and (without details) on the public game/player ports.
 
@@ -23,6 +25,7 @@ struct HealthInner {
     draining: AtomicBool,
     db_ready: AtomicBool,
     registered: AtomicBool,
+    fleet_connected: AtomicBool,
 }
 
 impl HealthState {
@@ -53,9 +56,26 @@ impl HealthState {
         self.inner.db_ready.store(yes, Ordering::Relaxed);
     }
 
-    /// Mark fleet registration (game-server role).
+    /// Mark fleet registration (game-server role). A latch for readiness: once registered, a
+    /// later player-service outage does not make the server unready (rooms keep running and
+    /// resumes keep working; see the failure matrix). The current link state is
+    /// [`Self::set_fleet_connected`].
     pub fn set_registered(&self, yes: bool) {
         self.inner.registered.store(yes, Ordering::Relaxed);
+        if yes {
+            self.set_fleet_connected(true);
+        }
+    }
+
+    /// Whether the fleet link is currently up (reported by admin status and a metric, not by
+    /// `/readyz`).
+    pub fn set_fleet_connected(&self, yes: bool) {
+        self.inner.fleet_connected.store(yes, Ordering::Relaxed);
+    }
+
+    /// See [`Self::set_fleet_connected`].
+    pub fn is_fleet_connected(&self) -> bool {
+        self.inner.fleet_connected.load(Ordering::Relaxed)
     }
 
     /// Liveness at `now_ms`: the supervisor beat and every running shard's beat are younger

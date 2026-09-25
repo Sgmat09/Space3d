@@ -310,8 +310,18 @@ impl Plugin for ServerReplicationPlugin {
         app.add_event::<PlayerDisconnected>();
         app.add_event::<PlayerResumed>();
         app.add_event::<PlayerLeft>();
+        crate::check_plugin_order(app, "ServerReplicationPlugin");
         app.add_system_named(Stage::Startup, "replication::server_startup", |ctx| {
             crate::freeze_registry(ctx);
+            if let Some(rate) = ctx.resources.get::<space3d_core::TickRate>()
+                && (rate.hz.fract() != 0.0 || rate.hz < 1.0)
+            {
+                // `Welcome::tick_hz` is an integer: clients would predict with a different dt.
+                tracing::error!(
+                    hz = rate.hz,
+                    "the room tick rate must be a whole number of Hz; clients will mispredict"
+                );
+            }
             if !ctx.resources.contains::<handshake::SecretSource>() {
                 tracing::warn!("no SecretSource resource: resume secrets use an insecure seeded generator (dev only)");
                 let seed = web_time::SystemTime::now()
@@ -442,7 +452,7 @@ pub struct NetServer {
     pub(crate) slots: slots::SlotTable,
     pub(crate) stats: RoomNetStats,
     pub(crate) cache: change::ChangeCache,
-    pub(crate) visibility: crate::FastMap<(PlayerId, Entity), Visibility>,
+    pub(crate) visibility: interest::VisibilityOverrides,
     pub(crate) rules: Vec<Box<dyn interest::VisibilityRule>>,
     pub(crate) pending: Vec<PendingEvent>,
     pub(crate) messages: Vec<QueuedMessage>,
@@ -659,12 +669,15 @@ impl NetServer {
     }
 
     /// Per-player visibility override of one entity.
+    /// Overrides are forgotten when the entity despawns (or stops being replicated) or the
+    /// player leaves the room.
     pub fn set_visibility(&mut self, player: PlayerId, entity: Entity, visibility: Visibility) {
-        if visibility == Visibility::Default {
-            self.visibility.remove(&(player, entity));
-        } else {
-            self.visibility.insert((player, entity), visibility);
-        }
+        self.visibility.set(player, entity, visibility);
+    }
+
+    /// Visibility overrides currently tracked (diagnostics).
+    pub fn visibility_overrides(&self) -> usize {
+        self.visibility.len()
     }
 
     /// Add a game relevancy rule, evaluated for candidates on interest ticks (fog of war).
@@ -759,6 +772,9 @@ impl NetServer {
     ) {
         let Some(slot) = self.slots.get_mut(client) else { return };
         let Some((link, tx)) = slot.link.take() else { return };
+        if let Some((code, _)) = disconnect {
+            self.stats.count_disconnect(code);
+        }
         if let Some((code, reason)) = disconnect {
             let pkt = crate::protocol::encode_handshake(
                 crate::protocol::PacketKind::Disconnect,
@@ -784,6 +800,7 @@ impl NetServer {
     pub(crate) fn free_slot(&mut self, client: NetClientId, reason: LeaveReason) {
         self.drop_link(client, None, false);
         if let Some(slot) = self.slots.remove(client) {
+            self.visibility.forget_player(slot.identity.player);
             self.pending.push(PendingEvent::Left(PlayerLeft {
                 client,
                 player: slot.identity.player,

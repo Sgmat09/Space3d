@@ -136,6 +136,10 @@ pub struct RoomStatus {
     /// Persistent world room.
     #[serde(default)]
     pub persistent: bool,
+    /// `RecoveryPolicy::Abandon`: if the hosting server is lost, the player service voids the
+    /// room instead of restoring it (rejoin answers 404, players return to matchmaking).
+    #[serde(default)]
+    pub abandon_on_loss: bool,
 }
 
 /// Detailed room view (admin `GET /admin/v1/rooms/{id}`).
@@ -214,6 +218,10 @@ pub struct RoomEnv {
     pub uplink: Uplink,
     /// Checkpoint store.
     pub checkpoints: Arc<dyn CheckpointStore>,
+    /// Local store on the game server's own database for a forced stop (second signal): every
+    /// room is captured synchronously and written there, then uploaded to `checkpoints` on the
+    /// next start (`gs::checkpoint::upload_rescued`). `None` disables it.
+    pub rescue: Option<Arc<dyn CheckpointStore>>,
     /// Metrics.
     pub metrics: GameServerMetrics,
     /// Server id.
@@ -306,7 +314,9 @@ pub fn restore_decision(env: &RoomEnv, spec: &RoomSpec, bytes: Option<Vec<u8>>) 
         return None;
     }
     if env.game.recovery_policy(spec) == RecoveryPolicy::Abandon {
-        tracing::info!(room = %spec.room_id, "recovery policy Abandon; starting fresh");
+        // The player service voids such rooms on rejoin; a room created anyway (e.g. a stale
+        // ticket) never resurrects the abandoned state.
+        tracing::info!(room = %spec.room_id, "recovery policy Abandon; not restoring");
         return None;
     }
     Some(cp)
@@ -412,6 +422,7 @@ impl RoomManager {
                 joinable: true,
                 created_ms: now_ms,
                 persistent: spec.persistent,
+                abandon_on_loss: self.env.game.recovery_policy(&spec) == crate::game::RecoveryPolicy::Abandon,
                 ..Default::default()
             }));
             let handle = RoomHandle {

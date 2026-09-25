@@ -145,6 +145,7 @@ impl Plugin for ClientReplicationPlugin {
         app.add_event::<ConnectionEvent>();
         app.add_event::<RemoteDespawned>();
         app.add_event::<Mispredicted>();
+        crate::check_plugin_order(app, "ClientReplicationPlugin");
         app.add_system_named(Stage::Startup, "replication::client_startup", crate::freeze_registry);
         app.add_system_named(Stage::PreUpdate, "replication::client_receive", receive::client_receive);
         app.add_system_named(Stage::PreUpdate, "replication::client_pace", prediction::client_pace);
@@ -380,6 +381,12 @@ impl NetClient {
     /// Settings.
     pub fn config(&self) -> &ClientConfig {
         &self.config
+    }
+
+    /// Debug builds: how many times a predicted component was found changed outside the sim
+    /// (by a system not registered with `add_sim_system`). Always 0 in release builds.
+    pub fn sim_discipline_violations(&self) -> u64 {
+        self.prediction.outside_sim_changes
     }
 
     /// Start connecting (replaces any current connection).

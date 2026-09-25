@@ -112,6 +112,31 @@ pub struct RoomNetStats {
     pub resumes: u64,
     /// Clients kicked.
     pub kicks: u64,
+    /// Inbound packets dropped by the per-link packet / byte rate limits.
+    pub rate_limited_packets: u64,
+    /// Client messages dropped by the message rate limits.
+    pub rate_limited_messages: u64,
+    /// Links the room ended with a `Disconnect`, indexed by `DisconnectCode as usize`
+    /// (see `DisconnectCode::ALL` / `label`); client `Leave`s are counted under `Leave`.
+    pub disconnects: [u64; 16],
+    /// Links that closed underneath the room (transport close, no `Disconnect`).
+    pub links_lost: u64,
+    /// Snapshot blocks dropped because one entity record exceeded the link's packet cap.
+    pub oversize_dropped: u64,
+}
+
+impl RoomNetStats {
+    /// Count a disconnect with `code`.
+    pub fn count_disconnect(&mut self, code: crate::protocol::handshake::DisconnectCode) {
+        if let Some(n) = self.disconnects.get_mut(code as usize) {
+            *n += 1;
+        }
+    }
+
+    /// Disconnects counted with `code`.
+    pub fn disconnects_with(&self, code: crate::protocol::handshake::DisconnectCode) -> u64 {
+        self.disconnects.get(code as usize).copied().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

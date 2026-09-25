@@ -75,11 +75,45 @@ impl ServerRecord {
 /// `(region, state) → servers` and `region → free seats` (see [`FleetRegistry::census`]).
 pub type Census = (BTreeMap<(String, &'static str), usize>, BTreeMap<String, u64>);
 
+/// A game build: which game servers can host a room (or a client). Empty `game_id` / zero
+/// `schema_hash` match any server.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Build {
+    /// `GameDefinition::game_id`.
+    pub game_id: String,
+    /// Replication schema hash.
+    pub schema_hash: u64,
+}
+
+impl Build {
+    /// A specific build.
+    pub fn new(game_id: &str, schema_hash: u64) -> Self {
+        Self {
+            game_id: game_id.to_owned(),
+            schema_hash,
+        }
+    }
+
+    /// The build a server registered with.
+    pub fn of(registration: &ServerRegistration) -> Self {
+        Self::new(&registration.game_id, registration.schema_hash)
+    }
+
+    /// Whether a server registered with `registration` can host this build.
+    pub fn accepts(&self, registration: &ServerRegistration) -> bool {
+        (self.game_id.is_empty() || registration.game_id == self.game_id)
+            && (self.schema_hash == 0 || registration.schema_hash == self.schema_hash)
+    }
+}
+
 /// A room known to the player service.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoomEntry {
     /// Hosting server.
     pub server: String,
+    /// Build of the server that created the room: a restore (rejoin after a server loss) only
+    /// goes to a server of the same game and schema, which can load its checkpoint.
+    pub build: Build,
     /// Spec (known for rooms the player service allocated or that reported `RoomOpened`).
     pub spec: Option<RoomSpec>,
     /// Last reported status (`None` until the server reports the room).
@@ -227,9 +261,11 @@ impl FleetRegistry {
                     ServerState::Ready
                 };
                 let reported: Vec<RoomId> = hb.rooms.iter().map(|r| r.room_id).collect();
+                let build = Build::of(&rec.registration);
                 for status in &hb.rooms {
                     let entry = self.rooms.entry(status.room_id).or_insert_with(|| RoomEntry {
                         server: server_id.to_owned(),
+                        build: build.clone(),
                         spec: None,
                         status: None,
                         orphaned: false,
@@ -261,8 +297,14 @@ impl FleetRegistry {
                 Vec::new()
             }
             FleetUp::RoomOpened { room_id, spec } => {
+                let build = self
+                    .servers
+                    .get(server_id)
+                    .map(|r| Build::of(&r.registration))
+                    .unwrap_or_default();
                 let entry = self.rooms.entry(room_id).or_insert_with(|| RoomEntry {
                     server: server_id.to_owned(),
+                    build,
                     spec: None,
                     status: None,
                     orphaned: false,
@@ -318,6 +360,14 @@ impl FleetRegistry {
                 op,
             }],
         }
+    }
+
+    /// Void an orphaned room (`RecoveryPolicy::Abandon`): forget it, its presence and its
+    /// reservations. Returns its entry.
+    pub fn abandon_room(&mut self, id: RoomId) -> Option<RoomEntry> {
+        let entry = self.rooms.get(&id).cloned()?;
+        self.forget_room(id);
+        Some(entry)
     }
 
     fn forget_room(&mut self, id: RoomId) {
@@ -390,11 +440,11 @@ impl FleetRegistry {
         now_ms: i64,
         reserve_ms: i64,
     ) -> Option<ServerRecord> {
+        let build = Build::new(game_id, schema_hash);
         let fits = |s: &ServerRecord, any_region: bool| {
             s.allocatable()
                 && (any_region || region.is_empty() || s.registration.region == region)
-                && (game_id.is_empty() || s.registration.game_id == game_id)
-                && (schema_hash == 0 || s.registration.schema_hash == schema_hash)
+                && build.accepts(&s.registration)
                 && s.free_seats() >= seats
                 && (s.registration.capacity.max_rooms == 0
                     || (s.heartbeat.rooms.len() as u32) < s.registration.capacity.max_rooms)
@@ -434,10 +484,16 @@ impl FleetRegistry {
         {
             r.room = Some(spec.room_id);
         }
+        let build = self
+            .servers
+            .get(server)
+            .map(|r| Build::of(&r.registration))
+            .unwrap_or_default();
         self.rooms.insert(
             spec.room_id,
             RoomEntry {
                 server: server.to_owned(),
+                build,
                 spec: Some(spec.clone()),
                 status: None,
                 orphaned: false,
@@ -451,6 +507,18 @@ impl FleetRegistry {
     pub fn open_room(
         &mut self,
         mode: &str,
+        seats: u32,
+        now_ms: i64,
+        reserve_ms: i64,
+    ) -> Option<(ServerRecord, RoomSpec)> {
+        self.open_room_for(mode, &Build::default(), seats, now_ms, reserve_ms)
+    }
+
+    /// [`Self::open_room`] on servers that can host `build` only.
+    pub fn open_room_for(
+        &mut self,
+        mode: &str,
+        build: &Build,
         seats: u32,
         now_ms: i64,
         reserve_ms: i64,
@@ -469,7 +537,7 @@ impl FleetRegistry {
             .filter_map(|(id, e)| {
                 let spec = e.spec.as_ref()?;
                 let server = self.servers.get(&e.server)?;
-                if e.orphaned || spec.mode != mode || !server.allocatable() {
+                if e.orphaned || spec.mode != mode || !server.allocatable() || !build.accepts(&server.registration) {
                     return None;
                 }
                 let (reported, joinable) = e
@@ -586,6 +654,52 @@ mod tests {
             max_players: max,
             ..Default::default()
         }
+    }
+
+    fn reg_schema(id: &str, schema_hash: u64) -> FleetUp {
+        let FleetUp::Register(mut r) = reg(id, "eu", 100) else {
+            unreachable!()
+        };
+        r.schema_hash = schema_hash;
+        FleetUp::Register(r)
+    }
+
+    /// Two builds in one fleet (a rolling deploy that changed the schema): new rooms, open rooms
+    /// and restores only go to servers of the matching build.
+    #[test]
+    fn allocation_and_restore_respect_the_build() {
+        let mut f = FleetRegistry::new(10_000, 60_000);
+        f.on_message("old", reg_schema("old", 1), 0);
+        f.on_message("new", reg_schema("new", 2), 0);
+        // "new" is emptier, but a schema-1 client must land on "old".
+        f.on_message("old", hb(80, vec![]), 100);
+        f.on_message("new", hb(0, vec![]), 100);
+        let s = f.allocate("eu", "arena", 1, 1, 100, 60_000).unwrap();
+        assert_eq!(s.registration.server_id, "old");
+        let s = f.allocate("eu", "arena", 2, 1, 100, 60_000).unwrap();
+        assert_eq!(s.registration.server_id, "new");
+        assert!(
+            f.allocate("eu", "arena", 3, 1, 100, 60_000).is_none(),
+            "no server of that build"
+        );
+        // Rooms remember the build of the server that created them.
+        f.note_room(&spec(7, "ffa", 8), "old", 100);
+        assert_eq!(f.room(RoomId(7)).unwrap().build, Build::new("arena", 1));
+        // Quick play finds the open room only for its own build.
+        assert!(
+            f.open_room_for("ffa", &Build::new("arena", 2), 1, 100, 60_000)
+                .is_none()
+        );
+        assert!(
+            f.open_room_for("ffa", &Build::new("arena", 1), 1, 100, 60_000)
+                .is_some()
+        );
+        // Restore target for an orphaned schema-1 room: never the (emptier) schema-2 server.
+        let b = f.room(RoomId(7)).unwrap().build.clone();
+        f.on_message("old2", reg_schema("old2", 1), 200);
+        f.on_message("old2", hb(90, vec![]), 200);
+        let target = f.allocate("eu", &b.game_id, b.schema_hash, 8, 200, 60_000).unwrap();
+        assert_ne!(target.registration.server_id, "new");
     }
 
     #[test]

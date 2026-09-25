@@ -118,11 +118,19 @@ impl Secrets {
             .map(|t| t.trim().to_owned())
             .filter(|t| !t.is_empty())
             .collect();
-        if prod && admin_tokens.iter().all(|t| t.len() < 16) {
+        if prod && admin_tokens.is_empty() {
             return Err(ConfigError::MissingSecret(format!(
                 "admin token ≥ 16 characters (set {} or security.admin_token_file)",
                 s.admin_token_env
             )));
+        }
+        // Every accepted token must be strong: one short token next to a long one would
+        // still open the admin API.
+        if prod && admin_tokens.iter().any(|t| t.len() < 16) {
+            return Err(invalid(
+                "security.admin_token_env",
+                "every admin token must be ≥ 16 characters in production".into(),
+            ));
         }
         Ok(Self {
             keys: Arc::new(keys),
@@ -164,12 +172,27 @@ mod tests {
             Err(ConfigError::MissingSecret(_))
         ));
         let key = "k1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        assert!(
+            Secrets::load(
+                &prod,
+                &env_of(&[
+                    ("SPACE3D_KEYS", "k1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="),
+                    ("SPACE3D_FLEET_TOKEN", "a-long-fleet-token-123"),
+                    ("SPACE3D_ADMIN_TOKENS", "abc, a-long-admin-token-xyz"),
+                ]),
+            )
+            .is_err(),
+            "a short admin token next to a long one is refused in production"
+        );
         let ok = Secrets::load(
             &prod,
             &env_of(&[
                 ("SPACE3D_KEYS", "k1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="),
                 ("SPACE3D_FLEET_TOKEN", "a-long-fleet-token-123"),
-                ("SPACE3D_ADMIN_TOKENS", "short, a-long-admin-token-xyz"),
+                (
+                    "SPACE3D_ADMIN_TOKENS",
+                    "another-long-admin-token, a-long-admin-token-xyz",
+                ),
             ]),
         )
         .unwrap();

@@ -250,3 +250,22 @@ fn ordering_and_raw_connection_access() {
         .unwrap();
     assert!(version.starts_with('3'));
 }
+
+#[test]
+fn queue_depth_counts_jobs_until_they_finish() {
+    let db = Db::open_in_memory();
+    db.blocking().execute_batch("CREATE TABLE t(x INTEGER);").unwrap();
+    let tasks: Vec<_> = (0..50)
+        .map(|i| db.execute("INSERT INTO t(x) VALUES (?1)", (i,)))
+        .collect();
+    assert!(db.queue_depth() <= 50);
+    for t in tasks {
+        t.block().unwrap().unwrap();
+    }
+    // The counter drops right after each job ran (just before its result is sent).
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db.queue_depth() != 0 && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(db.queue_depth(), 0);
+}

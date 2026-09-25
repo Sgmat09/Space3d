@@ -153,6 +153,17 @@ impl Db {
         }
     }
 
+    /// Jobs queued on (or running in) the worker thread; always 0 on the web backend, which
+    /// completes operations synchronously.
+    pub fn queue_depth(&self) -> usize {
+        match &self.inner.backend {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::Sqlite(w) => w.depth(),
+            #[cfg(any(test, target_arch = "wasm32"))]
+            Backend::Web(_) => 0,
+        }
+    }
+
     /// `true` when raw SQL ([`Db::execute`], [`Db::query`], ...) is available.
     pub fn supports_sql(&self) -> bool {
         self.backend() == BackendKind::Sqlite

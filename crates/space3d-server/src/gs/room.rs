@@ -183,6 +183,51 @@ pub fn after_tick(app: &mut App) {
     rt.start_upload(cp);
 }
 
+/// Forced stop (second signal): capture the room right now, write the checkpoint to the local
+/// rescue store and end every link with `Disconnect(ServerShutdown)` (no resume: this process
+/// is going away). Returns the pending write (the caller waits for it, bounded) or `None`
+/// when checkpoints are disabled or the capture failed.
+pub fn emergency_stop(app: &mut App) -> Option<Task<Result<(), StoreError>>> {
+    let write = emergency_checkpoint(app);
+    if let Some(net) = app.resources.get_mut::<NetServer>() {
+        net.disconnect_all(DisconnectCode::ServerShutdown, "server stopped", false);
+    }
+    write
+}
+
+fn emergency_checkpoint(app: &mut App) -> Option<Task<Result<(), StoreError>>> {
+    let rt = app.resources.get::<RoomRuntime>()?;
+    if !rt.env.checkpoints.enabled() {
+        return None;
+    }
+    let store = rt.env.rescue.clone()?;
+    let state = match full_state::capture(app) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "forced stop: checkpoint capture failed");
+            return None;
+        }
+    };
+    let rt = app.resources.expect::<RoomRuntime>();
+    let server_only = rt
+        .env
+        .game
+        .checkpoint_registry()
+        .and_then(|registry| space3d_scene::save_world(&app.world, &registry).ok())
+        .and_then(|scene| scene.to_json().ok());
+    let cp = Checkpoint {
+        version: CHECKPOINT_VERSION,
+        room_id: rt.spec.room_id,
+        spec: rt.spec.clone(),
+        state,
+        server_only,
+        game_blob: None,
+        saved_ms: rt.env.unix.now_ms(),
+    };
+    tracing::warn!(room = %cp.room_id, tick = cp.state.tick.0, "forced stop: room checkpointed locally");
+    Some(store.put(cp.room_id, cp.to_bytes()))
+}
+
 /// Resource: static facts about the room.
 #[derive(Clone, Debug)]
 pub struct RoomContext {
@@ -528,9 +573,9 @@ fn apply_command(
 ) {
     match cmd {
         RoomCommand::Kick { player, reason } => {
+            // Counted in `space3d_disconnects_total{reason="kicked"}` from the room stats.
             res.expect_mut::<NetServer>()
                 .kick(player, DisconnectCode::Kicked, &reason, false);
-            rt.env.metrics.disconnect("kicked");
             tracing::info!(event = "kick", room = %rt.spec.room_id, %player, %reason, "player kicked");
         }
         RoomCommand::Broadcast { text, level } => {
@@ -802,6 +847,25 @@ fn publish_status(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     }
     reg.counter("space3d_strikes_total", "Protocol strikes.", &[])
         .inc_by(delta(stats.strikes, prev.strikes));
+    for code in DisconnectCode::ALL {
+        let n = delta(stats.disconnects_with(code), prev.disconnects_with(code));
+        if n > 0 {
+            m.disconnects(code.label(), n);
+        }
+    }
+    let lost = delta(stats.links_lost, prev.links_lost);
+    if lost > 0 {
+        m.disconnects("link_lost", lost);
+    }
+    for (kind, now, before) in [
+        ("packets", stats.rate_limited_packets, prev.rate_limited_packets),
+        ("messages", stats.rate_limited_messages, prev.rate_limited_messages),
+    ] {
+        let n = delta(now, before);
+        if n > 0 {
+            m.rate_limited_by(kind, n);
+        }
+    }
     m.snapshots_skipped("backlog", delta(stats.snapshots_skipped, prev.snapshots_skipped));
     let sent = delta(stats.snapshots_sent, prev.snapshots_sent);
     if sent > 0 {
@@ -830,6 +894,7 @@ fn publish_status(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
         disconnected: disconnected as u16,
         player_ids: clients.iter().map(|c| c.identity.player).collect(),
         persistent: rt.spec.persistent,
+        abandon_on_loss: rt.env.game.recovery_policy(&rt.spec) == crate::game::RecoveryPolicy::Abandon,
     };
     let _ = rt.epoch;
 }

@@ -44,7 +44,13 @@ pub enum ShardCmd {
     Remove(RoomId),
     /// Stop the thread after removing all rooms.
     Stop,
+    /// Forced stop (second signal): checkpoint every room to the local rescue store and send
+    /// `Disconnect(ServerShutdown)` ([`super::room::emergency_stop`]), then stop.
+    ForceStop,
 }
+
+/// Longest a shard waits for its forced-stop checkpoint writes.
+pub const FORCE_STOP_WRITE_WAIT: Duration = Duration::from_secs(5);
 
 /// Handle to one shard thread.
 pub struct ShardHandle {
@@ -150,8 +156,18 @@ impl ShardPool {
 
     /// Stop all shards and join them.
     pub fn stop(&self) {
+        self.stop_with(|| ShardCmd::Stop);
+    }
+
+    /// Forced stop: every shard checkpoints its rooms locally and disconnects their clients
+    /// (bounded by [`FORCE_STOP_WRITE_WAIT`]), then stops; joins them.
+    pub fn force_stop(&self) {
+        self.stop_with(|| ShardCmd::ForceStop);
+    }
+
+    fn stop_with(&self, cmd: impl Fn() -> ShardCmd) {
         for s in self.shards.iter() {
-            let _ = s.commands.send(ShardCmd::Stop);
+            let _ = s.commands.send(cmd());
         }
         for s in self.shards.iter() {
             if let Some(t) = s.thread.lock().take() {
@@ -367,6 +383,28 @@ impl Hosted {
     }
 }
 
+/// Wait (bounded) for forced-stop writes; this thread is shutting down, so a short blocking
+/// wait here is fine (no frame runs anymore).
+fn wait_writes(mut writes: Vec<space3d_tasks::Task<Result<(), super::checkpoint::StoreError>>>, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    while !writes.is_empty() && Instant::now() < deadline {
+        writes.retain_mut(|t| match t.state() {
+            space3d_tasks::TaskState::Pending => true,
+            space3d_tasks::TaskState::Ready => {
+                if let Some(Err(e)) = t.poll() {
+                    tracing::error!(error = %e, "forced stop: local checkpoint write failed");
+                }
+                false
+            }
+            space3d_tasks::TaskState::Cancelled => false,
+        });
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    if !writes.is_empty() {
+        tracing::error!(pending = writes.len(), "forced stop: local checkpoint writes timed out");
+    }
+}
+
 impl Shard {
     fn run(self) {
         // Rooms are `!Send`: they only ever exist on this thread.
@@ -421,6 +459,18 @@ impl Shard {
                 false
             }
             ShardCmd::Stop => true,
+            ShardCmd::ForceStop => {
+                let writes: Vec<_> = rooms
+                    .iter_mut()
+                    .filter_map(|r| {
+                        catch_unwind(AssertUnwindSafe(|| super::room::emergency_stop(&mut r.app)))
+                            .ok()
+                            .flatten()
+                    })
+                    .collect();
+                wait_writes(writes, FORCE_STOP_WRITE_WAIT);
+                true
+            }
         }
     }
 

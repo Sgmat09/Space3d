@@ -152,12 +152,12 @@
 ### 2.4 Health, readiness and graceful shutdown
 
 - **`/healthz`** returns 200 while the supervisor ticks and every shard heartbeat is less than 5 s old. A stuck tick fails liveness.
-- **`/readyz`** returns 200 when the server is not draining, the DB is ready, it is registered with the PS (GS role), and its shards are alive.
+- **`/readyz`** returns 200 when the server is not draining, the DB is ready, it has registered with the PS once (GS role; registration is a latch, so a later PS outage keeps it ready and `space3d_fleet_connected` reports the link), and its shards are alive.
 - **Lifecycle** (`lifecycle.rs`): `Starting → Ready → Draining → Stopping → Stopped`.
   1. **Drain trigger:** SIGTERM or SIGINT, `POST /admin/v1/drain`, or `FleetDown::Drain`. `/readyz` returns 503, the heartbeat reports `draining`, new tickets get `Reject(ServerDraining)` while resumes still work, and every room gets `RoomCommand::Drain{deadline}`, which sends `Notice::ShuttingDown`.
   2. **During drain:** match rooms finish naturally within `drain_timeout`. Persistent rooms checkpoint immediately and send `Notice::Reconnect`, so clients rejoin through the PS and are restored elsewhere.
   3. **Deadline:** checkpoint all rooms, then await uploads and the outbox flush (up to 20 s). Send `Disconnect(ServerShutdown)`, stop listeners, deregister, drop `Db` (its worker drains the queue), and exit 0.
-  4. **Second signal:** checkpoint to local storage only, then exit 1.
+  4. **Second signal:** every shard captures its rooms synchronously into the GS's own database (`LocalCheckpoints`, the "rescue" store; writes bounded to 5 s), sends `Disconnect(ServerShutdown, resume_allowed = false)`, and the process exits 1. The next start uploads those checkpoints to the configured store unless it already holds a newer one (`gs::checkpoint::upload_rescued`), so a rejoin restores them.
 
 ---
 
@@ -419,14 +419,15 @@ It is computed when the registry freezes at the first `Startup`. A mismatch yiel
 | blocks per packet | 64 | `decode_packet` |
 | input runs per block / bytes per input | 32 / 256 | `InputWindow::decode` |
 | default message cap | 1 KiB (per type: `MessageConfig::max_bytes`) | receive |
-| input packets/s per link | 90 (burst 30) | `TokenBucket` |
+| input packets/s per link | 90 inputs + 30 other = 120/s, burst 60 (inputs never under 1.5 × tick rate) | `TokenBucket` |
+| packets/s per link into the room inbox | 4 × `input_packets_per_sec` (burst a third); excess dropped at the gateway, sustained excess closes the link + IP strike | gatekeeper |
 | messages/s per link | 30 (burst 60; per type `rate_limit`) | `TokenBucket` |
 | input tick window | `[T, T + max_input_ahead(32)]` (older are late and dropped) | `InputBuffer` |
 | handshakes per IP per minute / concurrent per IP | 20 / 8 | gatekeeper |
 | outbound backlog per link | skip snapshots above 256 KiB; kick `SlowConsumer` after 5 s above 1 MiB | send |
 | room inbox | 8192 messages (overflow: drop unreliable-only, close otherwise) | ingress |
 
-**Strikes:** a decode error, unknown channel, out-of-window input, oversize message or failed `validate` each count as a strike. `strikes.max` (5) within 10 s leads to `Disconnect(ProtocolViolation)`. Rate-limit overflow drops packets first and kicks after 3 s of sustained overflow.
+**Strikes:** a decode error, unknown channel, out-of-window input, oversize message or failed `validate` each count as a strike. `strikes.max` (5) within 10 s leads to `Disconnect(ProtocolViolation)`. Rate-limit overflow (packets, bytes and messages, per type too) is dropped first and counted per 1 s window (`OverflowWindows`): drops in 3 consecutive windows followed by another drop, or more than 10 s worth of the packet allowance within one window, lead to `Disconnect(RateLimited)`. (A bucket refills continuously, so "no packet passed for 3 s" never happens under a flood; windows do.)
 
 **Hostile input:** decoders never panic and never allocate beyond the packet size. This is enforced by proptest fuzzing of every reader.
 
@@ -438,13 +439,13 @@ SnapshotHeader := u8 flags (bit0 FULL_RESET · bit1 SYNC_COMPLETE · bit2 HAS_DE
                 · varu32 input_ack_delta   // tick − newest input tick consumed for this client (u32::MAX = none)
                 · i8 input_slack           // ticks early the input for `tick` arrived (i8::MIN = missing)
 Entity     := varu32 net_id_delta (ascending; first absolute)
-            · u8 op (bit0 SPAWN · bit1 HAS_REMOVED · bit2 CONTROLLED · bit3 OWNED)
+            · u8 op (bit0 SPAWN · bit1 HAS_REMOVED · bit2 CONTROLLED · bit3 OWNED · bit4 DEFERRED)
             · varu64 present_mask · [HAS_REMOVED] varu64 removed_mask
             · for each set bit ascending: varu32 len · codec bytes
 Despawns   := varu32 n · n × varu32 (net_id_delta << 1 | out_of_scope)
 ```
 
-**Invariant:** an entity written for a client includes **every** component whose `changed_tick` is newer than that client's ack tick for the entity. Loss and reordering are therefore harmless. The client skips a record whose tick is at or below the entity's `last_applied_tick`. A client's own predicted entities are written in **every** snapshot with all their `Predict*` components, because reconciliation needs a confirmation even when nothing changed (for example when the server rejected a move).
+**Invariant:** an entity written for a client includes **every** component whose `changed_tick` is newer than that client's ack tick for the entity (datagram records too are written against the acked baseline, never an unacked one, so each record supersedes every older in-flight one). Loss and reordering are therefore harmless. `DEFERRED` marks a record whose changes the byte budget held back for at least one earlier snapshot (the client must not read the gap as rest; §9.4). Protocol version 2 added it. The client skips a record whose tick is at or below the entity's `last_applied_tick`. A client's own predicted entities are written in **every** snapshot with all their `Predict*` components, because reconciliation needs a confirmation even when nothing changed (for example when the server rejected a move).
 
 **Example cost:** one moving player with the default `TransformCodec` (1 mm, 10-bit smallest-three, scale omitted) costs about 1 B id + 1 B op + 1 B mask + 1 B len + 12–14 B = **16–18 B**.
 
@@ -572,10 +573,10 @@ The bytes are copied into every recipient's packet, so there is no per-client re
 
 ### 8.4 Per-client state, baselines and acks (`server/send.rs`)
 
-`ClientEntity { spawned, ack_tick, last_sent_tick, acc, leaving_since }` is tracked for each visible entity. A component is due for a client when `changed_tick > max(ack_tick, last_sent_tick)` and the audience allows it. **All due components of an entity ship together**, which is why one baseline tick per entity is correct.
+`ClientEntity { spawned, ack_tick, last_sent_tick, acc, misses, leaving_since }` is tracked for each visible entity. A component is due for a client when `changed_tick > ack_tick` and the audience allows it. **All due components of an entity ship together**, which is why one baseline tick per entity is correct.
 
 - **Streams (WS): optimistic.** The baseline advances when the packet is handed to the link. If the link dies, resume sends `FULL_RESET` anyway.
-- **Datagrams: acked.** A `SentRecord{seq, tick, entities, despawns}` ring (256 entries) is kept, and an ack raises `ack_tick`. A packet unacked after `rto` is presumed lost: its entities fall back to `last_sent_tick = ack_tick` and are resent with **current** values, never stale bytes.
+- **Datagrams: acked.** A `SentRecord{seq, tick, entities, despawns, lost}` ring (256 entries) is kept, and an ack raises `ack_tick`. Records are written against `ack_tick` (in-flight changes are repeated until acked), so a reordered older record never carries something a newer one lacks. A packet unacked after the RTO (1 s before the first RTT sample, RFC 6298; the client's reported RTT seeds it) is presumed lost: an unacked spawn may be resent (`last_sent_tick = ack_tick`), and the record stays in the ring marked `lost`, so a late ack still credits it and samples the RTT (a long path raises the RTO instead of looking like permanent loss).
 - **Spawns and despawns are state.** A spawn record repeats until acked (datagrams) or is sent once (streams). Despawn tombstones persist until every client has acked them or they age past the resume window.
 
 ### 8.5 Interest (`server/interest.rs`)
@@ -591,9 +592,9 @@ Per client, per send tick:
 
 1. **Flow control.** If `LinkTx::backlog_bytes() > backlog_skip_bytes` (256 KiB), skip this client's snapshot and halve its snapshot rate until the backlog drains. Above `backlog_kick_bytes` (1 MiB) for 5 s, send `Disconnect(SlowConsumer, resume_allowed)`. **This is what prevents TCP bufferbloat.**
 2. **Budget.** `ByteBudget` is a token bucket at `client_bandwidth` (48 KiB/s default, clamped by `ClientCaps` and `SetRate`), with a 2× burst, and 4× until `SYNC_COMPLETE`.
-3. **Always first:** despawns, removals, control, reliable messages, pongs, and the client's own entities.
+3. **Always first:** despawns, removals, control, reliable messages, pongs, and the client's controlled (predicted) entities. The client's other own entities compete for the budget with a 4× priority boost (an RTS player owning hundreds of units stays within budget and still sees everything else).
 4. **Accumulate.** Each other relevant entity with due changes gets `acc += rule_priority × NetPriority × 1/(1 + d/ref) × Δticks`.
-5. **Write.** Select the top entries with `select_nth_unstable`, and write while the budget allows, trying up to 8 smaller entries after the first miss. Written entities reset `acc` to 0 and unwritten ones keep growing, so nothing starves.
+5. **Write.** Sort by `acc`, and write while the budget allows, trying up to 8 smaller entries after the first miss. Written entities reset `acc` to 0 and unwritten ones keep growing. Nothing starves: a full bucket lets the top entry through even when it does not fit (the budget goes into debt), and a top entry deferred more than 3 snapshots in a row holds lower priorities back until it goes, so an entity larger than a snapshot's budget (or the whole burst) is still delivered and never blocks `SYNC_COMPLETE`. Stream packets are cut at 16 KiB; a single larger entity record goes alone up to the link's cap (1 MiB server → client), and a record over the cap is dropped with an error and **not** marked delivered.
 6. **Stats.** `NetStats::{budget_utilization, starved_entities}` feed metrics and tests.
 
 ### 8.7 Messages / RPC (`messages.rs`)
@@ -673,7 +674,7 @@ app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Ticket { url, tic
 
 - **`InterpClock`:** `render_tick = (server_estimate − (rtt/2)·hz) − delay`, i.e. the delay trails the newest tick a snapshot can have arrived for, not the server's current tick. The delay is `clamp(send_interval + jitter_k·jitter + ½ tick, 35 ms, 250 ms)`, slewed by ±5 % playback speed, and snaps beyond 10 ticks.
 - **`SnapshotBuffer<T>`** holds 32 samples per `Interpolate`/`PredictAndInterpolate` component of each non-predicted entity. `sample(render_tick, lerp, max_extrapolate)` holds or extrapolates for up to 100 ms, then freezes. Extrapolation only applies to entities present in the newest snapshot received: an entity missing from newer snapshots is unchanged (or deferred by the budget), so it holds its last value instead of overshooting a stop or a teleport.
-- **Gap fix:** a sample arriving more than `send_interval` after the previous one gets a synthetic copy of the previous value inserted at `tick − send_interval`, so resting entities do not slide.
+- **Gap fix:** a sample arriving more than `send_interval` after the previous one gets a synthetic copy of the previous value inserted at `tick − send_interval`, so resting entities do not slide. Records with the `DEFERRED` bit skip it (the gap was motion held back by the budget), and the entity's buffer grows a per-entity render `lag` (its observed update gap beyond the send interval, decaying once updates arrive at the nominal rate): budget-deferred movers are drawn further in the past but move smoothly instead of freezing and jumping.
 - **`Delayed` components** and `Interpolated` events release when `render_tick` reaches their tick.
 
 ---
@@ -757,7 +758,7 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
 - **`FleetDown`:** `Registered{lease_ttl_ms, bans}`, `PrepareRoom{spec}`, `CloseRoom`, `Kick`, `Ban`, `Unban`, `Broadcast`, `Drain`, `Ack{op_id}`, `PlayerData`.
 - **Seats (integration pass):** a room's used seats are `max(reported players, presence) + reservations bound to the room`, and a server's are `max(heartbeat players, presence) + reservations`. `PlayerJoined`/`PlayerLeft` presence is immediate while room status and heartbeats lag by up to 2 s, and a join releases its reservation, so counting only the heartbeat oversubscribed rooms during quick-play bursts (`Reject(RoomFull)`). `allocate_room` binds the seat it reserves to the new room; a resume of a present player is not a new seat.
 - **Leases:** the heartbeat runs every 2 s and the lease lasts 10 s. When a lease expires the server is marked `Dead` and its rooms are orphaned (eligible for rejoin and restore).
-- **Allocation** filters on region, `game_id`, `schema_hash`, `Ready`, not draining, and enough free seats. It picks the lowest `players/capacity + tick_p99/budget` and reserves seats for the ticket TTL.
+- **Allocation** filters on region, `game_id`, `schema_hash`, `Ready`, not draining, and enough free seats. It picks the lowest `players/capacity + tick_p99/budget` and reserves seats for the ticket TTL. Clients declare their build in quick play, matchmaking and lobby requests (`game_id`, `schema_hash`; empty / 0 = any; `PlayerServiceClient::with_build`); the matchmaker only matches players of one build and open rooms are offered only to their build. Each `RoomEntry` records the build of the server that created it, and a rejoin/restore allocates only on that build (its checkpoint's schema must load).
 
 ### 11.3 Matchmaking and lobbies
 
@@ -794,8 +795,9 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
 | client network blip | close / idle 10 s | resume within 20 s: same slot, `FULL_RESET`, no pop-in |
 | room panic | `catch_unwind` (`--profile server`) | rebuild from the last checkpoint, epoch + 1, `Notice::Reconnect`; crash-loop guard (3 in 5 min → close) |
 | shard stall | heartbeat older than 5 s → `/healthz` 503 | orchestrator restart → server-loss path |
-| GS crash or node loss | PS lease expiry (10 s) | rooms orphaned; clients' resume fails → `POST /v1/sessions/rejoin` → PS allocates a new GS with `restore_from` checkpoint (or `RecoveryPolicy::Abandon`: void and requeue) |
-| PS unavailable | fleet link down | rooms keep running; outbox buffers; new logins and matchmaking unavailable; GS `/readyz` stays ready |
+| GS crash or node loss | PS lease expiry (10 s) | rooms orphaned; clients' resume fails → `POST /v1/sessions/rejoin` → PS allocates a new GS of the room's build with `restore_from` checkpoint. `RecoveryPolicy::Abandon` (reported in `RoomStatus::abandon_on_loss`): the PS voids the room (audit `match_void`, `space3d_matches_void_total`) and rejoin answers 404, so clients queue again |
+| PS unavailable | fleet link down | rooms keep running; outbox buffers; new logins and matchmaking unavailable; GS `/readyz` stays ready (registration latch; `space3d_fleet_connected` = 0) |
+| second SIGTERM / SIGINT | lifecycle | rooms checkpointed into the GS's local DB, clients `Disconnect(ServerShutdown)`, exit 1; the next start uploads the checkpoints |
 | PS crash | restart; WAL durability | fleet state rebuilt from `Register`s on reconnect; clients re-queue on 404 |
 
 ---
@@ -814,9 +816,13 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
   - `WsServerConfig`: 16 KiB messages and frames, bounded inbox, outbound byte cap, `max_connections`, text rejected, and an `accept` hook for per-IP concurrency and rate, IP/CIDR bans and the browser `Origin` allowlist.
   - `X-Forwarded-For` is honoured only from `trusted_proxies`.
   - Handshake deadline of 5 s.
+  - Per-address limits and strikes key IPv4 addresses as is and IPv6 addresses by /64; `KeyedLimiter` evicts least recently used keys in O(log n).
+  - Admitted links have a per-link packet budget into the shared room inbox (dropped at the gateway; sustained flooding closes the link), so one client cannot fill the inbox of everyone in its room. A resume refused as busy carries a retry delay and the client retries it.
+  - IP/CIDR bans added at runtime also close links already open from the banned range (`Disconnect(Banned)`).
+- **Join ticket nonces:** the cache never evicts an unexpired `jti` (that ticket could be replayed); when it is full of live nonces new tickets are refused with a retryable `RateLimited`.
 - **Runtime:** per-link token buckets, strikes, the input tick window, `sanitize`/`validate`, and backpressure disconnects. Server authority means clients send intent only. Interest and `Audience::Owner` limit what can leak (a wallhack sees only in-scope entities).
-- **Admin:** a separate listener (loopback or cluster-internal), bearer tokens compared constant-time against SHA-256 hashes, and every action audit-logged.
-- **Fleet:** the bearer token travels in `Register` over the in-cluster link. Tear down on mismatch.
+- **Admin:** a separate listener (loopback or cluster-internal), bearer tokens compared constant-time against SHA-256 hashes (production requires every token to be ≥ 16 characters), and every action audit-logged.
+- **Fleet:** the fleet token is checked at the WebSocket upgrade (`Authorization: Bearer`, constant time; no socket without it) and again in `Register`; at most 1024 fleet connections, and a connection that does not register within 10 s is closed. `/internal/v1/*` checks the per-IP rate and the fleet token in a middleware before any body is read, and bounds a checkpoint upload to 30 s.
 - **Secrets** come only from env or files, and are redacted in logs and config dumps.
 - **Dev auth** is only allowed with a loopback bind. Metrics labels never contain player ids, room ids or IPs.
 - **TLS** terminates at the ingress (`wss://` is required on https pages). In-process TLS is deferred.
@@ -831,14 +837,14 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
 - Rooms and players: `space3d_rooms{phase}`, `space3d_players{state}`.
 - Tick health: `space3d_tick_seconds` (histogram, 0.25–50 ms), `space3d_ticks_skipped_total`, `space3d_room_crashes_total`, `space3d_shard_load{shard}`.
 - Traffic: `space3d_bytes_total{dir,channel}`, `space3d_packets_total{dir}`, `space3d_snapshot_bytes` (histogram), `space3d_snapshots_skipped_total{reason}`, `space3d_rtt_seconds` (histogram).
-- Inputs and connections: `space3d_input_total{result=ok|late|missing|invalid}`, `space3d_handshakes_total{result}`, `space3d_rate_limited_total{kind}`, `space3d_strikes_total`, `space3d_disconnects_total{reason}`.
+- Inputs and connections: `space3d_input_total{result=ok|late|missing|invalid}`, `space3d_handshakes_total{result}`, `space3d_rate_limited_total{kind=packets|messages|link_packets|room_inbox}`, `space3d_strikes_total`, `space3d_disconnects_total{reason}` (every `DisconnectCode::label`, plus `link_lost` and `room_inbox_full`; from `RoomNetStats::disconnects`), `space3d_fleet_connected`.
 - Persistence: `space3d_outbox_pending`, `space3d_checkpoint_seconds`, `space3d_checkpoint_bytes`.
 
 **PS:**
-- Sessions: `space3d_logins_total{provider,result}`, `space3d_sessions_active`.
-- Matchmaking: `space3d_mm_queue_size{queue,region}`, `space3d_mm_wait_seconds{queue}`, `space3d_matches_total{queue}`.
+- Sessions: `space3d_logins_total{provider,result}`, `space3d_sessions_active` (refresh families with a live token, counted every 10 s).
+- Matchmaking: `space3d_mm_queue_size{queue,region}`, `space3d_mm_wait_seconds{queue}`, `space3d_matches_total{queue}`, `space3d_matches_void_total`.
 - Fleet: `space3d_fleet_servers{region,state}`, `space3d_fleet_free_seats{region}`.
-- Infrastructure: `space3d_db_queue_depth`, `space3d_http_requests_total{route,status}`, `space3d_http_seconds{route}`.
+- Infrastructure: `space3d_db_queue_depth` (`Db::queue_depth`), `space3d_http_requests_total{route,status}`, `space3d_http_seconds{route}`.
 
 Room stats: `NetServer::room_stats()` returns cumulative `RoomNetStats` counters, and the room plugin exports their deltas at 1 Hz. Per-room detail appears only in the admin JSON API.
 
@@ -1021,6 +1027,14 @@ All additive to the §18.1 contract.
 - **Examples and tests:** `examples/multiplayer_arena` (§3.3); `crates/space3d-server/tests/acceptance.rs` (§15.3).
 - **Still deferred:** predicted spawns, rayon packet building above 32 clients, the datagram `loss` stat, `select_nth_unstable` priority selection, Postgres, QUIC, Kubernetes manifests. The fleet link closes without a WebSocket close frame when a game server exits (the player service logs a warning; the lease handles it).
 
+### 18.5 Review fixes
+
+All additive to the §18.1 contract except the snapshot op bit (protocol version 2).
+
+- **Replication:** parked unresolved references are dropped when a newer value or a removal of the component arrives; rate-limit overflow is judged per 1 s window (message drops count) and kicks with `RateLimited`; datagram records use acked baselines, a conservative initial RTO and late acks of presumed-lost records; the budget covers owned entities, never starves large entities, and marks deferred records (`DEFERRED`), which clients interpolate across with a per-entity lag; oversized stream records are never marked delivered; per-player visibility overrides are forgotten on despawn / leave; `RoomNetStats` counts disconnects per code, lost links, rate-limit drops and oversize drops; debug checks for plugin order and sim discipline (§20); transient rejects of resumes are retried.
+- **Server:** forced stop rescue checkpoints (§2.4); readiness latch (§12); build-aware allocation and restore (§11.2); `RecoveryPolicy::Abandon` voids orphaned rooms (§12); per-link gateway budget, runtime IP-ban enforcement, IPv6 /64 rate keys, LRU limiter, fail-closed nonce cache, strict production admin tokens, fleet upgrade authentication and registration deadline, internal-route guard (§13); per-reason disconnect / rate-limit metrics, `space3d_sessions_active`, `space3d_db_queue_depth` (§14.1); whole-Hz `tick_hz` (the rate travels as an integer in `Welcome`).
+- **Net / db:** `ConnectMeta::authorization`, `WsConfig::headers` (native), lock-free `ClientSender` (`WsLinkTx` never takes the server-wide client lock), `Db::queue_depth`.
+
 ---
 
 ## 19. Deferred
@@ -1039,8 +1053,8 @@ All additive to the §18.1 contract.
 2. **Byte-compare change detection costs O(entities × components) per send tick.** Mitigations: only on send ticks, `SendRule::Interval`, archetype presence caching. A `NetStatic` marker or core change ticks can come later.
 3. **Float determinism across wasm, x86 and ARM.** Authoritative quantization plus `rollback_when` tolerate small differences; the server stays authoritative.
 4. **Single PS instance** is both a ceiling and a single point of failure. Rooms keep running thanks to the outbox; logins and matchmaking pause. The HA path is deferred.
-5. **`SimSchedule` discipline.** Games must put predicted logic in `add_sim_system` and query `With<Simulated>`. The arena example is the template, and a debug assert warns when a `Predicted` component changes outside the sim.
-6. **Registration order.** Replication plugins must come before game plugins. `App::system_names` makes this checkable in a debug assert.
+5. **`SimSchedule` discipline.** Games must put predicted logic in `add_sim_system` and query `With<Simulated>`. The arena example is the template. Debug builds check it: before each predicted tick the client compares every predicted component with what the sim recorded for the previous tick, warns once per session and counts changes made outside the sim (`NetClient::sim_discipline_violations`).
+6. **Registration order.** Replication plugins must come before game plugins. Debug builds check it with `App::system_names`: both replication plugins warn about game systems already registered in `PreUpdate` / `FixedUpdate` (`space3d_replication::systems_before_replication`).
 
 ---
 

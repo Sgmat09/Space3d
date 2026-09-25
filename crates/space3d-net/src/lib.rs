@@ -60,8 +60,8 @@ pub use client::{Http, HttpConfig, HttpRequest, HttpResponse, Method};
 pub use error::NetError;
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::{
-    AcceptHook, ClientId, ConnectMeta, CorsLayer, HttpServer, ServerEvent, ServerHandle, ShutdownTrigger, WsServer,
-    WsServerConfig,
+    AcceptHook, ClientId, ClientSender, ConnectMeta, CorsLayer, HttpServer, ServerEvent, ServerHandle, ShutdownTrigger,
+    WsServer, WsServerConfig,
 };
 pub use ws::{
     ConnectionId, Message, WsClient, WsConfig, WsConnection, WsEvent, WsEventKind, WsState, ws_events_system,

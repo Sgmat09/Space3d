@@ -31,7 +31,7 @@ use crate::config::{QueueConfig, Role, ServerConfig};
 use crate::game::{GameDefinition, RoomSpec};
 use crate::gs::GameServerHandle;
 use crate::gs::checkpoint::{CheckpointStore, PlayerServiceCheckpoints};
-use crate::gs::fleet::{FleetLink, in_process_pair};
+use crate::gs::fleet::{FleetLink, FleetOutage, in_process_pair};
 use crate::gs::room::{build_room_app, panic_message, run_tick_guarded};
 use crate::gs::rooms::{RoomEnv, RoomPhase, RoomStatus};
 use crate::ps::{FleetHub, PlayerService, PlayerServiceHandle};
@@ -140,6 +140,7 @@ struct GsNode {
     alive: Arc<AtomicBool>,
     rooms: BTreeMap<RoomId, HostedRoom>,
     next_ip: u32,
+    outage: FleetOutage,
 }
 
 struct ClientSlot {
@@ -237,6 +238,7 @@ impl TestCluster {
         config.admin.bind = loopback();
         config.game.public_url = format!("mem://{id}/play");
         let (link, peer) = in_process_pair();
+        let outage = link.outage();
         self.ps_app.resources.expect_mut::<FleetHub>().add_local(peer);
         let checkpoints: Arc<dyn CheckpointStore> = Arc::new(PlayerServiceCheckpoints {
             store: self.ps.service.store.clone(),
@@ -267,6 +269,7 @@ impl TestCluster {
             alive: Arc::new(AtomicBool::new(true)),
             rooms: BTreeMap::new(),
             next_ip: 1,
+            outage,
         });
     }
 
@@ -465,7 +468,10 @@ impl TestCluster {
             self.tick_rooms(i);
             let node = &mut self.nodes[i];
             if let Some(app) = &mut node.app {
-                node.handle.gate.lock().sweep(now);
+                let mut gate = node.handle.gate.lock();
+                gate.sweep(now);
+                gate.enforce_ip_bans(self.unix.now_ms());
+                drop(gate);
                 app.update(self.step);
             }
         }
@@ -663,6 +669,13 @@ impl TestCluster {
         }
         // Dropping the supervisor closes its fleet link: no more heartbeats.
         drop(node.app.take());
+    }
+
+    /// Take the fleet link of game server `server_id` down (player service unreachable for it)
+    /// or bring it back. Rooms keep running meanwhile; the outbox buffers results and replays
+    /// them when the link returns.
+    pub fn set_fleet_outage(&mut self, server_id: &str, down: bool) {
+        self.node(server_id).outage.set(down);
     }
 
     /// Ids of live game servers.

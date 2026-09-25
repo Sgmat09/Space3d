@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -114,7 +114,7 @@ impl WsServerConfig {
 }
 
 /// What the server knows about a client from its upgrade request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectMeta {
     /// TCP peer address (a proxy's address when behind one; see `forwarded_for`).
     pub addr: SocketAddr,
@@ -124,6 +124,94 @@ pub struct ConnectMeta {
     pub forwarded_for: Option<String>,
     /// `User-Agent` header.
     pub user_agent: Option<String>,
+    /// `Authorization` header (native clients can authenticate the upgrade itself; browsers
+    /// cannot set it). Redacted in `Debug`.
+    pub authorization: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectMeta")
+            .field("addr", &self.addr)
+            .field("origin", &self.origin)
+            .field("forwarded_for", &self.forwarded_for)
+            .field("user_agent", &self.user_agent)
+            .field("authorization", &self.authorization.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Lock-free sender for one connected client (see [`WsServer::client_sender`]): sending,
+/// backlog and liveness checks touch only this client's queue and counters, never the
+/// server-wide client table, so senders on many threads do not contend.
+#[derive(Clone)]
+pub struct ClientSender {
+    tx: mpsc::UnboundedSender<Outgoing>,
+    queued: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+    outbound_limit: usize,
+}
+
+impl std::fmt::Debug for ClientSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientSender")
+            .field("queued", &self.queued.load(Ordering::Relaxed))
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
+impl ClientSender {
+    /// Queue `msg` (same limits as [`WsServer::send`]).
+    pub fn send(&self, msg: impl Into<Message>) -> Result<(), NetError> {
+        if self.is_closed() {
+            return Err(NetError::Closed);
+        }
+        enqueue(&self.tx, &self.queued, self.outbound_limit, msg.into())
+    }
+
+    /// Bytes queued but not yet written to the socket.
+    pub fn backlog_bytes(&self) -> usize {
+        self.queued.load(Ordering::Acquire)
+    }
+
+    /// Close the connection with `code` (after flushing queued messages). From now on the
+    /// sender reports closed and refuses further sends.
+    pub fn close_with(&self, code: u16, reason: impl Into<String>) {
+        let _ = self.tx.send(Outgoing::Close(code, reason.into()));
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether the connection ended (or is ending: a close was queued by the server, the
+    /// socket errored, or the client left).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire) || self.tx.is_closed()
+    }
+
+    /// Whether the client is still connected (`!is_closed`).
+    pub fn is_connected(&self) -> bool {
+        !self.is_closed()
+    }
+}
+
+/// Queue one message against a client's outbound limit.
+fn enqueue(
+    tx: &mpsc::UnboundedSender<Outgoing>,
+    queued: &AtomicUsize,
+    limit: usize,
+    msg: Message,
+) -> Result<(), NetError> {
+    let len = msg.len();
+    let before = queued.fetch_add(len, Ordering::AcqRel);
+    if before + len > limit {
+        queued.fetch_sub(len, Ordering::AcqRel);
+        let _ = tx.send(Outgoing::Close(CLOSE_POLICY, "slow consumer".into()));
+        return Err(NetError::Closed);
+    }
+    tx.send(Outgoing::Message(msg)).map_err(|_| {
+        queued.fetch_sub(len, Ordering::AcqRel);
+        NetError::Closed
+    })
 }
 
 /// Inbound traffic of a [`WsServer`], polled by engine systems
@@ -176,6 +264,8 @@ struct Slot {
     meta: ConnectMeta,
     /// Bytes queued in `tx` but not yet written to the socket.
     queued: Arc<AtomicUsize>,
+    /// Set when the socket task ends (shared with [`ClientSender`]s).
+    closed: Arc<AtomicBool>,
 }
 
 struct Inner {
@@ -267,16 +357,17 @@ impl WsServer {
     }
 
     fn enqueue(&self, slot: &Slot, msg: Message) -> Result<(), NetError> {
-        let len = msg.len();
-        let before = slot.queued.fetch_add(len, Ordering::AcqRel);
-        if before + len > self.inner.config.outbound_limit_bytes {
-            slot.queued.fetch_sub(len, Ordering::AcqRel);
-            let _ = slot.tx.send(Outgoing::Close(CLOSE_POLICY, "slow consumer".into()));
-            return Err(NetError::Closed);
-        }
-        slot.tx.send(Outgoing::Message(msg)).map_err(|_| {
-            slot.queued.fetch_sub(len, Ordering::AcqRel);
-            NetError::Closed
+        enqueue(&slot.tx, &slot.queued, self.inner.config.outbound_limit_bytes, msg)
+    }
+
+    /// A lock-free sender for `client` (one table lookup now; none per send). `None` if the
+    /// client is not connected.
+    pub fn client_sender(&self, client: ClientId) -> Option<ClientSender> {
+        self.inner.clients.lock().get(&client).map(|slot| ClientSender {
+            tx: slot.tx.clone(),
+            queued: slot.queued.clone(),
+            closed: slot.closed.clone(),
+            outbound_limit: self.inner.config.outbound_limit_bytes,
         })
     }
 
@@ -413,6 +504,7 @@ impl WsServer {
     async fn run_client(self, socket: WebSocket, meta: ConnectMeta, shutdown: CancellationToken) {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let queued = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
         let addr = meta.addr;
         let id = {
             // Allocate, register and announce atomically: `Connected` events arrive in
@@ -425,6 +517,7 @@ impl WsServer {
                     tx,
                     meta,
                     queued: queued.clone(),
+                    closed: closed.clone(),
                 },
             );
             let _ = self
@@ -505,6 +598,7 @@ impl WsServer {
             }
         };
         tracing::debug!(client = id.0, %reason, "websocket client disconnected");
+        closed.store(true, Ordering::Release);
         let mut clients = self.inner.clients.lock();
         clients.remove(&id);
         let _ = self
@@ -536,6 +630,7 @@ async fn upgrade(
         origin: header_string(&headers, header::ORIGIN),
         forwarded_for: header_string(&headers, header::HeaderName::from_static("x-forwarded-for")),
         user_agent: header_string(&headers, header::USER_AGENT),
+        authorization: header_string(&headers, header::AUTHORIZATION),
     };
     if let Some(hook) = &config.accept
         && let Err(status) = hook(&meta)

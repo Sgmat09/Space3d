@@ -31,6 +31,9 @@ pub struct QueueEntry {
     pub region_pings: BTreeMap<String, u32>,
     /// Enqueue time (unix ms).
     pub enqueued_ms: i64,
+    /// Client build: players are only matched with the same build (they must share a
+    /// compatible game server).
+    pub build: crate::ps::fleet::Build,
 }
 
 /// A formed match.
@@ -362,7 +365,7 @@ fn pick(
             if idx.len() >= need {
                 break;
             }
-            if j == i || e.player == anchor.player {
+            if j == i || e.player == anchor.player || e.build != anchor.build {
                 continue;
             }
             let e_window = cfg.rating_window
@@ -423,6 +426,7 @@ mod tests {
 
     fn e(id: u64, rating: f64, at: i64, pings: &[(&str, u32)]) -> QueueEntry {
         QueueEntry {
+            build: Default::default(),
             ticket: TicketId(format!("t{id}")),
             player: PlayerId(id),
             display_name: format!("p{id}"),
@@ -440,6 +444,31 @@ mod tests {
             join_ticket: "t".into(),
             expires_ms: 61_000,
         }
+    }
+
+    /// Players of different builds are never matched together.
+    #[test]
+    fn matches_only_within_one_build() {
+        let cfg = QueueConfig {
+            name: "duel".into(),
+            mode: "duel".into(),
+            ..Default::default()
+        };
+        let mut m = Matchmaker::new(&[cfg]);
+        let mut a = e(1, 1500.0, 0, &[]);
+        a.build = crate::ps::fleet::Build::new("arena", 1);
+        let mut b = e(2, 1500.0, 0, &[]);
+        b.build = crate::ps::fleet::Build::new("arena", 2);
+        m.enqueue("duel", a).unwrap();
+        m.enqueue("duel", b).unwrap();
+        assert!(m.tick(1_000).is_empty(), "different schemas");
+        let mut c = e(3, 1500.0, 0, &[]);
+        c.build = crate::ps::fleet::Build::new("arena", 2);
+        m.enqueue("duel", c).unwrap();
+        let formed = m.tick(2_000);
+        assert_eq!(formed.len(), 1);
+        let ids: Vec<u64> = formed[0].players().map(|(_, e)| e.player.0).collect();
+        assert!(ids.contains(&2) && ids.contains(&3), "{ids:?}");
     }
 
     #[test]

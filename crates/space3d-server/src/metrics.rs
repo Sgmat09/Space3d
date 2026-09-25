@@ -442,6 +442,25 @@ impl GameServerMetrics {
             .inc();
     }
 
+    /// `space3d_rate_limited_total{kind}` += `n`.
+    pub fn rate_limited_by(&self, kind: &str, n: u64) {
+        self.registry
+            .counter("space3d_rate_limited_total", "Rate-limited events.", &[("kind", kind)])
+            .inc_by(n);
+    }
+
+    /// `space3d_disconnects_total{reason}` += `n` (room exports: every `DisconnectCode` label,
+    /// plus `link_lost`).
+    pub fn disconnects(&self, reason: &str, n: u64) {
+        self.registry
+            .counter(
+                "space3d_disconnects_total",
+                "Disconnects by reason.",
+                &[("reason", reason)],
+            )
+            .inc_by(n);
+    }
+
     /// `space3d_disconnects_total{reason}`.
     pub fn disconnect(&self, reason: &str) {
         self.registry
@@ -477,10 +496,43 @@ pub struct PlayerServiceMetrics {
 }
 
 impl PlayerServiceMetrics {
+    /// `space3d_matches_void_total`: orphaned rooms voided by `RecoveryPolicy::Abandon`.
+    pub fn match_void(&self) {
+        self.registry
+            .counter(
+                "space3d_matches_void_total",
+                "Matches voided after a server loss (RecoveryPolicy::Abandon).",
+                &[],
+            )
+            .inc();
+    }
+
+    /// `space3d_sessions_active`.
+    pub fn set_sessions_active(&self, n: u64) {
+        self.registry
+            .gauge(
+                "space3d_sessions_active",
+                "Sessions with a live refresh token (refresh families).",
+                &[],
+            )
+            .set(n as f64);
+    }
+
+    /// `space3d_db_queue_depth`.
+    pub fn set_db_queue_depth(&self, n: usize) {
+        self.registry
+            .gauge("space3d_db_queue_depth", "Store operations queued or running.", &[])
+            .set(n as f64);
+    }
+
     /// Register the standard families.
     pub fn register(registry: &Metrics) -> Self {
-        registry.gauge("space3d_sessions_active", "Refresh families issued this process.", &[]);
-        registry.gauge("space3d_db_queue_depth", "Store operations in flight.", &[]);
+        registry.gauge(
+            "space3d_sessions_active",
+            "Sessions with a live refresh token (refresh families).",
+            &[],
+        );
+        registry.gauge("space3d_db_queue_depth", "Store operations queued or running.", &[]);
         Self {
             registry: registry.clone(),
         }

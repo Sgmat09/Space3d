@@ -47,7 +47,12 @@ fn resolve(url: &str) -> String {
 }
 
 impl Socket {
-    pub async fn connect(url: &str, max_message_size: Option<usize>) -> Result<Self, String> {
+    /// `_headers` are ignored: browsers cannot set WebSocket upgrade headers.
+    pub async fn connect(
+        url: &str,
+        max_message_size: Option<usize>,
+        _headers: &[(String, String)],
+    ) -> Result<Self, String> {
         let ws = WebSocket::new(&resolve(url)).map_err(js_err)?;
         let limit = max_message_size.unwrap_or(usize::MAX);
         ws.set_binary_type(BinaryType::Arraybuffer);

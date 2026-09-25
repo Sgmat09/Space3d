@@ -11,7 +11,11 @@
 //!    `Disconnect(ServerShutdown)`, stop listeners, deregister, drop `Db` (drains its queue),
 //!    exit 0.
 //!
-//! A second signal checkpoints to local storage only and exits 1.
+//! A second signal forces the stop: every shard captures its rooms into the game server's local
+//! database (the rescue store), sends `Disconnect(ServerShutdown)` and stops, and the process
+//! exits with status 1. The next start uploads those checkpoints to the configured store.
+//! `POST /admin/v1/drain` and `FleetDown::Drain` start the same graceful drain as the first
+//! signal (ending in exit 0 once it completes); they never escalate to a forced stop.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};

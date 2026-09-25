@@ -6,6 +6,10 @@
 //! changes, on drain and on request. Capture runs on the room's thread right after a tick;
 //! serialization runs on the compute pool and the upload on the I/O runtime; at most one upload
 //! per room is in flight (a newer checkpoint replaces a queued one).
+//!
+//! A forced stop (second signal) captures every room synchronously into the game server's local
+//! database ([`LocalCheckpoints`], the "rescue" store); the next start moves those into the
+//! configured store ([`upload_rescued`]) so a rejoin can restore them.
 
 use crate::clock::UnixClock;
 use crate::game::RoomSpec;
@@ -333,6 +337,40 @@ impl CheckpointStore for MemoryCheckpoints {
         self.map.lock().remove(&room);
         ready(Ok(()))
     }
+}
+
+/// Startup after a forced stop: move the checkpoints the rescue store (the game server's local
+/// database) holds into the configured `store` — unless `store` already has a newer one for
+/// that room (restored elsewhere meanwhile) — and delete them locally. Runs on the I/O runtime;
+/// resolves to the number uploaded.
+pub fn upload_rescued(
+    rescue: Arc<dyn CheckpointStore>,
+    store: Arc<dyn CheckpointStore>,
+) -> Task<Result<usize, StoreError>> {
+    space3d_tasks::spawn(async move {
+        let lost = || StoreError("store task lost".into());
+        let rooms = rescue.recent(i64::MIN).wait().await.ok_or_else(lost)??;
+        let mut uploaded = 0;
+        for room in rooms {
+            let Some(bytes) = rescue.get(room).wait().await.ok_or_else(lost)?? else {
+                continue;
+            };
+            let saved = Checkpoint::from_bytes(&bytes).map_or(i64::MIN, |c| c.saved_ms);
+            let remote = store.get(room).wait().await.ok_or_else(lost)??;
+            let newer_remote = remote
+                .and_then(|r| Checkpoint::from_bytes(&r).ok())
+                .is_some_and(|r| r.saved_ms >= saved);
+            if !newer_remote {
+                store.put(room, bytes).wait().await.ok_or_else(lost)??;
+                uploaded += 1;
+            }
+            rescue.delete(room).wait().await.ok_or_else(lost)??;
+        }
+        if uploaded > 0 {
+            tracing::info!(rooms = uploaded, "uploaded checkpoints saved by a forced stop");
+        }
+        Ok(uploaded)
+    })
 }
 
 /// No-op store (`checkpoint_store = "none"`).

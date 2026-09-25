@@ -589,8 +589,10 @@ impl ServerConfig {
             return Err(invalid("server_id", "1-64 characters of [A-Za-z0-9-_.]"));
         }
         let g = &self.game;
-        if !(g.tick_hz > 0.0 && g.tick_hz <= 1000.0) {
-            return Err(invalid("game.tick_hz", "must be in (0, 1000]"));
+        // Whole Hz only: clients receive the rate as an integer (`Welcome::tick_hz`) and
+        // predict with that step, so a fractional rate would mispredict every snapshot.
+        if !(g.tick_hz >= 1.0 && g.tick_hz <= 1000.0 && g.tick_hz.fract() == 0.0) {
+            return Err(invalid("game.tick_hz", "must be a whole number in [1, 1000]"));
         }
         if g.send_interval == 0 {
             return Err(invalid("game.send_interval", "must be at least 1"));
@@ -1100,6 +1102,16 @@ mod tests {
         let mut c = ok.clone();
         c.game.tick_hz = 0.0;
         assert!(c.validate().is_err());
+        // Clients get the rate as an integer: fractional rates would mispredict.
+        for hz in [20.4, 29.6, 62.5] {
+            c.game.tick_hz = hz;
+            assert!(
+                matches!(c.validate(), Err(ConfigError::Invalid { key, .. }) if key == "game.tick_hz"),
+                "{hz} Hz accepted"
+            );
+        }
+        c.game.tick_hz = 30.0;
+        c.validate().unwrap();
         let mut c = ok.clone();
         c.fleet.heartbeat = Duration::from_secs(20);
         assert!(c.validate().is_err());

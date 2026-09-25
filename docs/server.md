@@ -137,7 +137,9 @@ Stop it with Ctrl-C (SIGINT) or SIGTERM:
 3. Clients are disconnected with `ServerShutdown`.
 4. The process exits 0.
 
-A second signal forces exit 1.
+A second signal forces exit 1 without waiting: every room is checkpointed synchronously into
+the game server's own database, clients are disconnected with `ServerShutdown`, and the next
+start moves those checkpoints into the configured store so rejoining players are restored.
 
 ### 2.1 Split mode on one machine
 
@@ -308,7 +310,7 @@ Tools:
 | `public_url` | `ws://127.0.0.1:7777/play` | URL written into assignments, e.g. `wss://{server_id}.play.example.com/play` |
 | `shards` | `0` | Room threads. 0 means cores − 1, minimum 1. |
 | `max_rooms` / `max_players` | 128 / 1024 | Capacity reported to the fleet |
-| `tick_hz` | 60 | Room tick rate |
+| `tick_hz` | 60 | Room tick rate, whole Hz (clients receive it as an integer) |
 | `send_interval` | 2 | Snapshot every N ticks (30 Hz) |
 | `resume_window` | `"20s"` | How long a dropped player's slot and pawn are kept |
 | `empty_room_ttl` | `"30s"` | Empty non-persistent rooms close after this |
@@ -328,7 +330,7 @@ Tools:
 | `handshake_timeout` / `idle_timeout` | 5 s / 10 s | |
 | `client_bandwidth` | 48 KiB | Default downstream snapshot budget per client, in bytes/s. Priority decides what fits. |
 | `outbound_backlog_bytes` | 1 MiB | Above this for 5 s, the link is kicked as `SlowConsumer`. Snapshots are skipped above 256 KiB. |
-| `input_packets_per_sec` / `messages_per_sec` | 90 / 30 | Token buckets. Overflow is dropped first and kicked after 3 s. |
+| `input_packets_per_sec` / `messages_per_sec` | 90 / 30 | Token buckets. The packet bucket adds 30/s for pings and control (120/s, burst 60, never under 1.5 × `tick_hz` for inputs). Overflow is dropped; drops in 3 consecutive seconds (or 10 s worth of the allowance within one second) kick with `RateLimited`. The gateway also caps each link at 4 × `input_packets_per_sec` into the shared room inbox and closes sustained flooders. |
 
 ### `[player_service]`
 
@@ -359,9 +361,9 @@ Tools:
 | `admin.bind` | `127.0.0.1:9090` | Admin API, `/metrics`, `/healthz`, `/readyz`. Keep it private. |
 | `security.signing_kid` | `"k1"` | Key that signs tokens. Every listed key verifies. |
 | `security.keys_env` / `keys_file` | `SPACE3D_KEYS` / none | `k2:<b64>,k1:<b64>` or a TOML file `{ k1 = "<b64>" }`. Rotate by adding k2 everywhere, switching `signing_kid`, and dropping k1 after 30 days. |
-| `security.fleet_token_env` / `_file` | `SPACE3D_FLEET_TOKEN` | Shared by the PS and the GSs |
-| `security.admin_token_env` / `_file` | `SPACE3D_ADMIN_TOKENS` | Comma-separated. With no tokens the admin API is open on a loopback bind and locked otherwise. |
-| `security.trusted_proxies` | `[]` | CIDRs whose `X-Forwarded-For` is honoured |
+| `security.fleet_token_env` / `_file` | `SPACE3D_FLEET_TOKEN` | Shared by the PS and the GSs. The fleet WebSocket requires it in the upgrade (`Authorization: Bearer …`) and closes connections that do not register within 10 s; `/internal/v1/*` checks it (and the per-IP rate) before reading a request body. |
+| `security.admin_token_env` / `_file` | `SPACE3D_ADMIN_TOKENS` | Comma-separated. With no tokens the admin API is open on a loopback bind and locked otherwise. In production every token must be ≥ 16 characters. |
+| `security.trusted_proxies` | `[]` | CIDRs whose `X-Forwarded-For` is honoured. Per-address limits and strikes key IPv4 addresses as is and IPv6 addresses by /64. |
 | `persistence.data_dir` | `data` | Game-server outbox and local checkpoints |
 | `persistence.checkpoint_interval` | 10 s | Rooms also checkpoint on phase change, drain and admin request |
 | `persistence.checkpoint_store` | `player-service` | `none` \| `local` \| `player-service`. With `player-service`, any GS can restore. |
@@ -385,17 +387,17 @@ These live on `admin.bind`.
 | method and path | what it does |
 |---|---|
 | `GET /healthz` | 200 while the supervisor ticks and every shard heartbeat is under 5 s old |
-| `GET /readyz` | 200 when the server is not draining, the DB is up, it is registered with the PS (GS role), and its shards are alive |
-| `GET /metrics` | Prometheus text: `space3d_tick_seconds`, `space3d_ticks_skipped_total`, `space3d_rooms{phase}`, `space3d_players{state}`, `space3d_bytes_total{dir}`, `space3d_input_total{result}`, `space3d_handshakes_total{result}`, `space3d_disconnects_total{reason}`, `space3d_outbox_pending`, `space3d_checkpoint_seconds`, and on the PS `space3d_logins_total`, `space3d_mm_*`, `space3d_fleet_*`, `space3d_http_*` |
-| `GET /admin/v1/status` | server id, role, version, schema hash, phase, registration |
+| `GET /readyz` | 200 when the server is not draining, the DB is up, it has registered with the PS once (GS role; a later PS outage keeps it ready), and its shards are alive |
+| `GET /metrics` | Prometheus text: `space3d_tick_seconds`, `space3d_ticks_skipped_total`, `space3d_rooms{phase}`, `space3d_players{state}`, `space3d_bytes_total{dir}`, `space3d_input_total{result}`, `space3d_handshakes_total{result}`, `space3d_disconnects_total{reason}` (every `DisconnectCode` label plus `link_lost` and `room_inbox_full`), `space3d_rate_limited_total{kind}` (`packets`, `messages`, `link_packets`, `room_inbox`), `space3d_fleet_connected`, `space3d_outbox_pending`, `space3d_checkpoint_seconds`, and on the PS `space3d_logins_total`, `space3d_sessions_active`, `space3d_db_queue_depth`, `space3d_matches_void_total`, `space3d_mm_*`, `space3d_fleet_*`, `space3d_http_*` |
+| `GET /admin/v1/status` | server id, role, version, schema hash, phase, registration, fleet link state |
 | `GET /admin/v1/rooms`, `GET /admin/v1/rooms/{id}` | room list and detail: phase, players, tick cost, entities |
 | `POST /admin/v1/rooms/{id}/close` | Close a room. Body: `{"reason": "…"}`, optional. |
 | `POST /admin/v1/rooms/{id}/checkpoint` | Checkpoint now. Returns 202. |
 | `GET /admin/v1/players` | connected players |
 | `POST /admin/v1/players/{id}/kick` | Kick a player |
-| `POST /admin/v1/bans`, `GET /admin/v1/bans`, `DELETE /admin/v1/bans/{id}` | Body: `{"player": "<id>"}` or `{"cidr": "10.0.0.0/8"}`, plus `"reason"` and an optional `"duration_s"`. The PS persists bans and pushes them to every GS. |
+| `POST /admin/v1/bans`, `GET /admin/v1/bans`, `DELETE /admin/v1/bans/{id}` | Body: `{"player": "<id>"}` or `{"cidr": "10.0.0.0/8"}`, plus `"reason"` and an optional `"duration_s"`. The PS persists bans and pushes them to every GS. A player ban kicks the player; an IP/CIDR ban also closes connections already open from that range (`Disconnect(Banned)`). |
 | `POST /admin/v1/broadcast` | Body: `{"text": "…", "room": "<id>"?, "level": "info\|warn"?}` |
-| `POST /admin/v1/drain` | Same as SIGTERM without the exit: not ready, no new rooms, matches finish |
+| `POST /admin/v1/drain` | Same as SIGTERM: not ready, no new rooms, matches finish, final checkpoints, then the process exits 0 once the drain completes (idle, or `drain_timeout`) |
 | `GET /admin/v1/config`, `GET /admin/v1/schema` | Redacted effective config; the replication manifest, for diffing client builds |
 | `POST /admin/v1/backup` | PS: `VACUUM INTO` a timestamped copy under `data_dir` |
 
@@ -433,7 +435,12 @@ clients per room.
 - Each game server needs a stable `server_id` and its own public URL. For example, a
   Kubernetes StatefulSet with `gs-N.play.example.com` per pod, or `hostPort`.
 - Allocation picks the least-loaded ready server in the requested region: players plus
-  reserved seats over capacity, plus tick p99 over the budget.
+  reserved seats over capacity, plus tick p99 over the budget. Only servers of the client's
+  build qualify: quick play, matchmaking and lobby requests carry `game_id` and
+  `schema_hash` (`PlayerServiceClient::with_build`), matchmaking only matches players of one
+  build, and a restore after a server loss only goes to a server of the room's build. During a
+  rolling deploy that changes the replication schema, old and new clients each land on their
+  own servers.
 - Seats count both the players in each heartbeat and the join / leave events between
   heartbeats. Quick play finds or opens a room atomically. So bursts of quick plays neither
   oversubscribe a room nor scatter over half-empty ones.
@@ -453,8 +460,8 @@ clients per room.
 |---|---|
 | Link blip | Resume within `resume_window`: same slot and pawn, with a full resync |
 | Room panic | Build with `--profile server`, which uses `panic = "unwind"`. The room is rebuilt from its last checkpoint and players rejoin. Three crashes in 5 minutes close the room. |
-| Game server lost | The lease expires in `lease_ttl`. Rejoin restores the room from the PS-stored checkpoint on another server. |
-| Player service down | Rooms keep playing, and results queue in the game servers' durable outbox. Logins and matchmaking pause until the PS returns. |
+| Game server lost | The lease expires in `lease_ttl`. Rejoin restores the room from the PS-stored checkpoint on another server of the same game and schema hash. With `RecoveryPolicy::Abandon` the room is voided instead (audit `match_void`); rejoin answers 404 and players queue again. |
+| Player service down | Rooms keep playing, results queue in the game servers' durable outbox, and `/readyz` stays ready (`space3d_fleet_connected` shows the link). Logins and matchmaking pause until the PS returns; the outbox then flushes. |
 
 **Limits of v1.**
 

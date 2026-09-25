@@ -361,10 +361,13 @@ impl<G: GameDefinition> ServerMain<G> {
             )
             .block()
             .ok_or_else(|| ServerError::Other("player service startup task lost".into()))??;
+            let fleet_token = secrets.fleet_token.clone();
             let fleet_ws = WsServer::with_config(
                 WsServerConfig::default()
                     .max_message_size(gs::fleet::MAX_FLEET_MESSAGE)
-                    .inbound_queue(65_536),
+                    .inbound_queue(65_536)
+                    .max_connections(gs::fleet::MAX_FLEET_CONNECTIONS)
+                    .accept(move |meta| gs::fleet::fleet_upgrade_authorized(&fleet_token, meta)),
             );
             let mut peers = Vec::new();
             if config.runs_game_server() {
@@ -411,6 +414,24 @@ impl<G: GameDefinition> ServerMain<G> {
                     token: secrets.fleet_token.clone(),
                 }),
             };
+            // Forced-stop rescue store: the game server's own database. When checkpoints go
+            // elsewhere, whatever a previous forced stop left there is uploaded now.
+            let rescue: Option<Arc<dyn CheckpointStore>> = if checkpoints.enabled() {
+                let local: Arc<dyn CheckpointStore> = Arc::new(
+                    LocalCheckpoints::open(db.clone(), unix_clock.clone())
+                        .block()
+                        .ok_or_else(|| ServerError::Other("checkpoint store task lost".into()))?
+                        .map_err(|e| ServerError::Other(e.to_string()))?,
+                );
+                if config.persistence.checkpoint_store != config::CheckpointStoreKind::Local
+                    || options.checkpoints.is_some()
+                {
+                    drop(gs::checkpoint::upload_rescued(local.clone(), checkpoints.clone()));
+                }
+                Some(local)
+            } else {
+                None
+            };
             let (uplink_tx, uplink_rx) = async_channel::bounded(16_384);
             let env = RoomEnv {
                 game: game_dyn.clone(),
@@ -419,6 +440,7 @@ impl<G: GameDefinition> ServerMain<G> {
                 outbox: outbox.sender(),
                 uplink: uplink_tx,
                 checkpoints,
+                rescue,
                 metrics: metrics.clone(),
                 server_id: config.server_id.clone(),
                 checkpoint_interval: config.persistence.checkpoint_interval,

@@ -15,16 +15,19 @@
 //!
 //! Anything but a Hello first, or no Hello within the deadline → close + IP strike; five
 //! strikes within a minute lock the IP out for the rest of that minute. After admission every
-//! packet/close of the link is forwarded to its room.
+//! packet/close of the link is forwarded to its room, within a per-link packet budget (excess
+//! dropped here; sustained flooding closes the link) so no client can fill the room's shared
+//! inbox. IP/CIDR bans also close links already open from the banned range.
 
 use crate::game::{GameDefinition, RoomSpec};
 use crate::security::bans::BanList;
-use crate::security::netaddr::Cidr;
-use crate::security::ratelimit::{ConnRefusal, ConnectionLimiter};
-use crate::security::token::{JoinClaims, KeyRing, NonceCache, TokenError, verify};
-use space3d_replication::protocol::handshake::{HelloAuth, RejectCode};
-use space3d_replication::protocol::{PacketKind, peek};
+use crate::security::netaddr::{Cidr, rate_key};
+use crate::security::ratelimit::{ConnRefusal, ConnectionLimiter, TokenBucket};
+use crate::security::token::{JoinClaims, KeyRing, NonceCache, NonceCheck, TokenError, verify};
+use space3d_replication::protocol::handshake::{Disconnect, DisconnectCode, HelloAuth, RejectCode};
+use space3d_replication::protocol::{PacketKind, encode_handshake, peek};
 use space3d_replication::server::handshake::{parse_hello, resume_route};
+use space3d_replication::server::receive::OverflowWindows;
 use space3d_replication::server::{JoinRequest, PlayerIdentity, RoomInbound};
 use space3d_replication::transport::{CloseCode, LinkEvent, LinkTx, PeerInfo};
 use space3d_replication::{FastMap, LinkId, RoomId};
@@ -59,6 +62,11 @@ pub struct GatekeeperConfig {
     pub game: Option<Arc<dyn GameDefinition>>,
     /// Strikes per IP within a minute before its new connections are refused.
     pub max_ip_strikes: u32,
+    /// Packets per second one admitted link may push into its room's shared inbox (4× the
+    /// room's own per-link allowance). Excess is dropped here; sustained or extreme excess
+    /// closes the link (`Disconnect(RateLimited)` + IP strike), so one client can never fill
+    /// the inbox that every player of the room shares.
+    pub link_packets_per_sec: u32,
 }
 
 impl std::fmt::Debug for GatekeeperConfig {
@@ -70,6 +78,7 @@ impl std::fmt::Debug for GatekeeperConfig {
             .field("allow_dev_auth", &self.allow_dev_auth)
             .field("max_connections_per_ip", &self.max_connections_per_ip)
             .field("handshakes_per_ip_per_min", &self.handshakes_per_ip_per_min)
+            .field("link_packets_per_sec", &self.link_packets_per_sec)
             .field("allowed_origins", &self.allowed_origins)
             .finish_non_exhaustive()
     }
@@ -89,6 +98,7 @@ impl Default for GatekeeperConfig {
             leeway: Duration::from_secs(5),
             game: None,
             max_ip_strikes: 5,
+            link_packets_per_sec: 360,
         }
     }
 }
@@ -113,6 +123,7 @@ impl GatekeeperConfig {
             leeway: Duration::from_secs(5),
             game: Some(game),
             max_ip_strikes: 5,
+            link_packets_per_sec: config.limits.input_packets_per_sec.saturating_mul(4).max(240),
         }
     }
 }
@@ -208,6 +219,10 @@ pub struct Gatekeeper {
     /// Links counted by the limiter → their IP (released on `Closed`).
     counted: FastMap<LinkId, IpAddr>,
     strikes: FastMap<IpAddr, (u32, Duration)>,
+    /// `BanList::generation` last enforced on connected links.
+    bans_seen: u64,
+    /// Packets dropped by the per-link budget (metric source).
+    dropped_packets: u64,
 }
 
 struct Pending {
@@ -219,6 +234,12 @@ struct Pending {
 struct Routed {
     room: RoomId,
     tx: Arc<dyn LinkTx>,
+    ip: IpAddr,
+    /// Per-link packet budget into the room inbox.
+    budget: TokenBucket,
+    overflow: OverflowWindows,
+    /// Closed for flooding; later packets are ignored until `Closed` arrives.
+    cut: bool,
 }
 
 const STRIKE_WINDOW: Duration = Duration::from_secs(60);
@@ -244,7 +265,14 @@ impl Gatekeeper {
             routed: Default::default(),
             counted: Default::default(),
             strikes: Default::default(),
+            bans_seen: 0,
+            dropped_packets: 0,
         }
+    }
+
+    /// Packets dropped so far by the per-link budget ([`GatekeeperConfig::link_packets_per_sec`]).
+    pub fn dropped_packets(&self) -> u64 {
+        self.dropped_packets
     }
 
     /// Settings.
@@ -273,6 +301,7 @@ impl Gatekeeper {
     }
 
     fn strike(&mut self, ip: IpAddr, now: Duration) {
+        let ip = rate_key(ip);
         if self.strikes.len() > 100_000 {
             self.strikes
                 .retain(|_, (_, since)| now.saturating_sub(*since) < STRIKE_WINDOW);
@@ -287,7 +316,7 @@ impl Gatekeeper {
 
     fn locked_out(&self, ip: IpAddr, now: Duration) -> bool {
         self.strikes
-            .get(&ip)
+            .get(&rate_key(ip))
             .is_some_and(|(n, since)| *n >= self.config.max_ip_strikes && now.saturating_sub(*since) < STRIKE_WINDOW)
     }
 
@@ -296,11 +325,30 @@ impl Gatekeeper {
         match event {
             LinkEvent::Opened { link, peer, tx } => self.on_open(link, peer, tx, now, now_ms),
             LinkEvent::Packet { link, data, .. } => {
-                if let Some(r) = self.routed.get(&link) {
-                    return GateOutcome::Forward {
-                        room: r.room,
-                        inbound: RoomInbound::Packet { link, bytes: data },
-                    };
+                if let Some(r) = self.routed.get_mut(&link) {
+                    if r.cut {
+                        return GateOutcome::None;
+                    }
+                    if r.budget.take(now, 1.0) {
+                        return GateOutcome::Forward {
+                            room: r.room,
+                            inbound: RoomInbound::Packet { link, bytes: data },
+                        };
+                    }
+                    self.dropped_packets += 1;
+                    if r.overflow.record_drop(now) {
+                        r.cut = true;
+                        let pkt = encode_handshake(
+                            PacketKind::Disconnect,
+                            &Disconnect::new(DisconnectCode::RateLimited, "rate limited", false),
+                        );
+                        let _ = r.tx.send(space3d_replication::transport::Lane::Reliable, pkt);
+                        r.tx.close(CloseCode::POLICY, "rate limited");
+                        let ip = r.ip;
+                        tracing::warn!(event = "link_flood", %ip, ?link, "link closed for flooding its room");
+                        self.strike(ip, now);
+                    }
+                    return GateOutcome::None;
                 }
                 match self.pending.remove(&link) {
                     Some(p) => self.on_hello(link, p, &data, now, now_ms),
@@ -434,12 +482,19 @@ impl Gatekeeper {
                 {
                     return refuse(p.tx, RejectCode::RoomNotFound, &why);
                 }
-                if !self
+                match self
                     .nonces
                     .insert(claims.jti, claims.exp_ms.saturating_add(leeway), now_ms)
                 {
-                    tracing::warn!(event = "ticket_reuse", %ip, player = %claims.player, "join ticket replayed");
-                    return refuse(p.tx, RejectCode::TicketReused, "ticket already used");
+                    NonceCheck::Fresh => {}
+                    NonceCheck::Replayed => {
+                        tracing::warn!(event = "ticket_reuse", %ip, player = %claims.player, "join ticket replayed");
+                        return refuse(p.tx, RejectCode::TicketReused, "ticket already used");
+                    }
+                    NonceCheck::Full => {
+                        tracing::warn!(event = "nonce_cache_full", %ip, "ticket nonce cache full; refusing");
+                        return refuse(p.tx, RejectCode::RateLimited, "server busy, retry");
+                    }
                 }
                 let identity = PlayerIdentity {
                     player: claims.player,
@@ -448,10 +503,10 @@ impl Gatekeeper {
                     is_bot: false,
                     extra: claims.extra.clone(),
                 };
-                self.admit(link, p, hello, Some(identity), claims.room, Some(claims.spec))
+                self.admit(link, p, hello, Some(identity), claims.room, Some(claims.spec), now)
             }
             HelloAuth::Resume(token) => match resume_route(&token) {
-                Ok(t) => self.admit(link, p, hello, None, t.room, None),
+                Ok(t) => self.admit(link, p, hello, None, t.room, None, now),
                 Err(_) => {
                     self.strike(ip, now);
                     refuse(p.tx, RejectCode::ResumeExpired, "invalid resume token")
@@ -477,11 +532,12 @@ impl Gatekeeper {
                 if let Some(ban) = self.bans.player(identity.player, now_ms) {
                     return refuse(p.tx, RejectCode::Banned, &ban.reason);
                 }
-                self.admit(link, p, hello, Some(identity), spec.room_id, Some(spec))
+                self.admit(link, p, hello, Some(identity), spec.room_id, Some(spec), now)
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn admit(
         &mut self,
         link: LinkId,
@@ -490,8 +546,20 @@ impl Gatekeeper {
         identity: Option<PlayerIdentity>,
         room: RoomId,
         spec: Option<RoomSpec>,
+        now: Duration,
     ) -> GateOutcome {
-        self.routed.insert(link, Routed { room, tx: p.tx.clone() });
+        let rate = f64::from(self.config.link_packets_per_sec.max(1));
+        self.routed.insert(
+            link,
+            Routed {
+                room,
+                tx: p.tx.clone(),
+                ip: peer_ip(&p.peer),
+                budget: TokenBucket::new(rate, (rate / 3.0).max(60.0)).starting_at(now),
+                overflow: OverflowWindows::starting_at(now, rate),
+                cut: false,
+            },
+        );
         GateOutcome::Admit {
             room,
             spec,
@@ -526,6 +594,52 @@ impl Gatekeeper {
             }
         }
         overdue.len()
+    }
+
+    /// IP/CIDR bans added since the last call also end connections already open from the banned
+    /// range: `Disconnect(Banned)` (no resume) and close. Cheap when nothing changed (a
+    /// generation check); the ingress task calls it with every sweep. Returns links closed.
+    pub fn enforce_ip_bans(&mut self, now_ms: i64) -> usize {
+        let generation = self.bans.generation();
+        if generation == self.bans_seen {
+            return 0;
+        }
+        self.bans_seen = generation;
+        if !self.bans.has_ip_bans() {
+            return 0;
+        }
+        let mut closed = 0;
+        for r in self.routed.values() {
+            if let Some(ban) = self.bans.ip(r.ip, now_ms) {
+                let pkt = encode_handshake(
+                    PacketKind::Disconnect,
+                    &Disconnect::new(DisconnectCode::Banned, &ban.reason, false),
+                );
+                let _ = r.tx.send(space3d_replication::transport::Lane::Reliable, pkt);
+                r.tx.close(CloseCode::POLICY, "banned");
+                closed += 1;
+            }
+        }
+        let banned: Vec<LinkId> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| self.bans.ip(peer_ip(&p.peer), now_ms).is_some())
+            .map(|(l, _)| *l)
+            .collect();
+        for link in banned {
+            if let Some(p) = self.pending.remove(&link) {
+                p.tx.close(CloseCode::POLICY, "banned");
+                closed += 1;
+            }
+        }
+        if closed > 0 {
+            tracing::info!(
+                event = "ban_enforced",
+                links = closed,
+                "closed links from banned addresses"
+            );
+        }
+        closed
     }
 
     /// Reject new tickets and dev joins with `ServerDraining` (resumes still pass).
@@ -885,6 +999,97 @@ mod tests {
             Some(RejectCode::RateLimited)
         );
         assert!(matches!(open(&mut g, 201, "203.0.113.9", S(75)).1, GateOutcome::None));
+    }
+
+    fn admit_dev(g: &mut Gatekeeper, link: u64, ip: &str) -> Arc<FakeLinkTx> {
+        let (tx, _) = open(g, link, ip, S(0));
+        let out = packet(
+            g,
+            link,
+            hello(HelloAuth::Dev {
+                name: format!("p{link}"),
+            }),
+            S(0),
+            0,
+        );
+        assert!(matches!(out, GateOutcome::Admit { .. }), "{out:?}");
+        tx
+    }
+
+    fn disconnect_code(tx: &FakeLinkTx) -> Option<DisconnectCode> {
+        tx.sent().iter().find_map(
+            |(_, p)| match space3d_replication::protocol::decode_packet(p, &Default::default()) {
+                Ok(space3d_replication::protocol::Packet::Disconnect(d)) => Some(d.code),
+                _ => None,
+            },
+        )
+    }
+
+    /// An IP/CIDR ban added later also ends links already open from the banned range.
+    #[test]
+    fn ip_bans_close_connected_links() {
+        let mut g = gate();
+        g.config.allow_dev_auth = true;
+        let a = admit_dev(&mut g, 1, "192.0.2.4");
+        let b = admit_dev(&mut g, 2, "198.51.100.9");
+        let (pending, _) = open(&mut g, 3, "192.0.2.77", S(0));
+        assert_eq!(g.enforce_ip_bans(0), 0, "no bans");
+        g.bans.upsert(Ban {
+            id: 9,
+            target: BanTarget::Ip(Cidr::parse("192.0.2.0/24").unwrap()),
+            until_ms: None,
+            reason: "abuse".into(),
+        });
+        assert_eq!(g.enforce_ip_bans(1_000), 2, "the admitted and the pending link");
+        assert_eq!(disconnect_code(&a), Some(DisconnectCode::Banned));
+        assert!(a.closed().is_some() && pending.closed().is_some());
+        assert!(b.closed().is_none(), "other ranges untouched");
+        assert_eq!(g.enforce_ip_bans(2_000), 0, "only on ban changes");
+    }
+
+    /// One admitted link cannot push more than its budget into the shared room inbox: excess
+    /// is dropped at the gateway and a sustained flood closes the link (with an IP strike).
+    #[test]
+    fn per_link_budget_drops_then_cuts_a_flood() {
+        let mut g = gate();
+        g.config.allow_dev_auth = true;
+        g.config.link_packets_per_sec = 120;
+        let tx = admit_dev(&mut g, 1, "203.0.113.5");
+        let mut forwarded = 0;
+        let mut t = Duration::ZERO;
+        // 5 s at 600 packets/s (5× the budget).
+        for _ in 0..300 {
+            t += Duration::from_millis(16);
+            for _ in 0..10 {
+                if matches!(packet(&mut g, 1, vec![4, 0], t, 0), GateOutcome::Forward { .. }) {
+                    forwarded += 1;
+                }
+            }
+            if tx.closed().is_some() {
+                break;
+            }
+        }
+        assert!(tx.closed().is_some(), "sustained flood cut");
+        assert_eq!(disconnect_code(&tx), Some(DisconnectCode::RateLimited));
+        assert!(g.dropped_packets() > 0);
+        assert!(t <= Duration::from_secs(5), "cut after {t:?}");
+        let secs = t.as_secs_f64();
+        assert!(
+            f64::from(forwarded) <= 120.0 * secs + 60.0,
+            "{forwarded} forwarded in {secs:.1} s"
+        );
+        // Nothing more is forwarded from the cut link.
+        assert!(matches!(packet(&mut g, 1, vec![4, 0], t, 0), GateOutcome::None));
+        // An honest link at 70 packets/s is never touched.
+        let honest = admit_dev(&mut g, 2, "203.0.113.6");
+        for i in 0..600u64 {
+            let at = t + Duration::from_millis(i * 1000 / 70);
+            assert!(matches!(
+                packet(&mut g, 2, vec![4, 0], at, 0),
+                GateOutcome::Forward { .. }
+            ));
+        }
+        assert!(honest.closed().is_none());
     }
 
     #[test]

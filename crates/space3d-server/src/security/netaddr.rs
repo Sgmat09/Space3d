@@ -114,6 +114,16 @@ fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
     }
 }
 
+/// Key for per-address limits, bans-adjacent strikes and quotas: an IPv4 address as is, an
+/// IPv6 address reduced to its /64 (one subscriber usually holds a whole /64, so per-address
+/// keys would hand out a fresh quota for every address in it).
+pub fn rate_key(ip: IpAddr) -> IpAddr {
+    match canonical(ip) {
+        v4 @ IpAddr::V4(_) => v4,
+        v6 => mask(v6, 64),
+    }
+}
+
 /// The real client IP: the right-most `X-Forwarded-For` hop not in `trusted`, but only when the
 /// TCP peer itself is trusted; otherwise the peer address.
 pub fn resolve_client_ip(peer: SocketAddr, forwarded_for: Option<&str>, trusted: &[Cidr]) -> IpAddr {
@@ -168,6 +178,18 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(json, "\"10.0.0.0/8\"");
         assert_eq!(serde_json::from_str::<Cidr>(&json).unwrap(), c);
+    }
+
+    #[test]
+    fn rate_keys_group_ipv6_by_slash_64() {
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(rate_key(a), rate_key(b), "same /64");
+        assert_ne!(rate_key(a), rate_key(c));
+        let v4: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(rate_key(v4), v4);
+        assert_eq!(rate_key("::ffff:203.0.113.7".parse().unwrap()), v4, "v4-mapped");
     }
 
     #[test]

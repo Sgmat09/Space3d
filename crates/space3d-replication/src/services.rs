@@ -149,6 +149,8 @@ pub struct PlayerServiceClient {
     http: Http,
     base_url: String,
     session: Arc<Mutex<Option<SessionTokens>>>,
+    /// `(game_id, schema_hash)` filled into allocation requests that leave them empty.
+    build: Option<(String, u64)>,
 }
 
 impl PlayerServiceClient {
@@ -158,6 +160,7 @@ impl PlayerServiceClient {
             http: http.clone(),
             base_url: base_url.trim_end_matches('/').to_owned(),
             session: Arc::new(Mutex::new(None)),
+            build: None,
         }
     }
 
@@ -261,9 +264,30 @@ impl PlayerServiceClient {
         self.authed(Method::PUT, format!("/v1/me/data/{}", encode(key)), Some(req))
     }
 
+    /// Declare this client's build (`game_id`, `ReplicationRegistry::schema_hash`): quick
+    /// play, matchmaking and lobby requests that leave those fields empty carry them, so the
+    /// player service only places the player on compatible game servers.
+    pub fn with_build(mut self, game_id: &str, schema_hash: u64) -> Self {
+        self.build = Some((game_id.to_owned(), schema_hash));
+        self
+    }
+
+    fn fill_build(&self, game_id: &mut String, schema_hash: &mut u64) {
+        if let Some((g, h)) = &self.build {
+            if game_id.is_empty() {
+                game_id.clone_from(g);
+            }
+            if *schema_hash == 0 {
+                *schema_hash = *h;
+            }
+        }
+    }
+
     /// Enter a matchmaking queue.
     pub fn matchmake(&self, req: &MatchmakeRequest) -> Task<Result<MatchmakeResponse, OnlineError>> {
-        self.authed(Method::POST, "/v1/matchmaking/tickets".into(), Some(req))
+        let mut req = req.clone();
+        self.fill_build(&mut req.game_id, &mut req.schema_hash);
+        self.authed(Method::POST, "/v1/matchmaking/tickets".into(), Some(&req))
     }
 
     /// Long-poll a ticket (`wait_s` ≤ 20).
@@ -279,7 +303,9 @@ impl PlayerServiceClient {
 
     /// Drop into the best open room.
     pub fn quick_play(&self, req: &QuickPlayRequest) -> Task<Result<Assignment, OnlineError>> {
-        self.authed(Method::POST, "/v1/play/quick".into(), Some(req))
+        let mut req = req.clone();
+        self.fill_build(&mut req.game_id, &mut req.schema_hash);
+        self.authed(Method::POST, "/v1/play/quick".into(), Some(&req))
     }
 
     /// After a server loss: a new ticket for the (restored) room, if any.
@@ -297,7 +323,9 @@ impl PlayerServiceClient {
 
     /// Create a lobby.
     pub fn create_lobby(&self, req: &CreateLobbyRequest) -> Task<Result<LobbyState, OnlineError>> {
-        self.authed(Method::POST, "/v1/lobbies".into(), Some(req))
+        let mut req = req.clone();
+        self.fill_build(&mut req.game_id, &mut req.schema_hash);
+        self.authed(Method::POST, "/v1/lobbies".into(), Some(&req))
     }
 
     /// Join a lobby by code.

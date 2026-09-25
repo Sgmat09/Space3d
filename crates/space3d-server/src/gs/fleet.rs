@@ -19,6 +19,7 @@ use crate::security::bans::Ban;
 use serde::{Deserialize, Serialize};
 use space3d_replication::api::PlayerDataEntry;
 use space3d_replication::{PlayerId, RoomId};
+use std::sync::Arc;
 
 /// Capacity advertised by a game server.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +280,27 @@ pub trait FleetLink: Send + Sync + 'static {
 /// Largest fleet message (JSON).
 pub const MAX_FLEET_MESSAGE: usize = 16 << 20;
 
+/// Concurrent fleet WebSocket connections the player service accepts (game servers).
+pub const MAX_FLEET_CONNECTIONS: usize = 1024;
+
+/// A fleet connection that has not sent a valid `Register` within this is closed.
+pub const FLEET_REGISTER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Accept hook of the fleet WebSocket: the upgrade must carry `Authorization: Bearer
+/// <fleet token>` (checked in constant time), so unauthenticated peers never get a socket.
+pub fn fleet_upgrade_authorized(token: &str, meta: &space3d_net::ConnectMeta) -> Result<(), u16> {
+    let presented = meta
+        .authorization
+        .as_deref()
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !token.is_empty() && crate::security::ct_eq(presented.as_bytes(), token.as_bytes()) {
+        Ok(())
+    } else {
+        Err(401)
+    }
+}
+
 #[derive(Default)]
 struct WsLinkState {
     connected: std::sync::atomic::AtomicBool,
@@ -338,6 +360,8 @@ async fn run_ws_link(
         std::time::Duration::from_secs(10),
     );
     let mut attempt = 0u32;
+    // The player service authenticates the upgrade itself (no socket without the token).
+    let bearer = format!("Bearer {}", registration.token);
     let register = match serde_json::to_string(&FleetUp::Register(registration)) {
         Ok(s) => s,
         Err(e) => {
@@ -346,7 +370,12 @@ async fn run_ws_link(
         }
     };
     while !state.stop.load(Ordering::Acquire) {
-        let conn = WsClient::connect_with(url.clone(), WsConfig::default().max_message_size(MAX_FLEET_MESSAGE));
+        let conn = WsClient::connect_with(
+            url.clone(),
+            WsConfig::default()
+                .max_message_size(MAX_FLEET_MESSAGE)
+                .header("authorization", bearer.clone()),
+        );
         let _ = conn.send(register.clone());
         let reason: String;
         'link: loop {
@@ -426,6 +455,38 @@ impl FleetLink for WsFleetLink {
 pub struct InProcessFleetLink {
     up: async_channel::Sender<FleetUp>,
     down: async_channel::Receiver<FleetDown>,
+    outage: FleetOutage,
+}
+
+/// Test switch that takes an in-process fleet link down (player service unreachable) and back
+/// up (clone = shared). While down, sends fail with `FleetError::Down`, nothing is received
+/// and `is_connected` is false; coming back bumps the session so the outbox replays.
+#[derive(Clone, Debug, Default)]
+pub struct FleetOutage {
+    down: Arc<std::sync::atomic::AtomicBool>,
+    session: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl FleetOutage {
+    /// Take the link down (`true`) or bring it back (`false`).
+    pub fn set(&self, down: bool) {
+        let was = self.down.swap(down, std::sync::atomic::Ordering::AcqRel);
+        if was && !down {
+            self.session.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// Whether the link is down.
+    pub fn is_down(&self) -> bool {
+        self.down.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl InProcessFleetLink {
+    /// The outage switch of this link.
+    pub fn outage(&self) -> FleetOutage {
+        self.outage.clone()
+    }
 }
 
 /// Player-service end of an in-process link.
@@ -445,6 +506,7 @@ pub fn in_process_pair() -> (InProcessFleetLink, InProcessFleetPeer) {
         InProcessFleetLink {
             up: up_tx,
             down: down_rx,
+            outage: FleetOutage::default(),
         },
         InProcessFleetPeer {
             up: up_rx,
@@ -455,13 +517,22 @@ pub fn in_process_pair() -> (InProcessFleetLink, InProcessFleetPeer) {
 
 impl FleetLink for InProcessFleetLink {
     fn send(&self, msg: FleetUp) -> Result<(), FleetError> {
+        if self.outage.is_down() {
+            return Err(FleetError::Down);
+        }
         self.up.try_send(msg).map_err(|_| FleetError::Down)
     }
     fn try_recv(&self) -> Option<FleetDown> {
+        if self.outage.is_down() {
+            return None;
+        }
         self.down.try_recv().ok()
     }
     fn is_connected(&self) -> bool {
-        !self.up.is_closed()
+        !self.outage.is_down() && !self.up.is_closed()
+    }
+    fn session(&self) -> u64 {
+        u64::from(self.is_connected()) + 2 * self.outage.session.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

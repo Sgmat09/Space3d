@@ -8,6 +8,8 @@
 //! * `Closed` → slot `Disconnected { until }` + `PlayerDisconnected`.
 //!
 //! Strikes: `strikes.max` within `strikes.window` → `Disconnect(ProtocolViolation)`.
+//! Rate limits: overflow is dropped; drops in 3 consecutive 1 s windows (or ten seconds' worth
+//! of the packet allowance within one window) → `Disconnect(RateLimited)` ([`OverflowWindows`]).
 
 use super::handshake::SecretSource;
 use super::slots::Slot;
@@ -85,17 +87,22 @@ pub struct LinkLimiter {
     pub strikes: Vec<Duration>,
     /// Per message kind buckets.
     pub per_kind: crate::FastMap<u16, TokenBucket>,
-    /// Sustained rate-limit overflow since.
-    pub overflow_since: Option<Duration>,
+    /// Rate-limit drops per 1 s window (sustained overflow → `RateLimited`).
+    pub overflow: OverflowWindows,
 }
 
 impl LinkLimiter {
-    /// Limiter for `limits`, starting at `now`.
-    pub fn new(limits: &WireLimits, now: Duration) -> Self {
-        let pps = f64::from(limits.input_packets_per_sec.max(1));
+    /// Limiter for `limits` at a room ticking at `tick_hz`, starting at `now`.
+    ///
+    /// Packets: `input_packets_per_sec` (never below 1.5 × the tick rate) plus 30/s of headroom
+    /// for pings, control and message-only packets, with a burst of half that: 120/s, burst 60
+    /// by default. The burst absorbs a TCP stall of about a second (the stream then delivers
+    /// the queued packets at once); a stream sends each input once, so a dropped input packet is
+    /// a lost input.
+    pub fn new(limits: &WireLimits, tick_hz: f64, now: Duration) -> Self {
+        let pps = f64::from(limits.input_packets_per_sec.max(1)).max((tick_hz * 1.5).ceil()) + 30.0;
         Self {
-            // Inputs plus some headroom for pings / control / messages.
-            packets: TokenBucket::new(pps + 30.0, 60.0).starting_at(now),
+            packets: TokenBucket::new(pps, (pps / 2.0).max(60.0)).starting_at(now),
             bytes: TokenBucket::new(f64::from(limits.max_packet) * 16.0, f64::from(limits.max_packet) * 8.0)
                 .starting_at(now),
             messages: TokenBucket::new(
@@ -105,13 +112,74 @@ impl LinkLimiter {
             .starting_at(now),
             strikes: Vec::new(),
             per_kind: Default::default(),
-            overflow_since: None,
+            overflow: OverflowWindows::starting_at(now, pps),
         }
     }
 }
 
-/// Sustained rate-limit overflow before a `RateLimited` kick.
-const OVERFLOW_KICK_AFTER: Duration = Duration::from_secs(3);
+/// Rate-limit drops counted per 1 s window. A token bucket lets a packet through every time
+/// it refills, so "no packet passed for 3 s" never happens under a flood; overflow is instead
+/// judged per window: a kick when drops happened in [`SUSTAINED_WINDOWS`] consecutive windows
+/// followed by another drop (≥ 3 s of sustained overflow), or at once when one window drops
+/// more than [`OverflowWindows::hard_limit`] (ten seconds' worth of the packet allowance; an
+/// honest client cannot produce that, even replaying a long stall).
+#[derive(Clone, Debug)]
+pub struct OverflowWindows {
+    start: Duration,
+    drops: u32,
+    streak: u32,
+    hard_limit: u32,
+}
+
+/// Length of one overflow window.
+pub const OVERFLOW_WINDOW: Duration = Duration::from_secs(1);
+/// Consecutive windows with drops before a `RateLimited` kick.
+pub const SUSTAINED_WINDOWS: u32 = 3;
+
+impl OverflowWindows {
+    /// Windows starting at `now` for a link allowed `packets_per_sec`.
+    pub fn starting_at(now: Duration, packets_per_sec: f64) -> Self {
+        Self {
+            start: now,
+            drops: 0,
+            streak: 0,
+            hard_limit: ((packets_per_sec * 10.0) as u32).max(1_000),
+        }
+    }
+
+    /// Drops in the current window.
+    pub fn drops(&self) -> u32 {
+        self.drops
+    }
+
+    /// Drops above this many within one window kick at once.
+    pub fn hard_limit(&self) -> u32 {
+        self.hard_limit
+    }
+
+    fn roll(&mut self, now: Duration) {
+        if now < self.start + OVERFLOW_WINDOW {
+            return;
+        }
+        let elapsed = (now - self.start).as_nanos() / OVERFLOW_WINDOW.as_nanos();
+        // The window that just ended continues the streak only if it had drops and is
+        // directly followed by the new one (windows without packets had no drops).
+        self.streak = if self.drops > 0 && elapsed == 1 {
+            self.streak + 1
+        } else {
+            0
+        };
+        self.drops = 0;
+        self.start += OVERFLOW_WINDOW * elapsed.min(u128::from(u32::MAX)) as u32;
+    }
+
+    /// Record a dropped packet or message at `now`; `true` = kick (`RateLimited`).
+    pub fn record_drop(&mut self, now: Duration) -> bool {
+        self.roll(now);
+        self.drops = self.drops.saturating_add(1);
+        self.streak >= SUSTAINED_WINDOWS || self.drops > self.hard_limit
+    }
+}
 
 /// The `replication::server_receive` system.
 pub(crate) fn server_receive(ctx: &mut SystemCtx) {
@@ -267,6 +335,7 @@ fn bind_link(server: &mut NetServer, client: NetClientId, req: &JoinRequest, sec
     let max = server.config.client_bandwidth_max;
     let default_rate = server.config.client_bandwidth;
     let limits = server.config.limits;
+    let tick_hz = server.tick_hz();
     let Some(slot) = server.slots.get_mut(client) else {
         return;
     };
@@ -283,7 +352,7 @@ fn bind_link(server: &mut NetServer, client: NetClientId, req: &JoinRequest, sec
     slot.clear_link_state();
     slot.view.reset_for_new_link();
     slot.inputs.reset();
-    slot.limits = LinkLimiter::new(&limits, now);
+    slot.limits = LinkLimiter::new(&limits, tick_hz, now);
     slot.datagram = req.tx.caps().true_datagrams;
     let wanted = req.hello.caps.max_down_bytes_per_sec;
     slot.down_rate = if wanted == 0 {
@@ -331,6 +400,7 @@ fn handle_closed(server: &mut NetServer, link: LinkId, reason: &str) {
         return;
     };
     tracing::debug!(room = %server.config.room, ?client, reason, "link closed");
+    server.stats.links_lost += 1;
     link_lost(server, client);
 }
 
@@ -367,12 +437,25 @@ fn check_links(server: &mut NetServer, now: Duration) {
             }
         }
     }
+    server.stats.links_lost += lost.len() as u64;
     for c in idle_kick {
         server.drop_link(c, Some((DisconnectCode::Timeout, "idle timeout")), true);
         lost.push(c);
     }
     for c in lost {
         link_lost(server, c);
+    }
+}
+
+/// Count a rate-limit drop; kicks (`RateLimited`, no resume) on sustained or extreme overflow.
+fn rate_limit_drop(server: &mut NetServer, client: NetClientId, now: Duration) {
+    let Some(slot) = server.slots.get_mut(client) else {
+        return;
+    };
+    if slot.limits.overflow.record_drop(now) {
+        let player = slot.identity.player;
+        tracing::warn!(event = "rate_limited", room = %server.config.room, ?client, "kicking");
+        server.kick(player, DisconnectCode::RateLimited, "rate limited", false);
     }
 }
 
@@ -418,14 +501,10 @@ fn handle_packet(
         slot.stats.bytes_in += bytes.len() as u64;
         let ok = slot.limits.packets.take(now, 1.0) && slot.limits.bytes.take(now, bytes.len() as f64);
         if !ok {
-            let since = *slot.limits.overflow_since.get_or_insert(now);
-            if now.saturating_sub(since) >= OVERFLOW_KICK_AFTER {
-                let player = slot.identity.player;
-                server.kick(player, DisconnectCode::RateLimited, "rate limited", false);
-            }
+            server.stats.rate_limited_packets += 1;
+            rate_limit_drop(server, client, now);
             return;
         }
-        slot.limits.overflow_since = None;
     }
     let limits = server.config.limits;
     let packet = match decode_packet(bytes, &limits) {
@@ -438,6 +517,7 @@ fn handle_packet(
     let data = match packet {
         Packet::Data(d) => d,
         Packet::Disconnect(d) => {
+            server.stats.count_disconnect(DisconnectCode::Leave);
             let reason = if d.code == DisconnectCode::Leave {
                 LeaveReason::Left
             } else {
@@ -501,7 +581,10 @@ fn handle_packet(
 fn handle_control(server: &mut NetServer, client: NetClientId, msg: ControlMsg, now: Duration) {
     let max = server.config.client_bandwidth_max;
     match msg {
-        ControlMsg::Leave => server.free_slot(client, LeaveReason::Left),
+        ControlMsg::Leave => {
+            server.stats.count_disconnect(DisconnectCode::Leave);
+            server.free_slot(client, LeaveReason::Left);
+        }
         ControlMsg::SetRate { max_down_bytes_per_sec } => {
             if let Some(slot) = server.slots.get_mut(client) {
                 slot.down_rate = max_down_bytes_per_sec.clamp(4096, max.max(4096));
@@ -519,6 +602,12 @@ fn handle_control(server: &mut NetServer, client: NetClientId, msg: ControlMsg, 
             if let Some(slot) = server.slots.get_mut(client) {
                 slot.report = Some(r);
                 slot.stats.interp_delay_ticks = r.interp_delay_ms;
+                // The client's measured RTT: the only source on streams, and a seed for the
+                // datagram RTO until acks provide samples (bounded: it is client-supplied and
+                // only ever affects this client's own resend timing and stats).
+                if (!slot.datagram || slot.rtt.samples() == 0) && r.rtt_ms.is_finite() && r.rtt_ms > 0.0 {
+                    slot.rtt.sample(Duration::from_secs_f32(r.rtt_ms.min(5_000.0) / 1000.0));
+                }
             }
         }
         ControlMsg::Notice(_) | ControlMsg::Kick { .. } => {
@@ -644,7 +733,11 @@ fn receive_message(
         (slot.identity.player, allowed)
     };
     if !allowed {
-        return; // dropped (rate limit)
+        // Dropped; honest clients apply the same limits before sending, so persistent drops
+        // count toward the `RateLimited` kick like packet overflow.
+        server.stats.rate_limited_messages += 1;
+        rate_limit_drop(server, client, now);
+        return;
     }
     match entry.ops.deliver_from_client(res, body, client, player, tick) {
         Ok(()) => {}
@@ -660,6 +753,57 @@ fn receive_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn overflow_kicks_after_three_windows_of_drops() {
+        let mut w = OverflowWindows::starting_at(Duration::ZERO, 120.0);
+        // A drop in each of three consecutive 1 s windows: not yet.
+        for s in 0..3u64 {
+            assert!(!w.record_drop(MS(s * 1000 + 500)));
+        }
+        // The fourth consecutive window with a drop: sustained for ≥ 3 s → kick.
+        assert!(w.record_drop(MS(3_500)));
+    }
+
+    #[test]
+    fn a_quiet_window_resets_the_streak() {
+        let mut w = OverflowWindows::starting_at(Duration::ZERO, 120.0);
+        assert!(!w.record_drop(MS(100)));
+        assert!(!w.record_drop(MS(1_100)));
+        // Nothing dropped in [2 s, 3 s).
+        assert!(!w.record_drop(MS(3_100)));
+        assert!(!w.record_drop(MS(4_100)));
+        assert!(!w.record_drop(MS(5_100)));
+        assert!(w.record_drop(MS(6_100)), "three full windows with drops again");
+    }
+
+    #[test]
+    fn extreme_overflow_kicks_within_one_window() {
+        let mut w = OverflowWindows::starting_at(Duration::ZERO, 120.0);
+        let limit = w.hard_limit();
+        assert_eq!(limit, 1_200, "ten seconds of the allowance");
+        for _ in 0..limit {
+            assert!(!w.record_drop(MS(10)));
+        }
+        assert!(w.record_drop(MS(10)));
+    }
+
+    #[test]
+    fn packet_allowance_covers_the_tick_rate() {
+        let limits = WireLimits::default();
+        // 60 Hz: 90 inputs + 30 other = 120/s, burst 60.
+        let mut l = LinkLimiter::new(&limits, 60.0, Duration::ZERO);
+        assert!((0..60).all(|_| l.packets.take(Duration::ZERO, 1.0)));
+        assert!(!l.packets.take(Duration::ZERO, 1.0));
+        // 128 Hz rooms get at least 1.5 × the tick rate for inputs.
+        let mut l = LinkLimiter::new(&limits, 128.0, Duration::ZERO);
+        let passed = (1..=1000u64)
+            .filter(|i| l.packets.take(MS(*i * 1000 / 128), 1.0))
+            .count();
+        assert_eq!(passed, 1000, "one packet per 128 Hz tick always passes");
+    }
 
     #[test]
     fn token_bucket_refills() {

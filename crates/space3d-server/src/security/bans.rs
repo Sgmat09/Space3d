@@ -41,6 +41,9 @@ impl Ban {
 #[derive(Clone, Debug, Default)]
 pub struct BanList {
     inner: Arc<RwLock<Vec<Ban>>>,
+    /// Bumped whenever a ban is added or replaced (the gatekeeper then re-checks connected
+    /// links against IP bans).
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BanList {
@@ -69,6 +72,21 @@ impl BanList {
             Some(slot) => *slot = ban,
             None => bans.push(ban),
         }
+        self.bump();
+    }
+
+    fn bump(&self) {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Changes whenever bans are added or replaced.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether any IP/CIDR ban exists (cheap pre-check).
+    pub fn has_ip_bans(&self) -> bool {
+        self.inner.read().iter().any(|b| matches!(b.target, BanTarget::Ip(_)))
     }
 
     /// Remove by id.
@@ -87,6 +105,7 @@ impl BanList {
     /// Replace everything (fleet `Registered { bans }`).
     pub fn replace_all(&self, bans: Vec<Ban>) {
         *self.inner.write() = bans;
+        self.bump();
     }
 
     /// Copy of all bans.
