@@ -68,6 +68,10 @@ pub struct RenderStats {
     pub instance_bytes_uploaded: u64,
     /// GPU buffers (re)allocated this frame (growth or first use).
     pub buffer_reallocations: u32,
+    /// Staging chunks (4 MiB `MAP_WRITE` buffers) the upload ring created this frame. The ring
+    /// grows to what the frames the GPU still holds need (their chunks cannot be reused until
+    /// it is done with them), then creates none: 0 in the steady state.
+    pub staging_chunks_created: u32,
     /// CPU-side scratch `Vec`s that had to grow this frame (0 in the steady state).
     pub cpu_reallocations: u32,
     /// Compute dispatches recorded (GPU culling).
@@ -87,7 +91,8 @@ pub struct RenderStats {
     pub textures_uploaded: u32,
     /// Render passes recorded by the graphics features (0 in Direct mode without them).
     pub render_passes: u32,
-    /// Compute passes recorded by the graphics features (particles, auto exposure, …).
+    /// Compute passes recorded by the graphics features (particles, auto exposure, …); render
+    /// nodes report theirs with `PrepareContext::count_compute_passes`.
     pub compute_passes: u32,
     /// Full-screen passes (composite, bloom levels, FXAA, depth resolves, …).
     pub fullscreen_passes: u32,

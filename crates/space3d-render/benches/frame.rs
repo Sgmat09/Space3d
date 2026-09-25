@@ -75,6 +75,15 @@ fn app(post: bool) -> Option<App> {
     Some(app)
 }
 
+/// One frame of the render stage as `App::update` runs it: `Time::frame` advances first, so
+/// the post camera's per-frame seeds (dither, grain: 16 bytes) are uploaded every frame like in
+/// a real loop (with `run_stage` alone the frame counter stood still and an Hdr frame uploaded
+/// nothing, hiding the staging traffic it causes).
+fn render(app: &mut App) {
+    app.resources.expect_mut::<Time>().frame += 1;
+    app.run_stage(Stage::Render);
+}
+
 fn wait(app: &App) {
     let _ = app
         .resources
@@ -93,7 +102,7 @@ fn frame(c: &mut Criterion) {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     let t = Instant::now();
-                    app.run_stage(Stage::Render);
+                    render(&mut app);
                     total += t.elapsed();
                     wait(&app);
                 }
@@ -102,7 +111,7 @@ fn frame(c: &mut Criterion) {
         });
         group.bench_function(format!("gpu/{name}"), |b| {
             b.iter(|| {
-                app.run_stage(Stage::Render);
+                render(&mut app);
                 wait(&app);
             })
         });
@@ -112,7 +121,7 @@ fn frame(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let t = Instant::now();
                 for i in 0..iters {
-                    app.run_stage(Stage::Render);
+                    render(&mut app);
                     if i % 8 == 7 {
                         wait(&app);
                     }
@@ -141,20 +150,20 @@ fn median(v: &mut [f64]) -> f64 {
 fn ab_round(app: &mut App) -> [f64; 3] {
     let spin = Instant::now();
     while spin.elapsed() < Duration::from_millis(30) {
-        app.run_stage(Stage::Render);
+        render(app);
     }
     wait(app);
     let mut cpu = Vec::with_capacity(16);
     for _ in 0..16 {
         let t = Instant::now();
-        app.run_stage(Stage::Render);
+        render(app);
         cpu.push(t.elapsed().as_secs_f64() * 1e6);
         wait(app);
     }
     let n = 64;
     let t = Instant::now();
     for i in 0..n {
-        app.run_stage(Stage::Render);
+        render(app);
         if i % 8 == 7 {
             wait(app);
         }
@@ -164,7 +173,7 @@ fn ab_round(app: &mut App) -> [f64; 3] {
     let mut latency = Vec::with_capacity(16);
     for _ in 0..16 {
         let t = Instant::now();
-        app.run_stage(Stage::Render);
+        render(app);
         wait(app);
         latency.push(t.elapsed().as_secs_f64() * 1e6);
     }
@@ -177,7 +186,7 @@ fn idle_round(app: &mut App, idle: Duration) -> f64 {
     for _ in 0..30 {
         std::thread::sleep(idle);
         let t = Instant::now();
-        app.run_stage(Stage::Render);
+        render(app);
         wait(app);
         v.push(t.elapsed().as_secs_f64() * 1e6);
     }

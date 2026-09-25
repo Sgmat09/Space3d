@@ -702,6 +702,7 @@ impl Renderer {
         self.stats.bytes_uploaded = self.uploader.bytes;
         self.stats.instance_bytes_uploaded = self.uploader.instance_bytes;
         self.stats.buffer_reallocations = self.uploader.reallocations;
+        self.stats.staging_chunks_created = self.uploader.chunks_created;
 
         if let Some(r) = resources.get_mut::<RenderAssets>() {
             *r = assets;

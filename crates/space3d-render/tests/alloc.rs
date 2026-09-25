@@ -129,7 +129,9 @@ fn steady_state_frames_allocate_a_small_constant_amount() {
     spawn_sun(&mut app);
 
     let mut frame = 0u32;
-    let mut step = |app: &mut App| -> (u64, i64) {
+    // Per frame: allocations, live bytes and the staging chunks the upload ring created (it
+    // holds two chunks when every frame is waited for, so none after the warm-up).
+    let mut step = |app: &mut App| -> (u64, i64, u32) {
         frame += 1;
         // Simulation work happens outside the counted window.
         let dy = if frame.is_multiple_of(2) { 0.01 } else { -0.01 };
@@ -147,7 +149,11 @@ fn steady_state_frames_allocate_a_small_constant_amount() {
         space3d_core::transform::propagate_transforms(&mut app.world);
         let (a0, l0) = (ALLOCS.load(Relaxed), LIVE_BYTES.load(Relaxed));
         app.run_stage(Stage::Render);
-        let counted = (ALLOCS.load(Relaxed) - a0, LIVE_BYTES.load(Relaxed) - l0);
+        let counted = (
+            ALLOCS.load(Relaxed) - a0,
+            LIVE_BYTES.load(Relaxed) - l0,
+            app.resources.expect::<RenderStats>().staging_chunks_created,
+        );
         // Let the GPU catch up (outside the window) so frames do not pile up in flight.
         let _ = app
             .resources
@@ -165,8 +171,11 @@ fn steady_state_frames_allocate_a_small_constant_amount() {
         }
         let live_before = LIVE_BYTES.load(Relaxed);
         per_frame.clear();
+        let mut chunks = 0;
         for _ in 0..FRAMES {
-            per_frame.push(step(&mut app).0);
+            let (allocs, _, created) = step(&mut app);
+            per_frame.push(allocs);
+            chunks += created;
         }
         let live_growth = LIVE_BYTES.load(Relaxed) - live_before;
         let s = stats(&app);
@@ -176,13 +185,15 @@ fn steady_state_frames_allocate_a_small_constant_amount() {
         let mean = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len() as f64;
         eprintln!(
             "{path:?} on {backend:?}: allocations per frame min {} max {max} mean {:.1}; live bytes \
-             {live_growth:+} over {FRAMES} frames ({} batches, {} pipeline binds, {} dispatches)",
+             {live_growth:+} over {FRAMES} frames ({} batches, {} pipeline binds, {} dispatches, \
+             {chunks} staging chunks created)",
             per_frame.iter().min().unwrap(),
             mean(&per_frame),
             s.batches,
             s.pipeline_switches,
             s.compute_dispatches,
         );
+        assert_eq!(chunks, 0, "{path:?}: the upload ring created chunks in a paced loop");
         let bound = bound(path, backend);
         assert!(
             max <= bound,
