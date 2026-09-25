@@ -1,0 +1,22 @@
+name: Nightly load
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # P4 exit criterion (§15.4): 200 real clients through the player service into rooms of 20,
+  # with the SLO gates of the load test (connect success, server tick p99, snapshot rate, no
+  # unexpected disconnects, no skipped ticks beyond scheduler noise).
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 200-client load test (release)
+        run: cargo test --release -p multiplayer_arena --test load -- --ignored --nocapture

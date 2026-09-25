@@ -219,6 +219,10 @@ impl Http {
         let client = reqwest::Client::builder()
             .user_agent(config.user_agent.clone())
             .tcp_nodelay(true)
+            // Drop idle pooled connections before servers close them (`HttpServer` closes idle
+            // keep-alive connections after its 15 s header-read timeout), so a request never
+            // races the server's close.
+            .pool_idle_timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_else(|e| {
                 tracing::error!("failed to build configured http client ({e}); using defaults");

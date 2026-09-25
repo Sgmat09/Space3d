@@ -1,0 +1,95 @@
+# Space3d server configuration (example). Every key can be overridden with an env var:
+#   SPACE3D__GAME__BIND=0.0.0.0:9000   (double underscore = nesting)
+# Secrets are never written here: point at env vars / files.
+
+role = "all-in-one"          # all-in-one | player-service | game-server
+env = "dev"                  # dev | production
+server_id = "${HOSTNAME:-local-1}"  # stable id; join tickets are bound to it
+region = "local"
+
+[log]
+format = "pretty"            # pretty | json
+filter = "info,space3d_server=info"
+
+[game]
+bind = "0.0.0.0:7777"
+path = "/play"
+public_url = "ws://127.0.0.1:7777/play"   # e.g. "wss://{server_id}.play.example.com/play"
+shards = 0                   # 0 = available_parallelism - 1
+max_rooms = 128
+max_players = 1024
+tick_hz = 60.0
+send_interval = 2            # snapshots at 30 Hz
+resume_window = "20s"
+empty_room_ttl = "30s"
+drain_timeout = "15m"
+max_catchup_ticks = 3
+allow_dev_auth = false       # only honoured on loopback binds
+allowed_origins = []         # ["https://play.example.com"]
+room_inbox = 8192
+
+[limits]
+max_message_bytes = "16KiB"
+max_connections = 10000
+max_connections_per_ip = 8
+handshakes_per_ip_per_min = 20
+handshake_timeout = "5s"
+idle_timeout = "10s"
+client_bandwidth = "48KiB"
+outbound_backlog_bytes = "1MiB"
+input_packets_per_sec = 90
+messages_per_sec = 30
+# Every HTTP listener, before a request completes / a WebSocket upgrade: per-IP and total
+# connection caps (checked at accept time), and slow-client timeouts.
+http_connections_per_ip = 64
+http_max_connections = 16384
+http_header_timeout = "10s"
+http_body_timeout = "10s"
+
+[player_service]
+bind = "0.0.0.0:8080"
+db_path = "data/players.db"
+session_ttl = "1h"
+refresh_ttl = "30d"
+join_ticket_ttl = "60s"
+guest_auth = true
+password_auth = false
+client_writable_keys = ["settings"]
+max_body_bytes = "64KiB"
+cors_origins = []
+http_rps_per_ip = 20
+login_attempts_per_min = 5
+
+[fleet]
+player_service_url = "ws://127.0.0.1:8080/internal/v1/fleet"
+player_service_http = "http://127.0.0.1:8080"
+heartbeat = "2s"
+lease_ttl = "10s"
+
+[admin]
+bind = "127.0.0.1:9090"
+
+[security]
+signing_kid = "k1"
+keys_env = "SPACE3D_KEYS"              # "k1:<base64 32+ bytes>,k0:<...>"
+# keys_file = "/run/secrets/keys.toml" # { k1 = "<base64>" }
+fleet_token_env = "SPACE3D_FLEET_TOKEN"
+admin_token_env = "SPACE3D_ADMIN_TOKENS"
+trusted_proxies = []                   # ["10.0.0.0/8"]
+
+[persistence]
+data_dir = "data"
+checkpoint_interval = "10s"
+checkpoint_store = "player-service"    # none | local | player-service
+recovery_max_age = "5m"
+
+[matchmaking]
+interval = "250ms"
+
+[[matchmaking.queues]]
+name = "duel"
+mode = "duel"
+teams = 2
+team_size = 1
+min_players = 2
+max_wait = "90s"

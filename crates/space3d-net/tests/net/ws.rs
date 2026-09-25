@@ -206,3 +206,170 @@ fn ws_events_system_tags_each_connection() {
         );
     }
 }
+
+#[test]
+fn server_closes_clients_that_send_oversized_messages() {
+    let ws = WsServer::with_config(WsServerConfig::default().max_message_size(1024));
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let conn = WsClient::connect(handle.ws_url("/"));
+    wait_until("open", || conn.is_open());
+
+    conn.send(vec![7u8; 1000]).unwrap();
+    wait_until("small message delivered", || {
+        ws.drain()
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Message { message, .. } if message.len() == 1000))
+    });
+
+    conn.send(vec![7u8; 4096]).unwrap();
+    wait_until("oversized sender closed", || conn.is_closed());
+    let reason = std::iter::from_fn(|| conn.poll_event())
+        .find_map(|e| match e {
+            WsEventKind::Closed { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("closed event");
+    assert!(reason.contains("1009"), "{reason}");
+    wait_until("server dropped client", || ws.client_count() == 0);
+    let left = ws
+        .drain()
+        .into_iter()
+        .find_map(|e| match e {
+            ServerEvent::Disconnected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("disconnected event");
+    assert!(left.contains("too big"), "{left}");
+}
+
+#[test]
+fn client_closes_on_oversized_inbound_message() {
+    let ws = WsServer::new();
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let conn = WsClient::connect_with(handle.ws_url("/"), WsConfig::default().max_message_size(1024));
+    wait_until("connected", || conn.is_open() && ws.client_count() == 1);
+    let client = ws.clients()[0];
+
+    ws.send(client, vec![1u8; 512]).unwrap();
+    wait_until("small message", || conn.try_recv().is_some_and(|m| m.len() == 512));
+    ws.send(client, vec![1u8; 8192]).unwrap();
+    wait_until("client refused the oversized message", || conn.is_closed());
+}
+
+#[test]
+fn outbound_backlog_limit_disconnects_slow_consumers() {
+    let ws = WsServer::with_config(WsServerConfig::default().outbound_limit_bytes(4096));
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let conn = WsClient::connect(handle.ws_url("/"));
+    wait_until("connected", || conn.is_open() && ws.client_count() == 1);
+    let client = ws.clients()[0];
+    assert!(ws.backlog_bytes(client).is_some_and(|b| b <= 4096));
+    assert_eq!(ws.backlog_bytes(ClientId(u64::MAX)), None);
+
+    ws.send(client, vec![0u8; 1024]).unwrap();
+    assert_eq!(ws.send(client, vec![0u8; 8192]), Err(NetError::Closed));
+    wait_until("slow consumer closed", || conn.is_closed());
+    let reason = std::iter::from_fn(|| conn.poll_event())
+        .find_map(|e| match e {
+            WsEventKind::Closed { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("closed event");
+    assert!(reason.contains("1008"), "{reason}");
+}
+
+#[test]
+fn accept_hook_and_metadata() {
+    let ws = WsServer::with_config(WsServerConfig::default().accept(|meta| {
+        if meta.user_agent.as_deref() == Some("blocked") {
+            Err(403)
+        } else {
+            Ok(())
+        }
+    }));
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let conn = WsClient::connect(handle.ws_url("/"));
+    wait_until("connected", || conn.is_open() && ws.client_count() == 1);
+    let meta = ws.client_meta(ws.clients()[0]).unwrap();
+    assert!(meta.addr.ip().is_loopback());
+    assert_eq!(meta.origin, None);
+    assert_eq!(ws.config().max_message_size, 1 << 20);
+
+    let closed = WsServer::with_config(WsServerConfig::default().accept(|_| Err(403)));
+    let handle = closed.listen(LOCALHOST_ANY_PORT).unwrap();
+    let rejected = WsClient::connect(handle.ws_url("/"));
+    wait_until("rejected upgrade", || rejected.is_closed());
+    assert_eq!(closed.client_count(), 0);
+}
+
+#[test]
+fn async_recv_and_inbound_bound() {
+    let ws = WsServer::with_config(WsServerConfig::default().inbound_queue(2));
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let conn = WsClient::connect(handle.ws_url("/"));
+    wait_until("connected", || conn.is_open() && ws.client_count() == 1);
+    let first = space3d_tasks::spawn({
+        let ws = ws.clone();
+        async move { ws.recv().await }
+    })
+    .block()
+    .flatten();
+    assert!(matches!(first, Some(ServerEvent::Connected { .. })));
+
+    for i in 0..4u8 {
+        let _ = conn.send(vec![i]);
+    }
+    // Two fit in the inbox; the third overflows it and the sender is closed.
+    wait_until("flooding sender closed", || conn.is_closed());
+    assert!(ws.inbound_len() <= 2);
+    let msgs = ws
+        .drain()
+        .into_iter()
+        .filter(|e| matches!(e, ServerEvent::Message { .. }))
+        .count();
+    assert_eq!(msgs, 2);
+    assert_eq!(ws.inbound_len(), 0);
+}
+
+#[test]
+fn upgrade_headers_reach_the_accept_hook() {
+    let ws = WsServer::with_config(WsServerConfig::default().accept(|meta| {
+        if meta.authorization.as_deref() == Some("Bearer s3cret") {
+            Ok(())
+        } else {
+            Err(401)
+        }
+    }));
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let anonymous = WsClient::connect(handle.ws_url("/"));
+    wait_until("anonymous refused", || anonymous.is_closed());
+    let authed = WsClient::connect_with(
+        handle.ws_url("/"),
+        WsConfig::default().header("authorization", "Bearer s3cret"),
+    );
+    wait_until("token accepted", || authed.is_open() && ws.client_count() == 1);
+    let meta = ws.client_meta(ws.clients()[0]).unwrap();
+    assert!(!format!("{meta:?}").contains("s3cret"), "redacted in Debug");
+    assert!(!format!("{:?}", WsConfig::default().header("authorization", "x-secret")).contains("x-secret"));
+}
+
+/// A `ClientSender` sends, reports its backlog and liveness, and closes without the server's
+/// client table.
+#[test]
+fn client_sender_works_without_the_client_table() {
+    let ws = WsServer::new();
+    let handle = ws.listen(LOCALHOST_ANY_PORT).unwrap();
+    let conn = WsClient::connect(handle.ws_url("/"));
+    wait_until("connected", || conn.is_open() && ws.client_count() == 1);
+    let id = ws.clients()[0];
+    let sender = ws.client_sender(id).expect("connected client");
+    assert!(sender.is_connected());
+    sender.send(vec![7u8, 8]).unwrap();
+    wait_until("delivered", || conn.drain().contains(&Message::Binary(vec![7, 8])));
+    assert_eq!(sender.backlog_bytes(), 0);
+    sender.close_with(1008, "bye");
+    assert!(!sender.is_connected(), "closing at once (no send after a queued close)");
+    wait_until("closed", || conn.is_closed() && ws.client_count() == 0);
+    assert_eq!(sender.send(vec![1u8]), Err(NetError::Closed));
+    assert!(ws.client_sender(id).is_none(), "gone from the table");
+}

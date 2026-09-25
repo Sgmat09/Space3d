@@ -1,0 +1,22 @@
+[package]
+name = "arena-client"
+description = "Arena example client (native + web): connects to a Space3d game server, predicts its own pawn, interpolates everyone else"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+arena-shared = { path = "../arena-shared" }
+space3d-core.workspace = true
+space3d-platform.workspace = true
+space3d-render.workspace = true
+space3d-replication.workspace = true
+tracing.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { workspace = true, features = ["Window", "Location"] }

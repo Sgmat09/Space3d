@@ -57,7 +57,27 @@ jobs:
           cargo check --target wasm32-unknown-unknown \
             -p space3d-core -p space3d-tasks -p space3d-render -p space3d-platform \
             -p space3d-assets -p space3d-net -p space3d-db -p space3d-audio \
-            -p space3d-physics -p space3d-scene -p space3d-ui -p space3d
+            -p space3d-physics -p space3d-scene -p space3d-ui -p space3d \
+            -p space3d-replication
+      # Web game clients build the replication crate client-only (§15.3).
+      - name: Check the replication client for web
+        run: cargo check --target wasm32-unknown-unknown -p space3d-replication --no-default-features --features client
+
+  # Dedicated servers ship with `--profile server` (panic = "unwind"): prove that a panicking
+  # room is contained and restored in that profile, not only in the test profile (§15.3).
+  server-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Room panics are contained (profile server)
+        run: |
+          cargo test --profile server -p space3d-server --test cluster -- \
+            room_crash_is_contained a_crash_looping_room_is_closed a_room_crash_during_its_drain_handoff \
+            a_stale_copy_rebuilt_after_a_crash
+          cargo test --profile server -p space3d-server --test handoff -- crash
+          cargo test --profile server -p space3d-server --test e2e
 
   mobile:
     runs-on: macos-latest

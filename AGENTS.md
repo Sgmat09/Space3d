@@ -35,6 +35,8 @@ Rust cross-platform game engine (desktop, web/wasm, Android, iOS). Cargo workspa
 | `space3d-render` | wgpu renderer, meshes, materials, camera, lights, instancing, headless capture |
 | `space3d-assets` | asset server, handles, image/glTF/OBJ loading, hot reload, texture & mesh editing ops |
 | `space3d-net` | HTTP client/server, WebSocket client/server, native + web |
+| `space3d-replication` | multiplayer netcode shared by client + server (wasm-clean): transports, protocol, delta snapshots, interest, prediction/reconciliation, interpolation, test harness |
+| `space3d-server` | dedicated authoritative game server + player service (auth, matchmaking, lobbies, fleet, checkpoints, admin/metrics); see docs/server.md |
 | `space3d-db` | SQLite (rusqlite, native), KV + save slots + migrations, web fallback |
 | `space3d-github` | GitHub REST: releases, issues (crash reports), CI templates |
 | `space3d-audio` | kira-based audio, spatial emitters |

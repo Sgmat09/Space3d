@@ -1,0 +1,43 @@
+[package]
+name = "space3d-replication"
+description = "Space3d netcode: authoritative-server replication, prediction, interpolation and transports (native + web)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["server", "client", "api"]
+# Room-side replication (pure logic; also used by the in-process harness and future listen servers).
+server = []
+# ClientReplicationPlugin: connection, prediction, interpolation.
+client = []
+# Player-service REST DTOs + PlayerServiceClient (owned by the space3d-server builder, see docs/design/game-server.md).
+api = ["dep:space3d-db", "dep:uuid"]
+# Deterministic in-process NetHarness (server + N clients over the memory transport) and bots.
+harness = ["server", "client"]
+
+[dependencies]
+space3d-core.workspace = true
+space3d-tasks.workspace = true
+space3d-net.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+ahash.workspace = true
+smallvec.workspace = true
+web-time.workspace = true
+parking_lot.workspace = true
+async-channel.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+space3d-db = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, optional = true, features = ["js"] }
+
+[dev-dependencies]
+proptest.workspace = true
+# Integration tests drive the deterministic harness.
+space3d-replication = { path = ".", features = ["harness"] }

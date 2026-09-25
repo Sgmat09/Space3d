@@ -1,0 +1,55 @@
+[package]
+name = "space3d-server"
+description = "Space3d dedicated servers: headless authoritative game server (rooms, gateway, checkpoints) and player service (accounts, sessions, matchmaking, fleet, leaderboards)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["password-auth"]
+# Username/password accounts (argon2id). Guest/device accounts are always available.
+password-auth = ["dep:argon2"]
+# In-process full-stack TestCluster (player service + gatekeeper + rooms + clients over the
+# memory network, manual clocks).
+testing = ["space3d-replication/harness"]
+
+[[bin]]
+name = "space3d-server"
+path = "src/bin/space3d-server.rs"
+
+# Native only: the library is empty on wasm32 (see src/lib.rs) so `cargo check --workspace
+# --target wasm32-unknown-unknown` stays green.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+space3d-core.workspace = true
+space3d-tasks.workspace = true
+space3d-net.workspace = true
+space3d-db.workspace = true
+space3d-scene.workspace = true
+space3d-replication = { workspace = true, features = ["server", "client", "api"] }
+tokio = { workspace = true, features = ["signal"] }
+futures.workspace = true
+async-channel.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+toml.workspace = true
+clap = { workspace = true, features = ["env"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+thiserror.workspace = true
+base64.workspace = true
+uuid.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+argon2 = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+space3d-replication = { workspace = true, features = ["harness"] }
+# Integration tests drive the in-process `TestCluster`.
+space3d-server = { path = ".", features = ["testing"] }

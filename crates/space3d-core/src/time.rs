@@ -55,4 +55,28 @@ impl Time {
     pub fn elapsed_secs(&self) -> f64 {
         self.elapsed.as_secs_f64()
     }
+
+    /// Whole fixed steps still pending in this frame (from `PreUpdate`, that many `FixedUpdate`
+    /// runs follow, capped by [`TickRate::max_steps_per_frame`]).
+    pub fn pending_steps(&self) -> u32 {
+        if self.fixed_delta.is_zero() {
+            return 0;
+        }
+        (self.accumulator.as_nanos() / self.fixed_delta.as_nanos()).min(u128::from(u32::MAX)) as u32
+    }
+
+    /// Drop the pending whole fixed steps of this frame beyond `keep` (call from `PreUpdate`).
+    /// For a system that just realigned the simulation with an external clock (a network
+    /// resync after a long frame), the backlog is already accounted for and running it would
+    /// overshoot. The fractional remainder (`alpha`) is kept. Returns the steps dropped; they
+    /// are not counted in `dropped_ticks`.
+    pub fn discard_backlog(&mut self, keep: u32) -> u32 {
+        let pending = self.pending_steps();
+        if pending <= keep {
+            return 0;
+        }
+        let drop = pending - keep;
+        self.accumulator = self.accumulator.saturating_sub(self.fixed_delta * drop);
+        drop
+    }
 }

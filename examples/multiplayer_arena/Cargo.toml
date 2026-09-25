@@ -1,0 +1,55 @@
+[package]
+name = "multiplayer_arena"
+description = "Multiplayer example: a dedicated authoritative server (player service + game server in one process) and native/web clients driving cubes with WASD (local prediction, remote interpolation)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["client"]
+# The windowed client (winit + wgpu). Build the headless server without it:
+# `cargo build -p multiplayer_arena --bin server --no-default-features`.
+client = ["dep:space3d-platform", "dep:space3d-render"]
+
+# Dedicated server (all-in-one by default; `--role game-server` / `player-service` to split).
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+# Native / web client (`--headless --bot` for tests).
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+required-features = ["client"]
+
+# Headless bots over real WebSockets with SLO gates.
+[[bin]]
+name = "loadtest"
+path = "src/bin/loadtest.rs"
+
+[dependencies]
+space3d-core.workspace = true
+space3d-net.workspace = true
+space3d-tasks.workspace = true
+space3d-replication.workspace = true
+serde.workspace = true
+tracing.workspace = true
+space3d-platform = { workspace = true, optional = true }
+space3d-render = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+space3d-server.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { workspace = true, features = ["Window", "Location"] }
+
+[dev-dependencies]
+space3d-replication = { workspace = true, features = ["harness"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+space3d-server = { workspace = true, features = ["testing"] }
+tempfile.workspace = true

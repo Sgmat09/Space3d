@@ -1,0 +1,27 @@
+[package]
+name = "arena-server"
+description = "Arena example: dedicated authoritative game server binary (all-in-one or game-server role) and a load-test bot binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "arena-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "arena-loadtest"
+path = "src/bin/arena-loadtest.rs"
+
+# Native only: the server library is empty on wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arena-shared = { path = "../arena-shared" }
+space3d-core.workspace = true
+space3d-replication.workspace = true
+space3d-server.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+space3d-server = { workspace = true, features = ["testing"] }

@@ -16,6 +16,8 @@ type Job = Box<dyn FnOnce(&mut std::result::Result<Connection, String>) + Send>;
 /// Owns the sending side of the job queue; the thread owns the connection.
 pub(crate) struct Worker {
     tx: mpsc::Sender<Job>,
+    /// Jobs submitted and not finished yet.
+    depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Worker {
@@ -35,7 +37,15 @@ impl Worker {
                 tracing::debug!(path = %config.path.display(), "db worker shutting down");
             })
             .expect("failed to spawn space3d-db worker thread");
-        Self { tx }
+        Self {
+            tx,
+            depth: Default::default(),
+        }
+    }
+
+    /// Jobs queued or running.
+    pub(crate) fn depth(&self) -> usize {
+        self.depth.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Queue `f` on the worker. Panics inside `f` are caught and reported as
@@ -46,7 +56,10 @@ impl Worker {
         F: FnOnce(&mut Connection) -> Result<R> + Send + 'static,
     {
         let (otx, orx) = oneshot::channel();
+        let depth = self.depth.clone();
+        depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let job: Job = Box::new(move |conn| {
+            let _done = DepthGuard(depth);
             let result = match conn {
                 Ok(conn) => catch_unwind(AssertUnwindSafe(|| f(conn))).unwrap_or_else(|p| {
                     let msg = p
@@ -63,6 +76,15 @@ impl Worker {
         // If the worker is gone the job (and `otx`) is dropped: the receiver reports WorkerGone.
         let _ = self.tx.send(job);
         orx
+    }
+}
+
+/// Decrements the queue depth when a job finishes (or is dropped unrun).
+struct DepthGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
