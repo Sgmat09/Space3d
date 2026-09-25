@@ -112,13 +112,39 @@ impl App {
         name: &'static str,
         system: impl FnMut(&mut SystemCtx) + Send + 'static,
     ) -> &mut Self {
-        self.schedule.stages[stage.index()].push(NamedSystem {
-            name,
-            run: Box::new(system),
-        });
+        self.add_system_ordered(stage, 0, name, system)
+    }
+
+    /// Register `system` in `stage` at position `order`: the systems of a stage run by
+    /// ascending `order`, ties in registration order. [`Self::add_system`] and
+    /// [`Self::add_system_named`] register at order 0, so their relative order is the
+    /// registration order.
+    ///
+    /// Plugins use a positive order for systems that must see what the stage's gameplay systems
+    /// did this tick, whenever those were added (the particle tick follows emitters to where
+    /// gameplay moved them: `space3d_particles::ParticlesPlugin::TICK_ORDER`), and a negative one
+    /// for systems that feed them.
+    pub fn add_system_ordered(
+        &mut self,
+        stage: Stage,
+        order: i32,
+        name: &'static str,
+        system: impl FnMut(&mut SystemCtx) + Send + 'static,
+    ) -> &mut Self {
+        let systems = &mut self.schedule.stages[stage.index()];
+        let at = systems.partition_point(|s| s.order <= order);
+        systems.insert(
+            at,
+            NamedSystem {
+                name,
+                order,
+                run: Box::new(system),
+            },
+        );
         self
     }
 
+    /// Names of the systems of `stage`, in run order.
     pub fn system_names(&self, stage: Stage) -> Vec<&'static str> {
         self.schedule.stages[stage.index()].iter().map(|s| s.name).collect()
     }
@@ -227,6 +253,25 @@ mod tests {
     struct Counter {
         fixed: u32,
         frames: u32,
+    }
+
+    #[test]
+    fn ordered_systems_run_by_order_then_registration() {
+        #[derive(Default)]
+        struct Log(Vec<&'static str>);
+        let mut app = App::new();
+        app.init_resource::<Log>();
+        let push = |name: &'static str| move |c: &mut SystemCtx| c.resources.expect_mut::<Log>().0.push(name);
+        app.add_system_ordered(Stage::FixedUpdate, 10, "late", push("late"));
+        app.add_system_named(Stage::FixedUpdate, "a", push("a"));
+        app.add_system_ordered(Stage::FixedUpdate, -5, "early", push("early"));
+        app.add_system_named(Stage::FixedUpdate, "b", push("b"));
+        app.add_system_ordered(Stage::FixedUpdate, 10, "later", push("later"));
+        app.add_system_ordered(Stage::FixedUpdate, 0, "c", push("c"));
+        let order = ["early", "a", "b", "c", "late", "later"];
+        assert_eq!(app.system_names(Stage::FixedUpdate), order);
+        app.step_ticks(1);
+        assert_eq!(app.resources.expect::<Log>().0, order);
     }
 
     #[test]
