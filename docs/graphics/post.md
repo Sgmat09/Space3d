@@ -124,28 +124,37 @@ change: a still scene uploads nothing. The steady state creates no textures and 
 nothing (`tests/post.rs`, `tests/alloc_post.rs`); wgpu-hal on Metal allocates about 20 times per
 render pass (332 allocations per frame with bloom vs 106 for the composite alone).
 
-GPU time on the dev machine (Apple M4 Max, Metal, 1080p, 6 levels, chains back to back, best
-of 40 rounds of 10; `cargo test -p space3d-render --lib bloom_gate -- --ignored --nocapture`):
+GPU time on the dev machine (Apple M4 Max, Metal; `bloom_gate_1080p` below): the GPU kept busy
+(command buffers of 5 chains submitted back to back after a warm-up), each timed from the start
+of its first pass to the end of its last, best of 40:
 
-| measurement | GPU |
+| chain | GPU (loaded) |
 |---|---|
-| whole chain, `Rg11b10Ufloat` | 0.26–0.31 ms |
-| of which the prefilter (reads the 1080p scene) | ~0.06 ms |
-| of which the level-0 upsample (960 × 540, blended) | ~0.03 ms |
-| a 128 × 128 chain (11 passes, almost no pixels) | ~0.19 ms |
+| 6 levels, 1080p (level 0 960 × 540), `Rg11b10Ufloat` | 0.14–0.17 ms |
+| the same, `Rgba16Float` | 0.14–0.15 ms |
+| 6 levels over a 128 × 128 scene (almost no pixels) | 0.15 ms |
+| the prefilter alone (1 level), 1080p | 0.07 ms |
+| `GraphicsQuality::Low` settings at 1080p (4 levels, level 0 480 × 270) | 0.08 ms |
+| `GraphicsQuality::High` (7 levels; level 0 still 960 × 540 at 1080p) | 0.17 ms |
 
-The chain is dominated by its 11 dependent render passes: on this GPU each costs about
-11–17 µs even when nearly empty. See "Gate" below.
+On this GPU the chain costs its 11 dependent render passes (about 14 µs each), not its pixels:
+a 128² chain costs as much as a 1080p one, and the two chain formats cost the same. When
+frames are isolated (the GPU idles between them and drops to low clocks) the same chain
+measures about 0.45 ms; as for the composite (`frame.md` "Cost"), the gate uses the loaded
+regime.
 
 ### Gate
 
-Spec §4.4 sets "bloom 6 mips @1080p ≤ 0.20 ms" on the dev machine. The measured chain is
-0.26–0.31 ms (recorded while the machine ran other builds, load average 80–250); a 128² chain
-with the same 11 passes and almost no pixels already takes ~0.19 ms, so the budget is spent by
-per-pass cost before any pixel work. The gate is relaxed to **0.35 ms** (the spec's T1 bloom
-budget), with this measurement as the reason. Reaching 0.20 ms needs fewer dependent passes (a
-compute chain with one pass on class A backends, or fused small levels), which is a design
-change, not a tuning.
+Spec §4.4: "bloom 6 mips @1080p ≤ 0.20 ms" on the dev machine: **met** (0.14–0.17 ms). The test
+`post::bloom::tests::bloom_gate_1080p` measures it; it is ignored by default because the other
+GPU tests of the same binary run in parallel with it, so run it alone:
+
+```sh
+cargo test -p space3d-render --lib bloom_gate -- --ignored --nocapture
+```
+
+`SPACE3D_PERF_BUDGET_SCALE` relaxes the budget on slower machines; the test skips without
+`TIMESTAMP_QUERY`.
 
 ### Determinism
 
@@ -161,6 +170,7 @@ Bloom has no temporal state and no noise: the same scene gives bit-identical cha
   `bloom_downlevel_parity`; `gl_bloom_matches_default_backend`.
 * `tests/alloc_post.rs`: allocations per frame with bloom on one and on two post groups.
 * Unit tests in `src/post/bloom.rs`: chain sizing, the soft threshold's CPU mirror, pass
-  uniforms, the WGSL layout, and the GPU-time gate (`bloom_gate_1080p`, ignored by default).
+  uniforms, the WGSL layout, and the GPU-time gate (`bloom_gate_1080p`, run alone with
+  `--ignored`).
 * Stories: `Engine/Post/Bloom` (engines, laser bolts, sparks, stars and a threshold ramp, with
   every `Bloom` field on a knob) and `Engine/Post/Bloom Veil` (`Bloom::natural()`).

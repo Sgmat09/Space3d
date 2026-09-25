@@ -598,9 +598,11 @@ mod tests {
         assert_eq!(all[10].src_rect, [0.0, 0.0, 480.0, 270.0]);
     }
 
-    /// GPU milliseconds of one bloom chain over a 1920 × 1080 scene texture in `format`,
-    /// loaded (`chains` recorded back to back, timed from the start of the first pass to the end of
-    /// the last; the best of `rounds`), or `None` without an adapter or `TIMESTAMP_QUERY`.
+    /// GPU milliseconds of one bloom chain over a 1920 × 1080 scene texture in `format` with the
+    /// GPU loaded: after a warm-up, `rounds` command buffers of `chains` chains are submitted back
+    /// to back (no idle between them); each round is timed from the start of its first pass to
+    /// the end of its last, and the best round counts (other processes' GPU work only ever adds).
+    /// `None` without an adapter or `TIMESTAMP_QUERY`.
     fn gpu_ms_per_chain(bloom: &Bloom, format: wgpu::TextureFormat, chains: u32, rounds: u32) -> Option<f64> {
         gpu_ms_per_chain_at((1920, 1080), bloom, format, chains, rounds)
     }
@@ -670,12 +672,13 @@ mod tests {
         let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("bloom gate"),
             ty: wgpu::QueryType::Timestamp,
-            count: 2,
+            count: 2 * rounds,
         });
+        let bytes = 16 * rounds as u64;
         let buffer = |usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bloom gate"),
-                size: 16,
+                size: bytes,
                 usage,
                 mapped_at_creation: false,
             })
@@ -685,80 +688,90 @@ mod tests {
         let mut pool = crate::frame::TexturePool::default();
         let mut stats = crate::RenderStats::default();
         let mut up = Uploader::new(device);
-        let mut best = f64::MAX;
-        for round in 0..=rounds {
-            let mut encoder = device.create_command_encoder(&Default::default());
-            if round == 0 {
-                // Scene content (the passes have no data-dependent branches).
-                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &scene,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 4.0,
-                                g: 2.0,
-                                b: 1.0,
-                                a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    ..Default::default()
-                });
-                state.flush(device, &mut encoder, &mut up, &sampler);
-                up.finish();
-            }
+        // Scene content (the passes have no data-dependent branches) and uniforms.
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &scene,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 4.0,
+                        g: 2.0,
+                        b: 1.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        state.flush(device, &mut encoder, &mut up, &sampler);
+        up.finish();
+        queue.submit([encoder.finish()]);
+        let mut record = |encoder: &mut wgpu::CommandEncoder, timed: Option<u32>| {
             for i in 0..chains {
-                pool.begin_frame(round as u64);
+                pool.begin_frame(0);
                 let mut cx = PostEncode {
                     device,
                     queue,
-                    encoder: &mut encoder,
+                    encoder,
                     stats: &mut stats,
                     pool: &mut pool,
                 };
-                let timestamps = ChainTimestamps {
+                let timestamps = timed.map(|round| ChainTimestamps {
                     query_set: &queries,
-                    begin: (i == 0).then_some(0),
-                    end: (i + 1 == chains).then_some(1),
-                };
+                    begin: (i == 0).then_some(2 * round),
+                    end: (i + 1 == chains).then_some(2 * round + 1),
+                });
                 state
-                    .encode(&mut cx, (&scene, 1), &plan, &exposure, 0, Some(timestamps))
+                    .encode(&mut cx, (&scene, 1), &plan, &exposure, 0, timestamps)
                     .expect("params");
                 pool.release_all();
             }
-            queue.submit([encoder.finish()]);
-            // Resolve once the passes finished (Metal writes end-of-pass samples late).
-            device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        };
+        // Warm-up, so the GPU runs at its loaded clocks.
+        for _ in 0..30 {
             let mut encoder = device.create_command_encoder(&Default::default());
-            encoder.resolve_query_set(&queries, 0..2, &resolve, 0);
-            encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, 16);
+            record(&mut encoder, None);
             queue.submit([encoder.finish()]);
-            read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-            let t: [u64; 2] = bytemuck::pod_read_unaligned(&read.slice(..).get_mapped_range().expect("mapped"));
-            read.unmap();
-            let ms = t[1].saturating_sub(t[0]) as f64 * queue.get_timestamp_period() as f64 * 1e-6;
-            if round > 0 {
-                best = best.min(ms / chains as f64);
-            }
         }
+        for round in 0..rounds {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            record(&mut encoder, Some(round));
+            queue.submit([encoder.finish()]);
+        }
+        // Resolve once every pass finished (Metal writes end-of-pass samples late).
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.resolve_query_set(&queries, 0..2 * rounds, &resolve, 0);
+        encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, bytes);
+        queue.submit([encoder.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let t: Vec<u64> = bytemuck::pod_collect_to_vec(&read.slice(..).get_mapped_range().expect("mapped"));
+        read.unmap();
+        let period = queue.get_timestamp_period() as f64 * 1e-6;
+        let best = t
+            .chunks(2)
+            .map(|p| p[1].saturating_sub(p[0]) as f64 * period / chains as f64)
+            .filter(|ms| *ms > 0.0)
+            .fold(f64::MAX, f64::min);
         assert_eq!(r.gpu_error_count(), 0);
         Some(best)
     }
 
-    /// Gate (graphics spec §4.4 "bloom 6 mips @1080p"): GPU time of the chain on the dev machine
-    /// (Apple M4 Max), loaded. The spec's initial 0.20 ms is relaxed to 0.35 ms (its T1 budget)
-    /// with the measurement in docs/graphics/post.md "Gate": 11 dependent render passes cost
-    /// ~0.19 ms on this GPU with almost no pixels. Skips without `TIMESTAMP_QUERY`;
-    /// `SPACE3D_PERF_BUDGET_SCALE` relaxes it on slower machines. Ignored by default (GPU time on
-    /// a shared machine varies with its load): run it with `-- --ignored --nocapture`.
+    /// Gate (graphics spec §4.4): bloom with 6 levels at 1080p ≤ 0.20 ms of GPU time on the dev
+    /// machine (Apple M4 Max), loaded (measured 0.14–0.17 ms). Skips without `TIMESTAMP_QUERY`;
+    /// `SPACE3D_PERF_BUDGET_SCALE` relaxes it on slower machines. Ignored by default: next to the
+    /// other GPU tests of this binary (run in parallel) or other processes' GPU work, the
+    /// timing is not the chain's alone. Run it alone: `cargo test -p space3d-render --lib
+    /// bloom_gate -- --ignored --nocapture`.
     #[test]
-    #[ignore = "perf gate: run on the dev machine with --ignored"]
+    #[ignore = "perf gate: run alone with --ignored"]
     fn bloom_gate_1080p() {
-        const GATE_MS: f64 = 0.35;
+        const GATE_MS: f64 = 0.20;
         let glow = Bloom::glow();
         assert_eq!(chain_size((1920, 1080), &glow).1, 6);
         let scale = std::env::var("SPACE3D_PERF_BUDGET_SCALE")
@@ -770,16 +783,19 @@ mod tests {
             eprintln!("skipping GPU test: no adapter or no float targets");
             return;
         };
+        let mut gated = None;
         for f in [format, wgpu::TextureFormat::Rgba16Float] {
-            let Some(ms) = gpu_ms_per_chain(&glow, f, 10, 40) else {
+            let Some(ms) = gpu_ms_per_chain(&glow, f, 5, 40) else {
                 eprintln!("skipping GPU timing: no TIMESTAMP_QUERY");
                 return;
             };
             eprintln!("bloom 6 mips @1080p, {f:?} chain: {ms:.3} ms GPU (loaded)");
             if f == format {
-                assert!(ms <= GATE_MS * scale, "bloom {ms:.3} ms > {:.3} ms", GATE_MS * scale);
+                gated = Some(ms);
             }
         }
+        let ms = gated.expect("measured");
+        assert!(ms <= GATE_MS * scale, "bloom {ms:.3} ms > {:.3} ms", GATE_MS * scale);
     }
 
     #[test]
