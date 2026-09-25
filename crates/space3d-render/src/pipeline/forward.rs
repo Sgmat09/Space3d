@@ -179,8 +179,10 @@ pub(super) const TEMPLATE_RESOURCES: [(u32, u32, &str); 4] = [
     (1, 2, "base_sampler"),
 ];
 
-/// [`validate_wgsl`] for a forward shader with a custom shader spliced in, checking what naga
-/// accepts but the forward pipeline cannot run the same way on every backend:
+/// naga validation ([`parse_and_validate`]) of a forward shader with a custom shader spliced in,
+/// plus what naga accepts but the forward pipeline cannot run the same way on every backend.
+///
+/// Rejected on every backend (`Err`):
 ///
 /// * resources of its own: the pipeline layout has no bindings for them, so the pipeline
 ///   fails validation;
@@ -190,18 +192,22 @@ pub(super) const TEMPLATE_RESOURCES: [(u32, u32, &str); 4] = [
 /// * any other address space but `function` and `private` (immediates, mesh and ray-tracing
 ///   payloads: optional capabilities the forward pipeline does not use);
 /// * pipeline constants (`override`) without a default: the forward pipeline sets none, so
-///   creating it fails;
-/// * built-in functions WebGL2 / GLES 3.0 (GLSL ES 3.00) lacks ([`GLES3_MISSING`],
-///   `textureGather*`), and anything else naga cannot translate to GLSL ES 3.00
-///   (`textureNumLevels`, `textureNumSamples`, `pack4x8snorm`, `pack4x8unorm`, …). Metal,
-///   Vulkan, DX12 and WebGPU run them, but a shader that works there would silently fall back to
-///   the built-in shader on WebGL2: they are rejected on every backend, so the problem shows up
-///   on the machine the shader is written on (see [`CustomShader`] for the list).
+///   creating it fails.
+///
+/// What GLSL ES 3.00 (WebGL2, GLES 3.0) cannot run — the built-in functions of
+/// [`GLES3_MISSING`] and `textureGather*`, and anything else naga cannot translate to GLSL
+/// ES 3.00 (`textureNumLevels`, `textureNumSamples`, `pack4x8snorm`, `pack4x8unorm`, …) — is
+/// rejected only when `glsl_es_300` (the device is such a GL device: the driver would fail to
+/// compile it, in the browser only once the pipeline exists). Elsewhere Metal, Vulkan, DX12,
+/// WebGPU and GLES 3.1+ run it, so the shader builds and draws exactly as before; the
+/// portability problem comes back as `Ok(Some(warning))` (reported through
+/// [`crate::Renderer::shader_warning`]), so it still shows up on the machine the shader is
+/// written on.
 ///
 /// Detected here synchronously, because on browser WebGPU the error scope around pipeline
 /// creation only answers later (see [`Pipelines::poll_pending`]): until then every frame
 /// drawing with the invalid pipeline is lost.
-pub(crate) fn validate_custom_wgsl(src: &str) -> Result<(), String> {
+pub(crate) fn validate_custom_wgsl(src: &str, glsl_es_300: bool) -> Result<Option<String>, String> {
     use naga::AddressSpace as A;
     let (module, info) = parse_and_validate(src)?;
     for (_, g) in module.global_variables.iter() {
@@ -251,20 +257,24 @@ pub(crate) fn validate_custom_wgsl(src: &str) -> Result<(), String> {
             ));
         }
     }
-    if let Some(name) = gles3_missing_builtin(&module) {
-        return Err(format!(
-            "custom shaders cannot use `{name}`: WebGL2 and GLES 3.0 devices (GLSL ES 3.00) \
-             lack it, so the shader would not compile there; custom shaders are limited to what \
-             every backend runs"
-        ));
+    let gles3 = if let Some(name) = gles3_missing_builtin(&module) {
+        format!("it uses `{name}`, which GLSL ES 3.00 lacks")
+    } else if let Some(e) = gles3_translation_error(&module, &info) {
+        format!("it does not translate to GLSL ES 3.00: {e}")
+    } else {
+        return Ok(None);
+    };
+    if glsl_es_300 {
+        Err(format!(
+            "custom shader cannot build on this device, which compiles GLSL ES 3.00 like WebGL2 \
+             and GLES 3.0: {gles3}"
+        ))
+    } else {
+        Ok(Some(format!(
+            "custom shader builds on this device but not on WebGL2 / GLES 3.0 (GLSL ES 3.00), \
+             where its draws use the built-in shader: {gles3}"
+        )))
     }
-    if let Some(e) = gles3_translation_error(&module, &info) {
-        return Err(format!(
-            "custom shader does not translate to GLSL ES 3.00 (WebGL2 / GLES 3.0), so it would \
-             not run there; custom shaders are limited to what every backend runs: {e}"
-        ));
-    }
-    Ok(())
 }
 
 /// Material bind group layouts: `[single-layer (texture_2d), array (texture_2d_array)]`.
@@ -297,7 +307,8 @@ pub(super) fn material_bgls(device: &wgpu::Device) -> [wgpu::BindGroupLayout; 2]
 
 impl Pipelines {
     /// Build a forward pipeline. Custom shaders are validated with naga first (including that
-    /// they declare no resources the layout lacks) and built inside validation and internal
+    /// they declare no resources the layout lacks; see [`validate_custom_wgsl`] for what is
+    /// rejected and what only warned about) and built inside validation and internal
     /// error scopes, so their errors never reach the uncaptured-error handler. Where the
     /// scopes do not answer immediately (browser WebGPU), the pipeline is returned with its
     /// pending result (for [`Self::poll_pending`]).
@@ -322,8 +333,10 @@ impl Pipelines {
             None => {
                 let (_, kinds, ext, _, _) = module_key;
                 let source = forward_shader(layout, kinds, ext, custom.map(|c| &**c));
-                if custom.is_some() {
-                    validate_custom_wgsl(&source)?;
+                if custom.is_some()
+                    && let Some(warning) = validate_custom_wgsl(&source, self.glsl_es_300)?
+                {
+                    self.custom_warned(key, warning);
                 }
                 Some(source)
             }

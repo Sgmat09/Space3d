@@ -64,9 +64,24 @@ CameraFrame::default().with_hdr(HdrMode::Compact)
 **The Ldr fallback** (devices without float render targets — WebGL2 without
 `EXT_color_buffer_float` — or `HdrMode::Ldr`): the scene texture is `Rgba8UnormSrgb`, and every
 fragment and clear color is exposed and tonemapped with the camera's operator before it is
-written. The image matches the HDR path up to blending and 8-bit precision; bloom and auto
-exposure are off there. `FrameSettings::downlevel` (`DownlevelOverride::webgl2()`) forces the
-WebGL2-class paths on any device for testing.
+written. Bloom and auto exposure are off there. `FrameSettings::downlevel`
+(`DownlevelOverride::webgl2()`) forces the WebGL2-class paths on any device for testing.
+
+The image matches the HDR path up to 8-bit precision where every pixel is one opaque surface at
+one sample: opaque single-sample scenes stay within `CompareOptions::perceptual()` (at most 1 %
+of pixels off by more than 8/255). Two differences are inherent to tonemapping per fragment:
+
+* **MSAA:** each sample is tonemapped before the resolve, where HDR resolves radiance and then
+  tonemaps. Silhouettes between bright and dark surfaces resolve differently, up to about
+  100/255 at high-contrast edges.
+* **Blending:** translucent surfaces (and additive ones) blend tonemapped colors, where HDR
+  blends radiance. Overlaps are darker or brighter, most visibly over bright or emissive
+  backgrounds.
+
+With these, a scene stays within `perceptual()` with up to 8 % of pixels allowed off. Measured:
+MSAA 4× 0.1 % on Metal and 1.1 % on ANGLE, a translucent emissive quad 5.3 %, and both together
+3.6 % on Metal and 4.3 % on ANGLE, with SSIM ≥ 0.99. Every pixel that is off lies on a silhouette or under a translucent surface
+(`tests/frame_modes.rs` `webgl2_override_parity_msaa_and_blending`).
 
 ## Render scale
 
@@ -146,6 +161,11 @@ app.resources.expect_mut::<RenderNodes>().insert("depth-tint", DepthTint { /* �
 
 `crates/space3d-render/examples/frame_nodes.rs` is this node in full; the `Engine/Frame/Node
 Phases` and `Engine/Frame/Soft Depth` stories show every phase and the depth paths.
+
+Group 0 (`FrameLayouts::view`) holds only binding 0, the `View` uniform, for now. The lighting
+bindings 1–6 (environment cubes, BRDF LUT, shadow map and their samplers) join it with the
+lighting wiring (F7 / P-MAT PM4). Until then, a node shader that declares any of them fails
+pipeline validation.
 
 **When nodes are called.** Every rendered frame: `prepare` once per node (after the frame is
 planned, before GPU culling and every pass; compute allowed), then per camera view
@@ -307,6 +327,17 @@ four steps). Lasers become particle beams instead (particles area).
 * `RenderStats`: `intermediate_groups`, `post_groups`, `post_passes`, `render_passes`,
   `fullscreen_passes`, `textures_created` (0 in the steady state), `target_bytes`,
   `node_draws`, `node_dispatches`, `scene_read_passes`, `depth_resolves`, `distortion_passes`.
+* **MSAA on Apple GPUs (Metal):** the first frames after a pipeline's first draw can differ from
+  later frames by a few levels on some silhouette pixels. The renderer's inputs and commands
+  are the same in every frame (a static scene uploads nothing after its first frame). What
+  changes is the wall-clock time since the first draw. Once the first frame finished about
+  20 ms earlier, every later frame is identical. Prewarmed pipelines do not help, and 1× is
+  stable from the first frame. The behaviour is the same on `main` (eb77fef).
+  Measured at 4× and 160×120 with 1,100 to 1,900 instances in 3 to 5 batches: without waiting,
+  25 to 69 of the 19,200 pixels differ, by up to 10 levels, for 1 to 4 frames. After a 20 ms
+  wait, none do.
+  For exact MSAA captures, render one warm-up frame, wait for the GPU, then wait about 20 ms
+  before the captured frame. Otherwise compare with a tolerance.
 
 ## Cost
 

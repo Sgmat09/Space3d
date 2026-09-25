@@ -105,6 +105,16 @@ Additions made by the foundation since F2 (additive):
   * Capture replays render the scene views of an intermediate primary group into `S` when the
     frame skipped them (no surface texture); `GroupTextures::scene_frame` records the frame `S`
     holds. `capture_scene_hdr` does the same, and errs when the last frame had no primary view.
+* F-core review, round 2:
+  * `Renderer::shader_warning(ShaderHandle) -> Option<&str>` is new and additive. A custom
+    shader that uses what GLSL ES 3.00 lacks (`countOneBits`, `pack4x8unorm`,
+    `textureNumLevels`, `textureGather*`, …) is rejected only on WebGL2 / GLES 3.0 devices (GL
+    without compute shaders), where it cannot build. On every other device it builds and draws
+    as on `main`, and `shader_warning` (plus one `tracing` warning) reports the portability
+    problem. F0 had rejected such shaders on every backend, which changed pixels for shaders
+    that ran on Metal, Vulkan, DX12 and WebGPU.
+  * `FrameLayouts::view` holds binding 0 (`View`) only. The lighting bindings 1–6 of spec §3.4
+    join it with the lighting wiring (F7 / P-MAT PM4), and their docs say so.
 
 ## Ownership map (spec §3.6)
 

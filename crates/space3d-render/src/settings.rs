@@ -118,6 +118,8 @@ pub enum HdrMode {
     #[default]
     Auto,
     /// LDR scene with per-fragment tonemapping even where HDR exists (cheapest post path).
+    /// Opaque single-sample scenes look like `Auto`; MSAA silhouettes (tonemapped per sample
+    /// before the resolve) and translucent overlaps (blended after tonemapping) differ.
     Ldr,
     /// `Rg11b10Ufloat` (half the bandwidth, no alpha) on opaque-cleared primary targets where
     /// renderable; `Auto` elsewhere.

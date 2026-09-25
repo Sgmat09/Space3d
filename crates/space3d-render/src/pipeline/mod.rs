@@ -280,6 +280,12 @@ pub(crate) struct Pipelines {
     custom: FastMap<ShaderHandle, (u32, Arc<CustomShader>)>,
     /// First build error of a custom shader version.
     custom_errors: FastMap<ShaderHandle, (u32, String)>,
+    /// First portability warning of a custom shader version (it builds here, but not on
+    /// GLSL ES 3.00 devices).
+    custom_warnings: FastMap<ShaderHandle, (u32, String)>,
+    /// The device compiles shaders as GLSL ES 3.00 (WebGL2, GLES 3.0): custom shaders using
+    /// what that lacks are rejected instead of warned about.
+    glsl_es_300: bool,
     /// Custom-shader pipelines whose error scope has not answered yet (browser WebGPU; native
     /// backends answer immediately). See [`Self::poll_pending`].
     pending: Vec<PendingPipeline>,
@@ -324,7 +330,10 @@ pub(crate) fn sampled_view_dimension(layered: bool) -> wgpu::TextureViewDimensio
 }
 
 impl Pipelines {
-    pub fn new(device: &wgpu::Device, compute: bool) -> Self {
+    /// Layouts and the built-in modules; culling pipelines when `compute`. `glsl_es_300`: the
+    /// device compiles shaders as GLSL ES 3.00 (WebGL2, GLES 3.0; see
+    /// [`forward::validate_custom_wgsl`]).
+    pub fn new(device: &wgpu::Device, compute: bool, glsl_es_300: bool) -> Self {
         let view_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("space3d view"),
             entries: &[uniform_entry(
@@ -477,6 +486,8 @@ impl Pipelines {
             forward: FastMap::default(),
             custom: FastMap::default(),
             custom_errors: FastMap::default(),
+            custom_warnings: FastMap::default(),
+            glsl_es_300,
             pending: Vec::new(),
             layouts: vec![<crate::instance::InstanceTransform as crate::instance::InstanceData>::LAYOUT],
             cull,
@@ -545,6 +556,7 @@ impl Pipelines {
         }
         self.custom.retain(|&h, _| live(h));
         self.custom_errors.retain(|&h, _| live(h));
+        self.custom_warnings.retain(|&h, _| live(h));
         self.pending.retain(|p| p.key.shader.is_none_or(|(h, _)| live(h)));
         self.forward.retain(|k, _| k.shader.is_none_or(|(h, _)| live(h)));
         self.shaders.retain(|k, _| k.4.is_none_or(|(h, _)| live(h)));
@@ -563,6 +575,24 @@ impl Pipelines {
     pub fn custom_error(&self, handle: ShaderHandle) -> Option<&str> {
         let (version, e) = self.custom_errors.get(&handle)?;
         (self.custom.get(&handle).map(|(v, _)| *v) == Some(*version)).then_some(e.as_str())
+    }
+
+    /// Portability warning of the current version of a custom shader: it builds on this device
+    /// but not on WebGL2 / GLES 3.0 (see [`forward::validate_custom_wgsl`]).
+    pub fn custom_warning(&self, handle: ShaderHandle) -> Option<&str> {
+        let (version, w) = self.custom_warnings.get(&handle)?;
+        (self.custom.get(&handle).map(|(v, _)| *v) == Some(*version)).then_some(w.as_str())
+    }
+
+    /// Record (and log once) a portability warning of the custom shader of `key`.
+    fn custom_warned(&mut self, key: PipelineKey, warning: String) {
+        let Some((handle, version)) = key.shader else { return };
+        if self.custom_warnings.get(&handle).is_some_and(|(v, _)| *v == version) {
+            return;
+        }
+        let name = self.custom.get(&handle).map_or("?", |(_, s)| s.name.as_str());
+        tracing::warn!(shader = name, "{warning}");
+        self.custom_warnings.insert(handle, (version, warning));
     }
 
     /// Get or build the forward pipeline for `key`. A custom shader that fails to build (or is
@@ -938,8 +968,10 @@ mod tests {
             );
             let src = forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&custom));
             validate(&src); // naga alone accepts it
-            let e = validate_custom_wgsl(&src).unwrap_err();
-            assert!(e.contains("extra") && e.contains("cannot declare resources"), "{e}");
+            for glsl_es_300 in [false, true] {
+                let e = validate_custom_wgsl(&src, glsl_es_300).unwrap_err();
+                assert!(e.contains("extra") && e.contains("cannot declare resources"), "{e}");
+            }
         }
         // Private variables and the template's own resources are fine.
         let ok = CustomShader::new(
@@ -951,13 +983,10 @@ mod tests {
 ",
         );
         for layered in [false, true] {
-            validate_custom_wgsl(&forward_shader(
-                InstanceTransform::LAYOUT,
-                u8::from(layered),
-                false,
-                Some(&ok),
-            ))
-            .unwrap_or_else(|e| panic!("{e}"));
+            let src = forward_shader(InstanceTransform::LAYOUT, u8::from(layered), false, Some(&ok));
+            for glsl_es_300 in [false, true] {
+                assert_eq!(validate_custom_wgsl(&src, glsl_es_300), Ok(None));
+            }
         }
     }
 
@@ -999,8 +1028,10 @@ mod tests {
             for layered in [false, true] {
                 let src = forward_shader(InstanceTransform::LAYOUT, u8::from(layered), false, Some(&custom));
                 validate(&src); // naga alone accepts it
-                let e = validate_custom_wgsl(&src).unwrap_err();
-                assert!(e.contains(expected), "{e}");
+                for glsl_es_300 in [false, true] {
+                    let e = validate_custom_wgsl(&src, glsl_es_300).unwrap_err();
+                    assert!(e.contains(expected), "{e}");
+                }
             }
         }
         // Private variables and overrides with a default are portable.
@@ -1011,17 +1042,20 @@ mod tests {
                 fragment("k = c; return k * strength;")
             ),
         );
-        validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&ok)))
-            .unwrap_or_else(|e| panic!("{e}"));
+        let src = forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&ok));
+        for glsl_es_300 in [false, true] {
+            assert_eq!(validate_custom_wgsl(&src, glsl_es_300), Ok(None));
+        }
     }
 
-    /// Regression: custom shaders calling WGSL built-ins GLSL ES 3.00 lacks passed validation.
-    /// They ran on Metal, Vulkan, DX12 and WebGPU but did not compile on WebGL2 / GLES 3.0
-    /// devices, where their draws silently used the built-in shader. They are now rejected on
-    /// every backend — used or not — like workgroup memory, while the built-ins naga polyfills
-    /// for GLSL ES 3.00 stay available.
+    /// Custom shaders calling WGSL built-ins GLSL ES 3.00 lacks (or anything naga cannot
+    /// translate to it) do not compile on WebGL2 / GLES 3.0 devices: there they are rejected up
+    /// front — used or not — with a message naming the construct. Everywhere else they run as
+    /// they did before the graphics upgrade (rejecting them there changed the pixels of shaders
+    /// that worked), and the same finding comes back as a portability warning. The built-ins naga polyfills for
+    /// GLSL ES 3.00 raise neither.
     #[test]
-    fn custom_shaders_cannot_use_builtins_webgl2_lacks() {
+    fn custom_shaders_using_what_webgl2_lacks_are_rejected_there_and_warned_elsewhere() {
         let fragment = |body: &str| format!("fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> {{ {body} }}");
         let cases = [
             (
@@ -1069,16 +1103,25 @@ mod tests {
             let custom = CustomShader::new("gles3", wgsl);
             let src = forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&custom));
             validate(&src); // naga alone accepts it
-            let e = validate_custom_wgsl(&src).expect_err(expected);
+            let e = validate_custom_wgsl(&src, true).expect_err(expected);
             assert!(e.contains(expected) && e.contains("GLES 3.0"), "{expected}: {e}");
+            let w = validate_custom_wgsl(&src, false)
+                .unwrap_or_else(|e| panic!("{expected}: rejected off GLSL ES 3.00: {e}"))
+                .unwrap_or_else(|| panic!("{expected}: no warning"));
+            assert!(
+                w.contains(expected) && w.contains("WebGL2") && w.contains("builds on this device"),
+                "{expected}: {w}"
+            );
         }
         // Calls on constants are folded to literals by naga: nothing left for GLSL to lack.
         let folded = CustomShader::new(
             "folded",
             fragment("return c * f32(reverseBits(1u) + countOneBits(7u));"),
         );
-        validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&folded)))
-            .unwrap_or_else(|e| panic!("{e}"));
+        let src = forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&folded));
+        for glsl_es_300 in [false, true] {
+            assert_eq!(validate_custom_wgsl(&src, glsl_es_300), Ok(None));
+        }
         // Built-ins naga polyfills for GLSL ES 3.00 (or that GLSL ES 3.00 has) are fine.
         let portable = CustomShader::new(
             "portable",
@@ -1097,13 +1140,10 @@ mod tests {
             } else {
                 portable.clone()
             };
-            validate_custom_wgsl(&forward_shader(
-                InstanceTransform::LAYOUT,
-                u8::from(layered),
-                false,
-                Some(&custom),
-            ))
-            .unwrap_or_else(|e| panic!("layered {layered}: {e}"));
+            let src = forward_shader(InstanceTransform::LAYOUT, u8::from(layered), false, Some(&custom));
+            for glsl_es_300 in [false, true] {
+                assert_eq!(validate_custom_wgsl(&src, glsl_es_300), Ok(None), "layered {layered}");
+            }
         }
         // The built-in shader itself, for every layout and texture kind.
         for l in [InstanceTransform::LAYOUT, InstanceHalf::LAYOUT, ATLAS] {

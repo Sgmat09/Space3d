@@ -650,3 +650,126 @@ fn webgl2_override_parity() {
     let cmp = compare_images(&default, &webgl2, &CompareOptions::perceptual());
     assert!(cmp.passed, "{}", cmp.summary());
 }
+
+/// Where the Ldr fallback (`DownlevelOverride::webgl2()`) differs from the HDR path by design
+/// (graphics spec §1.2, docs/graphics/frame.md "The Ldr fallback"), and that it differs nowhere
+/// else:
+///
+/// * **MSAA:** each sample is tonemapped before the resolve (HDR resolves radiance, then
+///   tonemaps), so silhouettes between bright and dark surfaces resolve differently. Every
+///   pixel off by more than 8/255 is a silhouette pixel: one where the HDR image at 4× differs
+///   from the HDR image at 1×.
+/// * **Blending:** translucent surfaces blend tonemapped colors (HDR blends radiance). Every
+///   pixel off by more than 8/255 is covered by the translucent quad.
+/// * **Split screens and a gizmo display view** combine both, per post group.
+///
+/// Opaque single-sample scenes match within `CompareOptions::perceptual()`
+/// ([`webgl2_override_parity`]); these stay within the looser bound documented in frame.md.
+#[test]
+fn webgl2_override_parity_msaa_and_blending() {
+    const PW: u32 = 160;
+    const PH: u32 = 96;
+    let bound = CompareOptions::perceptual().max_diff_fraction(0.08);
+    // (name, samples, translucent quad, split screen with a gizmo display view)
+    let cases = [
+        ("msaa4", 4, false, false),
+        ("blended", 1, true, false),
+        ("split + gizmo", 1, false, true),
+        ("everything", 4, true, true),
+    ];
+    for (name, samples, blended, split) in cases {
+        let Some(mut app) = headless_app(PW, PH) else { return };
+        let cam = lit_scene(&mut app);
+        app.world.insert_one(cam, PostProcess::default()).unwrap();
+        let translucent = blended.then(|| {
+            let mesh = app
+                .resources
+                .expect_mut::<RenderAssets>()
+                .add_mesh(MeshData::plane(1.4));
+            let mut material = Material::srgb(0.95, 0.9, 0.2).with_emissive(Vec3::splat(1.5));
+            material.base_color.w = 0.45;
+            material.alpha_blend = true;
+            app.world.spawn((
+                Transform::from_xyz(0.4, 0.3, 1.0).with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                Mesh3d(mesh),
+                material,
+            ))
+        });
+        if split {
+            app.world.get::<&mut Camera3d>(cam).unwrap().viewport = Some([0.0, 0.0, 0.5, 1.0]);
+            // A second post camera on the right half (darker, another clear color), and a
+            // gizmo camera without post over the left half.
+            app.world.spawn((
+                Transform::from_xyz(-2.8, 1.6, 2.6).looking_at(Vec3::ZERO, Vec3::Y),
+                Camera3d {
+                    viewport: Some([0.5, 0.0, 0.5, 1.0]),
+                    order: 1,
+                    clear_color: Some(Vec4::new(0.3, 0.2, 0.1, 1.0)),
+                    ..Default::default()
+                },
+                PostProcess::default().with_exposure(-0.5),
+            ));
+            let gizmo = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.3));
+            app.world.spawn((
+                Transform::from_xyz(-0.9, 0.9, 0.0),
+                Mesh3d(gizmo),
+                Material::unlit(Vec4::new(0.0, 1.0, 0.0, 1.0)),
+            ));
+            app.world.spawn((
+                Transform::from_xyz(2.4, 1.9, 3.2).looking_at(Vec3::ZERO, Vec3::Y),
+                Camera3d {
+                    viewport: Some([0.0, 0.0, 0.5, 1.0]),
+                    order: 2,
+                    clear_color: None,
+                    ..Default::default()
+                },
+            ));
+        }
+        let mut render_at = |samples: u32, downlevel: DownlevelOverride| {
+            app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+            frame_settings(&mut app).downlevel = downlevel;
+            let webgl2 = downlevel != DownlevelOverride::default();
+            let path = if webgl2 { DrawPath::CpuDirect } else { best_path(&app) };
+            set_path(&mut app, path);
+            let img = render(&mut app);
+            assert_eq!(
+                (stats(&app).post_groups, stats(&app).intermediate_groups),
+                (1 + u32::from(split), 1),
+                "{name}"
+            );
+            img
+        };
+        let hdr = render_at(samples, DownlevelOverride::default());
+        let webgl2 = render_at(samples, DownlevelOverride::webgl2());
+        let hdr_1x = render_at(1, DownlevelOverride::default());
+        let without_quad = translucent.map(|quad| {
+            app.world.despawn(quad).unwrap();
+            app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+            render(&mut app)
+        });
+        let cmp = compare_images(&hdr, &webgl2, &bound);
+        eprintln!("{name}: {}", cmp.summary());
+        assert!(cmp.passed, "{name}: {}", cmp.summary());
+        // Every pixel off by more than 8/255 is a silhouette (MSAA) or under the quad.
+        let mut unexplained = Vec::new();
+        for y in 0..PH {
+            for x in 0..PW {
+                let (a, b) = (hdr.get(x, y), webgl2.get(x, y));
+                if (0..3).all(|c| a[c].abs_diff(b[c]) <= 8) {
+                    continue;
+                }
+                let silhouette = samples > 1 && hdr_1x.get(x, y) != a;
+                let under_quad = without_quad.as_ref().is_some_and(|w| w.get(x, y) != a);
+                if !(silhouette || under_quad) {
+                    unexplained.push(((x, y), a, b));
+                }
+            }
+        }
+        assert!(
+            unexplained.is_empty(),
+            "{name}: {} pixels off outside silhouettes and the translucent quad: {:?}",
+            unexplained.len(),
+            &unexplained[..unexplained.len().min(8)]
+        );
+    }
+}

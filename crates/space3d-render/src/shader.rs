@@ -44,22 +44,31 @@
 /// [`crate::Renderer::shader_error`]; its draws fall back to the built-in shader instead of
 /// failing the frame.
 ///
-/// **Portability.** Custom shaders are limited to what every backend runs, so a shader that
-/// works on the machine it is written on works everywhere. These are rejected on every backend
-/// (before any GPU work, with a message naming the construct):
+/// **Portability.** Checked before any GPU work, with a message naming the construct.
+/// Rejected on every backend (the shader cannot work in the forward pipeline):
 ///
-/// | construct | Metal / Vulkan / DX12 / WebGPU | WebGL2, GLES 3.0 (GLSL ES 3.00) |
+/// | construct | why |
+/// |---|---|
+/// | own bindings (`@group`/`@binding` resources) | not in the pipeline layout |
+/// | `var<workgroup>` | compute-only; Metal accepts it in these stages, GL and browsers do not |
+/// | `override` without a default | pipeline creation fails |
+///
+/// What GLSL ES 3.00 (WebGL2, GLES 3.0) lacks is rejected **only on such devices** (a
+/// [`crate::Renderer::shader_error`] there, drawn with the built-in shader). Everywhere else —
+/// Metal, Vulkan, DX12, WebGPU, GLES 3.1+ — the shader builds and draws as written, and
+/// [`crate::Renderer::shader_warning`] (plus one `tracing` warning) says it will not run on
+/// WebGL2, so the problem shows up on the machine the shader is written on:
+///
+/// | construct | Metal / Vulkan / DX12 / WebGPU / GLES 3.1+ | WebGL2, GLES 3.0 (GLSL ES 3.00) |
 /// |---|---|---|
-/// | own bindings (`@group`/`@binding` resources) | not in the pipeline layout | same |
-/// | `var<workgroup>` | Metal only | no |
-/// | `override` without a default | pipeline creation fails | same |
-/// | `countOneBits`, `reverseBits`, `extractBits`, `insertBits`, `firstLeadingBit`, `firstTrailingBit`, `countTrailingZeros`, `ldexp`, `dot4I8Packed`, `dot4U8Packed`, `unpack4xI8`, `unpack4xU8`, `textureGather*` | yes | no (GLSL ES 3.10) |
-/// | `textureNumLevels`, `textureNumSamples`, `pack4x8snorm`, `pack4x8unorm` | yes | no |
+/// | `countOneBits`, `reverseBits`, `extractBits`, `insertBits`, `firstLeadingBit`, `firstTrailingBit`, `countTrailingZeros`, `ldexp`, `dot4I8Packed`, `dot4U8Packed`, `unpack4xI8`, `unpack4xU8`, `textureGather*` | runs, warning | error (GLSL ES 3.10) |
+/// | `textureNumLevels`, `textureNumSamples`, `pack4x8snorm`, `pack4x8unorm` | runs, warning | error |
 ///
-/// Available everywhere (naga polyfills them for GLSL ES 3.00): `frexp`, `modf`, `fma`,
-/// `countLeadingZeros`, `unpack4x8unorm`/`unpack4x8snorm`, `pack2x16unorm`/`pack2x16snorm` and their unpacks,
-/// the `Fine`/`Coarse` derivatives (as the plain ones on GL), `textureDimensions`,
-/// `textureLoad`, `textureSampleLevel`/`Grad`/`Bias`.
+/// The first row covers every function of the source, called or not. Available everywhere (naga
+/// polyfills them for GLSL ES 3.00): `frexp`, `modf`, `fma`, `countLeadingZeros`,
+/// `unpack4x8unorm`/`unpack4x8snorm`, `pack2x16unorm`/`pack2x16snorm` and their unpacks, the
+/// `Fine`/`Coarse` derivatives (as the plain ones on GL), `textureDimensions`, `textureLoad`,
+/// `textureSampleLevel`/`Grad`/`Bias`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomShader {
     /// Debug name (shader labels, error messages).

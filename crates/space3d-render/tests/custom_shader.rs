@@ -290,17 +290,28 @@ fn custom_shaders_using_workgroup_memory_fall_back() {
     assert_eq!(r.gpu_error_count(), 0);
 }
 
-/// Built-ins WebGL2 / GLES 3.0 (GLSL ES 3.00) lack are rejected on every backend, before any
-/// GPU work: the shader would run on Metal, Vulkan, DX12 and WebGPU but not compile on WebGL2.
-/// Those naga polyfills for GLSL ES 3.00 build on every backend — this test also runs on GL
-/// (`WGPU_BACKEND=gl`, e.g. ANGLE on macOS: GLES 3.0), where the shader really compiles.
+/// Built-ins WebGL2 / GLES 3.0 (GLSL ES 3.00) lack: on such devices (`WGPU_BACKEND=gl` on
+/// ANGLE, GLES 3.0) the shader is rejected before any GPU work and draws with the built-in
+/// shader; everywhere else it draws exactly as written — as before the graphics upgrade — and
+/// `shader_warning` reports that it will not run on WebGL2. The built-ins naga polyfills for
+/// GLSL ES 3.00 build everywhere, with neither error nor warning.
 #[test]
-fn custom_shaders_are_limited_to_what_webgl2_compiles() {
+fn custom_shaders_using_what_webgl2_lacks_run_where_supported() {
     let Some(mut app) = headless_app(64, 64) else { return };
-    let rejected = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+    let gles3 = |app: &App| {
+        let caps = app.resources.expect::<Renderer>().capabilities().clone();
+        // ANGLE / WebGL2: GL without compute shaders compiles GLSL ES 3.00.
+        caps.adapter.backend == wgpu::Backend::Gl && !caps.compute
+    };
+    // A shader as written before the graphics upgrade: `countOneBits` and `pack4x8unorm` on
+    // runtime values (red = 2 bits × 0.5 = 1, green = byte 1 of the packed color = 128/255
+    // linear, 188 in sRGB).
+    let bits = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
         "bits",
         "fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {\n\
-         \x20   return vec4<f32>(f32(countOneBits(u32(color.r * 3.0))) * 0.5, 0.0, 0.0, 1.0);\n}\n",
+         \x20   let p = pack4x8unorm(vec4<f32>(0.0, color.g * 128.0 / 255.0, 0.0, 0.0));\n\
+         \x20   let g = f32((p >> 8u) & 0xffu) / 255.0;\n\
+         \x20   return vec4<f32>(f32(countOneBits(u32(color.r * 3.0))) * 0.5, g, 0.0, 1.0);\n}\n",
     ));
     let portable = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
         "portable",
@@ -310,23 +321,32 @@ fn custom_shaders_are_limited_to_what_webgl2_compiles() {
          \x20   let g = fma(0.5, 0.5, 0.25) + dpdxFine(in.uv.x) * 0.0 + unpack4x8unorm(0xff00u).y;\n\
          \x20   return vec4<f32>(f.fract * 2.0 * lz, g - 1.0, 0.0, 1.0);\n}\n",
     ));
-    let a = scene(&mut app, Material::unlit(Vec4::ONE).with_shader(rejected));
+    let a = scene(&mut app, Material::unlit(Vec4::ONE).with_shader(bits));
     let img = render_to_image(&mut app).expect("capture");
-    assert_eq!(img.get(20, 32), [255, 255, 255, 255], "built-in shader");
     let r = app.resources.expect::<Renderer>();
-    let err = r.shader_error(rejected).unwrap_or_default();
-    assert!(err.contains("`countOneBits`") && err.contains("WebGL2"), "{err}");
+    let backend = r.capabilities().adapter.backend;
+    if gles3(&app) {
+        assert_eq!(img.get(20, 32), [255, 255, 255, 255], "built-in shader on {backend:?}");
+        let err = r.shader_error(bits).unwrap_or_default();
+        assert!(err.contains("`countOneBits`") && err.contains("WebGL2"), "{err}");
+        assert_eq!(r.shader_warning(bits), None);
+    } else {
+        // Drawn with the custom shader, pixel for pixel as before the upgrade.
+        assert_eq!(img.get(20, 32), [255, 188, 0, 255], "custom shader on {backend:?}");
+        assert_eq!(r.shader_error(bits), None, "{backend:?}");
+        let warning = r.shader_warning(bits).unwrap_or_default();
+        assert!(
+            warning.contains("`countOneBits`") && warning.contains("WebGL2"),
+            "{warning}"
+        );
+    }
     app.world.get::<&mut InstancedMesh>(a).unwrap().material = Material::unlit(Vec4::ONE).with_shader(portable);
     let img = render_to_image(&mut app).expect("capture");
     let r = app.resources.expect::<Renderer>();
-    assert_eq!(r.shader_error(portable), None, "{:?}", r.capabilities().adapter.backend);
+    assert_eq!(r.shader_error(portable), None, "{backend:?}");
+    assert_eq!(r.shader_warning(portable), None, "{backend:?}");
     // frexp(4) = 0.5 · 2³, countLeadingZeros(1) = 31, fma = 0.5, unpack4x8unorm(0xff00).y = 1.
-    assert_eq!(
-        img.get(20, 32),
-        [255, 188, 0, 255],
-        "custom shader on {:?}",
-        r.capabilities().adapter.backend
-    );
+    assert_eq!(img.get(20, 32), [255, 188, 0, 255], "custom shader on {backend:?}");
     assert_eq!(r.gpu_error_count(), 0);
 }
 

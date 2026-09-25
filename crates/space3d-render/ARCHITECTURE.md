@@ -447,16 +447,18 @@ bindings for them, so their pipeline would be invalid), workgroup memory (`var<w
 used or not: WGSL allows it in compute shaders only, and backends disagree about it in the
 vertex and fragment stages the hooks run in — Metal accepts it, GL and browsers reject it),
 any other address space but `function`/`private`, `override` constants without a default
-(the pipeline sets none), and built-ins WebGL2 / GLES 3.0 cannot compile — GLSL ES 3.00 lacks
-`countOneBits`, `reverseBits`, `extractBits`, `insertBits`, `firstLeadingBit`,
+(the pipeline sets none). What WebGL2 / GLES 3.0 cannot compile is checked too. GLSL ES 3.00
+lacks `countOneBits`, `reverseBits`, `extractBits`, `insertBits`, `firstLeadingBit`,
 `firstTrailingBit`, `countTrailingZeros`, `ldexp`, `dot4I8Packed`/`dot4U8Packed`,
-`unpack4xI8`/`unpack4xU8` and `textureGather*` (naga's GLSL backend emits them anyway), and the
-forward entry points are translated to GLSL ES 3.00 once to catch what naga refuses there
-(`textureNumLevels`, `pack4x8unorm`, …). Rejecting those on every backend keeps a shader that
-works on the machine it is written on working on the web (`CustomShader` has the per-backend
-table; `pipeline::tests::custom_shaders_cannot_use_builtins_webgl2_lacks`, and
-`tests/custom_shader.rs::custom_shaders_are_limited_to_what_webgl2_compiles`, which also runs
-on ANGLE). Its pipeline is then created inside validation and internal error
+`unpack4xI8`/`unpack4xU8` and `textureGather*`, and naga's GLSL backend emits them anyway. The
+forward entry points are also translated to GLSL ES 3.00 once, to catch what naga refuses there
+(`textureNumLevels`, `pack4x8unorm`, …). Such a shader is rejected only on devices that compile
+GLSL ES 3.00 (GL without compute shaders: WebGL2, GLES 3.0), where it cannot build. Everywhere
+else it builds and draws as it did before the graphics upgrade, and `Renderer::shader_warning`
+(plus one `tracing` warning) reports that it will not run on WebGL2. `CustomShader` has the
+per-backend table. Tests: `pipeline::tests::custom_shaders_using_what_webgl2_lacks_are_rejected_there_and_warned_elsewhere`,
+and `tests/custom_shader.rs::custom_shaders_using_what_webgl2_lacks_run_where_supported`, which
+also runs on ANGLE. Its pipeline is then created inside validation and internal error
 scopes, so no error reaches the uncaptured-error handler: a failure is logged once, reported
 by `Renderer::shader_error`, and the draws of that pipeline key fall back to the built-in
 shader. Native backends answer the scopes immediately. In the browser the answer

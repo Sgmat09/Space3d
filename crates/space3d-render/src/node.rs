@@ -717,11 +717,15 @@ pub struct DrawContext<'a> {
 /// Shared layouts (renderer lifetime, never recreated).
 #[non_exhaustive]
 pub struct FrameLayouts {
-    /// Group 0: binding 0 the `View` uniform (dynamic offset, VERTEX | FRAGMENT); bindings 1–6
-    /// lighting (environment specular cube, irradiance cube, BRDF LUT, environment sampler,
-    /// shadow map, comparison sampler; FRAGMENT). Identical to the forward pipelines' group 0
-    /// (a shader may declare only the bindings it uses). Compute passes of nodes use their own
-    /// layouts.
+    /// Group 0: binding 0 the `View` uniform (dynamic offset, VERTEX | FRAGMENT). Identical to
+    /// the forward pipelines' group 0 (a shader may declare only the bindings it uses). Compute
+    /// passes of nodes use their own layouts.
+    ///
+    /// **Not yet:** bindings 1–6 — lighting: environment specular cube, irradiance cube, BRDF
+    /// LUT, environment sampler, shadow map, comparison sampler; FRAGMENT (graphics spec §3.4)
+    /// — join this layout with the lighting wiring (milestones F7 / P-MAT PM4). Until then the
+    /// layout holds binding 0 only, and a pipeline whose shader declares any of bindings 1–6 in
+    /// group 0 fails validation.
     pub view: wgpu::BindGroupLayout,
     /// Group 1: binding 0 scene depth `texture_2d<f32>` (unfilterable), binding 1 exposure
     /// `texture_2d<f32>` (unfilterable, 1×1, EV in `.r`), binding 2 a non-filtering sampler

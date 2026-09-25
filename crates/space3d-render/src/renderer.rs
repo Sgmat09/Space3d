@@ -553,7 +553,14 @@ impl Renderer {
             true,
             graphics.msaa_depth_resolve,
         );
-        let pipelines = Pipelines::new(&device, caps.compute && caps.indirect);
+        // wgpu's GL backend compiles GLSL ES 3.00 on WebGL2 and GLES 3.0 (no compute shaders);
+        // GLES 3.1+ (compute) has what custom shaders may use beyond it.
+        let glsl_es_300 = caps.adapter.backend == wgpu::Backend::Gl
+            && !adapter
+                .get_downlevel_capabilities()
+                .flags
+                .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
+        let pipelines = Pipelines::new(&device, caps.compute && caps.indirect, glsl_es_300);
         let white = white_texture(&device, &queue);
         let mut samplers = SamplerCache::default();
         let white_sampler = samplers.get(&device, Default::default());
@@ -824,6 +831,16 @@ impl Renderer {
     /// (its draws then use the built-in shader). `None` while it builds fine or is unused.
     pub fn shader_error(&self, shader: crate::ShaderHandle) -> Option<&str> {
         self.pipelines.custom_error(shader)
+    }
+
+    /// Portability warning of the current version of a [`crate::CustomShader`], once a draw has
+    /// used it: the shader builds and draws on this device, but uses what WebGL2 / GLES 3.0
+    /// (GLSL ES 3.00) lacks, so on those devices it fails to build and its draws use the
+    /// built-in shader (see [`crate::CustomShader`], "Portability"). Also logged once through
+    /// `tracing`. `None` for portable shaders, and on WebGL2 / GLES 3.0 devices themselves,
+    /// where such a shader is a [`Self::shader_error`].
+    pub fn shader_warning(&self, shader: crate::ShaderHandle) -> Option<&str> {
+        self.pipelines.custom_warning(shader)
     }
 
     /// Number of wgpu errors that reached the uncaptured-error handler so far. Release builds

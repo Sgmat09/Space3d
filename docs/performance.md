@@ -193,18 +193,48 @@ load average 6–18, so the ranges are wide): `explicit/100k` 581 µs, `explicit
 within their noise ranges.
 
 Gate "Hdr minimal (composite only) over Direct" (`benches/frame.rs`, 1080p headless, a lit
-ground plane with 400 cubes; `cargo bench -p space3d-render --bench frame -- --warm-up-time 3
---measurement-time 8`):
+ground plane with 400 cubes, `PostProcess::default().without_bloom()`: exposure, AgX, dither).
+The criterion groups `frame/{cpu,gpu,throughput}/*` run Direct, then Hdr, one after the other: on
+this shared machine a load change between the two corrupts their difference (one F-core review
+run measured `frame/cpu/direct` at 477.8 µs, above Hdr's 89.1 µs). The F4 figure recorded here
+first (throughput +25 µs, 113.6 vs 138.5 µs) came from such a sequential run and was not
+reproduced. Deltas come from `frame/ab` (`cargo bench -p space3d-render --bench frame --
+frame/ab`), which interleaves the two modes round by round and reports medians of the paired
+deltas:
 
-| bench | Direct | Hdr minimal | delta | gate |
+| `frame/ab` (medians, µs) | Direct | Hdr minimal | paired delta | gate |
 |---|---|---|---|---|
-| `frame/cpu/*` (render stage on the CPU) | 58.9–63.6 µs | 70.6–78.4 µs | +10 to +15 µs | ≤ +20 µs |
-| `frame/throughput/*` (frames back to back; GPU-bound) | 113.6 µs | 138.5 µs | +25 µs (incl. the CPU delta) | ≤ +0.10 ms GPU |
-| `frame/gpu/*` (one frame, CPU + GPU latency) | 304 µs | 373 µs | +69 µs | (upper bound) |
+| cpu (render stage on the CPU) | 67–75 | 86–97 | +17 to +23 | ≤ +20 µs CPU |
+| throughput (frames back to back, a wait every 8th; GPU-bound) | 98–104 | 137–141 | +37 to +40 | ≤ +0.10 ms GPU |
+| latency (render + GPU wait, loaded clocks) | 273–278 | 340–351 | +70 to +81 (incl. the CPU delta) | (upper bound) |
+| latency, isolated frames 2 ms apart (lowest GPU clocks) | 814–902 | 1064–1297 | +254 to +294 | — (reference) |
 
-The per-frame GPU latency (`frame/gpu`) is the noisiest under load (runs between 0.3 and 1.2 ms
-were seen); the throughput numbers and the quiet run above are the recorded values. GPU
-timestamps per pass arrive with `GpuTimings` (F8).
+Three runs at load average 4–6. The F-core review's own interleaved harness measured throughput
+deltas of +44.6, +67.4 and +77.1 µs and a latency delta of +65 to +98 µs. Instructions retired on
+the CPU grow by 109k–116k per frame, which is +10 to +17 µs of thread CPU time (median). That is
+within the CPU gate at the median, but wall-clock runs reach +23 µs. The extra composite render
+pass is most of it (about 30 wgpu-hal allocations and the Metal encoder setup).
+
+**Which GPU regime the gate uses.** The gate is measured with the GPU at its loaded clocks, the
+way the benches run: frames back to back. At 1080p the HDR path moves about 33 MB more per frame:
+the scene texture is written at 8 B/px instead of D's 4, then the composite reads it back and
+writes D. At this GPU's ~550 GB/s, that is about 60 µs uncompressed, the same order as the measured
+delta. The loaded cost is mostly memory traffic, not ALU.
+
+When frames are isolated (2–16 ms apart, e.g. a light scene at 60 Hz), the GPU idles at its lowest
+performance state and every pass costs about 3× more. Direct's latency goes from ~280 µs to
+~850 µs, and the Hdr delta grows to +240 to +290 µs. The review traced the composite pass alone at
+258 µs there. By post setting, the delta at 2 ms apart measured +241 µs (default), +191 µs (dither
+off), +172 µs (tonemapper `None`) and +126 µs (`PostProcess::passthrough()`).
+
+This is not a gate failure: a scene heavy enough for frame time to matter keeps the GPU at its
+loaded clocks. It is still the cost of an idle 60 Hz frame, and it is recorded for P-POST, which
+owns `composite.wgsl` and its [`post.composite`] budget. Two ALU cuts are open there:
+
+* On an sRGB `D`, the dither encodes, adds the noise and decodes again, and then the hardware
+  encodes once more: 6 `pow` per pixel. Writing through a non-sRGB view of `D` (the
+  `S3D_POST_OUT = 1` path) needs 3.
+* The two per-frame seed hashes can be hashed once on the CPU.
 
 Allocations per frame by mode (`tests/alloc_frame.rs`: 400 moving lit cubes, CPU draw path,
 320×180; all inside wgpu/wgpu-hal; bounds +10 %):

@@ -1872,7 +1872,9 @@ Frame-owned overhead (F): resolves, SceneRead load/store, composite plumbing and
 
 **Dev-machine gates** (CI, `benches/*` + `tests/perf_*.rs`, GPU timestamps, 1080p headless; they skip without
 `TIMESTAMP_QUERY`). These are initial gates. A builder records the measured value in `docs/performance.md`, and a
-gate may be relaxed only with the measurement and a reason.
+gate may be relaxed only with the measurement and a reason. GPU figures are for the loaded GPU: frames back to back,
+as the benches run them. Isolated frames let the GPU drop to its lowest clocks, where every pass costs about 3×
+more. Record those figures for reference; they are not the gate.
 
 | gate | budget (M4 Max) |
 |---|---|
