@@ -4,8 +4,9 @@
 //! Config structs are plain `pub`-field `Copy` structs with `Default` (functional record update
 //! works); enums are `#[non_exhaustive]`. A camera with an enabled `PostProcess` renders through
 //! its target group's scene texture (HDR, or the Ldr fallback) and the composite: exposure
-//! (manual), the tonemapper and dither work since the frame milestone F4; bloom, auto exposure,
-//! FXAA, lens effects, grading and distortion arrive with the post milestones PO1–PO6.
+//! (manual), the tonemapper and dither work since the frame milestone F4, bloom since PO1, FXAA,
+//! vignette, chromatic aberration and film grain since PO3; auto exposure, grading and
+//! distortion arrive with the post milestones PO2, PO4 and PO5 (docs/graphics/post.md).
 
 use crate::assets::{AddressMode, FilterMode, SamplerSettings, TextureSource};
 use crate::handles::{ShaderHandle, TextureHandle};
@@ -258,19 +259,28 @@ pub enum Metering {
     CenterWeighted,
 }
 
-/// Bloom: soft-knee threshold, 13-tap downsample (Karis average on the first level), 3×3 tent
-/// upsample blended by `scatter`.
+/// Bloom (Jimenez, "Next-Generation Post Processing in Call of Duty: Advanced Warfare", 2014):
+/// the exposed scene above a soft-knee threshold (Karis-averaged on the first level, so single
+/// hot pixels do not flicker), a chain of 13-tap downsamples and 3×3 tent upsamples blended by
+/// `scatter`, added after exposure (or mixed in, [`BloomComposite::EnergyConserving`]).
+///
+/// Works in Hdr mode; off in the Ldr fallback (no float render targets or `HdrMode::Ldr`,
+/// warned once). Each post group has its own chain, clamped to its rect: split screens never
+/// bleed into each other. `HdrScene` overlays bloom; `AfterTonemap` overlays and display views do
+/// not. See docs/graphics/post.md.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bloom {
     /// On/off.
     pub enabled: bool,
     /// Additive: multiplier (default 0.35). Energy-conserving: mix factor 0..1.
     pub intensity: f32,
-    /// Exposed luminance where bloom starts (1.0 = display white). Default 1.
+    /// Exposed radiance (brightest channel, after exposure) where bloom starts; 1.0 = display
+    /// white, 0 = everything blooms. Default 1.
     pub threshold: f32,
     /// Knee width as a fraction of `threshold` (0 = hard cut). Default 0.5.
     pub soft_knee: f32,
-    /// 0 keeps the glow tight, 1 is a wide haze. Default 0.7.
+    /// 0 keeps the glow tight, 1 is a wide haze: level k of the chain weighs (1 − s)·s^k, the
+    /// last level the rest. Default 0.7.
     pub scatter: f32,
     /// How bloom is added.
     pub composite: BloomComposite,
@@ -346,7 +356,8 @@ pub enum AntiAliasing {
     /// None.
     #[default]
     None,
-    /// FXAA 3.11, after tonemapping, before grain.
+    /// FXAA 3.11 (Lottes) after tonemapping: one extra full-screen pass reading an 8-bit
+    /// intermediate the size of the target; grain and dither run after it, in that pass.
     Fxaa(FxaaQuality),
 }
 

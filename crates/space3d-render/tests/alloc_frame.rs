@@ -109,8 +109,11 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
     type Setup = fn(&mut App, Entity);
     let modes: [(&str, Setup); 5] = [
         ("direct", |_, _| {}),
+        // The composite alone: bloom's passes are measured in `tests/alloc_post.rs`.
         ("hdr", |app, cam| {
-            app.world.insert_one(cam, PostProcess::default()).unwrap()
+            app.world
+                .insert_one(cam, PostProcess::default().without_bloom())
+                .unwrap()
         }),
         ("ldr", |app, cam| {
             app.world.insert_one(cam, PostProcess::default()).unwrap();
