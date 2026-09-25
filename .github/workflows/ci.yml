@@ -57,7 +57,7 @@ jobs:
           cargo check --target wasm32-unknown-unknown \
             -p space3d-core -p space3d-tasks -p space3d-render -p space3d-platform \
             -p space3d-assets -p space3d-net -p space3d-db -p space3d-audio \
-            -p space3d-physics -p space3d-scene -p space3d-ui -p space3d
+            -p space3d-physics -p space3d-scene -p space3d-ui -p space3d-ai -p space3d
 
   mobile:
     runs-on: macos-latest
@@ -66,8 +66,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: "aarch64-apple-ios,aarch64-linux-android" }
       - uses: Swatinem/rust-cache@v2
+      # `ai-apple-ffi` compiles AppleBackend's FFI; `check` never links, so Apple's library isn't needed.
       - name: iOS check
-        run: cargo check --target aarch64-apple-ios -p space3d
+        run: cargo check --target aarch64-apple-ios -p space3d --features ai-apple-ffi
       - uses: nttld/setup-ndk@v1
         id: ndk
         with: { ndk-version: r28 }
@@ -77,4 +78,4 @@ jobs:
         run: |
           export CC_aarch64_linux_android=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android35-clang
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC_aarch64_linux_android
-          cargo check --target aarch64-linux-android -p space3d
+          cargo check --target aarch64-linux-android -p space3d --features ai
