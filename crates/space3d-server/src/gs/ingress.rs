@@ -165,36 +165,40 @@ pub fn spawn(ingress: Ingress) -> space3d_tasks::Task<()> {
 
 /// Like [`spawn`], but also stops when every sender of `stop` is dropped.
 pub fn spawn_until(ingress: Ingress, stop: async_channel::Receiver<()>) -> space3d_tasks::Task<()> {
-    space3d_tasks::spawn(async move {
-        let Ingress {
-            transport,
-            gate,
-            rooms,
-            draining,
-            metrics,
-            clock,
-            unix,
-        } = ingress;
-        let mut sweep = tokio::time::interval(Duration::from_millis(250));
-        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                ev = transport.next_event() => match ev {
-                    Some(ev) => handle_event(&gate, &rooms, ev, clock.now(), unix.now_ms(), &metrics),
-                    None => break,
-                },
-                _ = stop.recv() => break,
-                _ = sweep.tick() => {
-                    let mut g = gate.lock();
-                    g.set_draining(draining.load(Ordering::Acquire));
-                    let closed = g.sweep(clock.now());
-                    if closed > 0 {
-                        metrics.handshake("timeout");
+    let span = tracing::Span::current();
+    space3d_tasks::spawn(tracing::Instrument::instrument(
+        async move {
+            let Ingress {
+                transport,
+                gate,
+                rooms,
+                draining,
+                metrics,
+                clock,
+                unix,
+            } = ingress;
+            let mut sweep = tokio::time::interval(Duration::from_millis(250));
+            sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    ev = transport.next_event() => match ev {
+                        Some(ev) => handle_event(&gate, &rooms, ev, clock.now(), unix.now_ms(), &metrics),
+                        None => break,
+                    },
+                    _ = stop.recv() => break,
+                    _ = sweep.tick() => {
+                        let mut g = gate.lock();
+                        g.set_draining(draining.load(Ordering::Acquire));
+                        let closed = g.sweep(clock.now());
+                        if closed > 0 {
+                            metrics.handshake("timeout");
+                        }
+                        g.enforce_ip_bans(unix.now_ms());
                     }
-                    g.enforce_ip_bans(unix.now_ms());
                 }
             }
-        }
-        tracing::info!("ingress stopped");
-    })
+            tracing::info!("ingress stopped");
+        },
+        span,
+    ))
 }

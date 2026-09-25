@@ -23,9 +23,11 @@
 //! server.wait().unwrap(); // CLI/tools only: blocks until shutdown
 //! ```
 
+mod conn;
 mod ws;
 
-pub use ws::{AcceptHook, ClientId, ClientSender, ConnectMeta, ServerEvent, WsServer, WsServerConfig};
+pub use conn::{ConnectionLimits, ConnectionStats, PeerKey};
+pub use ws::{AcceptHook, ClientId, ClientSender, ConnectMeta, ServerEvent, WsServer, WsServerConfig, joined_header};
 
 use crate::NetError;
 use axum::Router;
@@ -44,13 +46,15 @@ pub use axum;
 /// CORS configuration for [`HttpServer::cors`].
 pub use tower_http::cors::CorsLayer;
 
-/// Builder for an axum HTTP server: static files, JSON routes, WebSockets, CORS.
+/// Builder for an axum HTTP server: static files, JSON routes, WebSockets, CORS. Connections
+/// are protected by [`ConnectionLimits`] (header-read timeout, connection caps).
 pub struct HttpServer {
     addr: SocketAddr,
     router: Router,
     cors: Option<CorsLayer>,
     headers: Vec<(HeaderName, HeaderValue)>,
     token: CancellationToken,
+    limits: ConnectionLimits,
 }
 
 impl Default for HttpServer {
@@ -68,7 +72,15 @@ impl HttpServer {
             cors: None,
             headers: Vec::new(),
             token: CancellationToken::new(),
+            limits: ConnectionLimits::default(),
         }
+    }
+
+    /// Connection-level protections (defaults: 15 s header-read timeout, 16 384 connections,
+    /// no per-peer cap).
+    pub fn connection_limits(mut self, limits: ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Address to bind, e.g. `([0, 0, 0, 0], 8080)`. Port `0` picks a free port.
@@ -211,7 +223,7 @@ impl HttpServer {
             .header("cross-origin-embedder-policy", "require-corp")
     }
 
-    fn into_router(self) -> (Router, CancellationToken) {
+    fn into_router(self) -> (Router, CancellationToken, ConnectionLimits) {
         let mut router = self.router;
         if !self.headers.is_empty() {
             let headers = std::sync::Arc::new(self.headers);
@@ -230,7 +242,7 @@ impl HttpServer {
         if let Some(cors) = self.cors {
             router = router.layer(cors);
         }
-        (router, self.token)
+        (router, self.token, self.limits)
     }
 
     /// Bind (synchronously, so errors and the real port are known right away) and
@@ -241,23 +253,25 @@ impl HttpServer {
             std::net::TcpListener::bind(addr).map_err(|e| NetError::Io(format!("failed to bind {addr}: {e}")))?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
-        let (router, token) = self.into_router();
+        let (router, token, limits) = self.into_router();
         let listener = {
             let _guard = space3d_tasks::runtime().enter();
             tokio::net::TcpListener::from_std(listener)?
         };
-        let listener = axum::serve::ListenerExt::tap_io(listener, |tcp: &mut tokio::net::TcpStream| {
-            let _ = tcp.set_nodelay(true);
-        });
-        let serve = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(token.clone().cancelled_owned());
-        let task = space3d_tasks::spawn(async move { serve.await.map_err(NetError::from) });
+        let stats = ConnectionStats::default();
+        let serve = conn::serve(listener, router, token.clone(), limits, stats.clone());
+        // Connections log inside the span that was current when the server started.
+        let task = space3d_tasks::spawn(tracing::Instrument::instrument(
+            async move { serve.await.map_err(NetError::from) },
+            tracing::Span::current(),
+        ));
         tracing::info!(addr = %local_addr, "http server listening");
         Ok(ServerHandle {
             addr: local_addr,
             token,
             task: Some(task),
             detached: false,
+            stats,
         })
     }
 }
@@ -286,6 +300,7 @@ pub struct ServerHandle {
     token: CancellationToken,
     task: Option<Task<Result<(), NetError>>>,
     detached: bool,
+    stats: ConnectionStats,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -306,6 +321,11 @@ impl ServerHandle {
     /// The actually bound port.
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// Live connection counters (open connections, refused by a cap).
+    pub fn connections(&self) -> ConnectionStats {
+        self.stats.clone()
     }
 
     /// `http://host:port` usable from this machine (unspecified IPs map to loopback).

@@ -4,6 +4,7 @@
 
 mod channel;
 mod http;
+mod limits;
 mod ws;
 
 use space3d_core::App;

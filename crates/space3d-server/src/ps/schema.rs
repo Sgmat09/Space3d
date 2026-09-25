@@ -22,7 +22,7 @@
 //! CREATE TABLE match_players(match_id INTEGER, account_id INTEGER, team INTEGER, score INTEGER,
 //!   placement INTEGER, stats TEXT, PRIMARY KEY(match_id, account_id));
 //! CREATE TABLE room_checkpoints(room_id INTEGER PRIMARY KEY, server_id TEXT, saved_ms INTEGER NOT NULL,
-//!   data BLOB NOT NULL);
+//!   data BLOB NOT NULL, epoch INTEGER NOT NULL DEFAULT 0 /* v102 */);
 //! CREATE TABLE bans(id INTEGER PRIMARY KEY, account_id INTEGER, cidr TEXT, until_ms INTEGER,
 //!   reason TEXT NOT NULL, created_by TEXT, created_ms INTEGER NOT NULL);
 //! CREATE TABLE audit_log(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, actor TEXT NOT NULL,
@@ -106,9 +106,15 @@ CREATE TABLE audit_log(
 );
 ";
 
+/// v102: checkpoints are ordered by `(epoch, saved_ms)` of the blob (stale uploads refused).
+const V102: &str = "ALTER TABLE room_checkpoints ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;";
+
 /// All migrations in order.
 pub fn migrations() -> Vec<Migration> {
-    vec![Migration::new(101, "player_service_v1", V101)]
+    vec![
+        Migration::new(101, "player_service_v1", V101),
+        Migration::new(102, "room_checkpoint_epoch", V102),
+    ]
 }
 
 #[cfg(test)]
@@ -117,7 +123,7 @@ mod tests {
     fn migrations_apply_and_are_idempotent() {
         let db = space3d_db::Db::open_in_memory();
         let r = db.blocking().migrate(super::migrations()).unwrap();
-        assert_eq!(r.applied, vec![101]);
+        assert_eq!(r.applied, vec![101, 102]);
         let r = db.blocking().migrate(super::migrations()).unwrap();
         assert!(r.applied.is_empty());
     }

@@ -240,11 +240,13 @@ pub struct RoomEnv {
     pub inbox_capacity: usize,
     /// Deterministic resume secrets (tests); `None` = OS CSPRNG.
     pub secret_seed: Option<u64>,
+    /// Account bans (rooms remove banned players, including ones that resume).
+    pub bans: Option<crate::security::bans::BanList>,
 }
 
 /// A room build waiting for its checkpoint lookup (manual mode).
 pub struct PendingBuild {
-    /// The build (its `restore` is filled in by [`PendingBuild::resolve`]).
+    /// The build (its `restore` is filled in by [`PendingBuild::poll`]).
     pub build: RoomBuild,
     /// Checkpoint lookup in flight.
     pub lookup: Option<Task<Option<Checkpoint>>>,
@@ -503,17 +505,34 @@ impl RoomManager {
         self.inner.lock().rooms.values().cloned().collect()
     }
 
-    /// Room currently hosting `player`, if any.
+    /// A room hosting `player` (per the 1 Hz status), if any. A player may hold slots in
+    /// several rooms: see [`Self::find_player_rooms`].
     pub fn find_player(&self, player: PlayerId) -> Option<RoomId> {
+        self.find_player_rooms(player).into_iter().next()
+    }
+
+    /// Every room hosting `player` (per the 1 Hz status).
+    pub fn find_player_rooms(&self, player: PlayerId) -> Vec<RoomId> {
         self.inner
             .lock()
             .rooms
             .values()
-            .find(|h| {
+            .filter(|h| {
                 let s = h.status.lock();
                 s.phase != RoomPhase::Closed && s.player_ids.contains(&player)
             })
             .map(|h| h.id)
+            .collect()
+    }
+
+    /// Kick `player` from every room of this server. Sent to all rooms (not just the ones the
+    /// 1 Hz status lists) so a slot taken in the last second is not missed; rooms without the
+    /// player ignore it.
+    pub fn kick_everywhere(&self, player: PlayerId, reason: &str) {
+        self.broadcast(|| RoomCommand::Kick {
+            player,
+            reason: reason.to_owned(),
+        });
     }
 
     /// Send a command to every room.

@@ -51,6 +51,10 @@ pub struct ServerRegistration {
     pub schema_hash: u64,
     /// Capacity.
     pub capacity: Capacity,
+    /// Modes this server hosts (`GameDefinition::modes`); empty = any mode. Quick play and
+    /// lobbies only create rooms of a mode on servers that list it.
+    #[serde(default)]
+    pub modes: Vec<String>,
 }
 
 /// Load report.
@@ -98,6 +102,17 @@ pub enum FleetUp {
         /// Room.
         room_id: RoomId,
         /// Reason.
+        reason: String,
+        /// The room's state was checkpointed for a move (drain handoff of a persistent room,
+        /// shutdown at the drain deadline): the player service keeps it as orphaned so its
+        /// players' rejoin restores it on another server. `false` = gone for good.
+        #[serde(default)]
+        restorable: bool,
+    },
+    /// The server is leaving the fleet (drain finished): the player service marks it dead
+    /// at once instead of waiting for its lease to expire.
+    Deregister {
+        /// Why.
         reason: String,
     },
     /// Presence: player joined a room (rejoin / assignment tracking).
@@ -252,6 +267,7 @@ impl FleetUp {
             FleetUp::Heartbeat(_) => "heartbeat",
             FleetUp::RoomOpened { .. } => "room_opened",
             FleetUp::RoomClosed { .. } => "room_closed",
+            FleetUp::Deregister { .. } => "deregister",
             FleetUp::PlayerJoined { .. } => "player_joined",
             FleetUp::PlayerLeft { .. } => "player_left",
             FleetUp::MatchResult { .. } => "match_result",
@@ -325,7 +341,10 @@ impl WsFleetLink {
         let (up_tx, up_rx) = async_channel::bounded::<FleetUp>(16_384);
         let (down_tx, down_rx) = async_channel::bounded::<FleetDown>(16_384);
         let state = std::sync::Arc::new(WsLinkState::default());
-        let task = space3d_tasks::spawn(run_ws_link(url.to_owned(), registration, up_rx, down_tx, state.clone()));
+        let task = space3d_tasks::spawn(tracing::Instrument::instrument(
+            run_ws_link(url.to_owned(), registration, up_rx, down_tx, state.clone()),
+            tracing::Span::current(),
+        ));
         Self {
             up: up_tx,
             down: down_rx,
@@ -465,9 +484,16 @@ pub struct InProcessFleetLink {
 pub struct FleetOutage {
     down: Arc<std::sync::atomic::AtomicBool>,
     session: Arc<std::sync::atomic::AtomicU64>,
+    swallow: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FleetOutage {
+    /// Lose every message from the player service while set (sends still succeed): a link that
+    /// drops right after a request went out, so its answer never arrives.
+    pub fn swallow_downlink(&self, yes: bool) {
+        self.swallow.store(yes, std::sync::atomic::Ordering::Release);
+    }
+
     /// Take the link down (`true`) or bring it back (`false`).
     pub fn set(&self, down: bool) {
         let was = self.down.swap(down, std::sync::atomic::Ordering::AcqRel);
@@ -524,6 +550,10 @@ impl FleetLink for InProcessFleetLink {
     }
     fn try_recv(&self) -> Option<FleetDown> {
         if self.outage.is_down() {
+            return None;
+        }
+        if self.outage.swallow.load(std::sync::atomic::Ordering::Acquire) {
+            while self.down.try_recv().is_ok() {}
             return None;
         }
         self.down.try_recv().ok()
@@ -584,6 +614,7 @@ mod tests {
     fn in_process_pair_delivers_both_ways() {
         let (link, peer) = in_process_pair();
         link.send(FleetUp::RoomClosed {
+            restorable: false,
             room_id: RoomId(1),
             reason: "done".into(),
         })

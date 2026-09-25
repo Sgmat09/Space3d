@@ -7,9 +7,10 @@
 //! `HelloAuth`:
 //! * `Ticket` → `verify::<JoinClaims>` (kind, kid, MAC, exp/iat ± leeway), `server_id == self`,
 //!   `room == spec.room_id`, player not banned, `GameDefinition::validate_spec`, `jti` unused
-//!   (`NonceCache`) → [`GateOutcome::Admit`] (the room is created lazily from the spec).
-//! * `Resume` → route by the token's room (the room verifies the secret) → `Admit` with
-//!   `identity: None` (resumes are accepted while draining).
+//!   (`NonceCache`) → [`GateOutcome::Admit`] (the room is created lazily from the spec; while
+//!   draining only rooms that already run here are joined, creating one is refused).
+//! * `Resume` → route by the token's room (the room verifies the secret and the ban list) →
+//!   `Admit` with `identity: None` (resumes are accepted while draining).
 //! * `Dev` → only if `allow_dev_auth` (loopback-bound, enforced by config validation); joins
 //!   `GameDefinition::dev_room_spec()`.
 //!
@@ -451,9 +452,10 @@ impl Gatekeeper {
         }
         match hello.auth.clone() {
             HelloAuth::Ticket(ticket) => {
-                if self.draining {
-                    return refuse(p.tx, RejectCode::ServerDraining, "server draining");
-                }
+                // While draining, tickets are still verified and routed: a ticket into a room
+                // this server still runs (a rejoin into a match that finishes here) is
+                // admitted; one that would create a room is refused by the room directory
+                // (`RoomError::Draining` → `Reject(ServerDraining)`).
                 let leeway = self.config.leeway.as_millis() as i64;
                 let claims = match verify::<JoinClaims>(&self.keys, &ticket, now_ms, leeway) {
                     Ok(c) => c,
@@ -860,10 +862,18 @@ mod tests {
             attempt(&mut g, ticket(66, "gs-1", 5, 4, 60_000), 0),
             Some(RejectCode::Banned)
         );
+        // Draining: tickets are still verified and routed (a rejoin into a room that still
+        // runs here must work); the room directory refuses to *create* rooms while draining.
         g.set_draining(true);
         assert_eq!(
             attempt(&mut g, ticket(2, "gs-1", 5, 5, 60_000), 0),
-            Some(RejectCode::ServerDraining)
+            None,
+            "routed; creation is refused by RoomManager"
+        );
+        assert_eq!(
+            attempt(&mut g, ticket(3, "gs-2", 5, 6, 60_000), 0),
+            Some(RejectCode::WrongServer),
+            "still verified while draining"
         );
     }
 

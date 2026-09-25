@@ -105,9 +105,11 @@ impl FromRequestParts<Arc<PlayerService>> for RequestMeta {
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map_or(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), |c| c.0);
-        let xff = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        // Every `X-Forwarded-For` line, joined in order: a proxy that adds its own line (rather
+        // than appending to the client's) must not leave the client's line as the one read.
+        let xff = space3d_net::joined_header(&parts.headers, "x-forwarded-for");
         Ok(Self {
-            ip: svc.client_ip(peer, xff),
+            ip: svc.client_ip(peer, xff.as_deref()),
             authorization: parts
                 .headers
                 .get(header::AUTHORIZATION)
@@ -117,7 +119,7 @@ impl FromRequestParts<Arc<PlayerService>> for RequestMeta {
     }
 }
 
-/// Per-IP request limit + request metrics.
+/// Per-IP request limit, bounded body read + request metrics.
 async fn guard(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, req: Request, next: Next) -> Response {
     let route = req
         .extensions()
@@ -129,6 +131,27 @@ async fn guard(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, req: Re
         e.1.retry_after_ms = Some(1_000);
         return e.into_response();
     }
+    // The whole body is read here, bounded in size and in time: a client trickling a body
+    // must not hold a request (and its connection slot) open.
+    let (parts, body) = req.into_parts();
+    let limit = svc.config.player_service.max_body_bytes as usize;
+    let body = match tokio::time::timeout(
+        svc.config.limits.http_body_timeout,
+        space3d_net::server::axum::body::to_bytes(body, limit),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
+            svc.metrics.http(&route, 413, 0.0);
+            return api_err(413, "too_large", "request body too large").into_response();
+        }
+        Err(_) => {
+            svc.metrics.http(&route, 408, 0.0);
+            return api_err(408, "timeout", "request body too slow").into_response();
+        }
+    };
+    let req = Request::from_parts(parts, space3d_net::server::axum::body::Body::from(body));
     let started = std::time::Instant::now();
     let res = next.run(req).await;
     svc.metrics
@@ -426,21 +449,39 @@ async fn mm_cancel(
 
 // ---- quick play / rejoin -------------------------------------------------------------------
 
+/// Mode names: 1-32 of `[A-Za-z0-9_.-]`.
+pub fn valid_mode(mode: &str) -> bool {
+    (1..=32).contains(&mode.len()) && mode.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+
+fn limited(retry_after_ms: u32, what: &str) -> ApiErr {
+    let mut e = api_err(429, "rate_limited", what);
+    e.1.retry_after_ms = Some(retry_after_ms);
+    e
+}
+
 async fn quick_play(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, body: Bytes) -> Res<Assignment> {
     let who = require(&svc, &meta)?;
     let req: QuickPlayRequest = parse_json(&body)?;
-    if req.mode.is_empty() || req.mode.len() > 32 {
-        return Err(api_err(400, "bad_request", "mode required"));
+    if !valid_mode(&req.mode) {
+        return Err(api_err(400, "bad_request", "mode: 1-32 of [A-Za-z0-9_.-]"));
+    }
+    if !svc.limits.lock().quick_play.check(&who.player(), svc.limiter_now()) {
+        return Err(limited(1_000, "too many quick plays"));
     }
     let account = account_of(&svc, who.player()).await?;
     let extra = serde_json::json!({ "rating": account.rating });
     let build = Build::new(&req.game_id, req.schema_hash);
     let (server, spec) = svc
-        .quick_play_room(&best_region(&req.region_pings), &req.mode, &build)
-        .ok_or_else(|| {
-            let mut e = api_err(503, "no_capacity", "no game server available");
-            e.1.retry_after_ms = Some(5_000);
-            e
+        .quick_play_room(&best_region(&req.region_pings), &req.mode, &build, account.id)
+        .map_err(|why| match why {
+            super::QuickPlayRefusal::NoCapacity => {
+                let mut e = api_err(503, "no_capacity", "no game server available");
+                e.1.retry_after_ms = Some(5_000);
+                e
+            }
+            super::QuickPlayRefusal::UnknownMode => api_err(404, "unknown_mode", "no server hosts this mode"),
+            super::QuickPlayRefusal::RoomRate => limited(10_000, "too many new rooms"),
         })?;
     Ok(Json(svc.issue_ticket(
         account.id,
@@ -476,20 +517,25 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
             .iter()
             .position(|t| t.contains(&account.id))
             .map(|t| t as u16);
-        let alive = fleet
+        // The hosting server still runs the room (it is in its heartbeat, even while it
+        // drains): the rejoin goes back to that same room — a match finishes where it runs.
+        // Only a room whose server was lost, or that a draining server handed off (checkpoint
+        // stored, `RoomClosed { restorable }`), is restored elsewhere: never two live copies.
+        let host = fleet
             .server(&server_id)
-            .is_some_and(|s| s.state == super::fleet::ServerState::Ready && !s.heartbeat.draining);
+            .filter(|s| s.state != super::fleet::ServerState::Dead)
+            .cloned();
         let abandon = entry.status.as_ref().is_some_and(|s| s.abandon_on_loss);
-        if alive && !entry.orphaned {
-            Some((fleet.server(&server_id).cloned().expect("checked"), spec, team))
+        if let (false, Some(host)) = (entry.orphaned, host) {
+            Some((host, spec, team))
         } else if entry.orphaned && abandon {
             // `RecoveryPolicy::Abandon`: void the room; clients go back to matchmaking.
             fleet.abandon_room(room);
             abandoned = Some((room, spec.match_id));
             None
         } else {
-            // Server lost or draining: restore the room elsewhere from its checkpoint, on a
-            // server of the same game and schema (it must be able to load the checkpoint).
+            // Server lost or room handed off: restore the room elsewhere from its checkpoint,
+            // on a server of the same game and schema (it must be able to load the checkpoint).
             let region = fleet
                 .server(&server_id)
                 .map(|s| s.registration.region.clone())
@@ -547,15 +593,21 @@ fn lobby_err(e: String) -> ApiErr {
 async fn lobby_create(State(svc): State<Arc<PlayerService>>, meta: RequestMeta, body: Bytes) -> Res<LobbyState> {
     let who = require(&svc, &meta)?;
     let req: CreateLobbyRequest = parse_json(&body)?;
+    if !valid_mode(&req.mode) {
+        return Err(api_err(400, "bad_request", "mode: 1-32 of [A-Za-z0-9_.-]"));
+    }
+    if req.game_id.len() > 64 {
+        return Err(api_err(400, "bad_request", "game_id too long"));
+    }
     let account = account_of(&svc, who.player()).await?;
     let code = super::lobbies::random_code();
     let mut lobbies = svc.lobbies.lock();
+    // A host has one open lobby: this closes their previous one.
     let state = lobbies.create(
         account.id,
         &account.display_name,
         &req.mode,
         req.max_players,
-        req.private,
         code,
         svc.now_ms(),
     );
@@ -734,7 +786,16 @@ async fn cp_put(
     .await
     .map_err(|_| api_err(408, "timeout", "request body too slow"))?
     .map_err(|_| api_err(413, "too_large", "checkpoint too large"))?;
-    wait(svc.store.put_checkpoint(room, body.to_vec(), svc.now_ms())).await?;
+    // Ordered by the blob's own (epoch, capture time), never by arrival: a slow upload of an
+    // older capture, or one from a room's previous incarnation, never replaces newer state.
+    let (id, key) = crate::gs::checkpoint::Checkpoint::peek(&body)
+        .map_err(|e| api_err(400, "bad_checkpoint", &format!("invalid checkpoint: {e}")))?;
+    if id != room {
+        return Err(api_err(400, "bad_checkpoint", "checkpoint is for another room"));
+    }
+    if !wait(svc.store.put_checkpoint(room, body.to_vec(), key)).await? {
+        tracing::debug!(%room, epoch = key.epoch, saved_ms = key.saved_ms, "stale checkpoint upload ignored");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

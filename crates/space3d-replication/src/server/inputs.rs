@@ -25,8 +25,9 @@ pub struct InputBuffer {
     slack_samples: u32,
     /// Newest tick consumed with a real (received) input.
     consumed_real: Option<Tick>,
-    /// Last tick consumed at all.
-    consumed_through: Option<Tick>,
+    /// Ticks simulated without their input (repeated / neutral), by ring index: the input for
+    /// such a tick that arrives afterwards is *late* (counted once).
+    missed: Vec<Option<Tick>>,
     /// An input was missing since the last snapshot.
     missing: bool,
 }
@@ -40,7 +41,7 @@ impl Default for InputBuffer {
             slack_ewma: 0.0,
             slack_samples: 0,
             consumed_real: None,
-            consumed_through: None,
+            missed: vec![None; RING],
             missing: false,
         }
     }
@@ -81,8 +82,17 @@ impl InputBuffer {
         matches!(&self.ring[t.0 as usize % RING], Some((tt, _)) if *tt == t)
     }
 
-    pub(crate) fn has_consumed(&self, t: Tick) -> bool {
-        self.consumed_through.is_some_and(|c| t <= c)
+    /// The input for an already simulated tick `t` arrived: `true` (once) when `t` was
+    /// simulated without it — a late input. Redundant copies of inputs that were on time, or
+    /// of a late input already counted, are not.
+    pub(crate) fn late_arrival(&mut self, t: Tick) -> bool {
+        let slot = &mut self.missed[t.0 as usize % RING];
+        if *slot == Some(t) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn insert(&mut self, t: Tick, v: ErasedInput) {
@@ -103,8 +113,9 @@ impl InputBuffer {
 
     /// Input for `t` (received or repeated). `None` before the client sent anything.
     pub(crate) fn take(&mut self, t: Tick, ops: &dyn crate::registry::InputOps) -> (Option<ErasedInput>, bool) {
-        self.consumed_through = Some(t);
-        let slot = &mut self.ring[t.0 as usize % RING];
+        let i = t.0 as usize % RING;
+        self.missed[i] = None;
+        let slot = &mut self.ring[i];
         if let Some((tt, _)) = slot
             && *tt == t
         {
@@ -116,6 +127,7 @@ impl InputBuffer {
         if self.newest.is_none() {
             return (None, false);
         }
+        self.missed[i] = Some(t);
         self.missing = true;
         (self.last.as_ref().map(|l| ops.repeat(l)), false)
     }
@@ -260,7 +272,12 @@ mod tests {
         assert_eq!(v.unwrap().downcast_ref::<Move>(), Some(&Move(6)));
         assert_eq!(b.take_slack_q2(), i8::MIN);
         assert_eq!(b.consumed_real(), Some(Tick(3)));
-        assert!(b.has_consumed(Tick(4)));
+        // Regression: late inputs were never counted (every simulated tick looked "consumed").
+        // Tick 4 ran on a repeated input: its input arriving now is late, once; tick 3's (a
+        // redundant copy of an on-time input) is not.
+        assert!(b.late_arrival(Tick(4)));
+        assert!(!b.late_arrival(Tick(4)), "counted once");
+        assert!(!b.late_arrival(Tick(3)), "was on time");
         b.observe_slack(2.0);
         assert_eq!(b.take_slack_q2(), 8);
     }

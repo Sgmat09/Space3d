@@ -154,9 +154,9 @@
 - **`/healthz`** returns 200 while the supervisor ticks and every shard heartbeat is less than 5 s old. A stuck tick fails liveness.
 - **`/readyz`** returns 200 when the server is not draining, the DB is ready, it has registered with the PS once (GS role; registration is a latch, so a later PS outage keeps it ready and `space3d_fleet_connected` reports the link), and its shards are alive.
 - **Lifecycle** (`lifecycle.rs`): `Starting → Ready → Draining → Stopping → Stopped`.
-  1. **Drain trigger:** SIGTERM or SIGINT, `POST /admin/v1/drain`, or `FleetDown::Drain`. `/readyz` returns 503, the heartbeat reports `draining`, new tickets get `Reject(ServerDraining)` while resumes still work, and every room gets `RoomCommand::Drain{deadline}`, which sends `Notice::ShuttingDown`.
-  2. **During drain:** match rooms finish naturally within `drain_timeout`. Persistent rooms checkpoint immediately and send `Notice::Reconnect`, so clients rejoin through the PS and are restored elsewhere.
-  3. **Deadline:** checkpoint all rooms, then await uploads and the outbox flush (up to 20 s). Send `Disconnect(ServerShutdown)`, stop listeners, deregister, drop `Db` (its worker drains the queue), and exit 0.
+  1. **Drain trigger:** SIGTERM or SIGINT, `POST /admin/v1/drain`, or `FleetDown::Drain`. `/readyz` returns 503, the heartbeat reports `draining`, and every room gets `RoomCommand::Drain{deadline}`, which sends `Notice::ShuttingDown`. No room is created any more (a ticket that would create one gets `Reject(ServerDraining)`); a ticket into a room that still runs here is admitted (a rejoin into a match that finishes here), and resumes still work.
+  2. **During drain:** match rooms finish naturally within `drain_timeout`; a player's `POST /v1/sessions/rejoin` sends them back to the same room on the draining server (the PS never restores a room that is still in a live server's heartbeat, so a match is never forked). **Persistent rooms move:** they checkpoint immediately and send `Notice::Reconnect`; once that checkpoint is stored, the room closes (`Disconnect(ServerShutdown)`) and reports `RoomClosed { restorable: true }`, which the PS keeps as orphaned, so the players' rejoin restores it on another server from exactly that state. Clients treat `Notice::Reconnect` as a warning; the example client rejoins on the disconnect.
+  3. **Deadline:** checkpoint all rooms, then await uploads and the outbox flush (up to 20 s). Send `Disconnect(ServerShutdown)` (rooms report `RoomClosed { restorable: true }`: their checkpoints are kept for a rejoin), stop listeners, send `FleetUp::Deregister` (the PS marks the server dead at once; its lease covers a lost message), drop `Db` (its worker drains the queue), and exit 0.
   4. **Second signal:** every shard captures its rooms synchronously into the GS's own database (`LocalCheckpoints`, the "rescue" store; writes bounded to 5 s), sends `Disconnect(ServerShutdown, resume_allowed = false)`, and the process exits 1. The next start uploads those checkpoints to the configured store unless it already holds a newer one (`gs::checkpoint::upload_rescued`), so a rejoin restores them.
 
 ---
@@ -496,7 +496,8 @@ Rules for sim systems:
 
 - **`NetInput`** (`Serialize + DeserializeOwned + Clone + Default + PartialEq`) carries **state, not edges**: axes, absolute view angles, a held-button mask, and wrapping counters for discrete actions. Redundancy and repetition are therefore idempotent. Games latch per-frame edges inside their `InputSampler`.
 - **`sanitize(&mut self) -> Result<(), InvalidInput>`** clamps NaN, ranges and unknown bits. `Err` counts as a strike and the neutral input is used.
-- **Missing inputs:** for tick T the server uses `buffer[T]`. If it is missing, the server uses `last.repeat()` (counted as missing). While the player is disconnected it uses `NetInput::neutral()`.
+- **Missing inputs:** for tick T the server uses `buffer[T]`. If it is missing, the server uses `last.repeat()` (counted as missing). While the player is disconnected it uses `NetInput::neutral()`. The input for such a tick that arrives afterwards is counted once as *late* (`space3d_input_total{result="late"}`, `NetStats::input_late`); redundant copies of on-time inputs are not.
+- **Client controls:** `NetClient::set_rate` (`ControlMsg::SetRate`, clamped to `[4096, client_bandwidth_max]`) and `NetClient::set_interest_hint` (`ControlMsg::InterestHint`, an extra interest centre such as a free camera, radius ≤ 1000 m).
 - **Slack:** `input_slack` is the EWMA of (arrival tick − T) and is reported in every snapshot.
 - **Beyond the wire:** clients send intent only. Cooldowns, ammo and reach are simulated server-side, and commands go through `NetMessage::validate` plus per-type size and rate limits.
 - **Server-side bots:** `NetServer::add_virtual_client(identity, brain(|world, tick| input))` fills a slot with no link, for backfill and load.
@@ -577,7 +578,7 @@ The bytes are copied into every recipient's packet, so there is no per-client re
 
 - **Streams (WS): optimistic.** The baseline advances when the packet is handed to the link. If the link dies, resume sends `FULL_RESET` anyway.
 - **Datagrams: acked.** A `SentRecord{seq, tick, entities, despawns, lost}` ring (256 entries) is kept, and an ack raises `ack_tick`. Records are written against `ack_tick` (in-flight changes are repeated until acked), so a reordered older record never carries something a newer one lacks. A packet unacked after the RTO (1 s before the first RTT sample, RFC 6298; the client's reported RTT seeds it) is presumed lost: an unacked spawn may be resent (`last_sent_tick = ack_tick`), and the record stays in the ring marked `lost`, so a late ack still credits it and samples the RTT (a long path raises the RTO instead of looking like permanent loss).
-- **Spawns and despawns are state.** A spawn record repeats until acked (datagrams) or is sent once (streams). Despawn tombstones persist until every client has acked them or they age past the resume window.
+- **Spawns and despawns are state.** A spawn record repeats until acked (datagrams) or is sent once (streams). Despawn tombstones persist until every client has acked them or they age past the resume window. The client keeps its own tombstones (`NetId` → despawn tick, 30 s, cleared on a new epoch): a spawn record older than a despawn it already applied (a reordered or duplicated datagram, or a despawn that overtook its spawn) is ignored, so a short-lived entity never comes back as a ghost; `NetId`s are never reused within an epoch, so re-entering scope (a newer spawn) still applies.
 
 ### 8.5 Interest (`server/interest.rs`)
 
@@ -594,7 +595,7 @@ Per client, per send tick:
 2. **Budget.** `ByteBudget` is a token bucket at `client_bandwidth` (48 KiB/s default, clamped by `ClientCaps` and `SetRate`), with a 2× burst, and 4× until `SYNC_COMPLETE`.
 3. **Always first:** despawns, removals, control, reliable messages, pongs, and the client's controlled (predicted) entities. The client's other own entities compete for the budget with a 4× priority boost (an RTS player owning hundreds of units stays within budget and still sees everything else).
 4. **Accumulate.** Each other relevant entity with due changes gets `acc += rule_priority × NetPriority × 1/(1 + d/ref) × Δticks`.
-5. **Write.** Sort by `acc`, and write while the budget allows, trying up to 8 smaller entries after the first miss. Written entities reset `acc` to 0 and unwritten ones keep growing. Nothing starves: a full bucket lets the top entry through even when it does not fit (the budget goes into debt), and a top entry deferred more than 3 snapshots in a row holds lower priorities back until it goes, so an entity larger than a snapshot's budget (or the whole burst) is still delivered and never blocks `SYNC_COMPLETE`. Stream packets are cut at 16 KiB; a single larger entity record goes alone up to the link's cap (1 MiB server → client), and a record over the cap is dropped with an error and **not** marked delivered.
+5. **Write.** Sort by `acc`, and write while the budget allows, trying up to 8 smaller entries after the first miss. Written entities reset `acc` to 0 and unwritten ones keep growing. Nothing starves: a full bucket lets the top entry through even when it does not fit (the budget goes into debt, capped at one burst), a top entry deferred 8 snapshots in a row goes out whatever the bucket holds (so a controlled set larger than the budget cannot shut everything else out), and a top entry deferred more than 3 snapshots in a row holds lower priorities back until it goes. While the bucket is in debt, the controlled entities' *unchanged* predicted components are re-confirmed every 4 snapshots instead of every snapshot (changes still go every snapshot); controlled entities that change every tick are always sent, so a controlled set larger than the budget exceeds `client_bandwidth` by design. Also, so an entity larger than a snapshot's budget (or the whole burst) is still delivered and never blocks `SYNC_COMPLETE`. Stream packets are cut at 16 KiB; a single larger entity record goes alone up to the link's cap (1 MiB server → client), and a record over the cap is dropped with an error and **not** marked delivered.
 6. **Stats.** `NetStats::{budget_utilization, starved_entities}` feed metrics and tests.
 
 ### 8.7 Messages / RPC (`messages.rs`)
@@ -640,7 +641,8 @@ app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Ticket { url, tic
 
 - **`RttEstimator`:** RFC 6298 (α = 1/8, β = 1/4) with a windowed minimum. `rtt = now − echo − hold`.
 - **`ServerClock`** keeps the last 16 pong samples, `server_tick + tick_frac + (rtt/2)·hz`. It uses the median of the lower-RTT half, slews at most 1 tick/s, and snaps when the error exceeds 5 ticks.
-- **Predicted tick target:** `est_server_tick + (rtt/2)·hz + target_slack`.
+- **Path RTT and jitter for pacing and interpolation** come from the `ServerClock` window, not from the RFC 6298 estimator: `path_rtt` = median RTT of the lowest-RTT half, `jitter` = median absolute deviation. A head-of-line stall on a stream adds a few high samples that these ignore, where `srtt` jumps several-fold (it would pull the render clock back and fight the pacer). `RttEstimator` still drives RTOs and `NetStats::rtt`.
+- **Predicted tick target:** `est_server_tick + (path_rtt/2)·hz + target_slack`.
 - **`TickPacer`** is a PI controller on the server-reported `input_slack` relative to `target_slack_ticks` (1.5, plus 2·jitter, raised after a head-of-line stall is detected).
   - `PaceAction::Scale(s)` with `s ∈ [0.95, 1.05]` sets `TickRate::hz = nominal × s`.
   - `PaceAction::Resync(n)` fires when the error exceeds 8 ticks: jump the tick and clear history.
@@ -664,6 +666,8 @@ app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Ticket { url, tic
 
 **Replay start (integration pass):** only the newest confirmed values are kept, so the replay always starts from the newest confirmed tick, whatever older tick first disagreed. When several snapshots arrive together after a stall, an older mismatch is superseded by the newest confirmation; if the prediction for that newest tick was right, nothing is replayed at all. (Starting at the oldest mismatch wrote the newest values and then re-applied the inputs in between: a wrong state and a second correction, or a snap when the span exceeded `max_rollback_ticks`.) Ticks with no recorded input (skipped by a forward resync) replay the last earlier input `repeat()`ed, exactly as the server filled them, and a resync keeps the input history, so a resync no longer forces a snap.
 
+**Behind the confirmed state:** when the newest confirmation S is at or past the next predicted tick T (a frame hitch on a low-latency link), the confirmed state already includes ticks T..=S: the timeline fast-forwards to S + 1 (a forward resync) instead of simulating those ticks again on top of it.
+
 **Snaps:** when a rollback cannot be replayed (longer than `max_rollback_ticks`, or inputs missing after a resync), the confirmed values are written and the recorded history before the current predicted tick T is dropped; confirmations older than T then only update the confirmed values, so one snap is followed by at most one ordinary replay. While the prediction lead itself exceeds `max_rollback_ticks` every correction snaps, so keep it above the expected lead (default 32 ticks ≈ 530 ms).
 
 **Visuals:** `PredictionError` decays with `smoothing_half_life` (60 ms), and errors above `snap_distance` (2 m) snap instead. It is applied to the rendered transform only and never simulated.
@@ -672,7 +676,7 @@ app.resources.expect_mut::<NetClient>().connect(ConnectTarget::Ticket { url, tic
 
 ### 9.4 Interpolation and jitter buffer (`client/interpolation.rs`)
 
-- **`InterpClock`:** `render_tick = (server_estimate − (rtt/2)·hz) − delay`, i.e. the delay trails the newest tick a snapshot can have arrived for, not the server's current tick. The delay is `clamp(send_interval + jitter_k·jitter + ½ tick, 35 ms, 250 ms)`, slewed by ±5 % playback speed, and snaps beyond 10 ticks.
+- **`InterpClock`:** `render_tick = (server_estimate − (path_rtt/2)·hz) − delay`, i.e. the delay trails the newest tick a snapshot can have arrived for, not the server's current tick. The delay is `clamp(send_interval + jitter_k·jitter + ½ tick, 35 ms, 250 ms)` (stall-resistant `jitter`, see §9.2), slewed by ±5 % playback speed. The render tick never runs backwards: more than 10 ticks ahead of the target it slows down (to half speed at most); more than 10 ticks behind it snaps forward.
 - **`SnapshotBuffer<T>`** holds 32 samples per `Interpolate`/`PredictAndInterpolate` component of each non-predicted entity. `sample(render_tick, lerp, max_extrapolate)` holds or extrapolates for up to 100 ms, then freezes. Extrapolation only applies to entities present in the newest snapshot received: an entity missing from newer snapshots is unchanged (or deferred by the budget), so it holds its last value instead of overshooting a stop or a teleport.
 - **Gap fix:** a sample arriving more than `send_interval` after the previous one gets a synthetic copy of the previous value inserted at `tick − send_interval`, so resting entities do not slide. Records with the `DEFERRED` bit skip it (the gap was motion held back by the budget), and the entity's buffer grows a per-entity render `lag` (its observed update gap beyond the send interval, decaying once updates arrive at the nominal rate): budget-deferred movers are drawn further in the past but move smoothly instead of freezing and jumping.
 - **`Delayed` components** and `Interpolated` events release when `render_tick` reaches their tick.
@@ -786,14 +790,14 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
 | player data written by rooms | `RoomControl::write_player_data` → outbox → `FleetUp::PlayerDataWrite{op_id}` → PS | at-least-once, idempotent |
 | results / scores | `RoomControl::end_match` / `submit_score` → outbox | same |
 | player data read by rooms | `RoomControl::load_player_data` → `FleetUp::FetchPlayerData` → `Events<PlayerDataLoaded>` | async; the slot plays meanwhile (small data such as rating travels in the ticket) |
-| room checkpoints (`FullState` keeps `NetId`s and the room-side markers `ControlledBy`, `Owner`, `NetTeam`, `NetPriority`, `NetRelevance`, `InterestSource`, `Simulated`) | `Checkpoint{version, room_id, spec, state: FullState, server_only, game_blob, saved_ms}` → `CheckpointStore` (`player-service` default, `local`, `none`) | every 10 s, on phase change, drain, request; serialization via `AsyncQueue::compute_then`; ≤ 1 upload in flight per room |
+| room checkpoints (`FullState` keeps `NetId`s and the room-side markers `ControlledBy`, `Owner`, `NetTeam`, `NetPriority`, `NetRelevance`, `InterestSource`, `Simulated`) | `Checkpoint{version, room_id, epoch, saved_ms, spec, state: FullState, server_only, game_blob}` (format 2: `epoch` + `saved_ms` form a header readable without decoding the state) → `CheckpointStore` (`player-service` default, `local`, `none`) | every 10 s, on phase change, drain, request; serialization on the compute pool; ≤ 1 upload in flight per room; a room's pending upload is abandoned when it is dropped or rebuilt, and a closed room's checkpoint is deleted after its last upload settles. **Every store keeps the checkpoint with the greatest `(epoch, saved_ms)` of the blob** (never the upload time) and refuses older ones, so a slow upload, a previous incarnation's upload (crash rebuild, restore elsewhere) or a draining server's late one never replaces newer state |
 
 **Failure matrix:**
 
 | failure | detection | recovery |
 |---|---|---|
 | client network blip | close / idle 10 s | resume within 20 s: same slot, `FULL_RESET`, no pop-in |
-| room panic | `catch_unwind` (`--profile server`) | rebuild from the last checkpoint, epoch + 1, `Notice::Reconnect`; crash-loop guard (3 in 5 min → close) |
+| room panic | `catch_unwind` (`--profile server`) | rebuild from the last checkpoint, epoch + 1, `Disconnect(RoomCrashed)` (clients rejoin); crash-loop guard (3 in 5 min → close; `gs::shard::recover_crashed`, shared by the shards and `TestCluster`) |
 | shard stall | heartbeat older than 5 s → `/healthz` 503 | orchestrator restart → server-loss path |
 | GS crash or node loss | PS lease expiry (10 s) | rooms orphaned; clients' resume fails → `POST /v1/sessions/rejoin` → PS allocates a new GS of the room's build with `restore_from` checkpoint. `RecoveryPolicy::Abandon` (reported in `RoomStatus::abandon_on_loss`): the PS voids the room (audit `match_void`, `space3d_matches_void_total`) and rejoin answers 404, so clients queue again |
 | PS unavailable | fleet link down | rooms keep running; outbox buffers; new logins and matchmaking unavailable; GS `/readyz` stays ready (registration latch; `space3d_fleet_connected` = 0) |
@@ -820,8 +824,11 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
   - Admitted links have a per-link packet budget into the shared room inbox (dropped at the gateway; sustained flooding closes the link), so one client cannot fill the inbox of everyone in its room. A resume refused as busy carries a retry delay and the client retries it.
   - IP/CIDR bans added at runtime also close links already open from the banned range (`Disconnect(Banned)`).
 - **Join ticket nonces:** the cache never evicts an unexpired `jti` (that ticket could be replayed); when it is full of live nonces new tickets are refused with a retryable `RateLimited`.
-- **Runtime:** per-link token buckets, strikes, the input tick window, `sanitize`/`validate`, and backpressure disconnects. Server authority means clients send intent only. Interest and `Audience::Owner` limit what can leak (a wallhack sees only in-scope entities).
-- **Admin:** a separate listener (loopback or cluster-internal), bearer tokens compared constant-time against SHA-256 hashes (production requires every token to be ≥ 16 characters), and every action audit-logged.
+  - Every HTTP listener (game port, PS, admin) runs its own accept loop (`space3d_net::ConnectionLimits`): a header-read timeout (`limits.http_header_timeout`, 10 s; also closes idle keep-alive connections), and caps on connections that have not completed a request or a WebSocket upgrade, per client IP (`limits.http_connections_per_ip`, 64; IPv6 per /64; trusted proxies exempt) and in total (`limits.http_max_connections`), refused at accept time. The PS reads request bodies within `limits.http_body_timeout` (10 s → 408).
+  - `X-Forwarded-For`: every header line counts, joined in order (RFC 9110), before the right-most-untrusted rule, so a proxy that adds its own line cannot leave the client's line in charge.
+- **Runtime:** per-link token buckets, strikes, the input tick window, `sanitize`/`validate`, and backpressure disconnects. Server authority means clients send intent only. Interest and `Audience::Owner` limit what can leak (a wallhack sees only in-scope entities). Account bans are enforced by every room a player is in (on the ban-list change and on every join, resume or supersede: `Disconnect(Banned)`); an admin kick reaches every room of the server.
+- **Abuse of the PS:** quick play holds at most one unused seat reservation per account (a new quick play releases the previous one), is limited per account (1/s, burst 10), may open at most 3 rooms at once then 6 per minute per account, and only for a mode that a configured queue or a server (`GameDefinition::modes`, sent at registration) hosts; a room a game server refuses to build (`PrepareRoom` fails) releases its reservations at once (`RoomClosed`). Lobbies: one open lobby per host (a new one closes the previous), mode 1–32 of `[A-Za-z0-9_.-]`, closed after 30 min without activity, codes indexed. Password logins charge the per-username budget only on failure, per (username, address prefix) first, with a 4× username-wide backstop, so other addresses' wrong guesses do not lock the owner out.
+- **Admin:** a separate listener (loopback or cluster-internal), bearer tokens compared constant-time against SHA-256 hashes (production requires every token to be ≥ 16 characters), and every action audit-logged under the token-derived actor. Without tokens on a loopback bind (dev) the API is open, but only to requests a web page cannot forge: a loopback `Host` (no DNS rebinding) and, if present, a loopback `Origin`.
 - **Fleet:** the fleet token is checked at the WebSocket upgrade (`Authorization: Bearer`, constant time; no socket without it) and again in `Register`; at most 1024 fleet connections, and a connection that does not register within 10 s is closed. `/internal/v1/*` checks the per-IP rate and the fleet token in a middleware before any body is read, and bounds a checkpoint upload to 30 s.
 - **Secrets** come only from env or files, and are redacted in logs and config dumps.
 - **Dev auth** is only allowed with a loopback bind. Metrics labels never contain player ids, room ids or IPs.
@@ -836,7 +843,7 @@ Game plugins go **after** `ServerReplicationPlugin` and `ClientReplicationPlugin
 **GS:**
 - Rooms and players: `space3d_rooms{phase}`, `space3d_players{state}`.
 - Tick health: `space3d_tick_seconds` (histogram, 0.25–50 ms), `space3d_ticks_skipped_total`, `space3d_room_crashes_total`, `space3d_shard_load{shard}`.
-- Traffic: `space3d_bytes_total{dir,channel}`, `space3d_packets_total{dir}`, `space3d_snapshot_bytes` (histogram), `space3d_snapshots_skipped_total{reason}`, `space3d_rtt_seconds` (histogram).
+- Traffic: `space3d_bytes_total{dir,channel="all"}` (no per-channel breakdown yet), `space3d_packets_total{dir}`, `space3d_snapshot_bytes` (histogram), `space3d_snapshots_skipped_total{reason}`, `space3d_rtt_seconds` (histogram).
 - Inputs and connections: `space3d_input_total{result=ok|late|missing|invalid}`, `space3d_handshakes_total{result}`, `space3d_rate_limited_total{kind=packets|messages|link_packets|room_inbox}`, `space3d_strikes_total`, `space3d_disconnects_total{reason}` (every `DisconnectCode::label`, plus `link_lost` and `room_inbox_full`; from `RoomNetStats::disconnects`), `space3d_fleet_connected`.
 - Persistence: `space3d_outbox_pending`, `space3d_checkpoint_seconds`, `space3d_checkpoint_bytes`.
 
@@ -851,8 +858,8 @@ Room stats: `NetServer::room_stats()` returns cumulative `RoomNetStats` counters
 ### 14.2 Logs
 
 `tracing-subscriber` writes JSON (production) or pretty output (dev) to stdout, with an `EnvFilter`.
-- **Fields:** `server_id`, `role`, `room_id`, `client`, `player_id`, `link`, `tick`.
-- **Spans:** each room tick runs in a `room` span.
+- **Spans:** the process runs in a `server` span (`server_id`, `role`), entered by `ServerMain` and inherited by the listeners' connection tasks, the ingress task, the fleet link and the shard threads; each room tick runs in a `room` span (`room_id`, `epoch`, `tick`), so replication warnings that do not name the room carry it. Both are `ERROR`-level spans so a `warn` filter keeps them. JSON lines include the current span's fields.
+- **Other fields:** `client`, `player_id`, `link`.
 - **Security events:** logged at `warn` with `event=`.
 - **Audit:** admin actions go to the `space3d::audit` target.
 
@@ -890,8 +897,11 @@ assert_eq!(h.wire_digest(), run_again_with_same_seed());            // byte-leve
 
 `TestCluster` runs the PS, `Gatekeeper`, rooms (stepped directly with no shard threads) and clients over `MemoryNetwork`, using `ManualClock` + `ManualUnixClock` and an in-memory `Db`. It covers:
 - `guest`, `matchmake`, `connect`, `step`, `run_until`;
-- `crash_room` (catch_unwind and restore);
-- `kill_game_server` (lease expiry, rejoin, restore).
+- `crash_room` (catch_unwind and restore, through the shards' crash-loop guard);
+- `kill_game_server` (lease expiry, rejoin, restore);
+- `set_fleet_outage` / `set_fleet_swallow` (fleet link down; answers lost after a request went out).
+
+Checkpoint uploads, database writes and the PS's async answers run in real time while cluster time can race ahead of them: tests that wait for them give background work real time per tick (see `run_until_bg` in `tests/cluster.rs`).
 
 ### 15.3 Test plan (gates per PR: fmt, clippy `-D warnings`, tests, wasm check)
 
@@ -907,11 +917,11 @@ assert_eq!(h.wire_digest(), run_again_with_same_seed());            // byte-leve
 | sessions | resume keeps entity and `NetId`, with no duplicates; window expiry → `PlayerLeft{Timeout}`; supersede; epoch bump forces a full reset |
 | determinism | `wire_digest` identical across two runs with the same seed |
 | security (server) | token sign/verify/tamper/expiry/kind confusion/kid rotation/`jti` replay; gatekeeper rejects (version, schema, ticket, wrong server, banned, draining, timeout); per-IP limits with an injected clock; strikes → kick |
-| server | config overlay precedence and validation; matchmaker; fleet leases and allocation; outbox idempotency; checkpoint round trip; room panic contained (`--profile server` CI job) |
+| server | config overlay precedence and validation; matchmaker; fleet leases and allocation; outbox idempotency; checkpoint round trip and `(epoch, saved_ms)` ordering; room panic contained and crash-loop close (`server-profile` CI job runs them with `--profile server`); drain handoff of persistent rooms; rejoin during drain; player-data load / fetch timeout / scores; quick-play, lobby and login abuse; slow / idle sockets; XFF lines; admin cross-site requests; room log spans |
 | net (done) | 17 KiB → 1009 on server and client; slow consumer → 1008; accept hook; bounded inbox |
 | e2e sockets | all-in-one on port 0: PS login → quick play → 3 WS clients see each other; drain writes checkpoints and closes with 1001 (`pump_until` style, 5 s deadline) |
 | wasm | `cargo check -p space3d-replication --target wasm32-unknown-unknown` (default features and `--no-default-features --features client`) |
-| load | CI smoke: 50 bots in process for 600 ticks, asserting bytes and allocations (not timing). Nightly: `loadtest` with 200 clients over real sockets and SLO gates (`examples/multiplayer_arena/tests/load.rs`, `#[ignore]`) |
+| load | CI smoke: 50 bots in process for 600 ticks, asserting bytes and allocations (not timing). Nightly (`.github/workflows/nightly.yml`): `loadtest` with 200 clients over real sockets and SLO gates (`examples/multiplayer_arena/tests/load.rs`, `#[ignore]`, release build) |
 | acceptance (integration pass) | `crates/space3d-server/tests/acceptance.rs`: 4 clients through guest login → quick play → ticket on a 100 ms RTT, ±20 ms jitter, 5 % loss stream link converge (remote p95 0, final 1 mm), predict exactly after reconciliation whenever the server had their inputs, resume the same slot after a 3 s blackout, stay under bandwidth budgets (4 movers ≈ 1.7 KB/s down; 300 NPCs held to a 12 KiB/s budget); separate player-service and game-server Apps over localhost with ticket → connect and single-use tickets. `examples/multiplayer_arena/tests/processes.rs`: the shipped binaries over localhost. Numbers: `docs/server.md` §7 |
 
 ### 15.4 Bots and load test
@@ -920,11 +930,13 @@ assert_eq!(h.wire_digest(), run_again_with_same_seed());            // byte-leve
 - `loadtest::run(config, protocol, make_bot)` runs N headless client `App`s over real WS on `clients / bots_per_thread` threads. Clients connect via dev auth or through the PS.
 - It reports connect success and handshake percentiles, RTT, down/up bytes/s, snapshot rate, rollbacks/s, disconnect reasons, and scraped server tick p99.
 - The SLO gates set the exit code.
-- Acceptance target: 200 clients across 10 rooms at 60 Hz on 4 cores, with server tick p99 < 4 ms and no skipped ticks.
+- Acceptance target: 200 clients across 10 rooms at 60 Hz on 4 cores, with server tick p99 < 4 ms and no skipped ticks in a release build (the nightly job; the test tolerates ≤ 0.1 % skipped ticks for scheduler noise when the bots share the machine with an unoptimised server).
 
 ---
 
-## 16. Budgets (targets verified by harness and load tests)
+## 16. Budgets (design targets)
+
+These are targets, not measured guarantees. What is measured: the byte budgets (harness scenarios and `acceptance.rs` assert downstream bytes per client), and the whole-server tick p99 of the 200-client / 10-room load test (≤ 4 ms SLO, nightly). The per-room CPU figures (16-client room < 1 ms, one 200-client room with 1000 movers < 5 ms p99) and the wasm client figures have no benchmark yet; they are budgets for future benches.
 
 - **Downstream:**
   - 16-player arena at 30 Hz snapshots: about 16 × 17 B plus about 12 B header ≈ 285 B per snapshot, or **8.5 KB/s**, plus WS/TLS framing of about 2.2 KB/s.
@@ -1025,7 +1037,7 @@ All additive to the §18.1 contract.
 - **Replication:** `ChangeCache::collect` adopts restored entities (above); `NetIdMap::retain`; `full_state` checkpoints the `Simulated` marker (`META_SIMULATED`), so a restored room keeps simulating its pawns; client replay starts from the newest confirmation and fills resync gaps with repeated inputs (§9.3). New scenario: `snapshot_burst_after_a_stall_replays_from_the_newest_confirmation`.
 - **Server:** `ServerConfig::load_layered` + `config::merge_tables`, `ServerMain::from_env_with_defaults` (game-supplied defaults under file and env; `--print-default-config` shows them); fleet seat counting with presence and room-bound reservations (§11.2), `ServerRecord::{present, players()}`; `PlayerService::quick_play_room` finds an open room or allocates one under a single fleet lock (concurrent quick plays used to open a room each); the load-test report gained `server: Option<ServerSample>` (tick mean / p50 / p99, ticks, skipped ticks, rooms, server bytes/s from two `/metrics` scrapes) and `loadtest::metric_value`; the Dockerfile takes `CARGO_ARGS` (package / features).
 - **Examples and tests:** `examples/multiplayer_arena` (§3.3); `crates/space3d-server/tests/acceptance.rs` (§15.3).
-- **Still deferred:** predicted spawns, rayon packet building above 32 clients, the datagram `loss` stat, `select_nth_unstable` priority selection, Postgres, QUIC, Kubernetes manifests. The fleet link closes without a WebSocket close frame when a game server exits (the player service logs a warning; the lease handles it).
+- **Still deferred:** predicted spawns, rayon packet building above 32 clients, the datagram `loss` stat, `select_nth_unstable` priority selection, Postgres, QUIC, Kubernetes manifests. The fleet link closes without a WebSocket close frame when a game server exits (the player service logs a warning; a drained server's `Deregister` normally arrives first, and the lease covers a lost one).
 
 ### 18.5 Review fixes
 
@@ -1034,6 +1046,13 @@ All additive to the §18.1 contract except the snapshot op bit (protocol version
 - **Replication:** parked unresolved references are dropped when a newer value or a removal of the component arrives; rate-limit overflow is judged per 1 s window (message drops count) and kicks with `RateLimited`; datagram records use acked baselines, a conservative initial RTO and late acks of presumed-lost records; the budget covers owned entities, never starves large entities, and marks deferred records (`DEFERRED`), which clients interpolate across with a per-entity lag; oversized stream records are never marked delivered; per-player visibility overrides are forgotten on despawn / leave; `RoomNetStats` counts disconnects per code, lost links, rate-limit drops and oversize drops; debug checks for plugin order and sim discipline (§20); transient rejects of resumes are retried.
 - **Server:** forced stop rescue checkpoints (§2.4); readiness latch (§12); build-aware allocation and restore (§11.2); `RecoveryPolicy::Abandon` voids orphaned rooms (§12); per-link gateway budget, runtime IP-ban enforcement, IPv6 /64 rate keys, LRU limiter, fail-closed nonce cache, strict production admin tokens, fleet upgrade authentication and registration deadline, internal-route guard (§13); per-reason disconnect / rate-limit metrics, `space3d_sessions_active`, `space3d_db_queue_depth` (§14.1); whole-Hz `tick_hz` (the rate travels as an integer in `Welcome`).
 - **Net / db:** `ConnectMeta::authorization`, `WsConfig::headers` (native), lock-free `ClientSender` (`WsLinkTx` never takes the server-wide client lock), `Db::queue_depth`.
+
+**Second review round** (additive to §18.1 except the checkpoint format, version 2, and `FleetUp::{RoomClosed.restorable, Deregister}` / `ServerRegistration::modes` with serde defaults):
+
+- **Replication:** fast-forward instead of re-simulating ticks the confirmed state already includes (§9.3); client despawn tombstones against reordered spawns (§8.4); budget debt capped, guaranteed progress for starved candidates, thinned re-confirmations while in debt (§8.6); stall-resistant path RTT / jitter for pacing and interpolation, a render clock that never runs backwards (§9.2, §9.4); late inputs counted per missed tick (§7.3); `NetClient::{set_rate, set_interest_hint, last_applied}`; `ClientSpec::with_team` in the harness; feature tests for audiences, send rules, relevance overrides, visibility rules, message targets, `rollback_when`, `NetPriority` and input sanitizing (`tests/features.rs`).
+- **Server:** checkpoints ordered by `(epoch, saved_ms)` in every store (§12); persistent-room handoff on drain, rejoin never forks a running room, deregistration (§2.4); one crash-loop guard for shards and `TestCluster`; player-data fetch timeout (`gs::FETCH_TIMEOUT`); bans enforced by every room (joins, resumes, ban-list changes) and kicks reaching every room; quick-play / lobby / login limits, `GameDefinition::modes` (§13); `server` / `room` log spans (§14.2).
+- **Net:** `HttpServer` runs its own HTTP/1.1 accept loop with `ConnectionLimits` (header-read timeout, total and per-peer caps) and `ConnectionStats`; `joined_header` for list-valued headers; the HTTP client drops idle pooled connections after 5 s.
+- **CI:** wasm check of `space3d-replication` (default and client-only), a `server-profile` job, and the nightly load job (§15.3).
 
 ---
 

@@ -10,6 +10,12 @@
 //! A forced stop (second signal) captures every room synchronously into the game server's local
 //! database ([`LocalCheckpoints`], the "rescue" store); the next start moves those into the
 //! configured store ([`upload_rescued`]) so a rejoin can restore them.
+//!
+//! Ordering: every store keeps the checkpoint with the greatest [`CheckpointKey`] — `(room
+//! epoch, capture time)`, read from the blob's header ([`Checkpoint::peek`]), never the upload
+//! time — and refuses to replace it with an older one. A slow upload that lands after a newer
+//! one, an upload from a room's previous incarnation (crash rebuild, restore on another server,
+//! a draining server's final checkpoint) therefore never overwrites newer state.
 
 use crate::clock::UnixClock;
 use crate::game::RoomSpec;
@@ -24,19 +30,24 @@ use space3d_tasks::Task;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Format version of [`Checkpoint`].
-pub const CHECKPOINT_VERSION: u16 = 1;
+/// Format version of [`Checkpoint`] (2: `epoch` + `saved_ms` header before the state).
+pub const CHECKPOINT_VERSION: u16 = 2;
 
 /// Largest accepted checkpoint (bytes).
 pub const MAX_CHECKPOINT_BYTES: usize = 16 << 20;
 
-/// A room checkpoint.
+/// A room checkpoint. The first four fields form a fixed header ([`Checkpoint::peek`]) that
+/// stores read without decoding the state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Checkpoint {
     /// [`CHECKPOINT_VERSION`].
     pub version: u16,
     /// Room.
     pub room_id: RoomId,
+    /// Room epoch at capture (`state.epoch`; a restore or crash rebuild bumps it).
+    pub epoch: u32,
+    /// Capture time (unix ms, taken right after the tick that was captured).
+    pub saved_ms: i64,
     /// Spec (to rebuild the room).
     pub spec: RoomSpec,
     /// Replicated state (tick, epoch, schema hash inside).
@@ -45,11 +56,79 @@ pub struct Checkpoint {
     pub server_only: Option<String>,
     /// Game-defined blob (resources).
     pub game_blob: Option<Vec<u8>>,
-    /// Save time (unix ms).
+}
+
+/// Which of two checkpoints of a room is newer: a later room epoch wins (the room was restored
+/// or rebuilt since), then the later capture time. Stores never replace a checkpoint with one
+/// whose key is smaller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CheckpointKey {
+    /// Room epoch.
+    pub epoch: u32,
+    /// Capture time (unix ms).
     pub saved_ms: i64,
 }
 
+/// The fixed prefix of an encoded [`Checkpoint`].
+#[derive(Deserialize)]
+struct Header {
+    version: u16,
+    room_id: RoomId,
+    epoch: u32,
+    saved_ms: i64,
+}
+
 impl Checkpoint {
+    /// A checkpoint of `state` captured at `saved_ms` (epoch taken from the state).
+    pub fn new(
+        spec: RoomSpec,
+        state: FullState,
+        server_only: Option<String>,
+        game_blob: Option<Vec<u8>>,
+        saved_ms: i64,
+    ) -> Self {
+        Self {
+            version: CHECKPOINT_VERSION,
+            room_id: spec.room_id,
+            epoch: state.epoch,
+            saved_ms,
+            spec,
+            state,
+            server_only,
+            game_blob,
+        }
+    }
+
+    /// Ordering key.
+    pub fn key(&self) -> CheckpointKey {
+        CheckpointKey {
+            epoch: self.epoch,
+            saved_ms: self.saved_ms,
+        }
+    }
+
+    /// Room and ordering key from the header of encoded checkpoint `bytes`, without decoding
+    /// the state (stores, the player service's upload route).
+    pub fn peek(bytes: &[u8]) -> Result<(RoomId, CheckpointKey), String> {
+        if bytes.len() > MAX_CHECKPOINT_BYTES {
+            return Err(format!("checkpoint of {} bytes exceeds the limit", bytes.len()));
+        }
+        let (h, _): (Header, _) = postcard::take_from_bytes(bytes).map_err(|e| e.to_string())?;
+        if h.version != CHECKPOINT_VERSION {
+            return Err(format!(
+                "checkpoint version {} (expected {CHECKPOINT_VERSION})",
+                h.version
+            ));
+        }
+        Ok((
+            h.room_id,
+            CheckpointKey {
+                epoch: h.epoch,
+                saved_ms: h.saved_ms,
+            },
+        ))
+    }
+
     /// postcard bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_stdvec(self).expect("checkpoint serializes")
@@ -67,6 +146,9 @@ impl Checkpoint {
                 cp.version
             ));
         }
+        if cp.epoch != cp.state.epoch || cp.room_id != cp.spec.room_id {
+            return Err("checkpoint header does not match its state".into());
+        }
         Ok(cp)
     }
 }
@@ -78,7 +160,9 @@ pub struct StoreError(pub String);
 
 /// Where checkpoints live. Every call returns a pollable `Task` (never blocks a tick).
 pub trait CheckpointStore: Send + Sync + 'static {
-    /// Save (replace) a room's checkpoint.
+    /// Save a room's checkpoint, replacing the stored one unless that one is newer (greater
+    /// [`CheckpointKey`], read from the blob header): an older checkpoint is dropped (`Ok`).
+    /// Bytes without a valid header are an error.
     fn put(&self, room: RoomId, bytes: Vec<u8>) -> Task<Result<(), StoreError>>;
     /// Latest checkpoint of a room.
     fn get(&self, room: RoomId) -> Task<Result<Option<Vec<u8>>, StoreError>>;
@@ -107,13 +191,39 @@ fn flatten<T: Send + 'static, E: std::fmt::Display + Send + 'static>(
     })
 }
 
-/// Game-server local migrations (outbox is 201, local checkpoints 202).
+/// Game-server local migrations (outbox is 201, local checkpoints 202-203).
 pub fn local_migrations() -> Vec<Migration> {
-    vec![Migration::new(
-        202,
-        "gs_local_checkpoints",
-        "CREATE TABLE IF NOT EXISTS gs_checkpoints(room_id INTEGER PRIMARY KEY, saved_ms INTEGER NOT NULL, data BLOB NOT NULL);",
-    )]
+    vec![
+        Migration::new(
+            202,
+            "gs_local_checkpoints",
+            "CREATE TABLE IF NOT EXISTS gs_checkpoints(room_id INTEGER PRIMARY KEY, saved_ms INTEGER NOT NULL, data BLOB NOT NULL);",
+        ),
+        Migration::new(
+            203,
+            "gs_local_checkpoint_epoch",
+            "ALTER TABLE gs_checkpoints ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;",
+        ),
+    ]
+}
+
+fn peek_for(room: RoomId, bytes: &[u8]) -> Result<CheckpointKey, StoreError> {
+    let (id, key) = Checkpoint::peek(bytes).map_err(|e| StoreError(format!("invalid checkpoint: {e}")))?;
+    if id != room {
+        return Err(StoreError(format!("checkpoint of room {id} stored as {room}")));
+    }
+    Ok(key)
+}
+
+/// SQL upsert that keeps the newer of the stored and the incoming checkpoint (`?1` room, `?2`
+/// epoch, `?3` saved_ms, `?4` data).
+fn fenced_upsert(table: &str) -> String {
+    format!(
+        "INSERT INTO {table}(room_id, epoch, saved_ms, data) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(room_id) DO UPDATE SET epoch = excluded.epoch, saved_ms = excluded.saved_ms, data = excluded.data
+         WHERE excluded.epoch > {table}.epoch
+            OR (excluded.epoch = {table}.epoch AND excluded.saved_ms >= {table}.saved_ms)"
+    )
 }
 
 /// Local SQLite (`space3d_db::Db` on the game server's volume; single-host setups).
@@ -140,11 +250,13 @@ impl LocalCheckpoints {
 
 impl CheckpointStore for LocalCheckpoints {
     fn put(&self, room: RoomId, bytes: Vec<u8>) -> Task<Result<(), StoreError>> {
-        let now = self.clock.now_ms();
+        let key = match peek_for(room, &bytes) {
+            Ok(k) => k,
+            Err(e) => return ready(Err(e)),
+        };
         flatten(self.db.execute(
-            "INSERT INTO gs_checkpoints(room_id, saved_ms, data) VALUES (?1, ?2, ?3)
-             ON CONFLICT(room_id) DO UPDATE SET saved_ms = excluded.saved_ms, data = excluded.data",
-            (room.0 as i64, now, bytes),
+            fenced_upsert("gs_checkpoints"),
+            (room.0 as i64, i64::from(key.epoch), key.saved_ms, bytes),
         ))
         .map_unit()
     }
@@ -283,7 +395,19 @@ pub struct PlayerServiceCheckpoints {
 
 impl CheckpointStore for PlayerServiceCheckpoints {
     fn put(&self, room: RoomId, bytes: Vec<u8>) -> Task<Result<(), StoreError>> {
-        flatten(self.store.put_checkpoint(room, bytes, self.clock.now_ms()))
+        // The blob's own capture key, never the arrival time: an upload that was slow to land
+        // must not look newer than it is.
+        let key = match peek_for(room, &bytes) {
+            Ok(k) => k,
+            Err(e) => return ready(Err(e)),
+        };
+        let stored = flatten(self.store.put_checkpoint(room, bytes, key));
+        space3d_tasks::spawn(async move {
+            match stored.wait().await {
+                Some(r) => r.map(|_| ()),
+                None => Err(StoreError("worker gone".into())),
+            }
+        })
     }
 
     fn get(&self, room: RoomId) -> Task<Result<Option<Vec<u8>>, StoreError>> {
@@ -308,14 +432,20 @@ impl CheckpointStore for PlayerServiceCheckpoints {
 /// In-memory (tests).
 #[derive(Default)]
 pub struct MemoryCheckpoints {
-    /// Stored bytes with their `saved_ms`.
-    pub map: parking_lot::Mutex<BTreeMap<RoomId, (i64, Vec<u8>)>>,
+    /// Stored bytes with their key.
+    pub map: parking_lot::Mutex<BTreeMap<RoomId, (CheckpointKey, Vec<u8>)>>,
 }
 
 impl CheckpointStore for MemoryCheckpoints {
     fn put(&self, room: RoomId, bytes: Vec<u8>) -> Task<Result<(), StoreError>> {
-        let saved = Checkpoint::from_bytes(&bytes).map_or(0, |c| c.saved_ms);
-        self.map.lock().insert(room, (saved, bytes));
+        let key = match peek_for(room, &bytes) {
+            Ok(k) => k,
+            Err(e) => return ready(Err(e)),
+        };
+        let mut map = self.map.lock();
+        if map.get(&room).is_none_or(|(stored, _)| key >= *stored) {
+            map.insert(room, (key, bytes));
+        }
         ready(Ok(()))
     }
 
@@ -328,7 +458,7 @@ impl CheckpointStore for MemoryCheckpoints {
             .map
             .lock()
             .iter()
-            .filter(|(_, (saved, _))| *saved >= min_saved_ms)
+            .filter(|(_, (key, _))| key.saved_ms >= min_saved_ms)
             .map(|(r, _)| *r)
             .collect()))
     }
@@ -355,11 +485,14 @@ pub fn upload_rescued(
             let Some(bytes) = rescue.get(room).wait().await.ok_or_else(lost)?? else {
                 continue;
             };
-            let saved = Checkpoint::from_bytes(&bytes).map_or(i64::MIN, |c| c.saved_ms);
+            let Ok((_, key)) = Checkpoint::peek(&bytes) else {
+                rescue.delete(room).wait().await.ok_or_else(lost)??;
+                continue;
+            };
             let remote = store.get(room).wait().await.ok_or_else(lost)??;
             let newer_remote = remote
-                .and_then(|r| Checkpoint::from_bytes(&r).ok())
-                .is_some_and(|r| r.saved_ms >= saved);
+                .and_then(|r| Checkpoint::peek(&r).ok())
+                .is_some_and(|(_, r)| r >= key);
             if !newer_remote {
                 store.put(room, bytes).wait().await.ok_or_else(lost)??;
                 uploaded += 1;
@@ -404,26 +537,28 @@ mod tests {
     use space3d_replication::{NetId, Tick};
 
     pub(crate) fn sample(room: u64, saved_ms: i64) -> Checkpoint {
-        Checkpoint {
-            version: CHECKPOINT_VERSION,
-            room_id: RoomId(room),
-            spec: RoomSpec {
+        sample_at(room, 2, saved_ms)
+    }
+
+    pub(crate) fn sample_at(room: u64, epoch: u32, saved_ms: i64) -> Checkpoint {
+        Checkpoint::new(
+            RoomSpec {
                 room_id: RoomId(room),
                 mode: "zone".into(),
                 persistent: true,
                 ..Default::default()
             },
-            state: FullState {
+            FullState {
                 schema_hash: 0xabc,
                 tick: Tick(600),
-                epoch: 2,
+                epoch,
                 next_net_id: 3,
                 entities: vec![(NetId(1), vec![("core.transform".into(), vec![1, 2, 3])])],
             },
-            server_only: Some("{}".into()),
-            game_blob: None,
+            Some("{}".into()),
+            None,
             saved_ms,
-        }
+        )
     }
 
     #[test]
@@ -431,6 +566,17 @@ mod tests {
         let cp = sample(5, 1_000);
         let bytes = cp.to_bytes();
         assert_eq!(Checkpoint::from_bytes(&bytes).unwrap(), cp);
+        assert_eq!(
+            Checkpoint::peek(&bytes).unwrap(),
+            (
+                RoomId(5),
+                CheckpointKey {
+                    epoch: 2,
+                    saved_ms: 1_000
+                }
+            )
+        );
+        assert!(Checkpoint::peek(&[1, 2]).is_err());
         let mut old = cp.clone();
         old.version = 99;
         assert!(Checkpoint::from_bytes(&old.to_bytes()).is_err());
@@ -441,6 +587,16 @@ mod tests {
         t.block().unwrap()
     }
 
+    fn stored_key(store: &dyn CheckpointStore, room: u64) -> Option<CheckpointKey> {
+        b(store.get(RoomId(room)))
+            .unwrap()
+            .map(|bytes| Checkpoint::from_bytes(&bytes).unwrap().key())
+    }
+
+    fn key(epoch: u32, saved_ms: i64) -> CheckpointKey {
+        CheckpointKey { epoch, saved_ms }
+    }
+
     fn exercise(store: &dyn CheckpointStore) {
         assert_eq!(b(store.get(RoomId(5))).unwrap(), None);
         b(store.put(RoomId(5), sample(5, 1_000).to_bytes())).unwrap();
@@ -448,13 +604,32 @@ mod tests {
         let back = b(store.get(RoomId(5))).unwrap().unwrap();
         assert_eq!(Checkpoint::from_bytes(&back).unwrap().saved_ms, 2_000);
         assert_eq!(b(store.recent(0)).unwrap(), vec![RoomId(5)]);
+        // Regression: a slow upload of an older capture that lands last never replaces the
+        // newer checkpoint (stores order by the blob's own (epoch, saved_ms), not arrival).
+        b(store.put(RoomId(5), sample(5, 1_500).to_bytes())).unwrap();
+        assert_eq!(stored_key(store, 5), Some(key(2, 2_000)));
+        assert_eq!(
+            b(store.recent(1_900)).unwrap(),
+            vec![RoomId(5)],
+            "row stamped with capture time"
+        );
+        // A later epoch (restored / rebuilt room) wins even with an earlier clock (another
+        // server's clock may lag); the previous incarnation's late upload is then refused.
+        b(store.put(RoomId(5), sample_at(5, 3, 1_800).to_bytes())).unwrap();
+        assert_eq!(stored_key(store, 5), Some(key(3, 1_800)));
+        b(store.put(RoomId(5), sample_at(5, 2, 9_000).to_bytes())).unwrap();
+        assert_eq!(stored_key(store, 5), Some(key(3, 1_800)));
+        // Garbage and foreign rooms are refused.
+        assert!(b(store.put(RoomId(5), vec![1, 2, 3])).is_err());
+        assert!(b(store.put(RoomId(6), sample(5, 5_000).to_bytes())).is_err());
         b(store.delete(RoomId(5))).unwrap();
         assert_eq!(b(store.get(RoomId(5))).unwrap(), None);
     }
 
     #[test]
     fn local_memory_and_player_service_stores() {
-        let clock: Arc<dyn UnixClock> = Arc::new(crate::clock::ManualUnixClock::at(2_000));
+        // The wall clock is far ahead of every capture: stores must not stamp arrival time.
+        let clock: Arc<dyn UnixClock> = Arc::new(crate::clock::ManualUnixClock::at(1_000_000));
         let db = Db::open_in_memory();
         let local = LocalCheckpoints::open(db.clone(), clock.clone())
             .block()

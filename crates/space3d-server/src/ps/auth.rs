@@ -280,10 +280,17 @@ pub async fn login(
 ) -> Result<Json<SessionTokens>, ApiErr> {
     password_enabled(svc)?;
     let username = req.username.trim().to_ascii_lowercase();
+    // Per-username budgets are charged only by *failed* logins, and per address prefix first:
+    // other addresses' wrong guesses do not lock the owner out (only a sustained, distributed
+    // attack that exhausts the 4× username-wide backstop does).
+    let pair = (username.clone(), rate_key(meta.ip));
     {
         let mut limits = svc.limits.lock();
         let now = svc.limiter_now();
-        if !limits.login_ip.check(&rate_key(meta.ip), now) || !limits.login_user.check(&username, now) {
+        if !limits.login_ip.check(&rate_key(meta.ip), now)
+            || !limits.login_user_ip.available(&pair, now)
+            || !limits.login_user.available(&username, now)
+        {
             svc.metrics.login("password", "rate_limited");
             tracing::warn!(event = "login_rate_limited", ip = %meta.ip, "login attempts limited");
             return Err(limited(60_000));
@@ -306,6 +313,12 @@ pub async fn login(
             finish(svc, account, None).await
         }
         _ => {
+            {
+                let mut limits = svc.limits.lock();
+                let now = svc.limiter_now();
+                limits.login_user_ip.check(&pair, now);
+                limits.login_user.check(&pair.0, now);
+            }
             svc.metrics.login("password", "bad_credentials");
             Err(api_err(401, "bad_credentials", "wrong username or password"))
         }

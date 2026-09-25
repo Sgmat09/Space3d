@@ -110,11 +110,60 @@ async fn auth(State(state): State<AdminState>, mut req: Request, next: Next) -> 
                 h[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()
             )
         }
-        None if state.open => "admin:dev".to_owned(),
+        None if state.open => {
+            // Open (dev, loopback, no token configured): only requests a page on another site
+            // cannot forge. Browsers attach `Origin` to cross-site POSTs (a "simple" text/plain
+            // POST needs no preflight), and a DNS-rebinding page reaches 127.0.0.1 under its
+            // own host name: both are refused. curl / tools send neither.
+            if let Err(why) = open_mode_request_ok(req.headers()) {
+                tracing::warn!(event = "admin_cross_site_refused", %why, "admin request refused");
+                return api_err(403, "forbidden", &why).into_response();
+            }
+            "admin:dev".to_owned()
+        }
         None => return api_err(401, "unauthorized", "admin token required").into_response(),
     };
     req.extensions_mut().insert(Actor(actor));
     next.run(req).await
+}
+
+/// Whether `authority` (a `Host` value or an origin's host[:port]) names this machine's
+/// loopback interface.
+fn loopback_authority(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        // [::1]:port
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => authority.rsplit_once(':').map_or(authority, |(h, port)| {
+            if port.bytes().all(|b| b.is_ascii_digit()) {
+                h
+            } else {
+                authority
+            }
+        }),
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Open-mode admin requests must come from this machine and not from a web page: a loopback
+/// `Host` (no DNS rebinding) and, when present, a loopback `Origin`.
+fn open_mode_request_ok(headers: &space3d_net::server::axum::http::HeaderMap) -> Result<(), String> {
+    if let Some(host) = headers.get(header::HOST) {
+        let host = host.to_str().unwrap_or_default();
+        if !loopback_authority(host) {
+            return Err(format!("host {host:?} is not loopback"));
+        }
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or_default();
+        let authority = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+            .unwrap_or("");
+        if !loopback_authority(authority) {
+            return Err(format!("cross-site request from origin {origin:?}"));
+        }
+    }
+    Ok(())
 }
 
 fn audit(state: &AdminState, req: &Request, action: &str, detail: serde_json::Value) {
@@ -229,6 +278,7 @@ async fn room_action(
     Path((id, action)): Path<(String, String)>,
     req: Request,
 ) -> Response {
+    let actor = req.extensions().get::<Actor>().cloned();
     let result = async {
         let id = room_id(&id)?;
         let handle = gs(&state)?
@@ -257,7 +307,12 @@ async fn room_action(
     .await;
     match result {
         Ok(detail) => {
-            audit_as(&state, "admin", "room_action", detail);
+            audit_as(
+                &state,
+                &actor.map_or_else(|| "admin:?".into(), |a| a.0),
+                "room_action",
+                detail,
+            );
             StatusCode::ACCEPTED.into_response()
         }
         Err(e) => e.into_response(),
@@ -320,14 +375,9 @@ async fn players(State(state): State<AdminState>, Query(q): Query<PlayersQuery>)
 }
 
 fn kick_everywhere(state: &AdminState, player: PlayerId, reason: &str) {
-    if let Some(rooms) = &state.rooms
-        && let Some(room) = rooms.find_player(player)
-        && let Some(h) = rooms.get(room)
-    {
-        let _ = h.command(RoomCommand::Kick {
-            player,
-            reason: reason.to_owned(),
-        });
+    // Every room of this server (a player may hold slots in several).
+    if let Some(rooms) = &state.rooms {
+        rooms.kick_everywhere(player, reason);
     }
     if let Some(ps) = &state.players {
         ps.send_fleet(
@@ -357,7 +407,7 @@ async fn kick(State(state): State<AdminState>, Path(id): Path<String>, req: Requ
     .await;
     match result {
         Ok(detail) => {
-            audit_as(&state, &actor.map_or_else(|| "admin".into(), |a| a.0), "kick", detail);
+            audit_as(&state, &actor.map_or_else(|| "admin:?".into(), |a| a.0), "kick", detail);
             StatusCode::ACCEPTED.into_response()
         }
         Err(e) => e.into_response(),
@@ -410,10 +460,10 @@ async fn ban(State(state): State<AdminState>, req: Request) -> Response {
             }
             None => ban.id = u64::from_le_bytes(crate::security::random_bytes::<8>()) >> 12,
         }
+        // Rooms remove banned players themselves (every room they are in, and on resume)
+        // with `Disconnect(Banned)` once the ban list changes; game servers get the ban over
+        // the fleet link.
         state.bans.upsert(ban.clone());
-        if let BanTarget::Player(p) = ban.target {
-            kick_everywhere(&state, p, &ban.reason);
-        }
         Ok::<_, ApiErr>(ban)
     }
     .await;
@@ -553,5 +603,52 @@ async fn backup(State(state): State<AdminState>, req: Request) -> Response {
         Some(Ok(())) => (StatusCode::CREATED, Json(serde_json::json!({ "path": path }))).into_response(),
         Some(Err(e)) => crate::ps::routes::store_err(e).into_response(),
         None => api_err(500, "internal", "worker gone").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_mode_refuses_cross_site_and_rebound_hosts() {
+        use space3d_net::server::axum::http::{HeaderMap, HeaderValue};
+        let h = |pairs: &[(header::HeaderName, &str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in pairs {
+                m.insert(k.clone(), HeaderValue::from_str(v).unwrap());
+            }
+            m
+        };
+        assert!(
+            open_mode_request_ok(&h(&[(header::HOST, "127.0.0.1:9090")])).is_ok(),
+            "curl"
+        );
+        assert!(open_mode_request_ok(&h(&[(header::HOST, "localhost:9090")])).is_ok());
+        assert!(open_mode_request_ok(&h(&[(header::HOST, "[::1]:9090")])).is_ok());
+        assert!(
+            open_mode_request_ok(&h(&[
+                (header::HOST, "127.0.0.1:9090"),
+                (header::ORIGIN, "http://localhost:3000")
+            ]))
+            .is_ok(),
+            "a local dev tool page"
+        );
+        assert!(
+            open_mode_request_ok(&h(&[
+                (header::HOST, "127.0.0.1:9090"),
+                (header::ORIGIN, "https://evil.example")
+            ]))
+            .is_err(),
+            "cross-site simple POST"
+        );
+        assert!(
+            open_mode_request_ok(&h(&[(header::HOST, "127.0.0.1:9090"), (header::ORIGIN, "null")])).is_err(),
+            "sandboxed / file origin"
+        );
+        assert!(
+            open_mode_request_ok(&h(&[(header::HOST, "rebind.evil.example:9090")])).is_err(),
+            "DNS rebinding"
+        );
     }
 }

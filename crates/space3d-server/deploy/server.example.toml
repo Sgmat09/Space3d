@@ -39,6 +39,12 @@ client_bandwidth = "48KiB"
 outbound_backlog_bytes = "1MiB"
 input_packets_per_sec = 90
 messages_per_sec = 30
+# Every HTTP listener, before a request completes / a WebSocket upgrade: per-IP and total
+# connection caps (checked at accept time), and slow-client timeouts.
+http_connections_per_ip = 64
+http_max_connections = 16384
+http_header_timeout = "10s"
+http_body_timeout = "10s"
 
 [player_service]
 bind = "0.0.0.0:8080"

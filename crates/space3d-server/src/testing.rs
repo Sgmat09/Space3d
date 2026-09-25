@@ -129,6 +129,7 @@ struct HostedRoom {
     status: Arc<Mutex<RoomStatus>>,
     created_ms: i64,
     step: Duration,
+    crashes: crate::gs::shard::CrashGuard,
 }
 
 struct GsNode {
@@ -569,6 +570,7 @@ impl TestCluster {
                             status,
                             created_ms,
                             step,
+                            crashes: Default::default(),
                         },
                     );
                 }
@@ -585,23 +587,25 @@ impl TestCluster {
     }
 
     fn tick_rooms(&mut self, i: usize) {
+        let now = self.now;
         let node = &mut self.nodes[i];
         let mut crashed = 0;
         node.rooms.retain(|id, room| {
+            let _span = tracing::error_span!("room", room_id = %id, server_id = %room.env.server_id).entered();
             if let Err(why) = run_tick_guarded(&mut room.app, room.step) {
                 crashed += 1;
-                room.env.metrics.room_crashes.inc();
-                tracing::warn!(room = %id, panic = %why, "test cluster: room crashed");
-                let rebuilt = crate::gs::shard::rebuild_crashed(
+                // The shards' path: rebuild from the in-memory checkpoint, or close the room
+                // when it crash-loops.
+                crate::gs::shard::recover_crashed(
                     &mut room.app,
                     &room.spec,
                     &room.env,
                     &room.status,
                     room.created_ms,
+                    &mut room.crashes,
+                    now,
+                    &why,
                 );
-                if rebuilt.is_err() {
-                    room.status.lock().phase = RoomPhase::Closed;
-                }
             }
             room.status.lock().phase != RoomPhase::Closed
         });
@@ -676,6 +680,12 @@ impl TestCluster {
     /// them when the link returns.
     pub fn set_fleet_outage(&mut self, server_id: &str, down: bool) {
         self.node(server_id).outage.set(down);
+    }
+
+    /// Lose every player-service → game-server message of `server_id`'s fleet link while set
+    /// (its sends still succeed): answers to requests that already went out never arrive.
+    pub fn set_fleet_swallow(&mut self, server_id: &str, yes: bool) {
+        self.node(server_id).outage.swallow_downlink(yes);
     }
 
     /// Ids of live game servers.

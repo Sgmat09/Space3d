@@ -27,6 +27,10 @@ impl GameDefinition for CubesGame {
         app.add_plugin(CubesRules);
     }
 
+    fn modes(&self) -> Vec<String> {
+        vec![MODE.to_owned(), "dev".to_owned()]
+    }
+
     fn validate_spec(&self, spec: &RoomSpec) -> Result<(), String> {
         match spec.mode.as_str() {
             MODE | "dev" => Ok(()),

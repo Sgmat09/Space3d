@@ -179,8 +179,14 @@ pub trait PlayerStore: Send + Sync + 'static {
     fn leaderboard_top(&self, board: String, n: u32) -> Task<Result<Vec<LeaderboardRow>, StoreError>>;
     /// A player's row on a board.
     fn leaderboard_rank(&self, board: String, player: PlayerId) -> Task<Result<Option<LeaderboardRow>, StoreError>>;
-    /// Save a room checkpoint (split mode).
-    fn put_checkpoint(&self, room: RoomId, bytes: Vec<u8>, now_ms: i64) -> Task<Result<(), StoreError>>;
+    /// Save a room checkpoint (split mode) unless the stored one has a greater `key` (newer
+    /// room epoch, or same epoch and later capture). `Ok(false)` = refused as stale.
+    fn put_checkpoint(
+        &self,
+        room: RoomId,
+        bytes: Vec<u8>,
+        key: crate::gs::checkpoint::CheckpointKey,
+    ) -> Task<Result<bool, StoreError>>;
     /// Load a room checkpoint.
     fn get_checkpoint(&self, room: RoomId) -> Task<Result<Option<StoredCheckpoint>, StoreError>>;
     /// Delete a room checkpoint (room closed normally).
@@ -751,14 +757,23 @@ impl PlayerStore for SqliteStore {
         })
     }
 
-    fn put_checkpoint(&self, room: RoomId, bytes: Vec<u8>, now_ms: i64) -> Task<Result<(), StoreError>> {
+    fn put_checkpoint(
+        &self,
+        room: RoomId,
+        bytes: Vec<u8>,
+        key: crate::gs::checkpoint::CheckpointKey,
+    ) -> Task<Result<bool, StoreError>> {
         self.tx(move |c| {
-            c.prepare_cached(
-                "INSERT INTO room_checkpoints(room_id, saved_ms, data) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(room_id) DO UPDATE SET saved_ms = excluded.saved_ms, data = excluded.data",
-            )?
-            .execute(params![room.0 as i64, now_ms, bytes])?;
-            Ok(())
+            let n = c
+                .prepare_cached(
+                    "INSERT INTO room_checkpoints(room_id, epoch, saved_ms, data) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(room_id) DO UPDATE SET epoch = excluded.epoch, saved_ms = excluded.saved_ms,
+                                                        data = excluded.data
+                     WHERE excluded.epoch > room_checkpoints.epoch
+                        OR (excluded.epoch = room_checkpoints.epoch AND excluded.saved_ms >= room_checkpoints.saved_ms)",
+                )?
+                .execute(params![room.0 as i64, i64::from(key.epoch), key.saved_ms, bytes])?;
+            Ok(n > 0)
         })
     }
 
@@ -1038,11 +1053,18 @@ mod tests {
 
     #[test]
     fn checkpoints_bans_audit_backup() {
+        use crate::gs::checkpoint::CheckpointKey;
+        let key = |epoch, saved_ms| CheckpointKey { epoch, saved_ms };
         let s = store();
-        b(s.put_checkpoint(RoomId(1), vec![1, 2, 3], 50)).unwrap();
-        b(s.put_checkpoint(RoomId(1), vec![4], 60)).unwrap();
+        assert!(b(s.put_checkpoint(RoomId(1), vec![1, 2, 3], key(1, 50))).unwrap());
+        assert!(b(s.put_checkpoint(RoomId(1), vec![4], key(1, 60))).unwrap());
         assert_eq!(b(s.get_checkpoint(RoomId(1))).unwrap(), Some((60, vec![4])));
         assert_eq!(b(s.recent_checkpoints(55)).unwrap(), vec![RoomId(1)]);
+        // Stale uploads (older capture, or an older epoch) are refused.
+        assert!(!b(s.put_checkpoint(RoomId(1), vec![5], key(1, 55))).unwrap());
+        assert!(b(s.put_checkpoint(RoomId(1), vec![6], key(2, 10))).unwrap());
+        assert!(!b(s.put_checkpoint(RoomId(1), vec![7], key(1, 99))).unwrap());
+        assert_eq!(b(s.get_checkpoint(RoomId(1))).unwrap(), Some((10, vec![6])));
         b(s.delete_checkpoint(RoomId(1))).unwrap();
         assert_eq!(b(s.get_checkpoint(RoomId(1))).unwrap(), None);
 

@@ -653,12 +653,10 @@ fn receive_inputs(
         slot.inputs.observe_slack(win.newest_tick.since(next) as f32);
         for (t, payload) in win.iter() {
             if t < next {
-                if !slot.inputs.has_consumed(t) {
-                    // Arrived after its tick was simulated.
-                    if t == win.newest_tick {
-                        server.stats.inputs_late += 1;
-                        slot.stats.input_late += 1;
-                    }
+                // Arrived after its tick was simulated with a repeated / neutral input.
+                if slot.inputs.late_arrival(t) {
+                    server.stats.inputs_late += 1;
+                    slot.stats.input_late += 1;
                 }
                 continue;
             }

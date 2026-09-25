@@ -287,7 +287,6 @@ fn matchmaking_tickets_and_lobbies_over_http() {
     let lobby = ok(alice.create_lobby(&CreateLobbyRequest {
         mode: "duel".into(),
         max_players: 2,
-        private: true,
         ..Default::default()
     }));
     assert_eq!(lobby.code.len(), 6);
@@ -358,10 +357,44 @@ fn internal_routes_refuse_before_reading_the_body() {
     let auth = |r: HttpRequest| r.header("authorization", "Bearer fleet");
     let room = space3d_replication::RoomId(7);
     let url = format!("{}/internal/v1/rooms/{room}/checkpoint", ps.url);
-    let (status, body) = ps.raw(auth(HttpRequest::put(url.clone())).body(vec![1, 2, 3]));
+    let cp = |room: u64, saved_ms: i64| {
+        use space3d_server::gs::checkpoint::Checkpoint;
+        Checkpoint::new(
+            space3d_server::game::RoomSpec {
+                room_id: space3d_replication::RoomId(room),
+                ..Default::default()
+            },
+            space3d_replication::server::full_state::FullState {
+                schema_hash: 1,
+                tick: space3d_replication::Tick(10),
+                epoch: 1,
+                next_net_id: 1,
+                entities: Vec::new(),
+            },
+            None,
+            None,
+            saved_ms,
+        )
+        .to_bytes()
+    };
+    let (status, body) = ps.raw(auth(HttpRequest::put(url.clone())).body(cp(7, 2_000)));
     assert_eq!(status, 204, "{body}");
-    let (status, _) = ps.raw(auth(HttpRequest::get(url)));
-    assert_eq!(status, 200);
+    // An older capture that arrives later is accepted but does not replace the newer one.
+    let (status, body) = ps.raw(auth(HttpRequest::put(url.clone())).body(cp(7, 1_000)));
+    assert_eq!(status, 204, "{body}");
+    // Not a checkpoint / another room's checkpoint: refused.
+    let (status, _) = ps.raw(auth(HttpRequest::put(url.clone())).body(vec![1, 2, 3]));
+    assert_eq!(status, 400);
+    let (status, _) = ps.raw(auth(HttpRequest::put(url.clone())).body(cp(8, 3_000)));
+    assert_eq!(status, 400);
+    let res = Http::new()
+        .request(auth(HttpRequest::get(url)))
+        .block()
+        .unwrap()
+        .unwrap();
+    assert_eq!(res.status, 200);
+    let stored = space3d_server::gs::checkpoint::Checkpoint::from_bytes(&res.body).unwrap();
+    assert_eq!(stored.saved_ms, 2_000, "the newest capture is kept");
 }
 
 /// The per-IP request limit covers unauthenticated internal requests; game servers holding the

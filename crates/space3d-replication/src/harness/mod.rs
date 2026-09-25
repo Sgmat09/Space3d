@@ -77,6 +77,8 @@ pub struct ClientSpec {
     pub frame_dt: Duration,
     /// Offset of the client's first frame relative to the server tick.
     pub phase: Duration,
+    /// Team of the player's identity (what matchmaking puts in a ticket).
+    pub team: Option<u16>,
 }
 
 impl ClientSpec {
@@ -87,7 +89,14 @@ impl ClientSpec {
             link: None,
             frame_dt: Duration::from_secs_f64(1.0 / 60.0),
             phase: Duration::ZERO,
+            team: None,
         }
+    }
+
+    /// Builder: team of the player.
+    pub fn with_team(mut self, team: u16) -> Self {
+        self.team = Some(team);
+        self
     }
 
     /// Builder: link conditions.
@@ -462,7 +471,15 @@ impl NetHarness {
                 Some(Route::Pending { tx, peer }) => match parse_hello(&data) {
                     Ok(hello) => {
                         let identity = match &hello.auth {
-                            HelloAuth::Dev { name } => Some(PlayerIdentity::dev(name)),
+                            HelloAuth::Dev { name } => {
+                                let mut id = PlayerIdentity::dev(name);
+                                id.team = self
+                                    .clients
+                                    .iter()
+                                    .find(|c| c.player == id.player)
+                                    .and_then(|c| c.spec.team);
+                                Some(id)
+                            }
                             _ => None,
                         };
                         let player = match &hello.auth {

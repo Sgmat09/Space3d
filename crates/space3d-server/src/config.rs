@@ -188,6 +188,19 @@ pub struct LimitsConfig {
     pub input_packets_per_sec: u32,
     /// Messages per second per link.
     pub messages_per_sec: u32,
+    /// Every HTTP listener (game port, player service, admin): concurrent TCP connections per
+    /// client IP (IPv6 per /64; trusted proxies exempt) that have not finished a request or
+    /// been upgraded to a WebSocket. Refused at accept time.
+    pub http_connections_per_ip: u32,
+    /// Every HTTP listener: concurrent TCP connections in total (not upgraded yet).
+    pub http_max_connections: usize,
+    /// Every HTTP listener: longest wait for a complete request head (slow or silent sockets,
+    /// idle keep-alive connections are closed).
+    #[serde(with = "serde_duration")]
+    pub http_header_timeout: Duration,
+    /// Player service: longest time to receive a request body.
+    #[serde(with = "serde_duration")]
+    pub http_body_timeout: Duration,
 }
 
 impl Default for LimitsConfig {
@@ -203,6 +216,10 @@ impl Default for LimitsConfig {
             outbound_backlog_bytes: 1 << 20,
             input_packets_per_sec: 90,
             messages_per_sec: 30,
+            http_connections_per_ip: 64,
+            http_max_connections: 16_384,
+            http_header_timeout: Duration::from_secs(10),
+            http_body_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -633,6 +650,15 @@ impl ServerConfig {
         }
         if l.client_bandwidth < 1024 {
             return Err(invalid("limits.client_bandwidth", "must be at least 1 KiB/s"));
+        }
+        if l.http_connections_per_ip == 0 || l.http_max_connections == 0 {
+            return Err(invalid(
+                "limits.http_connections_per_ip",
+                "connection caps must be at least 1",
+            ));
+        }
+        if l.http_header_timeout.is_zero() || l.http_body_timeout.is_zero() {
+            return Err(invalid("limits.http_header_timeout", "timeouts must be positive"));
         }
         let p = &self.player_service;
         if p.join_ticket_ttl.is_zero() || p.join_ticket_ttl > Duration::from_secs(600) {

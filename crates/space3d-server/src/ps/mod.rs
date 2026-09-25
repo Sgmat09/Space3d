@@ -41,11 +41,29 @@ pub struct Limiters {
     pub http: KeyedLimiter<IpAddr>,
     /// Password logins / registrations per IP.
     pub login_ip: KeyedLimiter<IpAddr>,
-    /// Password logins per username.
+    /// Failed password logins per (username, address prefix): charged only when the password
+    /// was wrong, so another address's bad guesses never lock the account's owner out.
+    pub login_user_ip: KeyedLimiter<(String, IpAddr)>,
+    /// Failed password logins per username from anywhere (backstop against distributed
+    /// guessing; 4× the per-address budget, charged only on failures).
     pub login_user: KeyedLimiter<String>,
     /// Guest logins / refreshes per IP (4× the password limit).
     pub guest_ip: KeyedLimiter<IpAddr>,
+    /// Quick-play requests per account.
+    pub quick_play: KeyedLimiter<PlayerId>,
+    /// Rooms quick play may open per account (joining an open room is not limited by it).
+    pub room_create: KeyedLimiter<PlayerId>,
 }
+
+/// Quick-play requests per account per second (burst [`QUICK_PLAY_BURST`]).
+pub const QUICK_PLAY_PER_SEC: f64 = 1.0;
+/// See [`QUICK_PLAY_PER_SEC`].
+pub const QUICK_PLAY_BURST: f64 = 10.0;
+/// New rooms one account may open through quick play per minute (burst
+/// [`QUICK_PLAY_ROOMS_BURST`]): drop-in rooms outlive their creator by `empty_room_ttl`.
+pub const QUICK_PLAY_ROOMS_PER_MIN: f64 = 6.0;
+/// See [`QUICK_PLAY_ROOMS_PER_MIN`].
+pub const QUICK_PLAY_ROOMS_BURST: f64 = 3.0;
 
 impl Limiters {
     fn new(config: &ServerConfig) -> Self {
@@ -58,8 +76,11 @@ impl Limiters {
                 100_000,
             ),
             login_ip: KeyedLimiter::new(per_min / 60.0, per_min, 100_000),
-            login_user: KeyedLimiter::new(per_min / 60.0, per_min, 100_000),
+            login_user_ip: KeyedLimiter::new(per_min / 60.0, per_min, 100_000),
+            login_user: KeyedLimiter::new(per_min * 4.0 / 60.0, per_min * 4.0, 100_000),
             guest_ip: KeyedLimiter::new(per_min * 4.0 / 60.0, per_min * 4.0, 100_000),
+            quick_play: KeyedLimiter::new(QUICK_PLAY_PER_SEC, QUICK_PLAY_BURST, 100_000),
+            room_create: KeyedLimiter::new(QUICK_PLAY_ROOMS_PER_MIN / 60.0, QUICK_PLAY_ROOMS_BURST, 100_000),
         }
     }
 }
@@ -301,42 +322,48 @@ impl PlayerService {
         Some((server, spec))
     }
 
-    /// Quick play: the fullest open room of `mode` with a free seat, else a fresh one (capacity
-    /// and params from the queue with that mode). Finding and allocating happen under one
-    /// fleet lock, so concurrent quick plays fill one new room instead of each opening their
-    /// own.
+    /// Quick play for `player`: the fullest open room of `mode` with a free seat, else a fresh
+    /// one (capacity and params from the queue with that mode) on a server that hosts the mode.
+    /// Finding and allocating happen under one fleet lock, so concurrent quick plays fill one
+    /// new room instead of each opening their own. The seat is reserved for `player`, and a
+    /// player holds at most one such reservation (a new quick play releases the previous one);
+    /// opening a fresh room also takes a token of the per-account room budget.
     pub fn quick_play_room(
         &self,
         region: &str,
         mode: &str,
         build: &fleet::Build,
-    ) -> Option<(fleet::ServerRecord, RoomSpec)> {
+        player: PlayerId,
+    ) -> Result<(fleet::ServerRecord, RoomSpec), QuickPlayRefusal> {
         let now = self.now_ms();
         let reserve = self.ticket_reserve_ms();
         let (found, fresh) = {
             let mut fleet = self.fleet.lock();
-            match fleet.open_room_for(mode, build, 1, now, reserve) {
+            let (found, fresh) = match fleet.open_room_for(mode, build, 1, now, reserve) {
                 Some(open) => (open, false),
                 None => {
-                    let params = self
-                        .config
-                        .matchmaking
-                        .queues
-                        .iter()
-                        .find(|q| q.mode == mode)
-                        .map(|q| q.params.clone())
-                        .unwrap_or_default();
+                    let queue = self.config.matchmaking.queues.iter().find(|q| q.mode == mode);
+                    if queue.is_none() && fleet.mode_unknown(build, mode) {
+                        return Err(QuickPlayRefusal::UnknownMode);
+                    }
+                    if !self.limits.lock().room_create.check(&player, self.limiter_now()) {
+                        return Err(QuickPlayRefusal::RoomRate);
+                    }
+                    let params = queue.map(|q| q.params.clone()).unwrap_or_default();
                     let capacity = self.mode_capacity(mode);
-                    let room =
-                        self.allocate_room_in(&mut fleet, region, mode, capacity, 1, Vec::new(), None, params, build)?;
+                    let room = self
+                        .allocate_room_in(&mut fleet, region, mode, capacity, 1, Vec::new(), None, params, build)
+                        .ok_or(QuickPlayRefusal::NoCapacity)?;
                     (room, true)
                 }
-            }
+            };
+            fleet.hold_last_reservation(player);
+            (found, fresh)
         };
         if fresh {
             self.prepare_room(&found.0, &found.1);
         }
-        Some(found)
+        Ok(found)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -358,14 +385,7 @@ impl PlayerService {
         if build.game_id.is_empty() {
             build.game_id = params.get("game_id").cloned().unwrap_or_default();
         }
-        let server = fleet.allocate(
-            region,
-            &build.game_id,
-            build.schema_hash,
-            seats,
-            now,
-            self.ticket_reserve_ms(),
-        )?;
+        let server = fleet.allocate_mode(region, &build, mode, seats, now, self.ticket_reserve_ms())?;
         let spec = RoomSpec {
             room_id: random_room_id(),
             mode: mode.to_owned(),
@@ -388,6 +408,17 @@ impl PlayerService {
             FleetDown::PrepareRoom { spec: spec.clone() },
         );
     }
+}
+
+/// Why quick play found no room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickPlayRefusal {
+    /// No compatible server with free seats / room slots.
+    NoCapacity,
+    /// No configured queue and no server hosts the mode.
+    UnknownMode,
+    /// The account opened too many rooms recently.
+    RoomRate,
 }
 
 /// A random non-zero room id.

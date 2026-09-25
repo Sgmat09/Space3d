@@ -74,15 +74,27 @@ pub struct GameServerRuntime {
     pub registration: ServerRegistration,
 }
 
+/// A `RoomControl::load_player_data` request waiting for the player service.
+struct Fetch {
+    room: RoomId,
+    player: space3d_replication::PlayerId,
+    sent_ms: i64,
+}
+
+/// A player-data fetch unanswered for this long is answered empty (the link may have dropped
+/// after the request went out), so the game never waits forever for `PlayerDataLoaded`.
+pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 struct GsState {
     rt: GameServerRuntime,
     heartbeat_seq: u64,
     next_heartbeat_ms: i64,
-    fetches: BTreeMap<u64, RoomId>,
+    fetches: BTreeMap<u64, Fetch>,
     next_request: u64,
     drain_started: bool,
     stop_started: bool,
     stopped: bool,
+    deregistered: bool,
 }
 
 /// Supervisor plugin for the game-server role: fleet link (register, heartbeats, commands),
@@ -116,6 +128,7 @@ impl space3d_core::Plugin for GameServerPlugin {
             drain_started: false,
             stop_started: false,
             stopped: false,
+            deregistered: false,
         };
         app.add_system_named(Stage::Update, "gs::supervisor", move |ctx| {
             state.tick();
@@ -140,8 +153,44 @@ impl GsState {
             self.next_heartbeat_ms = now + self.rt.config.fleet.heartbeat.as_millis() as i64;
             self.heartbeat();
         }
+        self.expire_fetches(now);
         self.metrics();
         self.lifecycle();
+        if !self.deregistered && self.drain_report().flushed {
+            // Drain done (rooms closed or handed off, outbox flushed): leave the fleet now
+            // rather than when the lease runs out (best effort; the lease still covers it).
+            self.deregistered = true;
+            let _ = self.rt.fleet.send(FleetUp::Deregister {
+                reason: "drained".into(),
+            });
+        }
+    }
+
+    fn expire_fetches(&mut self, now: i64) {
+        let limit = FETCH_TIMEOUT.as_millis() as i64;
+        let expired: Vec<u64> = self
+            .fetches
+            .iter()
+            .filter(|(_, f)| now.saturating_sub(f.sent_ms) >= limit)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(f) = self.fetches.remove(&id) {
+                tracing::warn!(room = %f.room, player = %f.player, "player data fetch timed out; answering empty");
+                self.answer_fetch(f.room, f.player, Vec::new());
+            }
+        }
+    }
+
+    fn answer_fetch(
+        &self,
+        room: RoomId,
+        player: space3d_replication::PlayerId,
+        entries: Vec<space3d_replication::api::PlayerDataEntry>,
+    ) {
+        if let Some(h) = self.rt.rooms.get(room) {
+            let _ = h.command(RoomCommand::PlayerData { player, entries });
+        }
     }
 
     fn fleet_down(&mut self) {
@@ -156,6 +205,12 @@ impl GsState {
                 FleetDown::PrepareRoom { spec } => {
                     if let Err(e) = self.rt.rooms.get_or_create(&spec) {
                         tracing::warn!(room = %spec.room_id, error = %e, "prepare room failed");
+                        // Release the seats the player service reserved for it.
+                        let _ = self.rt.fleet.send(FleetUp::RoomClosed {
+                            room_id: spec.room_id,
+                            reason: format!("not created: {e}"),
+                            restorable: false,
+                        });
                     }
                 }
                 FleetDown::CloseRoom { room_id, reason } => {
@@ -163,17 +218,13 @@ impl GsState {
                         let _ = h.command(RoomCommand::Close { reason });
                     }
                 }
-                FleetDown::Kick { player, reason } => self.kick(player, &reason),
+                FleetDown::Kick { player, reason } => self.rt.rooms.kick_everywhere(player, &reason),
                 FleetDown::Ban(ban) => {
-                    let player = match ban.target {
-                        crate::security::bans::BanTarget::Player(p) => Some(p),
-                        crate::security::bans::BanTarget::Ip(_) => None,
-                    };
-                    if let Some(p) = player {
-                        self.kick(p, &ban.reason);
-                    }
+                    let ip = matches!(ban.target, crate::security::bans::BanTarget::Ip(_));
+                    // Account bans: every room the player holds a slot in removes them
+                    // (`Disconnect(Banned)`) when it sees the ban list change.
                     self.rt.bans.upsert(ban);
-                    if player.is_none() {
+                    if ip {
                         // Connected clients in the banned range go now (not at their next join).
                         self.rt.gate.lock().enforce_ip_bans(self.rt.unix.now_ms());
                     }
@@ -206,24 +257,11 @@ impl GsState {
                     player,
                     entries,
                 } => {
-                    if let Some(room) = self.fetches.remove(&request_id)
-                        && let Some(h) = self.rt.rooms.get(room)
-                    {
-                        let _ = h.command(RoomCommand::PlayerData { player, entries });
+                    if let Some(f) = self.fetches.remove(&request_id) {
+                        self.answer_fetch(f.room, player, entries);
                     }
                 }
             }
-        }
-    }
-
-    fn kick(&self, player: space3d_replication::PlayerId, reason: &str) {
-        if let Some(room) = self.rt.rooms.find_player(player)
-            && let Some(h) = self.rt.rooms.get(room)
-        {
-            let _ = h.command(RoomCommand::Kick {
-                player,
-                reason: reason.to_owned(),
-            });
         }
     }
 
@@ -239,13 +277,17 @@ impl GsState {
                         keys,
                     });
                     if sent.is_ok() {
-                        self.fetches.insert(id, room);
-                    } else if let Some(h) = self.rt.rooms.get(room) {
+                        self.fetches.insert(
+                            id,
+                            Fetch {
+                                room,
+                                player,
+                                sent_ms: self.rt.unix.now_ms(),
+                            },
+                        );
+                    } else {
                         // Player service unreachable: answer empty so the game can proceed.
-                        let _ = h.command(RoomCommand::PlayerData {
-                            player,
-                            entries: Vec::new(),
-                        });
+                        self.answer_fetch(room, player, Vec::new());
                     }
                 }
                 other => {
@@ -254,8 +296,12 @@ impl GsState {
             }
         }
         if self.fetches.len() > 10_000 {
+            // Bounded; the oldest are answered empty.
             let keep = self.fetches.split_off(&(self.next_request - 5_000));
-            self.fetches = keep;
+            let dropped = std::mem::replace(&mut self.fetches, keep);
+            for f in dropped.into_values() {
+                self.answer_fetch(f.room, f.player, Vec::new());
+            }
         }
     }
 

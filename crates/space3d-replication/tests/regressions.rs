@@ -834,3 +834,358 @@ fn predicted_changes_outside_the_sim_are_detected() {
 fn _unused(p: PlayerId) -> Owner {
     _owner(p)
 }
+
+// ---- prediction: a hitch behind held snapshots ------------------------------------------------
+
+/// Regression: after a frame hitch on a low-latency link, the client's next predicted tick was
+/// behind snapshots it already held; the snap wrote the confirmed state (which includes those
+/// ticks) and then simulated them again, so the pawn ran ahead of the server by the overlap.
+/// With a constant input every prediction (even of a repeated input) is exact: the raw
+/// predicted position at tick T must equal the server's at T.
+#[test]
+fn a_hitch_behind_held_snapshots_never_applies_inputs_twice() {
+    for (latency_ms, hitch_ms) in [(1u64, 150u64), (1, 300), (5, 200), (20, 300)] {
+        let mut h = with_rules(HarnessConfig {
+            seed: 11,
+            semantics: Semantics::Stream,
+            link: perfect(latency_ms),
+            ..Default::default()
+        });
+        let w = h.add_client(ClientSpec::named("walker"), |app| {
+            app.add_plugin(TestProtocol);
+            space3d_replication::bots::install_bot(
+                app,
+                space3d_replication::bots::scripted(|_t: Tick| Move { x: 1, z: 0 }),
+            );
+        });
+        assert!(h.run_until(900, |h| h.client_net(w).is_connected()
+            && controlled(h.client(w)).is_some()));
+        h.step_ticks(300);
+        let sp = pawn(h.server(), h.player(w)).unwrap();
+        let mut server_x = std::collections::HashMap::new();
+        let mut observed = Vec::new();
+        for t in 0..240u32 {
+            if t == 60 {
+                h.stall(w, Duration::from_millis(hitch_ms));
+            }
+            h.step();
+            let st = h.server_net().tick().0;
+            server_x.insert(st, h.server().world.get::<&Transform>(sp).unwrap().translation.x);
+            let Some(next) = h.client_net(w).predicted_tick() else {
+                continue;
+            };
+            let ce = controlled(h.client(w)).unwrap();
+            let x = h.client(w).world.get::<&Transform>(ce).unwrap().translation.x;
+            let correction = h
+                .client(w)
+                .world
+                .get::<&space3d_replication::client::prediction::PredictionError>(ce)
+                .map_or(0.0, |p| p.translation.x);
+            observed.push((next.0.saturating_sub(1), x - correction));
+        }
+        h.step_ticks(60);
+        let mut compared = 0;
+        let mut worst = (0.0f32, 0u32);
+        for (tick, raw) in observed {
+            if let Some(sx) = server_x.get(&tick) {
+                compared += 1;
+                let err = (raw - sx).abs();
+                if err > worst.0 {
+                    worst = (err, tick);
+                }
+            }
+        }
+        assert!(compared > 150, "{compared}");
+        assert!(
+            worst.0 < 1e-3,
+            "latency {latency_ms} ms, hitch {hitch_ms} ms: client ran {:.3} m off the server at tick {}",
+            worst.0,
+            worst.1
+        );
+    }
+}
+
+// ---- datagram reordering: no ghosts -------------------------------------------------------------
+
+/// Regression: on datagram links a spawn record delayed (or duplicated) past the despawn of a
+/// short-lived entity recreated it on the client, and nothing ever removed it (the server had
+/// its despawn acked). The client now remembers despawned `NetId`s.
+#[test]
+fn reordered_spawns_never_resurrect_despawned_entities() {
+    for seed in 0..4u64 {
+        let down = LinkConditions {
+            latency: Duration::from_millis(20),
+            jitter: Duration::from_millis(4),
+            reorder: 0.3,
+            reorder_delay: Duration::from_millis(120),
+            duplicate: 0.1,
+            ..LinkConditions::perfect()
+        };
+        let mut h = with_rules(HarnessConfig {
+            seed,
+            semantics: Semantics::Datagram,
+            link: LinkProfile {
+                up: LinkConditions::lan(),
+                down,
+            },
+            ..Default::default()
+        });
+        let a = observer(&mut h, "alice");
+        assert!(h.run_until(900, |h| h.client_net(a).is_connected()));
+        // A projectile every 3 ticks, each living 4 ticks.
+        let mut live: Vec<(Entity, u32)> = Vec::new();
+        for t in 0..600u32 {
+            if t % 3 == 0 {
+                let e = h
+                    .server_mut()
+                    .world
+                    .spawn((Replicated, Transform::from_xyz(t as f32, 0.0, 0.0), Health(1)));
+                live.push((e, t + 4));
+            }
+            let (dead, keep): (Vec<_>, Vec<_>) = live.into_iter().partition(|(_, until)| *until <= t);
+            live = keep;
+            for (e, _) in dead {
+                let _ = h.server_mut().world.despawn(e);
+            }
+            h.step();
+        }
+        for (e, _) in live.drain(..) {
+            let _ = h.server_mut().world.despawn(e);
+        }
+        h.set_link(a, LinkProfile::symmetric(LinkConditions::lan()));
+        let ok = h.run_until(1200, |h| h.assert_converged(a).is_ok());
+        assert!(
+            ok,
+            "seed {seed}: {:?} (client entities {})",
+            h.assert_converged(a),
+            h.client_net(a).net_ids().len()
+        );
+    }
+}
+
+// ---- byte budget: a large controlled set ----------------------------------------------------------
+
+/// Run the "RTS" scenario: `units` controlled entities (moving with the player's input), a
+/// budget of `budget` B/s, then a second player joins. Returns (ticks until the rts player
+/// sees bob's pawn, rts downstream B/s over 20 s).
+fn controlled_units_run(units: usize, budget: u32, moving: bool) -> (Option<u64>, f64) {
+    let mut config = HarnessConfig {
+        seed: 3,
+        link: perfect(20),
+        ..Default::default()
+    };
+    config.client.max_down_bytes_per_sec = budget;
+    config.server.client_bandwidth = budget;
+    let mut h = with_rules(config);
+    let a = h.add_client(ClientSpec::named("rts"), move |app| {
+        app.add_plugin(TestProtocol);
+        space3d_replication::bots::install_bot(
+            app,
+            space3d_replication::bots::scripted(move |t: Tick| Move {
+                x: if !moving {
+                    0
+                } else if (t.0 / 60).is_multiple_of(2) {
+                    1
+                } else {
+                    -1
+                },
+                z: 0,
+            }),
+        );
+    });
+    assert!(h.run_until(900, |h| h.client_net(a).is_connected()));
+    let player = h.player(a);
+    for i in 0..units {
+        h.server_mut().world.spawn((
+            Replicated,
+            Simulated,
+            ControlledBy(player),
+            Transform::from_xyz(i as f32, 0.0, 5.0),
+        ));
+    }
+    h.step_ticks(120);
+    let bob = observer(&mut h, "bob");
+    let bytes0 = h.client_net(a).stats().bytes_in;
+    let mut seen_after = None;
+    for t in 0..1200u64 {
+        h.step();
+        if seen_after.is_none()
+            && let Some(p) = pawn(h.server(), h.player(bob))
+            && h.client_entity(a, p).is_some()
+        {
+            seen_after = Some(t);
+        }
+    }
+    let rate = (h.client_net(a).stats().bytes_in - bytes0) as f64 / 20.0;
+    (seen_after, rate)
+}
+
+/// Regression: controlled entities (and other always-sent bytes) were charged to the budget
+/// with no floor, so once they exceeded the refill nothing else was ever sent — another
+/// player's spawn included — and the client's rate was exceeded without limit.
+#[test]
+fn a_large_controlled_set_never_starves_other_entities() {
+    for (units, budget, moving) in [
+        (115usize, 48 * 1024u32, true),
+        (130, 48 * 1024, true),
+        (20, 4096, true),
+        (40, 8192, false),
+    ] {
+        let (seen, rate) = controlled_units_run(units, budget, moving);
+        let seen =
+            seen.unwrap_or_else(|| panic!("{units} units at {budget} B/s: bob's pawn never reached the rts player"));
+        assert!(
+            seen < 120,
+            "{units} units at {budget} B/s: bob's pawn took {seen} ticks"
+        );
+        if !moving {
+            // Idle controlled units: re-confirmations thin out, the budget holds.
+            assert!(
+                rate < f64::from(budget) * 1.3,
+                "{units} idle units: {rate:.0} B/s for a {budget} B/s budget"
+            );
+        }
+        eprintln!("{units} units, budget {budget}: bob seen after {seen} ticks, {rate:.0} B/s");
+    }
+}
+
+// ---- clocks across a stream stall -----------------------------------------------------------------
+
+/// Largest backward step of the render tick, number of predicted-tick jumps (a frame advancing
+/// it by more than 2 or moving it back) and the largest interpolation delay, across a
+/// head-of-line stall of the observer's uplink (`up = true`) or downlink.
+fn stall_run(seed: u64, up: bool) -> (f64, usize, f32) {
+    let base = LinkConditions {
+        latency: Duration::from_millis(40),
+        jitter: Duration::from_millis(3),
+        ..LinkConditions::perfect()
+    };
+    let mut h = with_rules(HarnessConfig {
+        seed,
+        semantics: Semantics::Stream,
+        link: LinkProfile::symmetric(base.clone()),
+        ..Default::default()
+    });
+    let w = h.add_client(ClientSpec::named("walker"), |app| {
+        app.add_plugin(TestProtocol);
+        space3d_replication::bots::install_bot(
+            app,
+            space3d_replication::bots::scripted(|_t: Tick| Move { x: 1, z: 0 }),
+        );
+    });
+    let o = h.add_client(ClientSpec::named("obs"), |app| {
+        app.add_plugin(TestProtocol);
+        space3d_replication::bots::install_bot(app, space3d_replication::bots::scripted(|_t: Tick| Move::default()));
+    });
+    assert!(h.run_until(900, |h| h.client_net(w).is_connected()
+        && h.client_net(o).is_connected()));
+    h.step_ticks(300);
+    let stalled = LinkConditions {
+        loss: 0.9,
+        ..base.clone()
+    };
+    h.set_link(
+        o,
+        if up {
+            LinkProfile {
+                up: stalled,
+                down: base.clone(),
+            }
+        } else {
+            LinkProfile {
+                up: base.clone(),
+                down: stalled,
+            }
+        },
+    );
+    let (mut back, mut jumps, mut delay) = (0.0f64, 0usize, 0.0f32);
+    let (mut last_render, mut last_pred): (Option<f64>, Option<u32>) = (None, None);
+    for t in 0..600u32 {
+        if t == 36 {
+            h.set_link(o, LinkProfile::symmetric(base.clone()));
+        }
+        h.step();
+        let net = h.client_net(o);
+        if let Some(r) = net.render_tick() {
+            if let Some(l) = last_render {
+                back = back.max(l - r);
+            }
+            last_render = Some(r);
+        }
+        if let Some(p) = net.predicted_tick() {
+            if let Some(l) = last_pred {
+                let d = i64::from(p.0) - i64::from(l);
+                if !(0..=2).contains(&d) {
+                    jumps += 1;
+                }
+            }
+            last_pred = Some(p.0);
+        }
+        if t > 120 {
+            delay = delay.max(net.stats().interp_delay_ticks);
+        }
+    }
+    (back, jumps, delay)
+}
+
+/// Regression: pacing and the render clock used the RFC 6298 `srtt`, which one head-of-line
+/// stall inflates several-fold: the render tick snapped backwards (remote entities froze), the
+/// interpolation delay ballooned to ~20 ticks and the clock-based resync fought the pacer
+/// (several forward/backward prediction jumps). They now use the stall-resistant path RTT of
+/// the server clock, and the render clock never runs backwards.
+#[test]
+fn a_stream_stall_neither_rewinds_the_render_clock_nor_jumps_prediction() {
+    for seed in 0..3u64 {
+        for up in [true, false] {
+            let (back, jumps, delay) = stall_run(seed, up);
+            let which = if up { "uplink" } else { "downlink" };
+            assert!(
+                back <= 0.0,
+                "seed {seed} {which}: render tick went back {back:.2} ticks"
+            );
+            assert!(jumps <= 1, "seed {seed} {which}: {jumps} predicted-tick jumps");
+            assert!(
+                delay < 8.0,
+                "seed {seed} {which}: interpolation delay grew to {delay:.1} ticks"
+            );
+        }
+    }
+}
+
+// ---- late inputs are counted -------------------------------------------------------------------
+
+/// Regression: `inputs_late` / `NetStats::input_late` stayed 0 even when many inputs arrived
+/// after their tick (every simulated tick counted as "consumed"). On a lossy stream (TCP
+/// head-of-line stalls) inputs go missing and then arrive late; both are counted now.
+#[test]
+fn late_inputs_are_counted() {
+    let mut h = with_rules(HarnessConfig {
+        seed: 5,
+        semantics: Semantics::Stream,
+        link: LinkProfile::symmetric(LinkConditions {
+            latency: Duration::from_millis(50),
+            jitter: Duration::from_millis(30),
+            loss: 0.15,
+            ..LinkConditions::perfect()
+        }),
+        ..Default::default()
+    });
+    let w = h.add_client(ClientSpec::named("walker"), |app| {
+        app.add_plugin(TestProtocol);
+        space3d_replication::bots::install_bot(
+            app,
+            space3d_replication::bots::scripted(|t: Tick| Move {
+                x: if (t.0 / 30).is_multiple_of(2) { 1 } else { -1 },
+                z: 0,
+            }),
+        );
+    });
+    assert!(h.run_until(1800, |h| h.client_net(w).is_connected()));
+    h.step_ticks(1200);
+    let room = h.server_net().room_stats();
+    assert!(room.inputs_missing > 0, "the lossy stream stalls inputs");
+    assert!(room.inputs_late > 0, "late inputs counted: {room:?}");
+    assert!(room.inputs_late <= room.inputs_missing, "{room:?}");
+    let slot = h.server_net().stats(h.client_net(w).client_id().unwrap()).unwrap();
+    assert_eq!(slot.input_late, room.inputs_late);
+}

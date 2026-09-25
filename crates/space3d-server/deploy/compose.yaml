@@ -1,5 +1,6 @@
 # Split-mode local stack: one player service + two game servers.
-#   SPACE3D_KEYS=k1:$(openssl rand -base64 32) SPACE3D_FLEET_TOKEN=dev-fleet SPACE3D_ADMIN_TOKENS=dev-admin \
+# The image runs with SPACE3D__ENV=production: tokens must be ≥ 16 characters (see docs/server.md §3).
+#   SPACE3D_KEYS=k1:$(openssl rand -base64 32) SPACE3D_FLEET_TOKEN=$(openssl rand -hex 24) SPACE3D_ADMIN_TOKENS=$(openssl rand -hex 24) \
 #   docker compose -f crates/space3d-server/deploy/compose.yaml up --build
 x-game: &game
   build: { context: ../../.., dockerfile: crates/space3d-server/deploy/Dockerfile, args: { BIN: arena-server } }

@@ -11,6 +11,7 @@ use space3d_replication::client::{ConnectionState, FailReason, NetClient};
 use space3d_replication::harness::ClientHandle;
 use space3d_replication::protocol::handshake::DisconnectCode;
 use space3d_replication::{PlayerId, RoomId};
+use space3d_server::gs::checkpoint::Checkpoint;
 use space3d_server::ps::fleet::ServerState;
 use space3d_server::testing::{TEST_ADMIN_TOKEN, TestCluster, TestClusterConfig};
 use std::time::Duration;
@@ -191,7 +192,10 @@ fn server_loss_scenario() {
     send(&mut c, ca, &SetHealth(7));
     assert!(c.run_until(120, |c| pawn_health(c.room(room).unwrap(), player(&alice)) == Some(7)));
     let set_at = c.unix_clock_ms();
-    // A checkpoint taken after the change must reach the player service's store.
+    // A checkpoint captured after the change must reach the player service's store. Judge it
+    // by the blob's own capture time: an older capture that was still uploading may land
+    // later (regression: the store used to stamp arrival time, so a stale blob passed this
+    // wait and the room was restored with health 100).
     let stored = c.run_until(600, |c| {
         c.player_service()
             .store
@@ -199,7 +203,11 @@ fn server_loss_scenario() {
             .block()
             .unwrap()
             .unwrap()
-            .is_some_and(|(saved, _)| saved > set_at)
+            .is_some_and(|(saved, bytes)| {
+                let cp = Checkpoint::from_bytes(&bytes).expect("stored checkpoint decodes");
+                assert_eq!(saved, cp.saved_ms, "row stamped with the capture time");
+                cp.saved_ms > set_at
+            })
     });
     assert!(stored, "checkpoint uploaded to the player service");
 
@@ -261,14 +269,25 @@ fn draining_server_gets_no_new_rooms_and_admin_api_is_guarded() {
     // Drain gs-1 through its admin API; the player service stops allocating to it.
     let (status, _) = admin(&c, "gs-1", "POST", "/admin/v1/drain", None, true);
     assert_eq!(status, 202);
+    // It reports draining; with no rooms the drain completes at once and it deregisters
+    // (dead right away, not after the lease).
     let draining = c.run_until(600, |c| {
         c.player_service()
             .fleet
             .lock()
             .server("gs-1")
-            .is_some_and(|s| s.state == ServerState::Draining)
+            .is_none_or(|s| s.state != ServerState::Ready)
     });
     assert!(draining, "heartbeat reported draining");
+    let lease_ticks = (c.player_service().config.fleet.lease_ttl.as_secs_f64() * 60.0) as u64;
+    let left = c.run_until(lease_ticks / 2, |c| {
+        c.player_service()
+            .fleet
+            .lock()
+            .server("gs-1")
+            .is_none_or(|s| s.state == ServerState::Dead && s.left)
+    });
+    assert!(left, "deregistered (dead and forgotten) before its lease ran out");
     let (status, _) = admin(&c, "gs-1", "GET", "/readyz", None, false);
     assert_eq!(status, 503, "a draining server is not ready");
     for name in ["p1", "p2", "p3"] {
@@ -294,10 +313,15 @@ fn bans_kick_players_and_block_their_tickets() {
         true,
     );
     assert_eq!(status, 201, "{body}");
+    // The room removes a banned player itself once its server's ban list changes.
     let kicked = c.run_until(300, |c| {
-        failed_with(c, cb, DisconnectCode::Kicked) && pawns(c.room(room).unwrap()) == 1
+        failed_with(c, cb, DisconnectCode::Banned) && pawns(c.room(room).unwrap()) == 1
     });
-    assert!(kicked, "the ban reached the game server and kicked bob");
+    assert!(
+        kicked,
+        "the ban reached the game server and removed bob: {:?}",
+        c.client_net(cb).state()
+    );
     assert!(c.client_net(ca).is_connected(), "alice unaffected");
     let err = c.api(&bob).me().block().unwrap().unwrap_err();
     assert_eq!(err.status(), Some(403));
@@ -378,4 +402,277 @@ fn concurrent_quick_plays_fill_one_room() {
         .map(|t| t.block().unwrap().expect("quick play").room_id)
         .collect();
     assert_eq!(rooms.len(), 1, "{rooms:?}");
+}
+
+/// [`TestCluster::run_until`] that also gives background work real time (≥ 2 ms per tick):
+/// checkpoint uploads, database writes and the player service's async answers finish in real
+/// time, while cluster time can race ahead of them.
+fn run_until_bg(c: &mut TestCluster, max_ticks: u64, mut pred: impl FnMut(&TestCluster) -> bool) -> bool {
+    for _ in 0..max_ticks {
+        if pred(c) {
+            return true;
+        }
+        c.step();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    pred(c)
+}
+
+fn persistent_cluster(game_servers: usize) -> TestCluster {
+    use space3d_server::config::QueueConfig;
+    let mut config = TestClusterConfig {
+        game_servers,
+        ..Default::default()
+    };
+    // Only the drain checkpoint captures state changed right before the drain.
+    config.server.persistence.checkpoint_interval = Duration::from_secs(600);
+    config.server.matchmaking.queues.push(QueueConfig {
+        name: "world".into(),
+        mode: "world".into(),
+        teams: 1,
+        team_size: 8,
+        min_players: 1,
+        backfill: true,
+        params: [("persistent".to_owned(), "true".to_owned())].into(),
+        ..Default::default()
+    });
+    TestCluster::new(DuelGame, config)
+}
+
+fn saw_notice(
+    c: &TestCluster,
+    client: ClientHandle,
+    reader: &mut space3d_core::EventReader,
+    want: &space3d_replication::protocol::control::Notice,
+) -> bool {
+    use space3d_replication::client::ConnectionEvent;
+    let events = c
+        .client(client)
+        .resources
+        .expect::<space3d_core::Events<ConnectionEvent>>();
+    reader
+        .read(events)
+        .any(|e| matches!(e, ConnectionEvent::Notice(n) if n == want))
+}
+
+/// §2.4.2 regression: draining a server moves its persistent room. The room checkpoints at the
+/// drain, closes once that checkpoint is stored (`Notice::Reconnect`, then
+/// `Disconnect(ServerShutdown)`), and its players' rejoin restores exactly that state on
+/// another server — never an older checkpoint, never two live copies.
+#[test]
+fn draining_hands_a_persistent_room_to_another_server() {
+    use space3d_replication::protocol::control::Notice;
+    let mut c = persistent_cluster(2);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let a = c.quick_play(&alice, "world").expect("quick play");
+    let b = c.quick_play(&bob, "world").expect("quick play");
+    assert_eq!(a.room_id, b.room_id, "one open world room");
+    let (room, host) = (a.room_id, a.server_id.clone());
+    let ca = c.connect(&a, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    let cb = c.connect(&b, |app| {
+        app.add_plugin(DuelProtocol);
+    });
+    assert!(c.run_until(600, |c| {
+        c.client_net(ca).is_connected() && c.client_net(cb).is_connected() && remote_count(c.client(ca)) == 2
+    }));
+    let spec = c
+        .room(room)
+        .unwrap()
+        .resources
+        .expect::<space3d_server::gs::room::RoomContext>()
+        .spec
+        .clone();
+    assert!(spec.persistent);
+    // Let the join checkpoint land, then change state only the drain checkpoint captures.
+    c.step_ticks(30);
+    send(&mut c, ca, &SetHealth(9));
+    assert!(c.run_until(120, |c| pawn_health(c.room(room).unwrap(), player(&alice)) == Some(9)));
+
+    let (status, _) = admin(&c, &host, "POST", "/admin/v1/drain", None, true);
+    assert_eq!(status, 202);
+    let mut reader = space3d_core::EventReader::default();
+    let mut warned = false;
+    let moved = run_until_bg(&mut c, 900, |c| {
+        warned |= saw_notice(c, ca, &mut reader, &Notice::Reconnect);
+        failed_with(c, ca, DisconnectCode::ServerShutdown) && failed_with(c, cb, DisconnectCode::ServerShutdown)
+    });
+    assert!(
+        moved,
+        "room handed off: {:?} / {:?}",
+        c.client_net(ca).state(),
+        c.client_net(cb).state()
+    );
+    assert!(warned, "clients were told the room moves");
+    assert!(c.room(room).is_none(), "no live copy left on the draining server");
+    let entry = c.player_service().fleet.lock().room(room).cloned().expect("room kept");
+    assert!(entry.orphaned, "kept restorable");
+
+    let mut target = None;
+    for (client, tokens) in [(ca, &alice), (cb, &bob)] {
+        let a = c.rejoin(tokens).unwrap().expect("the world can be restored");
+        assert_eq!(a.room_id, room);
+        assert_ne!(a.server_id, host, "restored on another server");
+        target.get_or_insert(a.server_id.clone());
+        assert_eq!(target.as_deref(), Some(a.server_id.as_str()));
+        c.reconnect(client, &a);
+    }
+    assert!(c.run_until(600, |c| {
+        c.client_net(ca).is_connected() && c.client_net(cb).is_connected()
+    }));
+    let restored = c.room(room).unwrap();
+    assert_eq!(
+        pawn_health(restored, player(&alice)),
+        Some(9),
+        "the drain checkpoint's state"
+    );
+    assert!(c.run_until(300, |c| healths(c.client(ca)) == vec![9, 100]));
+}
+
+/// Regression: a rejoin while the hosting server drains goes back to the match that still
+/// runs there instead of restoring a second copy on another server.
+#[test]
+fn rejoin_during_a_drain_returns_to_the_running_match() {
+    let mut c = cluster(2);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let (ca, cb, room) = connected_pair(&mut c, &alice, &bob);
+    let host = c.room_server(room).unwrap().to_owned();
+    let (status, _) = admin(&c, &host, "POST", "/admin/v1/drain", None, true);
+    assert_eq!(status, 202);
+    assert!(c.run_until(600, |c| {
+        c.player_service()
+            .fleet
+            .lock()
+            .server(&host)
+            .is_some_and(|s| s.state == ServerState::Draining)
+    }));
+    // Bob's client restarted (no resume token): rejoin through the player service.
+    let a = c.rejoin(&bob).unwrap().expect("rejoin");
+    assert_eq!(
+        (a.room_id, a.server_id.as_str()),
+        (room, host.as_str()),
+        "same room, same server"
+    );
+    c.reconnect(cb, &a);
+    assert!(
+        c.run_until(600, |c| c.client_net(cb).is_connected()),
+        "{:?}",
+        c.client_net(cb).state()
+    );
+    assert!(c.client_net(ca).is_connected(), "alice unaffected");
+    assert_eq!(pawns(c.room(room).unwrap()), 2, "bob took his own slot back");
+    let other = c.game_servers().into_iter().find(|s| *s != host).unwrap();
+    assert!(c.rooms_of(&other).is_empty(), "no second copy of the match");
+    assert_eq!(
+        c.player_service().fleet.lock().room(room).map(|e| e.server.clone()),
+        Some(host.clone())
+    );
+}
+
+/// §12 regression: a room crashing 3 times within 5 minutes is closed (clients get
+/// `RoomCrashed`, no rebuild) — the in-process cluster uses the shards' crash-loop guard.
+#[test]
+fn a_crash_looping_room_is_closed() {
+    let mut c = cluster(1);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let (ca, _cb, room) = connected_pair(&mut c, &alice, &bob);
+    for crash in 1..=3u64 {
+        c.crash_room(room);
+        assert!(
+            c.run_until(60, |c| c.room_crashes() == crash),
+            "crash {crash} contained"
+        );
+        if crash < 3 {
+            assert!(c.room(room).is_some(), "rebuilt after crash {crash}");
+        }
+        c.step_ticks(5);
+    }
+    assert!(c.room(room).is_none(), "closed after the third crash");
+    assert!(failed_with(&c, ca, DisconnectCode::RoomCrashed));
+    let gone = c.run_until(120, |c| c.player_service().fleet.lock().room(room).is_none());
+    assert!(gone, "the player service forgot the room");
+    assert!(!matches!(c.rejoin(&alice), Ok(Some(_))), "nothing to rejoin");
+}
+
+/// §12 regression: `RoomControl::load_player_data` reaches the player service and back
+/// (`PlayerDataLoaded`), a fetch during a fleet outage is answered empty, and
+/// `RoomControl::submit_score` reaches the leaderboard through the outbox (replayed after an
+/// outage, applied once).
+#[test]
+fn rooms_load_player_data_and_submit_scores() {
+    use common::{LoadData, Loaded, Score};
+    let mut c = cluster(1);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let (ca, _cb, room) = connected_pair(&mut c, &alice, &bob);
+    let server = c.room_server(room).unwrap().to_owned();
+    c.api(&alice)
+        .put_data(
+            "settings",
+            &space3d_replication::api::PutPlayerDataRequest {
+                value: serde_json::json!({ "fov": 90 }),
+                expected_version: None,
+            },
+        )
+        .block()
+        .unwrap()
+        .unwrap();
+    let loaded = |c: &TestCluster| c.room(room).unwrap().resources.expect::<Loaded>().0.clone();
+    send(&mut c, ca, &LoadData(vec!["settings".into(), "missing".into()]));
+    assert!(run_until_bg(&mut c, 500, |c| !loaded(c).is_empty()), "answer arrived");
+    let got = loaded(&c);
+    assert_eq!(got[0].player, player(&alice));
+    assert_eq!(got[0].entries.len(), 1, "missing keys are absent");
+    assert_eq!(got[0].entries[0].key, "settings");
+    assert_eq!(got[0].entries[0].value, serde_json::json!({ "fov": 90 }));
+
+    // Player service unreachable: the game still gets an (empty) answer.
+    c.set_fleet_outage(&server, true);
+    send(&mut c, ca, &LoadData(vec!["settings".into()]));
+    assert!(
+        run_until_bg(&mut c, 300, |c| loaded(c).len() == 2),
+        "answered during the outage"
+    );
+    assert!(loaded(&c)[1].entries.is_empty());
+
+    // Score submitted during the outage: buffered, replayed, on the board once.
+    send(&mut c, ca, &Score(7));
+    c.step_ticks(30);
+    c.set_fleet_outage(&server, false);
+    let board = c.api(&alice);
+    let on_board = c.run_until(600, |_| {
+        board
+            .leaderboard("kills", 10)
+            .block()
+            .unwrap()
+            .is_ok_and(|rows| rows.len() == 1)
+    });
+    assert!(on_board, "score reached the leaderboard");
+    let rows = board.leaderboard("kills", 10).block().unwrap().unwrap();
+    assert_eq!((rows[0].player_id, rows[0].score), (player(&alice), 7));
+}
+
+/// A fetch the player service never answers (the link dropped after the request went out) is
+/// answered empty after `FETCH_TIMEOUT`, so the game is never left waiting.
+#[test]
+fn unanswered_player_data_fetches_time_out() {
+    use common::{LoadData, Loaded};
+    let mut c = cluster(1);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let (ca, _cb, room) = connected_pair(&mut c, &alice, &bob);
+    let server = c.room_server(room).unwrap().to_owned();
+    c.set_fleet_swallow(&server, true);
+    send(&mut c, ca, &LoadData(vec!["settings".into()]));
+    let loaded = |c: &TestCluster| c.room(room).unwrap().resources.expect::<Loaded>().0.clone();
+    let ticks = (space3d_server::gs::FETCH_TIMEOUT.as_secs_f64() * 60.0) as u64 + 120;
+    assert!(
+        c.run_until(ticks, |c| !loaded(c).is_empty()),
+        "answered after the timeout"
+    );
+    assert!(loaded(&c)[0].entries.is_empty());
 }

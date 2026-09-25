@@ -63,7 +63,7 @@ use ps::{PlayerService, PlayerServiceHandle, PlayerServicePlugin};
 use security::Secrets;
 use security::bans::BanList;
 use space3d_core::{App, Stage};
-use space3d_net::{HttpServer, ServerHandle, WsServer, WsServerConfig};
+use space3d_net::{ConnectionLimits, HttpServer, ServerHandle, WsServer, WsServerConfig};
 use space3d_replication::protocol::WireLimits;
 use space3d_replication::server::ServerNetConfig;
 use space3d_replication::time::NetClockHandle;
@@ -286,6 +286,18 @@ impl<G: GameDefinition> ServerMain<G> {
     /// Startup (database open + migrations, schema hash) completes before this returns; it is
     /// not frame code.
     pub fn build(self) -> Result<App, ServerError> {
+        // Everything the process starts (listeners, ingress, fleet link, shard threads) logs
+        // inside this span, so every line carries `server_id` and `role`.
+        let span = logging::process_span(&self.config);
+        let mut app = {
+            let _entered = span.enter();
+            self.build_inner()?
+        };
+        app.insert_resource(logging::ProcessSpan(span));
+        Ok(app)
+    }
+
+    fn build_inner(self) -> Result<App, ServerError> {
         let ServerMain {
             game,
             config,
@@ -345,6 +357,7 @@ impl<G: GameDefinition> ServerMain<G> {
 
         // HTTP listeners, grouped by bind address (equal binds share one server).
         let mut servers: Vec<ServerSlot> = Vec::new();
+        let conn_limits = connection_limits(&config);
 
         // ---- player service ---------------------------------------------------------------
         let mut svc: Option<Arc<PlayerService>> = None;
@@ -377,7 +390,7 @@ impl<G: GameDefinition> ServerMain<G> {
             }
             let s2 = service.clone();
             let ws2 = fleet_ws.clone();
-            with_server(&mut servers, config.player_service.bind, move |srv| {
+            with_server(&mut servers, &conn_limits, config.player_service.bind, move |srv| {
                 ps::routes::mount(srv, s2, &ws2)
             });
             app.add_plugin(PlayerServicePlugin {
@@ -450,6 +463,7 @@ impl<G: GameDefinition> ServerMain<G> {
                 unix: unix_clock.clone(),
                 inbox_capacity: config.game.room_inbox,
                 secret_seed: options.secret_seed,
+                bans: Some(bans.clone()),
             };
             let shards = (!options.manual_rooms).then(|| {
                 let n = if config.game.shards == 0 {
@@ -485,7 +499,7 @@ impl<G: GameDefinition> ServerMain<G> {
             );
             let ws = transport.ws().clone();
             let path = config.game.path.clone();
-            with_server(&mut servers, config.game.bind, move |srv| {
+            with_server(&mut servers, &conn_limits, config.game.bind, move |srv| {
                 srv.ws(&path, &ws)
                     .route("/ping", space3d_net::server::axum::routing::get(|| async { "pong" }))
             });
@@ -502,6 +516,7 @@ impl<G: GameDefinition> ServerMain<G> {
                     max_rooms: config.game.max_rooms as u32,
                     max_players: config.game.max_players as u32,
                 },
+                modes: game_dyn.modes(),
             };
             let fleet: Arc<dyn FleetLink> = match (local_fleet.take(), options.fleet_link.clone()) {
                 (Some(link), _) | (None, Some(link)) => link,
@@ -563,7 +578,7 @@ impl<G: GameDefinition> ServerMain<G> {
         if servers.iter().any(|s| s.addr == admin_bind) {
             tracing::warn!("admin API shares a public listener ({admin_bind}); keep it on a private address");
         }
-        with_server(&mut servers, admin_bind, move |srv| {
+        with_server(&mut servers, &conn_limits, admin_bind, move |srv| {
             srv.merge(admin::router(admin_state))
         });
         // Public listeners answer /healthz and /readyz too (the admin router already has them).
@@ -654,6 +669,11 @@ impl<G: GameDefinition> ServerMain<G> {
             }
         };
         lifecycle::install_signal_handlers(app.resources.expect::<LifecycleHandle>().clone());
+        let span = app
+            .resources
+            .get::<logging::ProcessSpan>()
+            .map_or_else(tracing::Span::none, |s| s.0.clone());
+        let _entered = span.enter();
         let step = Duration::from_secs_f64(1.0 / SUPERVISOR_HZ);
         let mut last = std::time::Instant::now();
         loop {
@@ -687,12 +707,37 @@ impl ServerSlot {
     }
 }
 
-fn with_server(servers: &mut Vec<ServerSlot>, addr: SocketAddr, f: impl FnOnce(HttpServer) -> HttpServer) {
+fn with_server(
+    servers: &mut Vec<ServerSlot>,
+    limits: &ConnectionLimits,
+    addr: SocketAddr,
+    f: impl FnOnce(HttpServer) -> HttpServer,
+) {
     match servers.iter_mut().find(|s| s.addr == addr) {
         Some(slot) => slot.map(f),
         None => servers.push(ServerSlot {
             addr,
-            server: Some(f(HttpServer::new().bind(addr))),
+            server: Some(f(HttpServer::new().bind(addr).connection_limits(limits.clone()))),
+        }),
+    }
+}
+
+/// Connection-level limits of every listener (`[limits] http_*`): per-IP caps keyed like the
+/// rate limiters (IPv6 per /64), trusted proxies exempt (they carry many clients).
+pub fn connection_limits(config: &ServerConfig) -> ConnectionLimits {
+    let trusted: Vec<security::netaddr::Cidr> = config
+        .security
+        .trusted_proxies
+        .iter()
+        .filter_map(|c| security::netaddr::Cidr::parse(c).ok())
+        .collect();
+    ConnectionLimits {
+        header_read_timeout: config.limits.http_header_timeout,
+        max_connections: config.limits.http_max_connections,
+        max_per_peer: config.limits.http_connections_per_ip as usize,
+        peer_key: Arc::new(move |ip| {
+            let ip = security::netaddr::canonical(ip);
+            (!trusted.iter().any(|c| c.contains(ip))).then(|| security::netaddr::rate_key(ip))
         }),
     }
 }

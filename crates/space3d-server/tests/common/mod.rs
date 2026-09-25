@@ -8,7 +8,7 @@ use space3d_core::prelude::*;
 use space3d_replication::prelude::*;
 use space3d_replication::{NetEntity, Remote};
 use space3d_server::game::{GameDefinition, RoomSpec};
-use space3d_server::gs::room::{MatchResult, PlayerResult, RoomContext, RoomControl};
+use space3d_server::gs::room::{MatchResult, PlayerDataLoaded, PlayerResult, RoomContext, RoomControl};
 
 /// Game id of the test game.
 pub const GAME_ID: &str = "duel-test";
@@ -36,6 +36,22 @@ impl NetMessage for Finish {}
 pub struct SetHealth(pub u16);
 impl NetMessage for SetHealth {}
 
+/// Client → server: the room loads these player-data keys of the sender
+/// (`RoomControl::load_player_data`; answers land in the room's [`Loaded`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoadData(pub Vec<String>);
+impl NetMessage for LoadData {}
+
+/// Client → server: the room submits this score for the sender on the `kills` board
+/// (`RoomControl::submit_score`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Score(pub i64);
+impl NetMessage for Score {}
+
+/// Room resource: every `PlayerDataLoaded` the room received.
+#[derive(Default)]
+pub struct Loaded(pub Vec<PlayerDataLoaded>);
+
 /// Shared sim: move pawns.
 pub fn walk(ctx: &mut SystemCtx) {
     let dt = ctx.resources.expect::<SimTime>().dt_secs();
@@ -59,6 +75,8 @@ impl Plugin for DuelProtocol {
             .add_input::<Move>("duel.move")
             .add_message::<Finish>("duel.finish", MessageConfig::reliable(Direction::ClientToServer))
             .add_message::<SetHealth>("duel.set_health", MessageConfig::reliable(Direction::ClientToServer))
+            .add_message::<LoadData>("duel.load_data", MessageConfig::reliable(Direction::ClientToServer))
+            .add_message::<Score>("duel.score", MessageConfig::reliable(Direction::ClientToServer))
             .add_sim_system("duel::walk", walk);
     }
 }
@@ -80,6 +98,33 @@ impl Plugin for DuelRules {
         let mut left = EventReader::default();
         let mut finish = EventReader::default();
         let mut set_health = EventReader::default();
+        let mut load = EventReader::default();
+        let mut score = EventReader::default();
+        let mut loaded = EventReader::default();
+        app.init_resource::<Loaded>();
+        app.add_system_named(Stage::Update, "duel::data", move |ctx| {
+            let loads: Vec<FromClient<LoadData>> = load
+                .read(ctx.resources.expect::<Events<FromClient<LoadData>>>())
+                .cloned()
+                .collect();
+            let scores: Vec<FromClient<Score>> = score
+                .read(ctx.resources.expect::<Events<FromClient<Score>>>())
+                .cloned()
+                .collect();
+            let control = ctx.resources.expect_mut::<RoomControl>();
+            for l in loads {
+                let keys: Vec<&str> = l.message.0.iter().map(String::as_str).collect();
+                control.load_player_data(l.player, &keys);
+            }
+            for s in scores {
+                control.submit_score("kills", s.player, s.message.0);
+            }
+            let answers: Vec<PlayerDataLoaded> = loaded
+                .read(ctx.resources.expect::<Events<PlayerDataLoaded>>())
+                .cloned()
+                .collect();
+            ctx.resources.expect_mut::<Loaded>().0.extend(answers);
+        });
         app.add_system_named(Stage::Update, "duel::rules", move |ctx| {
             let events: Vec<PlayerJoined> = joined
                 .read(ctx.resources.expect::<Events<PlayerJoined>>())

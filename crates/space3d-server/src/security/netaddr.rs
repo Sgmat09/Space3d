@@ -84,7 +84,7 @@ impl<'de> Deserialize<'de> for Cidr {
 }
 
 /// IPv4-mapped IPv6 addresses (`::ffff:1.2.3.4`) are treated as IPv4.
-fn canonical(ip: IpAddr) -> IpAddr {
+pub fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,

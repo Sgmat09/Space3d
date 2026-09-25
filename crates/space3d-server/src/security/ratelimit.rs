@@ -65,6 +65,18 @@ impl<K: Hash + Eq + Clone> KeyedLimiter<K> {
         ok
     }
 
+    /// Whether `key` has a whole token at `now`, **without** taking it (unknown keys start
+    /// full). Pair with [`Self::check`] to charge only some outcomes (e.g. failed logins).
+    pub fn available(&mut self, key: &K, now: Duration) -> bool {
+        match self.buckets.get_mut(key) {
+            Some((bucket, _)) => {
+                bucket.take(now, 0.0);
+                bucket.tokens() >= 1.0
+            }
+            None => self.burst >= 1.0,
+        }
+    }
+
     /// Keys currently tracked.
     pub fn len(&self) -> usize {
         self.buckets.len()

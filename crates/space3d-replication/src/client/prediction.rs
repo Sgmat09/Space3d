@@ -218,9 +218,11 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
     let Some(conn) = net.conn.as_mut() else { return };
     let Some(welcome) = conn.welcome.as_ref() else { return };
     let hz = f64::from(welcome.tick_hz.max(1));
-    let jitter_ticks = conn.rtt.rttvar().as_secs_f64() * hz;
+    // Stall-resistant path RTT / jitter (a head-of-line stall must not move the target).
+    let jitter_ticks = conn.clock.jitter().as_secs_f64() * hz;
+    let rtt = conn.clock.path_rtt().unwrap_or_else(|| conn.rtt.srtt());
     let Some(est) = conn.clock.estimate(now) else { return };
-    let target = est + conn.rtt.srtt().as_secs_f64() / 2.0 * hz + conn.pacer.target(jitter_ticks);
+    let target = est + rtt.as_secs_f64() / 2.0 * hz + conn.pacer.target(jitter_ticks);
     let hard = conn.pacer.config().hard_resync_ticks;
     let prediction = &mut net.prediction;
     prediction.nominal_hz = hz;
@@ -361,14 +363,17 @@ pub(crate) fn client_tick(ctx: &mut SystemCtx) {
             let dt = Duration::from_secs_f64(1.0 / net.prediction.nominal_hz.max(1.0));
             (tick, net.prediction.rollback_from.take(), dt)
         };
-        match rollback {
-            Some(from) => rollback_and_replay(world, res, registry, from, tick, dt),
+        let tick = match rollback {
+            // A confirmation at or past `tick` moves the timeline forward (see
+            // `rollback_and_replay`): simulate the tick after it instead.
+            Some(from) => rollback_and_replay(world, res, registry, from, tick, dt).unwrap_or(tick),
             None if cfg!(debug_assertions) => {
                 let net = res.expect_mut::<NetClient>();
                 check_sim_discipline(world, registry, net, tick);
+                tick
             }
-            None => {}
-        }
+            None => tick,
+        };
         // Sample and simulate the next tick.
         let value = match registry.input() {
             Some(input) => {
@@ -478,6 +483,10 @@ fn newest_confirmation(world: &World, registry: &ReplicationRegistry, net: &NetC
     Some((newest, matches))
 }
 
+/// Returns the tick `client_tick` must simulate next when the timeline moved forward: the
+/// newest confirmation is at or past `next` (the client fell behind snapshots it already holds —
+/// a frame hitch on a low-latency link), so the confirmed state already includes ticks
+/// `next ..= from` and simulating them again would apply their inputs twice.
 fn rollback_and_replay(
     world: &mut World,
     res: &mut space3d_core::Resources,
@@ -485,13 +494,13 @@ fn rollback_and_replay(
     from: Tick,
     next: Tick,
     dt: Duration,
-) {
+) -> Option<Tick> {
     // Only the newest confirmed values are kept, so the replay starts from their tick: a
     // mismatch at an older tick (several snapshots arriving together after a stall) is
     // superseded by the newest one, and if our prediction for the newest confirmed tick was
     // right there is nothing to correct.
     let from = match newest_confirmation(world, registry, res.expect::<NetClient>()) {
-        Some((_, true)) => return,
+        Some((_, true)) => return None,
         Some((newest, false)) => newest.max(from),
         None => from,
     };
@@ -525,6 +534,9 @@ fn rollback_and_replay(
         let max = u32::from(net.config.prediction.max_rollback_ticks);
         (n > 0 && n <= max && have_inputs).then_some((from.0 + 1, last))
     };
+    // Confirmed at or past `next`: fast-forward to `from + 1` (a forward resync; the server
+    // already simulated the skipped ticks with the inputs it had).
+    let forward = (from >= next).then(|| from.next());
     if replay.is_none() {
         // Snap: the confirmed state stands in for ticks `from+1 .. next`, whose recorded
         // history no longer describes this timeline. Compare again from `next` on (a single
@@ -534,7 +546,13 @@ fn rollback_and_replay(
                 h.entries.clear();
             }
         }
-        res.expect_mut::<NetClient>().prediction.snap_floor = Some(next);
+        let prediction = &mut res.expect_mut::<NetClient>().prediction;
+        prediction.snap_floor = Some(forward.unwrap_or(next));
+        if let Some(to) = forward {
+            tracing::debug!(?next, ?to, "prediction behind the confirmed state; fast-forward");
+            prediction.next_tick = Some(to);
+            prediction.feedback_after = Some(to);
+        }
     }
     let mut replayed = 0u32;
     if let Some((a, b)) = replay {
@@ -599,6 +617,7 @@ fn rollback_and_replay(
     net.stats.rollbacks += 1;
     net.stats.resim_ticks += u64::from(replayed);
     super::receive::emit_mispredicted(res, Mispredicted { tick: from, replayed });
+    forward
 }
 
 /// PreUpdate: take the visual correction off `Transform` before anything simulates.

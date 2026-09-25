@@ -612,6 +612,20 @@ fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String
     headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
 }
 
+/// Every line of a list-valued header (e.g. `X-Forwarded-For`), in order, joined with `", "`
+/// (RFC 9110: repeated field lines equal one comma-separated list). Proxies may add their own
+/// line instead of appending to the client's, so reading only the first line would hand the
+/// client the choice of address. Non-UTF-8 bytes are replaced (an unparseable hop, never a
+/// dropped one).
+pub fn joined_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    let lines: Vec<String> = headers
+        .get_all(name)
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join(", "))
+}
+
 async fn upgrade(
     State((server, shutdown)): State<(WsServer, CancellationToken)>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -628,7 +642,7 @@ async fn upgrade(
     let meta = ConnectMeta {
         addr,
         origin: header_string(&headers, header::ORIGIN),
-        forwarded_for: header_string(&headers, header::HeaderName::from_static("x-forwarded-for")),
+        forwarded_for: joined_header(&headers, "x-forwarded-for"),
         user_agent: header_string(&headers, header::USER_AGENT),
         authorization: header_string(&headers, header::AUTHORIZATION),
     };

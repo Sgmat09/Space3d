@@ -47,6 +47,9 @@ pub struct ClientEntity {
     pub known_tick: Tick,
     /// Consecutive snapshots in which the entity had due changes that the budget deferred.
     pub misses: u16,
+    /// Controlled entity: snapshots since its unchanged predicted components were last
+    /// re-confirmed (see `priority::CONFIRM_EVERY`).
+    pub confirm_skipped: u16,
 }
 
 impl ClientEntity {
@@ -459,6 +462,12 @@ fn build_snapshot(
     }
     // Due components per relevant entity.
     let predicted_mask = registry.predicted_mask();
+    // Overspent last time (e.g. many controlled entities): thin out re-confirmations.
+    let in_debt = slot
+        .view
+        .budget
+        .as_ref()
+        .is_some_and(super::priority::ByteBudget::in_debt);
     let mut always: Vec<Pick> = Vec::new();
     let mut candidates: Vec<(f32, Pick, usize)> = Vec::new();
     let mut all_spawned = true;
@@ -488,7 +497,16 @@ fn build_snapshot(
             }
             due |= allowed & !ce.known_present;
             if controlled {
-                due |= allowed & predicted_mask;
+                // Predicted components are confirmed every snapshot (the client compares them
+                // with its prediction), changed or not — except while the budget is in debt,
+                // when unchanged ones are re-confirmed every CONFIRM_EVERY snapshots.
+                let predicted = allowed & predicted_mask;
+                if !in_debt || due & predicted != 0 || ce.confirm_skipped + 1 >= super::priority::CONFIRM_EVERY {
+                    due |= predicted;
+                    ce.confirm_skipped = 0;
+                } else {
+                    ce.confirm_skipped += 1;
+                }
             }
             (due, ce.known_present & !allowed, false)
         };
@@ -565,10 +583,12 @@ fn build_snapshot(
     for (_, mut pick, size) in rest.by_ref() {
         let top = written_candidates == 0 && misses == 0;
         let fits = used + size <= available;
-        let forced = top && (full || (picks.is_empty() && available > 0));
         let Some(ce) = slot.view.entities.get_mut(&pick.net_id) else {
             continue;
         };
+        // Guaranteed progress: however much the always-sent set takes, a top candidate that
+        // waited STARVE_FORCE snapshots goes out.
+        let forced = top && (full || (picks.is_empty() && available > 0) || ce.misses >= super::priority::STARVE_FORCE);
         if fits || forced {
             used += size;
             written_candidates += 1;

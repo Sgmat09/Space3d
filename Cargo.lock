@@ -1922,16 +1922,17 @@ dependencies = [
 
 [[package]]
 name = "hyper-util"
-version = "0.1.20"
+version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
+checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-channel",
  "futures-util",
  "http",
  "http-body",
+ "httparse",
  "hyper",
  "ipnet",
  "libc",
@@ -4661,6 +4662,8 @@ dependencies = [
  "axum",
  "futures",
  "http",
+ "hyper",
+ "hyper-util",
  "js-sys",
  "parking_lot",
  "postcard",
@@ -4675,6 +4678,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
+ "tower",
  "tower-http 0.7.1",
  "tracing",
  "url",

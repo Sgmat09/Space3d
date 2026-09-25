@@ -1,6 +1,11 @@
-//! Custom/private lobbies: 6-character codes, host starts, allocated like a fixed-composition
-//! match (one team with every member). Long-poll friendly (`GET /v1/lobbies/{id}?wait=20` via
-//! a version counter that changes on every mutation).
+//! Custom lobbies: joined only by their 6-character code (there is no lobby browser), host
+//! starts, allocated like a fixed-composition match (one team with every member). Long-poll
+//! friendly (`GET /v1/lobbies/{id}?wait=20` via a version counter that changes on every
+//! mutation).
+//!
+//! Bounded: a host has at most one open lobby (creating another closes the previous one),
+//! lobbies idle for [`IDLE_OPEN_TTL_MS`] are closed, and codes are indexed (create/join are
+//! `O(log n)` under the lobbies lock).
 
 use space3d_replication::PlayerId;
 use space3d_replication::api::{Assignment, LobbyMember, LobbyPhase, LobbyState};
@@ -45,10 +50,17 @@ pub struct StartingLobby {
 /// In-game lobbies are forgotten after this.
 const IN_GAME_TTL_MS: i64 = 600_000;
 
+/// Open (or starting) lobbies without any change for this long are closed.
+pub const IDLE_OPEN_TTL_MS: i64 = 30 * 60_000;
+
 /// All lobbies.
 #[derive(Debug, Default)]
 pub struct Lobbies {
     lobbies: BTreeMap<String, Lobby>,
+    /// Code → lobby id, for every lobby that is not closed.
+    codes: BTreeMap<String, String>,
+    /// Host → their open (or starting) lobby.
+    hosted: BTreeMap<PlayerId, String>,
 }
 
 impl Lobbies {
@@ -57,22 +69,36 @@ impl Lobbies {
         lobby.updated_ms = now_ms;
     }
 
+    /// Close a lobby (host left, replaced, idle): its code is freed.
+    fn close(&mut self, lobby_id: &str, now_ms: i64) {
+        if let Some(lobby) = self.lobbies.get_mut(lobby_id) {
+            if lobby.state.phase != LobbyPhase::Closed {
+                lobby.state.phase = LobbyPhase::Closed;
+                Self::bump(lobby, now_ms);
+            }
+            self.codes.remove(&lobby.state.code);
+            if self.hosted.get(&lobby.state.host).is_some_and(|id| id == lobby_id) {
+                self.hosted.remove(&lobby.state.host);
+            }
+        }
+    }
+
     /// Create a lobby hosted by `host` (a fresh id; `code` must be unique among open lobbies,
-    /// a new one is drawn on collision).
-    #[allow(clippy::too_many_arguments)]
+    /// a new one is drawn on collision). A lobby `host` still had open is closed.
     pub fn create(
         &mut self,
         host: PlayerId,
         name: &str,
         mode: &str,
         max_players: u16,
-        private: bool,
         code: String,
         now_ms: i64,
     ) -> LobbyState {
-        let _ = private;
+        if let Some(previous) = self.hosted.get(&host).cloned() {
+            self.close(&previous, now_ms);
+        }
         let mut code = code;
-        while self.lobbies.values().any(|l| l.state.code == code) {
+        while self.codes.contains_key(&code) {
             code = random_code();
         }
         let lobby_id = format!("{:016x}", u64::from_le_bytes(crate::security::random_bytes::<8>()));
@@ -90,6 +116,8 @@ impl Lobbies {
             phase: LobbyPhase::Open,
             assignment: None,
         };
+        self.codes.insert(state.code.clone(), lobby_id.clone());
+        self.hosted.insert(host, lobby_id.clone());
         self.lobbies.insert(
             lobby_id,
             Lobby {
@@ -113,9 +141,10 @@ impl Lobbies {
     pub fn join(&mut self, code: &str, player: PlayerId, name: &str, now_ms: i64) -> Result<LobbyState, String> {
         let code = code.trim().to_ascii_uppercase();
         let lobby = self
-            .lobbies
-            .values_mut()
-            .find(|l| l.state.code == code && l.state.phase != LobbyPhase::Closed)
+            .codes
+            .get(&code)
+            .and_then(|id| self.lobbies.get_mut(id))
+            .filter(|l| l.state.phase != LobbyPhase::Closed)
             .ok_or_else(|| "lobby not found".to_owned())?;
         if lobby.state.members.iter().any(|m| m.player_id == player) {
             return Ok(lobby.state.clone());
@@ -170,11 +199,11 @@ impl Lobbies {
             return Err("not a member".into());
         }
         if lobby.state.host == player {
-            lobby.state.phase = LobbyPhase::Closed;
+            self.close(lobby_id, now_ms);
         } else {
             lobby.state.members.retain(|m| m.player_id != player);
+            Self::bump(lobby, now_ms);
         }
-        Self::bump(lobby, now_ms);
         Ok(())
     }
 
@@ -217,6 +246,12 @@ impl Lobbies {
             lobby.assignments = assignments;
             lobby.state.phase = LobbyPhase::InGame;
             Self::bump(lobby, now_ms);
+            // In game: the code no longer admits anyone, and the host may open another lobby.
+            let (code, host) = (lobby.state.code.clone(), lobby.state.host);
+            self.codes.remove(&code);
+            if self.hosted.get(&host).is_some_and(|id| id == lobby_id) {
+                self.hosted.remove(&host);
+            }
         }
     }
 
@@ -230,13 +265,30 @@ impl Lobbies {
         }
     }
 
-    /// Forget closed lobbies and old in-game ones.
+    /// Close idle open lobbies; forget closed lobbies and old in-game ones.
     pub fn prune(&mut self, now_ms: i64) {
+        let idle: Vec<String> = self
+            .lobbies
+            .iter()
+            .filter(|(_, l)| {
+                matches!(l.state.phase, LobbyPhase::Open | LobbyPhase::Starting)
+                    && now_ms.saturating_sub(l.updated_ms) >= IDLE_OPEN_TTL_MS
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in idle {
+            self.close(&id, now_ms);
+        }
         self.lobbies.retain(|_, l| match l.state.phase {
             LobbyPhase::Closed => now_ms.saturating_sub(l.updated_ms) < 60_000,
             LobbyPhase::InGame => now_ms.saturating_sub(l.updated_ms) < IN_GAME_TTL_MS,
-            _ => now_ms.saturating_sub(l.updated_ms) < 6 * 3_600_000,
+            _ => true,
         });
+    }
+
+    /// Open (or starting) lobbies hosted by `host` (at most one).
+    pub fn hosted_by(&self, host: PlayerId) -> usize {
+        usize::from(self.hosted.contains_key(&host))
     }
 
     /// Number of lobbies.
@@ -268,7 +320,7 @@ mod tests {
     fn lobby_lifecycle() {
         let mut l = Lobbies::default();
         let (host, guest, other) = (PlayerId(1), PlayerId(2), PlayerId(3));
-        let s = l.create(host, "host", "duel", 2, true, "ABC234".into(), 0);
+        let s = l.create(host, "host", "duel", 2, "ABC234".into(), 0);
         assert_eq!(s.code, "ABC234");
         assert_eq!(l.join("abc234", guest, "guest", 1).unwrap().members.len(), 2);
         assert_eq!(l.join("ABC234", other, "o", 1).unwrap_err(), "lobby full");
@@ -298,8 +350,8 @@ mod tests {
     #[test]
     fn host_leaving_closes_and_codes_are_unique() {
         let mut l = Lobbies::default();
-        let a = l.create(PlayerId(1), "a", "m", 4, false, "AAAAAA".into(), 0);
-        let b = l.create(PlayerId(2), "b", "m", 4, false, "AAAAAA".into(), 0);
+        let a = l.create(PlayerId(1), "a", "m", 4, "AAAAAA".into(), 0);
+        let b = l.create(PlayerId(2), "b", "m", 4, "AAAAAA".into(), 0);
         assert_ne!(a.code, b.code);
         l.join(&a.code, PlayerId(3), "c", 1).unwrap();
         l.leave(&a.lobby_id, PlayerId(3), 2).unwrap();
@@ -308,5 +360,46 @@ mod tests {
         assert_eq!(l.view(&a.lobby_id, PlayerId(1)).unwrap().1.phase, LobbyPhase::Closed);
         assert!(l.join(&a.code, PlayerId(4), "d", 4).is_err());
         assert_eq!(random_code().len(), 6);
+    }
+
+    /// Regression: one guest could hold unbounded lobbies for 6 h, and create / join scanned
+    /// every lobby under the lock.
+    #[test]
+    fn one_open_lobby_per_host_idle_expiry_and_indexed_codes() {
+        let mut l = Lobbies::default();
+        let host = PlayerId(1);
+        let mut last = None;
+        for i in 0..300 {
+            last = Some(l.create(host, "h", "m", 4, random_code(), i));
+        }
+        let last = last.unwrap();
+        assert_eq!(l.hosted_by(host), 1);
+        let open = l.lobbies.values().filter(|x| x.state.phase == LobbyPhase::Open).count();
+        assert_eq!(open, 1, "creating a lobby closes the host's previous one");
+        assert_eq!(l.codes.len(), 1, "only open lobbies hold a code");
+        // Closed ones are forgotten after a minute.
+        l.prune(400 + 60_000);
+        assert_eq!(l.len(), 1);
+        // Codes are indexed: a join resolves through the index.
+        assert_eq!(l.join(&last.code, PlayerId(2), "g", 400).unwrap().members.len(), 2);
+        // Idle open lobbies close (and free their code) after IDLE_OPEN_TTL_MS.
+        l.prune(400 + IDLE_OPEN_TTL_MS);
+        assert!(l.join(&last.code, PlayerId(3), "x", 400 + IDLE_OPEN_TTL_MS).is_err());
+        assert_eq!(l.hosted_by(host), 0);
+        assert!(l.codes.is_empty());
+        // Many hosts: create + join stay fast (indexed, no scans).
+        let started = std::time::Instant::now();
+        let mut codes = Vec::new();
+        for i in 0..30_000u64 {
+            codes.push(l.create(PlayerId(10 + i), "h", "m", 4, random_code(), 0).code);
+        }
+        for (i, code) in codes.iter().enumerate().step_by(97) {
+            l.join(code, PlayerId(1_000_000 + i as u64), "j", 1).unwrap();
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

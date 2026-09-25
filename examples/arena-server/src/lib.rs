@@ -60,6 +60,10 @@ impl GameDefinition for ArenaGame {
         app.add_plugin(ArenaMatch::from_spec(spec));
     }
 
+    fn modes(&self) -> Vec<String> {
+        MODES.iter().map(|m| (*m).to_owned()).collect()
+    }
+
     fn validate_spec(&self, spec: &RoomSpec) -> Result<(), String> {
         if !MODES.contains(&spec.mode.as_str()) {
             return Err(format!("unknown mode `{}`", spec.mode));

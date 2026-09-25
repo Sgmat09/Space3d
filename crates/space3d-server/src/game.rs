@@ -62,6 +62,14 @@ pub trait GameDefinition: Send + Sync + 'static {
         base.clone()
     }
 
+    /// Modes this game hosts. The game server advertises them when it registers with the
+    /// fleet, and quick play / lobbies only create rooms of a listed mode on it (matchmaking
+    /// queues configure their own mode). Empty (default) = any mode [`Self::validate_spec`]
+    /// accepts; list them in production so clients cannot open rooms of arbitrary modes.
+    fn modes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Reject specs this game cannot host (unknown mode/map).
     fn validate_spec(&self, spec: &RoomSpec) -> Result<(), String> {
         let _ = spec;

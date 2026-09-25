@@ -227,6 +227,34 @@ impl ServerClock {
         self.last_update = now;
     }
 
+    /// Round-trip time of the path, stall-resistant: the median RTT of the lowest-RTT half of
+    /// the window (the samples the offset uses). A head-of-line stall on a stream only adds a
+    /// few high samples, which this ignores, where the RFC 6298 `srtt` jumps several-fold —
+    /// pacing and the render clock use this, not `srtt`.
+    pub fn path_rtt(&self) -> Option<Duration> {
+        let mut rtts: Vec<Duration> = self.samples.iter().map(|s| s.1).collect();
+        if rtts.is_empty() {
+            return None;
+        }
+        rtts.sort_unstable();
+        rtts.truncate(rtts.len().div_ceil(2));
+        Some(rtts[rtts.len() / 2])
+    }
+
+    /// Jitter, stall-resistant: the median absolute deviation of the window's RTTs (a stall's
+    /// few outliers do not move it). Zero without samples.
+    pub fn jitter(&self) -> Duration {
+        let mut rtts: Vec<f64> = self.samples.iter().map(|s| s.1.as_secs_f64()).collect();
+        if rtts.len() < 2 {
+            return Duration::ZERO;
+        }
+        rtts.sort_by(f64::total_cmp);
+        let median = rtts[rtts.len() / 2];
+        let mut dev: Vec<f64> = rtts.iter().map(|r| (r - median).abs()).collect();
+        dev.sort_by(f64::total_cmp);
+        Duration::from_secs_f64(dev[dev.len() / 2])
+    }
+
     /// Server tick (fractional) the server is simulating at local time `now`.
     pub fn estimate(&self, now: Duration) -> Option<f64> {
         self.offset_ticks.map(|o| o + now.as_secs_f64() * self.tick_hz)
@@ -404,7 +432,9 @@ impl Default for InterpConfig {
 }
 
 /// Render clock for remote entities: `render_tick = server_estimate - delay`, where the delay
-/// adapts to jitter and is slewed by at most ±5 % playback speed (snaps beyond 10 ticks).
+/// adapts to jitter and is slewed by at most ±5 % playback speed. It never runs backwards: a
+/// target more than 10 ticks behind slows playback (down to half speed) instead of snapping
+/// back; a target more than 10 ticks ahead snaps forward.
 #[derive(Clone, Debug)]
 pub struct InterpClock {
     config: InterpConfig,
@@ -415,8 +445,11 @@ pub struct InterpClock {
 impl InterpClock {
     /// Max playback speed deviation.
     pub const MAX_SPEED_DELTA: f64 = 0.05;
-    /// Error (ticks) beyond which the render clock snaps.
+    /// Error (ticks) beyond which the render clock snaps forward (or slows down strongly when
+    /// the target is behind).
     pub const SNAP_TICKS: f64 = 10.0;
+    /// Slowest playback while far ahead of the target (never backwards).
+    pub const MIN_SPEED: f64 = 0.5;
 
     /// New clock.
     pub fn new(config: InterpConfig) -> Self {
@@ -453,10 +486,17 @@ impl InterpClock {
             Some(r) => {
                 let advanced = r + frame_dt.as_secs_f64() * tick_hz;
                 let err = target - advanced;
-                if err.abs() > Self::SNAP_TICKS {
+                if err > Self::SNAP_TICKS {
                     target
                 } else {
-                    let speed = 1.0 + (err * 0.1).clamp(-Self::MAX_SPEED_DELTA, Self::MAX_SPEED_DELTA);
+                    // Far ahead of the target: slow down hard, but keep moving forward (a
+                    // backward snap replays positions already shown and freezes everything).
+                    let slowest = if err < -Self::SNAP_TICKS {
+                        Self::MIN_SPEED - 1.0
+                    } else {
+                        -Self::MAX_SPEED_DELTA
+                    };
+                    let speed = 1.0 + (err * 0.1).clamp(slowest, Self::MAX_SPEED_DELTA);
                     r + frame_dt.as_secs_f64() * tick_hz * speed
                 }
             }

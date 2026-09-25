@@ -15,7 +15,7 @@
 //! after the tick in [`after_tick`] (called by the shard and by `TestCluster` through
 //! [`run_tick`]); serialization and upload run off the room thread.
 
-use super::checkpoint::{CHECKPOINT_VERSION, Checkpoint, StoreError};
+use super::checkpoint::{Checkpoint, StoreError};
 use super::rooms::{RoomCommand, RoomDetail, RoomEnv, RoomError, RoomPhase, RoomStatus};
 use crate::game::RoomSpec;
 use crate::gs::fleet::{DataWrite, FleetUp};
@@ -26,13 +26,14 @@ use space3d_replication::protocol::control::{Notice, NoticeLevel};
 use space3d_replication::protocol::handshake::DisconnectCode;
 use space3d_replication::server::handshake::SecretSource;
 use space3d_replication::server::{
-    NetInbox, NetServer, PlayerJoined, PlayerLeft, ServerReplicationPlugin, SlotState, full_state,
+    NetInbox, NetServer, PlayerJoined, PlayerLeft, PlayerResumed, ServerReplicationPlugin, SlotState, full_state,
 };
 use space3d_replication::stats::RoomNetStats;
 use space3d_replication::{MatchId, PlayerId, Replicated, RoomId, Target};
 use space3d_tasks::{Task, TaskState};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Everything needed to build a room on its shard.
@@ -168,15 +169,7 @@ pub fn after_tick(app: &mut App) {
         .checkpoint_registry()
         .and_then(|registry| space3d_scene::save_world(&app.world, &registry).ok())
         .and_then(|scene| scene.to_json().ok());
-    let cp = Checkpoint {
-        version: CHECKPOINT_VERSION,
-        room_id: rt.spec.room_id,
-        spec: rt.spec.clone(),
-        state,
-        server_only,
-        game_blob: None,
-        saved_ms: rt.env.unix.now_ms(),
-    };
+    let cp = Checkpoint::new(rt.spec.clone(), state, server_only, None, rt.env.unix.now_ms());
     rt.env.metrics.checkpoint_seconds.observe_duration(started.elapsed());
     let rt = app.resources.expect_mut::<RoomRuntime>();
     rt.last_checkpoint = Some(cp.clone());
@@ -215,15 +208,7 @@ fn emergency_checkpoint(app: &mut App) -> Option<Task<Result<(), StoreError>>> {
         .checkpoint_registry()
         .and_then(|registry| space3d_scene::save_world(&app.world, &registry).ok())
         .and_then(|scene| scene.to_json().ok());
-    let cp = Checkpoint {
-        version: CHECKPOINT_VERSION,
-        room_id: rt.spec.room_id,
-        spec: rt.spec.clone(),
-        state,
-        server_only,
-        game_blob: None,
-        saved_ms: rt.env.unix.now_ms(),
-    };
+    let cp = Checkpoint::new(rt.spec.clone(), state, server_only, None, rt.env.unix.now_ms());
     tracing::warn!(room = %cp.room_id, tick = cp.state.tick.0, "forced stop: room checkpointed locally");
     Some(store.put(cp.room_id, cp.to_bytes()))
 }
@@ -382,7 +367,12 @@ pub struct PlayerDataLoaded {
 #[derive(Clone, Debug, PartialEq)]
 enum Closing {
     Close(String),
-    Shutdown { waited: u32 },
+    Shutdown {
+        waited: u32,
+    },
+    /// A draining persistent room whose drain checkpoint reached the store: close it and let
+    /// the player service restore it elsewhere when its players rejoin.
+    Handoff,
 }
 
 /// Resource: the room's operational state (internal; inserted by [`build_room_app`]).
@@ -401,6 +391,18 @@ pub struct RoomRuntime {
     last_checkpoint: Option<Checkpoint>,
     upload: Option<Task<Result<(), StoreError>>>,
     queued_upload: Option<Checkpoint>,
+    /// Set when this runtime is dropped (room removed, crash rebuild, server killed): an
+    /// upload that has not reached the store yet is abandoned.
+    retired: Arc<AtomicBool>,
+    /// Capture time of the checkpoint being uploaded.
+    uploading_ms: Option<i64>,
+    /// Capture time of the newest checkpoint the store confirmed.
+    uploaded_ms: Option<i64>,
+    /// Draining persistent room: hand off once a checkpoint captured at or after this time
+    /// (unix ms) is stored.
+    handoff_from_ms: Option<i64>,
+    resumed: EventReader,
+    bans_seen: u64,
     ticks_since_checkpoint: u32,
     checkpoint_every: u32,
     ticks_since_status: u32,
@@ -441,6 +443,12 @@ impl RoomRuntime {
             last_checkpoint: None,
             upload: None,
             queued_upload: None,
+            retired: Arc::new(AtomicBool::new(false)),
+            uploading_ms: None,
+            uploaded_ms: None,
+            handoff_from_ms: None,
+            resumed: EventReader::default(),
+            bans_seen: u64::MAX,
             ticks_since_checkpoint: 0,
             ticks_since_status: u32::MAX / 2,
             empty_ticks: 0,
@@ -451,8 +459,10 @@ impl RoomRuntime {
     }
 
     /// Split for a crash rebuild: the command receiver and the latest in-memory checkpoint.
-    pub fn into_parts(self) -> (crossbeam_channel::Receiver<RoomCommand>, Option<Checkpoint>) {
-        (self.commands, self.last_checkpoint)
+    /// The old runtime's pending upload is abandoned (the rebuilt room, epoch + 1, uploads its
+    /// own; stores refuse older epochs anyway).
+    pub fn into_parts(mut self) -> (crossbeam_channel::Receiver<RoomCommand>, Option<Checkpoint>) {
+        (self.commands.clone(), self.last_checkpoint.take())
     }
 
     /// Current phase.
@@ -491,13 +501,18 @@ impl RoomRuntime {
         }
         let store = self.env.checkpoints.clone();
         let metrics = self.env.metrics.clone();
+        let retired = self.retired.clone();
         let room = cp.room_id;
+        self.uploading_ms = Some(cp.saved_ms);
         self.upload = Some(space3d_tasks::spawn(async move {
             let bytes = space3d_tasks::spawn_compute(move || cp.to_bytes())
                 .wait()
                 .await
                 .ok_or_else(|| StoreError("serialization task lost".into()))?;
             metrics.checkpoint_bytes.observe(bytes.len() as f64);
+            if retired.load(Ordering::Acquire) {
+                return Err(StoreError("room retired before the upload".into()));
+            }
             store
                 .put(room, bytes)
                 .wait()
@@ -510,14 +525,26 @@ impl RoomRuntime {
         let Some(task) = &mut self.upload else {
             return;
         };
-        match task.state() {
+        let ok = match task.state() {
             TaskState::Pending => return,
-            TaskState::Ready => {
-                if let Some(Err(e)) = task.poll() {
+            TaskState::Ready => match task.poll() {
+                Some(Err(e)) => {
                     tracing::warn!(room = %self.spec.room_id, error = %e, "checkpoint upload failed");
+                    false
                 }
+                _ => true,
+            },
+            TaskState::Cancelled => {
+                tracing::warn!(room = %self.spec.room_id, "checkpoint upload cancelled");
+                false
             }
-            TaskState::Cancelled => tracing::warn!(room = %self.spec.room_id, "checkpoint upload cancelled"),
+        };
+        let saved = self.uploading_ms.take();
+        if ok {
+            self.uploaded_ms = self.uploaded_ms.max(saved);
+        } else if self.handoff_from_ms.is_some() && self.queued_upload.is_none() {
+            // The handoff needs a stored checkpoint: try again in a second.
+            self.ticks_since_checkpoint = self.checkpoint_every.saturating_sub(self.ticks_per_second);
         }
         self.upload = None;
         if let Some(next) = self.queued_upload.take() {
@@ -539,6 +566,12 @@ impl RoomRuntime {
         if self.env.uplink.try_send((self.spec.room_id, msg)).is_err() {
             tracing::debug!(room = %self.spec.room_id, "uplink full; presence update dropped");
         }
+    }
+}
+
+impl Drop for RoomRuntime {
+    fn drop(&mut self) {
+        self.retired.store(true, Ordering::Release);
     }
 }
 
@@ -573,10 +606,13 @@ fn apply_command(
 ) {
     match cmd {
         RoomCommand::Kick { player, reason } => {
+            // Sent to every room of the server (a player may hold slots in several rooms).
             // Counted in `space3d_disconnects_total{reason="kicked"}` from the room stats.
-            res.expect_mut::<NetServer>()
-                .kick(player, DisconnectCode::Kicked, &reason, false);
-            tracing::info!(event = "kick", room = %rt.spec.room_id, %player, %reason, "player kicked");
+            let net = res.expect_mut::<NetServer>();
+            if net.clients().iter().any(|c| c.identity.player == player) {
+                net.kick(player, DisconnectCode::Kicked, &reason, false);
+                tracing::info!(event = "kick", room = %rt.spec.room_id, %player, %reason, "player kicked");
+            }
         }
         RoomCommand::Broadcast { text, level } => {
             res.expect_mut::<NetServer>()
@@ -599,10 +635,13 @@ fn apply_command(
             let net = res.expect_mut::<NetServer>();
             net.set_joinable(false);
             net.notice(Target::All, Notice::ShuttingDown { in_ms });
-            if rt.spec.persistent {
-                // Persistent worlds move: checkpoint now, clients rejoin via the player service
-                // (which restores the room on another server).
+            if rt.spec.persistent && rt.env.checkpoints.enabled() {
+                // Persistent worlds move: checkpoint now; once that checkpoint is stored the room
+                // closes (`Disconnect(ServerShutdown)`, `RoomClosed { restorable }`) and its
+                // players' rejoin restores it on another server from exactly that state. Until
+                // then it keeps running here (a rejoin in the meantime comes back to it).
                 net.notice(Target::All, Notice::Reconnect);
+                rt.handoff_from_ms.get_or_insert(rt.env.unix.now_ms());
                 rt.request_checkpoint();
             }
             rt.set_phase(RoomPhase::Ending);
@@ -659,8 +698,15 @@ fn room_ops(ctx: &mut SystemCtx) {
             return;
         }
         forward_requests(res, rt);
-        presence(res, rt);
+        let arrived = presence(res, rt);
+        enforce_bans(res, rt, arrived);
         rt.poll_upload();
+        if rt.closing.is_none()
+            && let Some(from) = rt.handoff_from_ms
+            && rt.uploaded_ms.is_some_and(|saved| saved >= from)
+        {
+            rt.closing = Some(Closing::Handoff);
+        }
         if rt.env.checkpoints.enabled() {
             rt.ticks_since_checkpoint = rt.ticks_since_checkpoint.saturating_add(1);
             if rt.ticks_since_checkpoint >= rt.checkpoint_every {
@@ -757,10 +803,15 @@ fn forward_requests(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     }
 }
 
-fn presence(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
+/// Players who joined or resumed this tick (the ban check looks at them).
+fn presence(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) -> Vec<PlayerId> {
     let mut joined = Vec::new();
     if let Some(events) = res.get::<Events<PlayerJoined>>() {
         joined.extend(rt.joined.read(events).map(|e| e.identity.player));
+    }
+    let mut arrived = joined.clone();
+    if let Some(events) = res.get::<Events<PlayerResumed>>() {
+        arrived.extend(rt.resumed.read(events).map(|e| e.player));
     }
     let mut left = Vec::new();
     if let Some(events) = res.get::<Events<PlayerLeft>>() {
@@ -776,6 +827,34 @@ fn presence(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     for player in left {
         rt.uplink(FleetUp::PlayerLeft { room_id, player });
     }
+    arrived
+}
+
+/// Account bans inside the room: players who (re)joined this tick — tickets are checked by the
+/// gatekeeper, but resumes and supersedes are verified by the room alone — and, whenever the
+/// ban list changed, everyone holding a slot (a ban reaches every room the player is in).
+fn enforce_bans(res: &mut space3d_core::Resources, rt: &mut RoomRuntime, arrived: Vec<PlayerId>) {
+    let Some(bans) = rt.env.bans.clone() else {
+        return;
+    };
+    let generation = bans.generation();
+    let net = res.expect_mut::<NetServer>();
+    let check: Vec<PlayerId> = if generation != rt.bans_seen {
+        rt.bans_seen = generation;
+        net.clients().iter().map(|c| c.identity.player).collect()
+    } else {
+        arrived
+    };
+    if check.is_empty() {
+        return;
+    }
+    let now = rt.env.unix.now_ms();
+    for player in check {
+        if let Some(ban) = bans.player(player, now) {
+            net.kick(player, DisconnectCode::Banned, &ban.reason, false);
+            tracing::info!(event = "ban_enforced", room = %rt.spec.room_id, %player, "banned player removed from room");
+        }
+    }
 }
 
 /// Ticks a shutting-down room waits for its final checkpoint upload.
@@ -785,6 +864,8 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     let Some(closing) = rt.closing.clone() else {
         return;
     };
+    // `keep_checkpoint`: the stored checkpoint stays and the player service keeps the room
+    // restorable (players' rejoin restores it on another server).
     let (code, reason, keep_checkpoint) = match closing {
         Closing::Close(reason) => (DisconnectCode::RoomClosed, reason, false),
         Closing::Shutdown { waited } => {
@@ -795,14 +876,32 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
             }
             (DisconnectCode::ServerShutdown, "server shutting down".to_owned(), true)
         }
+        Closing::Handoff => (
+            DisconnectCode::ServerShutdown,
+            "room moved to another server; rejoin".to_owned(),
+            true,
+        ),
     };
     res.expect_mut::<NetServer>().disconnect_all(code, &reason, false);
     if !keep_checkpoint && rt.env.checkpoints.enabled() {
-        drop(rt.env.checkpoints.delete(rt.spec.room_id));
+        // Delete after the in-flight upload settles (a later upload would resurrect the row).
+        rt.queued_upload = None;
+        let upload = rt.upload.take();
+        let delete_store = rt.env.checkpoints.clone();
+        let room = rt.spec.room_id;
+        drop(space3d_tasks::spawn(async move {
+            if let Some(upload) = upload {
+                let _ = upload.wait().await;
+            }
+            if let Some(Err(e)) = delete_store.delete(room).wait().await {
+                tracing::warn!(%room, error = %e, "checkpoint delete failed");
+            }
+        }));
     }
     rt.uplink(FleetUp::RoomClosed {
         room_id: rt.spec.room_id,
         reason: reason.clone(),
+        restorable: keep_checkpoint && rt.env.checkpoints.enabled(),
     });
     tracing::info!(room = %rt.spec.room_id, %reason, "room closed");
     rt.phase = RoomPhase::Closed;

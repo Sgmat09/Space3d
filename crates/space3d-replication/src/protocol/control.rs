@@ -61,7 +61,12 @@ pub enum Notice {
         /// Milliseconds until disconnect.
         in_ms: u32,
     },
-    /// The room restarted from a checkpoint; resume (or rejoin via the player service).
+    /// The room is moving to another server (a persistent room on a draining server). It keeps
+    /// running here until its state is saved, then the link ends with
+    /// `Disconnect(ServerShutdown)`: rejoin through the player service
+    /// (`POST /v1/sessions/rejoin`), which restores the room elsewhere from that state. A
+    /// warning only — `NetClient` surfaces it as `ConnectionEvent::Notice`; reacting to the
+    /// disconnect (as the example client does) is enough.
     Reconnect,
     /// The match ended.
     MatchEnded,

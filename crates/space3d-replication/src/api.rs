@@ -238,16 +238,14 @@ pub struct QuickPlayRequest {
     pub schema_hash: u64,
 }
 
-/// `POST /v1/lobbies`.
+/// `POST /v1/lobbies`. Lobbies are joined by code only (no lobby browser); a host has one
+/// open lobby at a time (creating another closes the previous one).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateLobbyRequest {
     /// Game mode.
     pub mode: String,
     /// Capacity.
     pub max_players: u16,
-    /// Hidden from the lobby browser.
-    #[serde(default)]
-    pub private: bool,
     /// Game build of the client: only game servers registered with this `game_id` host its
     /// room (empty = any).
     #[serde(default, skip_serializing_if = "String::is_empty")]

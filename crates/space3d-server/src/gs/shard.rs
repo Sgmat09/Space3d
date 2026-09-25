@@ -75,6 +75,66 @@ pub const MAX_CRASHES: usize = 3;
 /// See [`MAX_CRASHES`].
 pub const CRASH_WINDOW: Duration = Duration::from_secs(300);
 
+/// Crash-loop bookkeeping of one room (shared by the shard threads and `TestCluster`, so both
+/// close a crash-looping room the same way).
+#[derive(Clone, Debug, Default)]
+pub struct CrashGuard {
+    crashes: VecDeque<Duration>,
+}
+
+impl CrashGuard {
+    /// Record a crash at monotonic time `now`; `true` = the room is crash-looping
+    /// ([`MAX_CRASHES`] within [`CRASH_WINDOW`]) and must be closed.
+    pub fn record(&mut self, now: Duration) -> bool {
+        self.crashes.push_back(now);
+        while self
+            .crashes
+            .front()
+            .is_some_and(|t| now.saturating_sub(*t) > CRASH_WINDOW)
+        {
+            self.crashes.pop_front();
+        }
+        self.crashes.len() >= MAX_CRASHES
+    }
+}
+
+/// A room's tick panicked: count it, then rebuild the room from its latest in-memory
+/// checkpoint (epoch + 1, [`rebuild_crashed`]) — unless it is crash-looping, in which case its
+/// clients get `Disconnect(RoomCrashed)` and the room closes (`RoomClosed` to the fleet).
+/// Returns `false` when the room is gone.
+#[allow(clippy::too_many_arguments)]
+pub fn recover_crashed(
+    app: &mut App,
+    spec: &RoomSpec,
+    env: &RoomEnv,
+    status: &Arc<Mutex<RoomStatus>>,
+    created_ms: i64,
+    guard: &mut CrashGuard,
+    now: Duration,
+    why: &str,
+) -> bool {
+    env.metrics.room_crashes.inc();
+    tracing::error!(room = %spec.room_id, panic = %why, "room tick panicked");
+    status.lock().phase = RoomPhase::Crashed;
+    if guard.record(now) {
+        tracing::error!(room = %spec.room_id, "room crash loop; closing");
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(net) = app.resources.get_mut::<NetServer>() {
+                net.disconnect_all(DisconnectCode::RoomCrashed, "room closed", false);
+            }
+        }));
+        close_status(status, env, spec.room_id, "crash loop");
+        return false;
+    }
+    match rebuild_crashed(app, spec, env, status, created_ms) {
+        Ok(()) => true,
+        Err(why) => {
+            close_status(status, env, spec.room_id, &why);
+            false
+        }
+    }
+}
+
 /// Default shard count: `available_parallelism − 1`, at least 1.
 pub fn default_shards() -> usize {
     std::thread::available_parallelism()
@@ -86,8 +146,11 @@ pub fn default_shards() -> usize {
 impl ShardPool {
     /// Start `n` shard threads (`space3d-shard-N`).
     pub fn start(n: usize, health: &HealthState, metrics: GameServerMetrics, max_catchup_ticks: u32) -> Self {
+        // Shard threads log inside the caller's span (the process span: server_id, role).
+        let parent = tracing::Span::current();
         let shards = (0..n.max(1))
             .map(|i| {
+                let parent = parent.clone();
                 let (tx, rx) = crossbeam_channel::unbounded();
                 let load = Arc::new(AtomicU64::new(0));
                 let rooms = Arc::new(AtomicUsize::new(0));
@@ -109,7 +172,10 @@ impl ShardPool {
                 };
                 let thread = std::thread::Builder::new()
                     .name(format!("space3d-shard-{i}"))
-                    .spawn(move || shard.run())
+                    .spawn(move || {
+                        let _span = parent.enter();
+                        shard.run();
+                    })
                     .expect("spawn shard thread");
                 ShardHandle {
                     commands: tx,
@@ -197,7 +263,10 @@ struct Hosted {
     env: RoomEnv,
     created_ms: i64,
     epoch: u32,
-    crashes: VecDeque<Instant>,
+    crashes: CrashGuard,
+    hosted_at: Instant,
+    /// `room` span (room_id, epoch, tick) every tick of this room runs in.
+    span: tracing::Span,
     tick_us: Vec<u32>,
     window_start: Instant,
     cost_us: f64,
@@ -220,6 +289,7 @@ fn close_status(status: &Arc<Mutex<RoomStatus>>, env: &RoomEnv, id: RoomId, reas
         FleetUp::RoomClosed {
             room_id: id,
             reason: reason.to_owned(),
+            restorable: false,
         },
     ));
 }
@@ -294,9 +364,11 @@ fn host(build: RoomBuild) -> Option<Hosted> {
     match catch_unwind(AssertUnwindSafe(|| build_room_app(build))) {
         Ok(Ok(app)) => {
             let step = app.resources.expect::<TickRate>().step();
+            let epoch = epoch_of(&app);
             Some(Hosted {
                 id,
-                epoch: epoch_of(&app),
+                epoch,
+                span: tracing::error_span!("room", room_id = %id, epoch, tick = tracing::field::Empty),
                 app,
                 step,
                 next_at: Instant::now(),
@@ -304,7 +376,8 @@ fn host(build: RoomBuild) -> Option<Hosted> {
                 spec,
                 env,
                 created_ms,
-                crashes: VecDeque::new(),
+                crashes: CrashGuard::default(),
+                hosted_at: Instant::now(),
                 tick_us: Vec::with_capacity(128),
                 window_start: Instant::now(),
                 cost_us: 0.0,
@@ -326,39 +399,22 @@ fn host(build: RoomBuild) -> Option<Hosted> {
 impl Hosted {
     /// A tick panicked: rebuild from the last in-memory checkpoint (epoch + 1) unless the room
     /// is crash-looping. Returns `false` when the room is gone.
-    fn recover(&mut self, metrics: &GameServerMetrics, why: &str) -> bool {
-        metrics.room_crashes.inc();
-        tracing::error!(room = %self.id, panic = %why, "room tick panicked");
-        self.status.lock().phase = RoomPhase::Crashed;
-        let now = Instant::now();
-        self.crashes.push_back(now);
-        while self
-            .crashes
-            .front()
-            .is_some_and(|t| now.duration_since(*t) > CRASH_WINDOW)
-        {
-            self.crashes.pop_front();
+    fn recover(&mut self, why: &str) -> bool {
+        let alive = recover_crashed(
+            &mut self.app,
+            &self.spec,
+            &self.env,
+            &self.status,
+            self.created_ms,
+            &mut self.crashes,
+            self.hosted_at.elapsed(),
+            why,
+        );
+        if alive {
+            self.epoch = epoch_of(&self.app);
+            self.span.record("epoch", self.epoch);
         }
-        if self.crashes.len() >= MAX_CRASHES {
-            tracing::error!(room = %self.id, "room crash loop; closing");
-            let _ = catch_unwind(AssertUnwindSafe(|| {
-                if let Some(net) = self.app.resources.get_mut::<NetServer>() {
-                    net.disconnect_all(DisconnectCode::RoomCrashed, "room closed", false);
-                }
-            }));
-            close_status(&self.status, &self.env, self.id, "crash loop");
-            return false;
-        }
-        match rebuild_crashed(&mut self.app, &self.spec, &self.env, &self.status, self.created_ms) {
-            Ok(()) => {
-                self.epoch = epoch_of(&self.app);
-                true
-            }
-            Err(why) => {
-                close_status(&self.status, &self.env, self.id, &why);
-                false
-            }
-        }
+        alive
     }
 
     fn closed(&self) -> bool {
@@ -479,9 +535,14 @@ impl Shard {
         let mut i = 0;
         while i < rooms.len() {
             let room = &mut rooms[i];
+            let span = room.span.clone();
+            let _span = span.enter();
             let mut rounds = 0;
             let mut alive = true;
             while Instant::now() >= room.next_at && rounds < self.max_catchup {
+                if let Some(net) = room.app.resources.get::<NetServer>() {
+                    room.span.record("tick", net.tick().0);
+                }
                 let started = Instant::now();
                 let result = run_tick_guarded(&mut room.app, room.step);
                 let us = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
@@ -490,7 +551,7 @@ impl Shard {
                 match result {
                     Ok(()) => room.observe(us, metrics),
                     Err(why) => {
-                        alive = room.recover(metrics, &why);
+                        alive = room.recover(&why);
                         break;
                     }
                 }

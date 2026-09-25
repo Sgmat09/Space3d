@@ -40,10 +40,13 @@ pub(crate) fn client_interpolate(ctx: &mut SystemCtx) {
                 let hz = f64::from(welcome.tick_hz.max(1));
                 // Snapshots describe the server as it was one trip ago: the jitter-buffer delay
                 // is applied to the newest tick that can have arrived, not to the server's now.
-                let arrived = est - conn.rtt.srtt().as_secs_f64() / 2.0 * hz;
+                // Stall-resistant RTT / jitter: a head-of-line stall must not pull the render
+                // clock back or balloon the delay.
+                let rtt = conn.clock.path_rtt().unwrap_or_else(|| conn.rtt.srtt());
+                let arrived = est - rtt.as_secs_f64() / 2.0 * hz;
                 let render = net
                     .interp
-                    .update(frame_dt, arrived, conn.rtt.rttvar(), hz, welcome.send_interval);
+                    .update(frame_dt, arrived, conn.clock.jitter(), hz, welcome.send_interval);
                 let max_ext = net.interp.max_extrapolation_ticks(hz);
                 for entry in registry.components() {
                     match entry.mode {

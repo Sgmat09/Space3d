@@ -50,6 +50,8 @@ pub struct ServerRecord {
     /// Players present in its rooms per `PlayerJoined` / `PlayerLeft` (ahead of the next
     /// heartbeat's count, which lags by up to one heartbeat interval).
     pub present: u32,
+    /// Sent `Deregister`: dead until it registers again (late heartbeats do not revive it).
+    pub left: bool,
 }
 
 impl ServerRecord {
@@ -154,6 +156,9 @@ struct Reservation {
     room: Option<RoomId>,
     seats: u32,
     expires_ms: i64,
+    /// The one player a quick-play / rejoin seat was reserved for (a player holds at most
+    /// one such reservation: a new one releases the previous).
+    holder: Option<PlayerId>,
 }
 
 /// Tick budget used in the load score (60 Hz).
@@ -239,6 +244,7 @@ impl FleetRegistry {
                         state: ServerState::Ready,
                         reserved: 0,
                         present: 0,
+                        left: false,
                     },
                 );
                 self.recount_reserved();
@@ -251,7 +257,7 @@ impl FleetRegistry {
                 }]
             }
             FleetUp::Heartbeat(hb) => {
-                let Some(rec) = self.servers.get_mut(server_id) else {
+                let Some(rec) = self.servers.get_mut(server_id).filter(|r| !r.left) else {
                     return Vec::new();
                 };
                 rec.last_seen_ms = now_ms;
@@ -278,12 +284,20 @@ impl FleetRegistry {
                         self.presence.insert(*p, status.room_id);
                     }
                 }
-                // Rooms this server reported before but not now are gone.
+                // Rooms this server reported before but not now are gone — except on a draining
+                // server, where a room may vanish from the heartbeat just before its
+                // `RoomClosed { restorable: true }` (handoff) arrives on the same link: those
+                // are settled by that message (or by the lease when the server exits).
+                let draining = hb.draining;
                 let gone: Vec<RoomId> = self
                     .rooms
                     .iter()
                     .filter(|(id, e)| {
-                        e.server == server_id && e.status.is_some() && !e.orphaned && !reported.contains(id)
+                        !draining
+                            && e.server == server_id
+                            && e.status.is_some()
+                            && !e.orphaned
+                            && !reported.contains(id)
                     })
                     .map(|(id, _)| *id)
                     .collect();
@@ -315,11 +329,32 @@ impl FleetRegistry {
                 entry.orphaned = false;
                 Vec::new()
             }
-            FleetUp::RoomClosed { room_id, .. } => {
+            FleetUp::RoomClosed {
+                room_id, restorable, ..
+            } => {
                 if self.rooms.get(&room_id).is_some_and(|e| e.server == server_id) {
-                    self.forget_room(room_id);
+                    if restorable {
+                        // Handed off (drain) with a fresh checkpoint: keep presence and spec;
+                        // the players' rejoin restores the room on another server.
+                        if let Some(e) = self.rooms.get_mut(&room_id) {
+                            e.orphaned = true;
+                            e.status = None;
+                            e.since_ms = now_ms;
+                        }
+                        self.reservations.retain(|r| r.room != Some(room_id));
+                        self.recount_reserved();
+                    } else {
+                        self.forget_room(room_id);
+                    }
                 }
                 Vec::new()
+            }
+            FleetUp::Deregister { reason } => {
+                tracing::info!(server = %server_id, %reason, "game server deregistered");
+                if let Some(rec) = self.servers.get_mut(server_id) {
+                    rec.left = true;
+                }
+                self.kill_server(server_id, now_ms).into_iter().collect()
             }
             FleetUp::PlayerJoined { room_id, player } => {
                 // A rejoin (resume / new link) is not a new seat.
@@ -377,6 +412,24 @@ impl FleetRegistry {
         self.recount_reserved();
     }
 
+    /// Server `id` is gone (lease expired or deregistered): orphan its rooms (rejoin restores
+    /// them elsewhere) and drop its reservations.
+    fn kill_server(&mut self, id: &str, now_ms: i64) -> Option<FleetEffect> {
+        let s = self.servers.get_mut(id)?;
+        s.state = ServerState::Dead;
+        s.heartbeat.players = 0;
+        s.heartbeat.draining = false;
+        let mut orphaned = Vec::new();
+        for (room, e) in self.rooms.iter_mut().filter(|(_, e)| e.server == id && !e.orphaned) {
+            e.orphaned = true;
+            e.since_ms = now_ms;
+            orphaned.push(*room);
+        }
+        self.reservations.retain(|r| r.server != id);
+        self.recount_reserved();
+        (!orphaned.is_empty()).then_some(FleetEffect::Orphaned { rooms: orphaned })
+    }
+
     /// Expire leases, reservations and stale pending/orphaned rooms; returns effects for dead
     /// servers.
     pub fn sweep(&mut self, now_ms: i64, lease_ttl_ms: i64) -> Vec<FleetEffect> {
@@ -388,21 +441,8 @@ impl FleetRegistry {
             .map(|(id, _)| id.clone())
             .collect();
         for id in dead {
-            if let Some(s) = self.servers.get_mut(&id) {
-                s.state = ServerState::Dead;
-                s.heartbeat.players = 0;
-            }
-            let mut orphaned = Vec::new();
-            for (room, e) in self.rooms.iter_mut().filter(|(_, e)| e.server == id && !e.orphaned) {
-                e.orphaned = true;
-                e.since_ms = now_ms;
-                orphaned.push(*room);
-            }
-            self.reservations.retain(|r| r.server != id);
-            tracing::warn!(server = %id, rooms = orphaned.len(), "game server lease expired");
-            if !orphaned.is_empty() {
-                effects.push(FleetEffect::Orphaned { rooms: orphaned });
-            }
+            tracing::warn!(server = %id, "game server lease expired");
+            effects.extend(self.kill_server(&id, now_ms));
         }
         let before = self.reservations.len();
         self.reservations.retain(|r| r.expires_ms > now_ms);
@@ -440,11 +480,47 @@ impl FleetRegistry {
         now_ms: i64,
         reserve_ms: i64,
     ) -> Option<ServerRecord> {
-        let build = Build::new(game_id, schema_hash);
+        self.allocate_mode(region, &Build::new(game_id, schema_hash), "", seats, now_ms, reserve_ms)
+    }
+
+    /// Whether a server hosts rooms of `mode` (it listed the mode at registration, or listed
+    /// none). An empty `mode` matches every server.
+    pub fn hosts_mode(s: &ServerRecord, mode: &str) -> bool {
+        mode.is_empty() || s.registration.modes.is_empty() || s.registration.modes.iter().any(|m| m == mode)
+    }
+
+    /// Whether `mode` is unknown to the fleet: allocatable servers of `build` exist and none of
+    /// them hosts `mode`. (No server at all is a capacity problem, not an unknown mode.)
+    pub fn mode_unknown(&self, build: &Build, mode: &str) -> bool {
+        let mut any = false;
+        for s in self
+            .servers
+            .values()
+            .filter(|s| s.allocatable() && build.accepts(&s.registration))
+        {
+            if Self::hosts_mode(s, mode) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+
+    /// [`Self::allocate`] on servers that host `mode` (see [`Self::hosts_mode`]).
+    pub fn allocate_mode(
+        &mut self,
+        region: &str,
+        build: &Build,
+        mode: &str,
+        seats: u32,
+        now_ms: i64,
+        reserve_ms: i64,
+    ) -> Option<ServerRecord> {
         let fits = |s: &ServerRecord, any_region: bool| {
             s.allocatable()
                 && (any_region || region.is_empty() || s.registration.region == region)
                 && build.accepts(&s.registration)
+                && Self::hosts_mode(s, mode)
                 && s.free_seats() >= seats
                 && (s.registration.capacity.max_rooms == 0
                     || (s.heartbeat.rooms.len() as u32) < s.registration.capacity.max_rooms)
@@ -466,6 +542,7 @@ impl FleetRegistry {
             room: None,
             seats,
             expires_ms: now_ms + reserve_ms,
+            holder: None,
         });
         self.recount_reserved();
         self.servers.get(&id).cloned()
@@ -557,9 +634,32 @@ impl FleetRegistry {
             room: Some(best.1),
             seats,
             expires_ms: now_ms + reserve_ms,
+            holder: None,
         });
         self.recount_reserved();
         Some((self.servers.get(&entry.server)?.clone(), entry.spec?))
+    }
+
+    /// The reservation made last (by [`Self::allocate`] / [`Self::open_room_for`]) is
+    /// `player`'s: every other reservation `player` holds is released, so one account holds
+    /// at most one unused quick-play / rejoin seat however often it asks.
+    pub fn hold_last_reservation(&mut self, player: PlayerId) {
+        let Some(last) = self.reservations.len().checked_sub(1) else {
+            return;
+        };
+        self.reservations[last].holder = Some(player);
+        let mut i = 0;
+        self.reservations.retain(|r| {
+            let keep = i == last || r.holder != Some(player);
+            i += 1;
+            keep
+        });
+        self.recount_reserved();
+    }
+
+    /// Reservations held by `player` (see [`Self::hold_last_reservation`]).
+    pub fn reservations_of(&self, player: PlayerId) -> usize {
+        self.reservations.iter().filter(|r| r.holder == Some(player)).count()
     }
 
     /// Move an orphaned room to a new server (rejoin → restore); the caller issues tickets.
@@ -634,6 +734,7 @@ mod tests {
                 max_rooms: 10,
                 max_players: cap,
             },
+            modes: Vec::new(),
         })
     }
 
@@ -947,6 +1048,7 @@ mod tests {
             FleetUp::RoomClosed {
                 room_id: RoomId(1),
                 reason: "done".into(),
+                restorable: false,
             },
             23,
         );

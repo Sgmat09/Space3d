@@ -308,6 +308,10 @@ pub struct NetClient {
     pub(crate) out_unreliable: Vec<(crate::protocol::ChannelId, Vec<u8>)>,
     /// Per-entity replication metadata.
     pub(crate) metas: crate::FastMap<NetId, receive::EntityMeta>,
+    /// Despawned `NetId` → snapshot tick of the despawn. A record older than that (a reordered
+    /// or duplicated datagram) must not recreate the entity; `NetId`s are never reused within
+    /// an epoch, so a later spawn (re-entering scope) still applies.
+    pub(crate) tombstones: crate::FastMap<NetId, Tick>,
     /// Entities to despawn in `Last`.
     pub(crate) despawn_queue: Vec<Entity>,
     /// After a resume: `NetId`s re-confirmed since (the rest is dropped at `SYNC_COMPLETE`).
@@ -361,6 +365,7 @@ impl NetClient {
             out_reliable: Vec::new(),
             out_unreliable: Vec::new(),
             metas: Default::default(),
+            tombstones: Default::default(),
             despawn_queue: Vec::new(),
             reset_seen: None,
             pending_refs: Default::default(),
@@ -464,6 +469,44 @@ impl NetClient {
         self.conn.as_ref()?.welcome.as_ref().map(|w| w.room)
     }
 
+    /// Tick of the newest snapshot record applied to replicated entity `id` (diagnostics:
+    /// how often an entity is updated under the byte budget).
+    pub fn last_applied(&self, id: NetId) -> Option<Tick> {
+        self.metas.get(&id).map(|m| m.last_applied)
+    }
+
+    /// Ask the server for a different downstream budget (`ControlMsg::SetRate`; the server
+    /// clamps it to `[4096, client_bandwidth_max]`). Fails when not connected.
+    pub fn set_rate(&mut self, max_down_bytes_per_sec: u32) -> Result<(), crate::transport::TransportError> {
+        self.queue_control(&crate::protocol::control::ControlMsg::SetRate { max_down_bytes_per_sec })
+    }
+
+    /// Add an interest centre (a free camera) for spatial rooms (`ControlMsg::InterestHint`;
+    /// the server clamps the radius to 1000 m). Fails when not connected.
+    pub fn set_interest_hint(
+        &mut self,
+        center: space3d_core::glam::Vec3,
+        radius: f32,
+    ) -> Result<(), crate::transport::TransportError> {
+        self.queue_control(&crate::protocol::control::ControlMsg::InterestHint {
+            center: center.to_array(),
+            radius,
+        })
+    }
+
+    fn queue_control(
+        &mut self,
+        msg: &crate::protocol::control::ControlMsg,
+    ) -> Result<(), crate::transport::TransportError> {
+        use crate::transport::TransportError;
+        if !matches!(self.state, ConnectionState::Syncing | ConnectionState::Connected) {
+            return Err(TransportError::Closed);
+        }
+        let bytes = postcard::to_stdvec(msg).map_err(|_| TransportError::Unsupported("control encode"))?;
+        self.out_reliable.push((crate::protocol::ChannelId::Control, bytes));
+        Ok(())
+    }
+
     /// Queue a client command (`Events<FromClient<M>>` on the server). Fails when not
     /// connected, when `M` is not registered `ClientToServer`/`Both`, or over its size cap.
     pub fn send<M: NetMessage>(&mut self, msg: &M) -> Result<(), crate::transport::TransportError> {
@@ -561,6 +604,7 @@ impl NetClient {
                 }
             }
             self.metas.clear();
+            self.tombstones.clear();
             self.pending_refs.entries.clear();
         }
         self.reset_seen = None;

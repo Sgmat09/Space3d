@@ -25,6 +25,7 @@ empty_room_ttl = "30s"
 # 20/min, on a public server).
 max_connections_per_ip = 512
 handshakes_per_ip_per_min = 2400
+http_connections_per_ip = 1024
 
 [player_service]
 bind = "127.0.0.1:7777"     # same listener as /play: equal binds share one HTTP server

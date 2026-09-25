@@ -413,6 +413,10 @@ fn apply_snapshot(
                 if rec.op & op::SPAWN == 0 {
                     continue; // delta for an entity we never saw (reordered datagram)
                 }
+                if net.tombstones.get(&rec.net_id).is_some_and(|t| *t >= tick) {
+                    continue; // spawn older than a despawn we already applied (reordered datagram)
+                }
+                net.tombstones.remove(&rec.net_id);
                 let e = world.spawn((NetEntity(rec.net_id), Remote));
                 net.map.insert(rec.net_id, e);
                 net.metas.insert(rec.net_id, EntityMeta::default());
@@ -526,14 +530,25 @@ fn apply_snapshot(
         }
     }
     for d in &view.despawns {
-        let Some(e) = net.map.entity(d.net_id) else { continue };
+        let Some(e) = net.map.entity(d.net_id) else {
+            // Despawn overtook the spawn (reordered datagrams): remember it, so the late spawn
+            // does not create an entity nobody will ever despawn.
+            let t = net.tombstones.entry(d.net_id).or_insert(tick);
+            *t = (*t).max(tick);
+            continue;
+        };
         if net.metas.get(&d.net_id).is_some_and(|m| m.last_applied > tick) {
             continue; // respawned after this (reordered) packet
         }
-        despawn_remote(net, d.net_id, e, d.out_of_scope);
+        despawn_remote(net, d.net_id, e, d.out_of_scope, tick);
     }
     if tick > net.last_snapshot_tick {
         net.last_snapshot_tick = tick;
+        // Reordering spans well under a second; keep tombstones for TOMBSTONE_SECS.
+        let keep = (net.prediction.nominal_hz.max(1.0) * TOMBSTONE_SECS) as u32;
+        if !net.tombstones.is_empty() {
+            net.tombstones.retain(|_, t| tick.0.saturating_sub(t.0) <= keep);
+        }
     }
     if header.flags & sflags::SYNC_COMPLETE != 0 {
         if let Some(seen) = net.reset_seen.take() {
@@ -541,7 +556,7 @@ fn apply_snapshot(
                 if !seen.contains_key(&id)
                     && let Some(e) = net.map.entity(id)
                 {
-                    despawn_remote(net, id, e, false);
+                    despawn_remote(net, id, e, false, tick);
                 }
             }
         }
@@ -553,7 +568,12 @@ fn apply_snapshot(
     retry_pending(net, registry, world, tick);
 }
 
-fn despawn_remote(net: &mut NetClient, id: NetId, e: Entity, out_of_scope: bool) {
+/// How long a despawned `NetId` is remembered (reordered / duplicated spawn records older than
+/// the despawn are ignored meanwhile).
+const TOMBSTONE_SECS: f64 = 30.0;
+
+fn despawn_remote(net: &mut NetClient, id: NetId, e: Entity, out_of_scope: bool, tick: Tick) {
+    net.tombstones.insert(id, tick);
     net.map.remove(id);
     net.metas.remove(&id);
     net.prediction.forget(id);
