@@ -670,9 +670,12 @@ pub fn scenario_world(h: &mut Harness) {
     );
 }
 
+/// A protocol scenario.
+pub type Scenario = fn(&mut Harness);
+
 /// Every scenario, in order.
 pub fn run_all(backend: impl Fn() -> Box<dyn AiBackend>) {
-    let scenarios: [(&str, fn(&mut Harness)); 8] = [
+    let scenarios: [(&str, Scenario); 8] = [
         ("core", scenario_core),
         ("session tool round trip", scenario_session_tool_round_trip),
         ("tool errors and timeouts", scenario_tool_errors_and_timeouts),
