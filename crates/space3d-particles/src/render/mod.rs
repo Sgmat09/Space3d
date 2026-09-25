@@ -4,11 +4,14 @@
 //!   Distortion @100]`. Soft particles therefore draw in the view's SceneRead pass (§1.6), after
 //!   the built-in blended meshes, as one slot, so their own back-to-front order is never split.
 //! * `prepare` (once per frame, inside `render_frame`): replay the pending ticks of the tick log
-//!   (CPU backend), pack the render instances, cull and sort the draws of every camera view, and
-//!   upload what changed through the renderer's staging ring. A frame without new ticks, local
-//!   layers or extrapolation uploads nothing.
+//!   — with compute kernels recorded into the frame's encoder (GPU backend, `crate::gpu`) or in
+//!   Rust (CPU backend, `crate::cpu`) — build the render instances (GPU compaction or CPU pack),
+//!   cull and sort the draws of every camera view, and upload what changed through the
+//!   renderer's staging ring. A frame without new ticks, local layers or extrapolation uploads
+//!   nothing.
 //! * `draw`: bind groups 0 (view) and 1 (scene depth) of the frame, group 2 (LUT, per-view
-//!   flags, per-layer draw parameters), one instanced strip per draw item.
+//!   flags, per-layer draw parameters), one instanced strip per draw item (an indirect draw on
+//!   the GPU backend, its instance count written by the compaction).
 //! * Pipelines per `PassTarget`, built in `prewarm` (WebGL2 links programs at creation). The
 //!   shader reads scene depth according to `PassTarget::depth_access`: the hardware test plus
 //!   `s3d_soft_fade` with a read-only attachment, a manual `s3d_scene_occluded` test plus the
@@ -21,9 +24,10 @@ mod layers;
 
 pub(crate) use layers::RenderLayers;
 
-use crate::cpu::{CpuSim, INSTANCE_SIZE, PackInput, PackItem, ParticleInstance, pack};
-use crate::runtime::ParticleRuntime;
-use crate::{ParticleBackend, ParticleEffects, ParticleSettings, ParticleStats};
+use crate::cpu::{CpuSim, DIRECT, INSTANCE_SIZE, PackInput, PackItem, Particle, ParticleInstance, pack};
+use crate::gpu::{GpuInput, GpuSim, PARTICLE_SIZE};
+use crate::runtime::{ParticleRuntime, Runtime};
+use crate::{ParticleBackend, ParticleEffects, ParticleSettings, ParticleStats, resolve_backend};
 use layers::GpuDrawParams;
 use space3d_core::glam::{Quat, Vec3};
 use space3d_core::{Entity, GlobalTransform, Time};
@@ -239,11 +243,31 @@ fn ensure_buffer(
     true
 }
 
+/// Render pose (position, rotation) of every effect instance: its entity's `GlobalTransform`
+/// while attached, else its last emitter pose.
+fn update_poses(poses: &mut Vec<(Vec3, Quat)>, rt: &Runtime, world: &space3d_core::World) {
+    poses.clear();
+    for inst in &rt.instances {
+        let pose = (inst.live && inst.attached && !inst.orphaned)
+            .then(|| world.get::<&GlobalTransform>(inst.entity).ok())
+            .flatten()
+            .map(|g| {
+                let (_, r, t) = g.0.to_scale_rotation_translation();
+                (t, r)
+            });
+        poses.push(pose.unwrap_or((inst.pos, inst.rot)));
+    }
+}
+
 /// The particles render node (registered by `ParticlesPlugin`).
 pub(crate) struct ParticlesNode {
     soft: bool,
     enabled: bool,
     sim: CpuSim,
+    /// The GPU backend's state (per renderer).
+    gpu_sim: Option<GpuSim>,
+    /// Backend of the last frame.
+    backend: Option<ParticleBackend>,
     layers: RenderLayers,
     instances: Vec<ParticleInstance>,
     items: Vec<PackItem>,
@@ -258,6 +282,20 @@ pub(crate) struct ParticlesNode {
     last_extrapolation: f32,
     gpu: Option<Gpu>,
     warned_gpu_backend: bool,
+    /// The frame bind groups of the last color draw (perf tests draw with them).
+    #[cfg(test)]
+    pub(crate) test_capture: Option<(wgpu::BindGroup, wgpu::BindGroup, u32, PassTarget)>,
+}
+
+/// What `simulate` reports to the stats.
+struct Simulated {
+    settings: ParticleSettings,
+    reallocs: u32,
+    ticks: u32,
+    alive: u32,
+    alive_frame: Option<u64>,
+    dispatches: u32,
+    bytes: u64,
 }
 
 impl ParticlesNode {
@@ -266,6 +304,8 @@ impl ParticlesNode {
             soft: settings.soft_particles,
             enabled: settings.enabled,
             sim: CpuSim::default(),
+            gpu_sim: None,
+            backend: None,
             layers: RenderLayers::default(),
             instances: Vec::new(),
             items: Vec::new(),
@@ -279,10 +319,12 @@ impl ParticlesNode {
             last_extrapolation: 0.0,
             gpu: None,
             warned_gpu_backend: false,
+            #[cfg(test)]
+            test_capture: None,
         }
     }
 
-    fn capacities(&self) -> [usize; 7] {
+    fn capacities(&self) -> [usize; 8] {
         [
             self.instances.capacity(),
             self.items.capacity(),
@@ -291,76 +333,165 @@ impl ParticlesNode {
             self.view_items.capacity(),
             self.views.capacity(),
             self.view_uniforms.capacity(),
+            self.gpu_sim.as_ref().map_or(0, GpuSim::capacities),
         ]
     }
 
-    /// Replay the log, pack, and publish the runtime side of the stats (CPU only).
-    fn simulate_and_pack(&mut self, ctx: &mut PrepareContext<'_>) -> Option<(ParticleSettings, u32)> {
-        let world = ctx.world;
-        let alpha = ctx.frame.alpha;
+    /// Replay the log on the frame's backend and build the draw items; publishes nothing.
+    fn simulate(&mut self, ctx: &mut PrepareContext<'_>) -> Option<Simulated> {
+        let settings = ctx.resources.get::<ParticleSettings>().cloned().unwrap_or_default();
         if !ctx.resources.contains::<ParticleRuntime>() {
             return None;
         }
-        ctx.resources.scope::<ParticleRuntime, _>(|res, runtime| {
-            let settings = res.get::<ParticleSettings>().cloned().unwrap_or_default();
-            if settings.soft_particles != self.soft {
-                self.soft = settings.soft_particles;
-                if let Some(nodes) = res.get_mut::<RenderNodes>() {
-                    nodes.invalidate();
-                }
+        if settings.soft_particles != self.soft {
+            self.soft = settings.soft_particles;
+            if let Some(nodes) = ctx.resources.get_mut::<RenderNodes>() {
+                nodes.invalidate();
             }
-            if settings.backend == ParticleBackend::Gpu && !self.warned_gpu_backend {
-                self.warned_gpu_backend = true;
-                tracing::warn!("ParticleBackend::Gpu lands with milestone PA2; simulating on the CPU");
-            }
-            let rebuilt = res.get::<ParticleEffects>().is_some_and(|fx| self.layers.sync(fx));
-            let rt = &mut runtime.rt;
-            let mut reallocs = self.sim.replay(rt, settings.max_catchup_ticks);
-            let dt = res
-                .get::<Time>()
-                .map_or(0.0, |t| t.fixed_delta_secs() * settings.time_scale.max(0.0));
-            let extrapolate = if settings.extrapolate { alpha * dt } else { 0.0 };
-            let has_local = rt.entries.iter().any(|e| e.live && e.sim.local);
-            if !self.packed_once || self.sim.ticks > 0 || rebuilt || has_local || extrapolate != self.last_extrapolation
-            {
-                self.packed_once = true;
-                self.last_extrapolation = extrapolate;
-                self.poses.clear();
-                for inst in &rt.instances {
-                    let pose = (inst.live && inst.attached && !inst.orphaned)
-                        .then(|| world.get::<&GlobalTransform>(inst.entity).ok())
-                        .flatten()
-                        .map(|g| {
-                            let (_, r, t) = g.0.to_scale_rotation_translation();
-                            (t, r)
-                        });
-                    self.poses.push(pose.unwrap_or((inst.pos, inst.rot)));
+        }
+        // Device lost: the CPU backend carries on until the renderer is recreated.
+        let compute = ctx.graphics.compute && !ctx.frame.device_lost;
+        let backend = resolve_backend(settings.backend, Some(compute));
+        if settings.backend == ParticleBackend::Gpu && backend == ParticleBackend::Cpu && !self.warned_gpu_backend {
+            self.warned_gpu_backend = true;
+            tracing::warn!("ParticleBackend::Gpu needs compute shaders and indirect draws; simulating on the CPU");
+        }
+        let switched = self.backend.is_some_and(|b| b != backend);
+        if switched && backend == ParticleBackend::Cpu {
+            // The GPU pool cannot be read back without waiting: the live particles are dropped.
+            self.sim.pool.fill(Particle::default());
+        }
+        self.backend = Some(backend);
+        let rebuilt = ctx
+            .resources
+            .get::<ParticleEffects>()
+            .is_some_and(|fx| self.layers.sync(fx));
+        let dt = ctx
+            .resources
+            .get::<Time>()
+            .map_or(0.0, |t| t.fixed_delta_secs() * settings.time_scale.max(0.0));
+        let extrapolate = if settings.extrapolate {
+            ctx.frame.alpha * dt
+        } else {
+            0.0
+        };
+        // The runtime moves out for the frame (no allocation), so the context stays free for
+        // uploads and compute passes.
+        let mut rt = std::mem::take(&mut ctx.resources.get_mut::<ParticleRuntime>()?.rt);
+        let mut out = Simulated {
+            settings,
+            reallocs: 0,
+            ticks: 0,
+            alive: 0,
+            alive_frame: None,
+            dispatches: 0,
+            bytes: 0,
+        };
+        let layers = &self.layers;
+        // Distortion layers draw into the post distortion buffer (PA4), not color.
+        let layer_of = |e: &crate::runtime::Entry| {
+            layers
+                .layer(e.effect, e.layer)
+                .filter(|l| !l.distortion)
+                .map(|l| l.pack)
+        };
+        match backend {
+            ParticleBackend::Gpu => {
+                if self.gpu_sim.as_ref().is_none_or(|g| g.renderer != ctx.frame.renderer) {
+                    self.gpu_sim = Some(GpuSim::new(ctx.device, ctx.frame.renderer));
                 }
-                let layers = &self.layers;
-                pack(
-                    &PackInput {
-                        rt,
-                        pool: &self.sim.pool,
+                update_poses(&mut self.poses, &rt, ctx.world);
+                let gpu = self.gpu_sim.as_mut().expect("created above");
+                let carry = switched.then_some(&self.sim.pool[..]);
+                gpu.prepare(
+                    ctx,
+                    &mut rt,
+                    &layer_of,
+                    &GpuInput {
                         poses: &self.poses,
                         extrapolate,
+                        dt,
+                        max_catchup: out.settings.max_catchup_ticks,
+                        carry,
                     },
-                    // Distortion layers draw into the post distortion buffer (PA4), not color.
-                    &|e| {
-                        layers
-                            .layer(e.effect, e.layer)
-                            .filter(|l| !l.distortion)
-                            .map(|l| l.pack)
-                    },
-                    &mut self.keys,
-                    &mut self.instances,
                     &mut self.items,
                 );
-                self.dirty = true;
+                let s = gpu.stats;
+                (out.ticks, out.dispatches, out.bytes, out.reallocs) = (s.ticks, s.dispatches, s.bytes, s.created);
+                if let Some((frame, alive)) = gpu.readback.latest {
+                    (out.alive, out.alive_frame) = (alive, Some(frame));
+                }
+                self.instances.clear();
             }
-            reallocs += rt.reallocations;
-            rt.reallocations = 0;
-            Some((settings, reallocs))
-        })
+            _ => {
+                out.reallocs += self.sim.replay(&mut rt, out.settings.max_catchup_ticks);
+                out.ticks = self.sim.ticks;
+                let has_local = rt.entries.iter().any(|e| e.live && e.sim.local);
+                if switched
+                    || !self.packed_once
+                    || self.sim.ticks > 0
+                    || rebuilt
+                    || has_local
+                    || extrapolate != self.last_extrapolation
+                {
+                    self.packed_once = true;
+                    self.last_extrapolation = extrapolate;
+                    update_poses(&mut self.poses, &rt, ctx.world);
+                    pack(
+                        &PackInput {
+                            rt: &rt,
+                            pool: &self.sim.pool,
+                            poses: &self.poses,
+                            extrapolate,
+                        },
+                        &layer_of,
+                        &mut self.keys,
+                        &mut self.instances,
+                        &mut self.items,
+                    );
+                    self.dirty = true;
+                }
+                out.alive = self.instances.len() as u32;
+                out.alive_frame = Some(ctx.frame.frame);
+            }
+        }
+        out.reallocs += rt.reallocations;
+        rt.reallocations = 0;
+        if let Some(r) = ctx.resources.get_mut::<ParticleRuntime>() {
+            r.rt = rt;
+        }
+        Some(out)
+    }
+
+    /// The backend of the last frame and a copy of its pool (tests; waits for the GPU).
+    pub(crate) fn read_pool(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<(ParticleBackend, Vec<Particle>)> {
+        match self.backend? {
+            ParticleBackend::Gpu => {
+                let pool = self.gpu_sim.as_ref()?.pool_buffer()?;
+                let size = pool.size();
+                let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("space3d particles pool readback (tests)"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let mut encoder = device.create_command_encoder(&Default::default());
+                encoder.copy_buffer_to_buffer(pool, 0, &staging, 0, size);
+                queue.submit([encoder.finish()]);
+                let slice = staging.slice(..);
+                slice.map_async(wgpu::MapMode::Read, |_| {});
+                device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+                let data = slice.get_mapped_range().ok()?;
+                let pool: Vec<Particle> =
+                    bytemuck::cast_slice(&data[..(size / PARTICLE_SIZE * PARTICLE_SIZE) as usize]).to_vec();
+                Some((ParticleBackend::Gpu, pool))
+            }
+            b => Some((b, self.sim.pool.clone())),
+        }
     }
 
     /// Cull and sort the draw items of every camera view; per-view flags.
@@ -372,10 +503,14 @@ impl ParticlesNode {
             let start = self.view_items.len();
             if settings.enabled {
                 for (i, it) in self.items.iter().enumerate() {
-                    if v.frustum.intersects_aabb(&Aabb {
-                        min: it.min,
-                        max: it.max,
-                    }) {
+                    // Unbounded items (world attractors on the GPU backend) are never culled.
+                    let unbounded = !(it.min.is_finite() && it.max.is_finite());
+                    if unbounded
+                        || v.frustum.intersects_aabb(&Aabb {
+                            min: it.min,
+                            max: it.max,
+                        })
+                    {
                         self.view_items.push(i as u32);
                     }
                 }
@@ -388,7 +523,7 @@ impl ParticlesNode {
                     let depth = if l.pack.batched {
                         0.0
                     } else {
-                        view.transform_point3((it.min + it.max) * 0.5).z
+                        view.transform_point3(it.center).z
                     };
                     (l.order, l.additive, depth, it.layer, it.serial)
                 };
@@ -598,11 +733,11 @@ impl RenderNode for ParticlesNode {
 
     fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
         let before = self.capacities();
-        let Some((settings, sim_reallocs)) = self.simulate_and_pack(ctx) else {
+        let Some(sim) = self.simulate(ctx) else {
             return;
         };
-        self.enabled = settings.enabled;
-        self.plan_views(ctx, &settings);
+        self.enabled = sim.settings.enabled;
+        self.plan_views(ctx, &sim.settings);
         let (bytes, created) = if ctx.frame.device_lost {
             (0, 0)
         } else {
@@ -611,36 +746,36 @@ impl RenderNode for ParticlesNode {
         let after = self.capacities();
         let node_reallocs = before.iter().zip(&after).filter(|(a, b)| a != b).count() as u32;
         let draw_calls = self.view_items.len() as u32;
-        let alive = self.instances.len() as u32;
-        let frame = ctx.frame.frame;
-        let (ticks, resets) = (self.sim.ticks, self.sim.resets);
-        ctx.resources.scope::<ParticleRuntime, _>(|res, runtime| {
+        let backend = self.backend;
+        let resets = self.sim.resets + self.gpu_sim.as_ref().map_or(0, |g| g.resets);
+        if let Some(runtime) = ctx.resources.get_mut::<ParticleRuntime>() {
             let rt = &mut runtime.rt;
             let (effects, layer_instances) = rt.counts();
-            if let Some(s) = res.get_mut::<ParticleStats>() {
-                *s = ParticleStats {
-                    backend: Some(ParticleBackend::Cpu),
-                    effects,
-                    layer_instances,
-                    pool_capacity: rt.pool.total(),
-                    pool_reserved: rt.pool.reserved(),
-                    alive,
-                    alive_frame: Some(frame),
-                    spawned: rt.spawned,
-                    refused: rt.refused,
-                    shrunk: rt.shrunk,
-                    ticks_simulated: ticks,
-                    catchup_resets: resets,
-                    dispatches: 0,
-                    draw_calls,
-                    ribbon_segments: 0,
-                    bytes_uploaded: bytes,
-                    cpu_reallocations: sim_reallocs + node_reallocs + created,
-                };
-            }
+            let stats = ParticleStats {
+                backend,
+                effects,
+                layer_instances,
+                pool_capacity: rt.pool.total(),
+                pool_reserved: rt.pool.reserved(),
+                alive: sim.alive,
+                alive_frame: sim.alive_frame,
+                spawned: rt.spawned,
+                refused: rt.refused,
+                shrunk: rt.shrunk,
+                ticks_simulated: sim.ticks,
+                catchup_resets: resets,
+                dispatches: sim.dispatches,
+                draw_calls,
+                ribbon_segments: 0,
+                bytes_uploaded: bytes + sim.bytes,
+                cpu_reallocations: sim.reallocs + node_reallocs + created,
+            };
             rt.refused = 0;
             rt.shrunk = 0;
-        });
+            if let Some(s) = ctx.resources.get_mut::<ParticleStats>() {
+                *s = stats;
+            }
+        }
     }
 
     fn prepare_view(&mut self, ctx: &mut ViewPrepareContext<'_>) -> SlotMask {
@@ -671,28 +806,140 @@ impl RenderNode for ParticlesNode {
         let Some(list) = self.views.iter().find(|l| l.camera == ctx.view.camera).copied() else {
             return;
         };
+        #[cfg(test)]
+        {
+            self.test_capture = Some((
+                ctx.view_bind_group.clone(),
+                ctx.scene_bind_group.clone(),
+                ctx.view.view_offset,
+                ctx.target,
+            ));
+        }
+        self.record(
+            pass,
+            ctx.device,
+            ctx.target,
+            (ctx.view_bind_group, ctx.scene_bind_group, ctx.view.view_offset),
+            list,
+        );
+    }
+}
+
+impl ParticlesNode {
+    /// Record the draws of `list` with the frame's view and scene bind groups.
+    fn record(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'static>,
+        device: &wgpu::Device,
+        target: PassTarget,
+        (view_bind_group, scene_bind_group, view_offset): (&wgpu::BindGroup, &wgpu::BindGroup, u32),
+        list: ViewList,
+    ) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        if list.end == list.start || gpu.bind_group.is_none() || gpu.instances.is_none() {
+        if list.end == list.start || gpu.bind_group.is_none() {
             return;
         }
-        let p = gpu.pipeline(ctx.device, ctx.target);
-        let (Some(bind_group), Some((instances, _))) = (&gpu.bind_group, &gpu.instances) else {
+        let p = gpu.pipeline(device, target);
+        let Some(bind_group) = &gpu.bind_group else {
             return;
         };
+        let direct = gpu.instances.as_ref().map(|(b, _)| b);
+        let indirect = self.gpu_sim.as_ref().and_then(GpuSim::draw_buffers);
         pass.set_pipeline(&gpu.pipelines[p].1);
-        pass.set_bind_group(0, ctx.view_bind_group, &[ctx.view.view_offset]);
-        pass.set_bind_group(1, ctx.scene_bind_group, &[]);
-        let view_offset = (list.uniform as u64 * gpu.align) as u32;
+        pass.set_bind_group(0, view_bind_group, &[view_offset]);
+        pass.set_bind_group(1, scene_bind_group, &[]);
+        let view_uniform = (list.uniform as u64 * gpu.align) as u32;
         for &i in &self.view_items[list.start as usize..list.end as usize] {
             let item = &self.items[i as usize];
-            pass.set_bind_group(2, bind_group, &[view_offset, (item.layer as u64 * gpu.align) as u32]);
             let from = item.first as u64 * INSTANCE_SIZE;
             let to = from + item.count as u64 * INSTANCE_SIZE;
-            pass.set_vertex_buffer(0, instances.slice(from..to));
-            pass.draw(0..4, 0..item.count);
+            pass.set_bind_group(2, bind_group, &[view_uniform, (item.layer as u64 * gpu.align) as u32]);
+            if item.args == DIRECT {
+                let Some(instances) = direct else { continue };
+                pass.set_vertex_buffer(0, instances.slice(from..to));
+                pass.draw(0..4, 0..item.count);
+            } else {
+                let (Some((work, instances)), Some(sim)) = (indirect, self.gpu_sim.as_ref()) else {
+                    continue;
+                };
+                pass.set_vertex_buffer(0, instances.slice(from..to));
+                pass.draw_indirect(work, sim.args_offset(item.args));
+            }
         }
+    }
+
+    /// The GPU backend's state (tests).
+    pub(crate) fn gpu_sim(&mut self) -> Option<&mut GpuSim> {
+        self.gpu_sim.as_mut()
+    }
+
+    /// Record the first view's draws again, into a fresh `size` target of the last color draw's
+    /// pass signature (depth cleared to far), inside a render pass writing timestamps `index`
+    /// and `index + 1` (the perf tests time the particle draws alone). Returns the draw calls.
+    #[cfg(test)]
+    pub(crate) fn record_timed_draws(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        queries: &wgpu::QuerySet,
+        index: u32,
+        size: (u32, u32),
+    ) -> Option<u32> {
+        let (view_bg, scene_bg, view_offset, target) = self.test_capture.clone()?;
+        let list = *self.views.first()?;
+        let texture = |format, usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("space3d particles timed draws"),
+                    size: wgpu::Extent3d {
+                        width: size.0,
+                        height: size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: target.samples,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let color = texture(target.color, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth = target.depth.map(|f| texture(f, wgpu::TextureUsages::RENDER_ATTACHMENT));
+        let mut pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("particles.draw (perf test)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: depth.as_ref().map(|view| wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: (!target.depth_read_only).then_some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
+                    query_set: queries,
+                    beginning_of_pass_write_index: Some(index),
+                    end_of_pass_write_index: Some(index + 1),
+                }),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            })
+            .forget_lifetime();
+        self.record(&mut pass, device, target, (&view_bg, &scene_bg, view_offset), list);
+        Some(list.end - list.start)
     }
 }
 

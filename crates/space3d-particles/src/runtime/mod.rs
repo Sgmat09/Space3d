@@ -9,6 +9,7 @@
 mod alloc;
 pub(crate) mod layer;
 pub(crate) mod log;
+mod path;
 mod spawn;
 #[cfg(test)]
 mod tests;
@@ -16,6 +17,7 @@ mod tests;
 pub(crate) use alloc::RangeAllocator;
 pub(crate) use layer::{LayerSim, capacity, window_ticks};
 pub(crate) use log::{SpawnRecord, TickLog, WorldAttractor, XformRow};
+pub(crate) use path::Path;
 
 use crate::components::{FinishAction, OnRemove, ParticleAttractor, ParticleEmitter};
 use crate::effect::{EffectPriority, MAX_LAYERS_PER_EFFECT, ParticleEffect};
@@ -49,6 +51,9 @@ pub(crate) struct Entry {
     pub full_capacity: u32,
     /// Particles spawned so far (the next spawn index).
     pub spawned: u64,
+    /// Last tick this layer instance emitted on (its particles are all dead
+    /// `window_ticks(sim.window)` ticks later).
+    pub last_spawn_tick: u64,
     pub rate_acc: u64,
     pub dist_acc: u64,
     pub seed: u32,
@@ -79,6 +84,7 @@ impl Entry {
             capacity,
             full_capacity: capacity,
             spawned: 0,
+            last_spawn_tick: 0,
             // Half a period: the first particle of a rate comes half its interval in.
             rate_acc: 1 << 31,
             dist_acc: 1 << 31,
@@ -158,9 +164,17 @@ pub(crate) struct Runtime {
     /// Seconds simulated (Σ dt).
     pub time: f64,
     pub instances: Vec<Instance>,
+    /// Recent emitter path of every instance (same index).
+    pub paths: Vec<Path>,
     free_instances: Vec<u32>,
     by_entity: FastMap<Entity, u32>,
     pub entries: Vec<Entry>,
+    /// Bumped whenever an entry is created, freed or gets new layer parameters (the GPU
+    /// backend re-uploads its entry table then).
+    pub entries_version: u64,
+    /// Pool budget for the resolved backend (set by the tick system; `None`:
+    /// `ParticleSettings::max_particles_cpu`).
+    pub budget: Option<u32>,
     /// Entries freed at a tick, reusable once the log no longer holds that tick.
     released_entries: VecDeque<(u64, u32)>,
     free_entries: Vec<u32>,
@@ -222,7 +236,7 @@ fn lod_scale(lod: &ParticleLod, distance: f32) -> f32 {
 impl Runtime {
     fn capacities(&self) -> [usize; 8] {
         [
-            self.instances.capacity(),
+            self.instances.capacity() + self.paths.capacity(),
             self.free_instances.capacity(),
             self.by_entity.capacity(),
             self.entries.capacity(),
@@ -252,6 +266,7 @@ impl Runtime {
     fn alloc_entry(&mut self, mut entry: Entry) -> u32 {
         entry.serial = self.next_serial;
         self.next_serial += 1;
+        self.entries_version += 1;
         match self.free_entries.pop() {
             Some(i) => {
                 self.entries[i as usize] = entry;
@@ -348,10 +363,12 @@ impl Runtime {
         let i = match self.free_instances.pop() {
             Some(i) => {
                 self.instances[i as usize] = inst;
+                self.paths[i as usize] = Path::default();
                 i
             }
             None => {
                 self.instances.push(inst);
+                self.paths.push(Path::default());
                 self.instances.len() as u32 - 1
             }
         };
@@ -414,6 +431,7 @@ impl Runtime {
                 entry.live = false;
                 self.pool.free(entry.base, entry.capacity);
                 self.released_entries.push_back((self.tick, e));
+                self.entries_version += 1;
             }
         }
     }
@@ -477,6 +495,7 @@ impl Runtime {
                     let entry = &mut self.entries[e as usize];
                     entry.sim = LayerSim::new(&effect.layers[entry.layer as usize]);
                 }
+                self.entries_version += 1;
                 let inst = &mut self.instances[i as usize];
                 inst.looping = effect.looping;
                 inst.duration = effect.duration;
@@ -508,7 +527,7 @@ impl Runtime {
         self.tick += 1;
         let t = self.tick;
         let dt = fixed_dt * settings.time_scale.max(0.0);
-        self.set_budget(settings.max_particles_cpu);
+        self.set_budget(self.budget.unwrap_or(settings.max_particles_cpu));
         self.release_entries(self.log.first_tick().unwrap_or(t));
         self.sync_effects(effects);
         self.log.begin(t, dt, settings.substeps.max(1), self.time);
@@ -650,6 +669,7 @@ impl Runtime {
                 .map(|&e| window_ticks(self.entries[e as usize].sim.window, dt))
                 .max()
                 .unwrap_or(0);
+            self.paths[i as usize].record(t, window.min(1 << 20), inst.prev_pos, inst.pos, inst.velocity.length());
             let emitting = self.instances[i as usize].emitting();
             if !emitting && dt > 0.0 && t >= inst.last_spawn_tick.saturating_add(window as u64) {
                 self.finish(i);
@@ -697,6 +717,9 @@ impl Runtime {
                 },
                 &mut self.log,
             );
+            if n > 0 {
+                entry.last_spawn_tick = self.tick;
+            }
             spawned += n;
         }
         if spawned > 0 {
@@ -732,6 +755,49 @@ impl Runtime {
         } else {
             self.free_instance(i);
         }
+    }
+
+    /// Where the draw of layer instance `e` sorts by depth: the render position of a
+    /// local-space layer's emitter, else the middle of the emitter's path over the life window.
+    /// A pure function of the ticks (and the render pose), so it orders draws the same way on
+    /// both backends and for any render cadence.
+    pub fn entry_center(&self, e: &Entry, poses: &[(Vec3, Quat)]) -> Vec3 {
+        let i = e.instance as usize;
+        let pose = poses.get(i).map_or(Vec3::ZERO, |p| p.0);
+        if e.sim.local {
+            return pose;
+        }
+        match self.paths.get(i).and_then(|p| p.bounds(self.tick)) {
+            Some((lo, hi, _)) => (lo + hi) * 0.5,
+            None => self.instances.get(i).map_or(pose, |inst| inst.pos),
+        }
+    }
+
+    /// Conservative world bounds of the particles of layer instance `e` (GPU backend culling;
+    /// the CPU backend measures them): the emitter's path over the life window (its render
+    /// position for local-space layers) grown by [`LayerSim::reach`] and the largest sprite
+    /// (`sprite` world units per unit of size).
+    pub fn entry_bounds(&self, e: &Entry, poses: &[(Vec3, Quat)], sprite: f32) -> (Vec3, Vec3) {
+        let i = e.instance as usize;
+        let inst = &self.instances[i];
+        let pose = poses.get(i).map_or(inst.pos, |p| p.0);
+        let (lo, hi, speed) = if e.sim.local {
+            (pose, pose, 0.0)
+        } else {
+            match self.paths.get(i).and_then(|p| p.bounds(self.tick)) {
+                Some(b) => b,
+                None => (inst.pos, inst.pos, inst.velocity.length()),
+            }
+        };
+        let s = &e.sim;
+        let size = s.size.0.abs().max(s.size.1.abs()) * inst.scale.abs() * sprite;
+        let r = Vec3::splat(s.reach(inst.scale, speed) + size);
+        (lo - r, hi + r)
+    }
+
+    /// Layer instance `e` may still have particles alive (it emitted within its life window).
+    pub fn may_be_alive(&self, e: &Entry, dt: f32) -> bool {
+        e.live && e.spawned > 0 && self.tick <= e.last_spawn_tick.saturating_add(window_ticks(e.sim.window, dt) as u64)
     }
 
     /// State of the instance playing on `entity`.

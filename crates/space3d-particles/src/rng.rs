@@ -28,6 +28,14 @@ pub(crate) fn range(seed: u32, stream: u32, lo: f32, hi: f32) -> f32 {
     lo + (hi - lo) * rnd(seed, stream)
 }
 
+/// `fma(hi − lo, rnd, lo)`: one rounding, so the GPU kernels (WGSL `fma`) compute the very same
+/// value whatever the shader compiler contracts. Used for the values that decide a particle's
+/// fate (lifetime, delay), so both backends kill and reveal particles on the same tick.
+#[inline]
+pub(crate) fn range_exact(seed: u32, stream: u32, lo: f32, hi: f32) -> f32 {
+    (hi - lo).mul_add(rnd(seed, stream), lo)
+}
+
 /// Seed of the particle with spawn index `index` of a layer instance seeded `entry_seed`.
 #[inline]
 pub(crate) fn particle_seed(entry_seed: u32, index: u64) -> u32 {
@@ -107,5 +115,7 @@ mod tests {
         assert_ne!(particle_seed(1, 5), particle_seed(1, 5 + (1 << 32)), "high bits matter");
         assert_ne!(mix(1, 2), mix(2, 1));
         assert_eq!(range(9, 3, 2.0, 2.0), 2.0);
+        assert_eq!(range_exact(9, 3, 2.0, 2.0), 2.0);
+        assert!((range_exact(9, 3, 1.0, 3.0) - range(9, 3, 1.0, 3.0)).abs() < 1e-6);
     }
 }

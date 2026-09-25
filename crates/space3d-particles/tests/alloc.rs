@@ -1,13 +1,15 @@
 //! Steady-state heap allocations (graphics spec §1.1 invariant 2, §4.4): the fixed-tick system
 //! allocates nothing, and a rendered frame with live particles allocates only wgpu's bookkeeping
-//! (pinned to its measured bound, never growing); `ParticleStats::cpu_reallocations` and
-//! `RenderStats::cpu_reallocations` stay 0.
+//! on either backend (pinned to its measured bound, never growing);
+//! `ParticleStats::cpu_reallocations` and `RenderStats::cpu_reallocations` stay 0. The GPU
+//! backend also keeps to its dispatch budget (≤ 5 per frame, 2 more per extra tick).
 //!
 //! The only test in this binary: the counter is global.
 
 mod common;
 use common::*;
 use space3d_core::prelude::*;
+use space3d_particles::ParticleBackend;
 use space3d_particles::prelude::*;
 use space3d_render::*;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -103,38 +105,76 @@ fn steady_state_allocations() {
     assert!(stats.effects > 20 && stats.pool_reserved > 1000, "{stats:?}");
     assert_eq!(allocs, 0, "the fixed-tick system allocates nothing in the steady state");
 
-    // 2. Rendered every tick: our code allocates nothing; wgpu's bookkeeping is bounded.
-    let Some(mut app) = common::app(320, 180) else { return };
-    let backend = app.resources.expect::<Renderer>().capabilities().adapter.backend;
-    camera(
-        &mut app,
-        Vec3::new(0.0, 180.0, 160.0),
-        Vec3::ZERO,
-        Vec4::new(0.0, 0.0, 0.0, 1.0),
-    );
-    scene(&mut app);
-    app.step_ticks(600);
-    let first = measure(&mut app, 300);
-    let second = measure(&mut app, 300);
-    let stats = app.resources.expect::<ParticleStats>().clone();
-    let render = app.resources.expect::<RenderStats>().clone();
-    let per_frame = (first.max(second) as f64 / 300.0).ceil() as u64;
-    eprintln!("rendered: {first} then {second} allocations per 300 frames ({per_frame}/frame, {backend:?}); {stats:?}");
-    assert!(stats.alive > 500 && stats.draw_calls > 5, "{stats:?}");
-    assert_eq!(stats.cpu_reallocations, 0, "{stats:?}");
-    assert_eq!((render.cpu_reallocations, render.textures_created), (0, 0));
-    assert!(second <= first + first / 10, "no growth: {first} → {second}");
-    // Measured on Apple M4 Max / Metal (wgpu 30.0.1, test profile) plus ~10 %; twice that
-    // elsewhere.
-    let bound = if backend == wgpu::Backend::Metal {
-        METAL_BOUND
-    } else {
-        2 * METAL_BOUND
-    };
-    assert!(per_frame <= bound, "{per_frame} allocations per frame (bound {bound})");
-    assert_eq!(gpu_errors(&app), 0);
+    // 2. Rendered every tick, on each backend: our code allocates nothing; wgpu's bookkeeping
+    //    is bounded.
+    for backend in [ParticleBackend::Cpu, ParticleBackend::Gpu] {
+        let settings = ParticleSettings {
+            backend,
+            ..ParticleSettings::default()
+        };
+        let Some(mut app) = common::app_with(320, 180, settings) else {
+            return;
+        };
+        let adapter = app.resources.expect::<Renderer>().capabilities().adapter.backend;
+        let compute = app.resources.expect::<Renderer>().graphics_caps().compute;
+        if backend == ParticleBackend::Gpu && !compute {
+            eprintln!("no compute: GPU backend not measured");
+            continue;
+        }
+        camera(
+            &mut app,
+            Vec3::new(0.0, 180.0, 160.0),
+            Vec3::ZERO,
+            Vec4::new(0.0, 0.0, 0.0, 1.0),
+        );
+        scene(&mut app);
+        app.step_ticks(600);
+        let first = measure(&mut app, 300);
+        let second = measure(&mut app, 300);
+        let stats = app.resources.expect::<ParticleStats>().clone();
+        let render = app.resources.expect::<RenderStats>().clone();
+        let per_frame = (first.max(second) as f64 / 300.0).ceil() as u64;
+        eprintln!(
+            "{backend:?} backend, rendered: {first} then {second} allocations per 300 frames ({per_frame}/frame, {adapter:?}); {stats:?}"
+        );
+        assert_eq!(stats.backend, Some(backend));
+        assert!(stats.alive > 500 && stats.draw_calls > 5, "{stats:?}");
+        assert_eq!(stats.cpu_reallocations, 0, "{stats:?}");
+        assert_eq!((render.cpu_reallocations, render.textures_created), (0, 0));
+        assert!(second <= first + first / 10, "no growth: {first} → {second}");
+        // Measured on Apple M4 Max / Metal (wgpu 30.0.1, test profile) plus ~10 %; twice that
+        // elsewhere.
+        let metal = match backend {
+            ParticleBackend::Gpu => METAL_BOUND_GPU,
+            _ => METAL_BOUND,
+        };
+        let bound = if adapter == wgpu::Backend::Metal {
+            metal
+        } else {
+            2 * metal
+        };
+        assert!(per_frame <= bound, "{per_frame} allocations per frame (bound {bound})");
+        if backend == ParticleBackend::Gpu {
+            // Graphics spec §4.4: ≤ 5 dispatches for a frame with one tick (4 here), 2 more per
+            // extra tick.
+            assert_eq!(stats.ticks_simulated, 1);
+            assert!(stats.dispatches <= 5, "{stats:?}");
+            let renderer = app.resources.remove::<Renderer>().unwrap();
+            app.step_ticks(3);
+            app.resources.insert(renderer);
+            common::render(&mut app);
+            let s = app.resources.expect::<ParticleStats>().clone();
+            assert_eq!(s.ticks_simulated, 3);
+            assert!(s.dispatches <= 5 + 2 * 2, "{s:?}");
+        }
+        assert_eq!(gpu_errors(&app), 0);
+    }
 }
 
-/// wgpu's allocations per frame of the scene above on Metal (measured 184 with 80 particle draws
-/// and one SceneRead pass), +10 %.
+/// wgpu's allocations per frame of the scene above on Metal with the CPU backend (measured 184
+/// with 80 particle draws and one SceneRead pass), +10 %.
 const METAL_BOUND: u64 = 203;
+
+/// The same with the GPU backend (measured 304: two compute passes with 4 dispatches, the tick's
+/// uploads, the alive-count readback and 89 indirect draws), +10 %.
+const METAL_BOUND_GPU: u64 = 341;

@@ -45,7 +45,7 @@ impl Harness {
             .iter()
             .copied()
             .enumerate()
-            .filter(|(_, p)| p.alive() && p.pos_age[3] * p.vel_inv_life[3] < 1.0)
+            .filter(|(_, p)| p.alive() && p.pos_age[3] < p.vel_life[3])
             .collect()
     }
 }
@@ -418,6 +418,84 @@ proptest! {
             h.step();
         }
         prop_assert_eq!(h.sim.overwrites, 0);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+    /// The conservative bounds of a layer instance (the GPU backend's culling) contain every
+    /// particle it has alive, for random shapes, speeds, drag, gravity, forces, delays, spaces
+    /// and a moving, turning emitter.
+    #[test]
+    fn entry_bounds_contain_every_particle(
+        shape in 0usize..6,
+        speed in (0.0f32..30.0, 0.0f32..20.0),
+        drag in 0.0f32..3.0,
+        gravity in -20.0f32..20.0,
+        force in 0usize..4,
+        strength in 0.0f32..30.0,
+        local in any::<bool>(),
+        inherit in 0.0f32..1.0,
+        delay in 0.0f32..0.4,
+        scale in 0.2f32..3.0,
+        spin in 0.0f32..0.2,
+    ) {
+        let mut h = Harness::new();
+        let shape = [
+            EmitShape::Point,
+            EmitShape::Sphere { radius: 5.0, inner: 0.2 },
+            EmitShape::Cone { angle: 0.5, radius: 2.0 },
+            EmitShape::Ring { radius: 6.0, width: 2.0, arc: 0.0 },
+            EmitShape::Box { half_extents: Vec3::new(3.0, 1.0, 4.0) },
+            EmitShape::Line { length: 10.0 },
+        ][shape];
+        let forces = match force {
+            0 => vec![],
+            1 => vec![crate::effect::Force::Attractor {
+                position: Vec3::new(2.0, 0.0, 0.0),
+                strength,
+                radius: 0.0,
+                falloff: crate::effect::Falloff::InverseSquare,
+            }],
+            2 => vec![crate::effect::Force::Vortex { axis: Vec3::Y, strength, pull: strength * 0.3 }],
+            _ => vec![crate::effect::Force::Turbulence { strength, frequency: 0.4, speed: 1.0 }],
+        };
+        let layer = ParticleLayer {
+            shape,
+            speed: FloatRange::new(speed.0, speed.0 + speed.1),
+            drag,
+            gravity: Vec3::new(0.0, gravity, 0.0),
+            forces,
+            inherit_velocity: inherit,
+            particle_delay: FloatRange::new(0.0, delay),
+            space: if local { crate::effect::SimulationSpace::Local } else { crate::effect::SimulationSpace::World },
+            ..ParticleLayer::continuous(120.0, (0.3, 1.2))
+        };
+        let fx = h.add(ParticleEffect { looping: true, ..ParticleEffect::new("b").layer(layer) });
+        let e = h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).scale(scale).keep());
+        for t in 0..150 {
+            let a = t as f32 * spin;
+            if let Ok(mut tr) = h.world.get::<&mut Transform>(e) {
+                tr.translation = Vec3::new(a.sin() * 40.0, 0.0, t as f32 * 0.8);
+                tr.rotation = Quat::from_rotation_y(a * 3.0);
+            }
+            h.step();
+            let poses: Vec<(Vec3, Quat)> = h.rt.instances.iter().map(|i| (i.pos, i.rot)).collect();
+            for (i, entry) in h.rt.entries.iter().enumerate().filter(|(_, e)| e.live) {
+                let (lo, hi) = h.rt.entry_bounds(entry, &poses, 0.0);
+                let (pp, pr) = poses[entry.instance as usize];
+                for (slot, p) in h.alive() {
+                    if p.misc[2] != i as u32 || p.pos_age[3] < 0.0 {
+                        continue;
+                    }
+                    let x = if local { pp + pr * p.pos() } else { p.pos() };
+                    prop_assert!(
+                        x.cmpge(lo - Vec3::splat(1e-3)).all() && x.cmple(hi + Vec3::splat(1e-3)).all(),
+                        "tick {t} slot {slot}: {x} outside {lo}..{hi}"
+                    );
+                }
+            }
+        }
     }
 }
 

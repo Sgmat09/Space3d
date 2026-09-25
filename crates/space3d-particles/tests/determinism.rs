@@ -5,6 +5,7 @@
 mod common;
 use common::*;
 use space3d_core::prelude::*;
+use space3d_particles::ParticleBackend;
 use space3d_particles::prelude::*;
 use space3d_render::*;
 use space3d_test::TestApp;
@@ -48,9 +49,18 @@ fn scene(app: &mut App) {
     });
 }
 
+const BACKENDS: [ParticleBackend; 2] = [ParticleBackend::Cpu, ParticleBackend::Gpu];
+
+fn settings(backend: ParticleBackend) -> ParticleSettings {
+    ParticleSettings {
+        backend,
+        ..ParticleSettings::default()
+    }
+}
+
 /// Every tick rendered (the renderer in the frame loop).
-fn every_tick(ticks: u64) -> Option<ImageData> {
-    let mut app = app(W, H)?;
+fn every_tick(backend: ParticleBackend, ticks: u64) -> Option<ImageData> {
+    let mut app = app_with(W, H, settings(backend))?;
     scene(&mut app);
     app.step_ticks(ticks);
     let img = render(&mut app);
@@ -58,46 +68,72 @@ fn every_tick(ticks: u64) -> Option<ImageData> {
     Some(img)
 }
 
-/// Rendered once, after all the ticks (the storybook's render-on-demand mode).
-fn on_demand(ticks: u64) -> Option<(ImageData, ParticleStats)> {
+/// Rendered once, after all the ticks (the storybook's render-on-demand mode); the stats of a
+/// second frame (the GPU backend reads its alive count back).
+fn on_demand(backend: ParticleBackend, ticks: u64) -> Option<(ImageData, ParticleStats)> {
     let mut base = App::new();
-    base.add_plugin(ParticlesPlugin::default());
+    base.add_plugin(ParticlesPlugin::with_settings(settings(backend)));
     let mut app = TestApp::builder().size(W, H).render_on_demand().build_with(base);
     app.backend()?;
     scene(&mut app);
     app.step_ticks(ticks);
     let img = app.screenshot()?;
-    let stats = app.resources.expect::<ParticleStats>().clone();
+    let mut stats = app.resources.expect::<ParticleStats>().clone();
+    app.screenshot()?;
+    stats.alive = app.resources.expect::<ParticleStats>().alive;
     Some((img, stats))
 }
 
 #[test]
 fn runs_are_identical() {
-    let Some(a) = every_tick(120) else { return };
-    let b = every_tick(120).unwrap();
-    dump(&a, "determinism_120");
-    assert_eq!(a, b);
+    for backend in BACKENDS {
+        let Some(a) = every_tick(backend, 120) else { return };
+        let b = every_tick(backend, 120).unwrap();
+        dump(&a, &format!("determinism_120_{backend:?}"));
+        assert_eq!(a, b, "{backend:?}");
+    }
 }
 
 /// 90 ticks: shorter than every life window, so the on-demand frame replays all 90 ticks.
 #[test]
 fn render_every_tick_equals_render_on_demand() {
-    let Some(a) = every_tick(90) else { return };
-    let Some((b, stats)) = on_demand(90) else { return };
-    assert_eq!(stats.ticks_simulated, 90, "{stats:?}");
-    assert_eq!(stats.catchup_resets, 0);
-    assert_eq!(a, b);
+    for backend in BACKENDS {
+        let Some(a) = every_tick(backend, 90) else { return };
+        let Some((b, stats)) = on_demand(backend, 90) else {
+            return;
+        };
+        assert_eq!(stats.ticks_simulated, 90, "{stats:?}");
+        assert_eq!(stats.catchup_resets, 0);
+        assert_eq!(a, b, "{backend:?}");
+    }
 }
 
 /// 600 ticks: the unconsumed log was trimmed to the catch-up window, the on-demand frame resets
 /// the pool and replays only that window, and the image is still identical.
 #[test]
 fn catch_up_reset_equals_every_tick() {
-    let Some(a) = every_tick(600) else { return };
-    let Some((b, stats)) = on_demand(600) else { return };
-    dump(&b, "determinism_600");
-    assert!(stats.ticks_simulated < 600, "{stats:?}");
-    assert_eq!(stats.catchup_resets, 1, "{stats:?}");
-    assert!(stats.alive > 100, "{stats:?}");
-    assert_eq!(a, b);
+    for backend in BACKENDS {
+        let Some(a) = every_tick(backend, 600) else { return };
+        let Some((b, stats)) = on_demand(backend, 600) else {
+            return;
+        };
+        dump(&b, &format!("determinism_600_{backend:?}"));
+        assert!(stats.ticks_simulated < 600, "{stats:?}");
+        assert_eq!(stats.catchup_resets, 1, "{stats:?}");
+        assert!(stats.alive > 100, "{stats:?}");
+        assert_eq!(a, b, "{backend:?}");
+    }
+}
+
+/// The two backends draw the same image (the parity of `tests/parity.rs`, on this scene).
+#[test]
+fn backends_draw_the_same_image() {
+    let Some(cpu) = every_tick(ParticleBackend::Cpu, 120) else {
+        return;
+    };
+    let Some(gpu) = every_tick(ParticleBackend::Gpu, 120) else {
+        return;
+    };
+    let diff = space3d_test::compare_images(&cpu, &gpu, &space3d_test::CompareOptions::default());
+    assert!(diff.passed, "{}", diff.summary());
 }

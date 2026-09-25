@@ -96,6 +96,58 @@ impl LayerSim {
     }
 }
 
+impl LayerSim {
+    /// Upper bound of how far from its emitter a particle of this layer gets (world units, the
+    /// sprite not included), for an effect `scale` and an emitter moving at most at
+    /// `emitter_speed` (world-space layers inherit part of it): the spawn shape's extent plus
+    /// the displacement over the whole life window under the initial speed (with drag), gravity
+    /// and the layer's forces. Infinite with world attractors (they can be anywhere).
+    /// Design-particles §5.1 "extent R".
+    pub fn reach(&self, scale: f32, emitter_speed: f32) -> f32 {
+        if self.world_forces != 0 {
+            return f32::INFINITY;
+        }
+        let scale = scale.abs();
+        let shape = match self.shape {
+            EmitShape::Point => 0.0,
+            EmitShape::Sphere { radius, .. } => radius.abs(),
+            EmitShape::Cone { radius, .. } => radius.abs(),
+            EmitShape::Ring { radius, width, .. } => radius.abs() + 0.5 * width.abs(),
+            EmitShape::Box { half_extents } => half_extents.abs().length(),
+            EmitShape::Line { length } => 0.5 * length.abs(),
+        } + self.offset.length();
+        let mut speed = self.speed.0.abs().max(self.speed.1.abs()) * scale.powf(self.speed_exponent);
+        if !self.local {
+            speed += self.inherit.abs() * emitter_speed;
+        }
+        // One tick more than the life window: extrapolation and the sub-tick pre-aging.
+        let t = self.window + 0.1;
+        let travel = if self.drag > 1e-6 {
+            speed * (1.0 - (-self.drag * t).exp()) / self.drag
+        } else {
+            speed * t
+        };
+        let mut accel = self.gravity.length();
+        for f in self.forces.iter().flatten() {
+            accel += match *f {
+                Force::Attractor { strength, falloff, .. } => {
+                    // `attract` caps the inverse square at 1 / 0.01.
+                    strength.abs()
+                        * if matches!(falloff, crate::effect::Falloff::InverseSquare) {
+                            100.0
+                        } else {
+                            1.0
+                        }
+                }
+                Force::Vortex { strength, pull, .. } => strength.abs() + pull.abs(),
+                Force::Turbulence { strength, .. } => strength.abs() * 3f32.sqrt(),
+            };
+        }
+        let r = shape * scale + travel + 0.5 * accel * t * t;
+        if r.is_finite() { r } else { f32::INFINITY }
+    }
+}
+
 /// Longest particle life after emission, delay included.
 pub(crate) fn window_secs(l: &ParticleLayer) -> f32 {
     l.lifetime.max.max(l.lifetime.min).max(0.0) + l.particle_delay.max.max(0.0)

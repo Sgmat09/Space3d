@@ -10,19 +10,22 @@
 
 use crate::effect::{EmitDirection, EmitShape, Facing, Falloff, Force, ParticleBlend};
 use crate::pack::{f16_bits, oct_decode, oct_encode};
-use crate::rng::{GOLDEN, particle_seed, pcg, range, rnd, stream};
+use crate::rng::{GOLDEN, particle_seed, pcg, range, range_exact, rnd, stream};
 use crate::runtime::{Entry, LayerSim, Runtime, SpawnRecord, WorldAttractor, XformRow};
 use space3d_core::glam::{Quat, Vec3, Vec4};
 use std::f32::consts::TAU;
 
-/// A pool slot (48 bytes, the GPU backend's storage layout). Zero = dead.
+/// A pool slot (48 bytes, the GPU backend's storage layout, `S3dpParticle` in `gpu.wgsl`). Zero
+/// = dead.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct Particle {
     /// Position (simulation space), age in seconds (< 0: delayed, hidden).
     pub pos_age: [f32; 4],
-    /// Velocity (simulation space), 1 / lifetime (0 = dead).
-    pub vel_inv_life: [f32; 4],
+    /// Velocity (simulation space), lifetime in seconds (0 = dead). A particle dies on the tick
+    /// its age reaches its lifetime: `age >= life`, two exactly computed values, so the CPU and
+    /// GPU backends agree on every death.
+    pub vel_life: [f32; 4],
     /// Octahedral emitter X axis at spawn, seed, layer instance (entry), octahedral emitter Y
     /// axis at spawn (`Facing::EmitterPlane`).
     pub misc: [u32; 4],
@@ -31,13 +34,13 @@ pub(crate) struct Particle {
 impl Particle {
     #[cfg(test)]
     pub fn alive(&self) -> bool {
-        self.vel_inv_life[3] != 0.0
+        self.vel_life[3] != 0.0
     }
     pub fn pos(&self) -> Vec3 {
         Vec3::new(self.pos_age[0], self.pos_age[1], self.pos_age[2])
     }
     pub fn vel(&self) -> Vec3 {
-        Vec3::new(self.vel_inv_life[0], self.vel_inv_life[1], self.vel_inv_life[2])
+        Vec3::new(self.vel_life[0], self.vel_life[1], self.vel_life[2])
     }
 }
 
@@ -58,6 +61,27 @@ pub(crate) struct ParticleInstance {
 
 /// Bytes per render instance.
 pub(crate) const INSTANCE_SIZE: u64 = std::mem::size_of::<ParticleInstance>() as u64;
+
+/// Sub-tick resolution of emission times: a spawn record's span is quantized to 1/16384 of a
+/// tick (about 1 µs at 60 Hz), so both backends derive identical spawn times and ages with
+/// integer arithmetic.
+pub(crate) const SUBTICKS: u32 = 16_384;
+
+/// `t` (a fraction of the tick, 0..=1) in sub-tick units.
+pub(crate) fn subtick_q(t: f32) -> u32 {
+    (t.clamp(0.0, 1.0) * SUBTICKS as f32).round() as u32
+}
+
+/// Sub-tick time of particle `k` of `count` spread over `t0..t1` (sub-tick units): the middle of
+/// its share of the span, `t0 + (t1 − t0)(2k + 1) / 2count` in integers (`(t1 − t0) ≤ 2¹⁴` and
+/// `2k + 1 < 2¹⁷`, so the product fits a `u32`).
+pub(crate) fn subtick(t0: u32, t1: u32, k: u32, count: u32) -> u32 {
+    if t1 > t0 {
+        t0 + ((t1 - t0) * (2 * k + 1)) / (2 * count)
+    } else {
+        t0
+    }
+}
 
 /// A uniformly distributed unit vector from two uniforms.
 fn uniform_dir(u: f32, v: f32) -> Vec3 {
@@ -340,8 +364,8 @@ fn simulate(
     attractors: &[WorldAttractor],
 ) {
     for p in pool.iter_mut() {
-        let inv_life = p.vel_inv_life[3];
-        if inv_life == 0.0 {
+        let life = p.vel_life[3];
+        if life == 0.0 {
             continue;
         }
         let age0 = p.pos_age[3];
@@ -350,13 +374,13 @@ fn simulate(
         if age0 < 0.0 {
             continue; // delayed: only ages
         }
-        if age * inv_life >= 1.0 {
-            p.vel_inv_life[3] = 0.0;
+        if age >= life {
+            p.vel_life[3] = 0.0;
             continue;
         }
         let e = p.misc[2] as usize;
         let Some(entry) = entries.get(e) else {
-            p.vel_inv_life[3] = 0.0;
+            p.vel_life[3] = 0.0;
             continue;
         };
         let s = &entry.sim;
@@ -370,7 +394,7 @@ fn simulate(
         v = (v + a * dt) * drag[e];
         x += v * dt;
         p.pos_age = [x.x, x.y, x.z, age];
-        p.vel_inv_life = [v.x, v.y, v.z, inv_life];
+        p.vel_life = [v.x, v.y, v.z, life];
     }
 }
 
@@ -385,6 +409,8 @@ fn emit(pool: &mut [Particle], r: &SpawnRecord, dt: f32, entries: &[Entry], xf: 
     let row = xf.get(e.instance as usize).unwrap_or(&XformRow::IDENTITY);
     let cap = e.capacity.max(1) as u64;
     let flat = |v: Vec3| v - s.flatten_axis * (v.dot(s.flatten_axis) * s.flatten);
+    let (t0, t1) = (subtick_q(r.t0), subtick_q(r.t1));
+    let tick_step = dt * (1.0 / SUBTICKS as f32);
     for k in 0..r.count {
         let index = r.first + k as u64;
         let slot = e.base as usize + (index % cap) as usize;
@@ -392,15 +418,12 @@ fn emit(pool: &mut [Particle], r: &SpawnRecord, dt: f32, entries: &[Entry], xf: 
             continue;
         }
         let old = &pool[slot];
-        if old.vel_inv_life[3] != 0.0 && old.misc[2] == r.entry && old.pos_age[3] * old.vel_inv_life[3] < 1.0 {
+        if old.vel_life[3] != 0.0 && old.misc[2] == r.entry && old.pos_age[3] < old.vel_life[3] {
             overwrites += 1;
         }
         let seed = particle_seed(e.seed, index);
-        let f = if r.t1 > r.t0 {
-            r.t0 + (r.t1 - r.t0) * (k as f32 + 0.5) / r.count as f32
-        } else {
-            r.t0
-        };
+        let fq = subtick(t0, t1, k, r.count);
+        let f = fq as f32 * (1.0 / SUBTICKS as f32);
         let (origin, rot) = if s.local {
             (Vec3::ZERO, Quat::IDENTITY)
         } else {
@@ -428,9 +451,11 @@ fn emit(pool: &mut [Particle], r: &SpawnRecord, dt: f32, entries: &[Entry], xf: 
         if !s.local {
             vel += row.velocity * s.inherit;
         }
-        let life = range(seed, stream::LIFETIME, s.lifetime.0, s.lifetime.1);
-        let delay = range(seed, stream::DELAY, s.delay.0, s.delay.1);
-        let age = (1.0 - f) * dt + r.extra_age - delay;
+        let life = range_exact(seed, stream::LIFETIME, s.lifetime.0, s.lifetime.1);
+        let delay = range_exact(seed, stream::DELAY, s.delay.0, s.delay.1);
+        // Exact on both backends: an integer times a power-of-two multiple of `dt`, then two
+        // sums (the GPU `emit` kernel evaluates the same expression).
+        let age = (SUBTICKS - fq) as f32 * tick_step + r.extra_age - delay;
         if age > 0.0 {
             (pos, vel) = pre_age(pos, vel, s.gravity, s.drag, age);
         }
@@ -441,7 +466,7 @@ fn emit(pool: &mut [Particle], r: &SpawnRecord, dt: f32, entries: &[Entry], xf: 
         };
         pool[slot] = Particle {
             pos_age: [pos.x, pos.y, pos.z, age],
-            vel_inv_life: [vel.x, vel.y, vel.z, if life > 0.0 { 1.0 / life } else { 0.0 }],
+            vel_life: [vel.x, vel.y, vel.z, life.max(0.0)],
             misc: [x_axis, seed, r.entry, y_axis],
         };
     }
@@ -466,7 +491,8 @@ pub(crate) struct PackLayer {
     pub extent: f32,
 }
 
-/// A draw of packed instances.
+/// A draw of render instances: `count` instances from `first` (CPU backend), or at most `count`
+/// from `first` with the instance count in the indirect args `args` (GPU backend).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PackItem {
     pub first: u32,
@@ -474,9 +500,18 @@ pub(crate) struct PackItem {
     pub layer: u32,
     /// Allocation serial of the (first) layer instance: the deterministic tie-break.
     pub serial: u64,
+    /// Culling bounds (exact on the CPU backend, conservative on the GPU backend).
     pub min: Vec3,
     pub max: Vec3,
+    /// Where the item sorts by depth: the same on both backends and for any render cadence
+    /// ([`Runtime::entry_center`]).
+    pub center: Vec3,
+    /// Index of the item's `DrawIndirectArgs` (GPU backend), `u32::MAX` for direct draws.
+    pub args: u32,
 }
+
+/// `args` of a direct draw.
+pub(crate) const DIRECT: u32 = u32::MAX;
 
 /// Inputs of [`pack`].
 pub(crate) struct PackInput<'a> {
@@ -561,6 +596,8 @@ pub(crate) fn pack(
                 serial,
                 min: min - r,
                 max: max + r,
+                center: rt.entry_center(e0, input.poses),
+                args: DIRECT,
             });
         }
         k = end;
@@ -590,16 +627,16 @@ fn pack_entry(
         let Some(p) = input.pool.get(slot) else {
             continue;
         };
-        let inv_life = p.vel_inv_life[3];
+        let life = p.vel_life[3];
         // Dead, or a particle of the range's previous owner (dead too by construction).
-        if inv_life == 0.0 || p.misc[2] != index {
+        if life == 0.0 || p.misc[2] != index {
             continue;
         }
         let age = p.pos_age[3] + dt;
-        let t = age * inv_life;
-        if age < 0.0 || t >= 1.0 {
+        if age < 0.0 || age >= life {
             continue;
         }
+        let t = age / life;
         let seed = p.misc[1];
         let moving = if p.pos_age[3] >= 0.0 { dt } else { age.max(0.0) };
         let v = p.vel();

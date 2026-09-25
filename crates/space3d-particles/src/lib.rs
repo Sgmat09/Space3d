@@ -20,11 +20,11 @@
 //!   through the `Parent` chain), decides the emission of the tick (exact rate accumulators,
 //!   bursts with their sub-tick time) and records it in a tick log. Emission never depends on the
 //!   frame rate.
-//! * The `"space3d/particles"` render node replays the pending ticks inside the render frame
-//!   (the CPU backend: [`ParticleBackend::Cpu`]; the GPU backend lands with milestone PA2), so
-//!   `render_to_image` after `n` ticks shows exactly `n` ticks of simulation, and rendering every
-//!   tick, rendering once at the end, or replaying only the last catch-up window give identical
-//!   images.
+//! * The `"space3d/particles"` render node replays the pending ticks inside the render frame —
+//!   with compute kernels ([`ParticleBackend::Gpu`], 100k+ particles) or in Rust
+//!   ([`ParticleBackend::Cpu`], the WebGL2 path) — so `render_to_image` after `n` ticks shows
+//!   exactly `n` ticks of simulation, and rendering every tick, rendering once at the end, or
+//!   replaying only the last catch-up window give identical images.
 //! * Particle `k` of a layer instance always lands in ring slot `base + k mod capacity`, and its
 //!   random attributes come from a PCG hash of (layer instance seed, `k`): deterministic, and
 //!   shared bit for bit with the shaders.
@@ -33,12 +33,15 @@ mod components;
 mod cpu;
 mod curve;
 mod effect;
+mod gpu;
 mod pack;
 mod registry;
 mod render;
 mod rng;
 mod runtime;
 mod stats;
+#[doc(hidden)]
+pub mod testing;
 
 pub use components::{
     BeamEnd, EffectSpawn, FinishAction, OnRemove, ParticleAttractor, ParticleBeam, ParticleEffectFinished,
@@ -55,8 +58,8 @@ pub use registry::{EffectError, EffectHandle, ParticleEffects, builtin};
 pub use runtime::ParticleRuntime;
 pub use stats::{EffectState, ParticleStats};
 
-use space3d_core::{App, Events, Plugin, Stage, SystemCtx, Time};
-use space3d_render::{GraphicsQuality, RenderNodes};
+use space3d_core::{App, Events, Plugin, Resources, Stage, SystemCtx, Time};
+use space3d_render::{FrameSettings, GraphicsQuality, RenderNodes, Renderer};
 
 /// Adds the particle resources, the fixed-tick emission system and the `"space3d/particles"`
 /// render node. Add it next to `RenderPlugin` (or `DefaultPlugins`); without a renderer effects
@@ -125,9 +128,11 @@ impl Plugin for ParticlesPlugin {
         }
         // The render node (the frame's `RenderNodes` exists with or without a renderer; a
         // `RenderPlugin` added later keeps it).
-        app.resources
+        let node = app
+            .resources
             .init::<RenderNodes>()
             .insert(render::NODE_NAME, render::ParticlesNode::new(&self.settings));
+        app.insert_resource(testing::NodeHandle(node));
     }
 }
 
@@ -149,6 +154,7 @@ pub fn tick_system(ctx: &mut SystemCtx) {
         };
         let dt = res.get::<Time>().map_or(0.0, Time::fixed_delta_secs);
         let rt = &mut runtime.rt;
+        rt.budget = Some(pool_budget(settings, res));
         rt.tick(world, settings, effects, dt);
         let (live, layers) = rt.counts();
         let (total, reserved, spawned) = (rt.pool.total(), rt.pool.reserved(), rt.spawned);
@@ -189,6 +195,33 @@ pub fn tick_system(ctx: &mut SystemCtx) {
     }
 }
 
+/// The backend `wanted` resolves to on a device with (`Some(true)`) or without culling-class
+/// compute and indirect draws, or before a renderer exists (`None`: as with compute).
+pub(crate) fn resolve_backend(wanted: ParticleBackend, compute: Option<bool>) -> ParticleBackend {
+    match (wanted, compute) {
+        (ParticleBackend::Cpu, _) | (_, Some(false)) => ParticleBackend::Cpu,
+        _ => ParticleBackend::Gpu,
+    }
+}
+
+/// Pool budget of the backend the renderer (if any) resolves to: `max_particles_cpu`, or
+/// `max_particles` within the device's storage binding and buffer limits.
+fn pool_budget(settings: &ParticleSettings, res: &Resources) -> u32 {
+    let renderer = res.get::<Renderer>();
+    let no_compute = res.get::<FrameSettings>().is_some_and(|f| f.downlevel.no_compute);
+    let compute = renderer.map(|r| r.graphics_caps().compute && !no_compute);
+    match resolve_backend(settings.backend, compute) {
+        ParticleBackend::Cpu => settings.max_particles_cpu,
+        _ => {
+            let limit = renderer.map_or(u32::MAX, |r| {
+                let caps = r.capabilities();
+                gpu::pool_limit(caps.max_storage_binding, caps.max_buffer_size)
+            });
+            settings.max_particles.min(limit)
+        }
+    }
+}
+
 /// Runtime options (resource). Fields are public; construct with `..Default::default()`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParticleSettings {
@@ -196,7 +229,8 @@ pub struct ParticleSettings {
     pub enabled: bool,
     /// Simulation backend.
     pub backend: ParticleBackend,
-    /// GPU pool budget: 262 144 (65 536 on Android and iOS).
+    /// GPU pool budget: 262 144 (65 536 on Android and iOS), within the device's storage
+    /// binding limit.
     pub max_particles: u32,
     /// CPU backend budget: 16 384 native, 8 192 on the web.
     pub max_particles_cpu: u32,
@@ -255,17 +289,20 @@ impl ParticleSettings {
     }
 }
 
-/// Simulation backend.
+/// Simulation backend (`ParticleStats::backend` reports the one in use).
 ///
-/// The GPU backend lands with milestone PA2; until then `Auto` and `Gpu` simulate on the CPU
-/// (`ParticleStats::backend` reports the backend in use).
+/// Both run the same tick log, ring slots, RNG streams and render pipeline: the alive sets and
+/// slots are identical and positions agree within float rounding, so switching backends
+/// changes performance, not the look.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ParticleBackend {
-    /// `Gpu` when the device has culling-class compute and indirect draws, else `Cpu`.
+    /// `Gpu` when the device has culling-class compute and indirect draws
+    /// (`GraphicsCaps::compute`, not masked by `DownlevelOverride::no_compute`), else `Cpu`.
     #[default]
     Auto,
-    /// Compute simulation and compaction.
+    /// Compute simulation and compaction (`max_particles`, 262 144 by default), drawn with
+    /// indirect draws. Falls back to `Cpu` (with a warning) on devices without compute.
     Gpu,
     /// CPU simulation (the WebGL2 path): the same tick log, ring slots, RNG, instance stream
     /// and render pipeline as the GPU backend.

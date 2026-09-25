@@ -93,6 +93,14 @@ pub fn stats(app: &App) -> ParticleStats {
     app.resources.expect::<ParticleStats>().clone()
 }
 
+/// Stats after two more frames without ticks: the GPU backend's alive count (read back 1–3
+/// frames late) describes the current particles.
+pub fn settled_stats(app: &mut App) -> ParticleStats {
+    render(app);
+    render(app);
+    stats(app)
+}
+
 /// A layer of one long-lived, motionless particle drawn as a hard-edged disc of `size`.
 pub fn dot(color: Vec4, blend: ParticleBlend, size: f32) -> ParticleLayer {
     ParticleLayer {
