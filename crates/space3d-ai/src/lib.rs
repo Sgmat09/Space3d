@@ -67,8 +67,9 @@
 //! ## Status
 //!
 //! The Android backend has been built into an APK and tested against the real `OamJni` in a
-//! desktop JVM, but has not yet run on a Gemini Nano device. iOS linking is documented but
-//! untested.
+//! desktop JVM, but has not yet run on a Gemini Nano device. On iOS the Apple backend has
+//! answered `initialize` in the simulator, linked from a static XCFramework slice, but has not
+//! run in an Xcode app project or on a device.
 //!
 //! ## Guides
 //!

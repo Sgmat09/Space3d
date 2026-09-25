@@ -51,7 +51,8 @@ fn build(app: &mut App) {
     app.add_plugin(DefaultPlugins::new());
     app.insert_resource(Stock(3));
     app.add_plugin(
-        // Apple or Android when available, a scripted model elsewhere (web, Linux, Windows, CI).
+        // The platform's backend where one is built in (Apple with `ai-apple-ffi`, Android),
+        // a scripted model elsewhere (web, Linux, Windows, CI).
         AiPlugin::new(BackendChoice::auto_or(ScriptedBackend::new())).with_tool(
             AiTool::new("check_inventory", "How many of an item are in stock, and its price in gold.")
                 .parameters(json!({"type": "object", "properties": {"item": {"type": "string"}}, "required": ["item"]}))
@@ -166,9 +167,15 @@ AiPlugin::new(BackendChoice::backend(MyTransport::new()))       // any `impl AiB
 `AndroidBackend::from_android_context()`, which uses the context that android-activity publishes through
 ndk-context. Everywhere else it resolves to `UnsupportedBackend`, with a reason. A backend that fails to start, for
 example an Android app without the open-android-models AAR, is replaced by an `UnsupportedBackend` that explains why.
-`AiError::is_unavailable()` covers both `model_unavailable` and `unsupported`: show scripted content then.
 
-Custom transports implement `AiBackend`: `start(inbox)`, `send(line)`, and optionally `poll()` and `shutdown()`.
+`auto_or`'s fallback is used only where no platform backend is built in: the web, Windows, Linux, and Apple
+targets without `apple-ffi`. On a Mac built with `ai-apple-ffi`, or on any Android device, the platform backend is
+used even when the device has no model (Apple Intelligence off, no AICore), and a platform backend that fails to
+start becomes an `UnsupportedBackend`, not the fallback. Requests then fail with `model_unavailable` or
+`unsupported`. `AiError::is_unavailable()` covers both: show scripted content then.
+
+Custom transports implement `AiBackend`: `kind()`, `start(inbox)`, `send(line)`, and optionally `poll()` and
+`shutdown()`.
 Deliver every line the bridge writes to `inbox.deliver(line)`, from any thread, in order.
 
 ## Scripted models
@@ -212,8 +219,10 @@ Requires OS 27 and, for the system model, Apple Intelligence. Scripted models wo
 **macOS.** Build the dylib, then build with the feature:
 
 ```sh
-cd open-apple-models && swift build -c release --product OpenAppleModelsFFI
-export OAM_APPLE_LIB_DIR=$PWD/.build/release          # folder with libOpenAppleModelsFFI.dylib
+OAM=/path/to/open-apple-models
+swift build --package-path $OAM -c release --product OpenAppleModelsFFI
+export OAM_APPLE_LIB_DIR=$OAM/.build/release          # folder with libOpenAppleModelsFFI.dylib
+# then, in the Space3d checkout:
 cargo run -p ai_tavern --features apple               # the example (space3d/ai-apple-ffi)
 cargo test -p space3d-ai --features apple-ffi         # includes tests/apple_live.rs
 ```
@@ -227,29 +236,47 @@ cargo test -p space3d-ai --features apple-ffi         # includes tests/apple_liv
   with `@executable_path/../Frameworks`.
 - Without the feature, or without Apple, `AppleBackend` compiles everywhere and reports `Unsupported`.
 
-**iOS and visionOS.** These need Xcode 27; that path is untested here, because this machine has no Xcode.
-Space3d builds the game as a Rust `staticlib` that the Xcode project links (`docs/platforms.md`). Build it with
-`--features apple-ffi` (`ai-apple-ffi` on the facade) and **without** `OAM_APPLE_LIB_DIR`: `build.rs` then only
-enables the backend, and Xcode resolves the `oam_bridge_*` symbols when it links the app. Link open-apple-models in
-one of two ways:
+**iOS and visionOS.** These need Xcode 27. Space3d builds the game as a Rust `staticlib` that the Xcode project
+links (`docs/platforms.md`). Build it with `--features apple-ffi` (`ai-apple-ffi` on the facade) and **without**
+`OAM_APPLE_LIB_DIR`: `build.rs` then only enables the backend, and the `oam_bridge_*` symbols are resolved when
+Xcode links the app. Link open-apple-models in one of two ways:
 
-1. **Static XCFramework**, recommended: one binary, nothing to embed.
-   1. Build the `OpenAppleModelsFFI` target as a static library for device and simulator:
-      `xcodebuild build -scheme OpenAppleModelsFFI -destination 'generic/platform=iOS' -configuration Release
-      -derivedDataPath .build/xcode MACH_O_TYPE=staticlib SKIP_INSTALL=NO`, then the same for
-      `'generic/platform=iOS Simulator'`. Alternatively, add a `.library(name: "OpenAppleModelsFFIStatic", type: .static,
-      targets: ["OpenAppleModelsFFI"])` product.
-   2. Package the slices: `xcodebuild -create-xcframework -library <device>/libOpenAppleModelsFFI.a -headers
-      bindings/c -library <simulator>/libOpenAppleModelsFFI.a -headers bindings/c -output
-      OpenAppleModelsFFI.xcframework`.
+1. **Static XCFramework**: one binary, nothing to embed.
+   1. In open-apple-models, build the `OpenAppleModelsFFI` scheme as a static framework for device and simulator:
+
+      ```sh
+      for destination in "generic/platform=iOS" "generic/platform=iOS Simulator"; do
+        xcodebuild build -scheme OpenAppleModelsFFI -destination "$destination" -configuration Release \
+          -derivedDataPath .build/xcode MACH_O_TYPE=staticlib SKIP_INSTALL=NO
+      done
+      ```
+
+      `MACH_O_TYPE=staticlib` turns `PackageFrameworks/OpenAppleModelsFFI.framework` into a static framework that
+      contains the whole library (the bridge, the game layer and the core), not only the C ABI target.
+   2. Package the slices:
+
+      ```sh
+      xcodebuild -create-xcframework \
+        -framework .build/xcode/Build/Products/Release-iphoneos/PackageFrameworks/OpenAppleModelsFFI.framework \
+        -framework .build/xcode/Build/Products/Release-iphonesimulator/PackageFrameworks/OpenAppleModelsFFI.framework \
+        -output OpenAppleModelsFFI.xcframework
+      ```
+
    3. Add the XCFramework to the app target's *Frameworks, Libraries, and Embedded Content* as **Do Not Embed**.
-      Link `FoundationModels.framework`, and add `-lswiftCore` if the linker reports missing Swift runtime symbols.
-      The runtime ships with the OS.
+      Its objects auto-link `FoundationModels` and the Swift runtime, which ships with the OS. If your link setup
+      turns auto-linking off, link `FoundationModels.framework` and add `$(SDKROOT)/usr/lib/swift` to the library
+      search paths.
 2. **Dynamic framework**: the `OpenAppleModelsFFI.xcframework` from open-apple-models' `bindings/README.md`, added
    as **Embed & Sign**.
 
 Either way, set the app's minimum deployment target to **27.0**. The library links FoundationModels strongly, so
 with a lower minimum the app crashes at launch on older systems.
+
+What has been checked: steps 1 and 2 above, with Xcode 27. A Rust `staticlib` using `AppleBackend`, built with
+`apple-ffi` and without `OAM_APPLE_LIB_DIR`, links with `clang` against the device and the simulator framework from
+step 1. In the iOS 27 simulator it started the bridge and answered `initialize`. It has not yet been checked in an
+Xcode app project, on a device, or with the on-device model on iOS. The dynamic framework and visionOS have not been
+tried.
 
 ## Android
 
@@ -312,7 +339,8 @@ open-android-models' real `OamJni` and `BridgeEngine` in a desktop JVM (`android
   Decode into structs.
 - The Android backend has not run on a device: no Gemini Nano device or emulator was available. It has been
   compiled and packaged into an APK, and its JNI code has been tested against the real `OamJni` in a desktop JVM.
-- iOS linking is documented but untested (no Xcode here).
+- iOS has only been checked in the simulator, outside an Xcode app project, with the static XCFramework
+  (see [iOS and visionOS](#apple-macos-ios-visionos-27)). It has not run on a device.
 
 [open-apple-models]: https://github.com/SpaceCorps/open-apple-models
 [open-android-models]: https://github.com/SpaceCorps/open-android-models

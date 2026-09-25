@@ -95,9 +95,12 @@ game keeps running and can show scripted content.
 1. Put the game in a library crate with `pub fn build(app: &mut App)`, and add
    `space3d = { …, features = ["ai"] }`.
 2. Copy `android/` and change the following:
-   - `native/Cargo.toml`: the package name and the path to your game crate
+   - `native/Cargo.toml`: the package name, and the paths to your game crate and to `space3d`
+   - `native/src/lib.rs`: `space3d::main!(your_game::build)`
    - `AndroidManifest.xml`: `android.app.lib_name`, which is the native package name with `-` replaced by `_`
    - `app/build.gradle.kts`: `namespace` and `applicationId`
+   - `gradle.properties`: `oamDir`, which is relative to the copy. If the folder has no `settings.gradle.kts`,
+     the build quietly falls back to `mavenLocal()`, and dependency resolution fails unless you published there.
 3. For a custom Activity, a GameActivity or an existing Android app, create the backend yourself and inject it:
    `AiPlugin::new(BackendChoice::backend(unsafe { AndroidBackend::from_raw(vm_ptr, context_ptr)? }))`, for example
    with `AndroidApp::vm_as_ptr()` and `activity_as_ptr()`.
@@ -110,13 +113,15 @@ game keeps running and can show scripted content.
   others; nano-v4 covers Pixel 11 and Galaxy Z Flip8/Fold8. There is no emulator support and no support on unlocked
   bootloaders. Elsewhere, `model/availability` reports `available: false` with a `reason`, and scripted models still
   work.
-- **Download.** A fresh device may report `status: "downloadable"` or `"downloading"` in `ModelAvailability`. Offer
-  the download, or show scripted content until it is ready.
+- **Download.** A fresh device may report `status: "downloadable"` or `"downloading"` in `ModelAvailability`. The
+  bridge protocol has no method that starts the download, so `space3d-ai` cannot start it. Kotlin code in the host
+  app can, with open-android-models' `GeminiNanoModel.download()` (for example from an `Application` subclass).
+  Until the model is ready, show scripted content.
 - **Foreground only.** Turns started in the background fail with `rate_limited` (`BACKGROUND_USE_BLOCKED`).
   NativeActivity is the foreground app while the game is on screen.
 - **Budget.** The input budget is about 4000 tokens (`contextSize`) and output is capped at 4096. Keep personas short.
-- **Behavior.** The protocol behaves the same as on Apple, apart from the Android differences in open-android-models'
-  `docs/PROTOCOL.md`:
+- **Behavior.** The protocol behaves the same as on Apple, apart from the Android differences listed in
+  open-android-models' `docs/PROTOCOL.md`. Among them:
   - `auto` behaves like `explicit`.
   - A step makes at most one tool call.
   - Steps carry `kind` and `isRepair`.
@@ -142,11 +147,11 @@ It also runs the eight shared protocol scenarios. The `android-jvm` feature comp
 and `tests/jvm` holds stubs for `android.content.Context` and `android.util.Log`.
 
 ```sh
-export JAVA_HOME=/path/to/jdk-21
-(cd open-android-models && ./gradlew -q --no-configuration-cache \
+export JAVA_HOME=/path/to/jdk-21 SPACE3D=/path/to/Space3d OAM=/path/to/open-android-models
+(cd $OAM && ./gradlew -q --no-configuration-cache \
     -I $SPACE3D/crates/space3d-ai/tests/jvm/print-classpath.init.gradle.kts \
-    :oam-bridge:jar :oam-mlkit:bundleLibRuntimeToDirDebug :oam-bridge:printOamJniClasspath) > /tmp/oam-cp
-OAM_ANDROID_CLASSPATH=$(tail -1 /tmp/oam-cp) \
+    :oam-bridge:printOamJniClasspath) > /tmp/oam-cp        # builds the jars first, prints the classpath
+cd $SPACE3D && OAM_ANDROID_CLASSPATH=$(tail -1 /tmp/oam-cp) \
     cargo test -p space3d-ai --features android-jvm --test android_jvm -- --nocapture
 ```
 

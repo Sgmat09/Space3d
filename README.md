@@ -160,7 +160,7 @@ Other commands: `space3d build --target desktop|web|android|ios [--release]`,
 | HTTP / WebSocket client | ✓ | ✓ | ✓ | ✓ (fetch / WebSocket) | ✓ | ✓ |
 | HTTP / WebSocket server | ✓ | ✓ | ✓ | — | ✓ | ✓ |
 | hot reload | ✓ | ✓ | ✓ | — | — | — |
-| on-device AI (`ai`) | scripted models | Foundation Models (macOS 27) | scripted models | scripted models | Gemini Nano (Gradle host app) | Foundation Models (iOS 27) |
+| on-device AI (`ai`) | scripted models | Foundation Models (macOS 27, `ai-apple-ffi`) | scripted models | scripted models | Gemini Nano (Gradle host app) | Foundation Models (iOS 27, `ai-apple-ffi`) |
 
 Details and per-platform setup: [docs/platforms.md](docs/platforms.md). On-device AI:
 [docs/ai.md](docs/ai.md) and, for Android's Gradle host app, [docs/ai-android.md](docs/ai-android.md);
