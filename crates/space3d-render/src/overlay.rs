@@ -20,6 +20,13 @@
 //! opaque black before the overlays run (the surface is cleared by the renderer already), so
 //! UI-only apps never show stale pixels.
 //!
+//! That is the default stage, [`OverlayStage::AfterTonemap`]. An overlay returning
+//! [`OverlayStage::HdrScene`] from [`RenderOverlay::stage`] draws into the primary target's scene
+//! color instead — after its last scene view, before post (exposure, bloom, tonemapping), in the
+//! encoding [`OverlayScene::output`] names — or, in Direct mode (no post camera), into the target
+//! before every `AfterTonemap` overlay. See graphics spec §1.5 and `docs/graphics/frame.md`
+//! ("Overlay stages", with the migration of an additive overlay).
+//!
 //! Overlays are shared as `Arc<Mutex<dyn RenderOverlay>>` ([`SharedOverlay`]): the owner keeps a
 //! typed handle (returned by [`RenderOverlays::insert`]) to feed per-frame data, and the
 //! renderer keeps a snapshot of the list so windowed captures can replay it.
@@ -88,6 +95,13 @@ pub struct OverlayTarget {
 /// [`RenderOverlay::render`] in the same order. For windowed captures the overlays run again
 /// with [`OverlayTargetKind::Capture`], possibly with a different texture format than the
 /// surface, so implementations must handle any `target.format`.
+///
+/// Overlays whose [`Self::stage`] is [`OverlayStage::HdrScene`] follow the same contract in an
+/// earlier pass: into the primary scene color (`Rgba16Float`, `Rg11b10Ufloat`, or
+/// `Rgba8UnormSrgb` in the Ldr fallback) after its last scene view, with
+/// [`Self::prepare_scene`] called before [`Self::prepare`]. They are skipped in frames without a
+/// primary view, and capture replays call them again only when the primary target rendered in
+/// Direct mode (otherwise they are already in the scene color the capture composites again).
 pub trait RenderOverlay: Send + Sync + 'static {
     /// Upload per-frame data. Called once per overlay pass, before [`Self::render`], with the
     /// frame's encoder (work recorded here executes before the overlay pass).
@@ -319,11 +333,14 @@ impl RenderOverlays {
 }
 
 /// The renderer's snapshot of [`RenderOverlays`] (re-cloned only when the list changes), kept so
-/// windowed captures can replay the overlays outside of `render_frame`.
+/// windowed captures can replay the overlays outside of `render_frame`, and every overlay's
+/// stage and scene reads (read at the start of every frame).
 #[derive(Default)]
 pub(crate) struct OverlayCache {
     generation: u64,
     list: Vec<SharedOverlay>,
+    /// Stage and scene reads of each overlay of `list`, this frame.
+    stages: Vec<(OverlayStage, SceneReads)>,
     scale_factor: f32,
 }
 
@@ -343,6 +360,42 @@ impl OverlayCache {
                 self.generation = 0;
             }
         }
+        self.stages.clear();
+        for overlay in &self.list {
+            let o = lock_overlay(overlay);
+            let stage = o.stage();
+            let reads = if stage == OverlayStage::HdrScene {
+                o.scene_reads()
+            } else {
+                SceneReads::NONE
+            };
+            self.stages.push((stage, reads));
+        }
+    }
+
+    /// Some overlay draws in `stage` this frame.
+    pub(crate) fn has_stage(&self, stage: OverlayStage) -> bool {
+        self.stages.iter().any(|(s, _)| *s == stage)
+    }
+
+    /// Some HdrScene overlay reads scene depth this frame.
+    pub(crate) fn hdr_scene_depth(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|(s, r)| *s == OverlayStage::HdrScene && r.contains(SceneReads::DEPTH))
+    }
+
+    /// Overlays in draw order with their stage and scene reads this frame.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&SharedOverlay, OverlayStage, SceneReads)> {
+        self.list
+            .iter()
+            .zip(&self.stages)
+            .map(|(o, &(stage, reads))| (o, stage, reads))
+    }
+
+    /// Scale factor of the overlays' targets.
+    pub(crate) fn scale_factor(&self) -> f32 {
+        self.scale_factor
     }
 }
 
@@ -367,7 +420,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         surface_view: Option<&wgpu::TextureView>,
     ) {
-        if self.overlays.list.is_empty() {
+        if !self.overlays.has_stage(OverlayStage::AfterTonemap) {
             return;
         }
         match (&self.surface, surface_view) {
@@ -386,7 +439,7 @@ impl Renderer {
     /// replayed views ([`Renderer::encode_capture_replay`]): drawn before them, the re-recorded
     /// scene would paint over them.
     pub(crate) fn encode_capture_overlays(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        if !self.overlays.list.is_empty() {
+        if self.overlays.has_stage(OverlayStage::AfterTonemap) {
             self.encode_offscreen_overlays(encoder, OverlayTargetKind::Capture);
         }
     }
@@ -412,8 +465,10 @@ impl Renderer {
         target: &OverlayTarget,
         clear: bool,
     ) {
-        for overlay in &self.overlays.list {
-            lock_overlay(overlay).prepare(&self.device, &self.queue, encoder, target);
+        for (overlay, stage, _) in self.overlays.iter() {
+            if stage == OverlayStage::AfterTonemap {
+                lock_overlay(overlay).prepare(&self.device, &self.queue, encoder, target);
+            }
         }
         let load = if clear {
             wgpu::LoadOp::Clear(wgpu::Color::BLACK)
@@ -436,7 +491,10 @@ impl Renderer {
             })
             .forget_lifetime();
         let (w, h) = target.size;
-        for overlay in &self.overlays.list {
+        for (overlay, stage, _) in self.overlays.iter() {
+            if stage != OverlayStage::AfterTonemap {
+                continue;
+            }
             pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, w, h);
             lock_overlay(overlay).render(&mut pass, target);

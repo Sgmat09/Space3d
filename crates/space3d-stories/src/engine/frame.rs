@@ -3,17 +3,29 @@
 //!
 //! Owner: F (graphics spec §3.6).
 
+mod demo;
+
 use super::{ambient, mesh, palette, sun};
 use crate::{KnobValues, Story};
+use demo::{AdditiveSprites, Band, BandKind, Particle, PhaseBands, SoftParticles, Sprite};
 use space3d_core::prelude::*;
 use space3d_render::{
-    Camera3d, CameraFrame, DownlevelOverride, FrameSettings, HdrMode, Material, Mesh3d, PointLight, PostProcess,
-    Projection, RenderAssets, RenderTarget, Tonemapper,
+    Camera3d, CameraFrame, DownlevelOverride, FrameSettings, HdrMode, Material, Mesh3d, PhaseSlot, PointLight,
+    PostProcess, Projection, RenderAssets, RenderNodes, RenderOverlays, RenderPhase, RenderTarget, RenderTargetDesc,
+    SceneReads, Tonemapper,
 };
 
 /// This area's stories, in registry order.
 pub(crate) fn stories() -> Vec<Story> {
-    vec![hdr_tonemapping(), render_scale(), multi_camera(), ldr_fallback()]
+    vec![
+        hdr_tonemapping(),
+        render_scale(),
+        multi_camera(),
+        ldr_fallback(),
+        node_phases(),
+        soft_depth(),
+        overlay_stages(),
+    ]
 }
 
 const TONEMAPPERS: [&str; 5] = [
@@ -320,6 +332,265 @@ fn multi_camera() -> Story {
     )
     .knob_f32("exposure", 0.0, -3.0..=3.0)
     .knob_f32("glow", 12.0, 0.0..=40.0)
+    .tag("graphics")
+    .size(320, 180)
+}
+
+fn node_phases() -> Story {
+    Story::new("Engine/Frame/Node Phases", |app, _| {
+        let cube = mesh(app, MeshData::cube(0.9));
+        let ground = mesh(app, MeshData::plane(14.0));
+        let panel = mesh(app, MeshData::plane(1.0));
+        for (i, x) in [-1.7f32, 0.0, 1.7].into_iter().enumerate() {
+            app.world.spawn((
+                at(Vec3::new(x, 0.0, 0.0)).with_rotation(Quat::from_rotation_y(0.5)),
+                Mesh3d(cube),
+                Material::color(palette(i * 2 + 1).extend(1.0)).with_metallic_roughness(0.0, 0.45),
+            ));
+        }
+        app.world.spawn((
+            at(Vec3::new(0.0, -0.45, 0.0)),
+            Mesh3d(ground),
+            Material::srgb(0.3, 0.31, 0.34).with_metallic_roughness(0.0, 0.9),
+        ));
+        // The built-in blended batch: a translucent panel on the right.
+        app.world.spawn((
+            at(Vec3::new(1.25, 0.35, 1.6))
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::new(1.4, 1.0, 1.3)),
+            Mesh3d(panel),
+            Material {
+                alpha_blend: true,
+                double_sided: true,
+                ..Material::unlit(Vec4::new(0.15, 0.55, 1.0, 0.55))
+            },
+        ));
+        sun(app, Vec3::new(-0.4, -1.0, -0.6), 2.2);
+        ambient(app, 0.08);
+        app.world.spawn((
+            Name("camera".into()),
+            Transform::from_xyz(0.0, 1.1, 5.2).looking_at(Vec3::new(0.0, 0.2, 0.0), Vec3::Y),
+            Camera3d::default().with_clear_color(SPACE),
+        ));
+        let (op, sky, tr) = (RenderPhase::Opaque, RenderPhase::Skybox, RenderPhase::Transparent);
+        let band = |slot, kind, rect, color| Band {
+            slot,
+            kind,
+            rect,
+            color,
+        };
+        let bands = vec![
+            // Before the built-in opaque batches, far away: the cubes and the ground cover it,
+            // the sky does not.
+            band(
+                PhaseSlot::new(op, -1),
+                BandKind::Backdrop,
+                [-1.0, 0.02, 1.0, 0.22],
+                [1.0, 0.45, 0.05, 1.0],
+            ),
+            // After them: over the left cube.
+            band(
+                PhaseSlot::new(op, 10),
+                BandKind::Flat,
+                [-0.36, -1.0, -0.28, 1.0],
+                [0.9, 0.08, 0.08, 1.0],
+            ),
+            // At the far plane, only where nothing was drawn.
+            band(
+                PhaseSlot::new(sky, 0),
+                BandKind::Sky,
+                [-1.0, -1.0, 1.0, 1.0],
+                [0.12, 0.2, 0.5, 1.0],
+            ),
+            // Before the built-in blended panel (under it), after it (over it).
+            band(
+                PhaseSlot::new(tr, -1),
+                BandKind::Flat,
+                [0.08, 0.0, 0.62, 0.14],
+                [0.1, 0.95, 0.3, 0.9],
+            ),
+            band(
+                PhaseSlot::new(tr, 5),
+                BandKind::Flat,
+                [0.08, -0.26, 0.62, -0.12],
+                [0.95, 0.2, 0.8, 0.9],
+            ),
+            // Reading scene depth, after everything: haze growing with distance.
+            band(
+                PhaseSlot::new(tr, 10).reading(SceneReads::DEPTH),
+                BandKind::Haze,
+                [-1.0, -1.0, 1.0, 0.02],
+                [0.55, 0.6, 0.75, 0.7],
+            ),
+        ];
+        app.resources
+            .init::<RenderNodes>()
+            .insert("stories/phase-bands", PhaseBands::new(bands));
+    })
+    .description(
+        "A render node with a colored band in every phase around the built-in batches: an orange \
+         Opaque band at order -1, far away (under the cubes and the ground), a red Opaque band at \
+         order 10 (over them), a sky gradient in the Skybox phase (only where nothing was drawn), \
+         a green Transparent band at order -1 (under the translucent built-in panel) and a magenta \
+         one at order 5 (over it), and a depth-reading Transparent slot adding haze with scene \
+         distance below the horizon (its SceneRead pass).",
+    )
+    .tag("graphics")
+    .size(320, 180)
+}
+
+fn soft_depth() -> Story {
+    Story::new("Engine/Frame/Soft Depth", |app, k| {
+        // The scene renders into a render target with the knob's sample count (an app's MSAA
+        // is set on its renderer; a story can only choose it per render target), shown
+        // full-screen by the primary camera.
+        let samples = if k.choice("msaa") == 1 { 4 } else { 1 };
+        let (w, h) = (320, 180);
+        let rt = app.resources.init::<RenderAssets>().add_render_target_with(
+            w,
+            h,
+            RenderTargetDesc::default().with_samples(samples),
+        );
+        app.insert_resource(FrameSettings::default().with_downlevel(DownlevelOverride {
+            no_read_only_depth: k.bool("no_read_only_depth"),
+            ..Default::default()
+        }));
+        // The analytic plane: a flat ground at y = 0.
+        let ground = mesh(app, MeshData::plane(16.0));
+        app.world.spawn((
+            Transform::IDENTITY,
+            Mesh3d(ground),
+            Material::srgb(0.32, 0.34, 0.38).with_metallic_roughness(0.0, 0.85),
+        ));
+        let pillar = mesh(app, MeshData::cube(1.0));
+        app.world.spawn((
+            at(Vec3::new(0.0, 0.6, -1.6)).with_scale(Vec3::new(0.5, 1.2, 0.5)),
+            Mesh3d(pillar),
+            Material::srgb(0.6, 0.55, 0.5),
+        ));
+        sun(app, Vec3::new(-0.3, -1.0, -0.4), 2.0);
+        ambient(app, 0.1);
+        // Particles centered on the ground (half below it): hard in the back row, soft in front.
+        let softness = k.f32("softness");
+        let mut particles = Vec::new();
+        for (row, (z, soft)) in [(-0.6f32, 0.0f32), (1.0, softness)].into_iter().enumerate() {
+            for i in 0..5 {
+                let hue = palette(i + row * 3);
+                particles.push(Particle {
+                    position: [-2.4 + i as f32 * 1.2, 0.0, z],
+                    radius: 0.6,
+                    color: (hue * 2.0).to_array(),
+                    softness: soft,
+                });
+            }
+        }
+        app.resources.init::<RenderNodes>().insert(
+            "stories/soft-particles",
+            SoftParticles::new(particles, RenderTarget::Texture(rt)),
+        );
+        app.world.spawn((
+            Name("scene camera".into()),
+            Transform::from_xyz(0.0, 1.6, 4.8).looking_at(Vec3::new(0.0, 0.2, 0.0), Vec3::Y),
+            Camera3d {
+                order: -1,
+                target: RenderTarget::Texture(rt),
+                ..Camera3d::default().with_clear_color(SPACE)
+            },
+        ));
+        // The render target on a full-screen quad, far from the scene.
+        let screen = mesh(app, MeshData::plane(1.0));
+        let aspect = w as f32 / h as f32;
+        app.world.spawn((
+            at(Vec3::new(0.0, -100.0, 0.0))
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::new(2.0 * aspect, 1.0, 2.0)),
+            Mesh3d(screen),
+            Material::unlit(Vec4::ONE).with_texture(rt),
+        ));
+        app.world.spawn((
+            Name("camera".into()),
+            Transform::from_xyz(0.0, -100.0, 5.0),
+            Camera3d::default()
+                .with_clear_color(SPACE)
+                .with_projection(Projection::Orthographic {
+                    height: 2.0,
+                    near: 0.1,
+                    far: 10.0,
+                }),
+        ));
+    })
+    .description(
+        "Additive particles centered on a flat ground, drawn by a render node whose Transparent \
+         slot reads scene depth: the back row intersects the ground hard, the front row fades \
+         within `softness` of it. The scene renders into a render target with `msaa` samples: \
+         with 4 the depth is resolved (minimum of the samples) for the single-sample SceneRead \
+         pass; with `no_read_only_depth` (the WebGL2 path) depth is sampled without an \
+         attachment and tested manually — and with both, the particles draw inside the \
+         multisampled pass without fade (GLES cannot sample multisampled depth).",
+    )
+    .knob_choice("msaa", &["1×", "4×"], 0)
+    .knob_bool("no_read_only_depth", false)
+    .knob_f32("softness", 0.6, 0.0..=2.0)
+    .tag("graphics")
+    .size(320, 180)
+}
+
+fn overlay_stages() -> Story {
+    Story::new("Engine/Frame/Overlay Stages", |app, k| {
+        let gain = k.f32("intensity");
+        let sphere = mesh(app, MeshData::sphere(1.3, 48, 24));
+        app.world.spawn((
+            at(Vec3::new(0.0, -1.2, -1.0)),
+            Mesh3d(sphere),
+            Material::srgb(0.35, 0.45, 0.6).with_metallic_roughness(0.0, 0.7),
+        ));
+        sun(app, Vec3::new(-0.6, -0.4, -0.7), 2.5);
+        ambient(app, 0.03);
+        app.world.spawn((
+            Name("camera".into()),
+            Transform::from_xyz(0.0, 0.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+            Camera3d::default().with_clear_color(SPACE),
+            PostProcess::default().with_exposure(k.f32("exposure")),
+        ));
+        // The same sprites twice: left half through HdrScene (tonemapped with the scene), right
+        // half through AfterTonemap (soft-clipped by the overlay itself, 249c874 style).
+        let sprites = |x0: f32| -> Vec<Sprite> {
+            (0..6)
+                .map(|i| {
+                    let intensity = 0.5 * 2f32.powi(i) * gain;
+                    let tint = if i % 2 == 0 {
+                        Vec3::new(1.0, 0.55, 0.2)
+                    } else {
+                        Vec3::new(0.3, 0.6, 1.0)
+                    };
+                    Sprite {
+                        center: [x0 + (i % 3) as f32 * 0.13, 0.32 + (i / 3) as f32 * 0.36],
+                        radius: 0.11,
+                        color: (tint * intensity).to_array(),
+                    }
+                })
+                .collect()
+        };
+        let overlays = app.resources.init::<RenderOverlays>();
+        overlays.insert(
+            "stories/sprites-hdr-scene",
+            -100,
+            AdditiveSprites::new(true, sprites(0.1)),
+        );
+        overlays.insert(
+            "stories/sprites-after-tonemap",
+            -100,
+            AdditiveSprites::new(false, sprites(0.62)),
+        );
+    })
+    .description(
+        "The same additive sprites (intensity 0.5 to 16) as overlays over a post-processed scene: \
+         left through `OverlayStage::HdrScene`, into the HDR scene color before post (exposed and \
+         tonemapped with the scene; bloomed once bloom exists), right through the default \
+         `AfterTonemap` stage, soft-clipped by the overlay itself as 249c874-era overlays do.",
+    )
+    .knob_f32("intensity", 1.0, 0.0..=4.0)
+    .knob_f32("exposure", 0.0, -3.0..=3.0)
     .tag("graphics")
     .size(320, 180)
 }

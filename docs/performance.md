@@ -219,3 +219,26 @@ Allocations per frame by mode (`tests/alloc_frame.rs`: 400 moving lit cubes, CPU
 The one extra render pass (the composite) costs 30 wgpu-hal allocations on Metal; the renderer
 itself allocates nothing, creates no textures after the first frame and uploads nothing for a
 still scene (only the 16-byte dither seed of each post group when frames advance).
+
+### F5 / F6 — render nodes, scene depth, overlay stages
+
+Direct mode is unchanged: the engine goldens are bit-exact, and `tests/alloc.rs` still measures
+82–86 (CPU path) / 191–195 (GPU paths) / 314.6 (two viewport cameras) allocations per frame. The
+built-in skybox and distortion-mesh nodes are asked for work every frame (`prepare` once,
+`prepare_view` per view) and report none; overlay stages are read every frame. None of it
+allocates.
+
+Allocations per frame (`tests/alloc_frame.rs`, same scene as F4):
+
+| mode | allocations per frame | bound |
+|---|---|---|
+| Direct, Hdr, Ldr fallback, passthrough | 76 / 106 / 106 / 106 (unchanged) | 84 / 117 |
+| nodes: an Opaque and a Transparent slot in the scene pass, a depth-reading slot in a SceneRead pass | 119 | 132 |
+
+The SceneRead pass (one render pass) accounts for about 30 of the 43 extra; `cpu_reallocations`,
+`buffer_reallocations` and `textures_created` are 0 and live bytes do not grow.
+
+`benches/frame.rs` `frame/cpu/direct`, alternating the F4 build and this one on the same machine
+(load average 5–13, so single runs vary by up to 3×): the quietest pair measured 60.9 µs (F4) and
+60.5 µs (F5/F6); `frame/throughput/direct` 112.0 µs (F4 recorded 113.6 µs). The node and
+overlay-stage bookkeeping is below the measurement noise.

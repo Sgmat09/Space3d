@@ -102,6 +102,10 @@ pub(crate) struct TargetGroup {
     /// The view (index in `FrameState::views`) after whose pass the group is finished: its
     /// last scene view.
     pub(super) last_scene_view: Option<usize>,
+    /// Views drawing into the group's scene-pass attachments this frame (every view in Direct
+    /// mode, the scene views otherwise): with more than one, a multisampled group cannot
+    /// resolve depth for single-sample passes between them (graphics spec §1.6).
+    pub(super) scene_views: u32,
 }
 
 impl TargetGroup {
@@ -127,6 +131,11 @@ pub(crate) struct FramePostGroup {
     /// For `Tonemapped` scene views: linear exposure multiplier and operator.
     pub(super) exposure: f32,
     pub(super) tonemapper: Tonemapper,
+    /// The settings camera's view (index in `FrameState::views`), once prepared.
+    pub(super) view: Option<usize>,
+    /// The Distortion phase runs for this group this frame: `PostProcess::distortion` is
+    /// enabled and a Distortion slot has work in the settings camera's view (graphics spec §1.8).
+    pub(super) distortion: bool,
 }
 
 /// Plan of one camera this frame.
@@ -241,6 +250,7 @@ impl FrameState {
                         post_groups: 0..0,
                         display_views: false,
                         last_scene_view: None,
+                        scene_views: 0,
                     });
                     f.groups.len() - 1
                 }
@@ -361,6 +371,8 @@ impl FrameState {
                     scene_output: OutputEncoding::Linear,
                     exposure: 1.0,
                     tonemapper: Tonemapper::None,
+                    view: None,
+                    distortion: false,
                 });
             } else {
                 for c in 0..f.cameras.len() {
@@ -384,6 +396,8 @@ impl FrameState {
                         scene_output,
                         exposure,
                         tonemapper,
+                        view: None,
+                        distortion: false,
                     };
                     match f.post_groups[start..]
                         .iter_mut()

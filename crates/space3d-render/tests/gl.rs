@@ -147,3 +147,61 @@ fn gl_backend_renders_frame_modes_like_the_default_backend() {
         }
     }
 }
+
+/// Scene depth on GL (graphics spec §1.6, GL rows): no read-only depth attachments, so depth
+/// readers draw in a single-sample SceneRead pass with the depth texture sampled and tested
+/// manually — Direct and post-processed alike; with MSAA they draw inside the scene pass (GLES
+/// 3.0 cannot sample multisampled depth). The Distortion phase samples depth at 1 sample.
+#[test]
+fn gl_backend_reads_scene_depth() {
+    use common::nodes::*;
+    if gl_app(8, 8).is_none() {
+        return;
+    }
+    let green = |img: &ImageData| count_rgb(img, [0, 255, 0]) as f64 / (img.width * img.height) as f64;
+    for (samples, post) in [(1, false), (1, true), (4, false)] {
+        let mut app = gl_app(64, 32).expect("GL adapter");
+        app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+        let cam = analytic_plane_scene(&mut app);
+        if post {
+            app.world.insert_one(cam, PostProcess::passthrough()).unwrap();
+        }
+        let (probe, seen) = DepthProbe::new();
+        let nodes = app.resources.expect_mut::<RenderNodes>();
+        nodes.insert("probe", probe);
+        let writer = nodes.insert("writer", DistortionWriter::new(true));
+        let img = render_to_image(&mut app).expect("capture");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+        let s = app.resources.expect::<RenderStats>().clone();
+        let (target, depth) = seen.lock().unwrap()[0];
+        let msaa = app.resources.expect::<Renderer>().msaa_samples() > 1;
+        if msaa && !post {
+            assert_eq!((target.depth_access, depth), (DepthAccess::None, false));
+            assert_eq!(count_rgb(&img, [0, 0, 255]), (img.width * img.height) as usize);
+            assert_eq!(s.scene_read_passes, 0);
+        } else {
+            assert_eq!(
+                (target.depth_access, target.depth, depth),
+                (DepthAccess::SampledOnly, None, true)
+            );
+            assert!(green(&img) > 0.99, "×{samples} post {post}: {:.3} green", green(&img));
+            assert_eq!(s.scene_read_passes, 1);
+        }
+        // Passthrough post has distortion off; nothing without post either.
+        assert_eq!(s.distortion_passes, 0);
+        assert!(writer.lock().unwrap().draws.lock().unwrap().is_empty());
+    }
+    // Distortion with post: the writer samples depth (1 sample) on GL.
+    let mut app = gl_app(64, 32).expect("GL adapter");
+    let cam = analytic_plane_scene(&mut app);
+    app.world.insert_one(cam, PostProcess::default()).unwrap();
+    let writer = app
+        .resources
+        .expect_mut::<RenderNodes>()
+        .insert("writer", DistortionWriter::new(true));
+    render_to_image(&mut app).expect("capture");
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    assert_eq!(app.resources.expect::<RenderStats>().distortion_passes, 1);
+    let (target, size) = writer.lock().unwrap().draws.lock().unwrap()[0];
+    assert_eq!((target.depth_access, size), (DepthAccess::SampledOnly, (32, 16)));
+}

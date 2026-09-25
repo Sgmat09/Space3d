@@ -510,6 +510,7 @@ struct RectOverlay {
     rect: [u32; 4],
     pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     kinds: std::sync::Arc<std::sync::Mutex<Vec<crate::OverlayTargetKind>>>,
+    stage: crate::OverlayStage,
 }
 
 impl crate::RenderOverlay for RectOverlay {
@@ -559,6 +560,10 @@ impl crate::RenderOverlay for RectOverlay {
         self.pipeline = Some((target.format, pipeline));
     }
 
+    fn stage(&self) -> crate::OverlayStage {
+        self.stage
+    }
+
     fn render(&self, pass: &mut wgpu::RenderPass<'static>, _: &crate::OverlayTarget) {
         let Some((_, pipeline)) = &self.pipeline else { return };
         let [x, y, w, h] = self.rect;
@@ -586,6 +591,7 @@ fn capture_replay_draws_overlays_after_the_views() {
                 rect: [24, 16, 16, 16],
                 pipeline: None,
                 kinds: kinds.clone(),
+                stage: crate::OverlayStage::AfterTonemap,
             },
         );
         let frame = crate::render_to_image(&mut app).expect("capture");
@@ -2164,6 +2170,7 @@ fn replay_path_equals_frame_output() {
                 rect: [2, 2, 6, 6],
                 pipeline: None,
                 kinds: kinds.clone(),
+                stage: crate::OverlayStage::AfterTonemap,
             },
         );
         let frame = crate::render_to_image(&mut app).expect("capture");
@@ -2201,5 +2208,265 @@ fn replay_path_equals_frame_output() {
         );
         use crate::OverlayTargetKind as K;
         assert_eq!(*kinds.lock().unwrap(), [K::Offscreen, K::Capture]);
+    }
+}
+
+/// A render node drawing a solid full-screen triangle per slot (no bind groups, depth test
+/// Always, no writes), counting `prepare` calls and logging the frame kind of every draw.
+struct KindNode {
+    slots: Vec<crate::PhaseSlot>,
+    color: [f32; 4],
+    prepares: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    draws: std::sync::Arc<std::sync::Mutex<Vec<(usize, crate::FrameKind, crate::PassTarget)>>>,
+    pipelines: Vec<(crate::PassTarget, wgpu::RenderPipeline)>,
+}
+
+impl KindNode {
+    fn new(slots: Vec<crate::PhaseSlot>, color: [f32; 4]) -> Self {
+        Self {
+            slots,
+            color,
+            prepares: Default::default(),
+            draws: Default::default(),
+            pipelines: Vec::new(),
+        }
+    }
+}
+
+impl crate::RenderNode for KindNode {
+    fn slots(&self) -> &[crate::PhaseSlot] {
+        &self.slots
+    }
+
+    fn prepare(&mut self, _: &mut crate::PrepareContext<'_>) {
+        self.prepares.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn draw(&mut self, pass: &mut wgpu::RenderPass<'static>, ctx: &crate::DrawContext<'_>) {
+        self.draws.lock().unwrap().push((ctx.slot, ctx.frame.kind, ctx.target));
+        if !self.pipelines.iter().any(|(t, _)| *t == ctx.target) {
+            let [r, g, b, a] = self.color;
+            let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("kind node"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!(
+                        "{}\n@fragment fn fs() -> @location(0) vec4<f32> {{ return vec4<f32>({r:?}, {g:?}, {b:?}, {a:?}); }}",
+                        crate::FULLSCREEN_WGSL
+                    )
+                    .into(),
+                ),
+            });
+            let t = ctx.target;
+            let pipeline = ctx.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("kind node"),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_fullscreen"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: t.depth_stencil(wgpu::CompareFunction::Always, false),
+                multisample: t.multisample(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(t.color_target(None))],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.pipelines.push((t, pipeline));
+        }
+        let (_, p) = self.pipelines.iter().find(|(t, _)| *t == ctx.target).unwrap();
+        pass.set_pipeline(p);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+/// Capture replays never call `prepare` (or `prepare_view`): they call `draw` again with
+/// `FrameKind::CaptureReplay`, SceneRead passes included, and give the frame's pixels — with
+/// and without MSAA (graphics spec §1.10).
+#[test]
+fn prepare_once_per_frame_not_in_replay() {
+    use crate::{FrameKind, PhaseSlot, RenderPhase, SceneReads};
+    for samples in [1, 4] {
+        let Some(mut app) = split_screen_app(64, 48, samples) else {
+            return;
+        };
+        // One view: with MSAA, views sharing the target draw depth readers in-pass instead.
+        let cameras: Vec<_> = app
+            .world
+            .query::<(space3d_core::Entity, &crate::Camera3d)>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in cameras.iter().skip(1) {
+            app.world.despawn(*e).unwrap();
+        }
+        app.world.get::<&mut crate::Camera3d>(cameras[0]).unwrap().viewport = None;
+        let node = KindNode::new(
+            vec![
+                PhaseSlot::new(RenderPhase::Opaque, 5),
+                PhaseSlot::new(RenderPhase::Transparent, 5).reading(SceneReads::DEPTH),
+            ],
+            [0.0, 0.0, 0.0, 0.0],
+        );
+        let (prepares, draws) = (node.prepares.clone(), node.draws.clone());
+        app.resources.expect_mut::<crate::RenderNodes>().insert("kind", node);
+        let frame = crate::render_to_image(&mut app).expect("capture");
+        let r = app.resources.expect_mut::<Renderer>();
+        let read_passes = r.stats.scene_read_passes;
+        r.frame.force_capture_replay = true;
+        let replayed = r.capture_blocking().expect("replayed capture");
+        assert_eq!(r.gpu_error_count(), 0);
+        assert_eq!(prepares.load(std::sync::atomic::Ordering::Relaxed), 1, "×{samples}");
+        let kinds: Vec<_> = draws.lock().unwrap().iter().map(|(s, k, _)| (*s, *k)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (0, FrameKind::Frame),
+                (1, FrameKind::Frame),
+                (0, FrameKind::CaptureReplay),
+                (1, FrameKind::CaptureReplay)
+            ],
+            "×{samples}"
+        );
+        // With MSAA the depth is resolved for the SceneRead pass; GL draws in-pass instead.
+        let resolves = r.frame_graphics.msaa_depth_resolve;
+        assert_eq!(
+            read_passes,
+            u32::from(samples == 1 || resolves),
+            "×{samples}: a SceneRead pass"
+        );
+        assert!(
+            frame.pixels == replayed.pixels,
+            "×{samples}: the replay differs from the frame"
+        );
+    }
+}
+
+/// The Distortion phase writes the post group's distortion buffer: a writer adding a constant
+/// `distortion_encode` output fills the half-resolution buffer with it (split signs), and the
+/// composite binds it.
+#[test]
+fn distortion_buffer_holds_the_writers_output() {
+    use crate::{PhaseSlot, RenderPhase};
+    let Some(mut app) = headless_app(64, 48) else { return };
+    app.world.spawn((
+        space3d_core::Transform::from_xyz(0.0, 0.0, 5.0),
+        crate::Camera3d::default(),
+        crate::PostProcess::default(),
+    ));
+    // A writer drawing distortion_encode((0.01, -0.02), 1) = (0.16, 0, 0, 0.32) with the
+    // distortion blend (One/One); the node draws a raw color: the encoded value.
+    let (r, a) = (0.01 / 0.0625, 0.02 / 0.0625);
+    let node = KindNode::new(vec![PhaseSlot::new(RenderPhase::Distortion, 0)], [r, 0.0, 0.0, a]);
+    let draws = node.draws.clone();
+    app.resources.expect_mut::<crate::RenderNodes>().insert("writer", node);
+    crate::render_to_image(&mut app).expect("capture");
+    let r = app.resources.expect::<Renderer>();
+    assert_eq!(r.stats.distortion_passes, 1);
+    let (_, kind, target) = draws.lock().unwrap()[0];
+    assert_eq!(
+        (kind, target.color),
+        (crate::FrameKind::Frame, crate::DISTORTION_FORMAT)
+    );
+    let camera = r.frame.cameras[0].id;
+    let (view, size, _) = r.post.distortion_view(camera).expect("distortion buffer");
+    assert_eq!(size, (32, 24));
+    let texture = view.texture();
+    let padded = align_up(size.0 as u64 * 4, 256);
+    let buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: padded * size.1 as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = r.device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded as u32),
+                rows_per_image: None,
+            },
+        },
+        texture.size(),
+    );
+    r.queue.submit([encoder.finish()]);
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    r.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let data = buffer.slice(..).get_mapped_range().unwrap();
+    for y in 0..size.1 as usize {
+        for x in 0..size.0 as usize {
+            let p = &data[y * padded as usize + x * 4..][..4];
+            assert_eq!(p, [41, 0, 0, 82], "({x}, {y})");
+        }
+    }
+    drop(data);
+    assert_eq!(r.gpu_error_count(), 0);
+}
+
+/// HdrScene overlays in capture replays (graphics spec §1.5, §1.10): a Direct primary group
+/// replays them (kind `Capture`) after its re-recorded views; an intermediate group does not
+/// call them again — they are already in the persisted scene color, which the replay only
+/// composites (risk R12). Either way the capture equals the frame.
+#[test]
+fn hdr_scene_overlay_not_replayed_in_hdr() {
+    use crate::OverlayTargetKind as K;
+    for post in [false, true] {
+        let Some(mut app) = split_screen_app(64, 48, 1) else {
+            return;
+        };
+        if post {
+            let cams: Vec<_> = app
+                .world
+                .query::<(space3d_core::Entity, &crate::Camera3d)>()
+                .iter()
+                .map(|(e, _)| e)
+                .collect();
+            for e in cams {
+                app.world.insert_one(e, crate::PostProcess::default()).unwrap();
+            }
+        }
+        let kinds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        app.resources.expect_mut::<crate::RenderOverlays>().insert(
+            "hdr",
+            0,
+            RectOverlay {
+                rect: [24, 16, 16, 16],
+                pipeline: None,
+                kinds: kinds.clone(),
+                stage: crate::OverlayStage::HdrScene,
+            },
+        );
+        let frame = crate::render_to_image(&mut app).expect("capture");
+        // Yellow, tonemapped with the scene (AgX, dithered) when post runs.
+        let yellow = if post {
+            crate::Tonemapper::AgX.apply(Vec3::new(1.0, 1.0, 0.0))
+        } else {
+            Vec3::new(1.0, 1.0, 0.0)
+        };
+        let px = frame.get(30, 20);
+        for (c, v) in px.iter().zip(yellow.to_array()) {
+            let v = (crate::linear_to_srgb(v) * 255.0).round() as u8;
+            assert!(c.abs_diff(v) <= 1, "post {post}: {px:?} vs {yellow}");
+        }
+        let r = app.resources.expect_mut::<Renderer>();
+        r.frame.force_capture_replay = true;
+        let replayed = r.capture_blocking().expect("replayed capture");
+        assert_eq!(r.gpu_error_count(), 0);
+        assert!(frame.pixels == replayed.pixels, "post {post}: the replay differs");
+        let expected: &[K] = if post {
+            &[K::Offscreen]
+        } else {
+            &[K::Offscreen, K::Capture]
+        };
+        assert_eq!(*kinds.lock().unwrap(), expected, "post {post}");
     }
 }

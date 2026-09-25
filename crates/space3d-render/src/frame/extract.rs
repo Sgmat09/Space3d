@@ -286,7 +286,7 @@ impl MaterialTable {
             e.last_used = frame;
             return (id, e.class);
         }
-        let class = if m.double_sided { CLASS_DOUBLE_SIDED } else { 0 } | if m.alpha_blend { CLASS_BLEND } else { 0 };
+        let class = material_class(m);
         let entry = MatEntry {
             key,
             class,
@@ -389,6 +389,11 @@ pub(super) fn pipeline_rank(materials: &MaterialTable, assets: &RenderAssets, ma
         .and_then(|e| e.gpu.as_ref())
         .is_some_and(|g| g.layered);
     shader << 1 | layered as u64
+}
+
+/// Pipeline class bits of a material (`PipelineKey::class`; the materials area adds bits 2..=5).
+pub(crate) fn material_class(m: &Material) -> u8 {
+    (if m.double_sided { CLASS_DOUBLE_SIDED } else { 0 }) | if m.alpha_blend { CLASS_BLEND } else { 0 }
 }
 
 /// Draw order of batches: opaque before blended, then pipeline (class, instance layout,

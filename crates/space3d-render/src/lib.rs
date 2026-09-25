@@ -15,7 +15,10 @@
 //!   per-instance attributes ([`InstanceSemantic::Custom`]).
 //! * **Headless capture** — [`Renderer::capture`] / [`render_to_image`].
 //! * **Overlays** — [`RenderOverlay`]s registered in [`RenderOverlays`] draw after the 3D scene
-//!   into the final target (window surface or capture target), e.g. the egui UI.
+//!   into the final target (window surface or capture target), e.g. the egui UI — or, with
+//!   [`OverlayStage::HdrScene`], into the HDR scene color before post.
+//! * **Render nodes** — [`RenderNode`]s registered in [`RenderNodes`] draw into the frame's own
+//!   passes per phase (Opaque, Skybox, Transparent, Distortion), optionally reading scene depth.
 //!
 //! ```no_run
 //! use space3d_core::prelude::*;

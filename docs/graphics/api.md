@@ -78,6 +78,21 @@ Additions made by the foundation since F2 (additive):
   `output_viewport` (the drawn rect; `output_rect` is its scissor). `PostEncode` adds `pool`
   (the frame's `TexturePool`, released after each group).
 
+* F5: `PostGroupPlan::distortion` (the group's Distortion phase runs this frame: the composite's
+  `DISTORTION` bit), `PostState::distortion_target` counts created buffers (reported through
+  `end_frame` in `textures_created`), `PostState::distortion_view(camera)` returns the existing
+  buffer (a cheap view clone, its size and generation) for the frame's passes and replays, and
+  `PostState::prewarm(device, format, manual_srgb)` builds a composite pipeline ahead of use
+  (`Renderer::prewarm`). The composite binds `PostGroupInput::distortion` at group 1 binding 4
+  (input bind groups are keyed by `(scene_generation, distortion generation)`).
+  `FrameLayouts::scene` has a third binding: a non-filtering nearest sampler (binding 2) through
+  which `scene_wgsl`'s `s3d_scene_depth` samples: WebGL2 depth textures read as 0 through
+  `textureLoad` (it uses the texture's own linear filter state there, and GLES 3.0 depth
+  textures are incomplete unless filtered nearest). Node shaders declaring only bindings 0–1
+  keep working.
+* F5: `frame::extract::material_class(&Material) -> u8` is the one place pipeline class bits
+  come from (P-MAT extends it for bits 2..=5; `Renderer::prewarm` uses it).
+
 ## Ownership map (spec §3.6)
 
 A builder edits only the files it owns; everything else goes through the foundation maintainer
@@ -91,7 +106,7 @@ A builder edits only the files it owns; everything else goes through the foundat
 | `src/quality.rs` | F→I |
 | `src/components.rs` (`Material` fields and docs) | F |
 | `src/material.rs` | F→P-MAT |
-| `src/frame/{mod, plan, views, targets, passes, tests}.rs` | F |
+| `src/frame/{mod, plan, views, targets, passes, nodes, tests}.rs` | F |
 | `src/frame/{extract, draws}.rs` | F→P-MAT |
 | `src/pipeline/{mod, view}.rs` | F |
 | `src/pipeline/{forward, instance}.rs`, `src/{arena, assets, texture, handles}.rs` | F→P-MAT |

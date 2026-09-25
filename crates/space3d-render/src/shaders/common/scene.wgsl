@@ -3,6 +3,9 @@
 
 @group(1) @binding(0) var s3d_scene_depth_tex: texture_2d<f32>;   // Depth32Float as unfilterable float
 @group(1) @binding(1) var s3d_exposure_tex: texture_2d<f32>;      // 1×1, EV in .r
+// Nearest, clamped. GLES 3.0 (WebGL2) depth textures are incomplete (read as 0) unless sampled
+// with nearest filtering, and `textureLoad` uses the texture's own (linear) filter state there.
+@group(1) @binding(2) var s3d_scene_sampler: sampler;
 
 // Whether real scene depth is bound.
 fn s3d_depth_valid() -> bool {
@@ -16,7 +19,8 @@ fn s3d_scene_uv(frag_xy: vec2<f32>) -> vec2<f32> {
 
 // Device depth of the scene at pixel `px` (1.0 without depth).
 fn s3d_scene_depth(px: vec2<i32>) -> f32 {
-    return textureLoad(s3d_scene_depth_tex, px, 0).x;
+    let size = vec2<f32>(textureDimensions(s3d_scene_depth_tex));
+    return textureSampleLevel(s3d_scene_depth_tex, s3d_scene_sampler, (vec2<f32>(px) + 0.5) / size, 0.0).x;
 }
 
 // Positive view-space distance of the scene at pixel `px` (perspective and orthographic).

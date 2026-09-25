@@ -21,6 +21,7 @@ use std::ops::Range;
 
 mod draws;
 mod extract;
+mod nodes;
 mod passes;
 mod plan;
 mod targets;
@@ -30,10 +31,11 @@ mod views;
 
 use draws::{DrawCmd, DrawKind, VertexSource};
 use extract::{GpuInstances, KeyBuckets, MaterialTable, Source, SourceBuffer};
+pub(crate) use nodes::{NodeCache, SceneInputs};
 use plan::{CameraItem, CameraPlan, FramePostGroup, PrimaryDisplay, TargetGroup};
 pub(crate) use plan::{GroupTarget, PlanWarnings};
 pub(crate) use targets::TexturePool;
-use targets::{Feedback, GroupTextures};
+use targets::{Feedback, GroupTextures, ResolvedDepth};
 use views::{Dispatch, SceneLights, ViewData, ViewTarget};
 
 /// Runtime render options (resource).
@@ -167,6 +169,16 @@ pub(crate) struct FrameState {
     /// Deterministic facts of the current frame (graphics spec §4.3).
     pub(crate) info: crate::node::FrameInfo,
     views: Vec<ViewData>,
+    /// Public description of every view (parallel to `views`), for nodes and overlays.
+    view_infos: Vec<crate::node::ViewInfo>,
+    /// Slot masks reported by the nodes' `prepare_view`: `views × nodes`, row-major.
+    node_masks: Vec<u32>,
+    /// Scratch: the pass target of each slot of one node in one view.
+    slot_targets: Vec<crate::node::PassTarget>,
+    /// Single-sample depths multisampled groups resolve into (graphics spec §1.6).
+    resolved_depth: FastMap<GroupTarget, ResolvedDepth>,
+    /// The last primary scene view: HdrScene overlays draw after it and see its depth.
+    hdr_scene_view: Option<usize>,
     draws: Vec<DrawCmd>,
     jobs: Vec<(SourceBuffer, GpuCullJob)>,
     dispatches: Vec<Dispatch>,
@@ -300,6 +312,11 @@ impl FrameState {
                 device_lost: false,
             },
             views: Vec::new(),
+            view_infos: Vec::new(),
+            node_masks: Vec::new(),
+            slot_targets: Vec::new(),
+            resolved_depth: FastMap::default(),
+            hdr_scene_view: None,
             draws: Vec::new(),
             jobs: Vec::new(),
             dispatches: Vec::new(),
@@ -349,7 +366,7 @@ impl FrameState {
     }
 
     /// Capacity snapshot of scratch vectors (to count CPU reallocations).
-    fn capacities(&self) -> [usize; 26] {
+    fn capacities(&self) -> [usize; 29] {
         [
             self.ecs_keys.capacity(),
             self.ecs_rows.capacity(),
@@ -377,6 +394,9 @@ impl FrameState {
             self.post_groups.capacity(),
             self.camera_plans.capacity(),
             self.group_encode.capacity(),
+            self.view_infos.capacity(),
+            self.node_masks.capacity(),
+            self.slot_targets.capacity(),
         ]
     }
 }
@@ -473,6 +493,90 @@ impl FrameState {
 }
 
 impl Renderer {
+    /// [`Renderer::prewarm`] (graphics spec §3.5): for every view of the last frame (and the
+    /// primary target before the first frame), and for each requested extra format on primary
+    /// views, the forward pipelines of the requested materials × instance layouts, every node's
+    /// `prewarm` for the targets its slots draw with, and the composite pipelines of the
+    /// intermediate groups' targets.
+    pub(crate) fn prewarm_pipelines(&mut self, request: &crate::renderer::PrewarmRequest) {
+        let primary = self.primary_display();
+        let Renderer {
+            device,
+            frame: f,
+            pipelines,
+            nodes,
+            post,
+            frame_graphics,
+            ..
+        } = self;
+        let ecs = <crate::instance::InstanceTransform as crate::instance::InstanceData>::LAYOUT;
+        let layouts: Vec<u16> = std::iter::once(ecs)
+            .chain(request.layouts.iter().copied())
+            .map(|l| pipelines.layout_id(l))
+            .collect();
+        let forward = |pipelines: &mut Pipelines, format, samples, output| {
+            for m in &request.materials {
+                let shader = match m.shader {
+                    Some(h) => match pipelines.custom_version(h) {
+                        Some(v) => Some((h, v)),
+                        // Custom shaders are prewarmed once drawn (their source is synced then).
+                        None => continue,
+                    },
+                    None => None,
+                };
+                for &layout in &layouts {
+                    pipelines.forward(
+                        device,
+                        crate::pipeline::PipelineKey {
+                            layout,
+                            class: extract::material_class(m),
+                            format,
+                            samples,
+                            output,
+                            kinds: 0,
+                            shader,
+                            pass: crate::pipeline::PassKind::Forward,
+                            globals: 0,
+                        },
+                    );
+                }
+            }
+        };
+        let primary_output = if primary.manual_srgb {
+            crate::output::OutputEncoding::ManualSrgb
+        } else {
+            crate::output::OutputEncoding::Linear
+        };
+        forward(pipelines, primary.format, primary.samples, primary_output);
+        for v in 0..f.views.len() {
+            let is_primary = matches!(f.views[v].target, ViewTarget::Primary);
+            let extra = request
+                .formats
+                .iter()
+                .filter(|_| is_primary)
+                .map(|&format| Some(format));
+            for format in std::iter::once(None).chain(extra) {
+                let t = f.view_targets(v, frame_graphics, format);
+                forward(pipelines, t.scene.color, t.scene.samples, t.scene.output);
+                for i in 0..nodes.len() {
+                    let c = &nodes.nodes[i];
+                    f.slot_targets.clear();
+                    f.slot_targets.extend(c.slots.iter().map(|slot| t.slot(slot)));
+                    let valid = t.valid(c);
+                    nodes.prewarm(device, i, valid, &f.slot_targets);
+                }
+            }
+        }
+        for g in f.groups.iter().filter(|g| g.intermediate()) {
+            post.prewarm(device, g.display_format, g.manual_srgb);
+            if g.target == GroupTarget::Primary {
+                for &format in &request.formats {
+                    post.prewarm(device, format, false);
+                }
+            }
+        }
+    }
+
     /// Extract the world, cull, upload and draw one frame. Normally called by the
     /// `Stage::Render` system of [`crate::RenderPlugin`].
     pub fn render_frame(&mut self, world: &World, resources: &mut Resources) {
@@ -495,6 +599,11 @@ impl Renderer {
         self.update_frame_info(resources.get::<space3d_core::Time>());
         self.post.begin_frame(&self.frame.info, &frame_settings);
         self.frame.pool.begin_frame(self.frame_index);
+        self.scene_inputs.begin_frame(self.frame_index);
+        // Snapshots of the registered nodes and overlays (re-read only when they changed); the
+        // overlays' stages are read every frame.
+        self.nodes.sync(resources.get::<crate::node::RenderNodes>());
+        self.overlays.sync(resources.get::<crate::overlay::RenderOverlays>());
 
         // Move the asset/instance registries out without re-boxing resources.
         let mut assets = resources
@@ -519,6 +628,7 @@ impl Renderer {
         }
         self.prepare(
             world,
+            resources,
             &assets,
             &mut buffers,
             ambient,
@@ -567,7 +677,6 @@ impl Renderer {
             })
         });
         self.encode_views(&mut encoder, surface_view.as_ref(), false);
-        self.overlays.sync(resources.get::<crate::overlay::RenderOverlays>());
         self.encode_frame_overlays(&mut encoder, surface_view.as_ref());
 
         self.uploader.finish();
@@ -580,6 +689,7 @@ impl Renderer {
         let _ = self.device.poll(wgpu::PollType::Poll);
 
         self.post.end_frame(&mut self.stats);
+        self.scene_inputs.evict();
         self.frame.pool.release_all();
         self.frame.pool.evict();
         self.stats.textures_created += self.frame.pool.take_created();
@@ -644,6 +754,7 @@ impl Renderer {
         let info = &mut self.frame.info;
         info.kind = crate::node::FrameKind::Frame;
         info.renderer = self.id;
+        info.device_lost = self.device_lost.load(std::sync::atomic::Ordering::Acquire);
         match time {
             Some(t) => {
                 let advanced = self.frame_index == 1 || t.frame != previous.frame;
@@ -667,6 +778,7 @@ impl Renderer {
     fn prepare(
         &mut self,
         world: &World,
+        resources: &mut Resources,
         assets: &RenderAssets,
         buffers: &mut InstanceBuffers,
         ambient: AmbientLight,
@@ -681,6 +793,8 @@ impl Renderer {
         let msaa_depth_binding = self.graphics.msaa_depth_resolve;
         let Renderer {
             device,
+            queue,
+            caps,
             frame: f,
             pipelines,
             uploader: up,
@@ -690,6 +804,9 @@ impl Renderer {
             post,
             plan_warnings,
             frame_graphics,
+            layouts,
+            nodes,
+            overlays,
             ..
         } = self;
         let caps_before = f.capacities();
@@ -735,7 +852,25 @@ impl Renderer {
             stats,
             &mut cpu_reallocs,
         );
-        // Post groups (spec §1.4 step 6): their composite parameters, in plan order.
+        // Render nodes (spec §1.4 steps 7–8): `prepare`, then `prepare_view` per camera view.
+        f.prepare_nodes(nodes::NodePrepare {
+            device,
+            queue,
+            encoder,
+            world,
+            resources,
+            assets,
+            caps,
+            graphics: frame_graphics,
+            layouts,
+            uploader: up,
+            stats,
+            nodes,
+            overlay_depth: overlays.hdr_scene_depth(),
+            frame_index,
+        });
+        // Post groups (spec §1.4 step 6): their composite parameters, in plan order, and the
+        // distortion buffers of the groups whose Distortion phase runs (created here only).
         for pg in &f.post_groups {
             let g = &f.groups[pg.group];
             let rect = |r: plan::ViewportRect| [r.x, r.y, r.w as i32, r.h as i32];
@@ -750,8 +885,13 @@ impl Renderer {
                 scene_alpha: g.scene_format != wgpu::TextureFormat::Rg11b10Ufloat,
                 transparent: g.transparent,
                 passthrough: pg.passthrough,
+                distortion: pg.distortion,
             };
             post.plan_group(world, &plan, &mut cpu_reallocs);
+            if pg.distortion {
+                let rect = pg.scene_rect.scissor(g.scene_size);
+                post.distortion_target(device, f.cameras[pg.camera].id, rect, pg.settings.distortion.resolution);
+            }
         }
         let wg_word = f.prepare_dispatches(&mut cpu_reallocs);
         f.upload(device, encoder, up, out_cursor, wg_word, &mut cpu_reallocs);

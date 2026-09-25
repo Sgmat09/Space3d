@@ -24,8 +24,19 @@
 //! app.resources.expect_mut::<RenderNodes>().insert("depth-tint", DepthTint);
 //! ```
 //!
-//! Frame integration (scheduling, SceneRead passes, the Distortion phase) lands with the frame
-//! milestones F4–F5; until then registered nodes are kept but not called.
+//! Scheduling (graphics spec §1.4, §1.6, §1.7):
+//! * `prepare` runs once per rendered frame, `prepare_view` once per camera view, both before any
+//!   view pass; capture replays call neither (only `draw`, with [`FrameKind::CaptureReplay`]).
+//! * Within a phase, slots draw by `(order, registration, slot index)`; built-in work sits at
+//!   order 0 and draws before nodes of the same order (so negative orders draw before it).
+//! * `Transparent` slots reading [`SceneReads::DEPTH`] draw in a separate single-sample
+//!   *SceneRead* pass after the view's scene pass, with the scene depth bound in group 1 and
+//!   either attached read-only ([`DepthAccess::ReadOnlyAttached`]) or not attached at all
+//!   ([`DepthAccess::SampledOnly`], WebGL2/GLES). Multisampled groups without a depth resolve
+//!   (GL, or several views sharing the multisampled target) draw them inside the scene pass
+//!   instead, with the far dummy bound ([`DepthAccess::None`]): no soft fade there.
+//! * `Distortion` slots draw into the distortion buffer of a post group, only in its settings
+//!   camera's view and only when that camera's `PostProcess::distortion` is enabled.
 
 use crate::assets::RenderAssets;
 use crate::caps::GraphicsCaps;
@@ -299,12 +310,13 @@ impl RenderNodes {
     }
 
     /// Changes whenever the list or its slots may have changed.
-    #[allow(
-        dead_code,
-        reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-    )]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The registered nodes in registration order.
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &SharedNode> {
+        self.entries.iter().map(|e| &e.node)
     }
 }
 
@@ -712,7 +724,9 @@ pub struct FrameLayouts {
     /// layouts.
     pub view: wgpu::BindGroupLayout,
     /// Group 1: binding 0 scene depth `texture_2d<f32>` (unfilterable), binding 1 exposure
-    /// `texture_2d<f32>` (unfilterable, 1×1, EV in `.r`). FRAGMENT.
+    /// `texture_2d<f32>` (unfilterable, 1×1, EV in `.r`), binding 2 a non-filtering sampler
+    /// (nearest, clamped) to sample the depth with: WebGL2 depth textures read as 0 through
+    /// `textureLoad`, which uses the texture's own (linear) filtering there. FRAGMENT.
     pub scene: wgpu::BindGroupLayout,
     /// Full-screen triangle (`vs_fullscreen`, [`FULLSCREEN_WGSL`]).
     pub fullscreen: wgpu::ShaderModule,
@@ -733,7 +747,16 @@ impl FrameLayouts {
         };
         let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("space3d scene inputs"),
-            entries: &[texture(0), texture(1)],
+            entries: &[
+                texture(0),
+                texture(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
         });
         let fullscreen = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("space3d fullscreen"),

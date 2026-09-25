@@ -119,11 +119,13 @@ impl FrameState {
 }
 
 impl Renderer {
-    /// Record a view's draws into its pass.
+    /// Record the draws `range` (within `view.draws`) of a view into its pass. Sets every
+    /// state it uses (bind groups, buffers, pipelines), so node draws may precede it.
     pub(super) fn encode_draws(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
         view: &ViewData,
+        range: std::ops::Range<usize>,
         format: wgpu::TextureFormat,
         samples: u32,
         output: OutputEncoding,
@@ -132,7 +134,7 @@ impl Renderer {
         let (Some((vb, ib)), Some((view_bg, _))) = (&f.arena_buffers, &f.view_bg) else {
             return;
         };
-        if view.draws.is_empty() {
+        if range.is_empty() {
             return;
         }
         pass.set_bind_group(0, view_bg, &[view.view_offset]);
@@ -152,7 +154,7 @@ impl Renderer {
         let mut slot0: Option<u32> = None;
         #[cfg(test)]
         let mut max_direct_base_vertex = self.frame.max_direct_base_vertex;
-        for cmd in &f.draws[view.draws.clone()] {
+        for cmd in &f.draws[range] {
             // (Indirect draws take their counts from the args buffer.)
             let direct = matches!(cmd.kind, DrawKind::Direct { .. });
             if direct && cmd.index_count == 0 {

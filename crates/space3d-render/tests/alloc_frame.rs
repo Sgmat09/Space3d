@@ -1,6 +1,7 @@
 //! Steady-state heap allocations of the render stage per frame mode (graphics spec §4.4
-//! "Passes and wgpu allocations"): Direct, Hdr (scene texture + composite), the Ldr fallback and
-//! render-scale passthrough. The renderer's own work allocates nothing in any mode
+//! "Passes and wgpu allocations"): Direct, Hdr (scene texture + composite), the Ldr fallback,
+//! render-scale passthrough and render nodes (Opaque and Transparent slots in the scene pass, a
+//! depth-reading slot in a SceneRead pass). The renderer's own work allocates nothing in any mode
 //! (`cpu_reallocations == 0`, `textures_created == 0`); what remains is wgpu's bookkeeping,
 //! which grows with the extra pass. Each mode is pinned to its measured bound (+10 %) and must
 //! not grow over time.
@@ -55,10 +56,12 @@ const FRAMES: usize = 100;
 /// Allocations per frame measured on Apple M4 Max / Metal (wgpu 30.0.1, test profile, CPU
 /// draw path) plus ~10 %; other backends get twice the headroom. Measured: Direct 76; Hdr, Ldr
 /// and passthrough 106 each — one render pass (the composite) more, and wgpu-hal's Metal backend
-/// allocates about 30 times per render pass.
+/// allocates about 30 times per render pass; nodes 119–120 (Direct + one SceneRead pass
+/// and three node draws).
 fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
     let metal = match mode {
         "direct" => 84,
+        "nodes" => 132,
         _ => 117,
     };
     if backend == wgpu::Backend::Metal {
@@ -104,7 +107,7 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
         counted
     };
     type Setup = fn(&mut App, Entity);
-    let modes: [(&str, Setup); 4] = [
+    let modes: [(&str, Setup); 5] = [
         ("direct", |_, _| {}),
         ("hdr", |app, cam| {
             app.world.insert_one(cam, PostProcess::default()).unwrap()
@@ -115,6 +118,25 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
         }),
         ("passthrough", |app, _| {
             app.resources.expect_mut::<FrameSettings>().render_scale = 0.75
+        }),
+        ("nodes", |app, _| {
+            use common::nodes::*;
+            let nodes = app.resources.expect_mut::<RenderNodes>();
+            let mut solid = Solid::new(
+                "solid",
+                vec![
+                    Solid::slot(PhaseSlot::new(RenderPhase::Opaque, -1), [0.1, 0.1, 0.1, 1.0]),
+                    SolidSlot {
+                        slot: PhaseSlot::new(RenderPhase::Transparent, 5),
+                        color: [0.9, 0.9, 0.1, 1.0],
+                        rect: [-0.5, -0.5, 0.0, 0.0],
+                    },
+                ],
+                log(),
+            );
+            solid.quiet = true;
+            nodes.insert("solid", solid);
+            nodes.insert("probe", DepthProbe::new().0);
         }),
     ];
     let mut per_frame = Vec::with_capacity(FRAMES);
@@ -137,7 +159,11 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
             (0, 0, 0),
             "{name}: {s:?}"
         );
-        assert_eq!(s.intermediate_groups, u32::from(name != "direct"), "{name}");
+        let intermediate = !matches!(name, "direct" | "nodes");
+        assert_eq!(s.intermediate_groups, u32::from(intermediate), "{name}");
+        if name == "nodes" {
+            assert_eq!((s.node_draws, s.scene_read_passes), (3, 1), "{name}");
+        }
         let max = *per_frame.iter().max().unwrap();
         let (first, second) = per_frame.split_at(FRAMES / 2);
         let mean = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len() as f64;

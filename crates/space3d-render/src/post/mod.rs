@@ -57,6 +57,9 @@ pub(crate) struct PostGroupPlan {
     pub transparent: bool,
     /// The implicit group of an Ldr passthrough target (every effect off).
     pub passthrough: bool,
+    /// The group's Distortion phase runs this frame (distortion enabled and a writer has work
+    /// in the settings camera's view): its distortion buffer is written before the composite.
+    pub distortion: bool,
 }
 
 /// What a post group needs this frame.
@@ -136,6 +139,8 @@ struct DistortionTarget {
     size: (u32, u32),
     view: wgpu::TextureView,
     last_used: u64,
+    /// Unique per creation (bind groups sampling it are cached by it).
+    generation: u64,
 }
 
 /// Composite pipelines' output kind (`S3D_POST_OUT`): how the last pass writes `D`.
@@ -192,8 +197,12 @@ pub(crate) struct PostState {
     /// 1×1 black stand-in for inputs a group does not have (bloom, exposure = 0 EV, LUT, …).
     dummy: wgpu::TextureView,
     params_bg: Option<(wgpu::BindGroup, u32)>,
-    /// Input bind groups by scene-texture generation, with the frame they were last used.
-    inputs_bgs: FastMap<u64, (wgpu::BindGroup, u64)>,
+    /// Input bind groups by (scene-texture generation, distortion-buffer generation or 0),
+    /// with the frame they were last used.
+    inputs_bgs: FastMap<(u64, u64), (wgpu::BindGroup, u64)>,
+    /// Distortion buffers created (generation counter) and created since `end_frame`.
+    distortion_generation: u64,
+    created: u32,
     composite: FastMap<(wgpu::TextureFormat, OutputKind), wgpu::RenderPipeline>,
 }
 
@@ -285,6 +294,8 @@ impl PostState {
             params_bg: None,
             inputs_bgs: FastMap::default(),
             composite: FastMap::default(),
+            distortion_generation: 0,
+            created: 0,
         }
     }
 
@@ -348,10 +359,6 @@ impl PostState {
 
     /// The persistent distortion buffer of a post group (created on demand; freed 60 frames
     /// after its last use), sized from `rect` and `res`. The caller's pass clears it.
-    #[allow(
-        dead_code,
-        reason = "graphics contract (spec §2.6): the Distortion phase arrives with F5"
-    )]
     pub fn distortion_target(
         &mut self,
         device: &wgpu::Device,
@@ -364,30 +371,44 @@ impl PostState {
             _ => (rect[2].max(1), rect[3].max(1)),
         };
         let frame = self.frame;
-        let t = self
-            .distortion
-            .entry(camera)
-            .and_modify(|t| {
-                if t.size != size {
-                    *t = create_distortion_target(device, size, frame);
-                }
-            })
-            .or_insert_with(|| create_distortion_target(device, size, frame));
+        let fresh = self.distortion.get(&camera).is_none_or(|t| t.size != size);
+        if fresh {
+            self.distortion_generation += 1;
+            self.created += 1;
+            let t = create_distortion_target(device, size, frame, self.distortion_generation);
+            self.distortion.insert(camera, t);
+        }
+        let t = self.distortion.get_mut(&camera).expect("inserted");
         t.last_used = frame;
         (&t.view, t.size)
     }
 
-    /// Record meter → bloom → composite (→ FXAA) for one post group into the frame encoder.
-    /// F4: the composite (STUB(P-POST): metering, bloom, FXAA and the other effects).
-    pub fn encode_group(&mut self, cx: &mut PostEncode<'_>, input: &PostGroupInput<'_>) {
-        let Some((params_bg, _)) = &self.params_bg else {
-            return;
-        };
-        let kind = OutputKind::of(input.output_format, input.output_manual_srgb);
+    /// A post group's existing distortion buffer: its view (a cheap clone), size and
+    /// generation.
+    pub fn distortion_view(&self, camera: Entity) -> Option<(wgpu::TextureView, (u32, u32), u64)> {
+        self.distortion
+            .get(&camera)
+            .map(|t| (t.view.clone(), t.size, t.generation))
+    }
+
+    /// Build the composite pipeline for an output target of `format` (`manual_srgb`: the shader
+    /// encodes sRGB) ahead of use (`Renderer::prewarm`). STUB(P-POST): the effects' pipelines.
+    pub fn prewarm(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, manual_srgb: bool) {
+        let kind = OutputKind::of(format, manual_srgb);
+        self.composite_pipeline(device, format, kind);
+    }
+
+    /// The composite pipeline for `format` and `kind` (created on first use).
+    fn composite_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        kind: OutputKind,
+    ) -> &wgpu::RenderPipeline {
         let (module, layout) = (&self.module, &self.layout);
-        let pipeline = self.composite.entry((input.output_format, kind)).or_insert_with(|| {
+        self.composite.entry((format, kind)).or_insert_with(|| {
             let constants = [("S3D_POST_OUT", kind.id())];
-            cx.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("space3d composite"),
                 layout: Some(layout),
                 vertex: wgpu::VertexState {
@@ -406,15 +427,34 @@ impl PostState {
                         constants: &constants,
                         ..Default::default()
                     },
-                    targets: &[Some(input.output_format.into())],
+                    targets: &[Some(format.into())],
                 }),
                 multiview_mask: None,
                 cache: None,
             })
-        });
+        })
+    }
+
+    /// Record meter → bloom → composite (→ FXAA) for one post group into the frame encoder.
+    /// F4: the composite (STUB(P-POST): metering, bloom, FXAA and the other effects).
+    pub fn encode_group(&mut self, cx: &mut PostEncode<'_>, input: &PostGroupInput<'_>) {
+        if self.params_bg.is_none() {
+            return;
+        }
+        let kind = OutputKind::of(input.output_format, input.output_manual_srgb);
+        self.composite_pipeline(cx.device, input.output_format, kind);
+        let Some((params_bg, _)) = &self.params_bg else {
+            return;
+        };
+        let pipeline = &self.composite[&(input.output_format, kind)];
         let frame = self.frame;
         let (inputs_bgl, dummy) = (&self.inputs_bgl, &self.dummy);
-        let inputs = &mut self.inputs_bgs.entry(input.scene_generation).or_insert_with(|| {
+        let distortion = input
+            .distortion
+            .and_then(|_| self.distortion.get(&input.camera))
+            .map_or(0, |t| t.generation);
+        let key = (input.scene_generation, distortion);
+        let inputs = &mut self.inputs_bgs.entry(key).or_insert_with(|| {
             let entry = |binding, view| wgpu::BindGroupEntry {
                 binding,
                 resource: wgpu::BindingResource::TextureView(view),
@@ -427,7 +467,7 @@ impl PostState {
                     entry(1, dummy),
                     entry(2, dummy),
                     entry(3, dummy),
-                    entry(4, dummy),
+                    entry(4, input.distortion.unwrap_or(dummy)),
                     entry(5, dummy),
                 ],
             });
@@ -466,7 +506,7 @@ impl PostState {
     }
 
     pub fn end_frame(&mut self, stats: &mut RenderStats) {
-        let _ = stats;
+        stats.textures_created += std::mem::take(&mut self.created);
         let frame = self.frame;
         self.distortion.retain(|_, t| t.last_used + 60 > frame);
         // Bind groups of scene textures no longer composited (replaced or freed).
@@ -490,7 +530,12 @@ impl PostState {
     }
 }
 
-fn create_distortion_target(device: &wgpu::Device, (w, h): (u32, u32), frame: u64) -> DistortionTarget {
+fn create_distortion_target(
+    device: &wgpu::Device,
+    (w, h): (u32, u32),
+    frame: u64,
+    generation: u64,
+) -> DistortionTarget {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("space3d distortion buffer"),
         size: wgpu::Extent3d {
@@ -502,13 +547,17 @@ fn create_distortion_target(device: &wgpu::Device, (w, h): (u32, u32), frame: u6
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DISTORTION_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        // COPY_SRC: tests read the buffer back.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     DistortionTarget {
         size: (w, h),
         view: texture.create_view(&Default::default()),
         last_used: frame,
+        generation,
     }
 }
 
@@ -541,6 +590,7 @@ mod tests {
             scene_alpha: true,
             transparent: false,
             passthrough: false,
+            distortion: false,
         };
         let mut reallocs = 0;
         assert!(post.plan_group(&world, &plan, &mut reallocs).distortion);

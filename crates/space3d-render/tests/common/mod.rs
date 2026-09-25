@@ -5,6 +5,8 @@
 use space3d_core::prelude::*;
 use space3d_render::*;
 
+pub mod nodes;
+
 /// App with `RenderPlugin` and a headless renderer, or `None` (test should skip).
 pub fn headless_app(width: u32, height: u32) -> Option<App> {
     let mut app = App::new();

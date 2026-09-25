@@ -9,7 +9,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | module | role |
 |---|---|
 | `renderer.rs` | `Renderer`: instance/adapter/device/queue, capability detection, surfaces, offscreen target, asset upload, `capture()` |
-| `frame/` | per-frame work: `mod.rs` (`render_frame` orchestration, `FrameState`, `RenderSettings`, uploads, frame facts), `plan.rs` (cameras, viewport rects, the frame plan: target groups, modes, post groups, view roles), `extract.rs` (ECS/explicit extraction, batching, material interning), `views.rs` (lights, `GpuView`s, draw commands, CPU culling, GPU culling jobs/dispatches), `draws.rs` (material bind groups, `encode_draws`), `passes.rs` (view passes, group finish: composites and display views, capture replay), `targets.rs` (scene textures of intermediate groups, render-target feedback copies, the texture pool), `tests.rs` |
+| `frame/` | per-frame work: `mod.rs` (`render_frame` orchestration, `FrameState`, `RenderSettings`, uploads, frame facts), `plan.rs` (cameras, viewport rects, the frame plan: target groups, modes, post groups, view roles), `extract.rs` (ECS/explicit extraction, batching, material interning), `views.rs` (lights, `GpuView`s, draw commands, CPU culling, GPU culling jobs/dispatches), `draws.rs` (material bind groups, `encode_draws`), `passes.rs` (view passes with the node phases, depth resolve, SceneRead and Distortion passes, HdrScene overlays, group finish: composites and display views, capture replay), `nodes.rs` (the render-node snapshot and schedule, node `prepare`/`prepare_view`, pass targets and depth-read modes, scene-input bind groups), `targets.rs` (scene textures of intermediate groups, resolved depths, render-target feedback copies, the texture pool), `tests.rs` |
 | `instance.rs` | `InstanceData` trait, `InstanceLayout`/semantics, built-in formats, `InstanceBuffer<T>`, `InstanceBuffers`, `InstancedMesh` |
 | `gpu.rs` | `Uploader` (staging ring), `GrowBuffer`, `TrackedBuffer` (shadow-diffed uploads), parallel staging copies |
 | `arena.rs` | mesh arena: shared vertex/index buffers, first-fit range allocator, GPU-side growth |
@@ -23,7 +23,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
 | `dirty.rs` | `DirtyRanges`: sorted, coalescing range set |
 | `stats.rs` | `RenderStats`, `DrawPath` |
-| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `post/composite.wgsl` (scene texture → display target), `post/distortion.wgsl` |
+| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `frame/depth_resolve.wgsl` (minimum of a multisampled depth's samples), `post/composite.wgsl` (scene texture → display target), `post/distortion.wgsl` |
 
 ## Frame data flow
 
@@ -59,9 +59,14 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  flush TrackedBuffers (only changed bytes) ─► staging ring ─► copy_buffer_to_buffer
    (CpuDirect: `ecs` uploads only ranges drawn from it; the rest stays pending)
  encoder: [uploads] → copy templates→args → clear counts
+          → [render nodes: prepare (compute), prepare_view per view]
           → compute(mark → scan → scatter [+compact]) → copy args → stats readback ring
           → per view: [copy own render target → feedback texture] → render pass
-                      (first pass into a target clears it; viewport: scissor [+ clear triangle])
+                      (first pass into a target clears it; viewport: scissor [+ clear triangle];
+                       node slots around the built-in opaque and blended batches)
+                      [→ depth resolve → SceneRead pass] [→ Distortion pass]
+          → [HdrScene overlays] → post groups' composites → display views
+          → AfterTonemap overlays
           → submit → present → staging recall → poll(Poll)
  next frames: read the mapped args copy (visible counts) into RenderStats
 ```
@@ -341,6 +346,65 @@ override parity), `tests/capture_hdr.rs`, `frame::tests::replay_path_equals_fram
 `tests/alloc_frame.rs` (allocations per mode), `tests/gl.rs` (the portability scenes in Hdr and
 Ldr on ANGLE); `benches/frame.rs` (Direct vs Hdr minimal at 1080p).
 
+## Render nodes, scene depth and overlay stages
+Render nodes (`node.rs`, `frame/nodes.rs`, graphics spec §1.4–§1.8) draw into frame-owned
+passes. The renderer keeps a snapshot of the `RenderNodes` resource (re-read only when its
+generation changes, like the overlay snapshot) with one sorted slot list per scheduling list —
+Opaque, Skybox, Transparent, depth-reading Transparent, Distortion — ordered by `(order,
+registration, slot)`, and per node the slot bits of each list and of its negative-order slots.
+Each frame (`prepare_nodes`, after the views are prepared and before GPU culling): every node's
+`prepare` (with `&mut Resources`, the frame's `ViewInfo`s, the staging uploader and the encoder),
+then per camera view every node's `prepare_view` with the `PassTarget` each slot will draw with
+there. The returned masks (views × nodes, reused) are cut to the slots that can draw in the view
+(Distortion slots only in a distortion-enabled post group's settings camera) and reduced to the
+view's *work bits* (`nodes::work`); `prewarm` runs for each `(slot, PassTarget)` not seen before
+(tracked per node, kept across snapshots). Views with no node work record exactly what they did
+before nodes existed.
+
+In a view's scene pass (`passes.rs` `encode_view`): Opaque slots of negative order, the built-in
+opaque batches, the other Opaque slots, the Skybox slots, Transparent slots of negative order,
+the built-in blended batches (`ViewData::opaque_end` splits the view's draws; without node work
+between them the batches are one `encode_draws` call as before), the other non-reading
+Transparent slots, and the depth-reading ones when they draw in-pass. Node draws get the view's
+viewport and scissor, which are restored before built-in draws resume. The pass stores depth only
+when a reader of this view's depth has work: its SceneRead pass, the Distortion writers of its
+post group, or HdrScene overlays reading depth (after the last primary scene view). After the
+pass, by the depth matrix of `docs/graphics/frame.md`: a depth resolve
+(`shaders/frame/depth_resolve.wgsl`, the minimum of the samples into the group's
+`ResolvedDepth`, created at frame start by `ensure_resolved_depth`) for multisampled groups on
+read-only-depth devices, then the SceneRead pass — single sample, `Load` on the resolved color,
+the depth attached read-only (`depth_ops: None`) or not at all (GL) and bound in group 1 — or,
+for GL with MSAA or several views sharing a multisampled target (a later view would load
+multisampled content without the single-sample pass's draws), the in-pass fallback with the far
+dummy bound. Scene views of a post group's settings camera then run the Distortion pass into the
+group's persistent distortion buffer (`PostState::distortion_target`, created while preparing).
+
+Group 1 bind groups (`SceneInputs`): the far dummy (1×1 `R32Float` = 1.0) with the 0 EV
+exposure dummy, and one per depth texture read (created on first use, keyed by the view, dropped
+3 frames after the last use; their creation order gives `SceneDepthRef::generation`). Depth is
+sampled through a nearest sampler (binding 2): GLES 3.0 depth textures are incomplete unless
+filtered nearest, and `textureLoad` uses the texture's own (linear) filter state on GL.
+
+Overlays (`overlay.rs`) are split by `stage()`, read with `scene_reads()` at the start of every
+frame (`OverlayCache::sync`). HdrScene overlays run after the primary target's last scene view
+(`FrameState::hdr_scene_view`): in Direct mode right after that view into `D`; otherwise at the
+start of `finish_group`, into `S` before the composites; one pass, `prepare_scene` → `prepare` →
+`render` per overlay, the target at `OverlayTarget` size = scene size, `scale_factor ×
+render_scale`. AfterTonemap overlays run where all overlays ran before. Capture replays call
+node `draw`s with `FrameKind::CaptureReplay` (Direct groups: SceneRead passes included) and
+HdrScene overlays only for Direct primary groups (kind `Capture`); intermediate groups
+composite again from `S`, which already holds them.
+
+`Renderer::prewarm` walks the last frame's views (and each requested extra format on primary
+views): forward pipelines for the requested materials × instance layouts, every node's `prewarm`
+for its slots' targets, and the composite pipelines of the intermediate groups' targets.
+
+Tests: `tests/nodes.rs` (order around the built-ins, masks, lifecycle, every depth row against an
+analytic plane, in-pass fallback, Distortion plumbing, renderer id, poisoning, prewarm),
+`tests/overlay_stages.rs`, `frame::tests::{prepare_once_per_frame_not_in_replay,
+distortion_buffer_holds_the_writers_output, hdr_scene_overlay_not_replayed_in_hdr}`,
+`tests/alloc_frame.rs` ("nodes"), `tests/gl.rs::gl_backend_reads_scene_depth` (ANGLE).
+
 ## Custom shaders
 A `CustomShader` is WGSL spliced into the built-in forward shader, registered with
 `RenderAssets::add_shader` and selected per material with `Material::with_shader`. It defines
@@ -562,6 +626,11 @@ wgpu-hal's Metal backend allocates in every compute dispatch and bind, so the GP
 count grows with the number of culling dispatches — two per source buffer (and window of 64
 views), whatever the number of views: 40 explicit buffers seen by 4 views allocate 298 times
 per frame on `GpuMultiDraw` (544 when every view had its own dispatches; `CpuDirect`: 124).
+
+`tests/alloc_frame.rs` pins the graphics frame modes the same way: Direct 76, Hdr / Ldr /
+passthrough 106 (one composite pass more) and render nodes 119 (Direct plus one SceneRead pass
+and three node draws) per frame on Metal; the renderer's own work allocates nothing in any of
+them.
 
 `tests/alloc.rs` pins this: a scene with 40k moving ECS entities (two materials, one
 textured), a 100k-instance dynamic buffer rewritten every frame, an f16 buffer and a custom

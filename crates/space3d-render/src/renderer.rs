@@ -318,6 +318,8 @@ pub struct Renderer {
     pub(crate) overlays: crate::overlay::OverlayCache,
     /// Uncaptured wgpu errors so far (see [`install_error_handler`]).
     pub(crate) gpu_errors: Arc<AtomicU64>,
+    /// The device was lost (`FrameInfo::device_lost`).
+    pub(crate) device_lost: Arc<AtomicBool>,
     /// Graphics capabilities of the device, unmasked (`frame_graphics` is what
     /// [`Renderer::graphics_caps`] reports).
     pub(crate) graphics: crate::caps::GraphicsCaps,
@@ -333,6 +335,10 @@ pub struct Renderer {
     pub(crate) post: crate::post::PostState,
     /// Frame-plan warnings already logged.
     pub(crate) plan_warnings: crate::frame::PlanWarnings,
+    /// Snapshot of the `RenderNodes` resource and its schedule.
+    pub(crate) nodes: crate::frame::NodeCache,
+    /// Scene-input bind groups (group 1 of node and overlay passes) and depth resolves.
+    pub(crate) scene_inputs: crate::frame::SceneInputs,
 }
 
 /// What [`Renderer::prewarm`] builds, in addition to the post pipelines of the current post
@@ -384,10 +390,10 @@ thread_local! {
 /// consequence of the loss, not bugs, so from the device-lost callback on they are only
 /// logged, in debug builds too: a lost device degrades (captures fail, frames are dropped)
 /// instead of crashing.
-pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> Arc<AtomicU64> {
+pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> (Arc<AtomicU64>, Arc<AtomicBool>) {
     let count = Arc::new(AtomicU64::new(0));
     let lost = Arc::new(AtomicBool::new(false));
-    let (counter, lost_seen) = (count.clone(), lost.clone());
+    let (counter, lost_seen, lost_flag) = (count.clone(), lost.clone(), lost.clone());
     device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
         let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
         let lost = lost_seen.load(Ordering::Acquire);
@@ -409,7 +415,7 @@ pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> Arc<A
             _ => tracing::error!(?reason, %message, "GPU device lost"),
         }
     });
-    count
+    (count, lost_flag)
 }
 
 /// Primary target size within `1..=max_dimension` (the device's `max_texture_dimension_2d`):
@@ -526,7 +532,7 @@ impl Renderer {
             })
             .await
             .map_err(|e| RenderError::Device(e.to_string()))?;
-        let gpu_errors = install_error_handler(&device, cfg!(debug_assertions));
+        let (gpu_errors, device_lost) = install_error_handler(&device, cfg!(debug_assertions));
         let caps = RenderCapabilities::detect(&adapter, &device);
         tracing::info!(
             adapter = %caps.adapter.name,
@@ -559,6 +565,7 @@ impl Renderer {
             ..Default::default()
         };
         let post = crate::post::PostState::new(&device, &graphics);
+        let scene_inputs = crate::frame::SceneInputs::new(&device, &queue, &layouts);
         let mut renderer = Self {
             instance,
             adapter,
@@ -578,6 +585,7 @@ impl Renderer {
             frame_index: 0,
             overlays: Default::default(),
             gpu_errors,
+            device_lost,
             layouts,
             id: next_renderer_id(),
             gpu_timings,
@@ -585,6 +593,8 @@ impl Renderer {
             graphics,
             post,
             plan_warnings: Default::default(),
+            nodes: Default::default(),
+            scene_inputs,
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;
@@ -1295,9 +1305,14 @@ impl Renderer {
     }
 
     /// Build pipelines ahead of use (loading screens: WebGL2 links programs at creation, 50–150
-    /// ms each).
+    /// ms each): for the pass signatures of the last rendered frame (render one frame of the
+    /// scene first) and `request.formats` on primary views (the capture format when windowed),
+    /// the forward pipelines of `request.materials` × instance layouts, every render node's
+    /// `prewarm` for the targets its slots draw with, and the composite pipelines of the post
+    /// groups' targets. STUB(P-MAT, P-POST): material variants and post effects join as they
+    /// land.
     pub fn prewarm(&mut self, request: &PrewarmRequest) {
-        let _ = request; // STUB(F + P-MAT + P-POST): forward, post and node pipelines
+        self.prewarm_pipelines(request);
     }
 
     /// Where a cubemap is on its way to being usable as an environment.
@@ -1572,12 +1587,12 @@ mod tests {
     fn uncaptured_wgpu_errors_are_logged_in_release_and_panic_in_debug() {
         let Some(r) = renderer() else { return };
         assert_eq!(r.gpu_error_count(), 0);
-        let count = install_error_handler(&r.device, false);
+        let (count, _) = install_error_handler(&r.device, false);
         invalid_buffer(&r.device);
         invalid_buffer(&r.device);
         assert_eq!(count.load(Ordering::Relaxed), 2, "logged, not panicked");
 
-        let count = install_error_handler(&r.device, true);
+        let (count, _) = install_error_handler(&r.device, true);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invalid_buffer(&r.device)));
         assert!(panicked.is_err());
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -1588,7 +1603,7 @@ mod tests {
     #[test]
     fn errors_after_device_loss_do_not_panic_in_debug() {
         let Some(r) = renderer() else { return };
-        let count = install_error_handler(&r.device, true);
+        let (count, _) = install_error_handler(&r.device, true);
         r.device.destroy();
         // `destroy` loses the device once its in-flight work is done: the callback fires here.
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());

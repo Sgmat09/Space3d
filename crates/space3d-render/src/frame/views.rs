@@ -11,7 +11,7 @@ use crate::culling::{Aabb, Frustum, Sphere};
 use crate::gpu::align_up;
 use crate::handles::TextureHandle;
 use crate::instance::{CULL_BLOCK, CullBounds, CullFloat, CullSource, InstanceBuffers, ScaleKind};
-use crate::node::ViewRole;
+use crate::node::{ViewInfo, ViewRole};
 use crate::output::{OutputEncoding, Tonemapper};
 use crate::pipeline::{
     CULL_VIEWS, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuFrustum, GpuPointLight, GpuView,
@@ -109,6 +109,8 @@ pub(crate) enum ViewTarget {
 #[derive(Clone)]
 pub(crate) struct ViewData {
     pub(super) target: ViewTarget,
+    /// The view's camera (index in `FrameState::cameras`).
+    pub(super) camera: usize,
     /// The view's target group (`FrameState::groups`) and its role there.
     pub(super) group: usize,
     pub(super) role: ViewRole,
@@ -124,6 +126,11 @@ pub(crate) struct ViewData {
     pub(super) size: (u32, u32),
     pub(super) view_offset: u32,
     pub(super) draws: Range<usize>,
+    /// First draw of the built-in blended batches (`draws.end` without any): node slots of the
+    /// Opaque (order ≥ 0), Skybox and Transparent (order < 0) phases draw between.
+    pub(super) opaque_end: usize,
+    /// Which node lists have work in this view (`nodes::work` bits; set after `prepare_view`).
+    pub(super) work: u8,
     /// Some draw of this view samples the view's own render target. A texture cannot be a
     /// color attachment and a sampled resource in the same pass, so such draws sample a copy
     /// of the target taken just before the pass (its previous content) instead.
@@ -317,6 +324,7 @@ impl FrameState {
         let SceneLights { dir, nd } = *lights;
         // ---- views -------------------------------------------------------------------
         f.views.clear();
+        f.view_infos.clear();
         f.draws.clear();
         #[cfg(test)]
         {
@@ -438,6 +446,7 @@ impl FrameState {
                 .write_at(view_offset, bytemuck::bytes_of(&gv), &mut cpu_reallocs);
 
             let draws_start = f.draws.len();
+            let mut opaque_end = None;
             let jobs_start = f.jobs.len();
             // Current multi-draw run: (layout, class, material, run_base, draw cmd index, first args).
             let mut run: Option<(u16, u8, u32, u64, usize, u32)> = None;
@@ -448,6 +457,10 @@ impl FrameState {
                     continue;
                 }
                 stats.instances += s.count as u64;
+                // Sources are sorted opaque first: the view's blended draws start here.
+                if s.blend && opaque_end.is_none() {
+                    opaque_end = Some(f.draws.len());
+                }
                 let tris = s.triangles as u64;
                 let alloc = s.mesh.alloc;
                 let base_cmd = DrawCmd {
@@ -706,8 +719,51 @@ impl FrameState {
             if scene {
                 f.groups[gi].last_scene_view = Some(f.views.len());
             }
+            // Views drawing into the group's scene-pass attachments (all views in Direct mode).
+            if scene || !f.groups[gi].intermediate() {
+                f.groups[gi].scene_views += 1;
+            }
+            let group = &f.groups[gi];
+            let (color_format, samples) = if scene {
+                (group.scene_format, group.samples)
+            } else if group.intermediate() {
+                (group.display_format, 1)
+            } else {
+                (group.display_format, group.display_samples)
+            };
+            let (near, far, orthographic) = match cam.camera.projection {
+                Projection::Perspective { near, far, .. } => (near, far, false),
+                Projection::Orthographic { near, far, .. } => (near, far, true),
+            };
+            f.view_infos.push(ViewInfo {
+                camera: cam.id,
+                order: cam.order,
+                target: cam.camera.target,
+                primary: matches!(cam.camera.target, RenderTarget::Primary),
+                mode: group.mode,
+                role: plan.role,
+                view: camera_view,
+                proj,
+                view_proj,
+                camera_pos: cam.transform.w_axis.truncate(),
+                near,
+                far,
+                orthographic,
+                frustum,
+                viewport: rect.map_or([0, 0, size.0, size.1], |r| r.scissor(size)),
+                scene_size: group.scene_size,
+                target_size: display_size,
+                render_scale: group.scale,
+                samples,
+                color_format,
+                output,
+                exposure,
+                tonemapper,
+                view_offset: view_offset as u32,
+            });
             f.views.push(ViewData {
                 target,
+                camera: ci,
                 group: gi,
                 role: plan.role,
                 output,
@@ -716,6 +772,8 @@ impl FrameState {
                 size,
                 view_offset: view_offset as u32,
                 draws: draws_start..f.draws.len(),
+                opaque_end: opaque_end.unwrap_or(f.draws.len()),
+                work: 0,
                 feedback,
             });
         }

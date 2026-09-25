@@ -76,6 +76,11 @@ impl GpuPost {
         if plan.scene_rect[2..] == plan.output_rect[2..] {
             flags |= bits::EXACT;
         }
+        // The distortion buffer is bound and written this frame (applying it is the post
+        // area's: STUB(P-POST) PO5).
+        if plan.distortion && !plan.passthrough {
+            flags |= bits::DISTORTION;
+        }
         // The Ldr fallback exposes and tonemaps per fragment already; passthrough copies.
         let hdr = plan.mode == FrameMode::Hdr && !plan.passthrough;
         let (exposure, tonemapper) = if hdr {

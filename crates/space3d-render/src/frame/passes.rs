@@ -1,12 +1,19 @@
 //! Render passes (graphics spec §1.4 step 12): every view's forward pass into its target
 //! (clears, viewports, MSAA resolve) — `D` in Direct mode, the group's scene texture `S` for
-//! scene views of intermediate groups — the finish of intermediate groups (post groups'
-//! composites, then display views into `D`), the clear of a window nothing drew to, and the
-//! windowed-capture replay.
+//! scene views of intermediate groups — with the render nodes' phases inside it; after it the
+//! depth resolve and the SceneRead pass of depth-reading node slots (§1.6), and the Distortion
+//! pass of a post group's settings camera (§1.8); HdrScene overlays after the primary group's
+//! last scene view (§1.5); the finish of intermediate groups (post groups' composites, then
+//! display views into `D`), the clear of a window nothing drew to, and the windowed-capture
+//! replay.
 
+use super::nodes::{
+    NodePass, Orders, ReadMode, SlotList, distortion_target, group_target, read_mode, read_target, scene_target, work,
+};
 use super::views::{ViewData, ViewTarget};
-use crate::node::{FrameKind, ViewRole};
-use crate::output::OutputEncoding;
+use crate::node::{FrameInfo, FrameKind, FrameMode, PassTarget, SceneDepthRef, SceneReads, ViewRole};
+use crate::output::{OutputEncoding, Tonemapper};
+use crate::overlay::{OverlayScene, OverlayStage, OverlayTarget, OverlayTargetKind, lock_overlay};
 use crate::pipeline::OFFSCREEN_FORMAT;
 use crate::post::{PostEncode, PostGroupInput};
 use crate::renderer::Renderer;
@@ -43,15 +50,56 @@ struct DisplayTarget {
     manual_srgb: bool,
 }
 
+/// The attachments of one view's scene pass.
+struct ViewPass<'a> {
+    /// Color attachment (multisampled when `samples > 1`).
+    color: &'a wgpu::TextureView,
+    resolve: Option<&'a wgpu::TextureView>,
+    /// The single-sample color (`resolve`, else `color`): SceneRead passes load it.
+    single: &'a wgpu::TextureView,
+    depth: &'a wgpu::TextureView,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    /// The encoding fragments apply in this pass.
+    output: OutputEncoding,
+}
+
 /// The encoding a view's pipelines use in a pass: its own, except that only manual-sRGB
 /// attachments get manual sRGB (a capture replay of a manual-sRGB window draws into the sRGB
 /// offscreen target).
-fn pass_output(view: OutputEncoding, manual_srgb: bool) -> OutputEncoding {
+pub(super) fn pass_output(view: OutputEncoding, manual_srgb: bool) -> OutputEncoding {
     match view {
         OutputEncoding::ManualSrgb | OutputEncoding::Linear if manual_srgb => OutputEncoding::ManualSrgb,
         OutputEncoding::ManualSrgb => OutputEncoding::Linear,
         other => other,
     }
+}
+
+/// Viewport and scissor of a view's passes: its rect (`None`: the whole `extent`).
+fn view_rects(view: &ViewData, extent: (u32, u32)) -> ([f32; 4], [u32; 4]) {
+    match view.rect {
+        Some(r) => ([r.x as f32, r.y as f32, r.w as f32, r.h as f32], r.scissor(extent)),
+        None => (
+            [0.0, 0.0, extent.0 as f32, extent.1 as f32],
+            [0, 0, extent.0.max(1), extent.1.max(1)],
+        ),
+    }
+}
+
+fn extent(view: &wgpu::TextureView) -> (u32, u32) {
+    (view.texture().width(), view.texture().height())
+}
+
+/// Where HdrScene overlays draw and what they are told.
+struct HdrScenePass<'a> {
+    target: &'a wgpu::TextureView,
+    format: wgpu::TextureFormat,
+    /// Scale factor on top of the overlays' own (the group's render scale).
+    scale: f32,
+    output: OutputEncoding,
+    mode: FrameMode,
+    depth: Option<wgpu::TextureView>,
+    kind: OverlayTargetKind,
 }
 
 impl Renderer {
@@ -60,7 +108,7 @@ impl Renderer {
     ///
     /// Views sharing a target (split screen, picture-in-picture, overlays) draw in camera
     /// order into the same attachments: the first pass into a target in a frame clears it,
-    /// later ones load what the earlier ones drew (see [`Self::encode_pass`]). In intermediate
+    /// later ones load what the earlier ones drew (see [`Self::encode_view`]). In intermediate
     /// groups, scene views draw into `S` the same way; after the group's last scene view its
     /// post groups are composited into `D` (the first composite clears `D`), then its display
     /// views draw into `D` in camera order.
@@ -75,6 +123,11 @@ impl Renderer {
         state.clear();
         state.resize(self.frame.groups.len(), GroupEncode::default());
         let mut presented = false;
+        let kind = match (primary_to_offscreen, surface_view.is_some()) {
+            (true, _) => OverlayTargetKind::Capture,
+            (false, true) => OverlayTargetKind::Surface,
+            (false, false) => OverlayTargetKind::Offscreen,
+        };
         for (i, view) in views.iter().enumerate() {
             let is_primary = matches!(view.target, ViewTarget::Primary);
             if primary_to_offscreen && !is_primary {
@@ -95,36 +148,58 @@ impl Renderer {
                 presented |= is_primary;
                 self.copy_feedback(encoder, view);
                 let output = pass_output(view.output, d.manual_srgb);
-                self.encode_pass(
-                    encoder,
-                    view,
-                    first,
-                    &d.color,
-                    d.resolve.as_ref(),
-                    &d.depth,
-                    d.format,
-                    d.samples,
+                let pass = ViewPass {
+                    color: &d.color,
+                    resolve: d.resolve.as_ref(),
+                    single: &d.single,
+                    depth: &d.depth,
+                    format: d.format,
+                    samples: d.samples,
                     output,
-                );
+                };
+                let depth = self.encode_view(encoder, i, view, first, &pass, primary_to_offscreen);
+                // HdrScene overlays of a Direct primary group: into `D` after its last view.
+                if is_primary && self.frame.hdr_scene_view == Some(i) {
+                    let hdr = HdrScenePass {
+                        target: &d.single,
+                        format: d.format,
+                        scale: 1.0,
+                        output,
+                        mode: FrameMode::Direct,
+                        depth,
+                        kind,
+                    };
+                    self.encode_hdr_scene_overlays(encoder, i, &hdr);
+                }
                 continue;
             }
             match view.role {
                 ViewRole::Scene => {
                     // Replays keep `S` from the frame: only its composites run again.
+                    let mut depth = None;
                     if !primary_to_offscreen {
                         let first = !state[g].scene_started;
                         state[g].scene_started = true;
-                        self.encode_scene_view(encoder, view, first);
+                        depth = self.encode_scene_view(encoder, i, view, first);
                     }
                     if last_scene_view == Some(i) {
-                        self.finish_group(encoder, g, &views[..i], &d, primary_to_offscreen, &mut state[g]);
+                        self.finish_group(
+                            encoder,
+                            g,
+                            i,
+                            &views[..i],
+                            &d,
+                            primary_to_offscreen,
+                            &mut state[g],
+                            depth,
+                        );
                         presented |= is_primary;
                     }
                 }
                 _ => {
                     // Display views before the group's last scene view wait for its finish.
                     if state[g].finished {
-                        self.encode_display_view(encoder, view, &d);
+                        self.encode_display_view(encoder, i, view, &d, primary_to_offscreen);
                     }
                 }
             }
@@ -236,34 +311,56 @@ impl Renderer {
     }
 
     /// A scene view of an intermediate group: its forward pass into the group's `S` (MSAA
-    /// resolved into it), with the viewport-clear rules applied to `S`.
-    fn encode_scene_view(&mut self, encoder: &mut wgpu::CommandEncoder, view: &ViewData, first: bool) {
+    /// resolved into it), with the viewport-clear rules applied to `S`, its SceneRead pass and,
+    /// for a post group's settings camera, the Distortion pass. Returns the single-sample depth
+    /// holding the view's depth afterwards, if a consumer needed one.
+    fn encode_scene_view(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        i: usize,
+        view: &ViewData,
+        first: bool,
+    ) -> Option<wgpu::TextureView> {
         let group = &self.frame.groups[view.group];
         let (format, samples) = (group.scene_format, group.samples);
-        let Some(t) = self.frame.group_textures.get(&group.target) else {
-            return;
-        };
+        let t = self.frame.group_textures.get(&group.target)?;
         let (color, resolve) = match &t.scene_msaa {
             Some(m) => (m.clone(), Some(t.scene_view.clone())),
             None => (t.scene_view.clone(), None),
         };
-        let depth = t.depth.clone();
-        self.encode_pass(
-            encoder,
-            view,
-            first,
-            &color,
-            resolve.as_ref(),
-            &depth,
+        let (single, depth) = (t.scene_view.clone(), t.depth.clone());
+        let pass = ViewPass {
+            color: &color,
+            resolve: resolve.as_ref(),
+            single: &single,
+            depth: &depth,
             format,
             samples,
-            view.output,
-        );
+            output: view.output,
+        };
+        let depth_1x = self.encode_view(encoder, i, view, first, &pass, false);
+        if view.work & work::DISTORTION != 0
+            && let Some(pg) = self
+                .frame
+                .post_groups
+                .iter()
+                .position(|p| p.view == Some(i) && p.distortion)
+        {
+            self.encode_distortion(encoder, i, pg, depth_1x.as_ref());
+        }
+        depth_1x
     }
 
     /// A display view of an intermediate group: drawn LDR, Direct-style, at 1 sample into `D`
     /// after the group's composites (with the group's display depth).
-    fn encode_display_view(&mut self, encoder: &mut wgpu::CommandEncoder, view: &ViewData, d: &DisplayTarget) {
+    fn encode_display_view(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        i: usize,
+        view: &ViewData,
+        d: &DisplayTarget,
+        replay: bool,
+    ) {
         let group = &self.frame.groups[view.group];
         let Some(depth) = self
             .frame
@@ -274,36 +371,65 @@ impl Renderer {
             return;
         };
         self.copy_feedback(encoder, view);
-        let output = pass_output(view.output, d.manual_srgb);
-        self.encode_pass(encoder, view, false, &d.single, None, &depth, d.format, 1, output);
+        let pass = ViewPass {
+            color: &d.single,
+            resolve: None,
+            single: &d.single,
+            depth: &depth,
+            format: d.format,
+            samples: 1,
+            output: pass_output(view.output, d.manual_srgb),
+        };
+        self.encode_view(encoder, i, view, false, &pass, replay);
     }
 
-    /// Finish an intermediate group (spec §1.4 `finish(G)`): composite each post group, in
-    /// settings-camera order, into `D` (the first write clears `D`), then the display views
-    /// that came before the group's last scene view (`earlier`), in camera order. A capture
-    /// replay composites again from the persisted `S` (no temporal update).
+    /// Finish an intermediate group (spec §1.4 `finish(G)`): the primary group's HdrScene
+    /// overlays into `S`, then each post group's composite, in settings-camera order, into `D`
+    /// (the first write clears `D`), then the display views that came before the group's last
+    /// scene view (`earlier`), in camera order. A capture replay composites again from the
+    /// persisted `S` (no temporal update; HdrScene overlays are already in `S`).
+    #[allow(clippy::too_many_arguments)]
     fn finish_group(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         g: usize,
+        last: usize,
         earlier: &[ViewData],
         d: &DisplayTarget,
         replay: bool,
         state: &mut GroupEncode,
+        depth: Option<wgpu::TextureView>,
     ) {
         let group = &self.frame.groups[g];
-        let (target, mode, scene_format, scene_size, transparent, post_groups) = (
+        let (target, mode, scene_format, scene_size, transparent, post_groups, scale) = (
             group.target,
             group.mode,
             group.scene_format,
             group.scene_size,
             group.transparent,
             group.post_groups.clone(),
+            group.scale,
         );
         let Some(t) = self.frame.group_textures.get(&target) else {
             return;
         };
         let (scene, generation) = (t.scene_view.clone(), t.generation);
+        if !replay && self.frame.hdr_scene_view == Some(last) {
+            let hdr = HdrScenePass {
+                target: &scene,
+                format: scene_format,
+                scale,
+                output: self.frame.view_infos[last].output,
+                mode,
+                depth,
+                kind: if self.surface.is_some() {
+                    OverlayTargetKind::Surface
+                } else {
+                    OverlayTargetKind::Offscreen
+                },
+            };
+            self.encode_hdr_scene_overlays(encoder, last, &hdr);
+        }
         let mut frame = self.frame.info;
         if replay {
             frame.kind = FrameKind::CaptureReplay;
@@ -312,8 +438,16 @@ impl Renderer {
         for p in post_groups {
             let pg = self.frame.post_groups[p];
             let (rect, _) = pg.display_rect.fitted(d.size, self.frame.max_texture_2d);
+            let camera = self.frame.cameras[pg.camera].id;
+            // The distortion buffer written by this frame's Distortion pass (it persists for
+            // replays).
+            let distortion = pg
+                .distortion
+                .then(|| self.post.distortion_view(camera))
+                .flatten()
+                .map(|(view, _, _)| view);
             let input = PostGroupInput {
-                camera: self.frame.cameras[pg.camera].id,
+                camera,
                 settings: pg.settings,
                 mode,
                 scene_output: pg.scene_output,
@@ -324,7 +458,7 @@ impl Renderer {
                 scene_alpha: scene_format != wgpu::TextureFormat::Rg11b10Ufloat,
                 transparent,
                 depth: None,
-                distortion: None,
+                distortion: distortion.as_ref(),
                 output: &d.single,
                 output_format: d.format,
                 output_size: d.size,
@@ -350,48 +484,73 @@ impl Renderer {
             state.drawn = true;
         }
         state.finished = true;
-        for view in earlier {
+        for (j, view) in earlier.iter().enumerate() {
             if view.group == g && view.role == ViewRole::Display {
-                self.encode_display_view(encoder, view, d);
+                self.encode_display_view(encoder, j, view, d, replay);
             }
         }
     }
 
-    /// Record one view's render pass. `first`: no earlier pass of this frame drew into the
-    /// view's target.
+    /// Record one view's passes. `first`: no earlier pass of this frame drew into the view's
+    /// target.
     ///
-    /// Color: a view covering its whole target clears it with its clear color (a load op). The
-    /// first pass into a target otherwise clears it to black — never leaving the previous
-    /// frame's content, and never painting a viewport's clear color outside the viewport —
-    /// and later passes load it. A view with a viewport and a clear color then clears only its
-    /// viewport, with a triangle in that color ([`Pipelines::viewport_clear`]). The viewport,
-    /// in whole pixels ([`viewport_rect`]), also sets the pass's scissor rect (its part within
-    /// the attachment). Depth is per view:
-    /// every pass clears the whole depth attachment (views never test against each other) and
-    /// discards it.
+    /// The scene pass: a view covering its whole target clears it with its clear color (a load
+    /// op). The first pass into a target otherwise clears it to black — never leaving the
+    /// previous frame's content, and never painting a viewport's clear color outside the
+    /// viewport — and later passes load it. A view with a viewport and a clear color then clears
+    /// only its viewport, with a triangle in that color ([`Pipelines::viewport_clear`]). The
+    /// viewport, in whole pixels ([`viewport_rect`]), also sets the pass's scissor rect (its
+    /// part within the attachment). Depth is per view: every pass clears the whole depth
+    /// attachment (views never test against each other) and discards it, unless a reader of
+    /// the view's depth has work (graphics spec §1.6: its SceneRead pass, its post group's
+    /// Distortion writers, HdrScene overlays reading depth).
+    ///
+    /// Inside the pass, per phase (graphics spec §1.4, §1.7): Opaque — node slots of negative
+    /// order, the built-in opaque batches, the other Opaque slots; Skybox slots; Transparent —
+    /// slots of negative order, the built-in blended batches, the other slots not reading
+    /// depth (and, without a single-sample depth to read, the depth-reading ones). After it:
+    /// the depth resolve (multisampled groups) and the SceneRead pass of the depth-reading
+    /// slots. Returns the single-sample depth holding the view's depth afterwards, when a
+    /// reader needed one.
     ///
     /// [`Pipelines::viewport_clear`]: crate::pipeline::Pipelines::viewport_clear
-    #[allow(clippy::too_many_arguments)]
-    fn encode_pass(
+    /// [`viewport_rect`]: super::plan::viewport_rect
+    fn encode_view(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
+        i: usize,
         view: &ViewData,
         first: bool,
-        color: &wgpu::TextureView,
-        resolve: Option<&wgpu::TextureView>,
-        depth: &wgpu::TextureView,
-        format: wgpu::TextureFormat,
-        samples: u32,
-        output: OutputEncoding,
-    ) {
+        p: &ViewPass<'_>,
+        replay: bool,
+    ) -> Option<wgpu::TextureView> {
         let rect = view.rect;
         let full = rect.is_none_or(|r| r.covers(view.size));
         // Scissor rects must lie within the attachment itself. It has the size the view was
         // prepared for on every path (see `surface_lost`); should that ever not hold, a scissor
         // rect outside it would fail validation and lose the whole frame's commands.
-        let extent = (color.texture().width(), color.texture().height());
+        let extent = extent(p.color);
+        let (viewport, scissor) = view_rects(view, extent);
+        // Scene-depth readers of this view (graphics spec §1.6).
+        let w = view.work;
+        let single = self.frame.groups[view.group].scene_views <= 1 || view.role == ViewRole::Display;
+        let resolved = (p.samples > 1)
+            .then(|| self.frame.resolved_depth(group_target(&view.target), extent).cloned())
+            .flatten();
+        let (rods, can_resolve) = (
+            self.frame_graphics.read_only_depth,
+            self.frame_graphics.msaa_depth_resolve && resolved.is_some(),
+        );
+        let mode = read_mode(p.samples, rods, can_resolve, single);
+        let reading = w & work::READING != 0;
+        let scene_read = reading && mode != ReadMode::InPass;
+        let overlay_depth = self.overlays.hdr_scene_depth() && self.frame.hdr_scene_view == Some(i);
+        let wants_1x = scene_read || w & work::DISTORTION != 0 || overlay_depth;
+        let resolve = p.samples > 1 && can_resolve && wants_1x;
+        let store = scene_read || resolve || (p.samples <= 1 && wants_1x);
+
         let clear = view.clear.map(|c| {
-            let c = if output == OutputEncoding::ManualSrgb {
+            let c = if p.output == OutputEncoding::ManualSrgb {
                 linear_to_srgb_color(c)
             } else {
                 c
@@ -408,44 +567,389 @@ impl Renderer {
             _ if first => (wgpu::LoadOp::Clear(wgpu::Color::BLACK), clear),
             _ => (wgpu::LoadOp::Load, clear),
         };
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("space3d forward"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color,
-                depth_slice: None,
-                resolve_target: resolve,
-                ops: wgpu::Operations {
-                    load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Discard,
+        let mut pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("space3d forward"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: p.color,
+                    depth_slice: None,
+                    resolve_target: p.resolve,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: p.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: if store {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
+                    }),
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
+                ..Default::default()
+            })
+            .forget_lifetime();
         if let Some(r) = rect {
             pass.set_viewport(r.x as f32, r.y as f32, r.w as f32, r.h as f32, 0.0, 1.0);
             let [x, y, w, h] = r.scissor(extent);
             pass.set_scissor_rect(x, y, w, h);
         }
         if let Some(c) = rect_clear {
-            pass.set_pipeline(self.pipelines.viewport_clear(&self.device, format, samples));
+            pass.set_pipeline(self.pipelines.viewport_clear(&self.device, p.format, p.samples));
             pass.set_blend_constant(c);
             pass.draw(0..3, 0..1);
         }
-        self.encode_draws(&mut pass, view, format, samples, output);
-        if rect.is_some() && resolve.is_some() {
+        let target = scene_target(p.format, p.samples, p.output);
+        let nodes = |r: &mut Self, pass: &mut wgpu::RenderPass<'static>, list: SlotList, orders: Orders| {
+            r.draw_nodes(pass, i, list, orders, target, extent, viewport, scissor, None, replay);
+        };
+        let restore = |pass: &mut wgpu::RenderPass<'static>| {
+            let [x, y, w, h] = viewport;
+            pass.set_viewport(x, y, w, h, 0.0, 1.0);
+            let [x, y, w, h] = scissor;
+            pass.set_scissor_rect(x, y, w, h);
+        };
+        if w & work::OPAQUE_PRE != 0 {
+            nodes(self, &mut pass, SlotList::Opaque, Orders::BeforeBuiltins);
+            restore(&mut pass);
+        }
+        if w & work::BETWEEN == 0 {
+            self.encode_draws(&mut pass, view, view.draws.clone(), p.format, p.samples, p.output);
+        } else {
+            self.encode_draws(
+                &mut pass,
+                view,
+                view.draws.start..view.opaque_end,
+                p.format,
+                p.samples,
+                p.output,
+            );
+            if w & work::OPAQUE_POST != 0 {
+                nodes(self, &mut pass, SlotList::Opaque, Orders::AfterBuiltins);
+            }
+            if w & work::SKYBOX != 0 {
+                nodes(self, &mut pass, SlotList::Skybox, Orders::All);
+            }
+            if w & work::TRANSPARENT_PRE != 0 {
+                nodes(self, &mut pass, SlotList::Transparent, Orders::BeforeBuiltins);
+            }
+            restore(&mut pass);
+            self.encode_draws(
+                &mut pass,
+                view,
+                view.opaque_end..view.draws.end,
+                p.format,
+                p.samples,
+                p.output,
+            );
+        }
+        if w & work::TRANSPARENT_POST != 0 {
+            nodes(self, &mut pass, SlotList::Transparent, Orders::AfterBuiltins);
+        }
+        if reading && mode == ReadMode::InPass {
+            nodes(self, &mut pass, SlotList::Reading, Orders::All);
+        }
+        if p.resolve.is_some() && (rect.is_some() || w != 0) {
             // wgpu's GL backend resolves MSAA with a framebuffer blit at the end of the pass,
-            // and GL clips blits to the scissor rect: only the viewport would be resolved, and
-            // the rest of the target would keep its previous content.
+            // and GL clips blits to the scissor rect: only the viewport (or a node's scissor)
+            // would be resolved, and the rest of the target would keep its previous content.
             pass.set_scissor_rect(0, 0, extent.0, extent.1);
         }
+        drop(pass);
+
+        // The single-sample depth holding this view's depth.
+        let depth_1x = if p.samples <= 1 {
+            store.then(|| p.depth.clone())
+        } else if resolve {
+            let resolved = resolved.expect("can_resolve");
+            self.encode_depth_resolve(encoder, p.depth, &resolved, p.samples, scissor);
+            Some(resolved)
+        } else {
+            None
+        };
+        if scene_read && let Some(depth) = &depth_1x {
+            let attached = mode != ReadMode::Sampled;
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("space3d scene read"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: p.single,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    // Read-only (no depth ops): tested by hardware and sampled in group 1.
+                    depth_stencil_attachment: attached.then_some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth,
+                        depth_ops: None,
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            let target = read_target(p.format, p.output, attached);
+            self.draw_nodes(
+                &mut pass,
+                i,
+                SlotList::Reading,
+                Orders::All,
+                target,
+                extent,
+                viewport,
+                scissor,
+                Some(depth),
+                replay,
+            );
+            drop(pass);
+            self.stats.scene_read_passes += 1;
+            self.stats.render_passes += 1;
+        }
+        depth_1x
+    }
+
+    /// Resolve a multisampled depth (minimum of its samples) into `resolved`, within
+    /// `scissor` (graphics spec §1.6).
+    fn encode_depth_resolve(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        depth: &wgpu::TextureView,
+        resolved: &wgpu::TextureView,
+        samples: u32,
+        scissor: [u32; 4],
+    ) {
+        let Renderer {
+            device,
+            pipelines,
+            scene_inputs,
+            stats,
+            ..
+        } = self;
+        let (pipeline, bgl) = pipelines.depth_resolve(device, samples);
+        let bind_group = scene_inputs.resolve(device, bgl, depth);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("space3d depth resolve"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: resolved,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        let [x, y, w, h] = scissor;
+        pass.set_scissor_rect(x, y, w, h);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+        stats.depth_resolves += 1;
+        stats.render_passes += 1;
+        stats.fullscreen_passes += 1;
+    }
+
+    /// The Distortion pass of post group `pg` (graphics spec §1.8): its settings camera's
+    /// Distortion slots into the group's distortion buffer, cleared to 0, with the view's
+    /// single-sample depth sampled when there is one.
+    fn encode_distortion(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        i: usize,
+        pg: usize,
+        depth: Option<&wgpu::TextureView>,
+    ) {
+        let camera = self.frame.cameras[self.frame.post_groups[pg].camera].id;
+        let Some((buffer, size, _)) = self.post.distortion_view(camera) else {
+            return;
+        };
+        let mut pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("space3d distortion"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &buffer,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            })
+            .forget_lifetime();
+        let viewport = [0.0, 0.0, size.0 as f32, size.1 as f32];
+        let scissor = [0, 0, size.0, size.1];
+        self.draw_nodes(
+            &mut pass,
+            i,
+            SlotList::Distortion,
+            Orders::All,
+            distortion_target(depth.is_some()),
+            size,
+            viewport,
+            scissor,
+            depth,
+            false,
+        );
+        drop(pass);
+        self.stats.distortion_passes += 1;
+        self.stats.render_passes += 1;
+    }
+
+    /// Record the node slots of `list` with work in view `i` into `pass` (see
+    /// [`super::NodeCache::draw`]), with scene depth `depth` bound in group 1 (the far dummy
+    /// without).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_nodes(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'static>,
+        i: usize,
+        list: SlotList,
+        orders: Orders,
+        target: PassTarget,
+        target_size: (u32, u32),
+        viewport: [f32; 4],
+        scissor: [u32; 4],
+        depth: Option<&wgpu::TextureView>,
+        replay: bool,
+    ) {
+        let Renderer {
+            device,
+            frame: f,
+            nodes,
+            scene_inputs,
+            layouts,
+            stats,
+            ..
+        } = self;
+        let n = nodes.len();
+        let Some((view_bind_group, _)) = &f.view_bg else { return };
+        let (scene_bind_group, scene_depth) = match depth {
+            Some(view) => {
+                let (bg, generation) = scene_inputs.with_depth(device, layouts, view);
+                let depth = SceneDepthRef {
+                    view,
+                    size: extent(view),
+                    generation,
+                };
+                (bg, Some(depth))
+            }
+            None => (&scene_inputs.none, None),
+        };
+        let frame = replay_info(f.info, replay);
+        let np = NodePass {
+            device,
+            view: &f.view_infos[i],
+            masks: &f.node_masks[i * n..(i + 1) * n],
+            target,
+            target_size,
+            view_bind_group,
+            scene_bind_group,
+            scene_depth,
+            frame,
+            viewport,
+            scissor,
+        };
+        stats.node_draws += nodes.draw(pass, list, orders, &np);
+    }
+
+    /// HdrScene overlays (graphics spec §1.5), after the last primary scene view `i`: each
+    /// overlay's `prepare_scene` and `prepare`, then one single-sample pass (no depth, `Load`)
+    /// into `hdr.target` with every overlay's `render`, viewport and scissor reset per overlay.
+    fn encode_hdr_scene_overlays(&mut self, encoder: &mut wgpu::CommandEncoder, i: usize, hdr: &HdrScenePass<'_>) {
+        if !self.overlays.has_stage(OverlayStage::HdrScene) {
+            return;
+        }
+        let Renderer {
+            device,
+            queue,
+            frame: f,
+            overlays,
+            scene_inputs,
+            layouts,
+            stats,
+            ..
+        } = self;
+        let Some((view_bind_group, _)) = &f.view_bg else { return };
+        let info = &f.view_infos[i];
+        let size = extent(hdr.target);
+        let (scene_bind_group, scene_depth) = match &hdr.depth {
+            Some(view) => {
+                let (bg, generation) = scene_inputs.with_depth(device, layouts, view);
+                let depth = SceneDepthRef {
+                    view,
+                    size: extent(view),
+                    generation,
+                };
+                (bg, Some(depth))
+            }
+            None => (&scene_inputs.none, None),
+        };
+        let (exposure, tonemapper) = if hdr.output == OutputEncoding::Tonemapped {
+            (info.exposure, info.tonemapper)
+        } else {
+            (1.0, Tonemapper::None)
+        };
+        let target = OverlayTarget {
+            size,
+            format: hdr.format,
+            scale_factor: overlays.scale_factor() * hdr.scale,
+            kind: hdr.kind,
+        };
+        for (overlay, stage, reads) in overlays.iter() {
+            if stage != OverlayStage::HdrScene {
+                continue;
+            }
+            let scene = OverlayScene {
+                view: info,
+                mode: hdr.mode,
+                output: hdr.output,
+                exposure,
+                tonemapper,
+                scene_depth: scene_depth.filter(|_| reads.contains(SceneReads::DEPTH)),
+                view_bind_group,
+                scene_bind_group,
+                layouts,
+            };
+            let mut o = lock_overlay(overlay);
+            o.prepare_scene(&scene);
+            o.prepare(device, queue, encoder, &target);
+        }
+        let mut pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("space3d overlays (hdr scene)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: hdr.target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            })
+            .forget_lifetime();
+        let (w, h) = size;
+        for (overlay, stage, _) in overlays.iter() {
+            if stage != OverlayStage::HdrScene {
+                continue;
+            }
+            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            pass.set_scissor_rect(0, 0, w, h);
+            lock_overlay(overlay).render(&mut pass, &target);
+        }
+        drop(pass);
+        stats.render_passes += 1;
     }
 
     /// Whether a capture re-records the last frame into the offscreen target: windowed
@@ -476,4 +980,13 @@ impl Renderer {
         self.encode_views(encoder, None, true);
         self.stats = stats;
     }
+}
+
+/// The frame facts node calls see: a capture replay's never advance time.
+fn replay_info(mut info: FrameInfo, replay: bool) -> FrameInfo {
+    if replay {
+        info.kind = FrameKind::CaptureReplay;
+        info.delta = 0.0;
+    }
+    info
 }

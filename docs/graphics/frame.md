@@ -1,4 +1,4 @@
-# Frame: HDR, tonemapping, render scale, cameras
+# Frame: HDR, tonemapping, render scale, cameras, render nodes, overlay stages
 
 How a frame turns cameras into pixels once graphics features are on. The normative design is
 [`docs/design/graphics.md`](../design/graphics.md) §1; the renderer internals are in
@@ -110,6 +110,181 @@ let rt = assets.add_render_target_with(512, 512, RenderTargetDesc::hdr().with_sa
   composite un-premultiplies before tonemapping and re-premultiplies after, so no haze appears
   where nothing was drawn.
 
+## Render nodes: drawing into the frame's passes
+
+A `RenderNode` draws into passes the frame owns — the view's scene pass, its scene-depth pass,
+a post group's distortion buffer — with the view's uniform, its encoding and (optionally) its
+scene depth. Particles, the skybox and distortion meshes are nodes; so can be any user draw.
+Register one in the `RenderNodes` resource (`RenderPlugin` inserts it, with the built-ins
+`"space3d/skybox"` and `"space3d/distortion-meshes"`):
+
+```rust
+use space3d::render::*;
+
+struct DepthTint { /* layouts captured in `prepare`, pipelines per `PassTarget` */ }
+static SLOTS: [PhaseSlot; 1] =
+    [PhaseSlot::new(RenderPhase::Transparent, 100).reading(SceneReads::DEPTH)];
+
+impl RenderNode for DepthTint {
+    fn slots(&self) -> &[PhaseSlot] { &SLOTS }
+    fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
+        // once per frame: keep ctx.layouts.{view, scene} (rebuild when ctx.frame.renderer changes),
+        // upload with ctx.upload, record compute into ctx.encoder
+    }
+    fn prewarm(&mut self, device: &wgpu::Device, targets: &[(usize, PassTarget)]) {
+        // build a pipeline per target: VIEW_WGSL + scene_wgsl(&target) + OUTPUT_WGSL + your code
+    }
+    fn draw(&mut self, pass: &mut wgpu::RenderPass<'static>, ctx: &DrawContext<'_>) {
+        pass.set_pipeline(/* the pipeline for ctx.target */);
+        pass.set_bind_group(0, ctx.view_bind_group, &[ctx.view.view_offset]);
+        pass.set_bind_group(1, ctx.scene_bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+app.resources.expect_mut::<RenderNodes>().insert("depth-tint", DepthTint { /* … */ });
+```
+
+`crates/space3d-render/examples/frame_nodes.rs` is this node in full; the `Engine/Frame/Node
+Phases` and `Engine/Frame/Soft Depth` stories show every phase and the depth paths.
+
+**When nodes are called.** Every rendered frame: `prepare` once per node (after the frame is
+planned, before GPU culling and every pass; compute allowed), then per camera view
+`prepare_view`, which returns the `SlotMask` of slots with work in that view — slots without
+work cost nothing (no pass, no depth store, no distortion write). `prewarm` runs before the first
+draw with a new `(slot, PassTarget)` (a new node, a new mode, MSAA or format) and from
+`Renderer::prewarm` (loading screens: WebGL2 links programs when pipelines are created). `draw`
+records into the pass: pipelines must match `ctx.target` exactly; viewport and scissor are set to
+the view's rect; bind groups and pipeline are unset. Windowed captures call `draw` again with
+`FrameKind::CaptureReplay` and never `prepare`/`prepare_view`: keep what `draw` needs from
+`prepare`. `FrameInfo` gives the frame number (seed noise with it), the fixed tick, render time
+`(tick + alpha) × fixed_delta`, `delta` (0 when `Time::frame` did not advance and in replays),
+the renderer id (a new renderer is a new device: rebuild GPU state) and `device_lost`.
+
+**Order.** Per view, phases run Opaque → Skybox → Transparent; within a phase slots draw by
+`(order, registration, slot index)`. The built-in batches sit at order 0 and draw before nodes
+of the same order, so negative orders draw before them:
+
+| phase | draws |
+|---|---|
+| Opaque | slots of order < 0, built-in opaque batches, slots of order ≥ 0 (may write depth) |
+| Skybox | slots (the built-in skybox node at 0), where depth is still at the far plane |
+| Transparent | slots of order < 0, built-in blended batches, slots of order ≥ 0 not reading depth; then the depth-reading slots (below) |
+| Distortion | only in a post group's settings camera, into its distortion buffer |
+
+`RenderNodes::schedule()` lists `(node, slot, phase, order)` in this order.
+
+**Scene depth.** A Transparent slot declared `.reading(SceneReads::DEPTH)` draws — as a whole —
+after the view's scene pass, in a single-sample *SceneRead* pass on the view's color with the
+view's depth in group 1 (`scene_wgsl(&ctx.target)` declares it and the helpers
+`s3d_view_depth_at`, `s3d_soft_fade`, `s3d_scene_occluded`, …). How depth is available depends
+on the device and the view (`PassTarget::depth_access`):
+
+| samples | read-only depth (`GraphicsCaps::read_only_depth`) | views in the target | depth readers draw in | `depth_access` | soft fade |
+|---|---|---|---|---|---|
+| 1 | yes (Metal, Vulkan, DX12, WebGPU) | any | SceneRead pass, depth attached read-only and sampled | `ReadOnlyAttached` | yes |
+| 1 | no (WebGL2 / GLES) | any | SceneRead pass, no depth attachment: test manually (`s3d_scene_occluded`) | `SampledOnly` | yes |
+| 4 | yes | 1 | the depth is resolved (minimum of the samples), then the SceneRead pass on the resolved color | `ReadOnlyAttached` | yes |
+| 4 | yes | > 1 | inside the multisampled scene pass (a later view would load multisampled content without the single-sample pass's draws) | `None` (far dummy) | no; hardware depth test |
+| 4 | no | any | inside the multisampled scene pass (GLES 3.0 cannot sample multisampled depth) | `None` | no |
+
+Write shaders that handle all three accesses: `s3d_depth_valid()` is false with `None`,
+`s3d_soft_fade` then returns 1 and `s3d_scene_occluded` false; use
+`target.depth_stencil(compare, false)` (it is `None` without a depth attachment). The minimum of
+the samples is conservative: readers behind partially covered silhouette pixels are hidden
+(slight edge aliasing instead of halos). Group 1 samples depth through a nearest sampler
+(binding 2): WebGL2 reads depth textures as 0 through `textureLoad`. `DownlevelOverride {
+no_read_only_depth: true, .. }` forces the WebGL2 rows on any device.
+
+**Distortion.** Distortion slots draw only in the view of a post group's settings camera whose
+`PostProcess::distortion` is enabled, and only when one has work there: into the group's
+persistent half-resolution `DISTORTION_FORMAT` buffer, cleared to 0, blend One/One, writing
+`distortion_encode(offset, weight)` from `DISTORTION_WGSL`, with the view's single-sample depth
+sampled where it exists (`SampledOnly`; `None` with MSAA on GL). The composite binds the buffer;
+applying it is the post area's (PO5). Registering a writer changes nothing by itself.
+
+**Cost.** A node with no work in a view costs one `prepare_view` call. Each SceneRead pass,
+depth resolve and distortion pass is one render pass (`RenderStats::{scene_read_passes,
+depth_resolves, distortion_passes, node_draws}`); the renderer allocates nothing for nodes in the
+steady state (`tests/alloc_frame.rs` "nodes").
+
+## Overlay stages: HDR overlays
+
+`RenderOverlay`s draw after the frame by default (`OverlayStage::AfterTonemap`): into the final
+target, after tonemapping, exactly where and how they always did — egui and every overlay written
+before stages existed. An overlay can instead draw into the scene before post:
+
+```rust
+fn stage(&self) -> OverlayStage { OverlayStage::HdrScene }
+```
+
+| stage | when | target | gets |
+|---|---|---|---|
+| `AfterTonemap` (default) | after every post group, display view and FXAA of the primary target | the display target (surface, headless target, capture target), display format | nothing: exactly the old placement and pixels |
+| `HdrScene` | after the primary target's last scene view (and its SceneRead / Distortion passes), before its post groups; in Direct mode into the target after its last view, before every `AfterTonemap` overlay | the scene color (`Rgba16Float`, `Rg11b10Ufloat`, or `Rgba8UnormSrgb` in the Ldr fallback) at scene size, `scale_factor × render_scale` | exposure, bloom, tonemapping, grading, FXAA and grain with the scene (and distortion) |
+
+`render()`'s contract is unchanged for both: one single-sample pass, no depth attachment,
+`target.format`, viewport and scissor reset per overlay, `(priority, insertion)` order within a
+stage. `OverlayTarget::kind` still says which frame it is (`Surface`, `Offscreen`, `Capture`).
+HdrScene overlays also get `prepare_scene` (before `prepare`) with an `OverlayScene`: the last
+primary scene view, the frame mode, the encoding to write (`output`, with `exposure` and
+`tonemapper` for the Ldr fallback's `Tonemapped`), the view's bind groups and layouts, and — if
+`scene_reads()` contains `DEPTH` — that view's single-sample depth. Frames without a primary view
+skip HdrScene overlays. Captures: a Direct primary group calls them again (`Capture`); an
+intermediate one does not (they are already in the scene color, which the capture composites
+again).
+
+Use `OverlayTarget::shader_encodes_srgb()` (or `OverlayScene::output`) to decide whether to
+encode sRGB in the shader: the old `!target.format.is_srgb()` test is wrong for float targets.
+
+### Migrating an additive overlay (the game's `additive.rs`)
+
+An LDR-era additive sprite overlay: premultiplied additive blending, no depth, a pipeline per
+target format, sRGB encoded in the shader for non-sRGB surfaces, and values above 1 squeezed
+into the 8-bit target with `1 − e^−x`:
+
+```rust
+impl RenderOverlay for Additive {
+    fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+               _: &mut wgpu::CommandEncoder, target: &OverlayTarget) {
+        let encode_srgb = !target.format.is_srgb();                 // (2) wrong for float targets
+        self.write_params(queue, target.size, encode_srgb, /* soft_clip */ true); // (3)
+        self.ensure_pipeline(device, target.format);                 // (4) per-format cache
+    }
+    fn render(&self, pass: &mut wgpu::RenderPass<'static>, target: &OverlayTarget) {
+        pass.set_pipeline(self.pipeline(target.format));
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..6, 0..self.count);
+    }
+}
+```
+
+The four steps to draw it into the HDR scene (bloomed and tonemapped with the scene):
+
+1. **Stage.** `fn stage(&self) -> OverlayStage { OverlayStage::HdrScene }`.
+2. **Encoding from the scene.** Keep what `prepare_scene` says and apply it with `s3d_output`
+   from `OUTPUT_WGSL` (`Linear` into float or sRGB scene colors, `ManualSrgb` for an 8-bit
+   non-sRGB window in Direct mode, `Tonemapped` with `exposure`/`tonemapper` in the Ldr
+   fallback) instead of `!target.format.is_srgb()`:
+   ```rust
+   fn prepare_scene(&mut self, scene: &OverlayScene<'_>) {
+       self.scene = Some((scene.output, scene.exposure, scene.tonemapper, scene.mode));
+   }
+   ```
+   ```wgsl
+   return s3d_output(vec4<f32>(c, 0.0), params.encoding, params.exposure, params.tonemapper);
+   ```
+3. **No soft clip outside Direct mode.** Values above 1 now feed bloom and the tonemapper: apply
+   `1 − e^−x` only when `scene.mode == FrameMode::Direct` (no post camera: the target is still
+   8-bit display color).
+4. **`Rgba16Float` pipelines.** The per-format pipeline cache now also sees the scene color's
+   format (`Rgba16Float`; `Rg11b10Ufloat` with `HdrMode::Compact`; `Rgba8UnormSrgb` in the Ldr
+   fallback). Blend state, depth (none) and sample count (1) stay the same.
+
+Nothing else changes: priorities, the per-kind buffers keyed by `OverlayTarget::kind`, the
+render pass contract. The `Engine/Frame/Overlay Stages` story draws the same sprites both ways
+(`crates/space3d-stories/src/engine/frame/demo.rs`, `AdditiveSprites`: `migrated` switches the
+four steps). Lasers become particle beams instead (particles area).
+
 ## Capture and tools
 
 * `Renderer::capture()` / `render_to_image` return the final, tonemapped sRGB image in every mode.
@@ -118,7 +293,8 @@ let rt = assets.add_render_target_with(512, 512, RenderTargetDesc::hdr().with_sa
 * `Renderer::capture_scene_hdr()` returns the primary group's scene texture before post as
   `space3d_core::HdrImageData` (linear floats; `Err` in Direct mode).
 * `RenderStats`: `intermediate_groups`, `post_groups`, `post_passes`, `render_passes`,
-  `fullscreen_passes`, `textures_created` (0 in the steady state), `target_bytes`.
+  `fullscreen_passes`, `textures_created` (0 in the steady state), `target_bytes`,
+  `node_draws`, `node_dispatches`, `scene_read_passes`, `depth_resolves`, `distortion_passes`.
 
 ## Cost
 

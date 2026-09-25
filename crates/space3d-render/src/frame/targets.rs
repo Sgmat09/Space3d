@@ -170,6 +170,73 @@ impl FrameState {
     }
 }
 
+/// The single-sample depth a multisampled group's depth is resolved into for scene-depth
+/// readers (graphics spec §1.6: `depth_1x`), by target. Created at the start of a frame that
+/// needs it, freed 3 frames after the last.
+pub(crate) struct ResolvedDepth {
+    pub(super) view: wgpu::TextureView,
+    pub(super) size: (u32, u32),
+    pub(super) last_used: u64,
+}
+
+impl FrameState {
+    /// The resolved depth of `target`'s group at `size`, (re)created only here (while
+    /// preparing a frame). Counts `textures_created` and `target_bytes`.
+    pub(super) fn ensure_resolved_depth(
+        &mut self,
+        device: &wgpu::Device,
+        target: GroupTarget,
+        size: (u32, u32),
+        frame_index: u64,
+        stats: &mut RenderStats,
+    ) {
+        let fresh = self.resolved_depth.get(&target).is_none_or(|d| d.size != size);
+        if fresh {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("space3d resolved depth"),
+                size: wgpu::Extent3d {
+                    width: size.0.max(1),
+                    height: size.1.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            stats.textures_created += 1;
+            self.resolved_depth.insert(
+                target,
+                ResolvedDepth {
+                    view: texture.create_view(&Default::default()),
+                    size,
+                    last_used: frame_index,
+                },
+            );
+        }
+        let d = self.resolved_depth.get_mut(&target).expect("inserted");
+        if d.last_used != frame_index || fresh {
+            stats.target_bytes += texture_bytes(DEPTH_FORMAT, size, 1);
+        }
+        d.last_used = frame_index;
+    }
+
+    /// The resolved depth of `target`'s group, if it has one of `size`.
+    pub(super) fn resolved_depth(&self, target: GroupTarget, size: (u32, u32)) -> Option<&wgpu::TextureView> {
+        self.resolved_depth
+            .get(&target)
+            .filter(|d| d.size == size)
+            .map(|d| &d.view)
+    }
+
+    /// Free resolved depths unused for 3 frames.
+    pub(super) fn evict_resolved_depth(&mut self, frame_index: u64) {
+        self.resolved_depth.retain(|_, d| d.last_used + 3 > frame_index);
+    }
+}
+
 /// Copy of a render target sampled by materials drawn into that same target.
 pub(super) struct Feedback {
     /// `TextureEntry::version` of the render target it was created for.

@@ -160,6 +160,23 @@ const CULL_SHADER: &str = include_str!("../shaders/cull.wgsl");
 const COMPACT_SHADER: &str = include_str!("../shaders/compact.wgsl");
 const BLIT_TEMPLATE: &str = include_str!("../shaders/blit.wgsl");
 const CLEAR_SHADER: &str = include_str!("../shaders/clear.wgsl");
+const DEPTH_RESOLVE_SHADER: &str = include_str!("../shaders/frame/depth_resolve.wgsl");
+
+/// Source of the depth resolve pass (`shaders/frame/depth_resolve.wgsl` after the full-screen
+/// triangle).
+pub(crate) fn depth_resolve_source() -> String {
+    format!("{}\n{DEPTH_RESOLVE_SHADER}", crate::node::FULLSCREEN_WGSL)
+}
+
+/// The depth resolve (graphics spec §1.6): layout (one multisampled depth texture), module and
+/// a pipeline per sample count. Created on first use: only read-only-depth backends with
+/// multisampled groups resolve depth (GLES cannot sample multisampled textures).
+pub(crate) struct DepthResolve {
+    pub bgl: wgpu::BindGroupLayout,
+    layout: wgpu::PipelineLayout,
+    module: wgpu::ShaderModule,
+    pipelines: FastMap<u32, wgpu::RenderPipeline>,
+}
 
 /// Mip-generation blit shader sampling a `texture_2d` or a `texture_2d_array` source.
 pub(crate) fn blit_shader(layered: bool) -> String {
@@ -277,6 +294,8 @@ pub(crate) struct Pipelines {
     clear_module: wgpu::ShaderModule,
     clear_layout: wgpu::PipelineLayout,
     clear: FastMap<(wgpu::TextureFormat, u32), wgpu::RenderPipeline>,
+    /// The depth resolve, once a frame needed it.
+    depth_resolve: Option<DepthResolve>,
 }
 
 /// Bind group layout entry of a filterable float texture of the given view dimension.
@@ -467,6 +486,7 @@ impl Pipelines {
             clear_module,
             clear_layout,
             clear: FastMap::default(),
+            depth_resolve: None,
         }
     }
 
@@ -510,6 +530,11 @@ impl Pipelines {
             None => {}
         }
         self.custom.insert(handle, (version, source.clone()));
+    }
+
+    /// The source version of a custom shader drawn (or prewarmed) before.
+    pub fn custom_version(&self, handle: ShaderHandle) -> Option<u32> {
+        self.custom.get(&handle).map(|(v, _)| *v)
     }
 
     /// Forget custom shaders for which `live` is false (removed from `RenderAssets`): their
@@ -733,6 +758,80 @@ impl Pipelines {
                 cache: None,
             })
         })
+    }
+
+    /// The depth resolve pipeline for `samples` and its bind group layout (group 0: the
+    /// multisampled depth texture). Draw 3 vertices into a `DEPTH_FORMAT` attachment.
+    pub fn depth_resolve(
+        &mut self,
+        device: &wgpu::Device,
+        samples: u32,
+    ) -> (&wgpu::RenderPipeline, &wgpu::BindGroupLayout) {
+        let r = self.depth_resolve.get_or_insert_with(|| {
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("space3d depth resolve"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: true,
+                    },
+                    count: None,
+                }],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("space3d depth resolve"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("space3d depth resolve"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(depth_resolve_source())),
+            });
+            DepthResolve {
+                bgl,
+                layout,
+                module,
+                pipelines: FastMap::default(),
+            }
+        });
+        let (module, layout) = (&r.module, &r.layout);
+        let p = r.pipelines.entry(samples).or_insert_with(|| {
+            let constants = [("S3D_SAMPLES", samples as f64)];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("space3d depth resolve"),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_fullscreen"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs_resolve"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &constants,
+                        ..Default::default()
+                    },
+                    targets: &[],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
+        (p, &r.bgl)
     }
 }
 
