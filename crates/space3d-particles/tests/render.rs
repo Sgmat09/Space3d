@@ -216,3 +216,44 @@ fn local_vs_world_space() {
     assert!(px(3.0, 0.0)[1] > 100, "local particles ride the emitter");
     assert_eq!(gpu_errors(&app), 0);
 }
+
+/// `DownlevelOverride::webgl2()` (no compute, no float targets, no read-only depth: the
+/// WebGL2 code paths on this device) renders the built-in effects like the default paths.
+#[test]
+fn webgl2_override_matches_default_paths() {
+    let scene = |webgl2: bool| {
+        let mut app = app(W, H)?;
+        if webgl2 {
+            app.insert_resource(FrameSettings::default().with_downlevel(DownlevelOverride::webgl2()));
+        }
+        camera(
+            &mut app,
+            Vec3::new(0.0, 150.0, 120.0),
+            Vec3::ZERO,
+            Vec4::new(0.01, 0.01, 0.02, 1.0),
+        );
+        let ground = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_mesh(MeshData::plane(400.0));
+        app.world.spawn((
+            Transform::from_xyz(0.0, -6.0, 0.0),
+            Mesh3d(ground),
+            Material::unlit(Vec4::new(0.05, 0.05, 0.06, 1.0)),
+        ));
+        app.spawn_effect(builtin::EXPLOSION, EffectSpawn::at(Vec3::ZERO).seed(3));
+        app.spawn_effect(
+            builtin::WARP_OUT,
+            EffectSpawn::at(Vec3::new(60.0, 0.0, -20.0)).scale(0.4).seed(4),
+        );
+        app.step_ticks(15);
+        let img = render(&mut app);
+        assert_eq!(gpu_errors(&app), 0);
+        Some(img)
+    };
+    let Some(a) = scene(false) else { return };
+    let b = scene(true).unwrap();
+    dump(&b, "webgl2_override");
+    let diff = space3d_test::compare_images(&a, &b, &space3d_test::CompareOptions::perceptual());
+    assert!(diff.passed, "{}", diff.summary());
+}
