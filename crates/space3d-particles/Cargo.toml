@@ -14,4 +14,13 @@ serde.workspace = true
 ron.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+bytemuck.workspace = true
+ahash.workspace = true
 
+[dev-dependencies]
+pollster.workspace = true
+proptest.workspace = true
+image.workspace = true
+space3d-test.workspace = true
+# WGSL → GLSL ES 3.00 (WebGL2) translation of the sprite shader in the unit tests.
+naga = { workspace = true, features = ["wgsl-in", "glsl-out"] }

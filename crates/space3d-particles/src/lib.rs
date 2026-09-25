@@ -15,13 +15,29 @@
 //! Not in the facade prelude (the game has its own `Particle`, `Effect` and `Fade` types): use
 //! `space3d::particles::prelude::*`.
 //!
-//! This is the F2 skeleton: the public API is frozen; simulation, rendering and the built-in
-//! library land with the particles milestones PA0–PA4 (`STUB(P-PART)` marks the placeholders).
+//! How it works (design-particles §3, §5):
+//! * [`tick_system`] runs on the fixed tick: it follows every [`ParticleEmitter`] (its `Transform`
+//!   through the `Parent` chain), decides the emission of the tick (exact rate accumulators,
+//!   bursts with their sub-tick time) and records it in a tick log. Emission never depends on the
+//!   frame rate.
+//! * The `"space3d/particles"` render node replays the pending ticks inside the render frame
+//!   (the CPU backend: [`ParticleBackend::Cpu`]; the GPU backend lands with milestone PA2), so
+//!   `render_to_image` after `n` ticks shows exactly `n` ticks of simulation, and rendering every
+//!   tick, rendering once at the end, or replaying only the last catch-up window give identical
+//!   images.
+//! * Particle `k` of a layer instance always lands in ring slot `base + k mod capacity`, and its
+//!   random attributes come from a PCG hash of (layer instance seed, `k`): deterministic, and
+//!   shared bit for bit with the shaders.
 
 mod components;
+mod cpu;
 mod curve;
 mod effect;
+mod pack;
 mod registry;
+mod render;
+mod rng;
+mod runtime;
 mod stats;
 
 pub use components::{
@@ -36,14 +52,15 @@ pub use effect::{
     RibbonUv, SimulationSpace, SortMode, Spawn, SpriteRender, SpriteShape, SpriteTarget, SpriteTexture,
 };
 pub use registry::{EffectError, EffectHandle, ParticleEffects, builtin};
-pub use stats::{EffectState, ParticleRuntime, ParticleStats};
+pub use runtime::ParticleRuntime;
+pub use stats::{EffectState, ParticleStats};
 
-use space3d_core::{App, Plugin, Stage, SystemCtx};
-use space3d_render::GraphicsQuality;
+use space3d_core::{App, Events, Plugin, Stage, SystemCtx, Time};
+use space3d_render::{GraphicsQuality, RenderNodes};
 
-/// Adds the particle resources and the fixed-tick emission system (and, from milestone PA1, the
-/// `"space3d/particles"` render node). Add after `RenderPlugin` (or `DefaultPlugins`); without a
-/// renderer effects still tick (and one-shots despawn) but nothing is drawn.
+/// Adds the particle resources, the fixed-tick emission system and the `"space3d/particles"`
+/// render node. Add it next to `RenderPlugin` (or `DefaultPlugins`); without a renderer effects
+/// still tick (and one-shots despawn) but nothing is drawn.
 #[derive(Clone, Debug)]
 pub struct ParticlesPlugin {
     /// Initial `ParticleSettings` resource (mutable at runtime; read every frame).
@@ -106,12 +123,70 @@ impl Plugin for ParticlesPlugin {
         if self.tick_system {
             app.add_system_named(Stage::FixedUpdate, "particles::tick", tick_system);
         }
+        // The render node (the frame's `RenderNodes` exists with or without a renderer; a
+        // `RenderPlugin` added later keeps it).
+        app.resources
+            .init::<RenderNodes>()
+            .insert(render::NODE_NAME, render::ParticlesNode::new(&self.settings));
     }
 }
 
-/// The fixed-tick emission system (registered by the plugin unless `tick_system == false`).
+/// The fixed-tick emission system (registered by the plugin unless `tick_system == false`):
+/// follow every [`ParticleEmitter`], schedule its emission for this tick into the tick log, and
+/// finish effects that have fully played ([`ParticleEffectFinished`], then their
+/// [`FinishAction`]). Allocates nothing in the steady state.
 pub fn tick_system(ctx: &mut SystemCtx) {
-    let _ = ctx; // STUB(P-PART): the runtime (PA0)
+    let world = &*ctx.world;
+    let finished = ctx.resources.scope::<runtime::ParticleRuntime, _>(|res, runtime| {
+        let Some(settings) = res.get::<ParticleSettings>() else {
+            return false;
+        };
+        if !settings.enabled {
+            return false;
+        }
+        let Some(effects) = res.get::<ParticleEffects>() else {
+            return false;
+        };
+        let dt = res.get::<Time>().map_or(0.0, Time::fixed_delta_secs);
+        let rt = &mut runtime.rt;
+        rt.tick(world, settings, effects, dt);
+        let (live, layers) = rt.counts();
+        let (total, reserved, spawned) = (rt.pool.total(), rt.pool.reserved(), rt.spawned);
+        if let Some(stats) = res.get_mut::<ParticleStats>() {
+            stats.effects = live;
+            stats.layer_instances = layers;
+            stats.pool_capacity = total;
+            stats.pool_reserved = reserved;
+            stats.spawned = spawned;
+        }
+        if rt.finished.is_empty() {
+            return false;
+        }
+        let events = res.init::<Events<ParticleEffectFinished>>();
+        for f in &rt.finished {
+            events.send(ParticleEffectFinished {
+                entity: f.entity,
+                effect: f.effect,
+            });
+        }
+        true
+    });
+    if !finished {
+        return;
+    }
+    // Finish actions (after the events, which are sent before them).
+    let rt = &ctx.resources.expect::<runtime::ParticleRuntime>().rt;
+    for f in &rt.finished {
+        match f.action {
+            FinishAction::Despawn => {
+                let _ = ctx.world.despawn(f.entity);
+            }
+            FinishAction::RemoveEmitter => {
+                let _ = ctx.world.remove_one::<ParticleEmitter>(f.entity);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Runtime options (resource). Fields are public; construct with `..Default::default()`.
@@ -239,7 +314,10 @@ mod tests {
         let e = app.spawn_effect(builtin::EXPLOSION, Vec3::ZERO);
         app.step_ticks(3);
         assert!(app.world.contains(e));
-        assert_eq!(app.resources.expect::<ParticleRuntime>().state(e), None);
+        let state = app.resources.expect::<ParticleRuntime>().state(e).unwrap();
+        assert!(state.emitting || state.time > 0.0);
+        assert!(state.reserved > 0 && !state.finished);
+        assert!(app.resources.expect::<RenderNodes>().contains("space3d/particles"));
         let manual = ParticlesPlugin {
             tick_system: false,
             ..ParticlesPlugin::with_settings(ParticleSettings::for_quality(GraphicsQuality::Low))
