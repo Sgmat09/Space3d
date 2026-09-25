@@ -1,6 +1,6 @@
 //! Steady-state heap allocations of the render stage with post effects (graphics spec §4.4
-//! "Passes and wgpu allocations"): bloom on one post camera, and on two split-screen post cameras
-//! sharing one pooled chain. The renderer's own work allocates nothing (`cpu_reallocations == 0`,
+//! "Passes and wgpu allocations"): bloom on one post camera, on two split-screen post cameras
+//! sharing one pooled chain, and every PO1/PO3 effect (`PostProcess::cinematic()`). The renderer's own work allocates nothing (`cpu_reallocations == 0`,
 //! `textures_created == 0`); what remains is wgpu's bookkeeping, about 20 allocations per render
 //! pass on Metal. Each mode is pinned to its measured bound (+10 %) and must not grow over time.
 //!
@@ -56,6 +56,7 @@ const FRAMES: usize = 100;
 fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
     let metal = match mode {
         "bloom" => MEASURED_BLOOM * 11 / 10,
+        "cinematic" => MEASURED_CINEMATIC * 11 / 10,
         _ => MEASURED_SPLIT * 11 / 10,
     };
     if backend == wgpu::Backend::Metal {
@@ -70,6 +71,9 @@ fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
 /// pass — and 617 for two post groups.
 const MEASURED_BLOOM: u64 = 332;
 const MEASURED_SPLIT: u64 = 617;
+/// `PostProcess::cinematic()` (bloom, FXAA, vignette, chromatic aberration, animated grain) on
+/// one camera: the FXAA pass on top of bloom.
+const MEASURED_CINEMATIC: u64 = 359;
 
 #[test]
 fn bloom_allocates_a_small_constant_amount() {
@@ -109,7 +113,7 @@ fn bloom_allocates_a_small_constant_amount() {
         counted
     };
     type Setup = fn(&mut App, Entity, Entity);
-    let modes: [(&str, Setup); 2] = [
+    let modes: [(&str, Setup); 3] = [
         ("bloom", |app, cam, _| {
             app.world.insert_one(cam, PostProcess::default()).unwrap();
         }),
@@ -121,6 +125,13 @@ fn bloom_allocates_a_small_constant_amount() {
                 c.order = order;
                 c.active = true;
             }
+        }),
+        ("cinematic", |app, cam, second| {
+            app.world.get::<&mut Camera3d>(second).unwrap().active = false;
+            let mut c = app.world.get::<&mut Camera3d>(cam).unwrap();
+            c.viewport = None;
+            drop(c);
+            app.world.insert_one(cam, PostProcess::cinematic()).unwrap();
         }),
     ];
     let mut per_frame = Vec::with_capacity(FRAMES);
@@ -141,10 +152,13 @@ fn bloom_allocates_a_small_constant_amount() {
             (0, 0, 0),
             "{name}: {s:?}"
         );
-        let groups = if name == "bloom" { 1 } else { 2 };
-        // Per group: six levels (prefilter, 5 downsamples, 5 upsamples) and the composite.
+        let groups = if name == "bloom split" { 2 } else { 1 };
+        // Per group: six levels (prefilter, 5 downsamples, 5 upsamples), the composite (and
+        // FXAA).
+        let passes = if name == "cinematic" { 13 } else { 12 };
         assert_eq!(s.post_groups, groups, "{name}");
-        assert_eq!(s.post_passes, groups * 12, "{name}");
+        assert_eq!(s.post_passes, groups * passes, "{name}");
+
         let max = *per_frame.iter().max().unwrap();
         let (first, second) = per_frame.split_at(FRAMES / 2);
         let mean = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len() as f64;

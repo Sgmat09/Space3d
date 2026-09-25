@@ -7,24 +7,29 @@
 //! owns the composite and its effects. The frame milestone F4 wrote the composite-only chain
 //! (exposure, tonemapping, dither, alpha, rect mapping, upscale; `chain.rs`,
 //! `shaders/post/composite.wgsl`); the post milestones add the effects: bloom (PO1,
-//! `bloom.rs`), the rest are `STUB(P-POST)` until PO2–PO5. Distortion buffers are real (the
-//! frame's Distortion phase plumbing, F5, clears and writes them).
+//! `bloom.rs`), FXAA (`fxaa.rs`) and the vignette, chromatic aberration and film grain in the
+//! composite (PO3); auto exposure, grading and the distortion apply are `STUB(P-POST)` until
+//! PO2, PO4 and PO5. Distortion buffers are real (the frame's Distortion phase plumbing, F5,
+//! clears and writes them).
 
 pub(crate) mod api;
 mod bloom;
 mod chain;
 mod distortion_mesh;
+mod fxaa;
 
 use crate::caps::GraphicsCaps;
+use crate::frame::PoolDesc;
 use crate::gpu::{TrackedBuffer, Uploader};
 use crate::handles::FastMap;
 use crate::node::{FULLSCREEN_WGSL, FrameInfo, FrameMode, RenderNodes};
 use crate::output::{HASH_WGSL, OUTPUT_WGSL, OutputEncoding};
 use crate::settings::FrameSettings;
 use crate::stats::RenderStats;
-use api::{BloomComposite, DISTORTION_FORMAT, DistortionResolution, PostProcess};
+use api::{AntiAliasing, BloomComposite, DISTORTION_FORMAT, DistortionResolution, FxaaQuality, PostProcess};
 use bloom::{BloomPlan, BloomState};
 use chain::GpuPost;
+use fxaa::{FxaaModules, LDR_FORMAT};
 use space3d_core::{Entity, World};
 use std::borrow::Cow;
 
@@ -207,6 +212,10 @@ pub(crate) struct PostState {
     distortion_generation: u64,
     created: u32,
     composite: FastMap<(wgpu::TextureFormat, OutputKind), wgpu::RenderPipeline>,
+    fxaa_modules: FxaaModules,
+    fxaa: FastMap<(FxaaQuality, wgpu::TextureFormat, OutputKind), wgpu::RenderPipeline>,
+    /// FXAA input bind groups by LDR-intermediate generation, with the frame last used.
+    fxaa_bgs: FastMap<u64, (wgpu::BindGroup, u64)>,
     /// Device capabilities, and this frame's (masked by `FrameSettings::downlevel`).
     caps: GraphicsCaps,
     frame_caps: GraphicsCaps,
@@ -223,6 +232,8 @@ pub(crate) struct PostState {
 #[derive(Clone, Copy, Debug, Default)]
 struct GroupPost {
     bloom: Option<BloomPlan>,
+    /// FXAA after the composite (which then writes the LDR intermediate).
+    fxaa: Option<FxaaQuality>,
 }
 
 /// The part of `rect` (pixels, unclipped) inside a `size` texture, at least 1×1: `[x, y, w, h]`
@@ -327,6 +338,9 @@ impl PostState {
             params_bg: None,
             inputs_bgs: FastMap::default(),
             composite: FastMap::default(),
+            fxaa_modules: FxaaModules::default(),
+            fxaa: FastMap::default(),
+            fxaa_bgs: FastMap::default(),
             distortion_generation: 0,
             created: 0,
             caps: caps.clone(),
@@ -355,10 +369,15 @@ impl PostState {
     pub fn plan_group(&mut self, world: &World, group: &PostGroupPlan, reallocs: &mut u32) -> PostGroupNeeds {
         let _ = world; // STUB(P-POST): distortion writers, auto exposure history
         let bloom = self.plan_bloom(group, reallocs);
+        // FXAA runs in every mode (display space), never in the passthrough group.
+        let fxaa = match group.settings.anti_aliasing {
+            AntiAliasing::Fxaa(q) if !group.passthrough && group.settings.enabled => Some(q),
+            _ => None,
+        };
         let capacity = self.groups.capacity();
-        self.groups.push(GroupPost { bloom });
+        self.groups.push(GroupPost { bloom, fxaa });
         *reallocs += u32::from(self.groups.capacity() != capacity);
-        let params = GpuPost::new(group, self.frame, bloom.is_some());
+        let params = GpuPost::new(group, self.frame, bloom.is_some(), fxaa.is_some());
         // Two writes: only the per-frame seeds (the last 16 bytes) change in a still scene,
         // and a write marks all of its bytes when any of them changed.
         let bytes = bytemuck::bytes_of(&params);
@@ -368,6 +387,7 @@ impl PostState {
         self.planned += 1;
         PostGroupNeeds {
             bloom: bloom.is_some(),
+            fxaa: fxaa.is_some(),
             distortion: !group.passthrough && group.settings.enabled && group.settings.distortion.enabled,
             ..Default::default()
         }
@@ -487,10 +507,14 @@ impl PostState {
     }
 
     /// Build the composite pipeline for an output target of `format` (`manual_srgb`: the shader
-    /// encodes sRGB) ahead of use (`Renderer::prewarm`). STUB(P-POST): the effects' pipelines.
+    /// encodes sRGB) ahead of use (`Renderer::prewarm`), with FXAA (Medium) and the bloom chains.
+    /// STUB(P-POST): auto exposure (PO2).
     pub fn prewarm(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, manual_srgb: bool) {
         let kind = OutputKind::of(format, manual_srgb);
         self.composite_pipeline(device, format, kind);
+        // FXAA (Medium, the default quality) and the composite into its LDR intermediate.
+        self.composite_pipeline(device, LDR_FORMAT, OutputKind::Srgb);
+        self.fxaa_pipeline(device, FxaaQuality::Medium, format, kind);
         // The additive chain's format and the energy-conserving one's (see `plan_bloom`).
         for format in [self.caps.bloom_format, self.caps.hdr_format].into_iter().flatten() {
             self.bloom.pipelines(device, format);
@@ -505,60 +529,67 @@ impl PostState {
         kind: OutputKind,
     ) -> &wgpu::RenderPipeline {
         let (module, layout) = (&self.module, &self.layout);
-        self.composite.entry((format, kind)).or_insert_with(|| {
-            let constants = [("S3D_POST_OUT", kind.id())];
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("space3d composite"),
-                layout: Some(layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some("vs_fullscreen"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some("fs_composite"),
-                    compilation_options: wgpu::PipelineCompilationOptions {
-                        constants: &constants,
-                        ..Default::default()
-                    },
-                    targets: &[Some(format.into())],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
+        self.composite
+            .entry((format, kind))
+            .or_insert_with(|| fullscreen_pipeline(device, layout, module, "fs_composite", format, kind))
+    }
+
+    /// The FXAA pipeline for a quality, `format` and `kind` (created on first use).
+    fn fxaa_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        q: FxaaQuality,
+        format: wgpu::TextureFormat,
+        kind: OutputKind,
+    ) -> &wgpu::RenderPipeline {
+        let (modules, layout) = (&mut self.fxaa_modules, &self.layout);
+        self.fxaa.entry((q, format, kind)).or_insert_with(|| {
+            let module = modules.get(device, q);
+            fullscreen_pipeline(device, layout, module, "fs_fxaa", format, kind)
         })
     }
 
     /// Record meter → bloom → composite (→ FXAA) for one post group into the frame encoder.
-    /// Bloom (PO1) and the composite; STUB(P-POST): metering (PO2), FXAA (PO3).
+    /// Bloom (PO1), the composite, FXAA and the lens effects (PO3); STUB(P-POST): metering (PO2).
     pub fn encode_group(&mut self, cx: &mut PostEncode<'_>, input: &PostGroupInput<'_>) {
         if self.params_bg.is_none() {
             return;
         }
-        let plan = self.groups.get(input.index).and_then(|g| g.bloom);
-        let bloom = plan.and_then(|plan| {
+        let group = self.groups.get(input.index).copied().unwrap_or_default();
+        let bloom = group.bloom.and_then(|plan| {
             let scene = (input.scene, input.scene_generation);
             let (view, generation) = self.bloom.encode(cx, scene, &plan, &self.dummy, self.frame, None)?;
-            // Groups of one size share a pooled chain: count its memory once per frame.
-            if !input.replay && !self.counted.contains(&generation) {
-                let capacity = self.counted.capacity();
-                self.counted.push(generation);
-                cx.stats.cpu_reallocations += u32::from(self.counted.capacity() != capacity);
-                cx.stats.target_bytes += plan.bytes();
-            }
+            self.count_target(cx.stats, input.replay, generation, plan.bytes());
             Some((view, generation))
         });
+        // With FXAA the composite writes the LDR intermediate L (pooled, the output's size, the
+        // same rect) and the FXAA pass writes the output.
+        let ldr = group.fxaa.map(|_| {
+            let desc = PoolDesc {
+                size: input.output_size,
+                format: LDR_FORMAT,
+                mips: 1,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            };
+            let index = cx.pool.acquire(cx.device, desc);
+            let texture = cx.pool.get(index);
+            let bytes = 4 * input.output_size.0 as u64 * input.output_size.1 as u64;
+            let (view, generation) = (texture.view.clone(), texture.generation);
+            self.count_target(cx.stats, input.replay, generation, bytes);
+            (view, generation)
+        });
         let kind = OutputKind::of(input.output_format, input.output_manual_srgb);
-        self.composite_pipeline(cx.device, input.output_format, kind);
+        let (composite_format, composite_kind) = match ldr {
+            Some(_) => (LDR_FORMAT, OutputKind::Srgb),
+            None => (input.output_format, kind),
+        };
+        self.composite_pipeline(cx.device, composite_format, composite_kind);
+        if let Some(q) = group.fxaa {
+            self.fxaa_pipeline(cx.device, q, input.output_format, kind);
+        }
         let Some((params_bg, _)) = &self.params_bg else {
             return;
         };
-        let pipeline = &self.composite[&(input.output_format, kind)];
         let frame = self.frame;
         let (inputs_bgl, dummy) = (&self.inputs_bgl, &self.dummy);
         let distortion = input
@@ -570,11 +601,11 @@ impl PostState {
             distortion,
             bloom.as_ref().map_or(0, |(_, g)| *g),
         );
+        let entry = |binding, view| wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::TextureView(view),
+        };
         let inputs = &mut self.inputs_bgs.entry(key).or_insert_with(|| {
-            let entry = |binding, view| wgpu::BindGroupEntry {
-                binding,
-                resource: wgpu::BindingResource::TextureView(view),
-            };
             let bg = cx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("space3d post inputs"),
                 layout: inputs_bgl,
@@ -584,41 +615,72 @@ impl PostState {
                     entry(2, dummy),
                     entry(3, dummy),
                     entry(4, input.distortion.unwrap_or(dummy)),
+                    // Never L: the composite renders into it.
                     entry(5, dummy),
                 ],
             });
             (bg, frame)
         });
         inputs.1 = frame;
-        let load = if input.output_clear {
+        let output_load = if input.output_clear {
             wgpu::LoadOp::Clear(wgpu::Color::BLACK)
         } else {
             wgpu::LoadOp::Load
         };
-        let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("space3d composite"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: input.output,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
+        let offset = (input.index * self.slot) as u32;
+        let (composite_target, composite_load) = match &ldr {
+            Some((view, _)) => (view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)),
+            None => (input.output, output_load),
+        };
+        let pipeline = &self.composite[&(composite_format, composite_kind)];
+        let pass = FullscreenPass {
+            label: "space3d composite",
+            target: composite_target,
+            load: composite_load,
+            viewport: input.output_viewport,
+            scissor: input.output_rect,
+        };
+        pass.draw(cx, pipeline, params_bg, offset, &inputs.0);
+        let (Some(q), Some((view, generation))) = (group.fxaa, &ldr) else {
+            return;
+        };
+        let fxaa_bg = &mut self.fxaa_bgs.entry(*generation).or_insert_with(|| {
+            let bg = cx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("space3d fxaa inputs"),
+                layout: inputs_bgl,
+                entries: &[
+                    entry(0, dummy),
+                    entry(1, dummy),
+                    entry(2, dummy),
+                    entry(3, dummy),
+                    entry(4, dummy),
+                    entry(5, view),
+                ],
+            });
+            (bg, frame)
         });
-        let [x, y, w, h] = input.output_viewport;
-        pass.set_viewport(x, y, w, h, 0.0, 1.0);
-        let [sx, sy, sw, sh] = input.output_rect;
-        pass.set_scissor_rect(sx, sy, sw, sh);
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, params_bg, &[(input.index * self.slot) as u32]);
-        pass.set_bind_group(1, &inputs.0, &[]);
-        pass.draw(0..3, 0..1);
-        cx.stats.render_passes += 1;
-        cx.stats.fullscreen_passes += 1;
-        cx.stats.post_passes += 1;
+        fxaa_bg.1 = frame;
+        let pipeline = &self.fxaa[&(q, input.output_format, kind)];
+        let pass = FullscreenPass {
+            label: "space3d fxaa",
+            target: input.output,
+            load: output_load,
+            viewport: input.output_viewport,
+            scissor: input.output_rect,
+        };
+        pass.draw(cx, pipeline, params_bg, offset, &fxaa_bg.0);
+    }
+
+    /// Count a pooled texture's memory in `RenderStats::target_bytes` once per frame (post
+    /// groups of one size share it; replays count nothing).
+    fn count_target(&mut self, stats: &mut RenderStats, replay: bool, generation: u64, bytes: u64) {
+        if replay || self.counted.contains(&generation) {
+            return;
+        }
+        let capacity = self.counted.capacity();
+        self.counted.push(generation);
+        stats.cpu_reallocations += u32::from(self.counted.capacity() != capacity);
+        stats.target_bytes += bytes;
     }
 
     pub fn end_frame(&mut self, stats: &mut RenderStats) {
@@ -628,6 +690,7 @@ impl PostState {
         // Bind groups of scene textures no longer composited (replaced or freed).
         self.inputs_bgs.retain(|_, (_, used)| *used + 3 > frame);
         self.bloom.sources.retain(|_, (_, used)| *used + 3 > frame);
+        self.fxaa_bgs.retain(|_, (_, used)| *used + 3 > frame);
     }
 
     /// Register the built-in post nodes (`"space3d/distortion-meshes"`).
@@ -645,6 +708,91 @@ impl PostState {
     pub fn reset_history(&mut self, camera: Entity) {
         self.distortion.remove(&camera);
     }
+}
+
+/// A full-screen post pass: its target, load op and the post group's rect.
+struct FullscreenPass<'a> {
+    label: &'static str,
+    target: &'a wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+    viewport: [f32; 4],
+    scissor: [u32; 4],
+}
+
+impl FullscreenPass<'_> {
+    /// Record the pass: one full-screen triangle with the group's parameters (`offset`) and
+    /// `inputs`.
+    fn draw(
+        &self,
+        cx: &mut PostEncode<'_>,
+        pipeline: &wgpu::RenderPipeline,
+        params: &wgpu::BindGroup,
+        offset: u32,
+        inputs: &wgpu::BindGroup,
+    ) {
+        let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(self.label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: self.target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: self.load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        let [x, y, w, h] = self.viewport;
+        pass.set_viewport(x, y, w, h, 0.0, 1.0);
+        let [sx, sy, sw, sh] = self.scissor;
+        pass.set_scissor_rect(sx, sy, sw, sh);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, params, &[offset]);
+        pass.set_bind_group(1, inputs, &[]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        cx.stats.render_passes += 1;
+        cx.stats.fullscreen_passes += 1;
+        cx.stats.post_passes += 1;
+    }
+}
+
+/// A post pipeline: the full-screen triangle and fragment `entry` of `module`, writing `format`
+/// with the output kind `kind` (`S3D_POST_OUT`).
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    module: &wgpu::ShaderModule,
+    entry: &str,
+    format: wgpu::TextureFormat,
+    kind: OutputKind,
+) -> wgpu::RenderPipeline {
+    let constants = [("S3D_POST_OUT", kind.id())];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(entry),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs_fullscreen"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
+            targets: &[Some(format.into())],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 fn create_distortion_target(

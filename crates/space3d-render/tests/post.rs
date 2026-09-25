@@ -1,4 +1,5 @@
-//! Post-processing effects (graphics spec §5.2 P-POST) on the default backend: bloom (PO1).
+//! Post-processing effects (graphics spec §5.2 P-POST) on the default backend: bloom (PO1), FXAA,
+//! vignette, chromatic aberration and film grain (PO3).
 //! The bodies live in `common/post.rs` (`cases`), shared with the GL run (`tests/gl_post.rs`);
 //! `WGPU_BACKEND=gl` runs this file on GL too.
 
@@ -52,4 +53,49 @@ fn bloom_steady_state() {
 #[test]
 fn bloom_downlevel_parity() {
     cases::bloom_downlevel_parity(headless_app);
+}
+
+#[test]
+fn fxaa_softens_edges() {
+    cases::fxaa_softens_edges(headless_app);
+}
+
+#[test]
+fn film_grain_is_seeded() {
+    cases::film_grain_is_seeded(headless_app);
+}
+
+#[test]
+fn grain_after_fxaa() {
+    cases::grain_after_fxaa(headless_app);
+}
+
+#[test]
+fn after_tonemap_overlays_untouched_by_grain_ca_vignette() {
+    cases::after_tonemap_overlays_untouched_by_grain_ca_vignette(headless_app);
+}
+
+#[test]
+fn vignette_darkens_corners() {
+    cases::vignette_darkens_corners(headless_app);
+}
+
+#[test]
+fn chromatic_aberration_splits_toward_corners() {
+    cases::chromatic_aberration_splits_toward_corners(headless_app);
+}
+
+#[test]
+fn lens_effects_do_not_bleed_across_viewports() {
+    cases::lens_effects_do_not_bleed_across_viewports(headless_app);
+}
+
+#[test]
+fn fxaa_ldr_fallback_and_steady_state() {
+    cases::fxaa_ldr_fallback_and_steady_state(headless_app);
+}
+
+#[test]
+fn transparent_rt_lens_effects_keep_alpha() {
+    cases::transparent_rt_lens_effects_keep_alpha(headless_app);
 }

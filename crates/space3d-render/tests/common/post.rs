@@ -588,6 +588,379 @@ pub mod cases {
         assert_eq!(stats(&app).post_passes, 1, "Ldr fallback: no bloom");
     }
 
+    /// Post without bloom (and, from `post`, without tonemapping and dither).
+    fn plain() -> PostProcess {
+        post(Bloom::glow()).without_bloom()
+    }
+
+    /// Pixels with an intermediate red value (neither 0 nor 255).
+    fn partial(img: &ImageData) -> usize {
+        img.pixels.chunks(4).filter(|p| p[0] != 0 && p[0] != 255).count()
+    }
+
+    /// Standard deviation of the red channel (8-bit levels).
+    fn red_std(img: &ImageData) -> f64 {
+        let n = (img.width * img.height) as f64;
+        let mean = img.pixels.chunks(4).map(|p| p[0] as f64).sum::<f64>() / n;
+        (img.pixels.chunks(4).map(|p| (p[0] as f64 - mean).powi(2)).sum::<f64>() / n).sqrt()
+    }
+
+    fn grain(intensity: f32, seed: u32, animated: bool) -> FilmGrain {
+        FilmGrain {
+            enabled: true,
+            intensity,
+            size: 1.0,
+            luminance_response: 0.0,
+            animated,
+            seed,
+        }
+    }
+
+    fn advance_frame(app: &mut App) {
+        app.resources.init::<Time>().frame += 1;
+    }
+
+    /// FXAA smooths the stair steps of a rotated square (no MSAA: every edge pixel is 0 or 255
+    /// without it) at every quality, and leaves flat areas alone. It is one pass after the
+    /// composite.
+    pub fn fxaa_softens_edges(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let q = quad(&mut app, Vec3::ONE, Vec2::ZERO, Vec2::splat(1.0));
+        {
+            let mut t = app.world.get::<&mut Transform>(q).unwrap();
+            t.rotation = Quat::from_rotation_z(0.35) * t.rotation;
+        }
+        let cam = camera(&mut app, 0.0, BLACK, Some(plain()));
+        let hard = render(&mut app);
+        assert_eq!(stats(&app).post_passes, 1);
+        assert_eq!(partial(&hard), 0, "no anti-aliasing: only 0 and 255");
+        for q in [
+            FxaaQuality::Low,
+            FxaaQuality::Medium,
+            FxaaQuality::High,
+            FxaaQuality::Ultra,
+        ] {
+            set_post(&mut app, cam, plain().with_fxaa(q));
+            let img = render(&mut app);
+            assert_eq!(stats(&app).post_passes, 2, "{q:?}: composite + FXAA");
+            let n = partial(&img);
+            assert!(n >= 40, "{q:?}: {n} softened edge pixels");
+            for (x, y) in [(64, 32), (2, 2), (125, 61)] {
+                assert_eq!(img.get(x, y), hard.get(x, y), "{q:?}: flat area at ({x}, {y})");
+            }
+        }
+    }
+
+    /// Film grain is a pure function of its seed: the same seed gives the same image, another
+    /// seed another pattern; `animated` grain changes with `Time::frame`, still grain does not;
+    /// `luminance_response` 1 leaves white untouched.
+    pub fn film_grain_is_seeded(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let grey = Vec4::new(0.2, 0.2, 0.2, 1.0);
+        let cam = camera(&mut app, 0.0, grey, Some(plain().with_film_grain(grain(0.2, 7, false))));
+        let a = render(&mut app);
+        assert_eq!(render(&mut app), a, "render_to_image twice");
+        assert!(red_std(&a) > 5.0, "grain visible: σ {}", red_std(&a));
+        set_post(&mut app, cam, plain().without_bloom());
+        let flat = render(&mut app);
+        assert_eq!(red_std(&flat), 0.0);
+        // Zero-mean in the encoded space.
+        let mean = |img: &ImageData| img.pixels.chunks(4).map(|p| p[0] as f64).sum::<f64>() / (W * H) as f64;
+        assert!((mean(&a) - mean(&flat)).abs() < 2.0, "{} vs {}", mean(&a), mean(&flat));
+        set_post(&mut app, cam, plain().with_film_grain(grain(0.2, 8, false)));
+        assert_ne!(render(&mut app), a, "another seed");
+        // Still grain ignores the frame; animated grain follows it (and repeats with it).
+        set_post(&mut app, cam, plain().with_film_grain(grain(0.2, 7, false)));
+        advance_frame(&mut app);
+        assert_eq!(render(&mut app), a, "still grain, next frame");
+        set_post(&mut app, cam, plain().with_film_grain(grain(0.2, 7, true)));
+        let f1 = render(&mut app);
+        assert_eq!(render(&mut app), f1, "same frame, same grain");
+        advance_frame(&mut app);
+        let f2 = render(&mut app);
+        assert_ne!(f2, f1, "animated grain, next frame");
+        // A still scene with animated grain uploads the 16 per-frame bytes of the group's
+        // parameters (the seeds), nothing else (spec §4.4).
+        assert_eq!(stats(&app).bytes_uploaded, 16);
+        // Highlights: response 1 keeps white clean.
+        let white = FilmGrain {
+            luminance_response: 1.0,
+            ..grain(0.2, 7, false)
+        };
+        app.world.get::<&mut Camera3d>(cam).unwrap().clear_color = Some(Vec4::ONE);
+        set_post(&mut app, cam, plain().with_film_grain(white));
+        let img = render(&mut app);
+        assert!(img.pixels.chunks(4).all(|p| p[..3] == [255, 255, 255]));
+    }
+
+    /// Grain, dither and encoding run in the last pass: with FXAA that is the FXAA pass, so the
+    /// grain is not smoothed by it. A flat scene with strong 1-pixel grain looks the same with
+    /// and without FXAA (within 1 level: FXAA reads the 8-bit intermediate).
+    pub fn grain_after_fxaa(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let grey = Vec4::new(0.3, 0.3, 0.3, 1.0);
+        let lens = plain().with_film_grain(grain(0.25, 3, false));
+        let cam = camera(&mut app, 0.0, grey, Some(lens));
+        let without = render(&mut app);
+        set_post(&mut app, cam, lens.with_fxaa(FxaaQuality::High));
+        let with = render(&mut app);
+        assert_eq!(stats(&app).post_passes, 2);
+        assert!(max_diff(&with, &without) <= 1, "{}", max_diff(&with, &without));
+        let (a, b) = (red_std(&without), red_std(&with));
+        assert!(
+            a > 10.0 && (a - b).abs() < 0.05 * a,
+            "grain σ {a} without FXAA, {b} with"
+        );
+    }
+
+    /// AfterTonemap overlays draw after post: grain, chromatic aberration and vignette never
+    /// touch them, even in a corner where all three are strongest. The same fill as an HdrScene
+    /// overlay is post-processed.
+    pub fn after_tonemap_overlays_untouched_by_grain_ca_vignette(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let grey = Vec4::new(0.3, 0.3, 0.3, 1.0);
+        let lens = plain()
+            .with_vignette(Vignette {
+                enabled: true,
+                intensity: 1.0,
+                ..Vignette::default()
+            })
+            .with_chromatic_aberration(1.0)
+            .with_film_grain(grain(0.05, 5, true))
+            .with_fxaa(FxaaQuality::Medium);
+        camera(&mut app, 0.0, grey, Some(PostProcess { dither: true, ..lens }));
+        let value = [0.5, 0.25, 0.75, 1.0];
+        let overlays = app.resources.expect_mut::<RenderOverlays>();
+        overlays.insert(
+            "after",
+            0,
+            FillOverlay::new(OverlayStage::AfterTonemap, [0, 0, 16, 16], value),
+        );
+        overlays.insert(
+            "hdr",
+            0,
+            FillOverlay::new(OverlayStage::HdrScene, [112, 48, 16, 16], value),
+        );
+        let img = render(&mut app);
+        let expected = img.get(0, 0);
+        let srgb = |v: f32| (linear_to_srgb(v) * 255.0).round() as i32;
+        for (c, v) in value[..3].iter().enumerate() {
+            assert!((expected[c] as i32 - srgb(*v)).abs() <= 1, "{expected:?}");
+        }
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(img.get(x, y), expected, "AfterTonemap fill at ({x}, {y})");
+            }
+        }
+        // The HdrScene fill got the vignette (dark corner) and grain.
+        let hdr: Vec<[u8; 4]> = (48..64)
+            .flat_map(|y| (112..128).map(move |x| (x, y)))
+            .map(|(x, y)| img.get(x, y))
+            .collect();
+        assert!(
+            hdr.iter().all(|p| (p[2] as i32) < srgb(0.75) - 10),
+            "vignetted: {:?}",
+            hdr[0]
+        );
+        assert!(hdr.iter().any(|p| *p != hdr[0]), "grain on the HdrScene fill");
+    }
+
+    /// Vignette: the center is untouched; a centered vignette of intensity `i` multiplies the
+    /// corners by `mix(1, color, i)` (black: darker, a color: tinted).
+    pub fn vignette_darkens_corners(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let grey = Vec4::new(0.5, 0.5, 0.5, 1.0);
+        let cam = camera(&mut app, 0.0, grey, Some(plain()));
+        let flat = render(&mut app);
+        let vignette = Vignette {
+            enabled: true,
+            intensity: 0.5,
+            ..Vignette::default()
+        };
+        set_post(&mut app, cam, plain().with_vignette(vignette));
+        let img = render(&mut app);
+        assert_eq!(img.get(64, 32), flat.get(64, 32), "center");
+        let corner = lin(&img, 0, 0).x;
+        assert!((corner - 0.25).abs() < 0.01, "corner {corner}");
+        // Round (default) vs following the rect's 2:1 shape: the left edge's middle is darker
+        // when round (it lies closer to the circle's rim).
+        let round_edge = lin(&img, 0, 32).x;
+        set_post(
+            &mut app,
+            cam,
+            plain().with_vignette(Vignette {
+                roundness: 0.0,
+                ..vignette
+            }),
+        );
+        let oval_edge = lin(&render(&mut app), 0, 32).x;
+        assert!(round_edge < oval_edge - 0.05, "{round_edge} vs {oval_edge}");
+        // Tint: full intensity toward red keeps red and removes green and blue at the corners.
+        set_post(
+            &mut app,
+            cam,
+            plain().with_vignette(Vignette {
+                intensity: 1.0,
+                color: Vec3::X,
+                ..vignette
+            }),
+        );
+        let c = lin(&render(&mut app), 127, 63);
+        assert!((c.x - 0.5).abs() < 0.01 && c.y < 0.01 && c.z < 0.01, "{c}");
+    }
+
+    /// Chromatic aberration splits red and blue radially, growing with r²: fringes around a
+    /// quad near the corner, none around one at the center.
+    pub fn chromatic_aberration_splits_toward_corners(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        quad(&mut app, Vec3::ONE, Vec2::ZERO, Vec2::splat(0.4));
+        quad(&mut app, Vec3::ONE, Vec2::new(1.6, 0.6), Vec2::splat(0.4));
+        camera(&mut app, 0.0, BLACK, Some(plain().with_chromatic_aberration(1.0)));
+        let img = render(&mut app);
+        // Largest red/blue difference in linear light over a window.
+        let split = |x0: u32, x1: u32, y0: u32, y1: u32| {
+            let mut m = 0.0f32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let c = lin(&img, x, y);
+                    m = m.max((c.x - c.z).abs());
+                }
+            }
+            m
+        };
+        // At the center quad's edges (≤ 9 px from the center) the split is ~0.005 px.
+        assert!(split(50, 78, 20, 44) < 0.02, "center: {}", split(50, 78, 20, 44));
+        // Near the corner (~55 px out) about 1 px: whole fringes.
+        assert!(split(100, 128, 0, 24) > 0.5, "corner: {}", split(100, 128, 0, 24));
+    }
+
+    /// Chromatic aberration and FXAA taps stay inside their post group: a white half never
+    /// lights the black one, either way round.
+    pub fn lens_effects_do_not_bleed_across_viewports(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let lens = plain().with_chromatic_aberration(1.0).with_fxaa(FxaaQuality::High);
+        let left = camera(&mut app, 0.0, Vec4::ONE, Some(lens));
+        let right = camera(&mut app, 50.0, BLACK, Some(lens));
+        for (e, viewport, order) in [(left, [0.0, 0.0, 0.5, 1.0], 0), (right, [0.5, 0.0, 0.5, 1.0], 1)] {
+            let mut c = app.world.get::<&mut Camera3d>(e).unwrap();
+            c.viewport = Some(viewport);
+            c.order = order;
+        }
+        for white_left in [true, false] {
+            let (white, black) = if white_left { (left, right) } else { (right, left) };
+            app.world.get::<&mut Camera3d>(white).unwrap().clear_color = Some(Vec4::ONE);
+            app.world.get::<&mut Camera3d>(black).unwrap().clear_color = Some(BLACK);
+            let img = render(&mut app);
+            assert_eq!(stats(&app).post_passes, 4);
+            for y in 0..H {
+                for x in 0..W {
+                    let expected = if (x < W / 2) == white_left {
+                        [255; 4]
+                    } else {
+                        [0, 0, 0, 255]
+                    };
+                    assert_eq!(img.get(x, y), expected, "white left {white_left}: ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    /// FXAA and grain run in the Ldr fallback too (display-space effects); post groups of one
+    /// size share one LDR intermediate; the steady state creates nothing and a still scene
+    /// uploads nothing.
+    pub fn fxaa_ldr_fallback_and_steady_state(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let q = quad(&mut app, Vec3::ONE, Vec2::ZERO, Vec2::splat(0.8));
+        {
+            let mut t = app.world.get::<&mut Transform>(q).unwrap();
+            t.rotation = Quat::from_rotation_z(0.4) * t.rotation;
+        }
+        let fxaa = plain()
+            .with_fxaa(FxaaQuality::Medium)
+            .with_film_grain(grain(0.05, 1, false));
+        let left = camera(&mut app, 0.0, BLACK, Some(fxaa));
+        frame_settings(&mut app).downlevel.no_float_targets = true;
+        let img = render(&mut app);
+        assert_eq!(stats(&app).post_passes, 2, "Ldr fallback: composite + FXAA");
+        assert!(partial(&img) > 20);
+        frame_settings(&mut app).downlevel.no_float_targets = false;
+        let right = camera(&mut app, 0.0, BLACK, Some(fxaa));
+        for (e, viewport, order) in [(left, [0.0, 0.0, 0.5, 1.0], 0), (right, [0.5, 0.0, 0.5, 1.0], 1)] {
+            let mut c = app.world.get::<&mut Camera3d>(e).unwrap();
+            c.viewport = Some(viewport);
+            c.order = order;
+        }
+        let first = render(&mut app);
+        let with_fxaa = stats(&app).target_bytes;
+        assert_eq!(stats(&app).post_passes, 4);
+        for e in [left, right] {
+            set_post(&mut app, e, plain());
+        }
+        render(&mut app);
+        let without = stats(&app).target_bytes;
+        assert_eq!(with_fxaa - without, 4 * (W * H) as u64, "one shared LDR intermediate");
+        for e in [left, right] {
+            set_post(&mut app, e, fxaa);
+        }
+        for _ in 0..4 {
+            render(&mut app);
+        }
+        let s = stats(&app);
+        assert_eq!(
+            (
+                s.textures_created,
+                s.cpu_reallocations,
+                s.buffer_reallocations,
+                s.bytes_uploaded
+            ),
+            (0, 0, 0, 0),
+            "{s:?}"
+        );
+        assert_eq!(render(&mut app), first, "deterministic");
+    }
+
+    /// A render target cleared transparent with every display-space effect: grain, dither,
+    /// vignette, chromatic aberration and FXAA are weighted by alpha (alpha 0 stays exactly 0).
+    pub fn transparent_rt_lens_effects_keep_alpha(make: MakeApp) {
+        let Some(mut app) = make(16, 16) else { return };
+        let rt = app.resources.expect_mut::<RenderAssets>().add_render_target(64, 64);
+        let q = quad(&mut app, Vec3::splat(4.0), Vec2::ZERO, Vec2::splat(0.6));
+        {
+            let mut t = app.world.get::<&mut Transform>(q).unwrap();
+            t.rotation = Quat::from_rotation_z(0.3) * t.rotation;
+        }
+        let lens = PostProcess::cinematic().with_film_grain(grain(0.3, 9, false));
+        app.world.spawn((
+            Transform::from_xyz(0.0, 0.0, 5.0),
+            Camera3d::default()
+                .with_clear_color(Vec4::ZERO)
+                .with_target(RenderTarget::Texture(rt))
+                .with_projection(Projection::Orthographic {
+                    height: 2.0,
+                    near: 0.1,
+                    far: 100.0,
+                }),
+            lens,
+        ));
+        camera(&mut app, 0.0, BLACK, None);
+        render(&mut app);
+        assert_eq!(stats(&app).post_passes, 9 + 2, "bloom (5 levels), composite, FXAA");
+        let texture = {
+            let assets = app.resources.expect::<RenderAssets>();
+            assets.render_target_view(rt).unwrap().texture().clone()
+        };
+        let px = crate::common::read_texture(app.resources.expect::<Renderer>(), &texture);
+        let mut transparent = 0;
+        for p in &px {
+            if p[3] == 0.0 {
+                transparent += 1;
+                assert_eq!(*p, [0.0; 4]);
+            }
+        }
+        assert!(transparent > 1000, "{transparent} transparent pixels");
+        assert_eq!(px[32 * 64 + 32][3], 1.0);
+    }
+
     fn stats(app: &App) -> RenderStats {
         app.resources.expect::<RenderStats>().clone()
     }

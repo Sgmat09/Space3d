@@ -5,11 +5,14 @@
 use super::{ambient, mesh, sun};
 use crate::{KnobValues, Story};
 use space3d_core::prelude::*;
-use space3d_render::{Bloom, BloomComposite, Camera3d, Material, Mesh3d, PostProcess};
+use space3d_render::{
+    Bloom, BloomComposite, Camera3d, ChromaticAberration, FilmGrain, FxaaQuality, Material, Mesh3d, PostProcess,
+    Vignette,
+};
 
 /// This area's stories, in registry order.
 pub(crate) fn stories() -> Vec<Story> {
-    vec![bloom(), bloom_veil()]
+    vec![bloom(), bloom_veil(), fxaa(), lens()]
 }
 
 /// Dark-space backdrop (linear).
@@ -211,6 +214,172 @@ fn bloom_veil() -> Story {
          image keeps its mean brightness.",
     )
     .knob_f32("intensity", Bloom::natural().intensity, 0.0..=1.0)
+    .tag("graphics")
+    .tag("post")
+    .size(320, 180)
+}
+
+const FXAA_QUALITIES: [&str; 4] = ["Low", "Medium", "High", "Ultra"];
+
+/// Aliasing-prone geometry: thin rotated bars, a lattice of thin beams receding in depth, tilted
+/// cubes and a lit sphere.
+fn aliased_scene(app: &mut App) {
+    let bar = mesh(app, MeshData::cube(1.0));
+    let sphere = mesh(app, MeshData::sphere(0.55, 48, 24));
+    for i in 0..9 {
+        let a = -0.9 + i as f32 * 0.22;
+        app.world.spawn((
+            at(Vec3::new(-1.1 + i as f32 * 0.27, 0.55, 0.0))
+                .with_rotation(Quat::from_rotation_z(a))
+                .with_scale(Vec3::new(0.025 + 0.004 * i as f32, 0.9, 0.05)),
+            Mesh3d(bar),
+            Material::unlit(Vec4::new(0.95, 0.9, 0.8, 1.0)),
+        ));
+    }
+    for i in 0..7 {
+        let z = -0.5 - i as f32 * 0.9;
+        app.world.spawn((
+            at(Vec3::new(0.0, -0.75, z)).with_scale(Vec3::new(4.0, 0.03, 0.03)),
+            Mesh3d(bar),
+            Material::unlit(Vec4::new(0.2, 0.8, 1.0, 1.0)),
+        ));
+    }
+    for i in 0..5 {
+        let x = -1.6 + i as f32 * 0.8;
+        app.world.spawn((
+            at(Vec3::new(x, -0.75, -3.2)).with_scale(Vec3::new(0.03, 0.03, 5.4)),
+            Mesh3d(bar),
+            Material::unlit(Vec4::new(0.2, 0.8, 1.0, 1.0)),
+        ));
+    }
+    for (i, x) in [-0.9f32, 0.9].into_iter().enumerate() {
+        app.world.spawn((
+            at(Vec3::new(x, -0.15, 0.3))
+                .with_rotation(
+                    Quat::from_rotation_x(0.5 + i as f32) * Quat::from_rotation_y(0.7) * Quat::from_rotation_z(0.2),
+                )
+                .with_scale(Vec3::splat(0.4)),
+            Mesh3d(bar),
+            Material::srgb(0.8, 0.35, 0.2).with_metallic_roughness(0.0, 0.5),
+        ));
+    }
+    app.world.spawn((
+        at(Vec3::new(0.0, -0.1, -0.8)),
+        Mesh3d(sphere),
+        Material::srgb(0.7, 0.72, 0.78).with_metallic_roughness(0.0, 0.3),
+    ));
+    sun(app, Vec3::new(-0.4, -0.7, -0.6), 2.5);
+    ambient(app, 0.06);
+}
+
+fn fxaa_quality(k: &KnobValues) -> FxaaQuality {
+    match k.choice("quality") {
+        0 => FxaaQuality::Low,
+        2 => FxaaQuality::High,
+        3 => FxaaQuality::Ultra,
+        _ => FxaaQuality::Medium,
+    }
+}
+
+fn fxaa() -> Story {
+    Story::new("Engine/Post/FXAA", |app, k| {
+        aliased_scene(app);
+        // Split screen, the same view twice: without anti-aliasing (left), with FXAA (right).
+        let base = PostProcess::default().without_bloom();
+        let eye = Transform::from_xyz(0.0, 0.45, 2.7).looking_at(Vec3::new(0.0, 0.12, -0.6), Vec3::Y);
+        for (i, post) in [base, base.with_fxaa(fxaa_quality(k))].into_iter().enumerate() {
+            app.world.spawn((
+                Name(if i == 0 { "camera" } else { "fxaa camera" }.into()),
+                eye,
+                Camera3d {
+                    order: i as i32,
+                    viewport: Some([0.5 * i as f32, 0.0, 0.5, 1.0]),
+                    clear_color: Some(SPACE),
+                    ..Default::default()
+                },
+                post,
+            ));
+        }
+    })
+    .description(
+        "FXAA 3.11 (Lottes) after tonemapping: the same view without anti-aliasing (left) and \
+         with `PostProcess::with_fxaa` (right). The composite writes an LDR intermediate; the \
+         FXAA pass smooths stair-stepped edges found by local contrast, then applies grain, \
+         dither and the output encoding. Qualities: Low (3 search steps), Medium (5), High \
+         (12), Ultra (12, full sub-pixel filtering).",
+    )
+    .knob_choice("quality", &FXAA_QUALITIES, 1)
+    .tag("graphics")
+    .tag("post")
+    .size(320, 180)
+}
+
+fn lens() -> Story {
+    Story::new("Engine/Post/Lens", |app, k| {
+        // A dim backdrop (the vignette darkens it toward the corners) and high-contrast stars
+        // all over it (chromatic aberration grows toward the corners).
+        let star = mesh(app, MeshData::cube(1.0));
+        app.world.spawn((
+            at(Vec3::new(0.0, 0.0, -9.0)).with_scale(Vec3::new(30.0, 20.0, 0.1)),
+            Mesh3d(star),
+            Material::unlit(Vec4::new(0.03, 0.035, 0.06, 1.0)),
+        ));
+        let mut rng = Lcg(11);
+        for _ in 0..220 {
+            let p = Vec3::new(rng.next() * 18.0 - 9.0, rng.next() * 10.0 - 5.3, -6.0);
+            let v = 1.0 + 3.0 * rng.next();
+            app.world.spawn((
+                at(p).with_scale(Vec3::splat(0.06 + 0.05 * rng.next())),
+                Mesh3d(star),
+                Material::unlit((Vec3::new(0.9, 0.95, 1.0) * v).extend(1.0)),
+            ));
+        }
+        aliased_scene(app);
+        let post = PostProcess::default()
+            .with_vignette(Vignette {
+                enabled: k.f32("vignette") > 0.0,
+                intensity: k.f32("vignette"),
+                ..Vignette::default()
+            })
+            .with_chromatic_aberration(k.f32("chromatic_aberration"))
+            .with_film_grain(FilmGrain {
+                enabled: k.f32("grain") > 0.0,
+                intensity: k.f32("grain"),
+                // A fixed pattern: goldens stay stable.
+                animated: false,
+                seed: 1,
+                ..FilmGrain::default()
+            });
+        let post = PostProcess {
+            chromatic_aberration: ChromaticAberration {
+                enabled: k.f32("chromatic_aberration") > 0.0,
+                ..post.chromatic_aberration
+            },
+            ..post
+        };
+        app.world.spawn((
+            Name("camera".into()),
+            Transform::from_xyz(0.0, 0.45, 2.7).looking_at(Vec3::new(0.0, 0.12, -0.6), Vec3::Y),
+            Camera3d::default().with_clear_color(SPACE),
+            if k.bool("fxaa") {
+                post.with_fxaa(FxaaQuality::Medium)
+            } else {
+                post
+            },
+        ));
+    })
+    .description(
+        "Display-space lens effects in the composite: a vignette (darkened corners; \
+         `roundness`, `smoothness` and a tint color on `Vignette`), chromatic aberration (red and \
+         blue split radially, growing with r², `intensity` × 2 % of the width at the corners) and \
+         film grain (value noise in the encoded space, fading in highlights, seeded: animated \
+         grain follows `Time::frame`, this story's is fixed). Grain and dither run in the last \
+         pass, after FXAA when it is on.",
+    )
+    .knob_f32("vignette", 0.45, 0.0..=1.0)
+    .knob_f32("chromatic_aberration", 0.35, 0.0..=1.0)
+    .knob_f32("grain", 0.06, 0.0..=0.5)
+    .knob_bool("fxaa", true)
     .tag("graphics")
     .tag("post")
     .size(320, 180)

@@ -97,6 +97,51 @@ fn gl_bloom_downlevel_parity() {
     cases::bloom_downlevel_parity(gl_app);
 }
 
+#[test]
+fn gl_fxaa_softens_edges() {
+    cases::fxaa_softens_edges(gl_app);
+}
+
+#[test]
+fn gl_film_grain_is_seeded() {
+    cases::film_grain_is_seeded(gl_app);
+}
+
+#[test]
+fn gl_grain_after_fxaa() {
+    cases::grain_after_fxaa(gl_app);
+}
+
+#[test]
+fn gl_after_tonemap_overlays_untouched_by_grain_ca_vignette() {
+    cases::after_tonemap_overlays_untouched_by_grain_ca_vignette(gl_app);
+}
+
+#[test]
+fn gl_vignette_darkens_corners() {
+    cases::vignette_darkens_corners(gl_app);
+}
+
+#[test]
+fn gl_chromatic_aberration_splits_toward_corners() {
+    cases::chromatic_aberration_splits_toward_corners(gl_app);
+}
+
+#[test]
+fn gl_lens_effects_do_not_bleed_across_viewports() {
+    cases::lens_effects_do_not_bleed_across_viewports(gl_app);
+}
+
+#[test]
+fn gl_fxaa_ldr_fallback_and_steady_state() {
+    cases::fxaa_ldr_fallback_and_steady_state(gl_app);
+}
+
+#[test]
+fn gl_transparent_rt_lens_effects_keep_alpha() {
+    cases::transparent_rt_lens_effects_keep_alpha(gl_app);
+}
+
 /// Emissive quads of 2 … 40 over a dark clear with the default bloom: GL (level views bound
 /// with `TEXTURE_BASE_LEVEL`/`MAX_LEVEL` while rendering the next level) looks like the
 /// default backend.

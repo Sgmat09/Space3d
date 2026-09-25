@@ -4,9 +4,9 @@
 //! Config structs are plain `pub`-field `Copy` structs with `Default` (functional record update
 //! works); enums are `#[non_exhaustive]`. A camera with an enabled `PostProcess` renders through
 //! its target group's scene texture (HDR, or the Ldr fallback) and the composite: exposure
-//! (manual), the tonemapper and dither work since the frame milestone F4, bloom since PO1; auto
-//! exposure, FXAA, lens effects, grading and distortion arrive with the post milestones PO2–PO6
-//! (docs/graphics/post.md).
+//! (manual), the tonemapper and dither work since the frame milestone F4, bloom since PO1, FXAA,
+//! vignette, chromatic aberration and film grain since PO3; auto exposure, grading and
+//! distortion arrive with the post milestones PO2, PO4 and PO5 (docs/graphics/post.md).
 
 use crate::assets::{AddressMode, FilterMode, SamplerSettings, TextureSource};
 use crate::handles::{ShaderHandle, TextureHandle};
@@ -356,7 +356,8 @@ pub enum AntiAliasing {
     /// None.
     #[default]
     None,
-    /// FXAA 3.11, after tonemapping, before grain.
+    /// FXAA 3.11 (Lottes) after tonemapping: one extra full-screen pass reading an 8-bit
+    /// intermediate the size of the target; grain and dither run after it, in that pass.
     Fxaa(FxaaQuality),
 }
 

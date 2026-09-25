@@ -1,13 +1,31 @@
-# Post-processing: bloom
+# Post-processing: bloom, FXAA, vignette, chromatic aberration, film grain
 
 Post effects run in a camera's post group after its scene is drawn, in exposed HDR units, and
 end in the one composite pass that writes the display target (see [`frame.md`](frame.md) for
 frame modes, post groups and the composite). The normative design is
 [`docs/design/graphics.md`](../design/graphics.md) §1.9 and §5.2 (P-POST).
 
-This page covers bloom (milestone PO1). Auto exposure, FXAA, vignette, chromatic aberration,
-film grain, color grading and the distortion apply land with the next post milestones; their
-settings already exist on `PostProcess` and are ignored until then.
+This page covers bloom (milestone PO1) and the display-space effects FXAA, vignette, chromatic
+aberration and film grain (PO3). Auto exposure, color grading and the distortion apply land
+with the next post milestones; their settings already exist on `PostProcess` and are ignored
+until then.
+
+```rust
+use space3d::prelude::*; // PostProcess, Bloom
+use space3d::render::{FilmGrain, FxaaQuality, Vignette};
+
+// Bloom is on by default; the display-space effects are opt-in.
+PostProcess::default()
+    .with_fxaa(FxaaQuality::Medium)
+    .with_vignette(Vignette { enabled: true, intensity: 0.3, ..Vignette::default() })
+    .with_chromatic_aberration(0.15)
+    .with_film_grain(FilmGrain { enabled: true, intensity: 0.05, ..FilmGrain::default() });
+// The same set: PostProcess::cinematic()
+```
+
+Order in a post group (normative, spec §1.9): scene (+ chromatic aberration taps) → exposure →
+bloom → vignette → tonemapper → [grading, LUT: PO4] → **last pass**: grain → dither → output
+encoding. The last pass is the composite, or the FXAA pass when FXAA is on.
 
 ## Bloom
 
@@ -143,6 +161,14 @@ frames are isolated (the GPU idles between them and drops to low clocks) the sam
 measures about 0.45 ms; as for the composite (`frame.md` "Cost"), the gate uses the loaded
 regime.
 
+CPU (release build, same machine, busy with other builds): with bloom the render stage grows by
+about 0.10 ms per post group over the composite alone, 11 render passes at roughly 10 µs of
+wgpu/Metal pass overhead each (the renderer's own work per pass is a few map lookups and
+allocates nothing); FXAA adds one more pass, about 0.01 ms. That is above the spec's §4.4 line
+"post ≤ 0.05 ms" of the Battle CPU budget; a compute chain (one compute pass of dependent
+dispatches on class A backends, the render-pass chain kept for WebGL2) would cut both the CPU
+and the GPU pass overhead and is the planned follow-up.
+
 ### Gate
 
 Spec §4.4: "bloom 6 mips @1080p ≤ 0.20 ms" on the dev machine: **met** (0.14–0.17 ms). The test
@@ -156,21 +182,89 @@ cargo test -p space3d-render --lib bloom_gate -- --ignored --nocapture
 `SPACE3D_PERF_BUDGET_SCALE` relaxes the budget on slower machines; the test skips without
 `TIMESTAMP_QUERY`.
 
-### Determinism
+## FXAA
+
+`PostProcess::with_fxaa(FxaaQuality)` (or `anti_aliasing: AntiAliasing::Fxaa(q)`): FXAA 3.11
+(Timothy Lottes), the PC quality path, after tonemapping. The composite then writes an 8-bit
+intermediate `L` (`Rgba8UnormSrgb`, the target's size, from the frame's texture pool: post groups
+of one size share it) instead of the target, and one more full-screen pass reads `L`, finds
+edges by local contrast (luma = √(Rec. 601 luma) of the display-linear color, about perceptual),
+blends along them and writes the target — with grain, dither and the output encoding applied
+there, after the anti-aliasing, so FXAA never smears the grain.
+
+| `FxaaQuality` | Lottes preset | search steps | edge threshold | sub-pixel |
+|---|---|---|---|---|
+| `Low` | 10 | 3 | 1/4 | 0.75 |
+| `Medium` (default) | 12 | 5 | 1/6 | 0.75 |
+| `High` | 29 | 12 | 1/8 | 0.75 |
+| `Ultra` | 39 | 12 | 1/8 | 1.0 |
+
+Every tap is clamped to the post group's rect (split screens never bleed into each other), the
+pass uses explicit-LOD sampling only (WebGL2), and it runs in the Ldr fallback too. Render
+targets with a transparent clear keep their alpha: FXAA filters premultiplied colors and alpha
+together, and grain and dither are weighted by alpha. `PostProcess::with_quality` sets the
+FXAA quality to the tier's (Low, Medium, High) when FXAA is on; the Low tier (WebGL2) uses FXAA
+Low instead of MSAA (spec §4.4). Cost: one pass, and `L` (8.3 MB at 1080p).
+
+## Vignette
+
+`Vignette` darkens (or tints) toward the corners, in HDR before the tonemapper:
+`color × mix(1, vignette.color, intensity × f)`, where `f` rises smoothly from 0 to 1 over the
+last `smoothness` of the distance to the corners (1 at the corners of a centered vignette).
+`roundness` 1 is circular whatever the aspect, 0 follows the rect's shape; `center` moves it;
+`color` black darkens (a color tints). At the defaults (intensity 0.3) the corners are 30 %
+darker.
+
+## Chromatic aberration
+
+`ChromaticAberration { enabled, intensity }` (or `with_chromatic_aberration(i)`): red and blue
+are sampled apart, radially from the rect's center and growing with r²; at the corners the split
+is `intensity × 2 %` of the rect's width (resolution-independent). The taps are bilinear and
+clamped to the rect. Off in `GraphicsQuality::Low`.
+
+## Film grain
+
+`FilmGrain`: value noise in the encoded (sRGB) space, one value for the three channels, cells of
+`size` pixels at 1080p (scaled with the target's height, at least one pixel), amplitude
+`intensity` fading in the highlights with `luminance_response` (1: no grain on white). It is
+seeded (spec §4.3): `animated` grain uses `pcg(seed ^ Time::frame)` — a new pattern each frame,
+the same pattern for the same frame (`render_to_image` twice is identical, capture replays
+repeat it) — and still grain (`animated: false`) always `seed` (use it for goldens). Animated
+grain and dither upload 16 bytes per post group per frame; everything else of a still scene
+uploads nothing.
+
+## Display-space effects and overlays
+
+Grain, dither, vignette, chromatic aberration and FXAA run inside the post group: `HdrScene`
+overlays get them, `AfterTonemap` overlays (egui, 249c874-era overlays) and display views
+(gizmo cameras without post) do not (tested:
+`after_tonemap_overlays_untouched_by_grain_ca_vignette`). The passthrough group (render scale
+without post) never applies them.
+
+## Determinism
 
 Bloom has no temporal state and no noise: the same scene gives bit-identical chains (tested with
-`render_to_image` twice). Capture replays re-run the chain from the scene texture.
+`render_to_image` twice). Capture replays re-run the chain from the scene texture. Grain and
+dither are seeded from `Time::frame` (never the wall clock or the renderer's own frame count);
+their seeds are hashed once per frame on the CPU (bit-identical to hashing per pixel).
 
-### Tests and stories
+## Tests and stories
 
-* `tests/post.rs` (and `tests/gl_post.rs` on GL/ANGLE): `bloom_only_above_threshold`,
+* `tests/post.rs` (and `tests/gl_post.rs` on GL/ANGLE): bloom — `bloom_only_above_threshold`,
   `bloom_is_in_exposed_units`, `energy_conserving_preserves_mean`,
   `bloom_does_not_bleed_across_viewports`, `hdr_scene_overlays_feed_bloom`,
   `bloom_off_in_ldr_fallback`, `transparent_rt_bloom_weighted_by_alpha`, `bloom_steady_state`,
-  `bloom_downlevel_parity`; `gl_bloom_matches_default_backend`.
-* `tests/alloc_post.rs`: allocations per frame with bloom on one and on two post groups.
-* Unit tests in `src/post/bloom.rs`: chain sizing, the soft threshold's CPU mirror, pass
-  uniforms, the WGSL layout, and the GPU-time gate (`bloom_gate_1080p`, run alone with
-  `--ignored`).
+  `bloom_downlevel_parity`; FXAA and lens effects — `fxaa_softens_edges`, `film_grain_is_seeded`,
+  `grain_after_fxaa`, `after_tonemap_overlays_untouched_by_grain_ca_vignette`,
+  `vignette_darkens_corners`, `chromatic_aberration_splits_toward_corners`,
+  `lens_effects_do_not_bleed_across_viewports`, `fxaa_ldr_fallback_and_steady_state`,
+  `transparent_rt_lens_effects_keep_alpha`; `gl_bloom_matches_default_backend`.
+* `tests/alloc_post.rs`: allocations per frame with bloom on one and on two post groups, and with
+  `PostProcess::cinematic()` (359 on Metal: the FXAA pass on top of bloom's 332).
+* Unit tests in `src/post/`: chain sizing, the soft threshold's CPU mirror, pass uniforms, WGSL
+  layouts, FXAA presets and their WGSL for every quality, the pre-hashed seeds, and the GPU-time
+  gate (`bloom_gate_1080p`, run alone with `--ignored`).
 * Stories: `Engine/Post/Bloom` (engines, laser bolts, sparks, stars and a threshold ramp, with
-  every `Bloom` field on a knob) and `Engine/Post/Bloom Veil` (`Bloom::natural()`).
+  every `Bloom` field on a knob), `Engine/Post/Bloom Veil` (`Bloom::natural()`),
+  `Engine/Post/FXAA` (the same view without and with FXAA side by side; quality knob) and
+  `Engine/Post/Lens` (vignette, chromatic aberration and still grain on knobs, FXAA on).

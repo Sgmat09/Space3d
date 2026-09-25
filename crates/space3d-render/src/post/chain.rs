@@ -4,7 +4,7 @@
 //! upscale) and grown by the post area (PO1–PO6).
 
 use super::PostGroupPlan;
-use super::api::BloomComposite;
+use super::api::{BloomComposite, FilmGrain};
 use crate::node::FrameMode;
 use crate::output::{Tonemapper, pcg};
 use bytemuck::{Pod, Zeroable};
@@ -60,12 +60,28 @@ pub(crate) fn dither_seed(frame: u64) -> u32 {
     pcg(0x9E37_79B9 ^ frame as u32)
 }
 
+/// Second dither hash seed (`s3d_hash01(px, seed) − s3d_hash01(px, seed ^ DITHER_SECOND)`).
+const DITHER_SECOND: u32 = 0x68E3_1DA4;
+
+/// Grain seed of frame `frame` (graphics spec §4.3): `animated ? pcg(seed ^ frame) : seed`.
+pub(crate) fn grain_seed(grain: &FilmGrain, frame: u64) -> u32 {
+    if grain.animated {
+        pcg(grain.seed ^ frame as u32)
+    } else {
+        grain.seed
+    }
+}
+
 impl GpuPost {
-    /// Parameters of one post group; `bloom`: its bloom chain is recorded this frame.
-    pub(crate) fn new(plan: &PostGroupPlan, frame: u64, bloom: bool) -> Self {
+    /// Parameters of one post group; `bloom`: its bloom chain is recorded this frame; `fxaa`:
+    /// the composite writes the LDR intermediate and the FXAA pass finishes (grain, dither,
+    /// encoding).
+    pub(crate) fn new(plan: &PostGroupPlan, frame: u64, bloom: bool, fxaa: bool) -> Self {
         let s = &plan.settings;
+        // The passthrough group is a plain copy and upscale: no effect.
+        let effects = !plan.passthrough;
         let mut flags = 0;
-        if s.dither && !plan.passthrough {
+        if s.dither && effects {
             flags |= bits::DITHER;
         }
         if plan.transparent {
@@ -79,11 +95,11 @@ impl GpuPost {
         }
         // The distortion buffer is bound and written this frame (applying it is the post
         // area's: STUB(P-POST) PO5).
-        if plan.distortion && !plan.passthrough {
+        if plan.distortion && effects {
             flags |= bits::DISTORTION;
         }
         // The Ldr fallback exposes and tonemaps per fragment already; passthrough copies.
-        let hdr = plan.mode == FrameMode::Hdr && !plan.passthrough;
+        let hdr = plan.mode == FrameMode::Hdr && effects;
         let (exposure, tonemapper) = if hdr {
             (s.exposure.exp2(), s.tonemapper)
         } else {
@@ -92,9 +108,10 @@ impl GpuPost {
         let rect = |r: [i32; 4]| [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32];
         let (sw, sh) = (plan.scene_size.0.max(1) as f32, plan.scene_size.1.max(1) as f32);
         let out = rect(plan.output_rect);
+        let src = rect(plan.scene_rect);
         let mut p = GpuPost::zeroed();
         p.out_rect = out;
-        p.src_rect = rect(plan.scene_rect);
+        p.src_rect = src;
         p.src_texel = [1.0 / sw, 1.0 / sh, out[2] / out[3].max(1.0), plan.output_size.1 as f32];
         p.exposure = [exposure, 0.0, 0.0, 0.0];
         if bloom {
@@ -107,16 +124,57 @@ impl GpuPost {
             };
             p.exposure[3] = f32::from(u8::from(energy));
         }
+        let v = &s.vignette;
+        if effects && v.enabled && v.intensity > 0.0 {
+            flags |= bits::VIGNETTE;
+            p.vignette = [
+                v.intensity.clamp(0.0, 1.0),
+                v.smoothness.clamp(0.01, 1.0),
+                v.roundness.clamp(0.0, 1.0),
+                v.center.x,
+            ];
+            p.vignette_color = [v.color.x, v.color.y, v.color.z, v.center.y];
+        }
+        let ca = &s.chromatic_aberration;
+        if effects && ca.enabled && ca.intensity > 0.0 {
+            flags |= bits::CA;
+            // Red and blue sit `d · |d|² · lens.x` apart (d: S pixels from the rect's center):
+            // intensity × 2 % of the rect's width at its corners.
+            let corner = 0.5 * (src[2] * src[2] + src[3] * src[3]).sqrt().max(1.0);
+            p.lens[0] = ca.intensity.clamp(0.0, 1.0) * 0.02 * src[2] / (corner * corner * corner);
+        }
+        let g = &s.film_grain;
+        if effects && g.enabled && g.intensity > 0.0 {
+            flags |= bits::GRAIN;
+            // Cells of `size` pixels at 1080p, scaled with the output height, at least a pixel.
+            let cell = (g.size.max(0.0) * plan.output_size.1 as f32 / 1080.0).max(1.0);
+            p.grain = [
+                g.intensity.clamp(0.0, 1.0),
+                cell,
+                g.luminance_response.clamp(0.0, 1.0),
+                0.0,
+            ];
+        }
         p.grade_matrix = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
-        p.flags = [flags, tonemapper.id(), 0, 0];
+        p.flags = [flags, tonemapper.id(), u32::from(!fxaa), 0];
+        // Seeds are hashed once here (`s3d_pcg(seed)`), not per pixel: the shader's
+        // `post_hash01(p, pcg(seed))` equals `s3d_hash01(p, seed)` bit for bit.
         p.frame = [
-            0,
-            if flags & bits::DITHER != 0 {
-                dither_seed(frame)
+            if flags & bits::GRAIN != 0 {
+                pcg(grain_seed(g, frame))
             } else {
                 0
             },
-            0,
+            if flags & bits::DITHER != 0 {
+                pcg(dither_seed(frame))
+            } else {
+                0
+            },
+            if flags & bits::DITHER != 0 {
+                pcg(dither_seed(frame) ^ DITHER_SECOND)
+            } else {
+                0
+            },
             0,
         ];
         p
@@ -152,10 +210,35 @@ mod tests {
             ("S3D_POST_SCENE_ALPHA", bits::SCENE_ALPHA),
             ("S3D_POST_EXACT", bits::EXACT),
             ("S3D_POST_DISTORTION", bits::DISTORTION),
+            ("S3D_POST_VIGNETTE", bits::VIGNETTE),
+            ("S3D_POST_CA", bits::CA),
+            ("S3D_POST_GRAIN", bits::GRAIN),
         ] {
             assert!(src.contains(&format!("const {name}: u32 = {bit}u;")), "{name}");
         }
         crate::pipeline::validate_wgsl(&src).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// The shader hashes pre-hashed seeds (`post_hash01(p, pcg(seed))`): the same numbers as
+    /// `s3d_hash01(p, seed)`, and the grain seed follows spec §4.3.
+    #[test]
+    fn seeds_are_prehashed() {
+        let hash = |p: [u32; 2], hashed: u32| pcg(p[0] ^ pcg(p[1] ^ hashed)) as f32 * (1.0 / 4_294_967_295.0);
+        for (p, seed) in [([0, 0], 0), ([17, 3], 0x9E37_79B9), ([1919, 1079], u32::MAX)] {
+            assert_eq!(hash(p, pcg(seed)), crate::output::hash01(p, seed));
+        }
+        let still = FilmGrain {
+            animated: false,
+            seed: 42,
+            ..FilmGrain::default()
+        };
+        assert_eq!((grain_seed(&still, 1), grain_seed(&still, 2)), (42, 42));
+        let animated = FilmGrain {
+            animated: true,
+            ..still
+        };
+        assert_eq!(grain_seed(&animated, 7), pcg(42 ^ 7));
+        assert_ne!(grain_seed(&animated, 7), grain_seed(&animated, 8));
     }
 
     #[test]
