@@ -11,7 +11,7 @@
 //! export JAVA_HOME=/path/to/jdk-21          # javac + libjvm
 //! (cd open-android-models && ./gradlew -q --no-configuration-cache \
 //!     -I $SPACE3D/crates/space3d-ai/tests/jvm/print-classpath.init.gradle.kts \
-//!     :oam-bridge:jar :oam-mlkit:bundleLibRuntimeToDirDebug :oam-bridge:printOamJniClasspath) > /tmp/oam-cp
+//!     :oam-bridge:printOamJniClasspath) > /tmp/oam-cp
 //! OAM_ANDROID_CLASSPATH=$(tail -1 /tmp/oam-cp) \
 //!     cargo test -p space3d-ai --features android-jvm --test android_jvm -- --nocapture
 //! ```
