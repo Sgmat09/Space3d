@@ -5,9 +5,11 @@
 //! (StatefulSet PVC). On an ephemeral volume a hard crash loses unsent entries — documented
 //! trade-off.
 //!
-//! `op_id`s are unique per room instance (`"<server_id>:<room_id>:<nonce>:<counter>"`, or
-//! `"<server_id>:<room_id>:match:<match_id>"` for results), so retries are idempotent on the
-//! player service (`applied_ops`). Unacked entries are re-sent after every (re)registration of
+//! `op_id`s are unique per room instance (`"<server_id>:<room_id>:<nonce>:<counter>"`), or per
+//! match for results (`"<room_id>:match:<match_id>"`: a room restored on another server that
+//! ends the same match again is not applied twice), so retries are idempotent on the player
+//! service (`applied_ops`). Ops carry their origin (room, epoch, tick): the player service drops
+//! the ops of a stale room copy made after the point its live copy was restored from. Unacked entries are re-sent after every (re)registration of
 //! the fleet link and every [`RESEND_AFTER_MS`].
 
 use super::fleet::{FleetLink, FleetUp};
@@ -266,6 +268,7 @@ mod tests {
             board: "b".into(),
             player: PlayerId(1),
             score: 5,
+            origin: None,
         }
     }
 

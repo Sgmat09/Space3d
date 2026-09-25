@@ -371,7 +371,7 @@ Tools:
 | `persistence.data_dir` | `data` | Game-server outbox and local checkpoints |
 | `persistence.checkpoint_interval` | 10 s | Rooms also checkpoint on phase change, drain and admin request |
 | `persistence.checkpoint_store` | `player-service` | `none` \| `local` \| `player-service`. With `player-service`, any GS can restore. |
-| `persistence.recovery_max_age` | 5 min | Older checkpoints are not restored |
+| `persistence.recovery_max_age` | 5 min | Older checkpoints are not restored, and are deleted (checked once a minute, 1 min grace) |
 | `matchmaking.interval` | 250 ms | Matcher period |
 | `[[matchmaking.queues]]` | none | `name`, `mode`, `teams`, `team_size`, `min_players`, `max_wait`, `rating_window` (+`_growth`), `region_ping_ms` (+`_max_ms`), `backfill`, `params`. The queue whose `mode` matches also sets quick-play room capacity to `teams × team_size`. The default is 16. |
 
@@ -466,9 +466,13 @@ clients per room.
 - Persistent rooms warn clients (`Notice::Reconnect`) and freeze: clients get
   `Disconnect(ServerShutdown)` and the final checkpoint is captured in the same tick, so it
   holds everything the players saw. Clients rejoin through the PS
-  (`POST /v1/sessions/rejoin`); the rejoin waits (up to 10 s) until that checkpoint is stored,
-  then the room is restored on another server from exactly that state. The example client
-  rejoins on any disconnect.
+  (`POST /v1/sessions/rejoin`); the rejoin waits (up to 10 s, then answers 503 `room_moving`:
+  retry) until that checkpoint is stored, then the room is restored on another server from
+  exactly that state. The room keeps retrying the upload as long as the process runs; if the
+  checkpoint store stays unreachable until the server stops, that capture is kept in the game
+  server's local database (uploaded on its next start) and the room counts as lost with the
+  server (rejoin restores the newest stored checkpoint). The example client rejoins on any
+  disconnect.
 - When the drain completes the server deregisters (the PS stops counting it at once).
 - Set `terminationGracePeriodSeconds ≥ drain_timeout + 30 s`.
 
@@ -477,10 +481,10 @@ clients per room.
 | failure | what happens |
 |---|---|
 | Link blip | Resume within `resume_window`: same slot and pawn, with a full resync |
-| Room panic | Build with `--profile server`, which uses `panic = "unwind"`. The room is rebuilt from its last checkpoint and players rejoin. Three crashes in 5 minutes close the room. |
+| Room panic | Build with `--profile server`, which uses `panic = "unwind"`. The room is rebuilt from its last checkpoint and players rejoin. Three crashes in 5 minutes close the room and delete its checkpoint. |
 | Game server lost | The lease expires in `lease_ttl`. Rejoin restores the room from the PS-stored checkpoint on another server of the same game and schema hash. With `RecoveryPolicy::Abandon` the room is voided instead (audit `match_void`); rejoin answers 404 and players queue again. |
 | Player service down | Rooms keep playing, results queue in the game servers' durable outbox, and `/readyz` stays ready (`space3d_fleet_connected` shows the link). Logins and matchmaking pause until the PS returns; the outbox then flushes. |
-| Game server cut off from the PS (PS up) for longer than `lease_ttl` | The game server keeps playing its rooms, but the PS counts it as lost: a player who rejoins meanwhile gets the room restored elsewhere, and that copy is the one that counts. When the link is back, the PS closes the stale copy (`Disconnect(ServerShutdown)`); its players rejoin the live copy and lose what they did in the stale one. |
+| Game server cut off from the PS (PS up) for longer than `lease_ttl` | The game server keeps playing its rooms, but the PS counts it as lost: a player who rejoins meanwhile gets the room restored elsewhere, and that copy is the one that counts. When the link is back, the PS closes the stale copy (`Disconnect(ServerShutdown)`); its players rejoin the live copy and lose what they did in the stale one — including its match results, scores and player-data writes after the point the live copy was restored from, which the PS drops when the outbox replays them. |
 
 **Limits of v1.**
 

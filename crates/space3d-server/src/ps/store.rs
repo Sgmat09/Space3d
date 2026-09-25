@@ -193,6 +193,9 @@ pub trait PlayerStore: Send + Sync + 'static {
     fn delete_checkpoint(&self, room: RoomId) -> Task<Result<(), StoreError>>;
     /// Rooms with checkpoints saved at or after `min_saved_ms`.
     fn recent_checkpoints(&self, min_saved_ms: i64) -> Task<Result<Vec<RoomId>, StoreError>>;
+    /// Delete every checkpoint saved before `before_ms` (garbage collection of checkpoints too
+    /// old to restore); returns how many.
+    fn prune_checkpoints(&self, before_ms: i64) -> Task<Result<u64, StoreError>>;
     /// All bans.
     fn bans(&self) -> Task<Result<Vec<Ban>, StoreError>>;
     /// Add a ban (`id == 0` assigns one; returns it with its id).
@@ -805,6 +808,15 @@ impl PlayerStore for SqliteStore {
         })
     }
 
+    fn prune_checkpoints(&self, before_ms: i64) -> Task<Result<u64, StoreError>> {
+        self.tx(move |c| {
+            let n = c
+                .prepare_cached("DELETE FROM room_checkpoints WHERE saved_ms < ?1")?
+                .execute([before_ms])?;
+            Ok(n as u64)
+        })
+    }
+
     fn bans(&self) -> Task<Result<Vec<Ban>, StoreError>> {
         self.tx(|c| {
             let rows = c
@@ -1067,6 +1079,11 @@ mod tests {
         assert_eq!(b(s.get_checkpoint(RoomId(1))).unwrap(), Some((10, vec![6])));
         b(s.delete_checkpoint(RoomId(1))).unwrap();
         assert_eq!(b(s.get_checkpoint(RoomId(1))).unwrap(), None);
+        assert!(b(s.put_checkpoint(RoomId(2), vec![1], key(1, 100))).unwrap());
+        assert!(b(s.put_checkpoint(RoomId(3), vec![2], key(1, 300))).unwrap());
+        assert_eq!(b(s.prune_checkpoints(200)).unwrap(), 1, "only the expired one");
+        assert_eq!(b(s.get_checkpoint(RoomId(2))).unwrap(), None);
+        assert_eq!(b(s.get_checkpoint(RoomId(3))).unwrap(), Some((300, vec![2])));
 
         let p = b(s.guest([1; 32], None, 0)).unwrap().id;
         let ban = b(s.add_ban(

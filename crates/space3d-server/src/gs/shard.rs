@@ -49,7 +49,7 @@ pub enum ShardCmd {
     ForceStop,
 }
 
-/// Longest a shard waits for its forced-stop checkpoint writes.
+/// Longest a shard waits for its stop-time (forced stop, unfinished handoff) checkpoint writes.
 pub const FORCE_STOP_WRITE_WAIT: Duration = Duration::from_secs(5);
 
 /// Handle to one shard thread.
@@ -123,6 +123,8 @@ pub fn recover_crashed(
                 net.disconnect_all(DisconnectCode::RoomCrashed, "room closed", false);
             }
         }));
+        // Its checkpoint is the state it keeps crashing on: it must not come back.
+        super::room::discard_checkpoint(app);
         close_status(status, env, spec.room_id, "crash loop");
         return false;
     }
@@ -331,7 +333,7 @@ pub fn rebuild_crashed(
     let (Some(inbox), Some(runtime)) = (inbox, runtime) else {
         return Err("crashed".into());
     };
-    let (commands, last): (_, Option<Checkpoint>) = runtime.into_parts();
+    let (commands, last, upload): (_, Option<Checkpoint>, _) = runtime.into_parts();
     let build = RoomBuild {
         spec: spec.clone(),
         env: env.clone(),
@@ -352,10 +354,12 @@ pub fn rebuild_crashed(
         }
         Ok(Err(e)) => {
             tracing::error!(room = %spec.room_id, error = %e, "room rebuild failed");
+            super::room::delete_checkpoint_after(env, spec.room_id, upload);
             Err("rebuild failed".into())
         }
         Err(p) => {
             tracing::error!(room = %spec.room_id, panic = %panic_message(p), "room rebuild panicked");
+            super::room::delete_checkpoint_after(env, spec.room_id, upload);
             Err("rebuild panicked".into())
         }
     }
@@ -446,8 +450,8 @@ impl Hosted {
     }
 }
 
-/// Wait (bounded) for forced-stop writes; this thread is shutting down, so a short blocking
-/// wait here is fine (no frame runs anymore).
+/// Wait (bounded) for stop-time local checkpoint writes; this thread is shutting down, so a
+/// short blocking wait here is fine (no frame runs anymore).
 fn wait_writes(mut writes: Vec<space3d_tasks::Task<Result<(), super::checkpoint::StoreError>>>, limit: Duration) {
     let deadline = Instant::now() + limit;
     while !writes.is_empty() && Instant::now() < deadline {
@@ -455,7 +459,7 @@ fn wait_writes(mut writes: Vec<space3d_tasks::Task<Result<(), super::checkpoint:
             space3d_tasks::TaskState::Pending => true,
             space3d_tasks::TaskState::Ready => {
                 if let Some(Err(e)) = t.poll() {
-                    tracing::error!(error = %e, "forced stop: local checkpoint write failed");
+                    tracing::error!(error = %e, "stop: local checkpoint write failed");
                 }
                 false
             }
@@ -464,7 +468,7 @@ fn wait_writes(mut writes: Vec<space3d_tasks::Task<Result<(), super::checkpoint:
         std::thread::sleep(Duration::from_millis(2));
     }
     if !writes.is_empty() {
-        tracing::error!(pending = writes.len(), "forced stop: local checkpoint writes timed out");
+        tracing::error!(pending = writes.len(), "stop: local checkpoint writes timed out");
     }
 }
 
@@ -521,7 +525,20 @@ impl Shard {
                 self.room_count.store(rooms.len(), Ordering::Relaxed);
                 false
             }
-            ShardCmd::Stop => true,
+            ShardCmd::Stop => {
+                // Rooms still hosted now are frozen handoffs whose final capture the store never
+                // confirmed: keep those captures locally (bounded wait).
+                let writes: Vec<_> = rooms
+                    .iter_mut()
+                    .filter_map(|r| {
+                        catch_unwind(AssertUnwindSafe(|| super::room::stop_hosted(&mut r.app)))
+                            .ok()
+                            .flatten()
+                    })
+                    .collect();
+                wait_writes(writes, FORCE_STOP_WRITE_WAIT);
+                true
+            }
             ShardCmd::ForceStop => {
                 let writes: Vec<_> = rooms
                     .iter_mut()

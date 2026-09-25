@@ -3,13 +3,16 @@
 use std::time::Duration;
 
 /// Per-connection statistics (client side: `NetClient::stats`; server side: `NetServer::stats`).
+/// Fields marked *(server)* or *(client)* are only filled on that side and stay 0 on the other
+/// (the client cannot see which of its inputs the server missed; use the server's per-slot
+/// stats or the room metrics for those).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NetStats {
     /// Smoothed round-trip time.
     pub rtt: Duration,
     /// RTT variation.
     pub jitter: Duration,
-    /// Estimated packet loss 0..1 (datagram transports; 0 on streams).
+    /// Estimated packet loss 0..1. Not measured yet: always 0.
     pub loss: f32,
     /// Received bytes/s (1 s window).
     pub bytes_in_per_sec: u32,
@@ -21,7 +24,8 @@ pub struct NetStats {
     pub bytes_out: u64,
     /// Current interpolation delay in ticks (client).
     pub interp_delay_ticks: f32,
-    /// Last server-reported input slack in ticks (client) / average slack (server).
+    /// Input slack in ticks: the slack the pacer steers to (client) / the smoothed slack of
+    /// this client's inputs (server).
     pub input_slack: f32,
     /// Current tick-rate scale from the pacer (client).
     pub tick_scale: f32,
@@ -29,11 +33,11 @@ pub struct NetStats {
     pub rollbacks: u64,
     /// Ticks re-simulated (client).
     pub resim_ticks: u64,
-    /// Ticks for which the server had no input from this client.
+    /// Ticks for which the server had no input from this client (server).
     pub input_missing: u64,
-    /// Inputs that arrived after their tick was simulated.
+    /// Inputs that arrived after their tick was simulated (server).
     pub input_late: u64,
-    /// Snapshots skipped by flow control (server) / dropped as stale (client).
+    /// Snapshots skipped by flow control (server).
     pub snapshots_skipped: u64,
     /// Entities that wanted to be sent but did not fit the budget last snapshot (server).
     pub starved_entities: u32,

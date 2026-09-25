@@ -599,6 +599,8 @@ async fn rejoin(State(svc): State<Arc<PlayerService>>, meta: RequestMeta) -> Res
     };
     if let Some((room, match_id)) = abandoned {
         tracing::info!(room = %room, ?match_id, "orphaned room abandoned (recovery policy); match void");
+        // Its checkpoint is never restored (the room is void); do not keep it until GC.
+        drop(svc.store.delete_checkpoint(room));
         let detail = serde_json::json!({ "room": room, "match_id": match_id, "reason": "server lost" });
         let _ = wait(svc.store.audit("system".into(), "match_void".into(), detail, now)).await;
         svc.metrics.match_void();

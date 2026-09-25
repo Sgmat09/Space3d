@@ -322,6 +322,9 @@ pub struct NetClient {
     pub(crate) timed_messages: Vec<(Tick, u16, Vec<u8>)>,
     /// Newest snapshot tick applied.
     pub(crate) last_snapshot_tick: Tick,
+    /// The newest snapshot tick received before `last_snapshot_tick` (the interpolation gap
+    /// fix needs to know which snapshots arrived; see `SnapshotBuffer::push_sample`).
+    pub(crate) prev_snapshot_tick: Tick,
     /// Datagram receive window for acks: newest seq + 32-bit history.
     pub(crate) recv_ack: Option<crate::protocol::AckField>,
     /// Prediction.
@@ -371,6 +374,7 @@ impl NetClient {
             pending_refs: Default::default(),
             timed_messages: Vec::new(),
             last_snapshot_tick: Tick::ZERO,
+            prev_snapshot_tick: Tick::ZERO,
             recv_ack: None,
             prediction,
             interp,
@@ -610,6 +614,7 @@ impl NetClient {
         self.reset_seen = None;
         self.timed_messages.clear();
         self.last_snapshot_tick = Tick::ZERO;
+        self.prev_snapshot_tick = Tick::ZERO;
         self.recv_ack = None;
         self.prediction.clear();
         self.interp.reset();

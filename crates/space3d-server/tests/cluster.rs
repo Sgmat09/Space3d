@@ -559,24 +559,33 @@ fn a_drain_handoff_keeps_every_change_the_players_saw() {
     c.step_ticks(30);
     let (status, _) = admin(&c, &host, "POST", "/admin/v1/drain", None, true);
     assert_eq!(status, 202);
-    // Alice changes her pawn every tick, as fast as the room accepts it, until the room moves.
+    // Alice changes her pawn every tick, as fast as the room accepts it, until the room
+    // freezes (her link is closed).
     let mut last_in_room = 0;
     let mut last_seen = 0;
-    for _ in 0..3000 {
-        if c.client_net(ca).is_connected() {
-            let seen = healths(c.client(ca)).into_iter().max().unwrap_or(0);
-            last_seen = last_seen.max(seen);
-            send(&mut c, ca, &SetHealth(seen + 1));
-        }
+    for _ in 0..600 {
         if let Some(app) = c.room(room) {
             last_in_room = pawn_health(app, player(&alice)).unwrap_or(last_in_room);
         }
-        if c.room(room).is_none() && c.player_service().fleet.lock().room(room).is_some_and(|e| e.orphaned) {
+        if !c.client_net(ca).is_connected() {
             break;
         }
+        let seen = healths(c.client(ca)).into_iter().max().unwrap_or(0);
+        last_seen = last_seen.max(seen);
+        send(&mut c, ca, &SetHealth(seen + 1));
         c.step();
     }
-    assert!(c.room(room).is_none(), "handed off");
+    assert!(!c.client_net(ca).is_connected(), "the room froze");
+    // The frozen room closes once its freeze capture is stored (serialization and upload run
+    // in the background: real time, not ticks — and however many ticks that takes, the room
+    // never closes restorable before that capture is stored).
+    let handed_off = run_until_bg(&mut c, 3000, |c| {
+        if let Some(app) = c.room(room) {
+            last_in_room = pawn_health(app, player(&alice)).unwrap_or(last_in_room);
+        }
+        c.room(room).is_none() && c.player_service().fleet.lock().room(room).is_some_and(|e| e.orphaned)
+    });
+    assert!(handed_off, "handed off");
     assert!(last_seen > 100, "alice changed her pawn during the drain");
     let target = c.rejoin(&alice).unwrap().expect("the world can be restored");
     assert_ne!(target.server_id, host);
@@ -714,6 +723,95 @@ fn a_partitioned_server_closes_its_stale_copy_of_a_restored_room() {
     assert_eq!(c.rooms_of(&stale), Vec::<RoomId>::new());
 }
 
+/// Regression (split brain): the stale copy's match result, scores and player data sat in its
+/// durable outbox during the partition and were applied when the link healed, next to the live
+/// copy's — Elo applied twice with opposite winners, both players credited a win, the stale
+/// copy's progress written. What a stale copy did after the point the live copy was restored
+/// from is now dropped (its ops are acknowledged, not applied).
+#[test]
+fn a_stale_copy_s_results_are_dropped_when_the_partition_heals() {
+    let mut c = cluster(2);
+    let alice = c.guest("alice");
+    let bob = c.guest("bob");
+    let (ca, cb, room) = connected_pair(&mut c, &alice, &bob);
+    let stale = c.room_server(room).unwrap().to_owned();
+    let stored = c.run_until(600, |c| {
+        c.player_service()
+            .store
+            .get_checkpoint(room)
+            .block()
+            .and_then(Result::ok)
+            .flatten()
+            .is_some()
+    });
+    assert!(stored, "a restore point");
+    c.set_fleet_outage(&stale, true);
+    let lease = c.player_service().config.fleet.lease_ttl;
+    let dead = c.run_until((lease.as_secs_f64() * 60.0) as u64 + 180, |c| {
+        c.player_service()
+            .fleet
+            .lock()
+            .server(&stale)
+            .is_none_or(|s| s.state == ServerState::Dead)
+    });
+    assert!(dead, "lease expired");
+    let moved = c.rejoin(&bob).unwrap().expect("restorable");
+    assert_ne!(moved.server_id, stale);
+    c.reconnect(cb, &moved);
+    assert!(c.run_until(600, |c| c.client_net(cb).is_connected()));
+    // Stale copy: alice "wins" (result, score and progress wait in its outbox).
+    send(&mut c, ca, &Finish);
+    c.step_ticks(60);
+    // Live copy: bob wins.
+    send(&mut c, cb, &Finish);
+    let board = |c: &TestCluster| {
+        let mut rows: Vec<(PlayerId, i64)> = c
+            .api(&alice)
+            .leaderboard("wins", 10)
+            .block()
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.player_id, r.score))
+            .collect();
+        rows.sort();
+        rows
+    };
+    let bob_won = run_until_bg(&mut c, 600, |c| board(c) == vec![(player(&bob), 1)]);
+    assert!(bob_won, "{:?}", board(&c));
+    let rating = |c: &TestCluster, t: &SessionTokens| c.api(t).me().block().unwrap().unwrap().rating;
+    let before = (rating(&c, &alice), rating(&c, &bob));
+    assert!(before.1 > before.0, "bob won once: {before:?}");
+    // The partition heals: the stale copy is closed and its outbox replayed.
+    c.set_fleet_outage(&stale, false);
+    assert!(
+        c.run_until(600, |c| !c.rooms_of(&stale).contains(&room)),
+        "stale copy closed"
+    );
+    let pending = c
+        .game_server(&stale)
+        .unwrap()
+        .rooms
+        .env()
+        .metrics
+        .outbox_pending
+        .clone();
+    let flushed = run_until_bg(&mut c, 1_800, |_| pending.get() == 0.0);
+    assert!(
+        flushed,
+        "the stale copy's ops were answered ({} pending)",
+        pending.get()
+    );
+    c.step_ticks(60);
+    let _ = c.settle(Duration::from_millis(500), |_| false);
+    assert_eq!(board(&c), vec![(player(&bob), 1)], "one win, bob's");
+    assert_eq!((rating(&c, &alice), rating(&c, &bob)), before, "Elo applied once");
+    assert!(
+        c.api(&alice).get_data("progress").block().unwrap().is_err(),
+        "the stale copy's progress write was dropped"
+    );
+}
+
 /// Regression: a rejoin while the hosting server drains goes back to the match that still
 /// runs there instead of restoring a second copy on another server.
 #[test]
@@ -763,6 +861,16 @@ fn a_crash_looping_room_is_closed() {
     let alice = c.guest("alice");
     let bob = c.guest("bob");
     let (ca, _cb, room) = connected_pair(&mut c, &alice, &bob);
+    let stored = |c: &TestCluster| {
+        c.player_service()
+            .store
+            .get_checkpoint(room)
+            .block()
+            .and_then(Result::ok)
+            .flatten()
+            .is_some()
+    };
+    assert!(c.settle(Duration::from_secs(10), stored), "the room checkpointed");
     for crash in 1..=3u64 {
         c.crash_room(room);
         assert!(
@@ -779,6 +887,68 @@ fn a_crash_looping_room_is_closed() {
     let gone = c.run_until(120, |c| c.player_service().fleet.lock().room(room).is_none());
     assert!(gone, "the player service forgot the room");
     assert!(!matches!(c.rejoin(&alice), Ok(Some(_))), "nothing to rejoin");
+    // Regression: the crash-looping room's checkpoint stayed stored forever (and a join ticket
+    // that was still valid recreated the room from it).
+    assert!(
+        c.settle(Duration::from_secs(10), |c| !stored(c)),
+        "the crash-looping room's checkpoint is deleted"
+    );
+}
+
+/// Regression: checkpoints of rooms that ended without a normal close (orphans nobody
+/// rejoined, abandoned rooms, handed-off rooms nobody came back to) were never deleted; the
+/// table grew with every lost server and deploy. Checkpoints too old to restore are now
+/// garbage-collected.
+#[test]
+fn checkpoints_too_old_to_restore_are_garbage_collected() {
+    use space3d_server::gs::checkpoint::CheckpointKey;
+    let mut c = cluster(1);
+    let store = c.player_service().store.clone();
+    let now = {
+        use space3d_server::clock::UnixClock;
+        c.unix_clock().now_ms()
+    };
+    let put = |room: u64, saved_ms: i64| {
+        let spec = space3d_server::game::RoomSpec {
+            room_id: RoomId(room),
+            mode: "duel".into(),
+            ..Default::default()
+        };
+        let state = space3d_replication::server::full_state::FullState {
+            schema_hash: 1,
+            tick: space3d_replication::Tick(10),
+            epoch: 1,
+            next_net_id: 1,
+            entities: Vec::new(),
+        };
+        let cp = Checkpoint::new(spec, state, None, None, saved_ms);
+        let key = CheckpointKey { epoch: 1, saved_ms };
+        store
+            .put_checkpoint(RoomId(room), cp.to_bytes(), key)
+            .block()
+            .unwrap()
+            .unwrap();
+    };
+    let max_age = c.player_service().config.persistence.recovery_max_age.as_millis() as i64;
+    // A lost room's checkpoint (nobody rejoined) and a fresh one.
+    put(901, now - max_age - 5 * 60_000);
+    put(902, now);
+    let has = |c: &TestCluster, room: u64| {
+        c.player_service()
+            .store
+            .get_checkpoint(RoomId(room))
+            .block()
+            .and_then(Result::ok)
+            .flatten()
+            .is_some()
+    };
+    // Supervisors prune once a minute.
+    c.step_ticks(61 * 60);
+    assert!(
+        c.settle(Duration::from_secs(10), |c| !has(c, 901)),
+        "expired checkpoint pruned"
+    );
+    assert!(has(&c, 902), "a restorable checkpoint stays");
 }
 
 /// §12 regression: `RoomControl::load_player_data` reaches the player service and back

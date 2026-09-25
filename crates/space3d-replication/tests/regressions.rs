@@ -1341,3 +1341,196 @@ fn a_hitch_resync_rebuilds_the_timeline_without_skipping_or_repeating_ticks() {
         }
     }
 }
+
+// ---- a large RTT drop ---------------------------------------------------------------------------
+
+/// Predicted-tick jumps back / forward (a frame moving it back, or by more than 2), inputs
+/// missing on the server, and fresh (not replayed) predicted ticks that differ from the server,
+/// over 15 s after the walker's link drops from `from` to `to` ms one-way (`up_only`: the
+/// downlink keeps `from`), in `ramp` ticks.
+fn rtt_drop_run(
+    seed: u64,
+    semantics: Semantics,
+    from: u64,
+    to: u64,
+    up_only: bool,
+    ramp: u32,
+) -> (usize, usize, u64, usize) {
+    let lat = |ms: u64| LinkConditions {
+        latency: Duration::from_millis(ms),
+        jitter: Duration::from_millis(2),
+        ..LinkConditions::perfect()
+    };
+    let mut h = with_rules(HarnessConfig {
+        seed,
+        semantics,
+        link: LinkProfile::symmetric(lat(from)),
+        ..Default::default()
+    });
+    let sims: Arc<Mutex<Vec<(u32, bool, f32)>>> = Default::default();
+    let record = sims.clone();
+    let w = h.add_client(ClientSpec::named("walker"), |app| {
+        app.add_plugin(TestProtocol);
+        app.add_sim_system("test::record", move |ctx| {
+            let time = *ctx.resources.expect::<SimTime>();
+            for (t, _) in ctx.world.query_mut::<(&Transform, &space3d_replication::Controlled)>() {
+                record
+                    .lock()
+                    .unwrap()
+                    .push((time.tick.0, time.resimulating, t.translation.x));
+            }
+        });
+        // A player: the input follows the sampling time (every 7 samples it flips), not the
+        // predicted tick — a tick predicted again with another input than the one the server
+        // got shows up as a fresh misprediction.
+        let mut samples = 0u32;
+        space3d_replication::bots::install_bot(app, move |_: &World, _: Tick| {
+            samples += 1;
+            Move {
+                x: if (samples / 7).is_multiple_of(2) { 1 } else { -1 },
+                z: 0,
+            }
+        });
+    });
+    assert!(h.run_until(1200, |h| h.client_net(w).is_connected()
+        && controlled(h.client(w)).is_some()));
+    h.step_ticks(600);
+    sims.lock().unwrap().clear();
+    let sp = pawn(h.server(), h.player(w)).unwrap();
+    let mut server_x = std::collections::HashMap::new();
+    let missing = h.server_net().room_stats().inputs_missing;
+    let mut last = h.client_net(w).predicted_tick().unwrap().0;
+    let (mut back, mut forward) = (0, 0);
+    for t in 0..900u32 {
+        if t < ramp.max(1) {
+            let ms = from - (from - to) * u64::from(t + 1) / u64::from(ramp.max(1));
+            let down = if up_only { from } else { ms };
+            h.set_link(
+                w,
+                LinkProfile {
+                    up: lat(ms),
+                    down: lat(down),
+                },
+            );
+        }
+        h.step();
+        server_x.insert(
+            h.server_net().tick().0,
+            h.server().world.get::<&Transform>(sp).unwrap().translation.x,
+        );
+        let next = h.client_net(w).predicted_tick().unwrap().0;
+        let d = i64::from(next) - i64::from(last);
+        back += usize::from(d < 0);
+        forward += usize::from(d > 2);
+        last = next;
+    }
+    let bad_fresh = sims
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(tick, resim, x)| !resim && server_x.get(tick).is_some_and(|sx| (x - sx).abs() > 1e-3))
+        .count();
+    (
+        back,
+        forward,
+        h.server_net().room_stats().inputs_missing - missing,
+        bad_fresh,
+    )
+}
+
+/// Regression: when the uplink latency dropped a lot (200 → 20 ms one-way), the pacer resynced
+/// backwards on the server's slack feedback, then kept acting on that feedback although it
+/// still described the old timeline (the client sends nothing until its prediction passes the
+/// newest input already sent, and the server's smoothed slack takes ~20 samples to follow),
+/// while the clock-based resync — whose path RTT lags such a change by ~1.25 s — jumped
+/// forward to the old target again: `[-7, +6, -9, +11, -9, -5, +6, -4]` within 90 ticks, then
+/// dozens of missing and late inputs. Ticks predicted again after a backward jump also sampled
+/// new inputs the server never got. Now one backward correction, no forward jump, and every
+/// fresh prediction matches the server.
+#[test]
+fn a_large_rtt_drop_is_one_correction_not_a_fight() {
+    for semantics in [Semantics::Stream, Semantics::Datagram] {
+        for (from, to, up_only, ramp) in [
+            (200u64, 20u64, false, 1u32),
+            (250, 60, false, 1),
+            (200, 20, true, 1),
+            (200, 20, false, 30),
+        ] {
+            for seed in 1..=2u64 {
+                let (back, forward, missing, bad_fresh) = rtt_drop_run(seed, semantics, from, to, up_only, ramp);
+                let case = format!("{semantics:?} {from} -> {to} ms (up only: {up_only}, ramp {ramp}), seed {seed}");
+                assert!(back <= 1, "{case}: {back} backward jumps");
+                assert_eq!(forward, 0, "{case}: forward jumps");
+                // (Uplink-only: the downlink keeps the 400 ms feedback loop, whose slow
+                // settling still lets a few inputs go missing — and those ticks mispredict.)
+                if !up_only {
+                    assert_eq!(missing, 0, "{case}: missing inputs");
+                    assert_eq!(bad_fresh, 0, "{case}: fresh predictions that differ from the server");
+                }
+            }
+        }
+    }
+}
+
+// ---- lost snapshots are not rest -----------------------------------------------------------------
+
+/// Regression: on a datagram link a lost snapshot leaves the same gap in a moving entity's
+/// samples as rest does, and the interpolation gap fix held its previous value across it: with
+/// 1–5 % downlink loss a remote walker stepped back (up to 0.125 m at 0.05 m/tick) dozens of
+/// times a minute. Only a snapshot that arrived without the entity counts as rest now.
+#[test]
+fn lost_snapshots_never_step_a_moving_remote_entity_back() {
+    for seed in 0..2u64 {
+        let base = LinkConditions {
+            latency: Duration::from_millis(40),
+            jitter: Duration::from_millis(2),
+            ..LinkConditions::perfect()
+        };
+        let mut h = with_rules(HarnessConfig {
+            seed,
+            semantics: Semantics::Datagram,
+            link: LinkProfile::symmetric(base.clone()),
+            ..Default::default()
+        });
+        let w = h.add_client(ClientSpec::named("walker"), |app| {
+            app.add_plugin(TestProtocol);
+            space3d_replication::bots::install_bot(
+                app,
+                space3d_replication::bots::scripted(|_t: Tick| Move { x: 1, z: 0 }),
+            );
+        });
+        let o = observer(&mut h, "obs");
+        assert!(h.run_until(1200, |h| h.client_net(w).is_connected()
+            && h.client_net(o).is_connected()));
+        h.step_ticks(300);
+        h.set_link(
+            o,
+            LinkProfile {
+                up: base.clone(),
+                down: LinkConditions {
+                    loss: 0.03,
+                    ..base.clone()
+                },
+            },
+        );
+        h.step_ticks(60);
+        let sp = pawn(h.server(), h.player(w)).unwrap();
+        let (mut last, mut back, mut worst): (Option<f32>, usize, f32) = (None, 0, 0.0);
+        for _ in 0..1200 {
+            h.step();
+            let Some(e) = h.client_entity(o, sp) else { continue };
+            let x = h.client(o).world.get::<&Transform>(e).unwrap().translation.x;
+            if let Some(p) = last
+                && x < p - 1e-4
+            {
+                back += 1;
+                worst = worst.max(p - x);
+            }
+            last = Some(x);
+        }
+        assert_eq!(
+            back, 0,
+            "seed {seed}: the walker stepped back {back} times (up to {worst:.3} m)"
+        );
+    }
+}

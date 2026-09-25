@@ -132,9 +132,15 @@ pub(crate) struct PredictionState {
     /// After a snap (no replay) at predicted tick T, the history of ticks before T is stale:
     /// confirmations older than this only update the confirmed values.
     pub(crate) snap_floor: Option<Tick>,
-    /// After a resync to tick T, the server's slack feedback describes the old timeline until
-    /// it consumed an input for T or later: feedback is ignored until then.
+    /// After a resync, the server's slack feedback describes the old timeline until it consumed
+    /// enough inputs of the new one (see [`client_pace`]): feedback is ignored until
+    /// `input_ack` reaches this tick.
     pub(crate) feedback_after: Option<Tick>,
+    /// After a backward resync on feedback: until then, the clock-based hard resync must not
+    /// undo it (see [`client_pace`]).
+    pub(crate) clock_hold_until: Option<Duration>,
+    /// The server reported a missing input since that resync.
+    pub(crate) missing_since_resync: bool,
     /// Debug builds: predicted component changes made outside the sim (between two predicted
     /// ticks) — they are invisible to rollback and mispredict (see [`check_sim_discipline`]).
     pub(crate) outside_sim_changes: u64,
@@ -156,6 +162,8 @@ impl PredictionState {
         self.rebuild = false;
         self.snap_floor = None;
         self.feedback_after = None;
+        self.clock_hold_until = None;
+        self.missing_since_resync = false;
         self.inputs.entries.clear();
         self.scale = 1.0;
     }
@@ -212,7 +220,24 @@ pub(crate) fn history_bytes(world: &World, entity: Entity, tick: Tick, kind: u16
         .and_then(|h| h.get(tick, kind).map(<[u8]>::to_vec))
 }
 
+/// Server slack samples to wait for after a backward feedback resync before its feedback is
+/// trusted again: the server smooths the slack (EWMA, α = 0.1), so right after the first input
+/// of the new timeline its report still mostly describes the old one (0.9²⁴ ≈ 8 % left).
+pub const SLACK_SETTLE_TICKS: u32 = 24;
+
 /// The `replication::client_pace` system (PreUpdate): tick pacing and prediction start.
+///
+/// Two sources can move the predicted tick: the server's slack feedback (the pacer) and the
+/// clock-based check (`|target − next| > 1.5 × hard_resync_ticks`, for when feedback cannot
+/// tell: stalls, hitches, missing inputs). The clock's target lags a path change by the time
+/// its path RTT and offset need to follow (≈ 1.25 s); after a large drop of the uplink
+/// latency the feedback reacts first, with a backward resync. After such a resync (1) feedback
+/// is ignored until the server consumed [`SLACK_SETTLE_TICKS`] inputs of the new timeline —
+/// the first new input is the one after the newest already sent, and the server's smoothed
+/// slack needs that many samples to forget the old timeline (acting on it again made further
+/// backward jumps) — and (2) the clock-based check does not undo it for a hold (8 ping
+/// intervals, at least 2 s) unless the server reports missing inputs meanwhile (then the clock
+/// is right). Other resyncs gate feedback until the server consumed an input for the new tick.
 pub(crate) fn client_pace(ctx: &mut SystemCtx) {
     let now = ctx.resources.init::<crate::time::NetClockHandle>().now();
     let Some(net) = ctx.resources.get_mut::<NetClient>() else {
@@ -241,6 +266,7 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
         }
         Some(next) => {
             if let Some(slack) = net.pending_slack.take() {
+                prediction.missing_since_resync |= slack == i8::MIN;
                 let fresh = prediction
                     .feedback_after
                     .is_none_or(|t| conn.input_ack.is_some_and(|a| a >= t));
@@ -248,15 +274,34 @@ pub(crate) fn client_pace(ctx: &mut SystemCtx) {
                     prediction.feedback_after = None;
                     match conn.pacer.on_feedback(slack, jitter_ticks) {
                         PaceAction::Scale(s) => prediction.scale = s,
-                        PaceAction::Resync(n) => resync(prediction, Tick((i64::from(next.0) + n).max(1) as u32)),
+                        PaceAction::Resync(n) => {
+                            let to = Tick((i64::from(next.0) + n).max(1) as u32);
+                            resync(prediction, to);
+                            if n < 0 && prediction.next_tick == Some(to) {
+                                // Inputs arrive too early: the path got faster, which the clock
+                                // only sees ≈ 1.25 s later. The server's slack describes the new
+                                // timeline once it consumed enough of its inputs — the first one
+                                // is after the newest input already sent (nothing new is sent
+                                // before the prediction passes it). (A forward jump on late
+                                // inputs, after a stall, keeps the short gate and gets no hold:
+                                // there the clock is right and may undo it at once.)
+                                let first_new = conn.last_input_sent.map_or(to, |s| s.next().max(to));
+                                prediction.feedback_after = Some(Tick(first_new.0.saturating_add(SLACK_SETTLE_TICKS)));
+                                let hold = (net.config.ping_interval * 8).max(Duration::from_secs(2));
+                                prediction.clock_hold_until = Some(now + hold);
+                                prediction.missing_since_resync = false;
+                            }
+                        }
                     }
                 }
             }
             let next = prediction.next_tick.unwrap_or(next);
-            if (target - f64::from(next.0)).abs() > hard * 1.5 {
+            let held = prediction.clock_hold_until.is_some_and(|until| now < until) && !prediction.missing_since_resync;
+            if !held && (target - f64::from(next.0)).abs() > hard * 1.5 {
                 // The clock says we are far off (stall, clock jump): jump.
                 resync(prediction, Tick(target.round().max(1.0) as u32));
                 conn.pacer.reset();
+                prediction.clock_hold_until = None;
                 realigned = true;
             }
         }
@@ -284,7 +329,9 @@ fn resync(p: &mut PredictionState, to: Tick) {
     // Ticks skipped by a forward jump get the server's repeated input (they are "missing"
     // on the server, which the pacer answers with a speed-up, never another jump). The input
     // history is kept: the rebuild below replays the recorded ticks and repeats the last input
-    // over the skipped ones, exactly like the server, instead of snapping.
+    // over the skipped ones, exactly like the server, instead of snapping. After a backward
+    // jump the ticks up to the newest input already sent are predicted again with those sent
+    // inputs (the server has them; see `client_tick`).
     if p.next_tick == Some(to) {
         return;
     }
@@ -397,13 +444,27 @@ pub(crate) fn client_tick(ctx: &mut SystemCtx) {
             }
             None => tick,
         };
-        // Sample and simulate the next tick.
-        let value = match registry.input() {
-            Some(input) => {
+        // Sample and simulate the next tick. A tick predicted again after a backward resync
+        // whose input was already sent keeps that input: the server simulates it with the one
+        // it received, so a fresh sample (never sent) would only mispredict.
+        let resent = {
+            let net = res.expect::<NetClient>();
+            let sent = net.conn.as_ref().and_then(|c| c.last_input_sent);
+            match (registry.input(), net.prediction.inputs.at_or_before(tick)) {
+                (Some(input), Some((at, _, v))) if *at == tick && sent.is_some_and(|s| tick <= s) => {
+                    Some(input.ops.clone_value(v))
+                }
+                _ => None,
+            }
+        };
+        let reused = resent.is_some();
+        let value = match (resent, registry.input()) {
+            (Some(v), _) => Some(v),
+            (None, Some(input)) => {
                 let mut inner = SystemCtx { world, resources: res };
                 Some(input.ops.sample(&mut inner))
             }
-            None => None,
+            (None, None) => None,
         };
         if let Some(v) = &value {
             write_inputs(world, registry, v);
@@ -422,7 +483,7 @@ pub(crate) fn client_tick(ctx: &mut SystemCtx) {
         }
         let net = res.expect_mut::<NetClient>();
         record_history(world, registry, net, tick);
-        if let (Some(v), Some(input)) = (value, registry.input()) {
+        if let (Some(v), Some(input), false) = (value, registry.input(), reused) {
             let keep = usize::from(net.config.prediction.max_rollback_ticks) + 64;
             net.prediction.inputs.push(tick, input.ops.encode(&v), v, keep);
         }

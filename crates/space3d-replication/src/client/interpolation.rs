@@ -4,9 +4,12 @@
 //! `Interpolate`/`PredictAndInterpolate` component of a non-predicted entity, the client keeps
 //! a [`SnapshotBuffer<T>`] and writes `T::interpolate(a, b, frac)` for the bracketing samples.
 //! Past the last sample it holds (or extrapolates up to `max_extrapolation`), then freezes.
-//! Gap fix: when a sample arrives more than `send_interval` after the previous one (the entity
-//! was at rest and unchanged values were not sent), a copy of the previous value is inserted at
-//! `tick − send_interval` so the entity does not slide across the gap. Records the server's
+//! Gap fix: when a sample arrives more than `send_interval` after the previous one and a
+//! snapshot received in between did not carry the entity (it was at rest: unchanged values are
+//! not sent), a copy of the previous value is inserted at that snapshot's tick so the entity
+//! does not slide across the gap. A gap no received snapshot explains — lost datagrams,
+//! snapshots the sender skipped — says nothing about rest, so the entity interpolates across it
+//! (holding there made every lost snapshot step a moving entity back). Records the server's
 //! byte budget held back carry the `DEFERRED` op bit: that gap was motion, so no hold sample is
 //! inserted and the entity is drawn `lag` ticks further in the past (its observed update gap),
 //! which keeps it between two samples instead of freezing and jumping.
@@ -103,18 +106,24 @@ impl<T: Clone> SnapshotBuffer<T> {
     /// Maximum samples kept.
     pub const CAPACITY: usize = 32;
 
-    /// Insert a sample (ignores duplicates / out-of-order older than the oldest kept).
-    /// A sample arriving more than `send_interval` ticks after the newest one gets a copy of
-    /// the newest value inserted at `tick − send_interval` first (rest → move gap fix).
+    /// Insert a sample (ignores duplicates / out-of-order older than the oldest kept), every
+    /// snapshot received (`send_interval` apart). A sample arriving more than `send_interval`
+    /// ticks after the newest one gets a copy of the newest value inserted at
+    /// `tick − send_interval` first (rest → move gap fix).
     pub fn push(&mut self, tick: Tick, value: T, send_interval: u8) {
-        self.push_sample(tick, value, send_interval, false);
+        let before = Tick(tick.0.saturating_sub(u32::from(send_interval.max(1))));
+        self.push_sample(tick, value, send_interval, false, before);
     }
 
-    /// Like [`Self::push`]. `deferred` (the record's `DEFERRED` op bit): the server's budget
-    /// held the entity's changes back, so the gap since the newest sample was motion, not rest:
-    /// no hold sample is inserted, and the entity's render [`Self::lag`] grows to cover such
-    /// gaps (it shrinks again, slowly, once updates arrive at the nominal rate).
-    pub fn push_sample(&mut self, tick: Tick, value: T, send_interval: u8, deferred: bool) {
+    /// Like [`Self::push`]. `received_before`: the newest other snapshot the client received
+    /// before this one. Only when it lies inside the gap since the newest sample did the
+    /// entity provably rest (that snapshot did not carry it): the newest value is held until
+    /// `received_before`. Otherwise the snapshots in between were lost or skipped and the entity
+    /// interpolates across the gap. `deferred` (the record's `DEFERRED` op bit): the server's
+    /// budget held the entity's changes back, so the gap was motion, not rest: no hold sample is
+    /// inserted, and the entity's render [`Self::lag`] grows to cover such gaps (it shrinks
+    /// again, slowly, once updates arrive at the nominal rate).
+    pub fn push_sample(&mut self, tick: Tick, value: T, send_interval: u8, deferred: bool, received_before: Tick) {
         let interval = u32::from(send_interval.max(1));
         match self.samples.back() {
             None => self.samples.push_back((tick, value)),
@@ -124,8 +133,8 @@ impl<T: Clone> SnapshotBuffer<T> {
                     let behind = f64::from(gap.saturating_sub(interval));
                     self.lag = behind.max(self.lag * 0.95);
                 } else {
-                    if gap > interval {
-                        let hold = (Tick(tick.0 - interval), newest_value.clone());
+                    if gap > interval && received_before > *newest && received_before < tick {
+                        let hold = (received_before, newest_value.clone());
                         self.samples.push_back(hold);
                     }
                     self.lag = (self.lag - 0.5).max(0.0);
@@ -280,20 +289,47 @@ mod tests {
         assert_eq!(b.sample(39.0, lerp, 6.0), Some(2.0));
     }
 
+    /// Regression: on a datagram link a lost snapshot leaves the same gap as rest, and the gap
+    /// fix held the previous value there: every lost snapshot stepped a moving remote entity
+    /// back. A hold is only inserted when a snapshot received inside the gap did not carry the
+    /// entity.
+    #[test]
+    fn a_lost_snapshot_is_not_taken_for_rest() {
+        let mut b = SnapshotBuffer::default();
+        // A mover at 1 unit/tick, snapshots every 2 ticks; the one for tick 14 is lost.
+        b.push_sample(Tick(10), 10.0f32, 2, false, Tick(8));
+        b.push_sample(Tick(12), 12.0, 2, false, Tick(10));
+        b.push_sample(Tick(16), 16.0, 2, false, Tick(12));
+        assert_eq!(b.len(), 3, "no hold sample");
+        assert_eq!(b.sample(13.0, lerp, 0.0), Some(13.0));
+        assert_eq!(
+            b.sample(14.5, lerp, 0.0),
+            Some(14.5),
+            "keeps moving across the lost snapshot"
+        );
+        // At rest: the snapshots for 18 .. 24 arrived without it, then it moves again.
+        b.push_sample(Tick(26), 20.0, 2, false, Tick(24));
+        assert_eq!(b.sample(24.0, lerp, 0.0), Some(16.0), "held while observed at rest");
+        assert_eq!(b.sample(25.0, lerp, 0.0), Some(18.0));
+        // No snapshot known to have arrived inside the gap (an older, reordered one): no hold.
+        b.push_sample(Tick(32), 26.0, 2, false, Tick(32));
+        assert_eq!(b.sample(29.0, lerp, 0.0), Some(23.0));
+    }
+
     #[test]
     fn deferred_updates_interpolate_across_the_gap_with_a_lag() {
         let mut b = SnapshotBuffer::default();
         // A mover at 1 unit/tick updated every 10 ticks because the budget defers it.
-        b.push_sample(Tick(10), 10.0f32, 2, false);
-        b.push_sample(Tick(20), 20.0, 2, true);
+        b.push_sample(Tick(10), 10.0f32, 2, false, Tick(8));
+        b.push_sample(Tick(20), 20.0, 2, true, Tick(18));
         assert_eq!(b.len(), 2, "no hold sample for a deferred gap");
         assert_eq!(b.lag(), 8.0);
         assert_eq!(b.sample(15.0, lerp, 0.0), Some(15.0), "moves across the gap");
-        b.push_sample(Tick(30), 30.0, 2, true);
+        b.push_sample(Tick(30), 30.0, 2, true, Tick(28));
         assert!(b.lag() >= 8.0);
         // Back to the nominal rate: the lag decays.
         for t in 0..40 {
-            b.push_sample(Tick(32 + t * 2), 32.0 + t as f32 * 2.0, 2, false);
+            b.push_sample(Tick(32 + t * 2), 32.0 + t as f32 * 2.0, 2, false, Tick(30 + t * 2));
         }
         assert_eq!(b.lag(), 0.0);
         b.clear();

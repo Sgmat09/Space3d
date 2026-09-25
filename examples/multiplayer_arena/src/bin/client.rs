@@ -315,7 +315,7 @@ fn exit_when_done(options: &Options, code: Arc<AtomicU8>) -> impl FnMut(&mut Sys
         let connected = net.is_connected();
         println!(
             "multiplayer_arena client: frames={} state={:?} cubes={} rtt_ms={:.1} down_bytes_per_sec={} \
-             up_bytes_per_sec={} rollbacks={} input_late={}",
+             up_bytes_per_sec={} rollbacks={} resim_ticks={}",
             time.frame,
             net.state(),
             cube_count(ctx.world),
@@ -323,7 +323,7 @@ fn exit_when_done(options: &Options, code: Arc<AtomicU8>) -> impl FnMut(&mut Sys
             s.bytes_in_per_sec,
             s.bytes_out_per_sec,
             s.rollbacks,
-            s.input_late,
+            s.resim_ticks,
         );
         code.store(u8::from(bot && !connected), Ordering::Release);
         if limit {

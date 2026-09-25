@@ -7,8 +7,8 @@
 //! TTL (released when the players show up in presence or the reservation expires).
 
 use crate::game::RoomSpec;
-use crate::gs::fleet::{FleetDown, FleetUp, Heartbeat, ServerRegistration};
-use crate::gs::rooms::RoomStatus;
+use crate::gs::fleet::{FleetDown, FleetUp, Heartbeat, OpOrigin, ServerRegistration};
+use crate::gs::rooms::{RoomOrigin, RoomStatus};
 use space3d_replication::{PlayerId, RoomId};
 use std::collections::BTreeMap;
 
@@ -164,6 +164,34 @@ struct Reservation {
     holder: Option<PlayerId>,
 }
 
+/// A room that moved to another server (rejoin → restore): its live copy there, and the point
+/// it was restored from. Outbox ops of any other copy (one left running behind a fleet
+/// partition, or replayed by a lost server that came back) made after that point are not part
+/// of the live copy's history and are dropped (acked, not applied). Kept after the room entry is
+/// gone (a stale outbox may replay much later), for [`FENCE_TTL_MS`].
+#[derive(Clone, Debug, PartialEq)]
+struct Fence {
+    live: String,
+    /// Reported by the live copy's status; `Unknown` until then (ops of other copies wait).
+    origin: RoomOrigin,
+    since_ms: i64,
+}
+
+/// How long the player service keeps a moved room's fence (the point its live copy was
+/// restored from; ops of other copies made after it are dropped).
+pub const FENCE_TTL_MS: i64 = 24 * 3_600_000;
+
+/// What to do with an outbox op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpVerdict {
+    Apply,
+    /// From a stale copy, after the point the live copy was restored from: ack, don't apply.
+    Stale,
+    /// The live copy has not reported its restore point yet: neither apply nor ack (the
+    /// outbox sends it again).
+    Hold,
+}
+
 /// Tick budget used in the load score (60 Hz).
 const TICK_BUDGET_US: f64 = 16_667.0;
 /// Rooms allocated but never reported are forgotten after this.
@@ -174,6 +202,7 @@ const PENDING_ROOM_TTL_MS: i64 = 120_000;
 pub struct FleetRegistry {
     servers: BTreeMap<String, ServerRecord>,
     rooms: BTreeMap<RoomId, RoomEntry>,
+    fences: BTreeMap<RoomId, Fence>,
     presence: BTreeMap<PlayerId, RoomId>,
     reservations: Vec<Reservation>,
     lease_ttl_ms: i64,
@@ -193,6 +222,7 @@ impl FleetRegistry {
         Self {
             servers: BTreeMap::new(),
             rooms: BTreeMap::new(),
+            fences: BTreeMap::new(),
             presence: BTreeMap::new(),
             reservations: Vec::new(),
             lease_ttl_ms,
@@ -289,6 +319,12 @@ impl FleetRegistry {
                 for status in &hb.rooms {
                     if self.moved_away(status.room_id, server_id) {
                         continue;
+                    }
+                    if let Some(f) = self.fences.get_mut(&status.room_id)
+                        && f.live == server_id
+                        && f.origin == RoomOrigin::Unknown
+                    {
+                        f.origin = status.origin;
                     }
                     let entry = self.rooms.entry(status.room_id).or_insert_with(|| RoomEntry {
                         server: server_id.to_owned(),
@@ -427,13 +463,46 @@ impl FleetRegistry {
                 }
                 Vec::new()
             }
-            op @ (FleetUp::MatchResult { .. }
-            | FleetUp::PlayerDataWrite { .. }
-            | FleetUp::SubmitScore { .. }
-            | FleetUp::FetchPlayerData { .. }) => vec![FleetEffect::Apply {
+            op @ (FleetUp::MatchResult { .. } | FleetUp::PlayerDataWrite { .. } | FleetUp::SubmitScore { .. }) => {
+                match op.origin().map_or(OpVerdict::Apply, |o| self.op_verdict(server_id, o)) {
+                    OpVerdict::Apply => vec![FleetEffect::Apply {
+                        server: server_id.to_owned(),
+                        op,
+                    }],
+                    OpVerdict::Stale => {
+                        let op_id = op.op_id().unwrap_or_default().to_owned();
+                        tracing::warn!(
+                            server = %server_id,
+                            %op_id,
+                            kind = op.kind(),
+                            "op from a stale room copy (made after the live copy's restore point); dropped"
+                        );
+                        vec![FleetEffect::Send {
+                            server: server_id.to_owned(),
+                            msg: FleetDown::Ack { op_id },
+                        }]
+                    }
+                    OpVerdict::Hold => Vec::new(),
+                }
+            }
+            op @ FleetUp::FetchPlayerData { .. } => vec![FleetEffect::Apply {
                 server: server_id.to_owned(),
                 op,
             }],
+        }
+    }
+
+    /// Whether an outbox op of `server_id` is part of its room's live history (see [`Fence`]).
+    fn op_verdict(&self, server_id: &str, origin: OpOrigin) -> OpVerdict {
+        let Some(fence) = self.fences.get(&origin.room_id).filter(|f| f.live != server_id) else {
+            return OpVerdict::Apply;
+        };
+        match fence.origin {
+            RoomOrigin::Unknown => OpVerdict::Hold,
+            // The live copy started from nothing: none of this copy's later history is in it.
+            RoomOrigin::Fresh => OpVerdict::Stale,
+            RoomOrigin::Restored(point) if origin.at > point => OpVerdict::Stale,
+            RoomOrigin::Restored(_) => OpVerdict::Apply,
         }
     }
 
@@ -478,6 +547,10 @@ impl FleetRegistry {
 
     fn forget_room(&mut self, id: RoomId) {
         self.rooms.remove(&id);
+        // Moved, but its new copy never reported a restore point (never built, build failed):
+        // there is no live history to fence other copies' ops against.
+        self.fences
+            .retain(|room, f| *room != id || f.origin != RoomOrigin::Unknown);
         self.presence.retain(|_, r| *r != id);
         self.reservations.retain(|r| r.room != Some(id));
         self.recount_reserved();
@@ -533,6 +606,8 @@ impl FleetRegistry {
         if before != self.reservations.len() {
             self.recount_reserved();
         }
+        self.fences
+            .retain(|_, f| now_ms.saturating_sub(f.since_ms) <= FENCE_TTL_MS);
         // Dead servers are forgotten once their rooms are gone.
         let rooms = &self.rooms;
         self.servers
@@ -736,6 +811,8 @@ impl FleetRegistry {
     }
 
     /// Move an orphaned room to a new server (rejoin → restore); the caller issues tickets.
+    /// From now on the copy on `server` is the live one: ops of other copies made after the
+    /// point it restores from are dropped (the room's fence, kept for [`FENCE_TTL_MS`]).
     pub fn reassign(&mut self, room: RoomId, server: &str, now_ms: i64) {
         if let Some(e) = self.rooms.get_mut(&room) {
             e.server = server.to_owned();
@@ -743,6 +820,14 @@ impl FleetRegistry {
             e.moving = false;
             e.status = None;
             e.since_ms = now_ms;
+            self.fences.insert(
+                room,
+                Fence {
+                    live: server.to_owned(),
+                    origin: RoomOrigin::Unknown,
+                    since_ms: now_ms,
+                },
+            );
         }
     }
 
@@ -1091,6 +1176,100 @@ mod tests {
         );
     }
 
+    /// Regression: after a fleet partition, the stale copy's match result, scores and player
+    /// data were replayed from its outbox when the link healed and applied next to the live
+    /// copy's (Elo applied twice with opposite winners, stale progress overwriting newer).
+    /// Ops a copy made after the point the live copy restored from are now dropped (acked).
+    #[test]
+    fn ops_of_a_stale_copy_after_the_restore_point_are_dropped() {
+        use crate::gs::fleet::OpOrigin;
+        use crate::gs::rooms::RoomTick;
+        let at = |epoch: u32, tick: u32| RoomTick { epoch, tick };
+        let score = |op: &str, origin: Option<OpOrigin>| FleetUp::SubmitScore {
+            op_id: op.into(),
+            board: "wins".into(),
+            player: PlayerId(10),
+            score: 1,
+            origin,
+        };
+        let from = |epoch: u32, tick: u32| {
+            Some(OpOrigin {
+                room_id: RoomId(1),
+                at: at(epoch, tick),
+            })
+        };
+        let applied = |effects: &[FleetEffect]| matches!(effects, [FleetEffect::Apply { .. }]);
+        let acked_only = |effects: &[FleetEffect], op: &str| matches!(effects, [FleetEffect::Send { msg: FleetDown::Ack { op_id }, .. }] if op_id == op);
+        let status = |origin: RoomOrigin| RoomStatus {
+            room_id: RoomId(1),
+            mode: "duel".into(),
+            players: 1,
+            max_players: 2,
+            player_ids: vec![PlayerId(20)],
+            origin,
+            ..Default::default()
+        };
+        let mut f = FleetRegistry::new(10_000, 300_000);
+        f.on_message("gs-1", reg("gs-1", "eu", 100), 0);
+        f.on_message("gs-2", reg("gs-2", "eu", 100), 0);
+        f.note_room(&spec(1, "duel", 2), "gs-1", 0);
+        f.on_message("gs-1", hb(2, vec![status(RoomOrigin::Fresh)]), 1_000);
+        // Not moved: everything applies.
+        assert!(applied(&f.on_message("gs-1", score("a", from(1, 500)), 1_100)));
+        f.on_message("gs-2", hb(0, vec![]), 11_500);
+        f.sweep(11_500, 10_000);
+        f.reassign(RoomId(1), "gs-2", 12_000);
+        // The live copy has not reported its restore point yet: the stale copy's ops wait.
+        assert_eq!(f.on_message("gs-1", score("b", from(1, 900)), 12_100), Vec::new());
+        f.on_message("gs-2", hb(1, vec![status(RoomOrigin::Restored(at(1, 700)))]), 13_000);
+        // Made before the restore point: part of the live history. After: dropped, acked.
+        assert!(applied(&f.on_message("gs-1", score("c", from(1, 650)), 13_100)));
+        assert!(applied(&f.on_message("gs-1", score("d", from(1, 700)), 13_100)));
+        assert!(acked_only(&f.on_message("gs-1", score("b", from(1, 900)), 13_200), "b"));
+        // The live copy's own ops, and ops without an origin (older servers), apply.
+        assert!(applied(&f.on_message("gs-2", score("e", from(2, 710)), 13_300)));
+        assert!(applied(&f.on_message("gs-1", score("f", None), 13_300)));
+        // The fence outlives the room entry (a stale outbox may replay much later).
+        f.on_message(
+            "gs-2",
+            FleetUp::RoomClosed {
+                room_id: RoomId(1),
+                reason: "done".into(),
+                restorable: false,
+            },
+            14_000,
+        );
+        assert!(f.room(RoomId(1)).is_none());
+        assert!(acked_only(&f.on_message("gs-1", score("g", from(1, 800)), 15_000), "g"));
+        f.sweep(14_000 + FENCE_TTL_MS + 1, 10_000);
+        assert!(applied(&f.on_message(
+            "gs-1",
+            score("h", from(1, 800)),
+            14_000 + FENCE_TTL_MS + 2
+        )));
+        // A move whose target never built the room fences nothing.
+        f.note_room(&spec(3, "duel", 2), "gs-1", 20_000);
+        f.reassign(RoomId(3), "gs-2", 20_000);
+        let late = |op: &str| FleetUp::SubmitScore {
+            op_id: op.into(),
+            board: "wins".into(),
+            player: PlayerId(10),
+            score: 1,
+            origin: Some(OpOrigin {
+                room_id: RoomId(3),
+                at: at(1, 5),
+            }),
+        };
+        assert_eq!(f.on_message("gs-1", late("i"), 20_100), Vec::new(), "held");
+        f.sweep(20_000 + PENDING_ROOM_TTL_MS + 1, i64::MAX);
+        assert!(f.room(RoomId(3)).is_none());
+        assert!(applied(&f.on_message(
+            "gs-1",
+            late("i"),
+            20_000 + PENDING_ROOM_TTL_MS + 2
+        )));
+    }
+
     #[test]
     fn a_frozen_room_is_moving_until_its_checkpoint_is_stored() {
         let mut f = FleetRegistry::new(10_000, 300_000);
@@ -1207,6 +1386,7 @@ mod tests {
                 board: "b".into(),
                 player: PlayerId(1),
                 score: 1,
+                origin: None,
             },
             22,
         );

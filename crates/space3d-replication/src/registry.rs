@@ -486,7 +486,8 @@ pub(crate) trait ComponentOps: Send + Sync + 'static {
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
     fn differs(&self, a: &[u8], b: &[u8], ctx: &mut DecodeCtx<'_>) -> bool;
     /// Buffer an interpolation sample. `deferred`: the server's budget held this entity back
-    /// (the gap since the previous sample is not rest; see `SnapshotBuffer::push_sample`).
+    /// (the gap since the previous sample is not rest); `received_before`: the newest other
+    /// snapshot the client received before this one (see `SnapshotBuffer::push_sample`).
     #[cfg(feature = "client")]
     #[allow(clippy::too_many_arguments)]
     fn push_sample(
@@ -498,6 +499,7 @@ pub(crate) trait ComponentOps: Send + Sync + 'static {
         ctx: &mut DecodeCtx<'_>,
         send_interval: u8,
         deferred: bool,
+        received_before: Tick,
     ) -> Result<(), DecodeError>;
     #[cfg(feature = "client")]
     /// Write interpolated values at `render_tick`. Extrapolation past the newest sample (at most
@@ -627,14 +629,15 @@ impl<T: Component + Clone> ComponentOps for TypedComponent<T> {
         ctx: &mut DecodeCtx<'_>,
         send_interval: u8,
         deferred: bool,
+        received_before: Tick,
     ) -> Result<(), DecodeError> {
         let v = self.decode(bytes, ctx)?;
         if let Ok(mut buf) = world.get::<&mut InterpBuffer<T>>(e) {
-            buf.0.push_sample(tick, v, send_interval, deferred);
+            buf.0.push_sample(tick, v, send_interval, deferred, received_before);
             return Ok(());
         }
         let mut buf = crate::client::interpolation::SnapshotBuffer::default();
-        buf.push_sample(tick, v.clone(), send_interval, deferred);
+        buf.push_sample(tick, v.clone(), send_interval, deferred, received_before);
         let has_value = world.satisfies::<&T>(e);
         let res = if has_value {
             world.insert_one(e, InterpBuffer(buf))

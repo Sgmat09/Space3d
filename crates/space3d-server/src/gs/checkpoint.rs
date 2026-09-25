@@ -170,9 +170,63 @@ pub trait CheckpointStore: Send + Sync + 'static {
     fn recent(&self, min_saved_ms: i64) -> Task<Result<Vec<RoomId>, StoreError>>;
     /// Delete (room closed normally).
     fn delete(&self, room: RoomId) -> Task<Result<(), StoreError>>;
+    /// Delete every checkpoint captured before `before_ms` and return how many went. Such
+    /// checkpoints can no longer be restored (older than `recovery_max_age`); this garbage
+    /// collects rooms that ended without a normal close (crash loops, orphans nobody rejoined,
+    /// abandoned or handed-off rooms). Stores pruned by another process (the player service
+    /// prunes what [`RemoteCheckpoints`] uploads) do nothing.
+    fn prune(&self, before_ms: i64) -> Task<Result<u64, StoreError>> {
+        let _ = before_ms;
+        ready(Ok(0))
+    }
     /// `false` for [`NoCheckpoints`]: rooms skip capture entirely.
     fn enabled(&self) -> bool {
         true
+    }
+}
+
+/// Checkpoints are garbage-collected ([`CheckpointStore::prune`]) this often.
+pub const CHECKPOINT_GC_EVERY_MS: i64 = 60_000;
+/// Extra age beyond `recovery_max_age` before a checkpoint is pruned (clock skew between the
+/// server that captured it and the one pruning).
+pub const CHECKPOINT_GC_GRACE_MS: i64 = 60_000;
+
+/// Periodic checkpoint garbage collection (supervisors poll it every tick; never blocks).
+#[derive(Default)]
+pub struct CheckpointGc {
+    next_ms: Option<i64>,
+    running: Vec<Task<Result<u64, StoreError>>>,
+}
+
+impl CheckpointGc {
+    /// Poll finished prunes; every [`CHECKPOINT_GC_EVERY_MS`] start `prune(cutoff)` on each of
+    /// `stores` (`start` builds the tasks), where `cutoff = now − max_age − grace`.
+    pub fn tick(
+        &mut self,
+        now_ms: i64,
+        max_age: std::time::Duration,
+        start: impl FnOnce(i64) -> Vec<Task<Result<u64, StoreError>>>,
+    ) {
+        self.running.retain_mut(|t| match t.state() {
+            space3d_tasks::TaskState::Pending => true,
+            space3d_tasks::TaskState::Ready => {
+                match t.poll() {
+                    Some(Ok(n)) if n > 0 => tracing::info!(pruned = n, "expired room checkpoints deleted"),
+                    Some(Err(e)) => tracing::warn!(error = %e, "checkpoint garbage collection failed"),
+                    _ => {}
+                }
+                false
+            }
+            space3d_tasks::TaskState::Cancelled => false,
+        });
+        let next = *self.next_ms.get_or_insert(now_ms);
+        if now_ms < next || !self.running.is_empty() {
+            return;
+        }
+        self.next_ms = Some(now_ms + CHECKPOINT_GC_EVERY_MS);
+        let max_age = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+        let cutoff = now_ms.saturating_sub(max_age).saturating_sub(CHECKPOINT_GC_GRACE_MS);
+        self.running = start(cutoff);
     }
 }
 
@@ -286,6 +340,19 @@ impl CheckpointStore for LocalCheckpoints {
                 .execute("DELETE FROM gs_checkpoints WHERE room_id = ?1", (room.0 as i64,)),
         )
         .map_unit()
+    }
+
+    fn prune(&self, before_ms: i64) -> Task<Result<u64, StoreError>> {
+        let deleted = flatten(
+            self.db
+                .execute("DELETE FROM gs_checkpoints WHERE saved_ms < ?1", (before_ms,)),
+        );
+        space3d_tasks::spawn(async move {
+            match deleted.wait().await {
+                Some(r) => r.map(|n| n as u64),
+                None => Err(StoreError("worker gone".into())),
+            }
+        })
     }
 }
 
@@ -427,6 +494,10 @@ impl CheckpointStore for PlayerServiceCheckpoints {
     fn delete(&self, room: RoomId) -> Task<Result<(), StoreError>> {
         flatten(self.store.delete_checkpoint(room))
     }
+
+    fn prune(&self, before_ms: i64) -> Task<Result<u64, StoreError>> {
+        flatten(self.store.prune_checkpoints(before_ms))
+    }
 }
 
 /// In-memory (tests).
@@ -466,6 +537,13 @@ impl CheckpointStore for MemoryCheckpoints {
     fn delete(&self, room: RoomId) -> Task<Result<(), StoreError>> {
         self.map.lock().remove(&room);
         ready(Ok(()))
+    }
+
+    fn prune(&self, before_ms: i64) -> Task<Result<u64, StoreError>> {
+        let mut map = self.map.lock();
+        let before = map.len();
+        map.retain(|_, (key, _)| key.saved_ms >= before_ms);
+        ready(Ok((before - map.len()) as u64))
     }
 }
 
@@ -624,6 +702,14 @@ mod tests {
         assert!(b(store.put(RoomId(6), sample(5, 5_000).to_bytes())).is_err());
         b(store.delete(RoomId(5))).unwrap();
         assert_eq!(b(store.get(RoomId(5))).unwrap(), None);
+        // Garbage collection deletes exactly the checkpoints captured before the cutoff.
+        b(store.put(RoomId(7), sample(7, 1_000).to_bytes())).unwrap();
+        b(store.put(RoomId(8), sample(8, 3_000).to_bytes())).unwrap();
+        assert_eq!(b(store.prune(2_000)).unwrap(), 1);
+        assert_eq!(b(store.get(RoomId(7))).unwrap(), None);
+        assert_eq!(stored_key(store, 8), Some(key(2, 3_000)));
+        assert_eq!(b(store.prune(2_000)).unwrap(), 0);
+        b(store.delete(RoomId(8))).unwrap();
     }
 
     #[test]

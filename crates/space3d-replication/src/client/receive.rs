@@ -400,6 +400,13 @@ fn apply_snapshot(
     let prediction_on = net.config.prediction.enabled;
     let prediction_running = net.prediction.next_tick.is_some();
     let send_interval = conn.welcome.as_ref().map_or(1, |w| w.send_interval);
+    // The newest other snapshot that arrived before this one (another part of the same tick
+    // counts as this one; an older, reordered snapshot knows nothing about the gap).
+    let received_before = match tick.cmp(&net.last_snapshot_tick) {
+        std::cmp::Ordering::Greater => net.last_snapshot_tick,
+        std::cmp::Ordering::Equal => net.prev_snapshot_tick,
+        std::cmp::Ordering::Less => Tick::ZERO,
+    };
     for rec in &view.entities {
         let existing = net.map.entity(rec.net_id);
         let entity = match existing {
@@ -514,6 +521,7 @@ fn apply_snapshot(
                         &mut ctx,
                         send_interval,
                         rec.op & op::DEFERRED != 0,
+                        received_before,
                     ),
                     ClientMode::Delayed => entry.ops.push_delayed(world, entity, tick, bytes, &mut ctx),
                 }
@@ -543,6 +551,7 @@ fn apply_snapshot(
         despawn_remote(net, d.net_id, e, d.out_of_scope, tick);
     }
     if tick > net.last_snapshot_tick {
+        net.prev_snapshot_tick = net.last_snapshot_tick;
         net.last_snapshot_tick = tick;
         // Reordering spans well under a second; keep tombstones for TOMBSTONE_SECS.
         let keep = (net.prediction.nominal_hz.max(1.0) * TOMBSTONE_SECS) as u32;

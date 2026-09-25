@@ -16,9 +16,9 @@
 //! [`run_tick`]); serialization and upload run off the room thread.
 
 use super::checkpoint::{Checkpoint, StoreError};
-use super::rooms::{RoomCommand, RoomDetail, RoomEnv, RoomError, RoomPhase, RoomStatus};
+use super::rooms::{RoomCommand, RoomDetail, RoomEnv, RoomError, RoomOrigin, RoomPhase, RoomStatus, RoomTick};
 use crate::game::RoomSpec;
-use crate::gs::fleet::{DataWrite, FleetUp};
+use crate::gs::fleet::{DataWrite, FleetUp, OpOrigin};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use space3d_core::{App, EventReader, Events, Stage, SystemCtx};
@@ -120,6 +120,10 @@ pub fn build_room_app(build: RoomBuild) -> Result<App, RoomError> {
         }
         if let Some(rt) = app.resources.get_mut::<RoomRuntime>() {
             rt.last_checkpoint = Some(cp.clone());
+            rt.origin = RoomOrigin::Restored(RoomTick {
+                epoch: cp.state.epoch,
+                tick: cp.state.tick.0,
+            });
         }
         tracing::info!(room = %spec.room_id, tick = cp.state.tick.0, epoch = room_epoch, "room restored from checkpoint");
     }
@@ -169,9 +173,14 @@ pub fn after_tick(app: &mut App) {
         .checkpoint_registry()
         .and_then(|registry| space3d_scene::save_world(&app.world, &registry).ok())
         .and_then(|scene| scene.to_json().ok());
-    let cp = Checkpoint::new(rt.spec.clone(), state, server_only, None, rt.env.unix.now_ms());
+    let saved_ms = rt.next_capture_ms();
+    let cp = Checkpoint::new(rt.spec.clone(), state, server_only, None, saved_ms);
     rt.env.metrics.checkpoint_seconds.observe_duration(started.elapsed());
     let rt = app.resources.expect_mut::<RoomRuntime>();
+    if let Handoff::Frozen { capture: freeze @ None } = &mut rt.handoff {
+        // The first capture after the freeze is the one the handoff carries over.
+        *freeze = Some(saved_ms);
+    }
     rt.last_checkpoint = Some(cp.clone());
     rt.start_upload(cp);
 }
@@ -194,6 +203,12 @@ fn emergency_checkpoint(app: &mut App) -> Option<Task<Result<(), StoreError>>> {
         return None;
     }
     let store = rt.env.rescue.clone()?;
+    if let Some(cp) = rt.freeze_capture() {
+        // Frozen for a handoff: the freeze capture holds everything the players saw (a new
+        // capture could miss their pawns, removed when they left).
+        tracing::warn!(room = %cp.room_id, tick = cp.state.tick.0, "forced stop: handoff checkpoint kept locally");
+        return Some(store.put(cp.room_id, cp.to_bytes()));
+    }
     let state = match full_state::capture(app) {
         Ok(s) => s,
         Err(e) => {
@@ -208,8 +223,29 @@ fn emergency_checkpoint(app: &mut App) -> Option<Task<Result<(), StoreError>>> {
         .checkpoint_registry()
         .and_then(|registry| space3d_scene::save_world(&app.world, &registry).ok())
         .and_then(|scene| scene.to_json().ok());
-    let cp = Checkpoint::new(rt.spec.clone(), state, server_only, None, rt.env.unix.now_ms());
+    let cp = Checkpoint::new(rt.spec.clone(), state, server_only, None, rt.next_capture_ms());
     tracing::warn!(room = %cp.room_id, tick = cp.state.tick.0, "forced stop: room checkpointed locally");
+    Some(store.put(cp.room_id, cp.to_bytes()))
+}
+
+/// Graceful stop (the shard removes a room that is still hosted when the process stops): a
+/// room frozen for a handoff whose freeze capture never reached the checkpoint store (store
+/// slow or unreachable for the whole stop window) writes that capture to the local rescue
+/// store, which the next start uploads (`gs::checkpoint::upload_rescued`), instead of dropping
+/// it. Returns the pending write (the caller waits for it, bounded), `None` when there is
+/// nothing to keep.
+pub fn stop_hosted(app: &mut App) -> Option<Task<Result<(), StoreError>>> {
+    let rt = app.resources.get::<RoomRuntime>()?;
+    if !rt.handoff_pending() {
+        return None;
+    }
+    let store = rt.env.rescue.clone()?;
+    let cp = rt.freeze_capture()?;
+    tracing::error!(
+        room = %cp.room_id,
+        tick = cp.state.tick.0,
+        "handoff incomplete at stop: the checkpoint store never confirmed the freeze capture; kept in the local rescue store"
+    );
     Some(store.put(cp.room_id, cp.to_bytes()))
 }
 
@@ -371,11 +407,14 @@ enum Handoff {
     None,
     /// Drain received: freeze at the end of this tick ([`freeze_for_handoff`]).
     Freeze,
-    /// Frozen at `at_ms` (clients gone, final capture taken): close once a checkpoint captured
-    /// at or after it is stored.
+    /// Frozen (clients gone): the capture taken right after the freeze tick is the room's
+    /// final state; the room closes once exactly that capture is stored.
     Frozen {
-        /// Freeze time (unix ms).
-        at_ms: i64,
+        /// Capture time (`saved_ms`) of the freeze capture; `None` until it is taken. Capture
+        /// times of a room strictly increase ([`RoomRuntime::next_capture_ms`]), so a stored
+        /// capture time at or past it can only be the freeze capture itself — an earlier
+        /// capture taken in the same unix millisecond (catch-up ticks) never counts.
+        capture: Option<i64>,
     },
 }
 
@@ -394,6 +433,41 @@ enum Closing {
     Superseded,
 }
 
+/// A checkpoint upload in flight.
+pub type Upload = Task<Result<(), StoreError>>;
+
+/// Delete `room`'s stored checkpoint once `upload` (an upload already in flight) settled — a
+/// later landing would resurrect the row.
+pub fn delete_checkpoint_after(env: &RoomEnv, room: RoomId, upload: Option<Upload>) {
+    if !env.checkpoints.enabled() {
+        return;
+    }
+    let store = env.checkpoints.clone();
+    drop(space3d_tasks::spawn(async move {
+        if let Some(upload) = upload {
+            let _ = upload.wait().await;
+        }
+        if let Some(Err(e)) = store.delete(room).wait().await {
+            tracing::warn!(%room, error = %e, "checkpoint delete failed");
+        }
+    }));
+}
+
+/// The room is closed for good outside a normal close (crash loop): stop its uploads and
+/// delete its stored checkpoint (after an upload in flight settled). Otherwise the row stays
+/// until garbage collection, and a join ticket that is still valid recreates the crash-looping
+/// room from it.
+pub fn discard_checkpoint(app: &mut App) {
+    let Some(rt) = app.resources.get_mut::<RoomRuntime>() else {
+        return;
+    };
+    rt.retired.store(true, Ordering::Release);
+    rt.want_checkpoint = false;
+    rt.queued_upload = None;
+    let upload = rt.upload.take();
+    delete_checkpoint_after(&rt.env, rt.spec.room_id, upload);
+}
+
 /// Resource: the room's operational state (internal; inserted by [`build_room_app`]).
 pub struct RoomRuntime {
     env: RoomEnv,
@@ -402,13 +476,15 @@ pub struct RoomRuntime {
     status: Arc<Mutex<RoomStatus>>,
     created_ms: i64,
     epoch: u32,
+    /// How this copy started (reported in the status: the player service fences stale copies).
+    origin: RoomOrigin,
     nonce: u64,
     op_counter: u64,
     phase: RoomPhase,
     closing: Option<Closing>,
     want_checkpoint: bool,
     last_checkpoint: Option<Checkpoint>,
-    upload: Option<Task<Result<(), StoreError>>>,
+    upload: Option<Upload>,
     queued_upload: Option<Checkpoint>,
     /// Set when this runtime is dropped (room removed, crash rebuild, server killed): an
     /// upload that has not reached the store yet is abandoned.
@@ -455,6 +531,7 @@ impl RoomRuntime {
             status,
             created_ms,
             epoch,
+            origin: RoomOrigin::Fresh,
             nonce: u64::from_le_bytes(crate::security::random_bytes::<8>()),
             op_counter: 0,
             phase: RoomPhase::Waiting,
@@ -479,11 +556,17 @@ impl RoomRuntime {
         }
     }
 
-    /// Split for a crash rebuild: the command receiver and the latest in-memory checkpoint.
-    /// The old runtime's pending upload is abandoned (the rebuilt room, epoch + 1, uploads its
-    /// own; stores refuse older epochs anyway).
-    pub fn into_parts(mut self) -> (crossbeam_channel::Receiver<RoomCommand>, Option<Checkpoint>) {
-        (self.commands.clone(), self.last_checkpoint.take())
+    /// Split for a crash rebuild: the command receiver, the latest in-memory checkpoint and the
+    /// upload in flight (if any). A queued upload is abandoned (the rebuilt room, epoch + 1,
+    /// uploads its own; stores refuse older epochs anyway).
+    pub fn into_parts(
+        mut self,
+    ) -> (
+        crossbeam_channel::Receiver<RoomCommand>,
+        Option<Checkpoint>,
+        Option<Upload>,
+    ) {
+        (self.commands.clone(), self.last_checkpoint.take(), self.upload.take())
     }
 
     /// Current phase.
@@ -513,7 +596,28 @@ impl RoomRuntime {
 
     /// Frozen for a handoff and the freeze capture is not stored yet.
     fn handoff_pending(&self) -> bool {
-        matches!(self.handoff, Handoff::Frozen { at_ms } if self.uploaded_ms.is_none_or(|saved| saved < at_ms))
+        matches!(self.handoff, Handoff::Frozen { capture }
+            if capture.is_none_or(|at| self.uploaded_ms.is_none_or(|saved| saved < at)))
+    }
+
+    /// The freeze capture of a room frozen for a handoff (once taken).
+    fn freeze_capture(&self) -> Option<Checkpoint> {
+        let Handoff::Frozen { capture: Some(at) } = self.handoff else {
+            return None;
+        };
+        self.last_checkpoint.clone().filter(|cp| cp.saved_ms == at)
+    }
+
+    /// Capture time for a new checkpoint: the wall clock, but strictly after the previous
+    /// capture of this room. Catch-up ticks run back to back, so two captures can fall in the
+    /// same unix millisecond; they must still differ (the handoff tells its freeze capture
+    /// from an earlier one by capture time, and stores keep the greater key).
+    fn next_capture_ms(&self) -> i64 {
+        let now = self.env.unix.now_ms();
+        match &self.last_checkpoint {
+            Some(cp) => now.max(cp.saved_ms.saturating_add(1)),
+            None => now,
+        }
     }
 
     fn next_op_id(&mut self) -> String {
@@ -737,18 +841,21 @@ fn room_ops(ctx: &mut SystemCtx) {
             freeze_for_handoff(res, rt);
         }
         rt.poll_upload();
-        if let Handoff::Frozen { at_ms } = rt.handoff
+        if matches!(rt.handoff, Handoff::Frozen { .. })
             && rt.handoff_pending()
             && !rt.uploading()
             && !rt.want_checkpoint
         {
             // Retry the freeze capture itself (a new capture would miss the players' pawns
-            // once the game handled their departure).
+            // once the game handled their departure) — for as long as the process runs: the
+            // room is not reported restorable before that capture is stored.
             rt.handoff_retry_in = rt.handoff_retry_in.saturating_sub(1);
-            if rt.handoff_retry_in == 0
-                && let Some(cp) = rt.last_checkpoint.clone().filter(|cp| cp.saved_ms >= at_ms)
-            {
-                rt.start_upload(cp);
+            if rt.handoff_retry_in == 0 {
+                match rt.freeze_capture() {
+                    Some(cp) => rt.start_upload(cp),
+                    // The freeze capture itself failed: take it again.
+                    None => rt.want_checkpoint = true,
+                }
             }
         }
         if rt.closing.is_none() && matches!(rt.handoff, Handoff::Frozen { .. }) && !rt.handoff_pending() {
@@ -781,13 +888,28 @@ fn room_ops(ctx: &mut SystemCtx) {
 
 fn forward_requests(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     let requests = res.expect_mut::<RoomControl>().take();
+    if requests.is_empty() {
+        return;
+    }
+    // This tick's point in the room's history: a checkpoint captured after this tick includes
+    // whatever led to these requests.
+    let origin = Some(OpOrigin {
+        room_id: rt.spec.room_id,
+        at: RoomTick {
+            epoch: rt.epoch,
+            tick: res.expect::<NetServer>().tick().0,
+        },
+    });
     let mut retry = Vec::new();
     for req in requests {
         let pushed = match &req {
             RoomRequest::EndMatch(result) => {
+                // One result per match, whichever server reports it (a room restored elsewhere
+                // may end the same match again; the player service applies the first).
                 let msg = FleetUp::MatchResult {
-                    op_id: format!("{}:{}:match:{}", rt.env.server_id, result.room_id, result.match_id),
+                    op_id: format!("{}:match:{}", result.room_id, result.match_id),
                     result: result.clone(),
+                    origin,
                 };
                 let ok = rt.env.outbox.push(msg).is_ok();
                 if ok {
@@ -808,6 +930,7 @@ fn forward_requests(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
                             value: value.clone(),
                             expected_version: None,
                         }],
+                        origin,
                     })
                     .is_ok()
             }
@@ -820,6 +943,7 @@ fn forward_requests(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
                         board: board.clone(),
                         player: *player,
                         score: *score,
+                        origin,
                     })
                     .is_ok()
             }
@@ -874,9 +998,7 @@ fn freeze_for_handoff(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     });
     rt.want_checkpoint = true;
     rt.queued_upload = None;
-    rt.handoff = Handoff::Frozen {
-        at_ms: rt.env.unix.now_ms(),
-    };
+    rt.handoff = Handoff::Frozen { capture: None };
     tracing::info!(room = %rt.spec.room_id, "room frozen for a handoff; storing its final checkpoint");
 }
 
@@ -937,7 +1059,7 @@ fn enforce_bans(res: &mut space3d_core::Resources, rt: &mut RoomRuntime, arrived
     }
 }
 
-/// Ticks a shutting-down room waits for its final checkpoint upload.
+/// Seconds a shutting-down room waits for its final checkpoint upload.
 const SHUTDOWN_UPLOAD_WAIT_S: u32 = 15;
 
 fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
@@ -948,11 +1070,22 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     // restorable (players' rejoin restores it on another server).
     let (code, reason, keep_checkpoint) = match closing {
         Closing::Close(reason) => (DisconnectCode::RoomClosed, reason, false),
+        Closing::Shutdown { .. } if rt.handoff_pending() => {
+            // A frozen room closes only once its freeze capture is stored: reporting it
+            // restorable earlier would let a rejoin restore an older checkpoint (everything
+            // since lost). It keeps retrying until then; if the process stops first, the
+            // capture goes to the local rescue store ([`stop_hosted`]) and the room counts as
+            // lost with its server.
+            return;
+        }
         Closing::Shutdown { waited } => {
-            let busy = rt.want_checkpoint || rt.uploading() || rt.handoff_pending();
+            let busy = rt.want_checkpoint || rt.uploading();
             if busy && waited < SHUTDOWN_UPLOAD_WAIT_S * rt.ticks_per_second {
                 rt.closing = Some(Closing::Shutdown { waited: waited + 1 });
                 return;
+            }
+            if busy {
+                rescue_unstored(rt);
             }
             (DisconnectCode::ServerShutdown, "server shutting down".to_owned(), true)
         }
@@ -967,16 +1100,7 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
         // Delete after the in-flight upload settles (a later upload would resurrect the row).
         rt.queued_upload = None;
         let upload = rt.upload.take();
-        let delete_store = rt.env.checkpoints.clone();
-        let room = rt.spec.room_id;
-        drop(space3d_tasks::spawn(async move {
-            if let Some(upload) = upload {
-                let _ = upload.wait().await;
-            }
-            if let Some(Err(e)) = delete_store.delete(room).wait().await {
-                tracing::warn!(%room, error = %e, "checkpoint delete failed");
-            }
-        }));
+        delete_checkpoint_after(&rt.env, rt.spec.room_id, upload);
     }
     rt.uplink(FleetUp::RoomClosed {
         room_id: rt.spec.room_id,
@@ -985,6 +1109,27 @@ fn close_if_requested(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
     });
     tracing::info!(room = %rt.spec.room_id, %reason, "room closed");
     rt.phase = RoomPhase::Closed;
+}
+
+/// A shutting-down room gave up waiting for its final upload: keep its newest capture in the
+/// local rescue store (uploaded on the next start) rather than only in memory.
+fn rescue_unstored(rt: &RoomRuntime) {
+    let (Some(store), Some(cp)) = (rt.env.rescue.clone(), rt.last_checkpoint.as_ref()) else {
+        return;
+    };
+    if rt.uploaded_ms.is_some_and(|saved| saved >= cp.saved_ms) {
+        return;
+    }
+    tracing::warn!(room = %cp.room_id, tick = cp.state.tick.0, "final checkpoint not confirmed by the store; kept in the local rescue store");
+    let (room, cp) = (cp.room_id, cp.clone());
+    drop(space3d_tasks::spawn(async move {
+        let Some(bytes) = space3d_tasks::spawn_compute(move || cp.to_bytes()).wait().await else {
+            return;
+        };
+        if let Some(Err(e)) = store.put(room, bytes).wait().await {
+            tracing::error!(%room, error = %e, "rescue checkpoint write failed");
+        }
+    }));
 }
 
 fn publish_status(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
@@ -1074,8 +1219,8 @@ fn publish_status(res: &mut space3d_core::Resources, rt: &mut RoomRuntime) {
         player_ids: clients.iter().map(|c| c.identity.player).collect(),
         persistent: rt.spec.persistent,
         abandon_on_loss: rt.env.game.recovery_policy(&rt.spec) == crate::game::RecoveryPolicy::Abandon,
+        origin: rt.origin,
     };
-    let _ = rt.epoch;
 }
 
 /// Level for admin broadcasts parsed from text (`"warn"` / anything else).

@@ -12,7 +12,7 @@
 //! * Reconnect: own loop with `space3d_net::Backoff` (never `WsConfig::reconnect`); on reconnect
 //!   Register again and replay the whole outbox.
 
-use super::rooms::RoomStatus;
+use super::rooms::{RoomStatus, RoomTick};
 use crate::game::RoomSpec;
 use crate::gs::room::MatchResult;
 use crate::security::bans::Ban;
@@ -83,6 +83,18 @@ pub struct DataWrite {
     pub expected_version: Option<i64>,
 }
 
+/// Where an outbox op was produced: its room and the point in that room copy's history (the
+/// tick whose systems requested it). A player service drops the ops of a stale copy (one left
+/// behind when the room was restored on another server) made after the point the live copy
+/// was restored from — the live copy's state does not include them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpOrigin {
+    /// Room.
+    pub room_id: RoomId,
+    /// Room epoch and tick.
+    pub at: RoomTick,
+}
+
 /// Game server → player service.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FleetUp {
@@ -143,6 +155,9 @@ pub enum FleetUp {
         op_id: String,
         /// Result.
         result: MatchResult,
+        /// The room copy and tick that produced it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<OpOrigin>,
     },
     /// Outbox: player-data writes.
     PlayerDataWrite {
@@ -152,6 +167,9 @@ pub enum FleetUp {
         player: PlayerId,
         /// Writes.
         writes: Vec<DataWrite>,
+        /// The room copy and tick that produced it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<OpOrigin>,
     },
     /// Outbox: leaderboard score.
     SubmitScore {
@@ -163,6 +181,9 @@ pub enum FleetUp {
         player: PlayerId,
         /// Score.
         score: i64,
+        /// The room copy and tick that produced it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<OpOrigin>,
     },
     /// Request player data (answer: `FleetDown::PlayerData`).
     FetchPlayerData {
@@ -265,6 +286,16 @@ impl FleetUp {
             FleetUp::MatchResult { op_id, .. }
             | FleetUp::PlayerDataWrite { op_id, .. }
             | FleetUp::SubmitScore { op_id, .. } => Some(op_id),
+            _ => None,
+        }
+    }
+
+    /// Where an outbox op was produced (`None` for non-op messages and ops from older servers).
+    pub fn origin(&self) -> Option<OpOrigin> {
+        match self {
+            FleetUp::MatchResult { origin, .. }
+            | FleetUp::PlayerDataWrite { origin, .. }
+            | FleetUp::SubmitScore { origin, .. } => *origin,
             _ => None,
         }
     }
@@ -613,6 +644,10 @@ mod tests {
                     value: serde_json::json!({"level": 3}),
                     expected_version: None,
                 }],
+                origin: Some(OpOrigin {
+                    room_id: RoomId(9),
+                    at: RoomTick { epoch: 2, tick: 77 },
+                }),
             },
         ];
         for m in msgs {
@@ -624,7 +659,12 @@ mod tests {
             board: "b".into(),
             player: PlayerId(1),
             score: 2,
+            origin: None,
         };
+        // Ops from servers that predate `origin` (no such field) still parse.
+        let old = serde_json::to_string(&m).unwrap();
+        assert!(!old.contains("origin"), "{old}");
+        assert_eq!(serde_json::from_str::<FleetUp>(&old).unwrap().origin(), None);
         *m.op_id_mut().unwrap() = "x".into();
         assert_eq!(m.op_id(), Some("x"));
         assert_eq!(FleetUp::Heartbeat(Heartbeat::default()).op_id(), None);

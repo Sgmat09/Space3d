@@ -576,8 +576,20 @@ impl space3d_core::Plugin for PlayerServicePlugin {
         let mut last_mm = i64::MIN;
         let mut last_sessions = i64::MIN;
         let mut sessions: Option<space3d_tasks::Task<Result<u64, store::StoreError>>> = None;
+        let mut checkpoint_gc = crate::gs::checkpoint::CheckpointGc::default();
         app.add_system_named(Stage::Update, "ps::supervisor", move |ctx| {
             let now = svc.now_ms();
+            // Room checkpoints too old to restore (rooms that ended without a normal close:
+            // crash loops, orphans nobody rejoined, abandoned or handed-off rooms).
+            checkpoint_gc.tick(now, svc.config.persistence.recovery_max_age, |cutoff| {
+                let pruned = svc.store.prune_checkpoints(cutoff);
+                vec![space3d_tasks::spawn(async move {
+                    match pruned.wait().await {
+                        Some(r) => r.map_err(|e| crate::gs::checkpoint::StoreError(e.to_string())),
+                        None => Err(crate::gs::checkpoint::StoreError("db worker gone".into())),
+                    }
+                })]
+            });
             ctx.resources.scope::<FleetHub, _>(|_, hub| fleet_io(&svc, hub, now));
             let interval = svc.config.matchmaking.interval.as_millis() as i64;
             if now.saturating_sub(last_mm) >= interval {
@@ -677,12 +689,14 @@ fn apply_op(svc: Arc<PlayerService>, server: String, op: FleetUp) {
     let now = svc.now_ms();
     space3d_tasks::runtime().spawn(async move {
         let answer = match op {
-            FleetUp::MatchResult { op_id, result } => {
+            FleetUp::MatchResult { op_id, result, .. } => {
                 let queue_hint = result.mode.clone();
                 let r = svc.store.apply_match(op_id.clone(), result, now).wait().await;
                 ack(r.map(|r| r.map(|_| ())), op_id, &queue_hint)
             }
-            FleetUp::PlayerDataWrite { op_id, player, writes } => {
+            FleetUp::PlayerDataWrite {
+                op_id, player, writes, ..
+            } => {
                 let r = svc.store.apply_writes(op_id.clone(), player, writes, now).wait().await;
                 ack(r.map(|r| r.map(|_| ())), op_id, "data")
             }
@@ -691,6 +705,7 @@ fn apply_op(svc: Arc<PlayerService>, server: String, op: FleetUp) {
                 board,
                 player,
                 score,
+                ..
             } => {
                 let r = svc
                     .store

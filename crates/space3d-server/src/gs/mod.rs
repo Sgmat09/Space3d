@@ -87,6 +87,7 @@ pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 
 struct GsState {
     rt: GameServerRuntime,
+    checkpoint_gc: checkpoint::CheckpointGc,
     heartbeat_seq: u64,
     next_heartbeat_ms: i64,
     fetches: BTreeMap<u64, Fetch>,
@@ -121,6 +122,7 @@ impl space3d_core::Plugin for GameServerPlugin {
         let _ = rt.fleet.send(FleetUp::Register(rt.registration.clone()));
         let mut state = GsState {
             rt,
+            checkpoint_gc: checkpoint::CheckpointGc::default(),
             heartbeat_seq: 0,
             next_heartbeat_ms: i64::MIN,
             fetches: BTreeMap::new(),
@@ -154,6 +156,7 @@ impl GsState {
             self.heartbeat();
         }
         self.expire_fetches(now);
+        self.prune_checkpoints(now);
         self.metrics();
         self.lifecycle();
         if !self.deregistered && self.drain_report().flushed {
@@ -164,6 +167,19 @@ impl GsState {
                 reason: "drained".into(),
             });
         }
+    }
+
+    /// Garbage-collect checkpoints too old to restore in this server's own stores (the local
+    /// store in single-host setups, and the rescue store).
+    fn prune_checkpoints(&mut self, now: i64) {
+        let env = self.rt.rooms.env();
+        if !env.checkpoints.enabled() {
+            return;
+        }
+        let (store, rescue) = (env.checkpoints.clone(), env.rescue.clone());
+        self.checkpoint_gc.tick(now, env.recovery_max_age, |cutoff| {
+            std::iter::once(store).chain(rescue).map(|s| s.prune(cutoff)).collect()
+        });
     }
 
     fn expire_fetches(&mut self, now: i64) {

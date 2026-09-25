@@ -144,6 +144,33 @@ pub struct RoomStatus {
     /// room instead of restoring it (rejoin answers 404, players return to matchmaking).
     #[serde(default)]
     pub abandon_on_loss: bool,
+    /// How this copy of the room started (fresh, or restored from which point). After a room
+    /// moved to another server, the player service drops the outbox ops of the copy it left
+    /// behind that were made after this point (`ps::fleet`).
+    #[serde(default)]
+    pub origin: RoomOrigin,
+}
+
+/// A point in a room's history: its epoch (bumped by every restore and crash rebuild), then
+/// its tick. Ordered by epoch, then tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RoomTick {
+    /// Room epoch.
+    pub epoch: u32,
+    /// Tick.
+    pub tick: u32,
+}
+
+/// How a room copy started (see [`RoomStatus::origin`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoomOrigin {
+    /// Not built yet (checkpoint lookup in flight).
+    #[default]
+    Unknown,
+    /// Built without a checkpoint.
+    Fresh,
+    /// Restored from the checkpoint captured at this point.
+    Restored(RoomTick),
 }
 
 /// Detailed room view (admin `GET /admin/v1/rooms/{id}`).
