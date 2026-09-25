@@ -3,7 +3,7 @@
 //! gradient; size, alpha and coverage curves), rebuilt only when the effects change.
 
 use crate::cpu::PackLayer;
-use crate::effect::{Facing, LUT_WIDTH, ParticleBlend, SortMode, SpriteShape};
+use crate::effect::{Facing, LUT_WIDTH, ParticleBlend, SortMode, SpriteShape, SpriteTarget};
 use crate::pack::f16_bits;
 use crate::registry::{EffectHandle, ParticleEffects};
 
@@ -22,6 +22,9 @@ pub(crate) struct GpuDrawParams {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LayerInfo {
     pub pack: PackLayer,
+    /// Draws into the post distortion buffer (`SpriteTarget::Distortion`, milestone PA4): not
+    /// drawn in color.
+    pub distortion: bool,
     /// `SpriteRender::order`.
     pub order: i16,
     /// Additive layers draw after alpha and premultiplied ones of the same order.
@@ -109,6 +112,7 @@ impl RenderLayers {
                 let batched = additive && matches!(r.sort, SortMode::Auto | SortMode::None);
                 self.info.push(LayerInfo {
                     pack: PackLayer { id, batched, extent },
+                    distortion: !matches!(r.target, SpriteTarget::Color),
                     order: r.order,
                     additive,
                 });

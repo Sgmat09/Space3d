@@ -420,3 +420,225 @@ proptest! {
         prop_assert_eq!(h.sim.overwrites, 0);
     }
 }
+
+/// Median of `n` timed runs of `f`, in milliseconds.
+fn median_ms(n: usize, mut f: impl FnMut()) -> f64 {
+    let mut samples: Vec<f64> = (0..n)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            f();
+            t.elapsed().as_secs_f64() * 1e3
+        })
+        .collect();
+    samples.sort_by(f64::total_cmp);
+    samples[n / 2]
+}
+
+/// The budget multiplier: `SPACE3D_PERF_BUDGET_SCALE`, ×4 for the unoptimized-crate test
+/// profile (the gates hold for release builds: `cargo test --release`).
+fn budget_scale() -> f64 {
+    let env = std::env::var("SPACE3D_PERF_BUDGET_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    env * if cfg!(debug_assertions) { 4.0 } else { 1.0 }
+}
+
+/// Graphics spec §4.4 gate: the CPU backend simulates and packs 16k particles in ≤ 0.35 ms per
+/// tick on one thread (Dev machine).
+#[test]
+fn cpu_backend_16k_within_budget() {
+    let mut h = Harness::new();
+    h.settings.max_particles_cpu = 32_768;
+    let fx = h.add(ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("stress").layer(ParticleLayer {
+            shape: EmitShape::Sphere {
+                radius: 20.0,
+                inner: 0.0,
+            },
+            speed: FloatRange::new(5.0, 20.0),
+            drag: 1.0,
+            gravity: Vec3::new(0.0, -2.0, 0.0),
+            capacity: Some(17_000),
+            ..ParticleLayer::continuous(16_384.0, 1.0)
+        })
+    });
+    h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).keep());
+    for _ in 0..70 {
+        h.step();
+    }
+    let poses = vec![(Vec3::ZERO, Quat::IDENTITY); h.rt.instances.len()];
+    let (mut keys, mut out, mut items) = (Vec::new(), Vec::new(), Vec::new());
+    let layer = crate::cpu::PackLayer {
+        id: 0,
+        batched: true,
+        extent: 0.5,
+    };
+    let mut alive = 0;
+    let ms = median_ms(60, || {
+        h.tick();
+        h.sim.replay(&mut h.rt, 1200);
+        crate::cpu::pack(
+            &crate::cpu::PackInput {
+                rt: &h.rt,
+                pool: &h.sim.pool,
+                poses: &poses,
+                extrapolate: 0.0,
+            },
+            &|_| Some(layer),
+            &mut keys,
+            &mut out,
+            &mut items,
+        );
+        alive = out.len();
+    });
+    let budget = 0.35 * budget_scale();
+    eprintln!("CPU backend: {alive} particles, tick + simulate + pack {ms:.3} ms (budget {budget:.2} ms)");
+    assert!(alive > 16_000, "{alive}");
+    assert!(ms <= budget, "{ms:.3} ms > {budget:.2} ms");
+}
+
+/// Graphics spec §4.4: `tick_system` ≤ 60 µs per tick at 500 layer instances (100 effects × 5
+/// continuous layers, moving emitters).
+#[test]
+fn tick_500_layer_instances_within_budget() {
+    let mut h = Harness::new();
+    let mut effect = ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("five")
+    };
+    for _ in 0..5 {
+        effect = effect.layer(ParticleLayer::continuous(20.0, 0.5));
+    }
+    let fx = h.add(effect);
+    let emitters: Vec<Entity> = (0..100)
+        .map(|i| {
+            h.world
+                .spawn_effect(fx, EffectSpawn::at(Vec3::new(i as f32, 0.0, 0.0)).keep())
+        })
+        .collect();
+    let mut t = 0.0f32;
+    let mut run = |h: &mut Harness| {
+        t += 0.01;
+        for (i, &e) in emitters.iter().enumerate() {
+            h.world.get::<&mut Transform>(e).unwrap().translation.z = (t + i as f32).sin();
+        }
+        h.tick();
+        h.rt.log.clear(); // consumed (the backend's replay is timed separately)
+    };
+    for _ in 0..60 {
+        run(&mut h);
+    }
+    assert_eq!(h.rt.counts(), (100, 500));
+    let ms = median_ms(100, || run(&mut h));
+    let budget = 0.06 * budget_scale();
+    eprintln!(
+        "tick system: 500 layer instances in {:.1} µs (budget {:.0} µs)",
+        ms * 1e3,
+        budget * 1e3
+    );
+    assert!(ms <= budget, "{ms:.4} ms > {budget:.3} ms");
+}
+
+/// Per-layer forces (attractor, vortex, turbulence) and world attractors act on the particles.
+#[test]
+fn forces_pull_swirl_and_stir() {
+    use crate::components::ParticleAttractor;
+    use crate::effect::{Falloff, Force};
+    let run = |forces: Vec<Force>, world_forces: u32, attractor_mask: u32| {
+        let mut h = Harness::new();
+        let fx = h.add(ParticleEffect {
+            duration: 0.0,
+            ..ParticleEffect::new("forces").layer(ParticleLayer {
+                shape: EmitShape::Sphere {
+                    radius: 1.0,
+                    inner: 0.0,
+                },
+                forces,
+                world_forces,
+                ..ParticleLayer::burst(20, 5.0)
+            })
+        });
+        h.world.spawn((
+            Transform::from_xyz(0.0, 10.0, 0.0),
+            ParticleAttractor {
+                strength: 20.0,
+                radius: 0.0,
+                falloff: Falloff::Constant,
+                mask: attractor_mask,
+            },
+        ));
+        h.world.spawn_effect(fx, EffectSpawn::at(Vec3::new(5.0, 0.0, 0.0)));
+        for _ in 0..30 {
+            h.step();
+        }
+        h.alive().into_iter().map(|(_, p)| p).collect::<Vec<_>>()
+    };
+    let mean = |ps: &[Particle]| ps.iter().map(|p| p.pos()).sum::<Vec3>() / ps.len() as f32;
+    let still = run(vec![], 0, 1);
+    assert!(
+        (mean(&still) - Vec3::new(5.0, 0.0, 0.0)).length() < 0.5,
+        "no force: stays"
+    );
+    // An attractor at emitter-local (10, 0, 0): world (15, 0, 0).
+    let pulled = run(
+        vec![Force::Attractor {
+            position: Vec3::new(10.0, 0.0, 0.0),
+            strength: 20.0,
+            radius: 0.0,
+            falloff: Falloff::Constant,
+        }],
+        0,
+        1,
+    );
+    assert!(mean(&pulled).x > 7.0, "pulled toward +X: {}", mean(&pulled));
+    // A vortex about Y: angular momentum about the emitter's axis.
+    let swirl = run(
+        vec![Force::Vortex {
+            axis: Vec3::Y,
+            strength: 10.0,
+            pull: 0.0,
+        }],
+        0,
+        1,
+    );
+    let spin: f32 = swirl
+        .iter()
+        .map(|p| (p.pos() - Vec3::new(5.0, 0.0, 0.0)).cross(p.vel()).y)
+        .sum();
+    assert!(spin > 1.0, "{spin}");
+    // Turbulence stirs them, deterministically.
+    let turb = || {
+        run(
+            vec![Force::Turbulence {
+                strength: 30.0,
+                frequency: 0.5,
+                speed: 1.0,
+            }],
+            0,
+            1,
+        )
+    };
+    let (a, b) = (turb(), turb());
+    assert_eq!(a, b);
+    let moved: f32 = a.iter().zip(&still).map(|(p, q)| (p.pos() - q.pos()).length()).sum();
+    assert!(moved > 1.0, "{moved}");
+    // A world attractor (entity at y = 10) acts on layers whose mask matches.
+    assert!(mean(&run(vec![], 1, 1)).y > 1.0, "attracted up");
+    assert!(mean(&run(vec![], 1, 2)).y.abs() < 0.5, "mask mismatch: no effect");
+}
+
+/// Distance LOD: full rate up to `near`, `min_scale` from `far`.
+#[test]
+fn lod_scales_with_camera_distance() {
+    let lod = crate::ParticleLod {
+        near: 100.0,
+        far: 300.0,
+        min_scale: 0.25,
+    };
+    assert_eq!(lod_scale(&lod, 50.0), 1.0);
+    assert_eq!(lod_scale(&lod, 200.0), 0.625);
+    assert_eq!(lod_scale(&lod, 1000.0), 0.25);
+    assert_eq!(lod_scale(&crate::ParticleLod::default(), 1e6), 1.0, "off by default");
+}

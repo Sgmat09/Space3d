@@ -256,6 +256,9 @@ impl ParticleSettings {
 }
 
 /// Simulation backend.
+///
+/// The GPU backend lands with milestone PA2; until then `Auto` and `Gpu` simulate on the CPU
+/// (`ParticleStats::backend` reports the backend in use).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ParticleBackend {
@@ -264,7 +267,8 @@ pub enum ParticleBackend {
     Auto,
     /// Compute simulation and compaction.
     Gpu,
-    /// CPU simulation (WebGL2).
+    /// CPU simulation (the WebGL2 path): the same tick log, ring slots, RNG, instance stream
+    /// and render pipeline as the GPU backend.
     Cpu,
 }
 

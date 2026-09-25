@@ -344,7 +344,13 @@ impl ParticlesNode {
                         poses: &self.poses,
                         extrapolate,
                     },
-                    &|e| layers.layer(e.effect, e.layer).map(|l| l.pack),
+                    // Distortion layers draw into the post distortion buffer (PA4), not color.
+                    &|e| {
+                        layers
+                            .layer(e.effect, e.layer)
+                            .filter(|l| !l.distortion)
+                            .map(|l| l.pack)
+                    },
                     &mut self.keys,
                     &mut self.instances,
                     &mut self.items,

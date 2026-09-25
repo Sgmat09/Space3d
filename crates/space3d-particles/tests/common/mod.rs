@@ -4,6 +4,7 @@
 
 use space3d_core::prelude::*;
 use space3d_particles::prelude::*;
+use space3d_particles::{FloatRange, Gradient, ParticleBlend, SpriteRender, SpriteShape};
 use space3d_render::*;
 
 /// App with `RenderPlugin`, `ParticlesPlugin` (with `settings`) and a headless renderer of
@@ -90,4 +91,129 @@ pub fn gpu_errors(app: &App) -> u64 {
 /// Particle stats of the last frame.
 pub fn stats(app: &App) -> ParticleStats {
     app.resources.expect::<ParticleStats>().clone()
+}
+
+/// A layer of one long-lived, motionless particle drawn as a hard-edged disc of `size`.
+pub fn dot(color: Vec4, blend: ParticleBlend, size: f32) -> ParticleLayer {
+    ParticleLayer {
+        lod: false,
+        size: FloatRange::constant(size),
+        color_over_life: Gradient::constant(color),
+        render: SpriteRender {
+            shape: SpriteShape::Glow {
+                core: 0.0,
+                hardness: 1.0,
+            },
+            blend,
+            ..SpriteRender::default()
+        },
+        ..ParticleLayer::burst(1, 100.0)
+    }
+}
+
+/// Register a one-layer effect.
+pub fn effect(app: &mut App, layer: ParticleLayer) -> EffectHandle {
+    app.resources
+        .expect_mut::<ParticleEffects>()
+        .add(ParticleEffect::new("test").layer(layer))
+        .unwrap()
+}
+
+/// Default settings without the Direct-mode soft clip (exact pixel values).
+pub fn settings() -> ParticleSettings {
+    ParticleSettings {
+        direct_soft_clip: false,
+        ..ParticleSettings::default()
+    }
+}
+
+/// Linear → sRGB byte.
+pub fn srgb(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let s = if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0).round() as u8
+}
+
+/// `got` is the sRGB encoding of `linear` within `tol`.
+#[track_caller]
+pub fn assert_rgb(got: [u8; 4], linear: Vec3, tol: u8, what: &str) {
+    let want = [srgb(linear.x), srgb(linear.y), srgb(linear.z)];
+    for c in 0..3 {
+        assert!(
+            got[c].abs_diff(want[c]) <= tol,
+            "{what}: got {got:?}, want {want:?} (linear {linear})"
+        );
+    }
+}
+
+/// The three blend modes over a 0.2 grey background at x = −3, 0, 3 (ortho height 10), and
+/// the linear colors each must produce.
+pub fn blend_scene(app: &mut App) -> [(f32, Vec3); 3] {
+    let bg = 0.2;
+    let add = effect(app, dot(Vec4::new(0.5, 0.25, 0.0, 1.0), ParticleBlend::Additive, 2.0));
+    let alpha = effect(app, dot(Vec4::new(0.8, 0.1, 0.1, 0.5), ParticleBlend::Alpha, 2.0));
+    let premul = effect(
+        app,
+        ParticleLayer {
+            coverage: FloatRange::constant(0.5),
+            ..dot(Vec4::new(0.3, 0.6, 0.9, 1.0), ParticleBlend::Premultiplied, 2.0)
+        },
+    );
+    for (fx, x) in [(add, -3.0), (alpha, 0.0), (premul, 3.0)] {
+        app.spawn_effect(fx, EffectSpawn::at(Vec3::new(x, 0.0, 0.0)).keep());
+    }
+    let b = Vec3::splat(bg);
+    [
+        (-3.0, b + Vec3::new(0.5, 0.25, 0.0)),
+        (0.0, Vec3::new(0.8, 0.1, 0.1) * 0.5 + b * 0.5),
+        (3.0, Vec3::new(0.3, 0.6, 0.9) + b * 0.5),
+    ]
+}
+
+/// An unlit 0.1 grey wall at z = 0 over the left half (seen by an ortho camera of height 10 at
+/// 320×180), particles 0.25 in front of it (soft distance 1), over the open background, and
+/// behind the wall. Returns the rendered image.
+pub fn soft_scene(app: &mut App) -> ImageData {
+    let quad = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_mesh(MeshData::plane(10.0));
+    app.world.spawn((
+        Transform::from_xyz(-5.0, 0.0, 0.0).with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+        Mesh3d(quad),
+        Material {
+            double_sided: true,
+            ..Material::unlit(Vec4::new(0.1, 0.1, 0.1, 1.0))
+        },
+    ));
+    let soft = effect(
+        app,
+        ParticleLayer {
+            render: SpriteRender {
+                soft_distance: 1.0,
+                ..dot(Vec4::ONE, ParticleBlend::Additive, 2.0).render
+            },
+            ..dot(Vec4::ONE, ParticleBlend::Additive, 2.0)
+        },
+    );
+    for p in [
+        Vec3::new(-2.5, 0.0, 0.25),
+        Vec3::new(2.5, 0.0, 0.25),
+        Vec3::new(-2.5, 2.5, -0.5),
+    ] {
+        app.spawn_effect(soft, EffectSpawn::at(p).keep());
+    }
+    app.step_ticks(2);
+    render(app)
+}
+
+/// The pixels of the particle in front of the wall, over the open background and behind the
+/// wall in [`soft_scene`].
+pub fn soft_probe(img: &ImageData) -> ([u8; 4], [u8; 4], [u8; 4]) {
+    let px = |x: f32, y: f32| at(img, 0.5 + x * 18.0 / 320.0, 0.5 - y * 18.0 / 180.0);
+    (px(-2.5, 0.0), px(2.5, 0.0), px(-2.5, 2.5))
 }
