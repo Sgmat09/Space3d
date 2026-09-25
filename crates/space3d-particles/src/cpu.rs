@@ -405,10 +405,8 @@ fn emit(pool: &mut [Particle], r: &SpawnRecord, dt: f32, entries: &[Entry], xf: 
         return 0;
     };
     let mut overwrites = 0;
-    let s = &e.sim;
     let row = xf.get(e.instance as usize).unwrap_or(&XformRow::IDENTITY);
     let cap = e.capacity.max(1) as u64;
-    let flat = |v: Vec3| v - s.flatten_axis * (v.dot(s.flatten_axis) * s.flatten);
     let (t0, t1) = (subtick_q(r.t0), subtick_q(r.t1));
     let tick_step = dt * (1.0 / SUBTICKS as f32);
     for k in 0..r.count {
@@ -421,56 +419,80 @@ fn emit(pool: &mut [Particle], r: &SpawnRecord, dt: f32, entries: &[Entry], xf: 
         if old.vel_life[3] != 0.0 && old.misc[2] == r.entry && old.pos_age[3] < old.vel_life[3] {
             overwrites += 1;
         }
-        let seed = particle_seed(e.seed, index);
         let fq = subtick(t0, t1, k, r.count);
-        let f = fq as f32 * (1.0 / SUBTICKS as f32);
-        let (origin, rot) = if s.local {
-            (Vec3::ZERO, Quat::IDENTITY)
-        } else {
-            (row.prev_pos.lerp(row.pos, f), row.prev_rot.lerp(row.rot, f))
-        };
-        let scale = row.scale;
-        let (offset, outward) = sample_shape(s.shape, seed, scale);
-        let offset = flat(offset + s.offset * scale);
-        let mut dir = match s.direction {
-            EmitDirection::Shape => outward,
-            EmitDirection::Fixed(d) => d.normalize_or(Vec3::NEG_Z),
-            EmitDirection::Random => uniform_dir(rnd(seed, stream::DIR_A), rnd(seed, stream::DIR_B)),
-            EmitDirection::Inward => -outward,
-            EmitDirection::Tangent => Vec3::Y.cross(outward).try_normalize().unwrap_or(Vec3::X),
-        };
-        if s.flatten > 0.0 {
-            dir = flat(dir).try_normalize().unwrap_or(dir);
-        }
-        if s.spread > 0.0 {
-            dir = cone_dir(dir, s.spread, rnd(seed, stream::SPREAD_A), rnd(seed, stream::SPREAD_B));
-        }
-        let speed = range(seed, stream::SPEED, s.speed.0, s.speed.1) * scale.max(0.0).powf(s.speed_exponent);
-        let mut pos = origin + rot * offset;
-        let mut vel = rot * dir * speed;
-        if !s.local {
-            vel += row.velocity * s.inherit;
-        }
-        let life = range_exact(seed, stream::LIFETIME, s.lifetime.0, s.lifetime.1);
-        let delay = range_exact(seed, stream::DELAY, s.delay.0, s.delay.1);
-        // Exact on both backends: an integer times a power-of-two multiple of `dt`, then two
-        // sums (the GPU `emit` kernel evaluates the same expression).
-        let age = (SUBTICKS - fq) as f32 * tick_step + r.extra_age - delay;
-        if age > 0.0 {
-            (pos, vel) = pre_age(pos, vel, s.gravity, s.drag, age);
-        }
-        let (x_axis, y_axis) = if matches!(s.facing, Facing::EmitterPlane) {
-            (oct_encode(rot * Vec3::X), oct_encode(rot * Vec3::Y))
-        } else {
-            (0, 0)
-        };
-        pool[slot] = Particle {
-            pos_age: [pos.x, pos.y, pos.z, age],
-            vel_life: [vel.x, vel.y, vel.z, life.max(0.0)],
-            misc: [x_axis, seed, r.entry, y_axis],
-        };
+        pool[slot] = spawn_particle(e, r.entry, row, index, fq, tick_step, r.extra_age);
     }
     overwrites
+}
+
+/// Particle `index` of layer instance `e` (entry `entry`), emitted at sub-tick `fq` of the
+/// emitter motion `row` (`prev_*` → current pose), aged `(SUBTICKS − fq) × tick_step +
+/// extra_age` minus its delay (pre-aged under gravity and drag). The GPU `emit` kernel computes
+/// the same particle.
+fn spawn_particle(
+    e: &Entry,
+    entry: u32,
+    row: &XformRow,
+    index: u64,
+    fq: u32,
+    tick_step: f32,
+    extra_age: f32,
+) -> Particle {
+    let s = &e.sim;
+    let flat = |v: Vec3| v - s.flatten_axis * (v.dot(s.flatten_axis) * s.flatten);
+    let seed = particle_seed(e.seed, index);
+    let f = fq as f32 * (1.0 / SUBTICKS as f32);
+    let (origin, rot) = if s.local {
+        (Vec3::ZERO, Quat::IDENTITY)
+    } else {
+        (row.prev_pos.lerp(row.pos, f), row.prev_rot.lerp(row.rot, f))
+    };
+    let scale = row.scale;
+    let (offset, outward) = sample_shape(s.shape, seed, scale);
+    let offset = flat(offset + s.offset * scale);
+    let mut dir = match s.direction {
+        EmitDirection::Shape => outward,
+        EmitDirection::Fixed(d) => d.normalize_or(Vec3::NEG_Z),
+        EmitDirection::Random => uniform_dir(rnd(seed, stream::DIR_A), rnd(seed, stream::DIR_B)),
+        EmitDirection::Inward => -outward,
+        EmitDirection::Tangent => Vec3::Y.cross(outward).try_normalize().unwrap_or(Vec3::X),
+    };
+    if s.flatten > 0.0 {
+        dir = flat(dir).try_normalize().unwrap_or(dir);
+    }
+    if s.spread > 0.0 {
+        dir = cone_dir(dir, s.spread, rnd(seed, stream::SPREAD_A), rnd(seed, stream::SPREAD_B));
+    }
+    // `pow` only for a non-zero exponent (`x⁰` is 1 anyway), like the GPU kernel.
+    let speed_mul = if s.speed_exponent != 0.0 {
+        scale.max(0.0).powf(s.speed_exponent)
+    } else {
+        1.0
+    };
+    let speed = range(seed, stream::SPEED, s.speed.0, s.speed.1) * speed_mul;
+    let mut pos = origin + rot * offset;
+    let mut vel = rot * dir * speed;
+    if !s.local {
+        vel += row.velocity * s.inherit;
+    }
+    let life = range_exact(seed, stream::LIFETIME, s.lifetime.0, s.lifetime.1);
+    let delay = range_exact(seed, stream::DELAY, s.delay.0, s.delay.1);
+    // Exact on both backends: an integer times a power-of-two multiple of `dt`, then two
+    // sums (the GPU `emit` kernel evaluates the same expression).
+    let age = (SUBTICKS - fq) as f32 * tick_step + extra_age - delay;
+    if age > 0.0 {
+        (pos, vel) = pre_age(pos, vel, s.gravity, s.drag, age);
+    }
+    let (x_axis, y_axis) = if matches!(s.facing, Facing::EmitterPlane) {
+        (oct_encode(rot * Vec3::X), oct_encode(rot * Vec3::Y))
+    } else {
+        (0, 0)
+    };
+    Particle {
+        pos_age: [pos.x, pos.y, pos.z, age],
+        vel_life: [vel.x, vel.y, vel.z, life.max(0.0)],
+        misc: [x_axis, seed, entry, y_axis],
+    }
 }
 
 /// The in-plane basis of a plane-facing sprite (the sprite shader's `s3dp_plane_basis`).
@@ -563,8 +585,7 @@ pub(crate) fn pack(
             k + 1
         };
         let start = out.len() as u32;
-        let (mut min, mut max) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
-        let mut radius = 0.0f32;
+        let mut bounds = Bounds::EMPTY;
         for &(_, _, ei) in &keys[k..end] {
             let e = &rt.entries[ei as usize];
             let pose = input
@@ -573,35 +594,39 @@ pub(crate) fn pack(
                 .copied()
                 .unwrap_or((Vec3::ZERO, Quat::IDENTITY));
             let inst = &rt.instances[e.instance as usize];
-            pack_entry(
-                input,
-                ei,
-                e,
-                inst.tint,
-                inst.scale,
-                pose,
-                out,
-                &mut min,
-                &mut max,
-                &mut radius,
-            );
+            pack_entry(input, ei, e, inst.tint, inst.scale, pose, out, &mut bounds);
         }
         let count = out.len() as u32 - start;
         if count > 0 {
-            let r = Vec3::splat(radius * layer.extent);
+            let r = Vec3::splat(bounds.radius * layer.extent);
             items.push(PackItem {
                 first: start,
                 count,
                 layer: id,
                 serial,
-                min: min - r,
-                max: max + r,
+                min: bounds.min - r,
+                max: bounds.max + r,
                 center: rt.entry_center(e0, input.poses),
                 args: DIRECT,
             });
         }
         k = end;
     }
+}
+
+/// Culling bounds of packed particles: positions and the largest sprite size.
+struct Bounds {
+    min: Vec3,
+    max: Vec3,
+    radius: f32,
+}
+
+impl Bounds {
+    const EMPTY: Self = Self {
+        min: Vec3::splat(f32::INFINITY),
+        max: Vec3::splat(f32::NEG_INFINITY),
+        radius: 0.0,
+    };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -611,90 +636,205 @@ fn pack_entry(
     e: &Entry,
     tint: Vec4,
     scale: f32,
-    (pose_pos, pose_rot): (Vec3, Quat),
+    pose: (Vec3, Quat),
     out: &mut Vec<ParticleInstance>,
-    min: &mut Vec3,
-    max: &mut Vec3,
-    radius: &mut f32,
+    bounds: &mut Bounds,
 ) {
-    let s = &e.sim;
     let cap = e.capacity as u64;
     let base = e.base as usize;
-    let dt = input.extrapolate;
-    let tint = if s.tinted { tint } else { Vec4::ONE };
+    let tint = if e.sim.tinted { tint } else { Vec4::ONE };
     for j in 0..cap {
         let slot = base + ((e.spawned + j) % cap) as usize;
         let Some(p) = input.pool.get(slot) else {
             continue;
         };
-        let life = p.vel_life[3];
         // Dead, or a particle of the range's previous owner (dead too by construction).
-        if life == 0.0 || p.misc[2] != index {
+        if p.vel_life[3] == 0.0 || p.misc[2] != index {
             continue;
         }
-        let age = p.pos_age[3] + dt;
-        if age < 0.0 || age >= life {
-            continue;
-        }
-        let t = age / life;
-        let seed = p.misc[1];
-        let moving = if p.pos_age[3] >= 0.0 { dt } else { age.max(0.0) };
-        let v = p.vel();
-        let mut pos = p.pos() + v * moving;
-        let mut vel = v;
-        if s.local {
-            pos = pose_pos + pose_rot * pos;
-            vel = pose_rot * vel;
-        }
-        let mut size = range(seed, stream::SIZE, s.size.0, s.size.1) * scale;
-        *radius = radius.max(size.abs());
-        if s.mirror && rnd(seed, stream::MIRROR) < 0.5 {
-            size = -size;
-        }
-        let mut rot = range(seed, stream::ROTATION, s.rotation.0, s.rotation.1)
-            + range(seed, stream::ANGULAR, s.angular.0, s.angular.1) * age;
-        let dir = match s.facing {
-            Facing::Plane { normal } => {
-                if s.local {
-                    pose_rot * normal
-                } else {
-                    normal
-                }
-            }
-            Facing::EmitterPlane => {
-                let (mut x, mut n) = (oct_decode(p.misc[0]), oct_decode(p.misc[3]));
-                if s.local {
-                    x = pose_rot * x;
-                    n = pose_rot * n;
-                }
-                let (bx, by) = plane_basis(n);
-                rot += x.dot(by).atan2(x.dot(bx));
-                n
-            }
-            _ => vel,
-        };
-        let start = s.color_a.lerp(s.color_b, rnd(seed, stream::COLOR));
-        let mut rgb = tint.truncate() * start.truncate();
-        if let Some(fl) = s.flicker {
-            let phase = rnd(seed, stream::FLICKER);
-            let wave = 0.5 + 0.5 * (TAU * (fl.frequency * age + phase)).sin();
-            rgb *= 1.0 - fl.amplitude.clamp(0.0, 1.0) * wave;
-        }
-        let alpha = tint.w * start.w;
-        let a = if s.blend == ParticleBlend::Premultiplied {
-            rgb *= alpha;
-            range(seed, stream::COVERAGE, s.coverage.0, s.coverage.1) * alpha
-        } else {
-            alpha
-        };
-        rot -= TAU * (rot / TAU).round();
-        *min = min.min(pos);
-        *max = max.max(pos);
-        out.push(ParticleInstance {
-            pos_size: [pos.x, pos.y, pos.z, size],
-            vel_age: [f16_bits(dir.x), f16_bits(dir.y), f16_bits(dir.z), f16_bits(t)],
-            tint: [f16_bits(rgb.x), f16_bits(rgb.y), f16_bits(rgb.z), f16_bits(a)],
-            rot_frame: [rot.to_bits(), pcg(seed.wrapping_add(stream::BITS.wrapping_mul(GOLDEN)))],
-        });
+        pack_particle(&e.sim, p, input.extrapolate, tint, scale, pose, out, bounds);
     }
+}
+
+/// The render instance of live particle `p` of a layer `s`, `dt` seconds after its simulated
+/// state (extrapolation), if it is visible then (born, not dead).
+#[allow(clippy::too_many_arguments)]
+fn pack_particle(
+    s: &LayerSim,
+    p: &Particle,
+    dt: f32,
+    tint: Vec4,
+    scale: f32,
+    (pose_pos, pose_rot): (Vec3, Quat),
+    out: &mut Vec<ParticleInstance>,
+    bounds: &mut Bounds,
+) {
+    let life = p.vel_life[3];
+    let age = p.pos_age[3] + dt;
+    if age < 0.0 || age >= life {
+        return;
+    }
+    let t = age / life;
+    let seed = p.misc[1];
+    let moving = if p.pos_age[3] >= 0.0 { dt } else { age.max(0.0) };
+    let v = p.vel();
+    let mut pos = p.pos() + v * moving;
+    let mut vel = v;
+    if s.local {
+        pos = pose_pos + pose_rot * pos;
+        vel = pose_rot * vel;
+    }
+    let mut size = range(seed, stream::SIZE, s.size.0, s.size.1) * scale;
+    bounds.radius = bounds.radius.max(size.abs());
+    if s.mirror && rnd(seed, stream::MIRROR) < 0.5 {
+        size = -size;
+    }
+    let mut rot = range(seed, stream::ROTATION, s.rotation.0, s.rotation.1)
+        + range(seed, stream::ANGULAR, s.angular.0, s.angular.1) * age;
+    let dir = match s.facing {
+        Facing::Plane { normal } => {
+            if s.local {
+                pose_rot * normal
+            } else {
+                normal
+            }
+        }
+        Facing::EmitterPlane => {
+            let (mut x, mut n) = (oct_decode(p.misc[0]), oct_decode(p.misc[3]));
+            if s.local {
+                x = pose_rot * x;
+                n = pose_rot * n;
+            }
+            let (bx, by) = plane_basis(n);
+            rot += x.dot(by).atan2(x.dot(bx));
+            n
+        }
+        _ => vel,
+    };
+    let start = s.color_a.lerp(s.color_b, rnd(seed, stream::COLOR));
+    let mut rgb = tint.truncate() * start.truncate();
+    if let Some(fl) = s.flicker {
+        let phase = rnd(seed, stream::FLICKER);
+        let wave = 0.5 + 0.5 * (TAU * (fl.frequency * age + phase)).sin();
+        rgb *= 1.0 - fl.amplitude.clamp(0.0, 1.0) * wave;
+    }
+    let alpha = tint.w * start.w;
+    let a = if s.blend == ParticleBlend::Premultiplied {
+        rgb *= alpha;
+        range(seed, stream::COVERAGE, s.coverage.0, s.coverage.1) * alpha
+    } else {
+        alpha
+    };
+    rot -= TAU * (rot / TAU).round();
+    bounds.min = bounds.min.min(pos);
+    bounds.max = bounds.max.max(pos);
+    out.push(ParticleInstance {
+        pos_size: [pos.x, pos.y, pos.z, size],
+        vel_age: [f16_bits(dir.x), f16_bits(dir.y), f16_bits(dir.z), f16_bits(t)],
+        tint: [f16_bits(rgb.x), f16_bits(rgb.y), f16_bits(rgb.z), f16_bits(a)],
+        rot_frame: [rot.to_bits(), pcg(seed.wrapping_add(stream::BITS.wrapping_mul(GOLDEN)))],
+    });
+}
+
+/// Inputs of [`pack_bridges`].
+pub(crate) struct BridgeInput<'a> {
+    pub rt: &'a Runtime,
+    /// Render pose of every instance.
+    pub poses: &'a [(Vec3, Quat)],
+    /// Whether each instance's emitter moved since the last tick (its `Transform` chain gives
+    /// another pose than the tick read).
+    pub moved: &'a [bool],
+    /// Tick length (seconds, × `time_scale`).
+    pub dt: f32,
+    /// Seconds from the last tick to the render time (`Time::alpha × dt`, 0 without
+    /// extrapolation): the age of a bridge's oldest end.
+    pub age: f32,
+}
+
+/// Append the render-time bridges ([`Runtime::bridge`]) of every live, visible world-space
+/// layer instance whose emitter moved since the last tick to `out`, as direct draw items in
+/// (render layer, allocation serial) order (one per render layer when batched); returns the
+/// particles written. `keys` is scratch.
+pub(crate) fn pack_bridges(
+    input: &BridgeInput<'_>,
+    layer_of: &dyn Fn(&Entry) -> Option<PackLayer>,
+    keys: &mut Vec<(u32, u64, u32)>,
+    out: &mut Vec<ParticleInstance>,
+    items: &mut Vec<PackItem>,
+) -> u32 {
+    let rt = input.rt;
+    keys.clear();
+    for (i, e) in rt.entries.iter().enumerate() {
+        let inst = e.instance as usize;
+        if !e.live || e.sim.local || !input.moved.get(inst).copied().unwrap_or(false) || rt.instances[inst].hidden {
+            continue;
+        }
+        if let Some(l) = layer_of(e) {
+            keys.push((l.id, e.serial, i as u32));
+        }
+    }
+    if keys.is_empty() {
+        return 0;
+    }
+    keys.sort_unstable();
+    let written = out.len();
+    let age_step = input.age.max(0.0) * (1.0 / SUBTICKS as f32);
+    let mut k = 0;
+    while k < keys.len() {
+        let (id, serial, first_entry) = keys[k];
+        let e0 = &rt.entries[first_entry as usize];
+        let Some(layer) = layer_of(e0) else {
+            k += 1;
+            continue;
+        };
+        let end = if layer.batched {
+            keys[k..]
+                .iter()
+                .position(|&(l, _, _)| l != id)
+                .map_or(keys.len(), |n| k + n)
+        } else {
+            k + 1
+        };
+        let start = out.len() as u32;
+        let mut bounds = Bounds::EMPTY;
+        for &(_, _, ei) in &keys[k..end] {
+            let e = &rt.entries[ei as usize];
+            let Some(b) = rt.bridge(e, input.poses, input.dt) else {
+                continue;
+            };
+            let inst = &rt.instances[e.instance as usize];
+            let tint = if e.sim.tinted { inst.tint } else { Vec4::ONE };
+            let (t0, t1) = (subtick_q(b.t0), subtick_q(b.t1));
+            for j in 0..b.count {
+                let fq = subtick(t0, t1, j, b.count);
+                let p = spawn_particle(e, ei, &b.row, b.first + j as u64, fq, age_step, 0.0);
+                pack_particle(
+                    &e.sim,
+                    &p,
+                    0.0,
+                    tint,
+                    inst.scale,
+                    (b.row.pos, b.row.rot),
+                    out,
+                    &mut bounds,
+                );
+            }
+        }
+        let count = out.len() as u32 - start;
+        if count > 0 {
+            let r = Vec3::splat(bounds.radius * layer.extent);
+            items.push(PackItem {
+                first: start,
+                count,
+                layer: id,
+                serial,
+                min: bounds.min - r,
+                max: bounds.max + r,
+                center: rt.entry_center(e0, input.poses),
+                args: DIRECT,
+            });
+        }
+        k = end;
+    }
+    (out.len() - written) as u32
 }

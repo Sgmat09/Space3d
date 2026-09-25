@@ -125,6 +125,11 @@ pub(crate) struct Instance {
     pub pos: Vec3,
     pub rot: Quat,
     pub velocity: Vec3,
+    /// World distance the emitter moved in the last tick (the render-time bridge's share of a
+    /// tick's time-rate emission).
+    pub distance: f32,
+    /// Quality × LOD rate multiplier of the last tick.
+    pub quality: f32,
     pub tint: Vec4,
     pub scale: f32,
     pub rate_scale: f32,
@@ -146,6 +151,18 @@ impl Instance {
     pub(crate) fn entries(&self) -> &[u32] {
         &self.entries[..self.n_entries as usize]
     }
+}
+
+/// The render-time bridge of a world-space layer instance ([`Runtime::bridge`]): `count`
+/// particles from spawn index `first`, spread over `t0..t1` of the tick like the next tick's
+/// record, along `row` (from the pose of the last tick, `prev_*`, to the render pose).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bridge {
+    pub first: u64,
+    pub count: u32,
+    pub t0: f32,
+    pub t1: f32,
+    pub row: XformRow,
 }
 
 /// A finished effect instance of this tick: its event and `FinishAction`.
@@ -197,7 +214,7 @@ pub(crate) struct Runtime {
 /// World position and rotation of an entity with `t` and `parent`, through the `Parent` chain
 /// of `Transform`s (exact per tick, unlike the `GlobalTransform` of the previous frame). The
 /// flag is set when a parent is missing.
-fn world_pose(world: &World, t: &Transform, parent: Option<&Parent>) -> (Vec3, Quat, bool) {
+pub(crate) fn world_pose(world: &World, t: &Transform, parent: Option<&Parent>) -> (Vec3, Quat, bool) {
     let (mut pos, mut rot) = (t.translation, t.rotation);
     let mut next = parent.map(|p| p.0);
     for _ in 0..32 {
@@ -353,6 +370,8 @@ impl Runtime {
             pos,
             rot,
             velocity: em.velocity,
+            distance: 0.0,
+            quality: 1.0,
             tint: em.tint,
             scale: em.scale,
             rate_scale: em.rate_scale,
@@ -639,10 +658,13 @@ impl Runtime {
                 moved.length()
             };
             let lod = camera.map_or(1.0, |c| lod_scale(&settings.lod, c.distance(pos)));
+            let quality = settings.quality.clamp(0.0, 1.0) * lod;
+            inst.distance = distance;
+            inst.quality = quality;
             let Some(effect) = effects.get(em.effect) else {
                 continue;
             };
-            self.schedule(i, effect, dt, settings.quality.clamp(0.0, 1.0) * lod, distance, 0.0);
+            self.schedule(i, effect, dt, quality, distance, 0.0);
         }
         drop(query);
 
@@ -816,6 +838,68 @@ impl Runtime {
         let size = s.size.0.abs().max(s.size.1.abs()) * inst.scale.abs() * sprite;
         let r = Vec3::splat(s.reach(inst.scale, speed) + size);
         (lo - r, hi + r)
+    }
+
+    /// The render-time bridge of world-space layer instance `e`, whose emitter moved after the
+    /// last tick (gameplay that moves it in `Stage::Update`, or frames between ticks): the
+    /// continuous emission the next tick would make if the emitter ended it at its render pose
+    /// (`poses`), laid from the pose the last tick read to the render pose. Its particles are
+    /// the next tick's (the same spawn indices, random attributes and spread), so a world-space
+    /// trail reaches the emitter's local-space layers and meshes at any frame rate, and the
+    /// bridge becomes the simulated trail at the next tick. The time rate counts the share of a
+    /// tick's motion the gap stands for (none for an emitter that was still at the last tick);
+    /// the distance rate counts the gap. A pure function of the ticks and the render pose.
+    /// `None` without emission (a local-space layer, a stopped, hidden or orphaned emitter,
+    /// `time_scale` 0, or nothing counted).
+    pub fn bridge(&self, e: &Entry, poses: &[(Vec3, Quat)], dt: f32) -> Option<Bridge> {
+        if !e.live || e.sim.local || dt <= 0.0 {
+            return None;
+        }
+        let inst = self.instances.get(e.instance as usize)?;
+        if !inst.live || inst.hidden || !inst.emitting() {
+            return None;
+        }
+        let &(pos, rot) = poses.get(e.instance as usize)?;
+        let gap = pos.distance(inst.pos);
+        if !gap.is_finite() {
+            return None;
+        }
+        let share = if inst.distance > 0.0 {
+            (gap / inst.distance).min(1.0) as f64
+        } else {
+            0.0
+        };
+        let c = &e.sim.spawn;
+        let tick = spawn::SpawnTick {
+            entry: 0,
+            time: inst.time,
+            dt,
+            emitting: true,
+            looping: inst.looping,
+            duration: inst.duration,
+            rate_scale: inst.rate_scale,
+            mul: if c.lod { inst.quality } else { 1.0 } * e.rate_mul,
+            distance: gap,
+            extra_age: 0.0,
+        };
+        let mut acc = (e.rate_acc, e.dist_acc);
+        let (n, t0, t1) = spawn::continuous(c, &mut acc, &tick, share)?;
+        let count = n.min(e.capacity as u64) as u32;
+        (count > 0).then_some(Bridge {
+            first: e.spawned,
+            count,
+            t0,
+            t1,
+            row: XformRow {
+                instance: e.instance,
+                prev_pos: inst.pos,
+                prev_rot: inst.rot,
+                pos,
+                rot,
+                velocity: inst.velocity,
+                scale: inst.scale,
+            },
+        })
     }
 
     /// Layer instance `e` may still have particles alive (it emitted within its life window).

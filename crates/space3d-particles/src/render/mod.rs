@@ -6,9 +6,11 @@
 //! * `prepare` (once per frame, inside `render_frame`): replay the pending ticks of the tick log
 //!   — with compute kernels recorded into the frame's encoder (GPU backend, `crate::gpu`) or in
 //!   Rust (CPU backend, `crate::cpu`) — build the render instances (GPU compaction or CPU pack),
-//!   cull and sort the draws of every camera view, and upload what changed through the
-//!   renderer's staging ring. A frame without new ticks, local layers or extrapolation uploads
-//!   nothing.
+//!   lay the render-time bridges of emitters moved since the last tick (world-space emission
+//!   from the tick's pose to the render pose, built on the CPU and drawn directly on both
+//!   backends: `Runtime::bridge`), cull and sort the draws of every camera view, and upload what
+//!   changed through the renderer's staging ring. A frame without new ticks, local layers,
+//!   moved emitters or extrapolation uploads nothing.
 //! * `draw`: bind groups 0 (view) and 1 (scene depth) of the frame, group 2 (LUT, per-view
 //!   flags, per-layer draw parameters), one instanced strip per draw item (an indirect draw on
 //!   the GPU backend, its instance count written by the compaction).
@@ -24,13 +26,15 @@ mod layers;
 
 pub(crate) use layers::RenderLayers;
 
-use crate::cpu::{CpuSim, DIRECT, INSTANCE_SIZE, PackInput, PackItem, Particle, ParticleInstance, pack};
+use crate::cpu::{
+    BridgeInput, CpuSim, DIRECT, INSTANCE_SIZE, PackInput, PackItem, Particle, ParticleInstance, pack, pack_bridges,
+};
 use crate::gpu::{GpuInput, GpuSim, PARTICLE_SIZE};
 use crate::runtime::{ParticleRuntime, Runtime};
 use crate::{ParticleBackend, ParticleEffects, ParticleSettings, ParticleStats, resolve_backend};
 use layers::GpuDrawParams;
 use space3d_core::glam::{Quat, Vec3};
-use space3d_core::{Entity, GlobalTransform, Time};
+use space3d_core::{Entity, GlobalTransform, Parent, Time, Transform};
 use space3d_render::wgpu;
 use space3d_render::{
     Aabb, DepthAccess, DrawContext, FrameMode, OUTPUT_WGSL, OutputEncoding, PassTarget, PhaseSlot, PrepareContext,
@@ -244,11 +248,16 @@ fn ensure_buffer(
 }
 
 /// Render pose (position, rotation) of every effect instance: its entity's `GlobalTransform`
-/// while attached, else its last emitter pose.
-fn update_poses(poses: &mut Vec<(Vec3, Quat)>, rt: &Runtime, world: &space3d_core::World) {
+/// while attached, else its last emitter pose; and whether the emitter moved since the last
+/// tick (its `Transform` chain, read the way the tick reads it, gives another pose: gameplay
+/// moved it after the tick, e.g. in `Stage::Update`), which gives its world-space layers a
+/// render-time bridge ([`crate::runtime::Runtime::bridge`]).
+fn update_poses(poses: &mut Vec<(Vec3, Quat)>, moved: &mut Vec<bool>, rt: &Runtime, world: &space3d_core::World) {
     poses.clear();
+    moved.clear();
     for inst in &rt.instances {
-        let pose = (inst.live && inst.attached && !inst.orphaned)
+        let attached = inst.live && inst.attached && !inst.orphaned;
+        let pose = attached
             .then(|| world.get::<&GlobalTransform>(inst.entity).ok())
             .flatten()
             .map(|g| {
@@ -256,6 +265,15 @@ fn update_poses(poses: &mut Vec<(Vec3, Quat)>, rt: &Runtime, world: &space3d_cor
                 (t, r)
             });
         poses.push(pose.unwrap_or((inst.pos, inst.rot)));
+        let now = attached
+            .then(|| {
+                let t = world.get::<&Transform>(inst.entity).ok()?;
+                let parent = world.get::<&Parent>(inst.entity).ok();
+                let (p, r, broken) = crate::runtime::world_pose(world, &t, parent.as_deref());
+                (!broken).then_some((p, r))
+            })
+            .flatten();
+        moved.push(now.is_some_and(|(p, r)| p != inst.pos || r != inst.rot));
     }
 }
 
@@ -273,6 +291,13 @@ pub(crate) struct ParticlesNode {
     items: Vec<PackItem>,
     keys: Vec<(u32, u64, u32)>,
     poses: Vec<(Vec3, Quat)>,
+    /// Per instance: the emitter moved since the last tick (`update_poses`).
+    moved: Vec<bool>,
+    /// Instances and items of the last pack of the simulated particles (CPU backend); the
+    /// render-time bridges follow them.
+    packed: (usize, usize),
+    /// Bridge particles of the last frame.
+    bridged: u32,
     view_items: Vec<u32>,
     views: Vec<ViewList>,
     view_uniforms: Vec<GpuParticleView>,
@@ -311,6 +336,9 @@ impl ParticlesNode {
             items: Vec::new(),
             keys: Vec::new(),
             poses: Vec::new(),
+            moved: Vec::new(),
+            packed: (0, 0),
+            bridged: 0,
             view_items: Vec::new(),
             views: Vec::new(),
             view_uniforms: Vec::new(),
@@ -329,7 +357,7 @@ impl ParticlesNode {
             self.instances.capacity(),
             self.items.capacity(),
             self.keys.capacity(),
-            self.poses.capacity(),
+            self.poses.capacity() + self.moved.capacity(),
             self.view_items.capacity(),
             self.views.capacity(),
             self.view_uniforms.capacity(),
@@ -400,7 +428,7 @@ impl ParticlesNode {
                 if self.gpu_sim.as_ref().is_none_or(|g| g.renderer != ctx.frame.renderer) {
                     self.gpu_sim = Some(GpuSim::new(ctx.device, ctx.frame.renderer));
                 }
-                update_poses(&mut self.poses, &rt, ctx.world);
+                update_poses(&mut self.poses, &mut self.moved, &rt, ctx.world);
                 let gpu = self.gpu_sim.as_mut().expect("created above");
                 let carry = switched.then_some(&self.sim.pool[..]);
                 gpu.prepare(
@@ -421,11 +449,13 @@ impl ParticlesNode {
                 if let Some((frame, alive)) = gpu.readback.latest {
                     (out.alive, out.alive_frame) = (alive, Some(frame));
                 }
+                // The simulated particles draw from the GPU pool; the bridges are direct draws.
                 self.instances.clear();
             }
             _ => {
                 out.reallocs += self.sim.replay(&mut rt, out.settings.max_catchup_ticks);
                 out.ticks = self.sim.ticks;
+                update_poses(&mut self.poses, &mut self.moved, &rt, ctx.world);
                 let has_local = rt.entries.iter().any(|e| e.live && e.sim.local);
                 if switched
                     || !self.packed_once
@@ -436,7 +466,6 @@ impl ParticlesNode {
                 {
                     self.packed_once = true;
                     self.last_extrapolation = extrapolate;
-                    update_poses(&mut self.poses, &rt, ctx.world);
                     pack(
                         &PackInput {
                             rt: &rt,
@@ -449,12 +478,36 @@ impl ParticlesNode {
                         &mut self.instances,
                         &mut self.items,
                     );
+                    self.packed = (self.instances.len(), self.items.len());
                     self.dirty = true;
+                } else {
+                    // Last frame's bridges go; this frame's follow the same pack.
+                    self.instances.truncate(self.packed.0);
+                    self.items.truncate(self.packed.1);
                 }
-                out.alive = self.instances.len() as u32;
+                out.alive = self.packed.0 as u32;
                 out.alive_frame = Some(ctx.frame.frame);
             }
         }
+        // Render-time bridges: world-space emission from each moved emitter's last tick pose
+        // to its render pose (both backends; CPU-generated, direct draws).
+        let bridged = pack_bridges(
+            &BridgeInput {
+                rt: &rt,
+                poses: &self.poses,
+                moved: &self.moved,
+                dt,
+                age: extrapolate,
+            },
+            &layer_of,
+            &mut self.keys,
+            &mut self.instances,
+            &mut self.items,
+        );
+        if bridged > 0 || self.bridged > 0 {
+            self.dirty = true;
+        }
+        self.bridged = bridged;
         out.reallocs += rt.reallocations;
         rt.reallocations = 0;
         if let Some(r) = ctx.resources.get_mut::<ParticleRuntime>() {
@@ -516,7 +569,8 @@ impl ParticlesNode {
                 }
                 let (items, layers, view) = (&self.items, &self.layers.info, v.view);
                 // Order, then alpha/premultiplied before additive, then back to front for sorted
-                // layers; ties by layer and allocation serial (deterministic).
+                // layers; ties by layer and allocation serial, then the simulated particles
+                // before their render-time bridge (deterministic).
                 let key = |i: u32| {
                     let it = &items[i as usize];
                     let l = &layers[it.layer as usize];
@@ -534,6 +588,7 @@ impl ParticlesNode {
                         .then(ka.2.total_cmp(&kb.2))
                         .then(ka.3.cmp(&kb.3))
                         .then(ka.4.cmp(&kb.4))
+                        .then(a.cmp(&b))
                 });
             }
             self.views.push(ViewList {

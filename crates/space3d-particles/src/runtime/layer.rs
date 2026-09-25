@@ -47,6 +47,8 @@ pub(crate) struct LayerSim {
     pub window: f32,
     /// Bound of the particles' distance from the emitter ([`Self::reach`]).
     pub reach: Reach,
+    /// Continuous emission (the render-time bridge, `Runtime::bridge`).
+    pub spawn: super::spawn::Continuous,
 }
 
 fn pair(r: FloatRange) -> (f32, f32) {
@@ -95,6 +97,7 @@ impl LayerSim {
             tinted: l.tinted,
             window: window_secs(l),
             reach: Reach::new(l, window_secs(l)),
+            spawn: super::spawn::Continuous::new(l),
         }
     }
 }

@@ -26,6 +26,12 @@
 //!   ([`ParticleBackend::Cpu`], the WebGL2 path) — so `render_to_image` after `n` ticks shows
 //!   exactly `n` ticks of simulation, and rendering every tick, rendering once at the end, or
 //!   replaying only the last catch-up window give identical images.
+//! * Emitters moved after the tick — in `Stage::Update` (how SpaceCorps2027 moves bolts and
+//!   avatars), or on frames without a tick at refresh rates above the tick rate — draw their
+//!   local-space layers at the render pose, and the render node lays each world-space layer's
+//!   emission on from the pose the last tick read to the render pose: the next tick's emission,
+//!   previewed (the same spawn indices and random attributes), which the next tick then
+//!   simulates. A bolt's trail reaches its head at any frame rate, whichever stage moves it.
 //! * Particle `k` of a layer instance always lands in ring slot `base + k mod capacity`, and its
 //!   random attributes come from a PCG hash of (layer instance seed, `k`): deterministic, and
 //!   shared bit for bit with the shaders.
@@ -89,10 +95,11 @@ impl Default for ParticlesPlugin {
 
 impl ParticlesPlugin {
     /// Order of [`tick_system`] in `Stage::FixedUpdate` (`App::add_system_ordered`): after the
-    /// systems added with `add_system` / `add_system_named` (order 0), so emission follows every
-    /// emitter to where gameplay moved it this tick. Run earlier, the world-space layers of a
-    /// moving emitter (a bolt's trail) would be laid one tick behind its local-space layers and
-    /// meshes (the bolt's head glow), which draw at the render-time pose.
+    /// systems added there with `add_system` / `add_system_named` (order 0), so each tick's
+    /// emission starts from where fixed-tick gameplay moved the emitter this tick. Emitters
+    /// moved later (in `Stage::Update`, or on frames without a tick) are caught up at render
+    /// time: the render node lays their world-space emission on to the render pose, where their
+    /// local-space layers and meshes draw (the crate docs, "How it works").
     pub const TICK_ORDER: i32 = 1000;
 
     /// The defaults.
@@ -380,9 +387,8 @@ mod tests {
         assert!(!app.system_names(Stage::FixedUpdate).contains(&"particles::tick"));
     }
 
-    /// The tick follows emitters to where gameplay systems moved them this tick, even when those
-    /// were added after the plugin (the laser trail's world-space glows end at its local-space
-    /// head instead of one tick behind it).
+    /// The tick follows emitters to where fixed-tick gameplay systems moved them this tick, even
+    /// when those were added after the plugin (movers in other stages: `tests/follow.rs`).
     #[test]
     fn tick_runs_after_gameplay_systems() {
         let mut app = App::new();

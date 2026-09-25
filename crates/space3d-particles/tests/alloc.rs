@@ -48,8 +48,8 @@ static GLOBAL: Counting = Counting;
 /// A ship's engine exhaust flying a circle, an explosion restarted every 6 ticks and a hit spark
 /// every 4 at new places (pools of emitters, restarted round-robin: the core's transform
 /// propagation allocates for newly spawned and parented entities, which is not what this test
-/// measures). Covers bursts, rates, rate per distance, local layers, restarts, draining and
-/// finishing.
+/// measures). Covers bursts, rates, rate per distance, local layers, restarts, draining,
+/// finishing and render-time bridges (the ship moves in `Stage::Update`, after the tick).
 fn scene(app: &mut App) {
     let ship = app.spawn_effect(builtin::ENGINE_EXHAUST, EffectSpawn::at(Vec3::ZERO).keep());
     let blasts: Vec<Entity> = (0..16)
@@ -181,6 +181,7 @@ fn steady_state_allocations() {
 /// with 80 particle draws and one SceneRead pass), +10 %.
 const METAL_BOUND: u64 = 203;
 
-/// The same with the GPU backend (measured 304: two compute passes with 4 dispatches, the tick's
-/// uploads, the alive-count readback and 89 indirect draws), +10 %.
+/// The same with the GPU backend (measured 307: two compute passes with 4 dispatches, the tick's
+/// uploads, the alive-count readback, 89 indirect draws and the direct draw of the exhaust's
+/// render-time bridge — the scene moves it in `Stage::Update`), +10 %.
 const METAL_BOUND_GPU: u64 = 341;

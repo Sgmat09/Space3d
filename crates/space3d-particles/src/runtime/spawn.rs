@@ -58,6 +58,64 @@ fn push(entry: &mut Entry, log: &mut TickLog, count: u32, t0: f32, t1: f32, extr
     entry.spawned += count as u64;
 }
 
+/// The continuous emission parameters of a layer, kept in its layer instances
+/// (`LayerSim::spawn`) for the render-time bridge ([`continuous`] without the layer).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Continuous {
+    pub rate: f32,
+    pub per_distance: f32,
+    pub max_rate_scale: f32,
+    /// `ParticleLayer::start`.
+    pub start: f32,
+    /// `ParticleLayer::lod`: quality and LOD scale the rates.
+    pub lod: bool,
+}
+
+impl Continuous {
+    pub fn new(l: &ParticleLayer) -> Self {
+        Self {
+            rate: l.spawn.rate,
+            per_distance: l.spawn.rate_per_distance,
+            max_rate_scale: l.spawn.max_rate_scale,
+            start: l.start,
+            lod: l.lod,
+        }
+    }
+}
+
+/// The continuous emission of one tick: `(count, t0, t1)`, the particles the rate accumulators
+/// `acc` (time rate, distance rate; advanced) give for the part of the tick inside
+/// `[start, duration)` (endless when looping), and that part as fractions of the tick. The time
+/// rate counts `rate_share` of it: 1 for a tick, less for a render-time bridge that stands for
+/// part of a tick's motion (`Runtime::bridge`). `None` when nothing of the tick emits.
+pub(crate) fn continuous(
+    c: &Continuous,
+    acc: &mut (u64, u64),
+    s: &SpawnTick,
+    rate_share: f64,
+) -> Option<(u64, f32, f32)> {
+    if !s.emitting || s.dt <= 0.0 {
+        return None;
+    }
+    let (a, b) = (s.time, s.time + s.dt as f64);
+    let dt = s.dt as f64;
+    let lo = a.max(c.start.max(0.0) as f64);
+    let hi = if s.looping { b } else { b.min(s.duration as f64) };
+    if hi <= lo {
+        return None;
+    }
+    let throttle = s.rate_scale.clamp(0.0, c.max_rate_scale.max(0.0)) as f64;
+    let span = hi - lo;
+    let rate = c.rate.max(0.0) as f64 * throttle * s.mul as f64 * span * rate_share;
+    let dist = c.per_distance.max(0.0) as f64 * throttle * s.mul as f64 * s.distance as f64 * span / dt;
+    acc.0 += (rate * ONE).round().min(u64::MAX as f64 / 4.0) as u64;
+    acc.1 += (dist * ONE).round().min(u64::MAX as f64 / 4.0) as u64;
+    let n = (acc.0 >> 32) + (acc.1 >> 32);
+    acc.0 &= FRACTION;
+    acc.1 &= FRACTION;
+    Some((n, ((lo - a) / dt) as f32, ((hi - a) / dt) as f32))
+}
+
 /// Schedule `layer`'s emission for one tick; returns the particles spawned.
 pub(crate) fn spawn_tick(entry: &mut Entry, layer: &ParticleLayer, s: &SpawnTick, log: &mut TickLog) -> u32 {
     if !s.emitting || s.dt <= 0.0 {
@@ -70,21 +128,10 @@ pub(crate) fn spawn_tick(entry: &mut Entry, layer: &ParticleLayer, s: &SpawnTick
     let start = layer.start.max(0.0) as f64;
 
     // Continuous: the part of the tick inside [start, duration) (endless when looping).
-    let lo = a.max(start);
-    let hi = if s.looping { b } else { b.min(s.duration as f64) };
-    if hi > lo {
-        let throttle = s.rate_scale.clamp(0.0, spawn.max_rate_scale.max(0.0)) as f64;
-        let span = hi - lo;
-        let rate = spawn.rate.max(0.0) as f64 * throttle * s.mul as f64 * span;
-        let dist = spawn.rate_per_distance.max(0.0) as f64 * throttle * s.mul as f64 * s.distance as f64 * span / dt;
-        entry.rate_acc += (rate * ONE).round().min(u64::MAX as f64 / 4.0) as u64;
-        entry.dist_acc += (dist * ONE).round().min(u64::MAX as f64 / 4.0) as u64;
-        let n = (entry.rate_acc >> 32) + (entry.dist_acc >> 32);
-        entry.rate_acc &= FRACTION;
-        entry.dist_acc &= FRACTION;
+    let mut acc = (entry.rate_acc, entry.dist_acc);
+    if let Some((n, t0, t1)) = continuous(&Continuous::new(layer), &mut acc, s, 1.0) {
+        (entry.rate_acc, entry.dist_acc) = acc;
         if n > 0 {
-            let t0 = ((lo - a) / dt) as f32;
-            let t1 = ((hi - a) / dt) as f32;
             push(entry, log, n.min(u32::MAX as u64) as u32, t0, t1, s.extra_age, s.entry);
         }
     }

@@ -720,3 +720,195 @@ fn lod_scales_with_camera_distance() {
     assert_eq!(lod_scale(&lod, 1000.0), 0.25);
     assert_eq!(lod_scale(&crate::ParticleLod::default(), 1e6), 1.0, "off by default");
 }
+
+/// The render-time bridge of an emitter that gameplay moved after the tick (`Stage::Update`)
+/// is the next tick's emission laid from the last tick's pose to the render pose: the same
+/// spawn indices, count and span of the tick, and the same positions along the same motion,
+/// so the bridge turns into the simulated trail without a jump. An emitter where the tick saw
+/// it has none.
+#[test]
+fn bridge_previews_the_next_tick() {
+    use crate::cpu::{BridgeInput, PackLayer, pack_bridges};
+    let mut h = Harness::new();
+    let mut layer = ParticleLayer::continuous(30.0, 1.0).speed(0.0);
+    layer.spawn.rate_per_distance = 0.5;
+    layer.capacity = Some(4096);
+    let fx = h.add(ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("trail").layer(layer)
+    });
+    let bolt = h.world.spawn((Transform::IDENTITY,));
+    let e = h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).follow(bolt));
+    let set = |h: &mut Harness, x: f32| h.world.get::<&mut Transform>(bolt).unwrap().translation.x = x;
+    for t in 1..=4 {
+        set(&mut h, 10.0 * t as f32);
+        h.step();
+    }
+    let i = h.rt.by_entity[&e] as usize;
+    let ei = h.rt.instances[i].entries()[0];
+    let entry = h.rt.entries[ei as usize];
+    let mut poses: Vec<(Vec3, Quat)> = h.rt.instances.iter().map(|inst| (inst.pos, inst.rot)).collect();
+    assert!(
+        h.rt.bridge(&entry, &poses, DT).is_none(),
+        "still since the tick: no bridge"
+    );
+
+    // Gameplay moves the bolt 10 units after the tick; the render pose follows.
+    set(&mut h, 50.0);
+    poses[i].0 = Vec3::new(50.0, 0.0, 0.0);
+    let b = h.rt.bridge(&entry, &poses, DT).expect("bridge");
+    let moved = vec![true; poses.len()];
+    let (mut keys, mut out, mut items) = (Vec::new(), Vec::new(), Vec::new());
+    let layer_of = |_: &Entry| {
+        Some(PackLayer {
+            id: 0,
+            batched: true,
+            extent: 0.5,
+        })
+    };
+    let input = BridgeInput {
+        rt: &h.rt,
+        poses: &poses,
+        moved: &moved,
+        dt: DT,
+        age: 0.0,
+    };
+    let n = pack_bridges(&input, &layer_of, &mut keys, &mut out, &mut items);
+    // 30/s × 1/60 s (the gap is the whole motion of a tick) + 0.5 per unit × 10 units.
+    assert!((5..=6).contains(&b.count), "{b:?}");
+    assert_eq!((n, out.len(), items.len()), (b.count, b.count as usize, 1));
+    assert_eq!((items[0].first, items[0].count), (0, b.count));
+    assert_eq!(b.first, entry.spawned);
+    for p in &out {
+        assert!(p.pos_size[0] > 40.0 && p.pos_size[0] < 50.0, "{:?}", p.pos_size);
+    }
+
+    // The next tick reads the moved pose and emits exactly the bridge.
+    h.tick();
+    let rec = *h.rt.log.records.iter().find(|r| r.entry == ei).expect("record");
+    assert_eq!((rec.first, rec.count, rec.t0, rec.t1), (b.first, b.count, b.t0, b.t1));
+    h.sim.replay(&mut h.rt, h.settings.max_catchup_ticks);
+    let cap = entry.capacity as u64;
+    for (j, p) in out.iter().enumerate() {
+        let slot = entry.base as usize + ((b.first + j as u64) % cap) as usize;
+        let sim = h.sim.pool[slot];
+        let d = sim.pos() - Vec3::new(p.pos_size[0], p.pos_size[1], p.pos_size[2]);
+        assert!(
+            d.length() < 1e-4,
+            "particle {j}: simulated {} bridged {:?}",
+            sim.pos(),
+            p.pos_size
+        );
+    }
+    // A time rate alone bridges the share of a tick's motion the gap stands for.
+    set(&mut h, 55.0);
+    poses[i].0 = Vec3::new(55.0, 0.0, 0.0);
+    let entry = h.rt.entries[ei as usize];
+    let half = h.rt.bridge(&entry, &poses, DT).map_or(0, |b| b.count);
+    assert!(
+        (2..=3).contains(&half),
+        "half a tick of the rate (0.25) + 0.5 × 5 units: {half}"
+    );
+}
+
+/// The render-time bridges' CPU cost: 20 bolts (`builtin::LASER_TRAIL`) at 3200 units/s moved
+/// one 60 Hz frame (53 units) after the tick, as gameplay in `Stage::Update` does — about 1100
+/// bridged glows per frame, built and packed within 0.1 ms (the graphics spec's budget for the
+/// whole particles `prepare` of a Battle frame on the GPU backend; Dev machine, release).
+#[test]
+fn bridges_of_20_fast_bolts_within_budget() {
+    use crate::cpu::{BridgeInput, PackLayer, pack_bridges};
+    let mut h = Harness::new();
+    h.settings.max_particles_cpu = 65_536;
+    let fx = crate::registry::builtin::effect(crate::registry::builtin::LASER_TRAIL).expect("laser trail");
+    let fx = h.add(fx);
+    let bolts: Vec<Entity> = (0..20)
+        .map(|i| {
+            let b = h.world.spawn((Transform::from_xyz(0.0, 0.0, i as f32 * 10.0),));
+            h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).follow(b));
+            b
+        })
+        .collect();
+    let per_tick = 3200.0 / 60.0;
+    let mut x = 0.0;
+    for _ in 0..30 {
+        x += per_tick;
+        for &b in &bolts {
+            h.world.get::<&mut Transform>(b).unwrap().translation.x = x;
+        }
+        h.step();
+    }
+    let mut poses: Vec<(Vec3, Quat)> = h.rt.instances.iter().map(|i| (i.pos, i.rot)).collect();
+    for p in &mut poses {
+        p.0.x += per_tick;
+    }
+    let moved = vec![true; poses.len()];
+    let (mut keys, mut out, mut items) = (Vec::new(), Vec::new(), Vec::new());
+    let layer = PackLayer {
+        id: 0,
+        batched: true,
+        extent: 0.5,
+    };
+    let mut n = 0;
+    let ms = median_ms(100, || {
+        out.clear();
+        items.clear();
+        let input = BridgeInput {
+            rt: &h.rt,
+            poses: &poses,
+            moved: &moved,
+            dt: DT,
+            age: 0.5 * DT,
+        };
+        n = pack_bridges(&input, &|_| Some(layer), &mut keys, &mut out, &mut items);
+    });
+    let budget = 0.1 * budget_scale();
+    eprintln!(
+        "bridges: {n} glows of 20 bolts in {:.1} µs (budget {:.0} µs)",
+        ms * 1e3,
+        budget * 1e3
+    );
+    assert!((20 * 50..=20 * 56).contains(&n), "{n}");
+    assert!(ms <= budget, "{ms:.4} ms > {budget:.3} ms");
+}
+
+/// Pool slots each built-in reserves per instance (the sum of its layers' rings: design-particles
+/// §5.1), as documented in docs/graphics/particles.md "Budgets": on the CPU backend's web budget
+/// (8192, `Normal` priority 90 %) that is, e.g., 20 engine exhausts and 4 laser trails at once.
+/// `LASER_TRAIL`'s ring holds a trail at the game's 3200 units/s without overwriting.
+#[test]
+fn builtin_slots() {
+    use crate::registry::builtin;
+    let table = [
+        (builtin::EXPLOSION, "explosion", 81),
+        (builtin::HIT_SPARK, "hit_spark", 16),
+        (builtin::SHIELD_RIPPLE, "shield_ripple", 8),
+        (builtin::WARP_IN, "warp_in", 26),
+        (builtin::WARP_OUT, "warp_out", 26),
+        (builtin::ENGINE_EXHAUST, "engine_exhaust", 237),
+        (builtin::LASER_TRAIL, "laser_trail", 581),
+    ];
+    for (h, name, want) in table {
+        let fx = builtin::effect(h).unwrap();
+        let slots: u32 = fx.layers.iter().filter(|l| l.enabled).map(capacity).sum();
+        assert_eq!(slots, want, "{name}");
+    }
+    let web = (8192.0 * priority_limit(EffectPriority::Normal)) as u32;
+    assert!(
+        20 * 237 + 4 * 581 <= web,
+        "20 exhausts and 4 trails fit the web budget ({web})"
+    );
+
+    // A trail at 3200 units/s (and 3800) fills at most its ring.
+    for speed in [3200.0f32, 3800.0] {
+        let mut h = Harness::new();
+        let fx = h.add(builtin::effect(builtin::LASER_TRAIL).unwrap());
+        let bolt = h.world.spawn((Transform::IDENTITY,));
+        h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).follow(bolt));
+        for t in 1..=60 {
+            h.world.get::<&mut Transform>(bolt).unwrap().translation.x = speed * DT * t as f32;
+            h.step();
+        }
+        assert_eq!(h.sim.overwrites, 0, "{speed} units/s: the ring overwrote live glows");
+    }
+}

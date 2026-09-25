@@ -185,8 +185,9 @@ fn vs_sprite(in: S3dpIn) -> S3dpOut {
     return out;
 }
 
-// Shape of a sprite at quad position `uv`: (color weight, white core, coverage mask).
-fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32) -> vec3<f32> {
+// Shape of a sprite at quad position `uv`: (color weight, white core, coverage mask). `peak`
+// is the sprite's brightest channel as the tonemapper sees it (color × opacity × exposure).
+fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32, peak: f32) -> vec3<f32> {
     let p = s3dp_draw.shape;
     switch s3dp_draw.mode.z {
         case 1u: {
@@ -253,12 +254,20 @@ fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32) -> vec3<f32> {
             return vec3<f32>(v, 0.0, v);
         }
         default: {
-            // Glow: soft halo (p.y hardens it into a disc) and a white-hot core of p.x.
+            // Glow: soft halo (p.y hardens it into a disc) and a white-hot core of p.x. The
+            // halo's window (1 − d²) steepens as (1 − d²)^(1 + ½·log2 peak) for a sprite brighter
+            // than 1: tonemapped, a bright gaussian saturates out to where the window cuts it
+            // and reads as a flat disc with a hard rim (embers, a bolt's head at 10–15×); the
+            // steeper window spreads its edge over ~8 stops instead. Unchanged up to 1.
             let d = length(uv);
             if (d >= 1.0) {
                 return vec3<f32>(0.0);
             }
-            let soft = exp(-d * d * 4.0) * (1.0 - d * d);
+            var win = 1.0 - d * d;
+            if (peak > 1.0) {
+                win = win * pow(win, min(0.5 * log2(peak), 3.0));
+            }
+            let soft = exp(-d * d * 4.0) * win;
             let hard = clamp((1.0 - d) * px + 0.5, 0.0, 1.0);
             let body = mix(soft, hard, p.y);
             return vec3<f32>(body, exp(-d * d * 28.0) * p.x, body);
@@ -272,7 +281,8 @@ fn fs_sprite(in: S3dpOut) -> @location(0) vec4<f32> {
     if (S3DP_MANUAL_DEPTH && s3d_scene_occluded(px, in.clip.z)) {
         discard;
     }
-    let s = s3dp_shape(in.uv, in.a.z, in.b.x, in.bits);
+    let peak = max(in.color.r, max(in.color.g, in.color.b)) * in.color.a * view.exposure.x;
+    let s = s3dp_shape(in.uv, in.a.z, in.b.x, in.bits, peak);
     var fade = in.a.y;
     if (s3dp_view.flags.y != 0u) {
         fade = fade * s3d_soft_fade(px, in.view_depth, s3dp_draw.stretch.w);
