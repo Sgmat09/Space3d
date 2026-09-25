@@ -120,7 +120,9 @@ the vertex shader reads, so the CPU never evaluates them per particle.
 ### Sprites
 
 * **Shapes** (analytic, no textures, crisp at any size — the game's `additive.rs` kinds as
-  data): `Glow { core, hardness }` (soft halo, hard disc, white-hot core), `Streak { core, taper }`
+  data): `Glow { core, hardness }` (soft halo, hard disc, white-hot core; the halo's edge
+  tightens with the sprite's HDR brightness, so a glow at 10× stays soft instead of tonemapping
+  into a flat disc — unchanged up to 1×), `Streak { core, taper }`
   (a capsule whose width and brightness taper toward its tail, with a hot head; pair it with
   `VelocityStretched`), `Ring { thickness, focus, fill }` (focus sharpens it toward the sprite's
   +X: shield arcs; the band sits inside the rim, which fades over 1.5 pixels),
@@ -189,8 +191,8 @@ in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's
 | `HIT_SPARK` | flash, sparks thrown along −Z, a ring, smoke; tinted | `.facing(-bolt_dir).tint(color)` |
 | `SHIELD_RIPPLE` | focused arc toward −Z, faint bubble, surface flash, streaks; local-space | `.facing(-bolt_dir).scale(radius / 20).follow(ship)` |
 | `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash, two rings | `EffectSpawn::at(portal)` |
-| `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow; `rate_scale` = throttle | emitter child behind the hull |
-| `LASER_TRAIL` | looping white-hot head + a continuous beam laid per unit of distance | `.follow(bolt).tint(color)` (a saturated tint: `(1, 0.1, 0.05)`) |
+| `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow; `rate_scale` = throttle. Near-neutral (white-hot): the flame takes its hue from the tint | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
+| `LASER_TRAIL` | looping white-hot head + a continuous beam laid per unit of distance (up to about 3800 units/s) | `.follow(bolt).tint(color)` (a saturated tint: `(1, 0.1, 0.05)`); the bolt may move in any stage |
 | `LASER_BEAM` | reserved: beams arrive with PA3 (until then an emitter with it plays nothing and finishes at once, warned once) | |
 
 An emitter whose handle has no effect data — a removed effect, `EffectHandle::INVALID`, or
@@ -206,14 +208,32 @@ editor's storybook viewer, golden tests).
 ## Time model and determinism
 
 * `tick_system` runs in `Stage::FixedUpdate` at `ParticlesPlugin::TICK_ORDER` (1000, through
-  `App::add_system_ordered`): after every system added with `add_system` / `add_system_named`,
-  whenever they were added, so it sees where gameplay moved each emitter this tick. (Run before
-  the movement, a fast emitter's world-space layers would be laid one tick behind its
-  local-space layers and meshes, which draw at the render-time pose: a bolt's head floating
-  25 units ahead of its trail at 1500 units/s.) `ParticlesPlugin { tick_system: false, .. }`
-  leaves the placement to you. It follows emitters, decides each tick's emission — exact 32.32 fixed-point rate accumulators (10/s at 60 Hz is
-  exactly 100 particles in 600 ticks), bursts on the tick that contains them with their sub-tick
-  time, emission spread over the emitter's motion within the tick — and records it in a tick log.
+  `App::add_system_ordered`): after every system added to that stage with `add_system` /
+  `add_system_named`, whenever they were added, so it sees where fixed-tick gameplay moved each
+  emitter this tick. `ParticlesPlugin { tick_system: false, .. }` leaves the placement to you. It
+  follows emitters, decides each tick's emission — exact 32.32 fixed-point rate accumulators
+  (10/s at 60 Hz is exactly 100 particles in 600 ticks), bursts on the tick that contains them
+  with their sub-tick time, emission spread over the emitter's motion within the tick — and
+  records it in a tick log.
+* Emitters may move in any stage. Local-space layers draw at the render pose (the entity's
+  `GlobalTransform`, like meshes). An emitter moved after the tick read it — in `Stage::Update`
+  (SpaceCorps2027 moves bolts, ships and the camera there), or on frames without a tick when the
+  display refreshes faster than the tick rate — would otherwise draw its world-space layers up to
+  the pose of the last tick only: a bolt's head floating one frame of motion (25 units at
+  1500 units/s) ahead of its trail. The render node closes that gap with a **render-time
+  bridge**: for each world-space layer of such an emitter it lays the continuous emission the
+  next tick would make if the emitter ended it at the render pose — the same spawn indices,
+  random attributes and spread, the distance rate over the gap and the time rate for the share
+  of a tick's motion the gap stands for — from the pose of the last tick to the render pose,
+  aged from 0 at the emitter to the render time's extrapolation at the tick pose. When the next
+  tick sees the same motion (one frame per tick) it emits exactly those particles into the
+  simulation (`runtime::tests::bridge_previews_the_next_tick`); otherwise the next frame's bridge
+  starts from the new tick's pose. The trail stays joined to its head at any frame rate and
+  whichever stage moves the emitter (`tests/follow.rs`: `LASER_TRAIL` moved in
+  `FixedUpdate`, `PreUpdate` and `Update`, at 60 and 120 Hz, both backends). Bridges are built
+  on the CPU (a frame of motion's worth of particles per moving emitter) and drawn as direct
+  draws on both backends; bursts and the simulation itself stay on the tick. A trail that must
+  reach a fast emitter emits per distance (`Spawn::rate_per_distance`), like `LASER_TRAIL`.
 * The render node replays the pending ticks inside the render frame. Particle *k* of a layer
   instance lands in ring slot `base + k mod capacity`; its random attributes are a PCG hash of
   (layer instance seed, *k*) (bit-identical in Rust and WGSL). The simulated state is a pure
@@ -222,7 +242,8 @@ editor's storybook viewer, golden tests).
   the log keeps only the last catch-up window `W` (the longest particle life) and replays it
   from an empty pool with the identical result (`ParticleStats::catchup_resets`).
   `max_catchup_ticks` (1200) bounds one frame's replay.
-* Rendering twice without a tick replays nothing and uploads nothing: identical images.
+* Rendering twice without a tick replays nothing and gives identical images; it uploads nothing
+  unless an emitter moved since the tick (its bridge is packed again).
 * Without a renderer effects still tick, finish and despawn (servers simply do not add the
   plugin; `TestApp::no_render` works).
 
@@ -242,7 +263,12 @@ editor's storybook viewer, golden tests).
   layer instance reserves a ring sized from its rates, bursts and life (§5.1 of the area
   design); over the budget rings shrink to 1/8 before a layer instance is refused
   (`ParticleStats::{shrunk, refused}`, logged once per effect). `EffectPriority::Low` stops at
-  75 % of the pool, `Normal` at 90 %, `High` may use it all.
+  75 % of the pool, `Normal` at 90 %, `High` may use it all. Slots a built-in reserves per
+  instance (`runtime::tests::builtin_slots`): `EXPLOSION` 81, `HIT_SPARK` 16, `SHIELD_RIPPLE` 8,
+  `WARP_IN` / `WARP_OUT` 26, `ENGINE_EXHAUST` 237 (its rates × the afterburner's
+  `max_rate_scale` 2), `LASER_TRAIL` 581. The CPU backend's web budget (8192 × 90 %) holds, for
+  example, 20 exhausts and 4 laser trails at once; the GPU pool (262 144) is not a practical
+  limit for them.
 * `ParticleStats` (resource, per rendered frame): backend, live effects and layer instances,
   pool capacity / reserved, alive particles (CPU: this frame; GPU: read back from the draw
   arguments 1–3 frames late, `alive_frame` says which), ticks replayed, catch-up resets,
@@ -309,7 +335,8 @@ cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --noca
 | GPU backend CPU cost: `prepare` + draw recording, 500 moving layer instances, one tick | 0.14 ms idle machine (0.2–0.3 ms under load) | ≤ 0.1 ms (Battle scene, Phase I) |
 | CPU backend: tick + simulate + pack 16 384 particles, one thread (test profile) | 0.28 ms | ≤ 0.35 ms |
 | `tick_system`, 500 layer instances | 13 µs | ≤ 60 µs |
-| allocations per frame, ~1000 particles, 80–90 draws (wgpu's bookkeeping; our code: 0) | CPU backend 183, GPU backend 304 | pinned +10 % (`tests/alloc.rs`) |
+| render-time bridges: 20 bolts at 3200 units/s moved a frame after the tick (1060 glows built and packed) | 63 µs (about 60 ns per glow, one thread, under load) | within the `prepare` line above (`runtime::tests::bridges_of_20_fast_bolts_within_budget`, ≤ 0.1 ms) |
+| allocations per frame, ~1000 particles, 80–90 draws, the exhaust moved in `Update` (wgpu's bookkeeping; our code: 0) | CPU backend 184, GPU backend 307 (a direct draw and upload for the exhaust's bridge) | pinned +10 % (`tests/alloc.rs`) |
 
 **Gate caveats, plainly.** The simulation gate is measured with the draws of the previous frame
 out of the way. With the camera drawing the 100k billboards every frame, the two particle
@@ -350,6 +377,6 @@ and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 | `fx::Effect::Impact { at, dir, color }` | `spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(at).facing(-dir).tint(color.extend(1.0)))` (the game's `color` is a `Vec3`; `tint` takes linear RGBA) |
 | `fx::Effect::ShieldHit { center, radius, dir }` | `spawn_effect(builtin::SHIELD_RIPPLE, EffectSpawn::at(center).facing(-dir).scale(radius / 20.0).follow(ship))` |
 | warp / portal jumps | `builtin::WARP_IN` / `WARP_OUT` |
-| engine trails and nozzle flames | `ParticleEmitter::new(builtin::ENGINE_EXHAUST)` per nozzle, `rate_scale` = throttle |
-| bolt afterglow | `builtin::LASER_TRAIL` following the bolt (beams: `LASER_BEAM`, PA3) |
+| engine trails and nozzle flames | `ParticleEmitter::new(builtin::ENGINE_EXHAUST)` per nozzle, `rate_scale` = throttle, `tint` = `engine_color(e).extend(1.0)` (the plume is neutral: the tier and faction colors come through) |
+| bolt afterglow | `builtin::LASER_TRAIL` following the bolt, which `fx::animate` keeps moving in `Stage::Update` (the render-time bridge joins the trail to the head; beams: `LASER_BEAM`, PA3) |
 | `1 − e^−x` soft clip in the overlay | `direct_soft_clip` in Direct mode; with `PostProcess` the tonemapper and bloom take over |

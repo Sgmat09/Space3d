@@ -41,9 +41,12 @@ the game.
 * **`space3d_assets::Primitive` stays frozen** (`mesh`, `material`): the game builds it with
   exhaustive literals (`client/src/game/models.rs`, splitting double-sided panels). Its extra
   vertex streams (glTF `TANGENT`, `TEXCOORD_1`) live beside it in
-  `ModelMesh::extras: Vec<PrimitiveExtras>` (`extras[i]` belongs to `primitives[i]`; a stream
-  whose length is not the primitive's vertex count is ignored, so code that splits or reorders
-  primitives without touching `extras` gets per-pixel tangents instead of wrong ones).
+  `ModelMesh::extras: Vec<PrimitiveExtras>` (`extras[i]` belongs to `primitives[i]`, matched by
+  index). Code that removes, splits or reorders primitives must keep `extras` in step or clear
+  it: a stream whose length is not the primitive's vertex count is ignored (per-pixel tangents
+  then), but a shifted stream of the same length — a removed primitive followed by one with as
+  many vertices, as the game's `resolve_coincident` does with `retain` + `extend` — is used for
+  the wrong primitive. `ModelMesh::primitive_extras` checks the length only.
   `api_compat_249c874.rs` compiles the game's literal.
 * **Frozen existing types** (unchanged): `Camera3d`, `Projection`, `RenderTarget`,
   `DirectionalLight`, `PointLight`, `AmbientLight`, `MeshData`, `InstancedMesh`,
@@ -145,6 +148,19 @@ Additions made by the foundation since F2 (additive):
     `true`; the presets are enabled, so `with_bloom(Bloom::glow())` is unchanged).
   * `RenderStats::staging_chunks_created`: staging chunks the upload ring created this frame (0 in
     the steady state; the ring now keeps what the frames queued on the GPU need).
+* Graphics review, round 1 (all additive or behavior-only):
+  * `render_frame` keeps at most three frames in flight: without a window to pace it (headless,
+    an unpaced `App::update` loop) it waits for the frame submitted three frames earlier, which
+    is usually done already. No API change.
+  * Particle emitters may move in any stage: the render node lays each moved emitter's
+    world-space emission on to its render pose (the render-time bridge, particles.md "Time
+    model"). `ParticlesPlugin::TICK_ORDER` is unchanged.
+  * `space3d_test::TestApp::with_renderer(f)` is public: `f` runs with the renderer in the
+    resources also under `render_on_demand`. `story_app` applies stories that way, so stories
+    that size render targets from `Renderer::size` get the capture size.
+  * `builtin::ENGINE_EXHAUST` is authored near-neutral and takes its hue from the tint (it was
+    blue, which a warm or green tint multiplied to grey); `builtin::LASER_TRAIL` reserves 576
+    slots (was 1024) and has a smaller head.
 
 ## Ownership map (spec §3.6)
 

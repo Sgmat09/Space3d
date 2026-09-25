@@ -248,7 +248,8 @@ Allocations per frame by mode (`tests/alloc_frame.rs`: 400 moving lit cubes, CPU
 
 The one extra render pass (the composite) costs 30 wgpu-hal allocations on Metal; the renderer
 itself allocates nothing, creates no textures after the first frame and uploads nothing for a
-still scene (only the 16-byte dither seed of each post group when frames advance).
+still scene (since the round-1 review not even the dither seeds, which go up 64 frames at a
+time).
 
 ### F5 / F6 — render nodes, scene depth, overlay stages
 
@@ -341,8 +342,65 @@ cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --noca
 | particles 100k: sim + compaction, nothing else on the GPU | 0.044 ms (in frames that also draw the 100k billboards: 0.084 ms, reported) | ≤ 0.06 ms |
 | particles 100k: draw into the HDR scene texture | 0.350 ms (into Direct's 8-bit target: 0.362 ms, reported) | ≤ 0.40 ms |
 
-**Bloom CPU.** Bloom's render passes cost about 10 µs of wgpu/Metal overhead each (the
-renderer's own work per pass allocates nothing): about 0.11 ms per post group at 1080p and above
-(11 passes), against the spec's Battle-scene line "post ≤ 0.05 ms". Smaller rects now have
-fewer levels (9 passes at 720p, 5 at 180p). The planned fix is a compute chain (one compute pass
-of dependent dispatches on class A backends; the render-pass chain kept for WebGL2).
+**Bloom CPU.** Bloom's render passes cost about 15 µs of wgpu/Metal overhead each (the
+renderer's own work per pass allocates nothing): 0.15–0.17 ms of thread CPU per post group at
+1080p and above (11 passes; +1.26 M to +1.38 M instructions per frame over the composite alone,
+measured in an `App::update` loop by the round-1 review; an earlier estimate here said 0.11 ms),
+about 3× the spec's Battle-scene line "post ≤ 0.05 ms". **That line is not met at M1.** Smaller
+rects have fewer levels (9 passes at 720p, 5 at 180p). The planned fix is a compute chain (one
+compute pass of dependent dispatches on class A backends; the render-pass chain kept for
+WebGL2), after M1.
+
+### M1 review, round 1 — frame pacing, gates at M1 close
+
+**Frames in flight (fixed).** Nothing paced `render_frame` without a window: in an `App::update`
+/ `step_ticks` loop (the engine's test pattern, headless batch renders) recording ran ahead of
+the GPU without bound (Metal queues up to 4096 command buffers), every queued frame kept its
+command memory, and the staging ring grew with the queue. `render_frame` now keeps at most three
+frames in flight: after submitting a frame it waits for the one submitted three frames earlier
+(native only; the browser paces its frames). With a window, presentation already paces frames
+and the wait returns at once. The review's harness (1920×1080, 2400 unpaced `App::update`
+frames, then 1200 paced ones; release; load 4–10), before → after:
+
+| scene | staging chunks, before / after | footprint before (frame 300 → 2400) | footprint after | µs per frame, frames 300–2400, before / after |
+|---|---|---|---|---|
+| Direct, still | 1 / 1 | 882 → 1105 MB | 504 → 507 MB | — |
+| Hdr minimal, still | 137 (still growing) / 4 | 924 → 2276 MB | 550 MB flat | — |
+| Hdr + bloom, one cube moving | 138 / 4 | 1709 → 6435 MB | 696 MB flat | 492 / 316 |
+| bloom + GPU particles 100k | 122 / 4 | 2034 → 6000 MB | 745 MB flat | 568 / 469 |
+| bloom + CPU particles 16k | 10 / 5 | 886 → 865 MB | 685 MB flat | 487 / 472 |
+
+Throughput does not suffer: three frames in flight keep the GPU busy. `tests/alloc_frame.rs`
+"hdr moving, unpaced" renders 1500 frames of 400 moving cubes without waiting: no staging chunk
+is created after the first 100 frames (5 were without the pacing), 148 allocations per frame
+(bound 167). (The harness figures above predate the seed window below.)
+
+**Post seeds, a window at a time.** The composite's dither and animated-grain seeds changed every
+frame and were the only upload of a still Hdr scene: a 16-byte staging copy per post group and
+frame (about 3–4 µs of CPU, and 20–40 µs of GPU throughput for the copy in an otherwise idle
+frame). They now go up 64 frames at a time — one aligned uniform slot per frame and post group,
+selected with a dynamic offset (`SeedWindow`, post/mod.rs) — the seeds themselves unchanged
+(spec §4.3; the goldens are bit-exact). A still scene uploads nothing in 63 of 64 frames
+(`tests/alloc_frame.rs`: 18 uploading frames in 1184).
+
+**Allocations of the 1080p bloom chain.** `tests/alloc_post.rs` measures bloom at 1920×1080 again
+(the 6-level chain every rect of 1080p or more gets, 11 bloom passes): 332 allocations per frame,
+pinned at +10 %, besides the 3-level chain at 320×180 (211).
+
+**Gates at M1 close** (Dev machine, 1080p headless):
+
+| gate | measured | status |
+|---|---|---|
+| Hdr minimal over Direct, CPU ≤ +20 µs | `frame/ab`, round 1, with the seed window: +13.2, +14.9, +14.9, +15.3, +16.6 µs (load 6–7); the same build still copying the seeds every frame: +13.8 to +18.4 µs (load 5–6); the review: +19.3 to +31.8 µs, 4 of 5 runs over (load 7–22) | met on a quiet machine with little margin; heavy load pushes it over. The composite's extra render pass is most of it |
+| Hdr minimal over Direct, GPU ≤ +0.10 ms | +31.9 to +37.8 µs throughput with the seed window (+55.6 to +59.9 µs with the per-frame seed copy) | met |
+| bloom 6 mips @1080p ≤ 0.20 ms | 0.150–0.159 ms, 3 of 3 invocations (device utilization ≈ 40 %); the review: 0.222–0.261 ms, 0 of 3, with another app keeping the GPU 49–57 % busy | met on an idle GPU; a shared GPU pushes it over |
+| Battle CPU "post ≤ 0.05 ms" | bloom alone 0.15–0.17 ms of thread CPU per post group | **not met** (compute chain after M1) |
+
+In real frames bloom costs more GPU than the isolated chain the gate times: `hdr_bloom` minus
+`hdr_minimal` throughput measured +244 µs at load 7.6 and +384 µs at load 40 in the review
+(the chain plus the composite's bloom reads, against a GPU shared with other work).
+
+**Particles.** Emitters moved after the tick get a render-time bridge (particles.md "Time
+model"): about 60 ns per bridged glow on one thread — 63 µs for 20 bolts at 3200 units/s moved
+a frame after the tick — and, on the GPU backend, one direct draw and a small upload per frame
+(`tests/alloc.rs`: 307 allocations per frame, was 304).
