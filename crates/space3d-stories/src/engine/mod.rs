@@ -15,7 +15,10 @@ mod showcase;
 
 use crate::Storybook;
 use space3d_core::prelude::*;
-use space3d_render::{AmbientLight, Camera3d, DirectionalLight, MeshHandle, Projection, RenderAssets};
+use space3d_render::{
+    AmbientLight, Camera3d, DirectionalLight, Material, Mesh3d, MeshHandle, Projection, RenderAssets, RenderTargetDesc,
+    Renderer, TextureHandle,
+};
 
 /// Linear clear color shared by the engine stories.
 pub(super) const CLEAR: Vec4 = Vec4::new(0.012, 0.015, 0.024, 1.0);
@@ -58,6 +61,57 @@ pub(super) fn sun(app: &mut App, direction: Vec3, intensity: f32) {
             intensity,
         },
     ));
+}
+
+/// A render target the size of the primary target (320 × 180 before a renderer exists), shown
+/// full-screen by the primary camera: a quad at `at`, far from the story's scene, and an
+/// orthographic camera looking at it. For stories that render their scene into a render target
+/// (MSAA is chosen per render target). A system keeps its size, and the quad's aspect, in step
+/// with the primary target: the gallery and the editor's viewer render stories at other sizes
+/// than their goldens, and the scene must not be an upscaled 320 × 180 image there.
+pub(super) fn screen_target(app: &mut App, desc: RenderTargetDesc, at: Vec3, clear: Vec4) -> TextureHandle {
+    let size = app.resources.get::<Renderer>().map_or((320, 180), Renderer::size);
+    let rt = app
+        .resources
+        .init::<RenderAssets>()
+        .add_render_target_with(size.0, size.1, desc);
+    let plane = mesh(app, MeshData::plane(1.0));
+    let aspect = |(w, h): (u32, u32)| w.max(1) as f32 / h.max(1) as f32;
+    let quad = app.world.spawn((
+        Transform::from_xyz(at.x, at.y, at.z)
+            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::new(2.0 * aspect(size), 1.0, 2.0)),
+        Mesh3d(plane),
+        Material::unlit(Vec4::ONE).with_texture(rt),
+    ));
+    app.world.spawn((
+        Name("camera".into()),
+        Transform::from_xyz(at.x, at.y, at.z + 5.0),
+        Camera3d::default()
+            .with_clear_color(clear)
+            .with_projection(Projection::Orthographic {
+                height: 2.0,
+                near: 0.1,
+                far: 10.0,
+            }),
+    ));
+    let mut current = size;
+    app.add_system(Stage::PreUpdate, move |ctx: &mut SystemCtx| {
+        let Some(size) = ctx.resources.get::<Renderer>().map(Renderer::size) else {
+            return;
+        };
+        if size == current {
+            return;
+        }
+        current = size;
+        if let Some(assets) = ctx.resources.get_mut::<RenderAssets>() {
+            assets.resize_render_target(rt, size.0, size.1);
+        }
+        if let Ok(mut t) = ctx.world.get::<&mut Transform>(quad) {
+            t.scale.x = 2.0 * aspect(size);
+        }
+    });
+    rt
 }
 
 pub(super) fn ambient(app: &mut App, intensity: f32) {

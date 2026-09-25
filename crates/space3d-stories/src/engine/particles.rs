@@ -6,8 +6,8 @@
 //! `engine`). Effects are driven by the fixed tick only, so every story is deterministic for its
 //! tick count and doubles as a golden screenshot.
 
-use super::{ambient, mesh, sun};
-use crate::Story;
+use super::{ambient, mesh, screen_target, sun};
+use crate::{KnobValues, Story};
 use space3d_core::prelude::*;
 use space3d_particles::prelude::*;
 use space3d_particles::{
@@ -15,20 +15,25 @@ use space3d_particles::{
     SimulationSpace, Spawn, SpriteRender, SpriteShape,
 };
 use space3d_render::{
-    Camera3d, DownlevelOverride, FrameSettings, Material, Mesh3d, PostProcess, Projection, RenderAssets, RenderTarget,
+    Camera3d, DownlevelOverride, FrameSettings, Material, Mesh3d, PostProcess, Projection, RenderTarget,
     RenderTargetDesc, Tonemapper,
 };
 
 /// This area's stories, in registry order.
 pub(crate) fn stories() -> Vec<Story> {
-    vec![
-        explosion(),
-        hit_spark(),
-        engine_exhaust(),
-        shield_ripple(),
-        warp_in(),
-        warp_out(),
-        laser_trail(),
+    let builtins = |hdr| {
+        [
+            explosion(hdr),
+            hit_spark(hdr),
+            engine_exhaust(hdr),
+            shield_ripple(hdr),
+            warp_in(hdr),
+            warp_out(hdr),
+            laser_trail(hdr),
+        ]
+    };
+    let mut stories: Vec<Story> = builtins(false).into_iter().chain(builtins(true)).collect();
+    stories.extend([
         blend_modes(),
         soft_particles(),
         shapes(),
@@ -37,7 +42,56 @@ pub(crate) fn stories() -> Vec<Story> {
         local_vs_world(),
         cpu_backend(),
         stress_100k(),
-    ]
+    ]);
+    stories
+}
+
+/// Tonemappers of the HDR variants' `tonemapper` knob.
+const LOOKS: [&str; 3] = ["AgX (default)", "AgX (punchy)", "ACES (fitted)"];
+
+/// A built-in effect's story: `Engine/Particles/Builtin/<name>` in Direct mode (no post: the
+/// particles soft-clip themselves), or with `hdr` `Engine/Particles/HDR/<name>`, the same scene
+/// through `PostProcess::default()` — the HDR scene texture, AgX and bloom: what a game with
+/// post shows.
+fn builtin_story(
+    name: &str,
+    hdr: bool,
+    setup: impl Fn(&mut App, &KnobValues) -> Entity + Send + Sync + 'static,
+) -> Story {
+    let area = if hdr { "HDR" } else { "Builtin" };
+    let story = Story::new(format!("Engine/Particles/{area}/{name}"), move |app, k| {
+        let cam = setup(app, k);
+        if hdr {
+            let tonemapper = match k.choice("tonemapper") {
+                1 => Tonemapper::AgXPunchy,
+                2 => Tonemapper::AcesFitted,
+                _ => Tonemapper::AgX,
+            };
+            let mut post = PostProcess::default().with_tonemapper(tonemapper);
+            if !k.bool("bloom") {
+                post = post.without_bloom();
+            }
+            let _ = app.world.insert_one(cam, post);
+        }
+    });
+    if hdr {
+        story.knob_choice("tonemapper", &LOOKS, 0).knob_bool("bloom", true)
+    } else {
+        story
+    }
+}
+
+/// The description of a built-in's story (`what`), with the HDR variant's note.
+fn builtin_description(what: &str, hdr: bool) -> String {
+    if hdr {
+        format!(
+            "{what} Rendered through `PostProcess::default()` (HDR scene texture, AgX, bloom): the \
+             look a game with post gets (`Builtin/*` shows Direct mode's soft clip); `tonemapper` \
+             switches to AgX's punchy look or ACES, `bloom` turns the glow off for comparison."
+        )
+    } else {
+        what.to_string()
+    }
 }
 
 /// Deep-space backdrop of the particle stories (linear).
@@ -133,8 +187,8 @@ fn circling_ship(app: &mut App, radius: f32, speed: f32, throttle: f32) -> Entit
     ship
 }
 
-fn explosion() -> Story {
-    Story::new("Engine/Particles/Builtin/Explosion", |app, k| {
+fn explosion(hdr: bool) -> Story {
+    builtin_story("Explosion", hdr, |app, k| {
         plugin(
             app,
             ParticleSettings {
@@ -144,36 +198,32 @@ fn explosion() -> Story {
         );
         lights(app);
         let cam = top_camera(app, 200.0);
-        if k.bool("hdr") {
-            let post = PostProcess::default().with_tonemapper(Tonemapper::AgX);
-            let _ = app.world.insert_one(cam, post);
-        }
         app.spawn_effect(
             builtin::EXPLOSION,
             EffectSpawn::at(Vec3::ZERO).scale(k.f32("scale")).seed(1),
         );
+        cam
     })
-    .description(
+    .description(builtin_description(
         "`builtin::EXPLOSION`, one call: `spawn_effect(builtin::EXPLOSION, EffectSpawn::at(p).scale(s))`. \
          A white-hot flash and afterglow, fireball billows (premultiplied smoke puffs whose light \
          burns out while their coverage holds), a hot core, sparks stretched along their velocity, \
          flickering embers, two shockwave rings on the flight plane and dark smoke rolling out \
-         (0.3 s in). `quality` scales the spawn counts of the LOD layers; `hdr` renders through \
-         the HDR scene texture and AgX instead of Direct mode's soft clip.",
-    )
+         (0.3 s in). `quality` scales the spawn counts of the LOD layers.",
+        hdr,
+    ))
     .knob_f32("scale", 1.0, 0.25..=3.0)
     .knob_f32("quality", 1.0, 0.0..=1.0)
-    .knob_bool("hdr", false)
     .tag("particles")
     .size(320, 180)
     .ticks(18)
 }
 
-fn hit_spark() -> Story {
-    Story::new("Engine/Particles/Builtin/Hit Spark", |app, k| {
+fn hit_spark(hdr: bool) -> Story {
+    builtin_story("Hit Spark", hdr, |app, k| {
         plugin(app, ParticleSettings::default());
         lights(app);
-        top_camera(app, 110.0);
+        let cam = top_camera(app, 110.0);
         hull(app, Transform::IDENTITY.with_rotation(Quat::from_rotation_y(0.6)));
         let tint = Vec4::from_array(k.color("color"));
         // Bolts from the left hit the hull's side: sparks fly back toward the shooter.
@@ -190,43 +240,47 @@ fn hit_spark() -> Story {
                 EffectSpawn::at(p).facing(from).tint(tint).seed(i as u32),
             );
         }
+        cam
     })
-    .description(
+    .description(builtin_description(
         "`builtin::HIT_SPARK`, spawned with `.facing(toward_the_shooter).tint(laser_color)`: a \
          flash, sparks thrown back toward the shooter (velocity-stretched streaks), a small ring \
          on the emitter's plane and two puffs of smoke; three hits on a hull, 0.1 s in.",
-    )
+        hdr,
+    ))
     .knob_color("color", [1.0, 0.35, 0.25, 1.0])
     .tag("particles")
     .size(320, 180)
     .ticks(5)
 }
 
-fn engine_exhaust() -> Story {
-    Story::new("Engine/Particles/Builtin/Engine Exhaust", |app, k| {
+fn engine_exhaust(hdr: bool) -> Story {
+    builtin_story("Engine Exhaust", hdr, |app, k| {
         plugin(app, ParticleSettings::default());
         lights(app);
-        top_camera(app, 190.0);
+        let cam = top_camera(app, 190.0);
         circling_ship(app, 55.0, 0.03, k.f32("throttle"));
+        cam
     })
-    .description(
+    .description(builtin_description(
         "`builtin::ENGINE_EXHAUST` on two nozzles of a ship flying a circle (the emitters are \
          children of the hull, `EffectSpawn::follow(ship)`): a blue plume inheriting part of the \
          ship's velocity, sparks, and a local-space glow riding the nozzle. Emission is spread \
          over each tick's motion, so the plume never clumps; `throttle` drives \
          `ParticleEmitter::rate_scale` (0..2).",
-    )
+        hdr,
+    ))
     .knob_f32("throttle", 1.0, 0.0..=2.0)
     .tag("particles")
     .size(320, 180)
     .ticks(90)
 }
 
-fn shield_ripple() -> Story {
-    Story::new("Engine/Particles/Builtin/Shield Ripple", |app, k| {
+fn shield_ripple(hdr: bool) -> Story {
+    builtin_story("Shield Ripple", hdr, |app, k| {
         plugin(app, ParticleSettings::default());
         lights(app);
-        top_camera(app, 150.0);
+        let cam = top_camera(app, 150.0);
         let ship = hull(app, Transform::IDENTITY.with_rotation(Quat::from_rotation_y(0.3)));
         let radius = k.f32("radius");
         // A bolt from the left (travelling +X) hits the shield: the arc faces the shooter.
@@ -238,58 +292,66 @@ fn shield_ripple() -> Story {
                 .follow(ship)
                 .seed(4),
         );
+        cam
     })
-    .description(
+    .description(builtin_description(
         "`builtin::SHIELD_RIPPLE` around a ship, spawned at the shield center with \
          `.facing(-bolt_direction).scale(radius / 20).follow(ship)`: an arc brightest toward the \
          shooter, a faint full bubble, a flash on the shield surface and tangent streaks \
          (0.07 s in). The rings are local-space: they stay on a moving ship.",
-    )
+        hdr,
+    ))
     .knob_f32("radius", 30.0, 10.0..=60.0)
     .tag("particles")
     .size(320, 180)
     .ticks(4)
 }
 
-fn warp_in() -> Story {
-    Story::new("Engine/Particles/Builtin/Warp In", |app, _| {
+fn warp_in(hdr: bool) -> Story {
+    builtin_story("Warp In", hdr, |app, _| {
         plugin(app, ParticleSettings::default());
         lights(app);
-        top_camera(app, 380.0);
+        let cam = top_camera(app, 380.0);
         app.spawn_effect(builtin::WARP_IN, EffectSpawn::at(Vec3::ZERO).seed(5));
+        cam
     })
-    .description(
+    .description(builtin_description(
         "`builtin::WARP_IN`: a vortex collapsing inward while streaks rush to the center, then a \
          flash and two expanding rings as the ship appears (0.35 s in).",
-    )
+        hdr,
+    ))
     .tag("particles")
     .size(320, 180)
     .ticks(21)
 }
 
-fn warp_out() -> Story {
-    Story::new("Engine/Particles/Builtin/Warp Out", |app, _| {
+fn warp_out(hdr: bool) -> Story {
+    builtin_story("Warp Out", hdr, |app, _| {
         plugin(app, ParticleSettings::default());
         lights(app);
-        top_camera(app, 380.0);
+        let cam = top_camera(app, 380.0);
         app.spawn_effect(builtin::WARP_OUT, EffectSpawn::at(Vec3::ZERO).seed(6));
+        cam
     })
-    .description(
+    .description(builtin_description(
         "`builtin::WARP_OUT`: a flash, a vortex opening outward, two expanding rings and streaks \
          rushing out of the center (0.2 s in).",
-    )
+        hdr,
+    ))
     .tag("particles")
     .size(320, 180)
     .ticks(12)
 }
 
-fn laser_trail() -> Story {
-    Story::new("Engine/Particles/Builtin/Laser Trail", |app, k| {
+fn laser_trail(hdr: bool) -> Story {
+    builtin_story("Laser Trail", hdr, |app, k| {
         plugin(app, ParticleSettings::default());
         lights(app);
-        top_camera(app, 240.0);
+        let cam = top_camera(app, 240.0);
         let tint = Vec4::from_array(k.color("color"));
         // Two bolts at 1500 units/s, the trail following each (it drains when a bolt is gone).
+        // Their movement is a gameplay system added after `ParticlesPlugin`: the particle tick
+        // still runs after it (`ParticlesPlugin::TICK_ORDER`), so the trail ends at the head.
         for (i, (start, dir)) in [
             (Vec3::new(-300.0, 0.0, -30.0), Vec3::new(1.0, 0.0, 0.1)),
             (Vec3::new(280.0, 0.0, 50.0), Vec3::new(-1.0, 0.0, -0.25)),
@@ -312,13 +374,17 @@ fn laser_trail() -> Story {
                 }
             });
         }
+        cam
     })
-    .description(
+    .description(builtin_description(
         "`builtin::LASER_TRAIL` following two bolts at 1500 units/s (`EffectSpawn::at(muzzle)\
-         .follow(bolt).tint(color)`): a head glow riding the bolt and glows laid along its path \
-         per unit of distance, spread over each tick's motion so the trail stays continuous.",
-    )
-    .knob_color("color", [1.0, 0.3, 0.2, 1.0])
+         .follow(bolt).tint(color)`): a white-hot head riding the bolt and a continuous beam of \
+         glows laid along its path per unit of distance, spread over each tick's motion. The \
+         bolts move in a gameplay system; the particle tick runs after it, so the trail ends at \
+         the head.",
+        hdr,
+    ))
+    .knob_color("color", [1.0, 0.1, 0.05, 1.0])
     .tag("particles")
     .size(320, 180)
     .ticks(13)
@@ -410,11 +476,11 @@ fn soft_particles() -> Story {
         // The scene renders into a render target with the knob's sample count (a story can
         // only choose MSAA per render target), shown full-screen by the primary camera.
         let samples = if k.choice("msaa") == 1 { 4 } else { 1 };
-        let (w, h) = (320, 180);
-        let rt = app.resources.init::<RenderAssets>().add_render_target_with(
-            w,
-            h,
+        let rt = screen_target(
+            app,
             RenderTargetDesc::default().with_samples(samples),
+            Vec3::new(0.0, -2000.0, 0.0),
+            SPACE,
         );
         app.insert_resource(FrameSettings::default().with_downlevel(DownlevelOverride {
             no_read_only_depth: k.bool("no_read_only_depth"),
@@ -485,26 +551,6 @@ fn soft_particles() -> Story {
                 target: RenderTarget::Texture(rt),
                 ..Camera3d::default().with_clear_color(SPACE)
             },
-        ));
-        // The render target on a full-screen quad, far from the scene.
-        let screen = mesh(app, MeshData::plane(1.0));
-        app.world.spawn((
-            Transform::from_xyz(0.0, -2000.0, 0.0)
-                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
-                .with_scale(Vec3::new(2.0 * w as f32 / h as f32, 1.0, 2.0)),
-            Mesh3d(screen),
-            Material::unlit(Vec4::ONE).with_texture(rt),
-        ));
-        app.world.spawn((
-            Name("camera".into()),
-            Transform::from_xyz(0.0, -2000.0, 5.0),
-            Camera3d::default()
-                .with_clear_color(SPACE)
-                .with_projection(Projection::Orthographic {
-                    height: 2.0,
-                    near: 0.1,
-                    far: 10.0,
-                }),
         ));
     })
     .description(

@@ -8,7 +8,7 @@ mod demo;
 #[cfg(feature = "particles")]
 mod particle_bloom;
 
-use super::{ambient, mesh, palette, sun};
+use super::{ambient, mesh, palette, screen_target, sun};
 use crate::{KnobValues, Story};
 use demo::{AdditiveSprites, Band, BandKind, Particle, PhaseBands, SoftParticles, Sprite};
 use space3d_core::prelude::*;
@@ -35,12 +35,13 @@ pub(crate) fn stories() -> Vec<Story> {
     stories
 }
 
-const TONEMAPPERS: [&str; 5] = [
+const TONEMAPPERS: [&str; 6] = [
     "AgX",
     "ACES (fitted)",
     "Reinhard",
     "Khronos PBR Neutral",
     "None (clamp)",
+    "AgX (punchy)",
 ];
 
 fn tonemapper(k: &KnobValues) -> Tonemapper {
@@ -49,6 +50,7 @@ fn tonemapper(k: &KnobValues) -> Tonemapper {
         1 => Tonemapper::AcesFitted,
         2 => Tonemapper::Reinhard,
         3 => Tonemapper::KhronosPbrNeutral,
+        5 => Tonemapper::AgXPunchy,
         _ => Tonemapper::None,
     }
 }
@@ -452,11 +454,11 @@ fn soft_depth() -> Story {
         // is set on its renderer; a story can only choose it per render target), shown
         // full-screen by the primary camera.
         let samples = if k.choice("msaa") == 1 { 4 } else { 1 };
-        let (w, h) = (320, 180);
-        let rt = app.resources.init::<RenderAssets>().add_render_target_with(
-            w,
-            h,
+        let rt = screen_target(
+            app,
             RenderTargetDesc::default().with_samples(samples),
+            Vec3::new(0.0, -100.0, 0.0),
+            SPACE,
         );
         app.insert_resource(FrameSettings::default().with_downlevel(DownlevelOverride {
             no_read_only_depth: k.bool("no_read_only_depth"),
@@ -503,27 +505,6 @@ fn soft_depth() -> Story {
                 target: RenderTarget::Texture(rt),
                 ..Camera3d::default().with_clear_color(SPACE)
             },
-        ));
-        // The render target on a full-screen quad, far from the scene.
-        let screen = mesh(app, MeshData::plane(1.0));
-        let aspect = w as f32 / h as f32;
-        app.world.spawn((
-            at(Vec3::new(0.0, -100.0, 0.0))
-                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
-                .with_scale(Vec3::new(2.0 * aspect, 1.0, 2.0)),
-            Mesh3d(screen),
-            Material::unlit(Vec4::ONE).with_texture(rt),
-        ));
-        app.world.spawn((
-            Name("camera".into()),
-            Transform::from_xyz(0.0, -100.0, 5.0),
-            Camera3d::default()
-                .with_clear_color(SPACE)
-                .with_projection(Projection::Orthographic {
-                    height: 2.0,
-                    near: 0.1,
-                    far: 10.0,
-                }),
         ));
     })
     .description(
@@ -593,7 +574,7 @@ fn overlay_stages() -> Story {
     .description(
         "The same additive sprites (intensity 0.5 to 16) as overlays over a post-processed scene: \
          left through `OverlayStage::HdrScene`, into the HDR scene color before post (exposed and \
-         tonemapped with the scene; bloomed once bloom exists), right through the default \
+         tonemapped and bloomed with the scene), right through the default \
          `AfterTonemap` stage, soft-clipped by the overlay itself as 249c874-era overlays do.",
     )
     .knob_f32("intensity", 1.0, 0.0..=4.0)
