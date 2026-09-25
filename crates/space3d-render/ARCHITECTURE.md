@@ -33,7 +33,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  RenderAssets.pending ──► upload_assets_into ──► mesh arena (staging ring)
                                               └► textures (write_texture + GPU mip blit)
 
- World ──┬─ lights (DirectionalLight ≤4, PointLight ≤16) ─────────────► GpuView (per camera)
+ World ──┬─ lights (DirectionalLight ≤4, PointLight: 16 nearest per view) ─► GpuView (per camera)
          ├─ cameras (Camera3d + GlobalTransform, sorted by order) ─────► views + frustums
          ├─ ECS: (GlobalTransform, Mesh3d, Material, Visibility?) — archetype columns
          │      intern Material → id (cached) ; key = class|material|mesh   (serial)
@@ -113,8 +113,12 @@ splices them into `forward.wgsl` (`instance_model`, `instance_color`, `instance_
 `instance_layer`, `instance_custom0..3` plus one per declared `Custom(n)`). `validate()`
 enforces WebGPU's rules (offset aligned to `min(4, format size)`, each semantic once) and at
 most 12 instance shader locations (16 vertex attributes, 4 used by the mesh). Pipelines are
-cached by `(layout, class, format, samples, manual_srgb, layered, custom shader + version)`
-(`layered`: the material texture is an array, see Textures). `Unorm8x4Bgra`
+cached by `PipelineKey` `(layout, class, format, samples, output encoding, texture kinds,
+custom shader + version, pass kind, frame-wide overrides)` (`kinds` bit 0: the material texture
+is an array, see Textures) and shader modules by `(layout, kinds, ext stream, pass kind, custom
+shader)`: the output encoding (`S3D_OUTPUT`, and the legacy `MANUAL_SRGB` flag custom shaders
+read) and the other `S3D_*` switches are WGSL `override` constants specialized per pipeline,
+so one module serves every output. `Unorm8x4Bgra`
 attributes are fetched as `Unorm8x4` and swizzled in the generated shader: wgpu's GL backend
 passes `GL_BGRA` as the component count, which WebGL2/GLES reject.
 Built-ins: `InstanceTransform` (64 B), `InstanceTransformColor` (80 B), `InstanceCompact`
@@ -638,7 +642,8 @@ instances, 2 views) are unchanged within noise (25 → 9 dispatches).
 
 ## Known limitations
 * No shadows, IBL or post-processing; lighting is metallic/roughness Blinn-Phong with Schlick
-  Fresnel, 4 directional + 16 point lights.
+  Fresnel, 4 directional + 16 point lights per view (with more, the 16 nearest to the view's
+  camera, in query order; with at most 16, every light in query order).
 * After a `Lost` surface the platform runner attaches a new one on a later redraw (throttled
   to once per second), so the window can stay blank briefly.
 * Layer indices past a texture array's last layer sample the unused padding layer on GL for

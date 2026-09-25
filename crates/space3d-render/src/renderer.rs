@@ -158,9 +158,15 @@ pub(crate) struct Attachments {
     pub color_view: Option<wgpu::TextureView>,
     pub msaa_view: Option<wgpu::TextureView>,
     pub depth_view: wgpu::TextureView,
+    /// A multisampled depth texture here is sampleable (`GraphicsCaps::msaa_depth_resolve`).
+    pub msaa_depth_binding: bool,
 }
 
 impl Attachments {
+    /// Color (offscreen only), MSAA color and depth attachments. The depth texture can be
+    /// sampled (`TEXTURE_BINDING`, graphics spec §1.6) at 1 sample, and multisampled only with
+    /// `msaa_depth_binding` (`GraphicsCaps::msaa_depth_resolve`: GL cannot sample multisampled
+    /// depth, and a sampled depth texture there is a texture instead of a renderbuffer).
     pub fn new(
         device: &wgpu::Device,
         width: u32,
@@ -168,6 +174,7 @@ impl Attachments {
         samples: u32,
         format: wgpu::TextureFormat,
         offscreen: bool,
+        msaa_depth_binding: bool,
     ) -> Self {
         let size = wgpu::Extent3d {
             width: width.max(1),
@@ -205,17 +212,18 @@ impl Attachments {
             )
             .create_view(&Default::default())
         });
-        let depth = tex(
-            "space3d depth",
-            DEPTH_FORMAT,
-            samples,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
+        let depth_usage = if samples == 1 || msaa_depth_binding {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
+        let depth = tex("space3d depth", DEPTH_FORMAT, samples, depth_usage);
         Self {
             width: size.width,
             height: size.height,
             samples,
             format,
+            msaa_depth_binding,
             color_view: color.as_ref().map(|c| c.create_view(&Default::default())),
             color,
             msaa_view,
@@ -245,7 +253,15 @@ impl SurfaceState {
         self.view_format = self.config.format;
         self.manual_srgb = !self.view_format.is_srgb();
         let a = &self.attachments;
-        self.attachments = Attachments::new(device, a.width, a.height, a.samples, self.view_format, false);
+        self.attachments = Attachments::new(
+            device,
+            a.width,
+            a.height,
+            a.samples,
+            self.view_format,
+            false,
+            a.msaa_depth_binding,
+        );
         self.surface.configure(device, &self.config);
     }
 }
@@ -514,6 +530,7 @@ impl Renderer {
         config.msaa_samples = if config.msaa_samples > 1 { caps.max_msaa } else { 1 };
         (config.width, config.height) =
             target_size(config.width, config.height, device.limits().max_texture_dimension_2d);
+        let graphics = crate::caps::GraphicsCaps::detect(&adapter, &device, &caps);
         let offscreen = Attachments::new(
             &device,
             config.width,
@@ -521,6 +538,7 @@ impl Renderer {
             config.msaa_samples,
             OFFSCREEN_FORMAT,
             true,
+            graphics.msaa_depth_resolve,
         );
         let pipelines = Pipelines::new(&device, caps.compute && caps.indirect);
         let white = white_texture(&device, &queue);
@@ -528,7 +546,6 @@ impl Renderer {
         let white_sampler = samplers.get(&device, Default::default());
         let frame = FrameState::new(&caps, &device);
         let uploader = Uploader::new(&device);
-        let graphics = crate::caps::GraphicsCaps::detect(&adapter, &device, &caps);
         let layouts = crate::node::FrameLayouts::new(&device, &pipelines.view_bgl);
         let gpu_timings = crate::timing::GpuTimings {
             supported: graphics.timestamps,
@@ -611,7 +628,15 @@ impl Renderer {
             1
         };
         // The MSAA and depth attachments are separate textures: they use the view format.
-        let attachments = Attachments::new(&self.device, config.width, config.height, samples, view_format, false);
+        let attachments = Attachments::new(
+            &self.device,
+            config.width,
+            config.height,
+            samples,
+            view_format,
+            false,
+            self.graphics.msaa_depth_resolve,
+        );
         self.surface = Some(SurfaceState {
             surface,
             view_format,
@@ -657,7 +682,15 @@ impl Renderer {
             s.config.width = width;
             s.config.height = height;
             s.surface.configure(&self.device, &s.config);
-            s.attachments = Attachments::new(&self.device, width, height, s.attachments.samples, s.view_format, false);
+            s.attachments = Attachments::new(
+                &self.device,
+                width,
+                height,
+                s.attachments.samples,
+                s.view_format,
+                false,
+                self.graphics.msaa_depth_resolve,
+            );
         }
     }
 
@@ -682,7 +715,15 @@ impl Renderer {
         let (w, h, samples) = (w.max(1), h.max(1), self.config.msaa_samples);
         let a = &self.offscreen;
         if (a.width, a.height, a.samples) != (w, h, samples) {
-            self.offscreen = Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
+            self.offscreen = Attachments::new(
+                &self.device,
+                w,
+                h,
+                samples,
+                OFFSCREEN_FORMAT,
+                true,
+                self.graphics.msaa_depth_resolve,
+            );
         }
     }
 
@@ -708,6 +749,7 @@ impl Renderer {
                 samples,
                 s.view_format,
                 false,
+                self.graphics.msaa_depth_resolve,
             );
         }
     }

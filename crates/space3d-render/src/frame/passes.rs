@@ -2,6 +2,7 @@
 //! the clear of a window nothing drew to, and the windowed-capture replay.
 
 use super::views::{ViewData, ViewTarget};
+use crate::output::OutputEncoding;
 use crate::pipeline::OFFSCREEN_FORMAT;
 use crate::renderer::Renderer;
 use glam::Vec4;
@@ -94,6 +95,13 @@ impl Renderer {
                     .any(|v| matches!(&v.target, ViewTarget::Texture { handle: h, .. } if h == handle)),
             };
             presented |= is_primary;
+            // The view's encoding, except that only manual-sRGB attachments get manual sRGB (a
+            // capture replay of a manual-sRGB window draws into the sRGB offscreen target).
+            let output = match view.output {
+                OutputEncoding::ManualSrgb | OutputEncoding::Linear if manual_srgb => OutputEncoding::ManualSrgb,
+                OutputEncoding::ManualSrgb => OutputEncoding::Linear,
+                other => other,
+            };
             self.encode_pass(
                 encoder,
                 view,
@@ -103,7 +111,7 @@ impl Renderer {
                 &depth,
                 format,
                 samples,
-                manual_srgb,
+                output,
             );
         }
         // Nothing drew to the window: still clear it so stale content is not shown.
@@ -153,7 +161,7 @@ impl Renderer {
         depth: &wgpu::TextureView,
         format: wgpu::TextureFormat,
         samples: u32,
-        manual_srgb: bool,
+        output: OutputEncoding,
     ) {
         let rect = view.rect;
         let full = rect.is_none_or(|r| r.covers(view.size));
@@ -162,7 +170,11 @@ impl Renderer {
         // rect outside it would fail validation and lose the whole frame's commands.
         let extent = (color.texture().width(), color.texture().height());
         let clear = view.clear.map(|c| {
-            let c = if manual_srgb { linear_to_srgb_color(c) } else { c };
+            let c = if output == OutputEncoding::ManualSrgb {
+                linear_to_srgb_color(c)
+            } else {
+                c
+            };
             wgpu::Color {
                 r: c.x as f64,
                 g: c.y as f64,
@@ -206,7 +218,7 @@ impl Renderer {
             pass.set_blend_constant(c);
             pass.draw(0..3, 0..1);
         }
-        self.encode_draws(&mut pass, view, format, samples, manual_srgb);
+        self.encode_draws(&mut pass, view, format, samples, output);
         if rect.is_some() && resolve.is_some() {
             // wgpu's GL backend resolves MSAA with a framebuffer blit at the end of the pass,
             // and GL clips blits to the scissor rect: only the viewport would be resolved, and

@@ -4,11 +4,13 @@
 
 use super::instance::{instance_attributes, instance_wgsl};
 use super::{
-    CLASS_BLEND, CLASS_DOUBLE_SIDED, DEPTH_FORMAT, ModuleKey, PipelineKey, Pipelines, parse_and_validate,
-    sampled_view_dimension, texture_entry, uniform_entry,
+    CLASS_BLEND, CLASS_DOUBLE_SIDED, DEPTH_FORMAT, KIND_COLOR_LAYERED, KIND_DATA_LAYERED, ModuleKey, PipelineKey,
+    Pipelines, VIEW_STRUCTS, output_constants, parse_and_validate, sampled_view_dimension, texture_entry,
+    uniform_entry,
 };
 use crate::arena::{VERTEX_ATTRIBUTES, VERTEX_SIZE};
 use crate::instance::InstanceLayout;
+use crate::output::{OUTPUT_WGSL, OutputEncoding};
 use crate::shader::{CustomShader, hooks_wgsl};
 use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
@@ -40,22 +42,28 @@ pub(super) fn texture_wgsl(layered: bool) -> &'static str {
     }
 }
 
-/// Full forward shader source for a layout, material texture kind and custom shader.
-pub(crate) fn forward_shader(
-    layout: &InstanceLayout,
-    manual_srgb: bool,
-    layered: bool,
-    custom: Option<&CustomShader>,
-) -> String {
+/// Full forward shader source for an instance layout, texture kinds (`PipelineKey::kinds`), the
+/// extension vertex stream and a custom shader. The output encoding and the other pipeline
+/// overrides are not part of the source (see `PipelineKey::constants`).
+pub(crate) fn forward_shader(layout: &InstanceLayout, kinds: u8, ext: bool, custom: Option<&CustomShader>) -> String {
     let varyings = if custom.is_some() {
         "    @location(5) custom: vec4<f32>,"
     } else {
         ""
     };
+    let color_layered = kinds & KIND_COLOR_LAYERED != 0;
+    let data_layered = kinds & KIND_DATA_LAYERED != 0;
+    let consts = format!(
+        "const S3D_COLOR_LAYERED: bool = {color_layered};\n\
+         const S3D_DATA_LAYERED: bool = {data_layered};\n\
+         const S3D_EXT: bool = {ext};"
+    );
     // The user's code is spliced in last, so markers inside it are left alone.
     FORWARD_TEMPLATE
-        .replace("//#CONSTS", &format!("const MANUAL_SRGB: bool = {manual_srgb};"))
-        .replace("//#TEXTURE", texture_wgsl(layered))
+        .replace("//#CONSTS", &consts)
+        .replace("//#VIEW", VIEW_STRUCTS)
+        .replace("//#OUTPUT", OUTPUT_WGSL)
+        .replace("//#TEXTURE", texture_wgsl(color_layered))
         .replace("//#INSTANCE", &instance_wgsl(layout))
         .replace("//#VARYINGS", varyings)
         .replace("//#HOOKS", &hooks_wgsl(custom))
@@ -122,11 +130,24 @@ pub(super) fn gles3_translation_error(module: &naga::Module, info: &naga::valid:
         binding_map: Default::default(),
         zero_initialize_workgroup_memory: true,
     };
-    let constants = naga::back::PipelineConstants::default();
-    for (stage, entry_point) in [
-        (naga::ShaderStage::Vertex, "vs_main"),
-        (naga::ShaderStage::Fragment, "fs_main"),
-    ] {
+    // Every output encoding: the fragment tail differs per `S3D_OUTPUT` value.
+    let outputs = [
+        OutputEncoding::Linear,
+        OutputEncoding::ManualSrgb,
+        OutputEncoding::Tonemapped,
+    ];
+    let stages = outputs.into_iter().flat_map(|output| {
+        [
+            (naga::ShaderStage::Vertex, "vs_main", output),
+            (naga::ShaderStage::Fragment, "fs_main", output),
+        ]
+    });
+    for (stage, entry_point, output) in stages {
+        let key_constants = output_constants(output);
+        let constants: naga::back::PipelineConstants = key_constants.0[..key_constants.1]
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
         let translated =
             naga::back::pipeline_constants::process_overrides(module, info, Some((stage, entry_point)), &constants)
                 .map_err(|e| e.to_string())
@@ -143,7 +164,7 @@ pub(super) fn gles3_translation_error(module: &naga::Module, info: &naga::valid:
                         .map_err(|e| e.to_string())
                 });
         if let Err(e) = translated {
-            return Some(format!("{stage:?} stage: {e}"));
+            return Some(format!("{stage:?} stage ({output:?} output): {e}"));
         }
     }
     None
@@ -294,12 +315,13 @@ impl Pipelines {
         String,
     > {
         let layout = self.layouts[key.layout as usize];
-        let module_key = (key.layout, key.manual_srgb, key.layered, key.shader);
+        let module_key = key.module_key();
         let cached = self.shaders.get(&module_key).cloned();
         let source = match cached {
             Some(_) => None,
             None => {
-                let source = forward_shader(layout, key.manual_srgb, key.layered, custom.map(|c| &**c));
+                let (_, kinds, ext, _, _) = module_key;
+                let source = forward_shader(layout, kinds, ext, custom.map(|c| &**c));
                 if custom.is_some() {
                     validate_custom_wgsl(&source)?;
                 }
@@ -329,9 +351,10 @@ impl Pipelines {
         };
         let inst_attrs = instance_attributes(layout);
         let blend = key.class & CLASS_BLEND != 0;
+        let (constants, n) = key.constants();
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(layout.name),
-            layout: Some(&self.layouts_by_texture[key.layered as usize]),
+            layout: Some(&self.layouts_by_texture[(key.kinds & KIND_COLOR_LAYERED) as usize]),
             vertex: wgpu::VertexState {
                 module: &module,
                 entry_point: Some("vs_main"),
@@ -373,7 +396,10 @@ impl Pipelines {
             fragment: Some(wgpu::FragmentState {
                 module: &module,
                 entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants[..n],
+                    ..Default::default()
+                },
                 targets: &[Some(wgpu::ColorTargetState {
                     format: key.format,
                     blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),

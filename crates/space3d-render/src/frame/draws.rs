@@ -6,7 +6,8 @@ use super::{ARGS_SIZE, FrameState, uniform_binding};
 use crate::arena::VERTEX_SIZE;
 use crate::assets::RenderAssets;
 use crate::handles::ShaderHandle;
-use crate::pipeline::{GpuMaterial, PipelineKey, Pipelines};
+use crate::output::OutputEncoding;
+use crate::pipeline::{GpuMaterial, KIND_COLOR_LAYERED, PassKind, PipelineKey, Pipelines};
 use crate::renderer::Renderer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,9 +41,9 @@ pub(crate) struct DrawCmd {
     pub(super) kind: DrawKind,
 }
 
-/// What selects a draw's forward pipeline besides the pass's target format and samples:
-/// (instance layout, class, layered texture, custom shader and its version).
-pub(super) type PipelineState = (u16, u8, bool, Option<(ShaderHandle, u32)>);
+/// What selects a draw's forward pipeline besides the pass's signature (format, samples,
+/// output encoding): (instance layout, class, texture kinds, custom shader and its version).
+pub(super) type PipelineState = (u16, u8, u8, Option<(ShaderHandle, u32)>);
 
 /// Where vertex slot 0 starts in the mesh arena (in vertices) and the `base_vertex` to draw
 /// with. Normally the whole arena is bound and draws select their mesh with `base_vertex`.
@@ -125,7 +126,7 @@ impl Renderer {
         view: &ViewData,
         format: wgpu::TextureFormat,
         samples: u32,
-        manual_srgb: bool,
+        output: OutputEncoding,
     ) {
         let f = &self.frame;
         let (Some((vb, ib)), Some((view_bg, _))) = (&f.arena_buffers, &f.view_bg) else {
@@ -145,7 +146,7 @@ impl Renderer {
         };
         let mut last_pipeline: Option<PipelineState> = None;
         let mut last_material = u32::MAX;
-        let mut layered = false;
+        let mut kinds = 0u8;
         let mut last_vb: Option<(VertexSource, u64)> = None;
         // First arena vertex bound to slot 0 (see `direct_vertex_base`).
         let mut slot0: Option<u32> = None;
@@ -174,21 +175,23 @@ impl Renderer {
                 pass.set_bind_group(1, bg, &[cmd.material * material_stride]);
                 self.stats.material_switches += 1;
                 last_material = cmd.material;
-                layered = l;
+                kinds = if l { KIND_COLOR_LAYERED } else { 0 };
             }
-            if last_pipeline != Some((cmd.layout, cmd.class, layered, cmd.shader)) {
+            if last_pipeline != Some((cmd.layout, cmd.class, kinds, cmd.shader)) {
                 let key = PipelineKey {
                     layout: cmd.layout,
                     class: cmd.class,
                     format,
                     samples,
-                    manual_srgb,
-                    layered,
+                    output,
+                    kinds,
                     shader: cmd.shader,
+                    pass: PassKind::Forward,
+                    globals: 0,
                 };
                 pass.set_pipeline(self.pipelines.forward(&self.device, key));
                 self.stats.pipeline_switches += 1;
-                last_pipeline = Some((cmd.layout, cmd.class, layered, cmd.shader));
+                last_pipeline = Some((cmd.layout, cmd.class, kinds, cmd.shader));
             }
             let (first_vertex, base_vertex) = direct_vertex_base(cmd.base_vertex, direct, base_vertex_supported);
             if slot0 != Some(first_vertex) {

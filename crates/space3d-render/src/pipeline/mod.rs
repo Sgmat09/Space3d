@@ -2,6 +2,7 @@
 
 use crate::handles::{FastMap, ShaderHandle};
 use crate::instance::InstanceLayout;
+use crate::output::OutputEncoding;
 use crate::shader::CustomShader;
 use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
@@ -12,7 +13,7 @@ mod instance;
 mod view;
 
 pub(crate) use forward::GpuMaterial;
-pub(crate) use view::{GpuDirLight, GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS};
+pub(crate) use view::{GpuDirLight, GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, VIEW_STRUCTS};
 
 /// Depth buffer format used by every pass.
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -73,23 +74,87 @@ pub(crate) struct GpuCompactParams {
 pub(crate) const CLASS_DOUBLE_SIDED: u8 = 1;
 pub(crate) const CLASS_BLEND: u8 = 2;
 
-/// Everything that selects a forward pipeline.
+/// Kind of pass a mesh pipeline draws in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "graphics contract (spec §3.5): depth-only pipelines arrive with the F7 depth views"
+)]
+pub(crate) enum PassKind {
+    /// Color pass (the forward shader).
+    #[default]
+    Forward,
+    /// Depth-only pass (shadow maps), vertex stage only.
+    Depth,
+    /// Depth-only pass with alpha-masked discards.
+    DepthMask,
+}
+
+/// `PipelineKey::kinds` bit: the color maps (base color, emissive) are multi-layer arrays
+/// (`texture_2d_array`; see [`Pipelines::material_bgl`]).
+pub(crate) const KIND_COLOR_LAYERED: u8 = 1;
+/// `PipelineKey::kinds` bit: the data maps (normal, metallic-roughness, occlusion) are arrays.
+#[allow(dead_code, reason = "graphics contract (spec §3.5): material maps arrive with P-MAT")]
+pub(crate) const KIND_DATA_LAYERED: u8 = 2;
+
+/// Everything that selects a forward (or depth) pipeline. Frozen after graphics milestone F3
+/// (spec §3.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PipelineKey {
     pub layout: u16,
+    /// Material class bits: [`CLASS_DOUBLE_SIDED`], [`CLASS_BLEND`]; the materials area defines
+    /// bits 2..=5.
     pub class: u8,
     pub format: wgpu::TextureFormat,
     pub samples: u32,
-    pub manual_srgb: bool,
-    /// The material texture is a multi-layer array (`texture_2d_array`); otherwise it is bound
-    /// as `texture_2d` (see [`Pipelines::material_bgl`]).
-    pub layered: bool,
+    /// How the fragment encodes its color: the `S3D_OUTPUT` (and `MANUAL_SRGB`) overrides.
+    pub output: OutputEncoding,
+    /// Texture kinds: [`KIND_COLOR_LAYERED`], [`KIND_DATA_LAYERED`].
+    pub kinds: u8,
     /// Custom shader and its source version (see [`Pipelines::sync_custom`]).
     pub shader: Option<(ShaderHandle, u32)>,
+    pub pass: PassKind,
+    /// Frame-wide override set (shading model, normal maps, shadow taps); 0 = every override
+    /// at its default.
+    pub globals: u8,
 }
 
-/// Shader module cache key: (layout, manual sRGB, layered texture, custom shader).
-pub(super) type ModuleKey = (u16, bool, bool, Option<(ShaderHandle, u32)>);
+impl PipelineKey {
+    /// The shader module this pipeline is built from (overrides are not part of it).
+    pub fn module_key(&self) -> ModuleKey {
+        // The extension vertex stream (tangents, second UV set) arrives with the materials
+        // area, which derives it from the class bits.
+        let ext = false;
+        (self.layout, self.kinds, ext, self.pass, self.shader)
+    }
+
+    /// Pipeline-overridable constants of this key: only those differing from their defaults
+    /// (at most 2 today; the frame-wide `globals` bits are all at their defaults until the
+    /// materials area defines them).
+    pub fn constants(&self) -> ([(&'static str, f64); 2], usize) {
+        output_constants(self.output)
+    }
+}
+
+/// The forward overrides selecting an output encoding (`S3D_OUTPUT`, and `MANUAL_SRGB` for
+/// custom shaders), those differing from their defaults: `(constants, count)`.
+pub(crate) fn output_constants(output: OutputEncoding) -> ([(&'static str, f64); 2], usize) {
+    let mut c = [("", 0.0); 2];
+    let mut n = 0;
+    if output != OutputEncoding::Linear {
+        c[n] = ("S3D_OUTPUT", output.id() as f64);
+        n += 1;
+    }
+    if output == OutputEncoding::ManualSrgb {
+        c[n] = ("MANUAL_SRGB", 1.0);
+        n += 1;
+    }
+    (c, n)
+}
+
+/// Shader module cache key: (layout, texture kinds, extension vertex stream, pass kind,
+/// custom shader). The output encoding and the other overrides are specialized per pipeline.
+pub(crate) type ModuleKey = (u16, u8, bool, PassKind, Option<(ShaderHandle, u32)>);
 
 const CULL_SHADER: &str = include_str!("../shaders/cull.wgsl");
 const COMPACT_SHADER: &str = include_str!("../shaders/compact.wgsl");
@@ -438,7 +503,7 @@ impl Pipelines {
             Some((v, _)) if *v == version => return,
             Some(_) => {
                 self.forward.retain(|k, _| k.shader.is_none_or(|(h, _)| h != handle));
-                self.shaders.retain(|k, _| k.3.is_none_or(|(h, _)| h != handle));
+                self.shaders.retain(|k, _| k.4.is_none_or(|(h, _)| h != handle));
                 self.custom_errors.remove(&handle);
                 self.pending.retain(|p| p.key.shader.is_none_or(|(h, _)| h != handle));
             }
@@ -457,7 +522,7 @@ impl Pipelines {
         self.custom_errors.retain(|&h, _| live(h));
         self.pending.retain(|p| p.key.shader.is_none_or(|(h, _)| live(h)));
         self.forward.retain(|k, _| k.shader.is_none_or(|(h, _)| live(h)));
-        self.shaders.retain(|k, _| k.3.is_none_or(|(h, _)| live(h)));
+        self.shaders.retain(|k, _| k.4.is_none_or(|(h, _)| live(h)));
     }
 
     /// Custom shaders with cached state, and forward pipelines built for custom shaders.
@@ -557,7 +622,7 @@ impl Pipelines {
     /// Resolve `key`'s pending validation with `error` (tests: native backends never pend).
     #[cfg(test)]
     pub fn defer_validation(&mut self, key: PipelineKey, error: Option<String>) {
-        let module_key = (key.layout, key.manual_srgb, key.layered, key.shader);
+        let module_key = key.module_key();
         let error = space3d_tasks::spawn(async move { error });
         self.pending.push(PendingPipeline { key, module_key, error });
     }
@@ -731,9 +796,9 @@ mod tests {
             HALF_SPLIT,
         ] {
             l.validate().unwrap();
-            for (manual_srgb, layered) in [(false, false), (true, false), (false, true), (true, true)] {
+            for kinds in 0..4 {
                 for c in [None, Some(&custom), Some(&only_fragment)] {
-                    validate(&forward_shader(l, manual_srgb, layered, c));
+                    validate(&forward_shader(l, kinds, false, c));
                 }
             }
         }
@@ -747,7 +812,7 @@ mod tests {
             "broken",
             "fn fragment_hook(in: VsOut) -> f32 { return undefined_thing; }",
         );
-        let e = validate_wgsl(&forward_shader(ATLAS, false, false, Some(&broken))).unwrap_err();
+        let e = validate_wgsl(&forward_shader(ATLAS, 0, false, Some(&broken))).unwrap_err();
         assert!(e.contains("undefined_thing") || e.contains("fragment_hook"), "{e}");
     }
 
@@ -772,7 +837,7 @@ mod tests {
 {hook}"
                 ),
             );
-            let src = forward_shader(InstanceTransform::LAYOUT, false, false, Some(&custom));
+            let src = forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&custom));
             validate(&src); // naga alone accepts it
             let e = validate_custom_wgsl(&src).unwrap_err();
             assert!(e.contains("extra") && e.contains("cannot declare resources"), "{e}");
@@ -787,8 +852,13 @@ mod tests {
 ",
         );
         for layered in [false, true] {
-            validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, false, layered, Some(&ok)))
-                .unwrap_or_else(|e| panic!("{e}"));
+            validate_custom_wgsl(&forward_shader(
+                InstanceTransform::LAYOUT,
+                u8::from(layered),
+                false,
+                Some(&ok),
+            ))
+            .unwrap_or_else(|e| panic!("{e}"));
         }
     }
 
@@ -828,7 +898,7 @@ mod tests {
         ] {
             let custom = CustomShader::new("portability", wgsl);
             for layered in [false, true] {
-                let src = forward_shader(InstanceTransform::LAYOUT, false, layered, Some(&custom));
+                let src = forward_shader(InstanceTransform::LAYOUT, u8::from(layered), false, Some(&custom));
                 validate(&src); // naga alone accepts it
                 let e = validate_custom_wgsl(&src).unwrap_err();
                 assert!(e.contains(expected), "{e}");
@@ -842,7 +912,7 @@ mod tests {
                 fragment("k = c; return k * strength;")
             ),
         );
-        validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, false, false, Some(&ok)))
+        validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&ok)))
             .unwrap_or_else(|e| panic!("{e}"));
     }
 
@@ -898,7 +968,7 @@ mod tests {
         ];
         for (wgsl, expected) in cases {
             let custom = CustomShader::new("gles3", wgsl);
-            let src = forward_shader(InstanceTransform::LAYOUT, false, false, Some(&custom));
+            let src = forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&custom));
             validate(&src); // naga alone accepts it
             let e = validate_custom_wgsl(&src).expect_err(expected);
             assert!(e.contains(expected) && e.contains("GLES 3.0"), "{expected}: {e}");
@@ -908,7 +978,7 @@ mod tests {
             "folded",
             fragment("return c * f32(reverseBits(1u) + countOneBits(7u));"),
         );
-        validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, false, false, Some(&folded)))
+        validate_custom_wgsl(&forward_shader(InstanceTransform::LAYOUT, 0, false, Some(&folded)))
             .unwrap_or_else(|e| panic!("{e}"));
         // Built-ins naga polyfills for GLSL ES 3.00 (or that GLSL ES 3.00 has) are fine.
         let portable = CustomShader::new(
@@ -930,8 +1000,8 @@ mod tests {
             };
             validate_custom_wgsl(&forward_shader(
                 InstanceTransform::LAYOUT,
+                u8::from(layered),
                 false,
-                layered,
                 Some(&custom),
             ))
             .unwrap_or_else(|e| panic!("layered {layered}: {e}"));
@@ -939,7 +1009,7 @@ mod tests {
         // The built-in shader itself, for every layout and texture kind.
         for l in [InstanceTransform::LAYOUT, InstanceHalf::LAYOUT, ATLAS] {
             for layered in [false, true] {
-                let (module, info) = parse_and_validate(&forward_shader(l, true, layered, None)).unwrap();
+                let (module, info) = parse_and_validate(&forward_shader(l, u8::from(layered), false, None)).unwrap();
                 assert_eq!(gles3_translation_error(&module, &info), None, "{}", l.name);
                 assert_eq!(gles3_missing_builtin(&module), None);
             }
@@ -979,8 +1049,9 @@ mod tests {
     fn uniform_sizes_match_wgsl() {
         assert_eq!(
             std::mem::size_of::<GpuView>(),
-            64 + 16 * 3 + 32 * (MAX_DIR_LIGHTS + MAX_POINT_LIGHTS)
+            64 + 16 * 3 + 32 * (MAX_DIR_LIGHTS + MAX_POINT_LIGHTS) + 560
         );
+        assert_eq!(std::mem::size_of::<GpuView>(), 1312);
         assert_eq!(std::mem::size_of::<GpuMaterial>(), 48);
         assert_eq!(std::mem::size_of::<GpuCullParams>(), 32);
         assert_eq!(std::mem::size_of::<GpuFrustum>(), 96);
@@ -988,6 +1059,200 @@ mod tests {
         assert!((CULL_VIEWS * std::mem::size_of::<GpuFrustum>()).is_multiple_of(256));
         assert_eq!(std::mem::size_of::<GpuCompactParams>(), 16);
         assert_eq!(std::mem::size_of::<GpuCullJob>(), 64);
+    }
+
+    /// Every member of the forward template's `View` sits where `GpuView` writes it (graphics
+    /// spec §3.3): the template is parsed with naga and each member's offset compared with the
+    /// Rust field's, by name.
+    #[test]
+    fn gpu_view_matches_wgsl() {
+        use std::mem::offset_of;
+        let src = forward_shader(InstanceTransform::LAYOUT, 0, false, None);
+        let module = naga::front::wgsl::parse_str(&src).unwrap();
+        let (_, view) = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("View"))
+            .expect("View struct");
+        let naga::TypeInner::Struct { members, span } = &view.inner else {
+            panic!("View is a struct")
+        };
+        assert_eq!(*span as usize, std::mem::size_of::<GpuView>());
+        let rust = [
+            ("view_proj", offset_of!(GpuView, view_proj)),
+            ("camera_pos", offset_of!(GpuView, camera_pos)),
+            ("ambient", offset_of!(GpuView, ambient)),
+            ("counts", offset_of!(GpuView, counts)),
+            ("dir_lights", offset_of!(GpuView, dir_lights)),
+            ("point_lights", offset_of!(GpuView, point_lights)),
+            ("view", offset_of!(GpuView, view)),
+            ("proj", offset_of!(GpuView, proj)),
+            ("inv_view_proj", offset_of!(GpuView, inv_view_proj)),
+            ("inv_proj", offset_of!(GpuView, inv_proj)),
+            ("viewport", offset_of!(GpuView, viewport)),
+            ("target_size", offset_of!(GpuView, target_size)),
+            ("depth", offset_of!(GpuView, depth)),
+            ("output", offset_of!(GpuView, output)),
+            ("exposure", offset_of!(GpuView, exposure)),
+            ("shadow_view_proj", offset_of!(GpuView, shadow_view_proj)),
+            ("shadow_params", offset_of!(GpuView, shadow_params)),
+            ("shadow_info", offset_of!(GpuView, shadow_info)),
+            ("env_params", offset_of!(GpuView, env_params)),
+            ("env_rotation", offset_of!(GpuView, env_rotation)),
+            ("sky_rotation", offset_of!(GpuView, sky_rotation)),
+            ("sky_params", offset_of!(GpuView, sky_params)),
+        ];
+        assert_eq!(members.len(), rust.len(), "every WGSL member has a Rust field");
+        for (member, (name, offset)) in members.iter().zip(rust) {
+            assert_eq!(member.name.as_deref(), Some(name), "member order");
+            assert_eq!(member.offset as usize, offset, "offset of `{name}`");
+        }
+        // The lights too.
+        for (name, fields) in [
+            (
+                "DirLight",
+                [offset_of!(GpuDirLight, direction), offset_of!(GpuDirLight, color)],
+            ),
+            (
+                "PointLight",
+                [
+                    offset_of!(GpuPointLight, position_range),
+                    offset_of!(GpuPointLight, color),
+                ],
+            ),
+        ] {
+            let (_, t) = module
+                .types
+                .iter()
+                .find(|(_, t)| t.name.as_deref() == Some(name))
+                .unwrap();
+            let naga::TypeInner::Struct { members, span } = &t.inner else {
+                panic!()
+            };
+            assert_eq!(*span, 32);
+            let offsets: Vec<usize> = members.iter().map(|m| m.offset as usize).collect();
+            assert_eq!(offsets, fields, "{name}");
+        }
+        // `VIEW_WGSL` (render nodes, overlays) declares the same struct.
+        assert!(crate::VIEW_WGSL.starts_with(VIEW_STRUCTS));
+    }
+
+    /// Custom shaders the tests use (their fixtures), plus ones reading the pipeline overrides
+    /// and the view fields added for the graphics upgrade.
+    const PERMUTATION_FIXTURES: [&str; 6] = [
+        // tests/custom_shader.rs `TINT`
+        "fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {
+            var o = out;
+            o.custom = instance_custom0(inst);
+            o.color = vec4<f32>(o.color.rgb + instance_custom3(inst).rgb, o.color.a);
+            return o;
+        }
+        fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {
+            return vec4<f32>(color.rgb * in.custom.rgb, color.a);
+        }",
+        "fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> { return c.bgra; }",
+        "var<private> k: vec4<f32> = vec4<f32>(0.5);
+         fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> {
+             return c * k * material.base_color * sample_base(in.uv, in.layer) + view.ambient;
+         }",
+        "override strength: f32 = 0.5;
+         fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {
+             var o = out;
+             o.clip = view.proj * view.view * vec4<f32>(o.world_pos, 1.0);
+             return o;
+         }
+         fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> { return c * strength; }",
+        // The legacy `MANUAL_SRGB` flag (an override now) and the output helpers.
+        "fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> {
+             if (MANUAL_SRGB || S3D_OUTPUT == S3D_OUTPUT_TONEMAPPED) { return c * 0.5; }
+             return vec4<f32>(s3d_tonemap(view.output.y, c.rgb * view.exposure.x), c.a);
+         }",
+        "fn my_luma(c: vec3<f32>) -> f32 { return s3d_luma(c) + f32(view.counts.y); }
+         fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> {
+             let uv = (in.clip.xy - view.viewport.xy) * view.target_size.zw;
+             return vec4<f32>(c.rgb * my_luma(c.rgb) + vec3<f32>(uv, view.depth.x), c.a);
+         }",
+    ];
+
+    /// Every custom-shader fixture builds against every forward permutation — instance
+    /// layouts, texture kinds and every value of the output override — on the device (inside
+    /// the custom-shader error scopes) and through the GLSL ES 3.00 translation (graphics spec
+    /// §3.2).
+    #[test]
+    fn custom_shaders_compile_against_every_permutation() {
+        let Ok(mut r) = pollster::block_on(crate::Renderer::new_headless(4, 4)) else {
+            eprintln!("skipping GPU test: no adapter available");
+            return;
+        };
+        let mut assets = crate::RenderAssets::default();
+        let fixtures: Vec<(ShaderHandle, Arc<CustomShader>)> = PERMUTATION_FIXTURES
+            .iter()
+            .enumerate()
+            .map(|(i, wgsl)| {
+                let shader = CustomShader::new(format!("fixture {i}"), *wgsl);
+                (assets.add_shader(shader.clone()), Arc::new(shader))
+            })
+            .collect();
+        let layouts: Vec<u16> = [
+            InstanceTransform::LAYOUT,
+            InstanceTransformColor::LAYOUT,
+            InstanceCompact::LAYOUT,
+            InstancePacked::LAYOUT,
+            InstanceHalf::LAYOUT,
+            ATLAS,
+            HALF_SPLIT,
+        ]
+        .into_iter()
+        .map(|l| r.pipelines.layout_id(l))
+        .collect();
+        let mut built = 0;
+        for (handle, shader) in &fixtures {
+            r.pipelines.sync_custom(*handle, 0, shader);
+            for &layout in &layouts {
+                for kinds in [0, KIND_COLOR_LAYERED] {
+                    let (module, info) = parse_and_validate(&forward_shader(
+                        r.pipelines.layouts[layout as usize],
+                        kinds,
+                        false,
+                        Some(shader),
+                    ))
+                    .unwrap();
+                    assert_eq!(
+                        forward::gles3_translation_error(&module, &info),
+                        None,
+                        "{}",
+                        shader.name
+                    );
+                    for output in [
+                        OutputEncoding::Linear,
+                        OutputEncoding::ManualSrgb,
+                        OutputEncoding::Tonemapped,
+                    ] {
+                        for (format, samples) in [
+                            (wgpu::TextureFormat::Rgba8UnormSrgb, 1),
+                            (wgpu::TextureFormat::Rgba16Float, 4),
+                        ] {
+                            let key = PipelineKey {
+                                layout,
+                                class: CLASS_BLEND,
+                                format,
+                                samples,
+                                output,
+                                kinds,
+                                shader: Some((*handle, 0)),
+                                pass: PassKind::Forward,
+                                globals: 0,
+                            };
+                            r.pipelines.forward(&r.device, key);
+                            assert_eq!(r.pipelines.custom_error(*handle), None, "{} × {key:?}", shader.name);
+                            built += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(built, fixtures.len() * layouts.len() * 2 * 3 * 2);
+        assert_eq!(r.gpu_error_count(), 0);
     }
 
     /// Regression: `Unorm8x4Bgra` reached wgpu's GL backend, which cannot express it (WebGL2 /
@@ -1024,8 +1289,8 @@ mod tests {
              fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {\n\
              \x20   var o = out;\n    o.custom = instance_custom1(inst) + inst.custom1;\n    return o;\n}\n",
         );
-        validate(&forward_shader(LAYOUT, false, false, None));
-        validate(&forward_shader(LAYOUT, false, false, Some(&custom)));
+        validate(&forward_shader(LAYOUT, 0, false, None));
+        validate(&forward_shader(LAYOUT, 0, false, Some(&custom)));
     }
 
     /// Exact `(format, offset, location)` of every built-in layout: a wrong offset or format

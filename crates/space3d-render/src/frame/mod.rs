@@ -10,7 +10,10 @@ use crate::gpu::{GrowBuffer, TrackedBuffer, Uploader};
 use crate::handles::FastMap;
 use crate::handles::{MeshHandle, TextureHandle};
 use crate::instance::InstanceBuffers;
-use crate::pipeline::{GpuCompactParams, GpuCullJob, GpuCullParams, GpuFrustum, GpuMaterial, GpuView, Pipelines};
+use crate::output::OutputEncoding;
+use crate::pipeline::{
+    GpuCompactParams, GpuCullJob, GpuCullParams, GpuFrustum, GpuMaterial, GpuPointLight, GpuView, Pipelines,
+};
 use crate::readback::CullReadback;
 use crate::renderer::{RenderCapabilities, Renderer};
 use crate::stats::DrawPath;
@@ -144,6 +147,10 @@ pub(crate) struct FrameState {
     cull_mask: Vec<u64>,
     sources: Vec<Source>,
     cameras: Vec<CameraItem>,
+    /// Every point light of the frame, in query order (see `views::select_point_lights`).
+    point_lights: Vec<GpuPointLight>,
+    /// Scratch of the per-view point-light selection: (squared distance, light index).
+    light_order: Vec<(f32, u32)>,
     views: Vec<ViewData>,
     draws: Vec<DrawCmd>,
     jobs: Vec<(SourceBuffer, GpuCullJob)>,
@@ -189,6 +196,9 @@ pub(crate) struct FrameState {
     /// Times the ECS batch order was rebuilt.
     #[cfg(test)]
     pub(crate) ecs_reorders: u64,
+    /// Every view renders with this output encoding, linear exposure and tonemapper.
+    #[cfg(test)]
+    pub(crate) force_output: Option<(OutputEncoding, f32, crate::output::Tonemapper)>,
 }
 
 fn strided(size: usize, align: usize) -> usize {
@@ -255,6 +265,8 @@ impl FrameState {
             cull_mask: Vec::new(),
             sources: Vec::new(),
             cameras: Vec::new(),
+            point_lights: Vec::new(),
+            light_order: Vec::new(),
             views: Vec::new(),
             draws: Vec::new(),
             jobs: Vec::new(),
@@ -284,6 +296,8 @@ impl FrameState {
             force_capture_replay: false,
             #[cfg(test)]
             ecs_reorders: 0,
+            #[cfg(test)]
+            force_output: None,
         }
     }
 
@@ -303,7 +317,7 @@ impl FrameState {
     }
 
     /// Capacity snapshot of scratch vectors (to count CPU reallocations).
-    fn capacities(&self) -> [usize; 20] {
+    fn capacities(&self) -> [usize; 22] {
         [
             self.ecs_keys.capacity(),
             self.ecs_rows.capacity(),
@@ -325,6 +339,8 @@ impl FrameState {
             self.jobs.capacity(),
             self.dispatches.capacity(),
             self.cull_planes.capacity(),
+            self.point_lights.capacity(),
+            self.light_order.capacity(),
         ]
     }
 }
@@ -563,6 +579,10 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let primary_size = self.primary_size();
+        let primary_output = match &self.surface {
+            Some(s) if s.manual_srgb => OutputEncoding::ManualSrgb,
+            _ => OutputEncoding::Linear,
+        };
         self.frame.last_primary_size = primary_size;
         let frame_index = self.frame_index;
         let Renderer {
@@ -583,7 +603,7 @@ impl Renderer {
             _ => None,
         };
 
-        let lights = SceneLights::collect(world);
+        let lights = SceneLights::collect(world, &mut f.point_lights);
         f.collect_cameras(world);
         f.extract(
             world,
@@ -603,6 +623,7 @@ impl Renderer {
             &lights,
             ambient,
             primary_size,
+            primary_output,
             settings.frustum_culling,
             stats,
             &mut cpu_reallocs,

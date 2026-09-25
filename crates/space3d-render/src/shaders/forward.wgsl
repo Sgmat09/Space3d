@@ -3,7 +3,9 @@
 //
 // The INSTANCE marker below is replaced by the renderer with an `InstanceInput` struct and
 // accessor functions generated from the instance layout (see `pipeline/instance.rs`); the CONSTS
-// marker with per-pipeline constants; the TEXTURE marker with the material texture binding
+// marker with structural constants; the VIEW marker with the shared `View` struct
+// (`shaders/common/view.wgsl`); the OUTPUT marker with the shared output tail (`OUTPUT_WGSL`:
+// `s3d_output`, tonemappers); the TEXTURE marker with the material texture binding
 // (`texture_2d` for single-layer textures, `texture_2d_array` for arrays) and `sample_base`;
 // the VARYINGS marker with extra `VsOut` fields and the HOOKS marker with `vertex_hook` /
 // `fragment_hook` — identity functions, or a material's `CustomShader`.
@@ -12,27 +14,22 @@
 
 //#CONSTS
 
+// Pipeline-overridable constants (graphics spec §3.1), specialized per pipeline. Every one has
+// a default, so a module never changes shape with them.
+// `S3D_OUTPUT`: how `fs_main` encodes its color (`OutputEncoding::id`: 0 linear, 1 manual sRGB,
+// 2 tonemapped). `MANUAL_SRGB` is set with it (`S3D_OUTPUT == 1`), for custom shaders.
+override S3D_OUTPUT: u32 = 0u;
+override MANUAL_SRGB: bool = false;
+override S3D_ALPHA_MASK: bool = false;
+override S3D_ALPHA_TO_COVERAGE: bool = false;
+override S3D_SHADING_STANDARD: bool = false;
+override S3D_SHADOW_TAPS: u32 = 0u;
+override S3D_NORMAL_MAPS: bool = true;
+
 const MAX_DIR_LIGHTS: u32 = 4u;
 const MAX_POINT_LIGHTS: u32 = 16u;
 
-struct DirLight {
-    direction: vec4<f32>,   // xyz: direction the light travels (normalized)
-    color: vec4<f32>,       // rgb: color * intensity
-}
-
-struct PointLight {
-    position_range: vec4<f32>,
-    color: vec4<f32>,
-}
-
-struct View {
-    view_proj: mat4x4<f32>,
-    camera_pos: vec4<f32>,
-    ambient: vec4<f32>,
-    counts: vec4<u32>,      // x: dir lights, y: point lights
-    dir_lights: array<DirLight, 4>,
-    point_lights: array<PointLight, 16>,
-}
+//#VIEW
 
 struct MaterialParams {
     base_color: vec4<f32>,
@@ -75,6 +72,8 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
     return select(hi, lo, c <= vec3<f32>(0.0031308));
 }
+
+//#OUTPUT
 
 fn quat_to_mat3(q_in: vec4<f32>) -> mat3x3<f32> {
     let q = normalize(q_in);
@@ -187,9 +186,6 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         }
         rgb = acc + material.emissive.rgb;
     }
-    var color = fragment_hook(in, vec4<f32>(rgb, base.a));
-    if (MANUAL_SRGB) {
-        color = vec4<f32>(linear_to_srgb(clamp(color.rgb, vec3<f32>(0.0), vec3<f32>(1.0))), color.a);
-    }
-    return color;
+    let color = fragment_hook(in, vec4<f32>(rgb, base.a));
+    return s3d_output(color, S3D_OUTPUT, view.exposure.x, view.output.y);
 }

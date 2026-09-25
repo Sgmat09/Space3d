@@ -23,7 +23,18 @@
 /// interpolated varying for passing data from `vertex_hook` to `fragment_hook`), the `view`
 /// and `material` uniforms, `sample_base(uv, layer)` and the helpers `srgb_to_linear`,
 /// `linear_to_srgb`, `quat_to_mat3`, `trs`. Custom shaders cannot declare their own bindings.
-/// Prefix your own helper functions (e.g. `my_`) to avoid clashes with the template.
+/// Prefix your own helper functions (e.g. `my_`) to avoid clashes with the template; every name
+/// the engine adds is prefixed `s3d_` / `S3D_`.
+///
+/// The `view` uniform is the shared `View` of [`crate::VIEW_WGSL`]: besides `view_proj`,
+/// `camera_pos`, `ambient` and the lights it has `view`, `proj`, `inv_view_proj`, `inv_proj`,
+/// `viewport` (pixels of the target), `target_size` (w, h, 1/w, 1/h), `depth` (near, far,
+/// orthographic), `output` and `exposure`. The output helpers of [`crate::OUTPUT_WGSL`]
+/// (`s3d_tonemap`, `s3d_luma`, `s3d_linear_to_srgb`, …) are in scope too. The color returned by
+/// `fragment_hook` is linear: the template encodes it for the pass (`s3d_output` with the
+/// pipeline override `S3D_OUTPUT`). `MANUAL_SRGB` — true when the target needs sRGB encoded in
+/// the shader — is a pipeline-overridable constant (`override`), so it can be read in function
+/// bodies but not in `const` declarations.
 ///
 /// The same material/shader works with every instance layout and on every draw path; GPU
 /// culling uses the instance's position and scale, so a `vertex_hook` that moves vertices far

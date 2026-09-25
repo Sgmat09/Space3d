@@ -6,11 +6,12 @@ use super::extract::SourceBuffer;
 use super::plan::{ViewportRect, viewport_rect};
 use super::{ARGS_SIZE, FrameState, WORKGROUP, binding, uniform_binding};
 use crate::assets::RenderAssets;
-use crate::components::{AmbientLight, DirectionalLight, PointLight, RenderTarget};
+use crate::components::{AmbientLight, DirectionalLight, PointLight, Projection, RenderTarget};
 use crate::culling::{Aabb, Frustum, Sphere};
 use crate::gpu::align_up;
 use crate::handles::TextureHandle;
 use crate::instance::{CULL_BLOCK, CullBounds, CullFloat, CullSource, InstanceBuffers, ScaleKind};
+use crate::output::{OutputEncoding, Tonemapper};
 use crate::pipeline::{
     CULL_VIEWS, GpuCompactParams, GpuCullJob, GpuCullParams, GpuDirLight, GpuFrustum, GpuPointLight, GpuView,
     MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, Pipelines,
@@ -22,18 +23,18 @@ use glam::{Mat4, Vec3, Vec4};
 use space3d_core::{GlobalTransform, World};
 use std::ops::Range;
 
-/// The frame's directional and point lights, as written into every view's `GpuView` (the first
-/// `MAX_DIR_LIGHTS` / `MAX_POINT_LIGHTS` in query order).
+/// The frame's directional lights, as written into every view's `GpuView` (the first
+/// `MAX_DIR_LIGHTS` in query order). Point lights are collected into
+/// `FrameState::point_lights` and chosen per view ([`select_point_lights`]).
 #[derive(Clone, Copy)]
 pub(super) struct SceneLights {
     pub(super) dir: [GpuDirLight; MAX_DIR_LIGHTS],
     pub(super) nd: usize,
-    pub(super) point: [GpuPointLight; MAX_POINT_LIGHTS],
-    pub(super) np: usize,
 }
 
 impl SceneLights {
-    pub(super) fn collect(world: &World) -> Self {
+    /// The directional lights; every point light (in query order) goes into `points`.
+    pub(super) fn collect(world: &World, points: &mut Vec<GpuPointLight>) -> Self {
         let mut dir = [GpuDirLight::zeroed(); MAX_DIR_LIGHTS];
         let mut nd = 0;
         for (gt, l) in world.query::<(&GlobalTransform, &DirectionalLight)>().iter() {
@@ -46,19 +47,44 @@ impl SceneLights {
                 nd += 1;
             }
         }
-        let mut point = [GpuPointLight::zeroed(); MAX_POINT_LIGHTS];
-        let mut np = 0;
+        points.clear();
         for (gt, l) in world.query::<(&GlobalTransform, &PointLight)>().iter() {
-            if np < MAX_POINT_LIGHTS {
-                point[np] = GpuPointLight {
-                    position_range: gt.0.w_axis.truncate().extend(l.range.max(1e-3)).to_array(),
-                    color: (l.color * l.intensity).extend(1.0).to_array(),
-                };
-                np += 1;
-            }
+            points.push(GpuPointLight {
+                position_range: gt.0.w_axis.truncate().extend(l.range.max(1e-3)).to_array(),
+                color: (l.color * l.intensity).extend(1.0).to_array(),
+            });
         }
-        Self { dir, nd, point, np }
+        Self { dir, nd }
     }
+}
+
+/// The point lights a view shades with (graphics spec D19): all of them, in query order, when
+/// there are at most `MAX_POINT_LIGHTS` (exactly the lights of the original renderer); else the
+/// `MAX_POINT_LIGHTS` nearest to the view's camera, still in query order (ties: query order).
+/// `scratch` is reused. Returns the number written into `out`.
+pub(super) fn select_point_lights(
+    all: &[GpuPointLight],
+    camera: Vec3,
+    scratch: &mut Vec<(f32, u32)>,
+    out: &mut [GpuPointLight; MAX_POINT_LIGHTS],
+) -> usize {
+    if all.len() <= MAX_POINT_LIGHTS {
+        out[..all.len()].copy_from_slice(all);
+        return all.len();
+    }
+    scratch.clear();
+    scratch.extend(all.iter().enumerate().map(|(i, l)| {
+        let p = Vec3::from_slice(&l.position_range[..3]);
+        (p.distance_squared(camera), i as u32)
+    }));
+    let nearer = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+    scratch.select_nth_unstable_by(MAX_POINT_LIGHTS - 1, nearer);
+    let chosen = &mut scratch[..MAX_POINT_LIGHTS];
+    chosen.sort_unstable_by_key(|&(_, i)| i);
+    for (slot, &(_, i)) in out.iter_mut().zip(chosen.iter()) {
+        *slot = all[i as usize];
+    }
+    MAX_POINT_LIGHTS
 }
 
 #[derive(Clone)]
@@ -74,6 +100,9 @@ pub(crate) enum ViewTarget {
 #[derive(Clone)]
 pub(crate) struct ViewData {
     pub(super) target: ViewTarget,
+    /// How the view's fragments encode their color (the pipelines' `S3D_OUTPUT`). A capture
+    /// replay into the offscreen target draws `ManualSrgb` views as `Linear`.
+    pub(super) output: OutputEncoding,
     pub(super) clear: Option<Vec4>,
     /// The camera's viewport in whole pixels of the target, as drawn (see
     /// [`ViewportRect::fitted`]); `None` = the whole target.
@@ -219,6 +248,37 @@ pub(super) fn cull_job_encoding(cull: CullSource) -> (u32, u32, u32, u32) {
     }
 }
 
+/// The frame-owned fields of a view's `GpuView` (graphics spec §3.3): matrices, viewport,
+/// target size, depth range and output encoding. `proj` is the projection as drawn (with the
+/// viewport fit); `rect` the drawn viewport (`None`: the whole `size` target).
+pub(super) fn write_view_info(
+    gv: &mut GpuView,
+    projection: &Projection,
+    view: Mat4,
+    proj: Mat4,
+    rect: Option<ViewportRect>,
+    size: (u32, u32),
+    output: OutputEncoding,
+) {
+    let (near, far, ortho) = match *projection {
+        Projection::Perspective { near, far, .. } => (near, far, 0.0),
+        Projection::Orthographic { near, far, .. } => (near, far, 1.0),
+    };
+    let viewport = rect.map_or([0.0, 0.0, size.0 as f32, size.1 as f32], |r| {
+        [r.x as f32, r.y as f32, r.w as f32, r.h as f32]
+    });
+    let (w, h) = (size.0.max(1) as f32, size.1.max(1) as f32);
+    gv.view = view.to_cols_array_2d();
+    gv.proj = proj.to_cols_array_2d();
+    gv.inv_view_proj = (proj * view).inverse().to_cols_array_2d();
+    gv.inv_proj = proj.inverse().to_cols_array_2d();
+    gv.viewport = viewport;
+    gv.target_size = [w, h, 1.0 / w, 1.0 / h];
+    gv.depth = [near, far, ortho, 0.0];
+    gv.output = [output.id(), Tonemapper::None.id(), 0, 0];
+    gv.exposure = [1.0, 0.0, 0.0, 0.0];
+}
+
 impl FrameState {
     /// One `ViewData` per camera with a live target: its `GpuView`, its draws and, on GPU
     /// paths, its culling jobs (frustum slot, output region). Returns the bytes of culled
@@ -231,6 +291,7 @@ impl FrameState {
         lights: &SceneLights,
         ambient: AmbientLight,
         primary_size: (u32, u32),
+        primary_output: OutputEncoding,
         culling: bool,
         stats: &mut RenderStats,
         reallocs: &mut u32,
@@ -241,7 +302,7 @@ impl FrameState {
         let gpu = path.gpu_culling();
         let multi = matches!(path, DrawPath::GpuMultiDraw | DrawPath::GpuMultiDrawCount);
         let view_stride = f.view_stride();
-        let SceneLights { dir, nd, point, np } = *lights;
+        let SceneLights { dir, nd } = *lights;
         // ---- views -------------------------------------------------------------------
         f.views.clear();
         f.draws.clear();
@@ -305,17 +366,38 @@ impl FrameState {
                 }
                 None => (None, Mat4::IDENTITY),
             };
-            let view_proj = fit * cam.camera.projection.matrix(aspect) * cam.transform.inverse();
+            let camera_view = cam.transform.inverse();
+            let proj = fit * cam.camera.projection.matrix(aspect);
+            let view_proj = proj * camera_view;
             let frustum = Frustum::from_view_proj(&view_proj);
             let view_offset = f.views.len() * view_stride;
-            let gv = GpuView {
-                view_proj: view_proj.to_cols_array_2d(),
-                camera_pos: cam.transform.w_axis.to_array(),
-                ambient: (ambient.color * ambient.intensity).extend(1.0).to_array(),
-                counts: [nd as u32, np as u32, 0, 0],
-                dir_lights: dir,
-                point_lights: point,
+            let output = match target {
+                ViewTarget::Primary => primary_output,
+                ViewTarget::Texture { .. } => OutputEncoding::Linear,
             };
+            #[cfg(test)]
+            let (output, forced) = match f.force_output {
+                Some((o, exposure, tonemapper)) => (o, Some((exposure, tonemapper))),
+                None => (output, None),
+            };
+            let mut gv = GpuView::zeroed();
+            gv.view_proj = view_proj.to_cols_array_2d();
+            gv.camera_pos = cam.transform.w_axis.to_array();
+            gv.ambient = (ambient.color * ambient.intensity).extend(1.0).to_array();
+            gv.dir_lights = dir;
+            let np = select_point_lights(
+                &f.point_lights,
+                cam.transform.w_axis.truncate(),
+                &mut f.light_order,
+                &mut gv.point_lights,
+            );
+            gv.counts = [nd as u32, np as u32, 0, 0];
+            write_view_info(&mut gv, &cam.camera.projection, camera_view, proj, rect, size, output);
+            #[cfg(test)]
+            if let Some((exposure, tonemapper)) = forced {
+                gv.exposure = [exposure, exposure.log2(), 0.0, 0.0];
+                gv.output[1] = tonemapper.id();
+            }
             f.views_buf
                 .write_at(view_offset, bytemuck::bytes_of(&gv), &mut cpu_reallocs);
 
@@ -586,6 +668,7 @@ impl FrameState {
             };
             f.views.push(ViewData {
                 target,
+                output,
                 clear: cam.camera.clear_color,
                 rect,
                 size,

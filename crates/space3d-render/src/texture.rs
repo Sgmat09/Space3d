@@ -149,7 +149,8 @@ pub(crate) fn create_gpu_texture(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // Sampleable: scene-depth readers (graphics spec §1.6).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         // One D2 view serves as color attachment and for sampling.

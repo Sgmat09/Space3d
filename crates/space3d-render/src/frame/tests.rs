@@ -493,7 +493,7 @@ fn scissor_rects_stay_within_the_attachment() {
         assert_eq!(r.frame.last_primary_size, (64, 48));
         // Re-record the frame's primary views into a smaller target.
         let samples = r.config.msaa_samples;
-        r.offscreen = crate::renderer::Attachments::new(&r.device, 40, 30, samples, OFFSCREEN_FORMAT, true);
+        r.offscreen = crate::renderer::Attachments::new(&r.device, 40, 30, samples, OFFSCREEN_FORMAT, true, false);
         let scope = r.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = r.device.create_command_encoder(&Default::default());
         r.encode_views(&mut encoder, None, true);
@@ -1915,4 +1915,185 @@ fn texture_pool_reuses_and_evicts() {
     let fresh = pool.acquire(&r.device, desc);
     assert_eq!(pool.get(fresh).generation, 3, "evicted after 3 unused frames");
     assert_eq!(r.gpu_error_count(), 0);
+}
+
+/// The CPU mirrors of the tonemappers (`Tonemapper::apply`) match the shader's `s3d_tonemap`
+/// through the forward shader's `Tonemapped` output (graphics spec F3): unlit quads of radiance
+/// 0.05…64 (grey and a saturated orange), each operator and two exposures, within 2/255 of the
+/// CPU value encoded to sRGB.
+#[test]
+fn tonemapper_cpu_mirror_matches_gpu() {
+    use crate::components::{Camera3d, Mesh3d, Projection, linear_to_srgb};
+    use crate::output::{OutputEncoding, Tonemapper};
+    use space3d_core::{Transform, prelude::MeshData};
+    const VALUES: [f32; 8] = [0.05, 0.18, 0.5, 1.0, 2.0, 4.0, 16.0, 64.0];
+    const HUES: [Vec3; 2] = [Vec3::ONE, Vec3::new(1.0, 0.45, 0.12)];
+    let Some(mut app) = headless_app(8 * 8, 8 * 2) else {
+        return;
+    };
+    let quad = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_mesh(MeshData::plane(1.0));
+    for (row, hue) in HUES.iter().enumerate() {
+        for (col, v) in VALUES.iter().enumerate() {
+            let c = *hue * *v;
+            app.world.spawn((
+                Transform::from_xyz(col as f32 - 3.5, 0.5 - row as f32, 0.0)
+                    .with_rotation(glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                Mesh3d(quad),
+                Material::unlit(c.extend(1.0)),
+            ));
+        }
+    }
+    app.world.spawn((
+        Transform::from_xyz(0.0, 0.0, 5.0),
+        Camera3d::default()
+            .with_clear_color(Vec4::new(0.0, 0.0, 0.0, 1.0))
+            .with_projection(Projection::Orthographic {
+                height: 2.0,
+                near: 0.1,
+                far: 100.0,
+            }),
+    ));
+    let mut checked = 0;
+    for tonemapper in [
+        Tonemapper::None,
+        Tonemapper::Reinhard,
+        Tonemapper::AcesFitted,
+        Tonemapper::AgX,
+        Tonemapper::KhronosPbrNeutral,
+    ] {
+        for exposure in [1.0f32, 0.25] {
+            app.resources.expect_mut::<Renderer>().frame.force_output =
+                Some((OutputEncoding::Tonemapped, exposure, tonemapper));
+            let img = crate::render_to_image(&mut app).expect("capture");
+            for (row, hue) in HUES.iter().enumerate() {
+                for (col, v) in VALUES.iter().enumerate() {
+                    let cpu = tonemapper.apply(*hue * *v * exposure);
+                    let want = cpu.to_array().map(|c| (linear_to_srgb(c) * 255.0).round());
+                    let got = img.get(col as u32 * 8 + 4, row as u32 * 8 + 4);
+                    for ch in 0..3 {
+                        assert!(
+                            (got[ch] as f32 - want[ch]).abs() <= 2.0,
+                            "{tonemapper:?} ×{exposure} of {:?}: GPU {got:?}, CPU {want:?}",
+                            *hue * *v
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 5 * 2 * 16);
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+}
+
+/// Point lights per view (graphics spec D19): up to `MAX_POINT_LIGHTS` every light in query
+/// order (the original renderer's lights, bit for bit); past it the nearest to the camera, still
+/// in query order, ties broken by query order.
+#[test]
+fn point_light_selection_keeps_query_order() {
+    use crate::pipeline::{GpuPointLight, MAX_POINT_LIGHTS};
+    let light = |x: f32, id: f32| GpuPointLight {
+        position_range: [x, 0.0, 0.0, 1.0],
+        color: [id, 0.0, 0.0, 1.0],
+    };
+    let mut scratch = Vec::new();
+    let mut out = [GpuPointLight::default(); MAX_POINT_LIGHTS];
+    let few: Vec<_> = (0..MAX_POINT_LIGHTS)
+        .map(|i| light(100.0 - i as f32, i as f32))
+        .collect();
+    assert_eq!(
+        select_point_lights(&few, Vec3::ZERO, &mut scratch, &mut out),
+        MAX_POINT_LIGHTS
+    );
+    assert!(
+        out.iter()
+            .zip(&few)
+            .all(|(a, b)| bytemuck::bytes_of(a) == bytemuck::bytes_of(b)),
+        "≤ 16 lights: unchanged, in query order"
+    );
+    // 24 lights at x = 0..24 (ids = query order), shuffled positions; camera at x = 30: the
+    // nearest 16 are x = 8..24.
+    let many: Vec<_> = (0..24).map(|i| light(((i * 7) % 24) as f32, i as f32)).collect();
+    assert_eq!(select_point_lights(&many, Vec3::X * 30.0, &mut scratch, &mut out), 16);
+    let ids: Vec<u32> = out.iter().map(|l| l.color[0] as u32).collect();
+    let mut expected: Vec<u32> = (0..24).filter(|i| (i * 7) % 24 >= 8).collect();
+    expected.sort_unstable();
+    assert_eq!(ids, expected, "nearest 16, in query order");
+    // Equal distances: the first in query order win.
+    let ties: Vec<_> = (0..20).map(|i| light(5.0, i as f32)).collect();
+    select_point_lights(&ties, Vec3::ZERO, &mut scratch, &mut out);
+    assert_eq!(out.map(|l| l.color[0] as u32), std::array::from_fn(|i| i as u32));
+}
+
+/// With more than 16 point lights, each view shades with the 16 nearest to its camera
+/// (graphics spec D19): a light far from one view but next to the other lights only the second
+/// view, although it comes last in query order (the original renderer dropped it everywhere).
+#[test]
+fn point_lights_over_16_pick_nearest_per_view() {
+    use crate::components::{Camera3d, Mesh3d, PointLight, Projection};
+    use space3d_core::{Transform, prelude::MeshData};
+    let Some(mut app) = headless_app(64, 32) else { return };
+    let plane = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_mesh(MeshData::plane(4.0));
+    // Two floor patches 1000 units apart, each seen by its own half-screen camera from above.
+    for x in [0.0, 1000.0] {
+        app.world.spawn((
+            Transform::from_xyz(x, 0.0, 0.0),
+            Mesh3d(plane),
+            Material::color(Vec4::ONE).with_metallic_roughness(0.0, 1.0),
+        ));
+    }
+    for (i, x) in [0.0f32, 1000.0].into_iter().enumerate() {
+        app.world.spawn((
+            Transform::from_xyz(x, 5.0, 0.0).looking_at(Vec3::new(x, 0.0, 0.0), Vec3::NEG_Z),
+            Camera3d {
+                viewport: Some([0.5 * i as f32, 0.0, 0.5, 1.0]),
+                clear_color: Some(Vec4::new(0.0, 0.0, 0.0, 1.0)),
+                projection: Projection::Orthographic {
+                    height: 4.0,
+                    near: 0.1,
+                    far: 50.0,
+                },
+                order: i as i32,
+                ..Default::default()
+            },
+        ));
+    }
+    app.insert_resource(crate::components::AmbientLight {
+        color: Vec3::ONE,
+        intensity: 0.0,
+    });
+    // 16 dim red lights near patch A (query order first), then one bright green light above
+    // patch B.
+    for k in 0..16 {
+        app.world.spawn((
+            Transform::from_xyz(-1.5 + 0.2 * k as f32, 0.5, 0.0),
+            PointLight {
+                color: Vec3::new(1.0, 0.0, 0.0),
+                intensity: 0.2,
+                range: 3.0,
+            },
+        ));
+    }
+    app.world.spawn((
+        Transform::from_xyz(1000.0, 1.0, 0.0),
+        PointLight {
+            color: Vec3::new(0.0, 1.0, 0.0),
+            intensity: 8.0,
+            range: 6.0,
+        },
+    ));
+    let img = crate::render_to_image(&mut app).expect("capture");
+    let (a, b) = (img.get(16, 16), img.get(48, 16));
+    assert!(a[0] > 20 && a[1] == 0, "view A: the 16 red lights, no green: {a:?}");
+    assert!(
+        b[1] > 60 && b[0] == 0,
+        "view B: the green light (17th in query order): {b:?}"
+    );
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
 }
