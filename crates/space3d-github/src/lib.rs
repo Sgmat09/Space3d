@@ -63,7 +63,10 @@ pub struct GithubPlugin {
     pub submit_crash_reports: bool,
     /// Override the API root (proxy / tests).
     pub api_base_url: Option<String>,
-    /// Explicit token (otherwise env vars).
+    /// Explicit token. `None` (the default) makes read-only calls anonymously, which is
+    /// what a shipped game wants: public repos need no token for release checks, and a
+    /// player's own `GITHUB_TOKEN` must never be used to file crash issues. Development
+    /// tools can opt in with [`GithubPlugin::with_token_from_env`].
     pub token: Option<String>,
 }
 
@@ -95,6 +98,13 @@ impl GithubPlugin {
         self
     }
 
+    /// Use a token from `GITHUB_TOKEN` / `GH_TOKEN` (development builds and tools only;
+    /// never in a game shipped to players).
+    pub fn with_token_from_env(mut self) -> Self {
+        self.token = token_from_env();
+        self
+    }
+
     /// Route API calls through `url`.
     pub fn with_api_base_url(mut self, url: impl Into<String>) -> Self {
         self.api_base_url = Some(url.into());
@@ -122,7 +132,7 @@ pub struct PendingCrashReports(pub Vec<CrashReport>);
 impl Plugin for GithubPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugin(TasksPlugin);
-        let mut client = GithubClient::new(self.token.clone().or_else(token_from_env));
+        let mut client = GithubClient::new(self.token.clone());
         if let Some(url) = &self.api_base_url {
             client = client.with_base_url(url);
         }

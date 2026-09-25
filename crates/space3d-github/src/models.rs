@@ -199,23 +199,110 @@ impl Release {
         })
     }
 
-    /// Best-guess build for the platform this binary is running on, based on
-    /// asset names (`*-linux*`, `*-windows*`, `*-macos*`, `*-web*`, `*.apk`, `*.ipa`).
+    /// Best-guess build for the platform this binary is running on, based on asset names
+    /// such as `Game-macos-aarch64.zip`, `Game-windows-x86_64.zip`, `game-linux-x64.tar.gz`,
+    /// `game-web.zip`, `*.apk`, `*.ipa`. See [`Self::asset_for`].
     pub fn asset_for_current_platform(&self) -> Option<&ReleaseAsset> {
-        let needles: &[&str] = if cfg!(target_arch = "wasm32") {
-            &["web", "wasm"]
+        let os = if cfg!(target_arch = "wasm32") {
+            "web"
         } else {
-            match std::env::consts::OS {
-                "macos" => &["macos", "darwin", "osx", "mac"],
-                "windows" => &["windows", "win64", "win"],
-                "linux" => &["linux"],
-                "android" => &[".apk", "android"],
-                "ios" => &[".ipa", "ios"],
-                _ => &[],
-            }
+            std::env::consts::OS
         };
-        self.find_asset(needles)
+        self.asset_for(os, std::env::consts::ARCH)
     }
+
+    /// Asset for `os` (`std::env::consts::OS` values, or `"web"`) and `arch`
+    /// (`std::env::consts::ARCH` values).
+    ///
+    /// Names are split into tokens on non-alphanumeric characters, so `darwin` never
+    /// matches a Windows `win` token. Among assets for the OS, one built for `arch` wins,
+    /// then one with no architecture in its name (or `universal`); assets for another
+    /// architecture are never returned.
+    ///
+    /// ```
+    /// # use space3d_github::{Release, ReleaseAsset};
+    /// # fn asset(name: &str) -> ReleaseAsset {
+    /// #     ReleaseAsset { name: name.into(), ..Default::default() }
+    /// # }
+    /// let release = Release {
+    ///     assets: vec![asset("Game-macos-x86_64.zip"), asset("Game-macos-aarch64.zip"), asset("Game-windows-x86_64.zip")],
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(release.asset_for("macos", "aarch64").unwrap().name, "Game-macos-aarch64.zip");
+    /// assert_eq!(release.asset_for("windows", "x86_64").unwrap().name, "Game-windows-x86_64.zip");
+    /// assert!(release.asset_for("windows", "aarch64").is_none());
+    /// ```
+    pub fn asset_for(&self, os: &str, arch: &str) -> Option<&ReleaseAsset> {
+        let os_tokens: &[&str] = match os {
+            "web" => &["web", "wasm", "wasm32", "browser"],
+            "macos" => &["macos", "darwin", "osx", "mac", "dmg"],
+            "windows" => &["windows", "win64", "win32", "win", "exe", "msi"],
+            "linux" => &["linux", "appimage", "deb"],
+            "android" => &["android", "apk", "aab"],
+            "ios" => &["ios", "ipa"],
+            _ => return None,
+        };
+        let want = arch_family(arch);
+        let mut untagged = None;
+        for a in &self.assets {
+            let name = a.name.to_ascii_lowercase();
+            let tokens: Vec<&str> = name
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if !tokens.iter().any(|t| os_tokens.contains(t)) {
+                continue;
+            }
+            match asset_arch(&name, &tokens) {
+                Some(f) if Some(f) == want => return Some(a),
+                Some(ArchFamily::Universal) | None => {
+                    untagged.get_or_insert(a);
+                }
+                Some(_) => {}
+            }
+        }
+        untagged
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchFamily {
+    X86_64,
+    Aarch64,
+    X86,
+    Arm,
+    Wasm32,
+    Universal,
+}
+
+fn arch_family(arch: &str) -> Option<ArchFamily> {
+    Some(match arch {
+        "x86_64" => ArchFamily::X86_64,
+        "aarch64" => ArchFamily::Aarch64,
+        "x86" => ArchFamily::X86,
+        "arm" => ArchFamily::Arm,
+        "wasm32" => ArchFamily::Wasm32,
+        _ => return None,
+    })
+}
+
+/// Architecture named in an asset file name, if any.
+fn asset_arch(name: &str, tokens: &[&str]) -> Option<ArchFamily> {
+    // Multi-token spellings first (`x86_64`, `x86-64` split into `x86` + `64`).
+    if name.contains("x86_64") || name.contains("x86-64") || tokens.iter().any(|t| matches!(*t, "amd64" | "x64")) {
+        return Some(ArchFamily::X86_64);
+    }
+    for t in tokens {
+        match *t {
+            "aarch64" | "arm64" => return Some(ArchFamily::Aarch64),
+            "universal" | "universal2" => return Some(ArchFamily::Universal),
+            "i686" | "i386" | "x86" | "win32" => return Some(ArchFamily::X86),
+            "armv7" | "armhf" | "armv7l" => return Some(ArchFamily::Arm),
+            "wasm32" => return Some(ArchFamily::Wasm32),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parameters for [`crate::GithubClient::create_release`].
@@ -455,5 +542,69 @@ mod tests {
         assert_eq!(release.asset_for_current_platform().unwrap().name, "game-linux.zip");
         #[cfg(target_os = "windows")]
         assert_eq!(release.asset_for_current_platform().unwrap().name, "game-windows.zip");
+    }
+}
+
+#[cfg(test)]
+mod asset_matching_tests {
+    use super::*;
+
+    fn release(names: &[&str]) -> Release {
+        Release {
+            assets: names
+                .iter()
+                .map(|n| ReleaseAsset {
+                    name: n.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn picks_os_and_arch_from_spacecorps_style_names() {
+        let r = release(&[
+            "SpaceCorps2027-windows-x86_64.zip",
+            "SpaceCorps2027-macos-x86_64.zip",
+            "SpaceCorps2027-macos-aarch64.zip",
+            "SpaceCorps2027-linux-x86_64.tar.gz",
+            "SpaceCorps2027-web-wasm32.zip",
+        ]);
+        let pick = |os, arch| r.asset_for(os, arch).map(|a| a.name.as_str());
+        assert_eq!(pick("macos", "aarch64"), Some("SpaceCorps2027-macos-aarch64.zip"));
+        assert_eq!(pick("macos", "x86_64"), Some("SpaceCorps2027-macos-x86_64.zip"));
+        assert_eq!(pick("windows", "x86_64"), Some("SpaceCorps2027-windows-x86_64.zip"));
+        assert_eq!(pick("linux", "x86_64"), Some("SpaceCorps2027-linux-x86_64.tar.gz"));
+        assert_eq!(pick("web", "wasm32"), Some("SpaceCorps2027-web-wasm32.zip"));
+        // No build for this architecture: never hand out another architecture's binary.
+        assert_eq!(pick("linux", "aarch64"), None);
+        assert_eq!(pick("windows", "aarch64"), None);
+    }
+
+    #[test]
+    fn darwin_is_not_windows_and_untagged_or_universal_builds_are_fallbacks() {
+        let r = release(&["game-darwin-universal.dmg", "game-win64.zip", "game-linux.AppImage"]);
+        assert_eq!(r.asset_for("windows", "x86_64").unwrap().name, "game-win64.zip");
+        assert_eq!(
+            r.asset_for("macos", "aarch64").unwrap().name,
+            "game-darwin-universal.dmg"
+        );
+        assert_eq!(r.asset_for("linux", "aarch64").unwrap().name, "game-linux.AppImage");
+        assert!(release(&["game-darwin.zip"]).asset_for("windows", "x86_64").is_none());
+    }
+
+    #[test]
+    fn arch_spellings() {
+        let r = release(&[
+            "g-linux-amd64.tgz",
+            "g-linux-arm64.tgz",
+            "g-windows-i686.zip",
+            "g-windows-x64.zip",
+        ]);
+        assert_eq!(r.asset_for("linux", "x86_64").unwrap().name, "g-linux-amd64.tgz");
+        assert_eq!(r.asset_for("linux", "aarch64").unwrap().name, "g-linux-arm64.tgz");
+        assert_eq!(r.asset_for("windows", "x86").unwrap().name, "g-windows-i686.zip");
+        assert_eq!(r.asset_for("windows", "x86_64").unwrap().name, "g-windows-x64.zip");
     }
 }
