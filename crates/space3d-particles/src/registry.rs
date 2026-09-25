@@ -57,6 +57,8 @@ struct Slot {
 pub struct ParticleEffects {
     slots: Vec<Slot>,
     free: Vec<u32>,
+    /// Bumped by every change (the runtime and the render node rebuild what depends on it).
+    version: u64,
 }
 
 impl std::fmt::Debug for ParticleEffects {
@@ -90,6 +92,7 @@ impl ParticleEffects {
         };
         let slot = &mut self.slots[index as usize];
         slot.effect = Some(effect);
+        self.version += 1;
         Ok(EffectHandle {
             index,
             generation: slot.generation,
@@ -105,6 +108,7 @@ impl ParticleEffects {
             });
         }
         self.slots[handle.index as usize].effect = Some(effect);
+        self.version += 1;
     }
 
     /// Replace an effect (hot reload). Render parameters and curves apply next frame; spawn and
@@ -113,6 +117,7 @@ impl ParticleEffects {
         effect.validate()?;
         let slot = self.slot_mut(handle).ok_or(EffectError::UnknownHandle)?;
         slot.effect = Some(effect);
+        self.version += 1;
         Ok(())
     }
 
@@ -121,6 +126,7 @@ impl ParticleEffects {
         let slot = self.slot_mut(handle)?;
         let effect = slot.effect.take()?;
         slot.generation = slot.generation.wrapping_add(1);
+        self.version += 1;
         if handle.index >= builtin::COUNT {
             self.free.push(handle.index);
         }
@@ -165,6 +171,16 @@ impl ParticleEffects {
         self.len() == 0
     }
 
+    /// Changes whenever an effect is added, replaced or removed.
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Number of slots (the highest handle index + 1).
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     fn slot_mut(&mut self, handle: EffectHandle) -> Option<&mut Slot> {
         self.slots
             .get_mut(handle.index as usize)
@@ -173,8 +189,9 @@ impl ParticleEffects {
 }
 
 /// The built-in effect library: handles reserved at indices `0..COUNT` whenever
-/// `ParticlesPlugin::builtins` is set. Their data lands with the particles milestones PA1/PA3;
-/// until then [`builtin::effect`] returns `None` and the handles resolve to nothing.
+/// `ParticlesPlugin::builtins` is set. The effects are RON data (`assets/particles/*.pfx.ron`,
+/// embedded): sprite layers only for now; `LASER_BEAM` (beam layers) lands with milestone PA3,
+/// until then its handle resolves to nothing.
 pub mod builtin {
     use super::EffectHandle;
     use crate::effect::ParticleEffect;
@@ -199,14 +216,47 @@ pub mod builtin {
     /// Reserved built-in slots.
     pub(crate) const COUNT: u32 = 8;
 
-    /// `(name, RON source)` of every built-in (also shipped as files under
-    /// `assets/particles/`).
-    pub const SOURCES: &[(&str, &str)] = &[]; // STUB(P-PART): the library (PA1, PA3)
+    /// `(name, RON source)` of every built-in, in handle order (also shipped as files under
+    /// `crates/space3d-particles/assets/particles/`).
+    pub const SOURCES: &[(&str, &str)] = &[
+        (
+            "space3d/explosion",
+            include_str!("../assets/particles/explosion.pfx.ron"),
+        ),
+        (
+            "space3d/hit_spark",
+            include_str!("../assets/particles/hit_spark.pfx.ron"),
+        ),
+        (
+            "space3d/shield_ripple",
+            include_str!("../assets/particles/shield_ripple.pfx.ron"),
+        ),
+        ("space3d/warp_in", include_str!("../assets/particles/warp_in.pfx.ron")),
+        ("space3d/warp_out", include_str!("../assets/particles/warp_out.pfx.ron")),
+        (
+            "space3d/engine_exhaust",
+            include_str!("../assets/particles/engine_exhaust.pfx.ron"),
+        ),
+        (
+            "space3d/laser_trail",
+            include_str!("../assets/particles/laser_trail.pfx.ron"),
+        ),
+    ];
 
-    /// The built-in effect of `handle`, parsed from [`SOURCES`].
+    /// The built-in effect of `handle`, parsed from [`SOURCES`] (`None` for handles without
+    /// data yet: `LASER_BEAM`).
     pub fn effect(handle: EffectHandle) -> Option<ParticleEffect> {
+        if handle.generation != 0 {
+            return None;
+        }
         let (_, src) = SOURCES.get(handle.index() as usize)?;
-        ParticleEffect::from_ron(src).ok()
+        match ParticleEffect::from_ron(src) {
+            Ok(e) => Some(e),
+            Err(err) => {
+                tracing::error!("built-in particle effect {handle:?}: {err}");
+                None
+            }
+        }
     }
 }
 
@@ -234,5 +284,30 @@ mod tests {
         assert_eq!(fx.len(), 2);
         assert!(builtin::effect(builtin::LASER_BEAM).is_none());
         assert!(fx.get(EffectHandle::INVALID).is_none());
+        let v = fx.version();
+        fx.remove(b);
+        assert!(fx.version() > v, "every change bumps the version");
+    }
+
+    /// Every built-in parses, validates, round-trips through RON and sits at its handle.
+    #[test]
+    fn builtins_parse_and_round_trip() {
+        let handles = [
+            builtin::EXPLOSION,
+            builtin::HIT_SPARK,
+            builtin::SHIELD_RIPPLE,
+            builtin::WARP_IN,
+            builtin::WARP_OUT,
+            builtin::ENGINE_EXHAUST,
+            builtin::LASER_TRAIL,
+        ];
+        assert_eq!(builtin::SOURCES.len(), handles.len());
+        for (h, (name, src)) in handles.into_iter().zip(builtin::SOURCES) {
+            let e = ParticleEffect::from_ron(src).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(&e.name, name);
+            assert!(!e.layers.is_empty(), "{name}");
+            assert_eq!(builtin::effect(h).as_ref(), Some(&e));
+            assert_eq!(ParticleEffect::from_ron(&e.to_ron()).unwrap(), e, "{name} round-trips");
+        }
     }
 }

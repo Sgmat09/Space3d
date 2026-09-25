@@ -4893,10 +4893,17 @@ dependencies = [
 name = "space3d-particles"
 version = "0.1.0"
 dependencies = [
+ "ahash",
+ "bytemuck",
+ "image",
+ "naga",
+ "pollster",
+ "proptest",
  "ron",
  "serde",
  "space3d-core",
  "space3d-render",
+ "space3d-test",
  "thiserror 2.0.21",
  "tracing",
 ]

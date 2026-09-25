@@ -1,7 +1,7 @@
-//! Counters ([`ParticleStats`]) and read-only runtime state ([`ParticleRuntime`]).
+//! Counters ([`ParticleStats`]) and the state of an effect instance ([`EffectState`], from
+//! [`crate::ParticleRuntime::state`]).
 
 use crate::ParticleBackend;
-use space3d_core::Entity;
 
 /// Counters of the last rendered frame (resource).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -40,20 +40,6 @@ pub struct ParticleStats {
     pub bytes_uploaded: u64,
     /// Scratch vectors that grew this frame (0 in the steady state).
     pub cpu_reallocations: u32,
-}
-
-/// Read-only view of the particle runtime (resource), for gameplay and UI queries.
-#[derive(Debug, Default)]
-pub struct ParticleRuntime {
-    _private: (),
-}
-
-impl ParticleRuntime {
-    /// State of the effect instance playing on `entity`.
-    pub fn state(&self, entity: Entity) -> Option<EffectState> {
-        let _ = entity; // STUB(P-PART): the runtime (PA0)
-        None
-    }
 }
 
 /// State of one effect instance.

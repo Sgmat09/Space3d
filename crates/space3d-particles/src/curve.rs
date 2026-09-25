@@ -66,6 +66,49 @@ fn keys_eval(keys: &[(f32, f32)], t: f32) -> f32 {
     keys.last().map_or(1.0, |k| k.1)
 }
 
+/// Catmull-Rom through sorted `(t, value)` keys, the end keys repeated as outer control points,
+/// clamped outside the keys.
+fn smooth_eval(keys: &[(f32, f32)], t: f32) -> f32 {
+    let Some(&(t0, v0)) = keys.first() else {
+        return 1.0;
+    };
+    if t <= t0 {
+        return v0;
+    }
+    let n = keys.len();
+    for i in 0..n.saturating_sub(1) {
+        let ((a, p1), (b, p2)) = (keys[i], keys[i + 1]);
+        if t <= b {
+            let p0 = keys[i.saturating_sub(1)].1;
+            let p3 = keys[(i + 2).min(n - 1)].1;
+            let u = if b > a { (t - a) / (b - a) } else { 1.0 };
+            let (u2, u3) = (u * u, u * u * u);
+            return 0.5
+                * (2.0 * p1
+                    + (p2 - p0) * u
+                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u2
+                    + (3.0 * (p1 - p2) + p3 - p0) * u3);
+        }
+    }
+    keys[n - 1].1
+}
+
+impl FadeCurve {
+    /// The fade at `t` (clamped to 0..1): the game's `fx::particles::Fade::at` formulas.
+    pub fn eval(self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => 1.0 - t,
+            Self::Out => (1.0 - t) * (1.0 - t),
+            Self::Flash => (-t * 7.0).exp() * (1.0 - t),
+            Self::InOut => (t / 0.12).min(1.0) * (1.0 - t).powf(1.4),
+            Self::Linger => (t / 0.1).min(1.0) * (1.0 - t * t),
+            Self::Burn => (1.0 - t).powf(2.8),
+            Self::Hold => 1.0 - t * t,
+        }
+    }
+}
+
 impl Curve {
     /// The value at `t` (clamped to 0..1).
     pub fn eval(&self, t: f32) -> f32 {
@@ -74,11 +117,34 @@ impl Curve {
             Self::Constant(v) => *v,
             Self::Linear(a, b) => a + (b - a) * t,
             Self::Keys(k) => keys_eval(k, t),
-            // STUB(P-PART): Catmull-Rom; linear between keys until then.
-            Self::Smooth(k) => keys_eval(k, t),
-            // STUB(P-PART): the game's fade shapes; linear until then.
-            Self::Preset(_) => 1.0 - t,
+            Self::Smooth(k) => smooth_eval(k, t),
+            Self::Preset(f) => f.eval(t),
         }
+    }
+
+    /// Largest value over `0..=1` (sampled at the LUT resolution; bounds and culling).
+    pub fn max_value(&self) -> f32 {
+        match self {
+            Self::Constant(v) => *v,
+            Self::Linear(a, b) => a.max(*b),
+            Self::Preset(_) => 1.0,
+            _ => (0..crate::effect::LUT_WIDTH)
+                .map(|i| self.eval(i as f32 / (crate::effect::LUT_WIDTH - 1) as f32))
+                .fold(f32::MIN, f32::max),
+        }
+    }
+
+    /// An ease-out from `a` to `b` (`a + (b − a)·(1 − (1 − t)²)`, the game's size easing), as
+    /// nine keys.
+    pub fn ease_out(a: f32, b: f32) -> Self {
+        Self::Keys(
+            (0..=8)
+                .map(|i| {
+                    let t = i as f32 / 8.0;
+                    (t, a + (b - a) * (1.0 - (1.0 - t) * (1.0 - t)))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -268,6 +334,43 @@ mod tests {
         let g = Gradient::linear(Vec4::ZERO, Vec4::ONE);
         assert_eq!(g.eval(0.5), Vec4::splat(0.5));
         assert_eq!(Gradient::default().eval(0.9), Vec4::ONE);
+    }
+
+    #[test]
+    fn smooth_curves_pass_through_their_keys() {
+        let keys = vec![(0.0, 0.0), (0.3, 1.0), (0.7, 0.2), (1.0, 0.5)];
+        let c = Curve::Smooth(keys.clone());
+        for (t, v) in keys {
+            assert!((c.eval(t) - v).abs() < 1e-6, "{t}: {}", c.eval(t));
+        }
+        // Between keys it is smooth: no kink at 0.3 (left and right slopes agree).
+        let h = 1e-3;
+        let left = (c.eval(0.3) - c.eval(0.3 - h)) / h;
+        let right = (c.eval(0.3 + h) - c.eval(0.3)) / h;
+        assert!((left - right).abs() < 0.5, "{left} vs {right}");
+        assert_eq!(Curve::Smooth(vec![(0.5, 2.0)]).eval(0.9), 2.0);
+        assert_eq!(Curve::Smooth(vec![]).eval(0.9), 1.0);
+    }
+
+    /// The presets are the game's `Fade::at` shapes.
+    #[test]
+    fn fade_presets_match_the_game() {
+        let at = |f: FadeCurve, t: f32| Curve::Preset(f).eval(t);
+        for t in [0.0f32, 0.05, 0.25, 0.5, 0.9, 1.0] {
+            assert_eq!(at(FadeCurve::Linear, t), 1.0 - t);
+            assert_eq!(at(FadeCurve::Out, t), (1.0 - t) * (1.0 - t));
+            assert_eq!(at(FadeCurve::Flash, t), (-t * 7.0).exp() * (1.0 - t));
+            assert_eq!(at(FadeCurve::InOut, t), (t / 0.12).min(1.0) * (1.0 - t).powf(1.4));
+            assert_eq!(at(FadeCurve::Linger, t), (t / 0.1).min(1.0) * (1.0 - t * t));
+            assert_eq!(at(FadeCurve::Burn, t), (1.0 - t).powf(2.8));
+            assert_eq!(at(FadeCurve::Hold, t), 1.0 - t * t);
+        }
+        assert_eq!(at(FadeCurve::Hold, 2.0), 0.0, "clamped");
+        assert_eq!(Curve::Linear(1.0, 3.0).max_value(), 3.0);
+        assert!((Curve::Keys(vec![(0.0, 0.0), (0.5, 4.0), (1.0, 0.0)]).max_value() - 4.0).abs() < 0.05);
+        let e = Curve::ease_out(1.0, 3.0);
+        assert_eq!((e.eval(0.0), e.eval(1.0)), (1.0, 3.0));
+        assert!(e.eval(0.5) > 2.0, "eases out");
     }
 
     #[test]
