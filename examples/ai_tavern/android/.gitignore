@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+native/target/
+app/src/main/jniLibs/
+native/Cargo.lock

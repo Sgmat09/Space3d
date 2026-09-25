@@ -3,13 +3,13 @@
 //! [`ScriptedBackend`]). The engine only speaks the protocol, so backends are injected per
 //! platform ([`BackendChoice`]).
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", feature = "android-jvm"))]
 mod android;
 mod apple;
 pub(crate) mod scripted;
 
-#[cfg(target_os = "android")]
-pub use android::AndroidBackend;
+#[cfg(any(target_os = "android", feature = "android-jvm"))]
+pub use android::{AndroidBackend, OAM_JNI_CLASS};
 pub use apple::AppleBackend;
 pub use scripted::{ModelRequest, RequestKind, ScriptedBackend};
 

@@ -16,6 +16,9 @@
 //! Gemini Nano on Android (in the Gradle host app, see docs/ai-android.md), otherwise a
 //! keyword-driven scripted Mira that goes through exactly the same tool calls.
 //! Controls: type and press Enter, or click a suggested reply; `Esc` quits.
+//!
+//! The game is a library (`build`), so the desktop/web binary (`src/main.rs`) and the Android
+//! host's native library (`android/native`, see docs/ai-android.md) share it.
 
 use serde_json::{Value, json};
 use space3d::ai::{Ai, AiEvent, AiTool, BackendChoice, ModelRequest, NpcOptions, RequestKind, ScriptedBackend};
@@ -90,7 +93,9 @@ fn menu() -> [(MenuItem, Stock); 4] {
     ]
 }
 
-fn build(app: &mut App) {
+/// Configures the tavern: engine plugins, the AI backend (the platform's model, or scripted
+/// Mira), the game logic and the visuals.
+pub fn build(app: &mut App) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let demo = args.iter().any(|a| a == "--demo")
         || std::env::var_os("SPACE3D_EXIT_AFTER_FRAMES").is_some()
@@ -105,8 +110,6 @@ fn build(app: &mut App) {
     add_tavern(app, BackendChoice::auto_or(scripted_mira()), demo);
     add_visuals(app);
 }
-
-space3d::main!(build);
 
 // ------------------------------------------------------------------------------------------
 // Game logic (no rendering: the tests run it headless)

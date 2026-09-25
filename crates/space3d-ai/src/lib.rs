@@ -73,12 +73,12 @@ mod tools;
 mod types;
 
 pub use ai::{Ai, AiPlugin, AiStatus};
-#[cfg(target_os = "android")]
-pub use backend::AndroidBackend;
 pub use backend::{
     AiBackend, AppleBackend, BackendChoice, BackendKind, Inbox, ModelRequest, RequestKind, ScriptedBackend,
     UnsupportedBackend,
 };
+#[cfg(any(target_os = "android", feature = "android-jvm"))]
+pub use backend::{AndroidBackend, OAM_JNI_CLASS};
 pub use config::{
     Actor, ContentRequest, Created, DecisionRequest, NpcConfig, NpcOptions, RespondOptions, SessionConfig,
     SessionOptions, TalkOptions,

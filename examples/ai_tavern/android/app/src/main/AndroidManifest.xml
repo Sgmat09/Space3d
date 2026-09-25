@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Space3d renders with Vulkan, falling back to OpenGL ES 3. -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+    <!-- hasCode stays true: the open-android-models and ML Kit classes are in the APK's dex. -->
+    <application
+        android:allowBackup="false"
+        android:label="AI Tavern">
+        <!-- The game is a NativeActivity (android-activity / winit), as with cargo-apk.
+             Gemini Nano only runs while this is the top foreground app. -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode|density"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="ai_tavern_android" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

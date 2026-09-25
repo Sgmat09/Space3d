@@ -1,0 +1,26 @@
+# The Android native library of the AI tavern: the game (the `ai_tavern` crate) plus the
+# `android_main` entry that NativeActivity calls. Built by the Gradle host (`cargoNdk` task)
+# with cargo-ndk into the APK's jniLibs, next to the open-android-models AAR.
+#
+# Its own workspace, so the engine workspace's `cargo build` / `cargo test` never link it.
+[package]
+name = "ai_tavern_android"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "LicenseRef-SpaceCorps-Proprietary"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ai_tavern = { path = "../.." }
+space3d = { path = "../../../../crates/space3d", features = ["ai"] }
+
+[workspace]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

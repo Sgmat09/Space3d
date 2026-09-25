@@ -12,6 +12,9 @@
 //! sees system classes), strings cross as proper modified UTF-8 (the `jni` crate encodes and
 //! decodes surrogate pairs, so emoji survive), and `destroy` is never called while holding a
 //! lock `nativeDeliver` takes.
+//!
+//! With the test-only `android-jvm` feature the module also builds on desktop hosts, where
+//! `tests/android_jvm.rs` runs it against the real `OamJni` in a desktop JVM.
 
 use super::{AiBackend, BackendKind, Inbox};
 use crate::error::{AiError, AiResult};
@@ -85,6 +88,7 @@ impl AndroidBackend {
     /// `NativeActivity` runner) through `ndk-context`.
     ///
     /// Must run after `android_main` started (for example in `AiPlugin::build`).
+    #[cfg(target_os = "android")]
     pub fn from_android_context() -> AiResult<Self> {
         let context = ndk_context::android_context();
         // SAFETY: ndk-context holds the process's JavaVM and a global reference to the
