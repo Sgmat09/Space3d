@@ -1,0 +1,15 @@
+[package]
+name = "ai_tavern"
+description = "Space3d example: Mira the innkeeper, an on-device-AI NPC whose tools read and write ECS state (Apple Foundation Models, Gemini Nano, or a scripted model)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+## Use Apple's on-device model on macOS 27 (needs OAM_APPLE_LIB_DIR; see docs/ai.md).
+apple = ["space3d/ai-apple-ffi"]
+
+[dependencies]
+space3d = { workspace = true, features = ["ai"] }
+serde_json.workspace = true

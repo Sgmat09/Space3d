@@ -56,6 +56,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai_tavern"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "space3d",
+]
+
+[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4704,6 +4712,7 @@ name = "space3d"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "space3d-ai",
  "space3d-assets",
  "space3d-audio",
  "space3d-core",

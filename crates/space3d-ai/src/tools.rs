@@ -92,6 +92,37 @@ impl AiTool {
         self.handler.is_some()
     }
 
+    /// Runs the handler directly, as `ai::run_tools` does for a `tool/call` — for unit tests
+    /// of tools. A deferred reply's [`ToolResponder`] is detached (replies go nowhere).
+    ///
+    /// ```
+    /// use space3d_ai::{AiTool, ToolCall, ToolOutput, ToolReply};
+    /// use space3d_core::prelude::*;
+    /// use serde_json::json;
+    /// let mut tool = AiTool::new("double", "Doubles n.")
+    ///     .handler(|_ctx, call| call.i64("n").map(|n| ToolOutput::json(n * 2)));
+    /// let mut app = App::new();
+    /// let mut ctx = SystemCtx { world: &mut app.world, resources: &mut app.resources };
+    /// let call = ToolCall { id: "c1".into(), name: "double".into(), arguments: json!({"n": 21}) };
+    /// assert_eq!(tool.invoke(&mut ctx, call), ToolReply::Output(ToolOutput::json(42)));
+    /// ```
+    pub fn invoke(&mut self, ctx: &mut SystemCtx, call: ToolCall) -> ToolReply {
+        let Some(handler) = self.handler.as_mut() else {
+            return ToolReply::Output(ToolOutput::error(format!(
+                "No handler is registered for tool '{}'.",
+                self.name
+            )));
+        };
+        let invocation = ToolInvocation {
+            call,
+            owner: ToolOwner::Request,
+            request: None,
+            context: Map::new(),
+            responder: ToolResponder::new(Arc::new(Detached), Value::Null),
+        };
+        handler(ctx, &invocation)
+    }
+
     /// The protocol's tool definition: `{"name", "description", "parameters"?, "timeoutSeconds"?}`.
     pub fn definition(&self) -> Value {
         let mut definition = json!({"name": self.name, "description": self.description});
@@ -139,6 +170,23 @@ impl fmt::Debug for AiTool {
             .field("definition", &self.definition())
             .field("has_handler", &self.has_handler())
             .finish()
+    }
+}
+
+/// The backend of [`AiTool::invoke`]'s detached responders: drops every line.
+struct Detached;
+
+impl AiBackend for Detached {
+    fn kind(&self) -> crate::BackendKind {
+        crate::BackendKind::Custom("detached")
+    }
+
+    fn start(&self, _inbox: crate::Inbox) -> AiResult<()> {
+        Ok(())
+    }
+
+    fn send(&self, _line: &str) -> AiResult<()> {
+        Ok(())
     }
 }
 

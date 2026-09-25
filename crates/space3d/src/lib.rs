@@ -50,6 +50,7 @@
 //! | `github` | releases, update checker, crash reporter | `github` (no) |
 //! | `stories` | storybook | `stories` (no) |
 //! | `test` | test harness, input simulation, golden screenshots | `test` (no) |
+//! | `ai` | on-device AI: sessions, NPCs, decisions, engine tools (Apple / Android / scripted) | `ai` (no; `ai-apple-ffi` links Apple's bridge) |
 //!
 //! ## Environment variables understood by the plugin groups
 //!
@@ -75,6 +76,8 @@ pub use space3d_tasks as tasks;
 /// Logging macros (`space3d::tracing::info!(...)`); [`LogPlugin`] installs the subscriber.
 pub use tracing;
 
+#[cfg(feature = "ai")]
+pub use space3d_ai as ai;
 #[cfg(feature = "assets")]
 pub use space3d_assets as assets;
 #[cfg(feature = "audio")]
@@ -176,4 +179,11 @@ pub mod prelude {
 
     #[cfg(feature = "github")]
     pub use space3d_github::{GithubClient, GithubPlugin, RepoRef, UpdateChecker};
+
+    #[cfg(feature = "ai")]
+    pub use space3d_ai::{
+        Ai, AiError, AiErrorCode, AiEvent, AiPlugin, AiTool, BackendChoice, ContentRequest, DecisionRequest,
+        DialogueTurn, Emotion, NpcConfig, NpcEvent, Persona, Script, ScriptStep, ScriptedBackend, SessionConfig,
+        TalkOptions, ToolChoice, ToolOutput, ToolReply, TurnEvent,
+    };
 }
