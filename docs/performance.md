@@ -412,3 +412,21 @@ the particles node about 0.29 ms of render-thread CPU per frame against 0.14 ms 
 `FixedUpdate` (1080p, HDR + bloom; 0.35–0.44 ms before), so the Battle scene's "particles
 prepare ≤ 0.1 ms" line is missed about 3× until the bridges move to the GPU (particles.md,
 "Bridges are not free").
+
+### P-MAT PM1 / PM2 — material maps, blend modes, glTF import
+
+Dev machine as above; measured while other builds kept the machine busy (load averages 12–39),
+so every figure is an interleaved A/B against a pre-materials build (the `instancing` bench
+binary of `graphics` at 62a28d8) run in the same minutes.
+
+| gate / measurement | measured | status |
+|---|---|---|
+| ECS 100k static PBR entities ≤ 2.5 ms (`materials/ecs_pbr/100k`: 4 meshes × 8 materials with ORM, normal and emissive maps and a UV transform, render stage, camera looking away) | 2.23 / 2.35 / 2.34 ms | met |
+| Direct mode unchanged, `extract_upload/ecs_static_mixed/100k` (map-less materials) | 2.13 / 2.21 / 2.22 ms against 2.10–2.27 ms for the pre-materials binary in the same rounds | within noise (the first version of the material key cost +0.8 ms: the per-entity fast path now compares the material field by field without branches, and the cache holds materials, so only real misses build a key) |
+| `materials/transparent_sort/4096` (one 4096-instance alpha batch sorted back to front per frame, camera moving; whole frame) | 0.38–0.41 ms per frame | recorded (the sort is a u64 `sort_unstable` of depth keys; no allocation) |
+| steady-state allocations with every PM1/PM2 feature (`tests/alloc_materials.rs`) | 100 per frame on `CpuDirect`, 195 on the GPU culling paths, constant; 0 in the renderer; live bytes +0 over 90 frames | bound 110 / 215 |
+| static scene with maps (`tests/materials.rs`) | 0 bytes uploaded, 0 textures created once warm | met |
+
+Not measured yet: the GPU cost of a full screen of mapped pixels (the gate "all maps + IBL +
+PCF9 ≤ +0.20 ms" needs PM4/PM5; the maps are sampled behind uniform branches, so map-less
+materials run the original instruction stream).
