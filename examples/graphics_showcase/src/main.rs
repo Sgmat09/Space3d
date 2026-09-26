@@ -14,6 +14,8 @@
 //! SPACE3D_HEADLESS=1 cargo run -p graphics_showcase --release      # no window: writes graphics_showcase.png
 //! # web (WebGL2 → Low, WebGPU → Medium/High): from this directory
 //! cargo run -p space3d-cli -- serve
+//! # (the page's full-window <canvas id="space3d">; add `?webgl2` to the URL to take the WebGL2
+//! # path in a browser that also has WebGPU)
 //! ```
 //!
 //! Keys: `Q` next quality tier, `1` bloom, `2` shadows, `3` image-based lighting, `4`
@@ -66,7 +68,13 @@ fn build(app: &mut App) {
     let headless = DefaultPlugins::headless_from_env((1280, 720)).is_some();
     app.add_plugin(
         DefaultPlugins::new()
-            .title("Space3d — graphics showcase")
+            .window(WindowPlugin {
+                title: "Space3d — graphics showcase".into(),
+                // Render into the page's <canvas id="space3d"> (web/index.html sizes it to the
+                // viewport); ignored on desktop.
+                canvas_id: Some("space3d".into()),
+                ..WindowPlugin::default()
+            })
             .without_physics()
             .without_net(),
     );

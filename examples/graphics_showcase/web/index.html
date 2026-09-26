@@ -18,6 +18,11 @@
     // `space3d build --target web` runs wasm-bindgen with --out-name graphics_showcase.
     import init from "./graphics_showcase.js";
     const status = document.getElementById("status");
+    // `?webgl2`: hide WebGPU so wgpu falls back to WebGL2 (the Low tier's path) in a browser
+    // that has both.
+    if (new URLSearchParams(location.search).has("webgl2")) {
+      Object.defineProperty(navigator, "gpu", { value: undefined, configurable: true });
+    }
     init()
       .then(() => { status.textContent = "Q quality · 1 bloom · 2 shadows · 3 IBL · 4 distortion · C follow · arrows pan · wheel zoom"; })
       .catch((e) => { status.textContent = "failed to start: " + e; console.error(e); });
