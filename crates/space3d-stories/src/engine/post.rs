@@ -8,7 +8,7 @@ use space3d_core::prelude::*;
 use space3d_render::{
     AutoExposure, Bloom, BloomComposite, Camera3d, ChromaticAberration, ColorGrading, ColorLut, CustomShader,
     Distortion, DistortionMaterial, DistortionMode, DistortionResolution, FilmGrain, FxaaQuality, Material, Mesh3d,
-    Metering, PointLight, PostProcess, RenderAssets, Vignette,
+    Metering, PointLight, PostProcess, RenderAssets, Tonemapper, Vignette,
 };
 
 /// This area's stories, in registry order.
@@ -23,6 +23,7 @@ pub(crate) fn stories() -> Vec<Story> {
         distortion(),
         warp_shockwave(),
         engine_heat_haze(),
+        tonemappers(),
     ]
 }
 
@@ -668,6 +669,144 @@ fn color_grading() -> Story {
     .knob_choice("lut", &["None", "Teal & orange", "Bleach bypass"], 1)
     .knob_f32("lut_contribution", 0.8, 0.0..=1.0)
     .knob_bool("night_vision", false)
+    .tag("graphics")
+    .tag("post")
+    .size(320, 180)
+}
+
+const TONEMAPPER_NAMES: [&str; 6] = [
+    "None",
+    "Reinhard",
+    "ACES fitted",
+    "AgX",
+    "Khronos PBR Neutral",
+    "AgX punchy",
+];
+const TONEMAPPER_CHOICES: [Tonemapper; 6] = [
+    Tonemapper::None,
+    Tonemapper::Reinhard,
+    Tonemapper::AcesFitted,
+    Tonemapper::AgX,
+    Tonemapper::KhronosPbrNeutral,
+    Tonemapper::AgXPunchy,
+];
+
+fn tonemappers() -> Story {
+    Story::new("Engine/Post/Tonemappers", |app, k| {
+        let sphere = mesh(app, MeshData::sphere(0.5, 32, 16));
+        // Top row: white emissive spheres of radiance 1/16 … 64 (×4 each).
+        for i in 0..6 {
+            let v = 4f32.powi(i) / 16.0;
+            app.world.spawn((
+                at(Vec3::new(-2.5 + i as f32, 1.1, 0.0)).with_scale(Vec3::splat(0.8)),
+                Mesh3d(sphere),
+                Material::unlit(Vec4::new(v, v, v, 1.0)),
+            ));
+        }
+        // Middle row: saturated emissives (lasers, exhausts, shields) at radiance 8.
+        for (i, c) in [
+            Vec3::new(1.0, 0.04, 0.02),
+            Vec3::new(1.0, 0.35, 0.02),
+            Vec3::new(0.2, 1.0, 0.05),
+            Vec3::new(0.02, 0.8, 1.0),
+            Vec3::new(0.05, 0.12, 1.0),
+            Vec3::new(0.8, 0.05, 1.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.world.spawn((
+                at(Vec3::new(-2.5 + i as f32, 0.0, 0.0)).with_scale(Vec3::splat(0.8)),
+                Mesh3d(sphere),
+                Material::unlit((c * 8.0).extend(1.0)),
+            ));
+        }
+        // Bottom row: lit hull materials under a sun and a saturated blue light.
+        for (i, (c, metal)) in [
+            (Vec3::splat(0.5), 0.0),
+            (Vec3::new(0.9, 0.55, 0.3), 0.4),
+            (Vec3::new(0.7, 0.7, 0.75), 0.3),
+            (Vec3::new(0.15, 0.3, 0.6), 0.0),
+            (Vec3::new(0.85, 0.2, 0.15), 0.2),
+            (Vec3::splat(0.9), 0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.world.spawn((
+                at(Vec3::new(-2.5 + i as f32, -1.1, 0.0)).with_scale(Vec3::splat(0.8)),
+                Mesh3d(sphere),
+                Material::color(c.extend(1.0)).with_metallic_roughness(metal, 0.35),
+            ));
+        }
+        app.world.spawn((
+            at(Vec3::new(1.5, -1.6, 1.2)),
+            PointLight {
+                color: Vec3::new(0.1, 0.3, 1.0),
+                intensity: 40.0,
+                range: 6.0,
+            },
+        ));
+        sun(app, Vec3::new(-0.4, -0.6, -0.7), 3.0);
+        ambient(app, 0.05);
+        let bloom = if k.bool("bloom") {
+            Bloom::glow()
+        } else {
+            Bloom {
+                enabled: false,
+                ..Bloom::glow()
+            }
+        };
+        for (i, knob) in ["top_left", "top_right", "bottom_left", "bottom_right"]
+            .into_iter()
+            .enumerate()
+        {
+            let post = PostProcess {
+                exposure: k.f32("exposure"),
+                tonemapper: TONEMAPPER_CHOICES[k.choice(knob).min(TONEMAPPER_CHOICES.len() - 1)],
+                bloom,
+                color_grading: ColorGrading {
+                    saturation: k.f32("saturation"),
+                    ..ColorGrading::default()
+                },
+                ..PostProcess::default()
+            };
+            app.world.spawn((
+                Name(format!("camera {knob}")),
+                // Long lens: the spheres stay round across the row.
+                Transform::from_xyz(0.0, 0.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
+                Camera3d {
+                    order: i as i32,
+                    viewport: Some([0.5 * (i % 2) as f32, 0.5 * (i / 2) as f32, 0.5, 0.5]),
+                    clear_color: Some(Vec4::new(0.02, 0.022, 0.03, 1.0)),
+                    ..Default::default()
+                }
+                .with_projection(space3d_render::Projection::Perspective {
+                    fov_y: 0.36,
+                    near: 0.5,
+                    far: 50.0,
+                }),
+                post,
+            ));
+        }
+    })
+    .description(
+        "The same HDR scene through four tonemappers (one post group per quadrant): white \
+         emissives of radiance 1/16 … 64 (top), saturated emissives at 8 (middle) and lit hull \
+         materials under a sun and a saturated blue light (bottom). Defaults: `None` (clips each \
+         channel: everything above 1 is flat white, saturated lights turn into lighter, \
+         shifted hues), `Reinhard` (never \
+         white; saturated lights stay saturated), `AcesFitted` (contrasty, hues skew toward \
+         yellow and cyan) and `AgX`, the default (bright lights desaturate to white without a \
+         hue skew). `Khronos PBR Neutral` and `AgX punchy` are one knob away.",
+    )
+    .knob_choice("top_left", &TONEMAPPER_NAMES, 0)
+    .knob_choice("top_right", &TONEMAPPER_NAMES, 1)
+    .knob_choice("bottom_left", &TONEMAPPER_NAMES, 2)
+    .knob_choice("bottom_right", &TONEMAPPER_NAMES, 3)
+    .knob_f32("exposure", 0.0, -4.0..=4.0)
+    .knob_f32("saturation", 1.0, 0.0..=2.0)
+    .knob_bool("bloom", false)
     .tag("graphics")
     .tag("post")
     .size(320, 180)
