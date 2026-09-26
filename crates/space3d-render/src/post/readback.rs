@@ -104,6 +104,12 @@ impl ExposureReadback {
             self.capacity = self.capacity.max(count.next_power_of_two());
         }
         for s in &mut self.slots {
+            // Every slot's camera list too, in flight or not: a slot first used frames later
+            // (the GPU was slower, GL) must not grow it then.
+            if s.cameras.capacity() < self.capacity {
+                s.cameras.reserve(self.capacity - s.cameras.len());
+                self.reallocations += 1;
+            }
             if s.capacity < self.capacity && s.state.load(Ordering::Acquire) == IDLE {
                 s.capacity = self.capacity;
                 s.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
