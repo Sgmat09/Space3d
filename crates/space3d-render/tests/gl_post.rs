@@ -295,6 +295,11 @@ fn gl_radial_distortion_pushes_outward() {
 }
 
 #[test]
+fn gl_normal_writers_are_capped_by_their_size() {
+    distortion::normal_writers_are_capped_by_their_size(gl_app);
+}
+
+#[test]
 fn gl_distortion_does_not_bleed_across_viewports() {
     distortion::distortion_does_not_bleed_across_viewports(gl_app);
 }

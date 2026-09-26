@@ -77,20 +77,31 @@ fn s3d_dm_value(p: vec2<f32>, period: f32, seed: u32) -> f32 {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-// Built-in heat-haze field: two octaves of value noise per axis (8 and 16 cells per UV unit),
-// -1..1, repeating every UV unit.
+// Built-in heat-haze field: two octaves of value noise per axis (3 and 7 cells per UV unit,
+// the finer at a quarter), -1..1, repeating every UV unit. Coarse enough that a strip's
+// offsets change smoothly across it (a shimmer, not a tear: the gradient of the offset stays
+// well below 1 pixel per pixel under the size cap below).
 fn s3d_dm_noise(uv: vec2<f32>) -> vec2<f32> {
-    let p = uv * 8.0;
-    let x = s3d_dm_value(p, 8.0, 0x51u) + 0.5 * s3d_dm_value(p * 2.0, 16.0, 0x93u);
-    let y = s3d_dm_value(p, 8.0, 0x2Du) + 0.5 * s3d_dm_value(p * 2.0, 16.0, 0xC7u);
-    return vec2<f32>(x, y) * (2.0 / 1.5) - 1.0;
+    let p = uv * 3.0;
+    let q = uv * 7.0 + vec2<f32>(0.37, 0.61);
+    let x = s3d_dm_value(p, 3.0, 0x51u) + 0.25 * s3d_dm_value(q, 7.0, 0x93u);
+    let y = s3d_dm_value(p, 3.0, 0x2Du) + 0.25 * s3d_dm_value(q, 7.0, 0xC7u);
+    return vec2<f32>(x, y) * (2.0 / 1.25) - 1.0;
 }
+
+// How far a writer may bend the image, as a fraction of half its narrower on-screen extent (the
+// particles' writers use the same: `S3DP_HEAT_REACH`, `S3DP_WAVE_REACH`): the built-in heat haze
+// shimmers what is behind it, a texture may push further. Radial rings are not capped.
+const S3D_DM_HEAT_REACH: f32 = 0.12;
+const S3D_DM_TEXTURE_REACH: f32 = 0.5;
 
 @fragment
 fn fs_distortion(in: DmOut) -> @location(0) vec4<f32> {
     // Derivatives and the implicit-LOD sample first, in uniform control flow.
     let duv_dx = dpdx(in.uv);
     let duv_dy = dpdy(in.uv);
+    // View heights per pixel of this pass (NDC spans 2 view heights; exact per fragment).
+    let vh_per_px = 0.5 * abs(dpdy(in.clip.y / in.clip.z));
     let scrolled = in.uv + in.extra.xy;
     var texel = textureSample(s3d_dm_texture, s3d_dm_sampler, scrolled).rg;
 
@@ -133,7 +144,20 @@ fn fs_distortion(in: DmOut) -> @location(0) vec4<f32> {
         screen = vec2<f32>(dd * dir.x - b * dir.y, -c * dir.x + a * dir.y) * (sign(det) / sqrt(abs(det)));
     }
     // Screen pixels are y down; offsets are +y up.
-    let offset = vec2<f32>(screen.x, -screen.y) * in.params.x * amount * in.weight;
+    var offset = vec2<f32>(screen.x, -screen.y) * in.params.x * amount * in.weight;
+    if (mode < 1.5 && abs(det) > 1e-12) {
+        // At most `reach` × half the narrower extent of the mesh's UV square on screen: the
+        // strength is in view heights, so a thin or distant strip would otherwise bend the
+        // image by more than its own width and tear straight edges into squiggles.
+        let px_u = length(vec2<f32>(dd, c)) / abs(det);
+        let px_v = length(vec2<f32>(b, a)) / abs(det);
+        let reach = select(S3D_DM_TEXTURE_REACH, S3D_DM_HEAT_REACH, mode < 0.5);
+        let cap = reach * 0.5 * min(px_u, px_v) * vh_per_px;
+        let len = length(offset);
+        if (len > cap) {
+            offset = offset * (cap / len);
+        }
+    }
 
     // Occlusion by scene depth at the scene pixel under this fragment, and the foreground guard
     // where it looks.

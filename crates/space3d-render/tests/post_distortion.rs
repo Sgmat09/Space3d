@@ -121,6 +121,11 @@ fn radial_distortion_pushes_outward() {
 }
 
 #[test]
+fn normal_writers_are_capped_by_their_size() {
+    cases::normal_writers_are_capped_by_their_size(headless_app);
+}
+
+#[test]
 fn distortion_does_not_bleed_across_viewports() {
     cases::distortion_does_not_bleed_across_viewports(headless_app);
 }

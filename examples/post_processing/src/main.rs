@@ -303,7 +303,7 @@ fn spawn_fighter(
             Transform::from_xyz(x, -0.35, 1.5).with_scale(Vec3::new(0.5, 1.0, 1.5)),
             Mesh3d(plane),
             DistortionMaterial {
-                strength: 0.012,
+                strength: 0.004,
                 scroll: Vec2::new(0.0, -1.2),
                 ..DistortionMaterial::default()
             },

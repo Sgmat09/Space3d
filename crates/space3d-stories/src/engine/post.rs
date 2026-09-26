@@ -1240,7 +1240,7 @@ fn engine_heat_haze() -> Story {
          stars and the nebula shimmer under the plumes; the ships above the haze stay sharp \
          (scene depth), and `soft_depth` fades the haze where it meets the station.",
     )
-    .knob_f32("haze", 0.012, 0.0..=0.0625)
+    .knob_f32("haze", 0.004, 0.0..=0.0625)
     .knob_f32("scroll", 1.2, 0.0..=4.0)
     .knob_bool("distortion", true)
     .knob_f32("strength", 1.0, 0.0..=2.0)

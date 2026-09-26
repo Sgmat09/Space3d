@@ -571,9 +571,10 @@ world.spawn((ring_transform, Mesh3d(quad), DistortionMaterial {
     mode: DistortionMode::Radial { inner: 0.3, outer: 0.5 },
     ..DistortionMaterial::default()
 }));
-// Engine heat haze: the built-in value noise, scrolling down the plume (UV per second).
+// Engine heat haze: the built-in value noise, scrolling down the plume (UV per second). A
+// shimmer is a few pixels: 0.004 view heights is 4 px at 1080p (and capped by the strip's size).
 world.spawn((plume_transform, Mesh3d(strip), DistortionMaterial {
-    strength: 0.012,
+    strength: 0.004,
     scroll: Vec2::new(0.0, -1.2),
     soft_depth: 0.3,
     ..DistortionMaterial::default()
@@ -628,9 +629,17 @@ does it through the public node API only (graphics spec §5.2 PO5):
 * **`DistortionMode::Normal`**: the offset comes from `texture` (RG, 0.5 = none, 0 and 1 = −/+
   `strength` along U and V; sampled with the texture's own sampler, so use `AddressMode::Repeat`
   to scroll; sRGB formats are read back as their stored values) or, without one, the built-in
-  value noise (two octaves, 8 and 16 cells per UV unit, repeating every UV unit). `scroll` moves
-  it by render time (`FrameInfo::time`: deterministic, replays and `render_to_image` twice give
-  the same haze). The outer 0.2 of the UV square feathers out, so a quad has no visible edge.
+  value noise (two octaves, 3 and 7 cells per UV unit, the finer at a quarter, repeating every
+  UV unit). `scroll` moves it by render time (`FrameInfo::time`: deterministic, replays and
+  `render_to_image` twice give the same haze). The outer 0.2 of the UV square feathers out, so a
+  quad has no visible edge.
+* **Size cap.** The strength is in view heights, so a thin or distant strip could bend the
+  image by more than its own width: at 1080p the old recipe (0.012 with 8- and 16-cell noise)
+  asked a plume strip 82 px wide for 13 px and tore the straight seams under it into 10–15 px
+  squiggles. Like the particles' writers, a `Normal` writer bends the image by at most a
+  fraction of half the narrower on-screen extent of its UV square: 0.12 with the built-in noise
+  (a shimmer: 4.9 px for that strip), 0.5 with a texture. `Radial` rings are not capped. Keep heat
+  haze at a few pixels: `strength` 0.003–0.005.
 * **`DistortionMode::Radial { inner, outer }`**: a smooth ring (sin², zero slope at both radii)
   between the two UV radii whose pixels look toward the UV center: the image under the ring is
   pushed outward, up to `strength` halfway between the radii

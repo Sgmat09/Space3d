@@ -2182,6 +2182,55 @@ pub mod distortion {
         assert_near(edge_x(&img, 4, 48, 80, 0), 64.0, 0.02, "outside the ring");
     }
 
+    /// A `Normal` writer bends the image by at most a fraction of half the narrower on-screen
+    /// extent of its UV square (0.5 with a texture, 0.12 with the built-in noise): the constant
+    /// writer on a square 0.25 units (16 px) across asks for 7.24 px (5.12 per axis) and gets
+    /// 0.5 × 8 px = 4 px (2.83 per axis); the built-in noise at 0.05 view heights (6.4 px) moves
+    /// the edge by at most 0.12 × 8 px (≈ 1 px, plus the buffer's bilinear footprint). `Radial`
+    /// rings are not capped (`radial_distortion_pushes_outward`).
+    pub fn normal_writers_are_capped_by_their_size(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        quad_at(&mut app, 1.0, Vec3::new(0.5, 0.5, -1.0), Vec2::ONE);
+        camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        let plain = render(&mut app);
+        let small = Vec2::splat(0.25);
+        let m = constant(&mut app);
+        let w = writer(&mut app, Vec3::ZERO, small, m);
+        let img = render(&mut app);
+        // The vertical edge (x = 64) in the square's full-strength rows above the quadrant's
+        // horizontal edge (the square spans 56 … 72, its outer 0.2 feathered).
+        let rows = 60..64u32;
+        let mean = |img: &ImageData| rows.clone().map(|y| edge_x(img, y, 48, 80, 0)).sum::<f32>() / rows.len() as f32;
+        let capped = 0.5 * 8.0 / std::f32::consts::SQRT_2;
+        assert_near(
+            mean(&img),
+            64.0 - capped,
+            0.5,
+            "texture: half of half the square's width",
+        );
+        app.world.despawn(w).unwrap();
+        // The built-in noise, well over its cap.
+        writer(
+            &mut app,
+            Vec3::ZERO,
+            small,
+            DistortionMaterial {
+                strength: 0.05,
+                scroll: Vec2::ZERO,
+                ..DistortionMaterial::default()
+            },
+        );
+        let img = render(&mut app);
+        let worst = (56..64u32)
+            .map(|y| (edge_x(&img, y, 48, 80, 0) - edge_x(&plain, y, 48, 80, 0)).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("noise: worst edge shift {worst:.2} px");
+        assert!(
+            worst > 0.1 && worst <= 0.12 * 8.0 + 0.5,
+            "noise: worst edge shift {worst} px"
+        );
+    }
+
     /// Split screen: the writer in the left post group looks right, past its rect's right edge
     /// into the right group's pixels: the composite clamps the lookup to the rect, so no pixel of
     /// the right view (bright) appears in the left one; the right group has no Distortion pass
