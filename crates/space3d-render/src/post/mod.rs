@@ -606,6 +606,7 @@ impl PostState {
         self.planned += 1;
         PostGroupNeeds {
             bloom: bloom.is_some(),
+            auto_exposure: meter.is_some(),
             fxaa: fxaa.is_some(),
             distortion: !group.passthrough && group.settings.enabled && group.settings.distortion.enabled,
             ..Default::default()

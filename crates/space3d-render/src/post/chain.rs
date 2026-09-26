@@ -253,6 +253,61 @@ impl SeedKey {
 mod tests {
     use super::*;
 
+    /// Neutral grading and no auto exposure set no bits; each grading part sets its own, with
+    /// sanitized values; auto exposure only in Hdr mode; nothing in the passthrough group.
+    #[test]
+    fn grading_and_exposure_bits() {
+        use super::super::api::{ColorGrading, ColorLut, PostProcess};
+        let plan = |settings: PostProcess, mode: FrameMode, passthrough: bool| PostGroupPlan {
+            camera: space3d_core::World::new().spawn(()),
+            settings,
+            mode,
+            scene_rect: [0, 0, 64, 64],
+            output_rect: [0, 0, 64, 64],
+            scene_size: (64, 64),
+            output_size: (64, 64),
+            scene_alpha: true,
+            transparent: false,
+            passthrough,
+            distortion: false,
+        };
+        let grading_bits = bits::GRADE | bits::GRADE_LDR | bits::LUT | bits::AUTO_EXPOSURE;
+        let plain = GpuPost::new(
+            &plan(PostProcess::default(), FrameMode::Hdr, false),
+            CompositePlan::default(),
+        );
+        assert_eq!(plain.flags[0] & grading_bits, 0);
+        assert_eq!(plain.lift_contrast[3], 1.0);
+        assert_eq!(plain.gamma_lut[..3], [1.0; 3]);
+        let lut = ColorLut::new(crate::RenderAssets::default().add_texture(ColorLut::identity(16)), 16);
+        let graded = PostProcess::default().with_color_grading(ColorGrading {
+            saturation: 0.5,
+            gamma: glam::Vec3::splat(2.0),
+            gain: glam::Vec3::new(f32::NAN, 1.0, 1.0),
+            lut: Some(lut),
+            ..ColorGrading::default()
+        });
+        let with = CompositePlan {
+            auto_exposure: true,
+            lut: Some((16, true)),
+            ..CompositePlan::default()
+        };
+        let p = GpuPost::new(&plan(graded, FrameMode::Hdr, false), with);
+        assert_eq!(p.flags[0] & grading_bits, grading_bits);
+        assert_eq!((p.gamma_lut, p.gain_lut), ([0.5, 0.5, 0.5, 1.0], [1.0, 1.0, 1.0, 16.0]));
+        assert_eq!(p.flags[3], 1, "sRGB strip");
+        assert_eq!(p.grade_matrix[0][0], 0.5 + 0.5 * 0.2126);
+        let ldr = GpuPost::new(&plan(graded, FrameMode::Ldr, false), with);
+        assert_eq!(
+            ldr.flags[0] & bits::AUTO_EXPOSURE,
+            0,
+            "no auto exposure in the Ldr fallback"
+        );
+        assert_eq!(ldr.flags[0] & bits::GRADE, bits::GRADE, "grading runs there");
+        let passthrough = GpuPost::new(&plan(graded, FrameMode::Ldr, true), with);
+        assert_eq!(passthrough.flags[0] & grading_bits, 0);
+    }
+
     #[test]
     fn gpu_post_matches_wgsl() {
         let src = super::super::composite_source();

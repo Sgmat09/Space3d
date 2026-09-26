@@ -5,8 +5,9 @@
 //! Two paths, the same inputs and output:
 //!
 //! * **Compute** (`GraphicsCaps::compute_histogram` and an `R32Float` E): a 255-bin log2
-//!   luminance histogram (black excluded), the percentile window, the weighted mean of the bin
-//!   centers, the clamp and the adaptation in one compute pass of two dispatches
+//!   luminance histogram (black excluded; each bin keeps its samples' mean position), the
+//!   percentile window, the weighted mean, the clamp and the adaptation in one compute pass of two
+//!   dispatches
 //!   (`shaders/post/exposure.wgsl`); the camera's 16-byte state buffer is then copied into E.
 //! * **Render passes** (WebGL2, GLES 3.0, `DownlevelOverride::no_compute`): a quarter-size
 //!   log-luminance level, reductions by 8 until it is at most 16 × 16, and an adapt pass that
