@@ -51,6 +51,10 @@ mod runner;
 
 #[cfg(feature = "engine")]
 pub use engine::engine_storybook;
+/// The graphics showcase: the content and scenes of the `Engine/Showcase/*` stories, shared
+/// with `benches/graphics.rs`, `tests/perf_graphics.rs` and `examples/graphics_showcase`.
+#[cfg(feature = "engine")]
+pub use engine::showcase;
 pub use gallery::{GalleryManifest, StoryResult, StoryStatus, render_gallery_html, screenshot_all};
 pub use regression::{
     StoryCheck, StoryCheckOutcome, StorybookTestOptions, assert_storybook, assert_storybook_in, check_storybook,

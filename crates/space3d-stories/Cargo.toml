@@ -30,7 +30,14 @@ web-time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `benches/graphics.rs` (the Battle reference scene).
+criterion.workspace = true
 
 [[example]]
 name = "gallery"
+required-features = ["engine"]
+
+[[bench]]
+name = "graphics"
+harness = false
 required-features = ["engine"]

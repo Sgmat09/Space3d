@@ -11,7 +11,7 @@ mod materials;
 #[cfg(feature = "particles")]
 mod particles;
 mod post;
-mod showcase;
+pub mod showcase;
 
 use crate::Storybook;
 use space3d_core::prelude::*;
