@@ -1895,6 +1895,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphics_showcase"
+version = "0.1.0"
+dependencies = [
+ "space3d",
+]
+
+[[package]]
 name = "guillotiere"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5233,6 +5240,7 @@ dependencies = [
 name = "space3d-stories"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "serde",
  "serde_json",
  "space3d-assets",

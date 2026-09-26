@@ -1,0 +1,12 @@
+[package]
+name = "graphics_showcase"
+description = "Space3d example: the Battle reference scene with every graphics feature — PBR hulls with all maps, nebula skybox + IBL, shadows, particles, bloom, distortion — under a GraphicsQuality preset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# `stories`: the showcase content and scenes (`space3d::stories::showcase`); `test`: the
+# headless PNG.
+space3d = { workspace = true, features = ["particles", "stories", "test"] }
