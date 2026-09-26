@@ -24,6 +24,7 @@
 //! positions come from sums of integers, never from the order of atomics.
 
 mod readback;
+pub(crate) mod sort;
 pub(crate) mod tables;
 #[cfg(test)]
 mod tests;
@@ -109,6 +110,8 @@ pub(crate) struct GpuFrameStats {
     pub passes: u32,
     pub bytes: u64,
     pub created: u32,
+    /// The compaction ran (the instance stream changed).
+    pub compacted: bool,
 }
 
 /// Inputs of [`GpuSim::prepare`] owned by the render node.
@@ -750,6 +753,7 @@ impl GpuSim {
                 pass.set_pipeline(&self.scatter);
                 pass.dispatch_workgroups(x, y, 1);
                 stats.dispatches += 2;
+                stats.compacted = true;
             }
             stats.created += self.readback.record(
                 ctx.device,

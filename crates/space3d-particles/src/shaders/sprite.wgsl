@@ -86,6 +86,11 @@ fn s3dp_cell(uv: vec2<f32>, frame: f32) -> vec3<f32> {
 
 @vertex
 fn vs_sprite(in: S3dpIn) -> S3dpOut {
+    return s3dp_sprite(in);
+}
+
+// The sprite's corner `in.vi` (shared by the color and distortion vertex stages).
+fn s3dp_sprite(in: S3dpIn) -> S3dpOut {
     var out: S3dpOut;
     let corner = vec2<f32>(f32(in.vi & 1u), f32(in.vi >> 1u)) * 2.0 - 1.0;
     let age = clamp(in.vel_age.w, 0.0, 1.0);

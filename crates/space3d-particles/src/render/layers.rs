@@ -56,9 +56,12 @@ pub(crate) enum LayerKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LayerInfo {
     pub pack: PackLayer,
-    /// Draws into the post distortion buffer (`SpriteTarget::Distortion`, milestone PA4): not
-    /// drawn in color.
+    /// Draws into the post distortion buffer (`SpriteTarget::Distortion`) in the Distortion
+    /// slot, never in color.
     pub distortion: bool,
+    /// Per-particle back-to-front order in each view (`SortMode::ByDistance`): the layer's
+    /// emitters draw as one group, sorted per view.
+    pub sorted: bool,
     /// `SpriteRender::order` (`RibbonLayer::order`, `BeamLayer::order`).
     pub order: i16,
     /// Additive layers draw after alpha and premultiplied ones of the same order.
@@ -200,6 +203,13 @@ impl RenderLayers {
             _ => ([1.0, 1.0, 1.0, 0.0], [0.0, 0.0, layers as f32, 0.0]),
         };
         let rows = self.params.len() as u32 * 2;
+        // Distortion layers: the offset at full opacity (view heights) in `fade.w`; their
+        // opacity is the shape's weight whatever the blend (they add into the buffer).
+        let (distortion, strength) = match r.target {
+            SpriteTarget::Distortion { strength } => (true, strength),
+            _ => (false, 0.0),
+        };
+        let blend = if distortion { 0 } else { blend_id(r.blend) };
         self.params.push(GpuDrawParams {
             lut: [
                 self.row(rows),
@@ -207,19 +217,24 @@ impl RenderLayers {
                 layer.intensity,
                 layer.aspect.max(1e-3),
             ],
-            mode: [blend_id(r.blend), facing, kind, 0],
+            mode: [blend, facing, kind, 0],
             shape,
             stretch: [stretch[0], stretch[1], stretch[2], r.soft_distance.max(0.0)],
-            fade: [r.near_fade.0, r.near_fade.1, r.max_screen_size.max(0.0), 0.0],
+            fade: [r.near_fade.0, r.near_fade.1, r.max_screen_size.max(0.0), strength],
             book,
             book2,
         });
         let extent = 0.5 * layer.size_over_life.max_value().max(0.0) * layer.aspect.max(1.0).max(stretch[2]);
-        let additive = r.blend == ParticleBlend::Additive;
-        let batched = additive && matches!(r.sort, SortMode::Auto | SortMode::None);
+        let additive = r.blend == ParticleBlend::Additive || distortion;
+        // Unsorted additive layers and distortion layers (order-independent sums) batch every
+        // emitter of the layer into one draw, and so do per-particle sorted layers (one group
+        // sorted per view); the others draw per emitter, back to front.
+        let sorted = !distortion && r.sort == SortMode::ByDistance;
+        let batched = sorted || distortion || (additive && matches!(r.sort, SortMode::Auto | SortMode::None));
         self.info.push(LayerInfo {
             pack: PackLayer { id, batched, extent },
-            distortion: !matches!(r.target, SpriteTarget::Color),
+            distortion,
+            sorted,
             order: r.order,
             additive,
             kind: LayerKind::Sprite,
@@ -267,6 +282,7 @@ impl RenderLayers {
                 extent: 0.5 * s.width.max(0.0) * s.width_max.max(1.0),
             },
             distortion: false,
+            sorted: false,
             order: s.order,
             additive,
             kind,

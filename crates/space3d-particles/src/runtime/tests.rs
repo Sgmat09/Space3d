@@ -992,18 +992,18 @@ fn bridges_of_a_battle_fleet_within_budget() {
 fn builtin_slots() {
     use crate::registry::builtin;
     let table = [
-        (builtin::EXPLOSION, 81, 0),
+        (builtin::EXPLOSION, 87, 0),
         (builtin::HIT_SPARK, 16, 0),
         (builtin::SHIELD_RIPPLE, 8, 0),
-        (builtin::WARP_IN, 27, 0),
-        (builtin::WARP_OUT, 27, 0),
-        (builtin::ENGINE_EXHAUST, 148, 0),
+        (builtin::WARP_IN, 29, 0),
+        (builtin::WARP_OUT, 29, 0),
+        (builtin::ENGINE_EXHAUST, 164, 0),
         (builtin::LASER_TRAIL, 5, 64),
         (builtin::LASER_BEAM, 7, 0),
         (builtin::MISSILE_TRAIL, 23, 192),
         (builtin::DEBRIS_SPARKS, 78, 0),
-        (builtin::ENGINE_AFTERBURNER, 196, 96),
-        (builtin::EMP, 63, 0),
+        (builtin::ENGINE_AFTERBURNER, 215, 96),
+        (builtin::EMP, 64, 0),
         (builtin::REPAIR_BEAM, 8, 0),
         (builtin::LASER_SHOT, 1, 0),
     ];
@@ -1016,7 +1016,7 @@ fn builtin_slots() {
     }
     let web = (8192.0 * priority_limit(EffectPriority::Normal)) as u32;
     assert!(
-        30 * 148 + 40 * 5 <= web,
+        30 * 164 + 40 * 5 <= web,
         "30 exhausts and 40 laser trails fit the web budget ({web})"
     );
 

@@ -262,7 +262,9 @@ fn ribbon(input: &StripInput<'_>, tr: &Track, now: f64, out: &mut Vec<StripPoint
     }
     let from = first.saturating_sub(1);
     let start = out.len();
-    let bits = pcg(tr.serial as u32 ^ 0x51d0_7a11);
+    // The noise seed: the instance's seed and the ribbon's index (like the layers' and the
+    // beams'), so a trail looks the same whatever was allocated before it.
+    let bits = mix(inst.seed, 0x51d0_7a11 ^ tr.layer as u32);
     let width = inst.scale.abs();
     let mut newest = None;
     let mut base = None;

@@ -36,6 +36,7 @@ pub(crate) use layers::RenderLayers;
 use crate::cpu::{
     BridgeInput, CpuSim, DIRECT, INSTANCE_SIZE, PackInput, PackItem, Particle, ParticleInstance, pack, pack_bridges,
 };
+use crate::gpu::sort::{GpuSort, MAX_SORT, SortJob, sort_size};
 use crate::gpu::{GpuInput, GpuSim, PARTICLE_SIZE};
 use crate::runtime::{ParticleRuntime, Runtime};
 use crate::{ParticleBackend, ParticleEffects, ParticleSettings, ParticleStats, resolve_backend};
@@ -44,8 +45,9 @@ use space3d_core::glam::{Quat, Vec3};
 use space3d_core::{Entity, GlobalTransform, Parent, Time, Transform};
 use space3d_render::wgpu;
 use space3d_render::{
-    Aabb, DepthAccess, DrawContext, FrameMode, OUTPUT_WGSL, OutputEncoding, PassTarget, PhaseSlot, PrepareContext,
-    RenderNode, RenderNodes, RenderPhase, SceneReads, SlotMask, VIEW_WGSL, ViewPrepareContext, scene_wgsl_for,
+    Aabb, DISTORTION_BLEND, DISTORTION_WGSL, DepthAccess, DrawContext, FrameMode, OUTPUT_WGSL, OutputEncoding,
+    PassTarget, PhaseSlot, PrepareContext, RenderNode, RenderNodes, RenderPhase, SceneReads, SlotMask, VIEW_WGSL,
+    ViewPrepareContext, scene_wgsl_for,
 };
 use strips::{POINT_SIZE, StripInput, StripPoint, StripScratch};
 
@@ -53,10 +55,13 @@ use strips::{POINT_SIZE, StripInput, StripPoint, StripScratch};
 pub(crate) const NODE_NAME: &str = "space3d/particles";
 /// Slot of color sprites.
 pub(crate) const SLOT_COLOR: usize = 0;
+/// Slot of distortion sprites (the post group's distortion buffer).
+pub(crate) const SLOT_DISTORTION: usize = 1;
 
 const COMMON_WGSL: &str = include_str!("../shaders/particles.wgsl");
 const SPRITE_WGSL: &str = include_str!("../shaders/sprite.wgsl");
 const STRIP_WGSL: &str = include_str!("../shaders/strip.wgsl");
+const DISTORTION_SPRITE_WGSL: &str = include_str!("../shaders/distortion.wgsl");
 
 static SLOTS_SOFT: [PhaseSlot; 2] = [
     PhaseSlot::new(RenderPhase::Transparent, 100).reading(SceneReads::DEPTH),
@@ -78,13 +83,48 @@ struct GpuParticleView {
     params: [f32; 4],
 }
 
-/// The draws of one camera view: `view_items[start..end]`, uniform slot `uniform`.
+/// The draws of one camera view: color `view_items[start..end]`, then distortion
+/// `view_items[end..dist_end]`; its per-particle sorted draws `sorted_draws[sorted.0..sorted.1]`;
+/// uniform slot `uniform`.
 #[derive(Clone, Copy, Debug)]
 struct ViewList {
     camera: Entity,
     start: u32,
     end: u32,
+    dist_end: u32,
+    sorted: (u32, u32),
     uniform: u32,
+}
+
+/// A draw item of a `SortMode::ByDistance` layer as one view draws it: its instances sorted
+/// back to front from `first` of the sorted instance buffer — the CPU-sorted one (direct draws:
+/// the CPU backend, render-time bridges) or the GPU sort's (`gpu`, indirect draws).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SortedDraw {
+    item: u32,
+    first: u32,
+    gpu: bool,
+}
+
+/// The order-preserving u32 of a float (`order_key` in `sort.wgsl`).
+fn order_key(f: f32) -> u32 {
+    let bits = f.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+}
+
+impl ViewList {
+    /// The color draws (`distortion` false) or the distortion draws.
+    fn range(&self, distortion: bool) -> std::ops::Range<usize> {
+        if distortion {
+            self.end as usize..self.dist_end as usize
+        } else {
+            self.start as usize..self.end as usize
+        }
+    }
 }
 
 /// The per-instance vertex layout of `ParticleInstance`.
@@ -104,6 +144,9 @@ pub(crate) enum DrawKind {
     Sprite,
     /// Ribbons and beams (`strip.wgsl`).
     Strip,
+    /// Distortion sprites (`sprite.wgsl`'s vertex stage, `distortion.wgsl`) into the post
+    /// distortion buffer.
+    Distortion,
 }
 
 /// The texture binding of a pipeline (group 3).
@@ -140,16 +183,17 @@ fn texture_wgsl(tex: TexVariant) -> &'static str {
 
 /// The particle shader for a pass signature, a draw kind and a texture variant.
 pub(crate) fn shader_for(output: OutputEncoding, access: DepthAccess, kind: DrawKind, tex: TexVariant) -> String {
+    let body = match kind {
+        DrawKind::Sprite => SPRITE_WGSL.to_string(),
+        DrawKind::Strip => STRIP_WGSL.to_string(),
+        DrawKind::Distortion => format!("{DISTORTION_WGSL}\n{SPRITE_WGSL}\n{DISTORTION_SPRITE_WGSL}"),
+    };
     format!(
-        "const S3DP_OUTPUT: u32 = {}u;\nconst S3DP_MANUAL_DEPTH: bool = {};\n{VIEW_WGSL}\n{}\n{OUTPUT_WGSL}\n{}\n{COMMON_WGSL}\n{}",
+        "const S3DP_OUTPUT: u32 = {}u;\nconst S3DP_MANUAL_DEPTH: bool = {};\n{VIEW_WGSL}\n{}\n{OUTPUT_WGSL}\n{}\n{COMMON_WGSL}\n{body}",
         output.id(),
         access == DepthAccess::SampledOnly,
         scene_wgsl_for(access),
         texture_wgsl(tex),
-        match kind {
-            DrawKind::Sprite => SPRITE_WGSL,
-            DrawKind::Strip => STRIP_WGSL,
-        },
     )
 }
 
@@ -187,6 +231,8 @@ struct Gpu {
     views: Option<(wgpu::Buffer, u64)>,
     view_mirror: Vec<GpuParticleView>,
     instances: Option<(wgpu::Buffer, u64)>,
+    /// The CPU-sorted instances of `ByDistance` layers (per view).
+    sorted: Option<(wgpu::Buffer, u64)>,
     bind_group: Option<wgpu::BindGroup>,
     pipelines: Vec<(PipelineKey, wgpu::RenderPipeline)>,
     /// Scratch for the draw-parameter upload.
@@ -305,6 +351,7 @@ impl Gpu {
             views: None,
             view_mirror: Vec::new(),
             instances: None,
+            sorted: None,
             bind_group: None,
             pipelines: Vec::new(),
             bytes: Vec::new(),
@@ -346,11 +393,18 @@ impl Gpu {
         let (vs, fs, buffers): (_, _, &[Option<wgpu::VertexBufferLayout<'_>>]) = match kind {
             DrawKind::Sprite => ("vs_sprite", "fs_sprite", &sprite),
             DrawKind::Strip => ("vs_strip", "fs_strip", &strip),
+            DrawKind::Distortion => ("vs_distortion", "fs_distortion", &sprite),
+        };
+        // Distortion sprites add their offsets (One/One) into the distortion buffer.
+        let blend = match kind {
+            DrawKind::Distortion => DISTORTION_BLEND,
+            _ => PARTICLE_BLEND,
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(match kind {
                 DrawKind::Sprite => "space3d particles sprite",
                 DrawKind::Strip => "space3d particles strip",
+                DrawKind::Distortion => "space3d particles distortion",
             }),
             layout: Some(layout),
             vertex: wgpu::VertexState {
@@ -370,7 +424,7 @@ impl Gpu {
                 module: &module,
                 entry_point: Some(fs),
                 compilation_options: Default::default(),
-                targets: &[Some(target.color_target(Some(PARTICLE_BLEND)))],
+                targets: &[Some(target.color_target(Some(blend)))],
             }),
             multiview_mask: None,
             cache: None,
@@ -475,6 +529,22 @@ pub(crate) struct ParticlesNode {
     view_items: Vec<u32>,
     views: Vec<ViewList>,
     view_uniforms: Vec<GpuParticleView>,
+    /// Per-particle sorted draws of every view (`ViewList::sorted`).
+    sorted_draws: Vec<SortedDraw>,
+    /// The CPU-sorted instances, what the GPU buffer holds, and the sort's scratch keys.
+    sorted_instances: Vec<ParticleInstance>,
+    sorted_uploaded: Vec<ParticleInstance>,
+    sort_keys: Vec<(u32, u32)>,
+    /// What the CPU-sorted instances were built from: the instance stream's generation, the
+    /// sorting views' depth rows and the sorted draws.
+    sort_source: (u64, Vec<[f32; 4]>, Vec<SortedDraw>),
+    sort_rows: Vec<[f32; 4]>,
+    /// The GPU sort's jobs this frame, and its state (per renderer).
+    sort_jobs: Vec<SortJob>,
+    gpu_sort: Option<GpuSort>,
+    warned_sort: bool,
+    /// Bumped whenever the CPU instance stream is rewritten (pack, bridges).
+    pack_gen: u64,
     /// The packed instances changed since they were last uploaded.
     dirty: bool,
     packed_once: bool,
@@ -520,6 +590,16 @@ impl ParticlesNode {
             view_items: Vec::new(),
             views: Vec::new(),
             view_uniforms: Vec::new(),
+            sorted_draws: Vec::new(),
+            sorted_instances: Vec::new(),
+            sorted_uploaded: Vec::new(),
+            sort_keys: Vec::new(),
+            sort_source: (u64::MAX, Vec::new(), Vec::new()),
+            sort_rows: Vec::new(),
+            sort_jobs: Vec::new(),
+            gpu_sort: None,
+            warned_sort: false,
+            pack_gen: 0,
             dirty: false,
             packed_once: false,
             last_extrapolation: 0.0,
@@ -530,8 +610,17 @@ impl ParticlesNode {
         }
     }
 
-    fn capacities(&self) -> [usize; 9] {
+    fn capacities(&self) -> [usize; 10] {
         [
+            self.sorted_draws.capacity()
+                + self.sorted_instances.capacity()
+                + self.sorted_uploaded.capacity()
+                + self.sort_keys.capacity()
+                + self.sort_source.1.capacity()
+                + self.sort_source.2.capacity()
+                + self.sort_rows.capacity()
+                + self.sort_jobs.capacity()
+                + self.gpu_sort.as_ref().map_or(0, GpuSort::capacities),
             self.instances.capacity(),
             self.items.capacity(),
             self.keys.capacity(),
@@ -591,18 +680,13 @@ impl ParticlesNode {
             bytes: 0,
         };
         let layers = &self.layers;
-        // Distortion layers draw into the post distortion buffer (PA4), not color; textured
-        // layers whose texture is not ready yet wait.
+        // Textured layers whose texture is not ready yet wait (distortion layers are drawn
+        // like the others, in the Distortion slot).
         let ready = |l: &layers::LayerInfo| {
             l.texture
                 .is_none_or(|k| self.gpu.as_ref().is_some_and(|g| g.tex_bind(k).is_some()))
         };
-        let layer_of = |e: &crate::runtime::Entry| {
-            layers
-                .layer(e.effect, e.layer)
-                .filter(|l| !l.distortion && ready(l))
-                .map(|l| l.pack)
-        };
+        let layer_of = |e: &crate::runtime::Entry| layers.layer(e.effect, e.layer).filter(|l| ready(l)).map(|l| l.pack);
         match backend {
             ParticleBackend::Gpu => {
                 if self.gpu_sim.as_ref().is_none_or(|g| g.renderer != ctx.frame.renderer) {
@@ -660,6 +744,7 @@ impl ParticlesNode {
                     );
                     self.packed = (self.instances.len(), self.items.len());
                     self.dirty = true;
+                    self.pack_gen += 1;
                 } else {
                     // Last frame's bridges go; this frame's follow the same pack.
                     self.instances.truncate(self.packed.0);
@@ -686,6 +771,7 @@ impl ParticlesNode {
         );
         if bridged > 0 || self.bridged > 0 {
             self.dirty = true;
+            self.pack_gen += 1;
         }
         self.bridged = bridged;
         // Ribbons and beams: rebuilt every frame there are any (they follow the render poses).
@@ -766,19 +852,34 @@ impl ParticlesNode {
         self.view_items.clear();
         self.views.clear();
         self.view_uniforms.clear();
+        self.sorted_draws.clear();
+        self.sort_jobs.clear();
+        self.sort_rows.clear();
+        let (mut cpu_sorted, mut gpu_sorted) = (0u32, 0u32);
         for (vi, v) in ctx.views.iter().enumerate() {
             let start = self.view_items.len();
+            let mut end = start;
+            let sorted_start = self.sorted_draws.len() as u32;
             if settings.enabled {
-                for (i, it) in self.items.iter().enumerate() {
-                    // Unbounded items (world attractors on the GPU backend) are never culled.
-                    let unbounded = !(it.min.is_finite() && it.max.is_finite());
-                    if unbounded
-                        || v.frustum.intersects_aabb(&Aabb {
-                            min: it.min,
-                            max: it.max,
-                        })
-                    {
-                        self.view_items.push(i as u32);
+                // Color draws first, then distortion draws (culled alike).
+                for distortion in [false, true] {
+                    for (i, it) in self.items.iter().enumerate() {
+                        if self.layers.info[it.layer as usize].distortion != distortion {
+                            continue;
+                        }
+                        // Unbounded items (world attractors on the GPU backend) are never culled.
+                        let unbounded = !(it.min.is_finite() && it.max.is_finite());
+                        if unbounded
+                            || v.frustum.intersects_aabb(&Aabb {
+                                min: it.min,
+                                max: it.max,
+                            })
+                        {
+                            self.view_items.push(i as u32);
+                        }
+                    }
+                    if !distortion {
+                        end = self.view_items.len();
                     }
                 }
                 let (items, layers, view) = (&self.items, &self.layers.info, v.view);
@@ -795,7 +896,7 @@ impl ParticlesNode {
                     };
                     (l.order, l.additive, depth, it.layer, it.serial)
                 };
-                self.view_items[start..].sort_unstable_by(|&a, &b| {
+                self.view_items[start..end].sort_unstable_by(|&a, &b| {
                     let (ka, kb) = (key(a), key(b));
                     ka.0.cmp(&kb.0)
                         .then(ka.1.cmp(&kb.1))
@@ -804,11 +905,63 @@ impl ParticlesNode {
                         .then(ka.4.cmp(&kb.4))
                         .then(a.cmp(&b))
                 });
+                // Distortion adds up (order-independent): layer and serial, for determinism.
+                self.view_items[end..].sort_unstable_by_key(|&i| {
+                    let it = &items[i as usize];
+                    (it.layer, it.serial, i)
+                });
+                // `ByDistance` layers: their particles back to front in this view, sorted on the
+                // CPU (direct draws) or by the GPU sort (indirect draws).
+                let row = v.view.row(2).to_array();
+                let mut rows_pushed = false;
+                for &i in &self.view_items[start..end] {
+                    let it = &self.items[i as usize];
+                    if !self.layers.info[it.layer as usize].sorted {
+                        continue;
+                    }
+                    if it.args == DIRECT {
+                        self.sorted_draws.push(SortedDraw {
+                            item: i,
+                            first: cpu_sorted,
+                            gpu: false,
+                        });
+                        cpu_sorted += it.count;
+                        if !rows_pushed {
+                            self.sort_rows.push(row);
+                            rows_pushed = true;
+                        }
+                    } else if let Some(sim) = self.gpu_sim.as_ref() {
+                        if sort_size(it.count) > MAX_SORT {
+                            if !self.warned_sort {
+                                self.warned_sort = true;
+                                tracing::warn!(
+                                    particles = it.count,
+                                    "a SortMode::ByDistance layer holds more than 65 536 particles: drawn unsorted"
+                                );
+                            }
+                            continue;
+                        }
+                        self.sort_jobs.push(SortJob {
+                            src: it.first,
+                            capacity: it.count,
+                            count_word: (sim.args_offset(it.args) / 4) as u32 + 1,
+                            row,
+                        });
+                        self.sorted_draws.push(SortedDraw {
+                            item: i,
+                            first: gpu_sorted,
+                            gpu: true,
+                        });
+                        gpu_sorted += it.count;
+                    }
+                }
             }
             self.views.push(ViewList {
                 camera: v.camera,
                 start: start as u32,
-                end: self.view_items.len() as u32,
+                end: end as u32,
+                dist_end: self.view_items.len() as u32,
+                sorted: (sorted_start, self.sorted_draws.len() as u32),
                 uniform: vi as u32,
             });
             let soft_clip = settings.direct_soft_clip && v.mode == FrameMode::Direct;
@@ -816,6 +969,73 @@ impl ParticlesNode {
                 flags: [soft_clip as u32, settings.soft_particles as u32, 0, 0],
                 params: [settings.max_screen_size.max(0.0), 0.0, 0.0, 0.0],
             });
+        }
+        self.sort_on_cpu(ctx.views);
+    }
+
+    /// Record the GPU sort of this frame's `ByDistance` draw groups (GPU backend); returns the
+    /// buffers created and the bytes uploaded.
+    fn sort_on_gpu(&mut self, ctx: &mut PrepareContext<'_>) -> (u32, u64) {
+        let Some(sim) = self.gpu_sim.as_ref() else {
+            return (0, 0);
+        };
+        if self.sort_jobs.is_empty() && self.gpu_sort.is_none() {
+            return (0, 0);
+        }
+        let Some((work, instances)) = sim.draw_buffers() else {
+            return (0, 0);
+        };
+        let compacted = sim.stats.compacted;
+        let (work, instances) = (work.clone(), instances.clone());
+        let sort = self.gpu_sort.get_or_insert_with(|| GpuSort::new(ctx.device));
+        sort.prepare(ctx, (&work, &instances), &self.sort_jobs, compacted)
+    }
+
+    /// Sort the direct draws of `ByDistance` layers per view (`sorted_draws` without `gpu`)
+    /// into `sorted_instances`: farthest first by view depth, ties by instance order (the GPU
+    /// sort's keys). Skipped while the instance stream and the sorting views are unchanged.
+    fn sort_on_cpu(&mut self, views: &[space3d_render::ViewInfo]) {
+        if self.sort_rows.is_empty() {
+            self.sorted_instances.clear();
+            return;
+        }
+        let same_draws = self.sort_source.2.len() == self.sorted_draws.len()
+            && self.sort_source.2.iter().zip(&self.sorted_draws).all(|(a, b)| a == b);
+        if self.sort_source.0 == self.pack_gen && self.sort_source.1 == self.sort_rows && same_draws {
+            return;
+        }
+        self.sort_source.0 = self.pack_gen;
+        self.sort_source.1.clear();
+        self.sort_source.1.extend_from_slice(&self.sort_rows);
+        self.sort_source.2.clear();
+        self.sort_source.2.extend_from_slice(&self.sorted_draws);
+        self.sorted_instances.clear();
+        for list in &self.views {
+            let Some(v) = views.get(list.uniform as usize) else {
+                continue;
+            };
+            let row = v.view.row(2);
+            for d in &self.sorted_draws[list.sorted.0 as usize..list.sorted.1 as usize] {
+                if d.gpu {
+                    continue;
+                }
+                let it = &self.items[d.item as usize];
+                let instances = &self.instances[it.first as usize..(it.first + it.count) as usize];
+                self.sort_keys.clear();
+                for (j, p) in instances.iter().enumerate() {
+                    let z = row.dot(space3d_core::glam::Vec4::new(
+                        p.pos_size[0],
+                        p.pos_size[1],
+                        p.pos_size[2],
+                        1.0,
+                    ));
+                    self.sort_keys.push((order_key(z), j as u32));
+                }
+                self.sort_keys.sort_unstable();
+                debug_assert_eq!(self.sorted_instances.len(), d.first as usize);
+                self.sorted_instances
+                    .extend(self.sort_keys.iter().map(|&(_, j)| instances[j as usize]));
+            }
         }
     }
 
@@ -1027,6 +1247,27 @@ impl ParticlesNode {
             self.dirty = false;
         }
 
+        // CPU-sorted instances of `ByDistance` layers (only when they changed).
+        let sorted: &[u8] = bytemuck::cast_slice(&self.sorted_instances);
+        if sorted != bytemuck::cast_slice::<_, u8>(&self.sorted_uploaded) {
+            let size = sorted.len() as u64;
+            if ensure_buffer(
+                device,
+                &mut gpu.sorted,
+                size,
+                wgpu::BufferUsages::VERTEX,
+                "space3d particles sorted instances",
+            ) {
+                created += 1;
+            }
+            if let (Some((buffer, _)), true) = (&gpu.sorted, size > 0) {
+                ctx.upload(buffer, 0, sorted);
+                bytes += size;
+            }
+            self.sorted_uploaded.clear();
+            self.sorted_uploaded.extend_from_slice(&self.sorted_instances);
+        }
+
         // Ribbon and beam points (rebuilt every frame there are any).
         if self.strips_dirty {
             let size = self.strip_points.len() as u64 * POINT_SIZE;
@@ -1107,7 +1348,8 @@ impl RenderNode for ParticlesNode {
             (0, 0)
         } else {
             let (b, c) = self.upload(ctx);
-            (b, c + textures)
+            let (sort_created, sort_bytes) = self.sort_on_gpu(ctx);
+            (b + sort_bytes, c + textures + sort_created)
         };
         let after = self.capacities();
         let node_reallocs = before.iter().zip(&after).filter(|(a, b)| a != b).count() as u32;
@@ -1130,7 +1372,7 @@ impl RenderNode for ParticlesNode {
                 shrunk: rt.shrunk,
                 ticks_simulated: sim.ticks,
                 catchup_resets: resets,
-                dispatches: sim.dispatches,
+                dispatches: sim.dispatches + self.gpu_sort.as_ref().map_or(0, |g| g.recorded),
                 draw_calls,
                 ribbon_segments: self.segments,
                 bytes_uploaded: bytes + sim.bytes,
@@ -1148,10 +1390,19 @@ impl RenderNode for ParticlesNode {
         if !self.enabled || self.gpu.as_ref().is_none_or(|g| g.bind_group.is_none()) {
             return SlotMask::NONE;
         }
-        match self.views.iter().find(|l| l.camera == ctx.view.camera) {
-            Some(l) if l.end > l.start => SlotMask::only(SLOT_COLOR),
-            _ => SlotMask::NONE,
+        let Some(l) = self.views.iter().find(|l| l.camera == ctx.view.camera) else {
+            return SlotMask::NONE;
+        };
+        let mut mask = SlotMask::NONE;
+        if l.end > l.start {
+            mask = mask.with(SLOT_COLOR);
         }
+        // Only the settings camera of a post group with distortion draws the Distortion slot
+        // (the frame ignores the bit elsewhere).
+        if l.dist_end > l.end {
+            mask = mask.with(SLOT_DISTORTION);
+        }
+        mask
     }
 
     fn prewarm(&mut self, device: &wgpu::Device, targets: &[(usize, PassTarget)]) {
@@ -1159,12 +1410,20 @@ impl RenderNode for ParticlesNode {
             return;
         };
         for &(slot, target) in targets {
-            if slot != SLOT_COLOR {
-                continue;
+            let distortion = match slot {
+                SLOT_COLOR => false,
+                SLOT_DISTORTION => true,
+                _ => continue,
+            };
+            // Color: untextured sprites always; strips and the textured variants the layers
+            // use. Distortion: the variants of the distortion layers.
+            if !distortion {
+                gpu.pipeline(device, (target, DrawKind::Sprite, TexVariant::None));
             }
-            // Untextured sprites always; strips and textured variants the layers use.
-            gpu.pipeline(device, (target, DrawKind::Sprite, TexVariant::None));
             for info in &self.layers.info {
+                if info.distortion != distortion {
+                    continue;
+                }
                 let tex = match info.texture {
                     None => TexVariant::None,
                     Some(k) => match gpu.tex_bind(k) {
@@ -1173,20 +1432,27 @@ impl RenderNode for ParticlesNode {
                         None => continue,
                     },
                 };
-                gpu.pipeline(device, (target, draw_kind(info.kind), tex));
+                let kind = if distortion {
+                    DrawKind::Distortion
+                } else {
+                    draw_kind(info.kind)
+                };
+                gpu.pipeline(device, (target, kind, tex));
             }
         }
     }
 
     fn draw(&mut self, pass: &mut wgpu::RenderPass<'static>, ctx: &DrawContext<'_>) {
-        if ctx.slot != SLOT_COLOR {
-            return;
-        }
+        let distortion = match ctx.slot {
+            SLOT_COLOR => false,
+            SLOT_DISTORTION => true,
+            _ => return,
+        };
         let Some(list) = self.views.iter().find(|l| l.camera == ctx.view.camera).copied() else {
             return;
         };
         #[cfg(test)]
-        {
+        if !distortion {
             self.test_capture = Some((
                 ctx.view_bind_group.clone(),
                 ctx.scene_bind_group.clone(),
@@ -1200,12 +1466,14 @@ impl RenderNode for ParticlesNode {
             ctx.target,
             (ctx.view_bind_group, ctx.scene_bind_group, ctx.view.view_offset),
             list,
+            distortion,
         );
     }
 }
 
 impl ParticlesNode {
-    /// Record the draws of `list` with the frame's view and scene bind groups.
+    /// Record the color (or `distortion`) draws of `list` with the frame's view and scene bind
+    /// groups.
     fn record(
         &mut self,
         pass: &mut wgpu::RenderPass<'static>,
@@ -1213,11 +1481,13 @@ impl ParticlesNode {
         target: PassTarget,
         (view_bind_group, scene_bind_group, view_offset): (&wgpu::BindGroup, &wgpu::BindGroup, u32),
         list: ViewList,
+        distortion: bool,
     ) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        if list.end == list.start || gpu.bind_group.is_none() {
+        let range = list.range(distortion);
+        if range.is_empty() || gpu.bind_group.is_none() {
             return;
         }
         let indirect = self.gpu_sim.as_ref().and_then(GpuSim::draw_buffers);
@@ -1226,10 +1496,14 @@ impl ParticlesNode {
         let view_uniform = (list.uniform as u64 * gpu.align) as u32;
         let mut current: Option<usize> = None;
         let mut bound_tex: Option<TexKey> = None;
-        for &i in &self.view_items[list.start as usize..list.end as usize] {
+        for &i in &self.view_items[range] {
             let item = self.items[i as usize];
             let info = self.layers.info[item.layer as usize];
-            let kind = draw_kind(info.kind);
+            let kind = if distortion {
+                DrawKind::Distortion
+            } else {
+                draw_kind(info.kind)
+            };
             // The texture's bind group (group 3) and variant; a texture not ready is skipped.
             let tex = match info.texture {
                 None => TexVariant::None,
@@ -1266,7 +1540,36 @@ impl ParticlesNode {
                     pass.set_vertex_buffer(1, strips.slice(from + POINT_SIZE..from + POINT_SIZE + len));
                     pass.draw(0..4, 0..item.count);
                 }
-                DrawKind::Sprite => {
+                DrawKind::Sprite | DrawKind::Distortion => {
+                    // `ByDistance` layers draw their instances sorted for this view.
+                    let sorted = if info.sorted && !distortion {
+                        self.sorted_draws[list.sorted.0 as usize..list.sorted.1 as usize]
+                            .iter()
+                            .find(|d| d.item == i)
+                            .copied()
+                    } else {
+                        None
+                    };
+                    let bytes = item.count as u64 * INSTANCE_SIZE;
+                    if let Some(d) = sorted {
+                        let from = d.first as u64 * INSTANCE_SIZE;
+                        if d.gpu {
+                            let (Some(buffer), Some((work, _)), Some(sim)) = (
+                                self.gpu_sort.as_ref().and_then(GpuSort::sorted_buffer),
+                                indirect,
+                                self.gpu_sim.as_ref(),
+                            ) else {
+                                continue;
+                            };
+                            pass.set_vertex_buffer(0, buffer.slice(from..from + bytes));
+                            pass.draw_indirect(work, sim.args_offset(item.args));
+                        } else {
+                            let Some((buffer, _)) = &gpu.sorted else { continue };
+                            pass.set_vertex_buffer(0, buffer.slice(from..from + bytes));
+                            pass.draw(0..4, 0..item.count);
+                        }
+                        continue;
+                    }
                     let from = item.first as u64 * INSTANCE_SIZE;
                     let to = from + item.count as u64 * INSTANCE_SIZE;
                     if item.args == DIRECT {
@@ -1353,7 +1656,14 @@ impl ParticlesNode {
                 multiview_mask: None,
             })
             .forget_lifetime();
-        self.record(&mut pass, device, target, (&view_bg, &scene_bg, view_offset), list);
+        self.record(
+            &mut pass,
+            device,
+            target,
+            (&view_bg, &scene_bg, view_offset),
+            list,
+            false,
+        );
         Some(list.end - list.start)
     }
 }
@@ -1389,6 +1699,9 @@ mod tests {
                 (OutputEncoding::Linear, DrawKind::Strip, TexVariant::Array),
                 (OutputEncoding::ManualSrgb, DrawKind::Strip, TexVariant::None),
                 (OutputEncoding::Tonemapped, DrawKind::Strip, TexVariant::D2),
+                (OutputEncoding::Linear, DrawKind::Distortion, TexVariant::None),
+                (OutputEncoding::Linear, DrawKind::Distortion, TexVariant::D2),
+                (OutputEncoding::Linear, DrawKind::Distortion, TexVariant::Array),
             ] {
                 let src = shader_for(output, access, kind, tex);
                 let module =
@@ -1402,6 +1715,7 @@ mod tests {
                 let entries = match kind {
                     DrawKind::Sprite => ["vs_sprite", "fs_sprite"],
                     DrawKind::Strip => ["vs_strip", "fs_strip"],
+                    DrawKind::Distortion => ["vs_distortion", "fs_distortion"],
                 };
                 for (stage, entry) in [
                     (naga::ShaderStage::Vertex, entries[0]),
