@@ -111,6 +111,11 @@ impl RangeAllocator {
         }
     }
 
+    /// Room for `ranges` free ranges (a pool of `n` live ranges has at most `n + 1`).
+    pub fn reserve(&mut self, ranges: usize) {
+        super::reserve_to(&mut self.free, ranges);
+    }
+
     /// Capacity of the free list (reallocation tracking).
     pub fn capacity(&self) -> usize {
         self.free.capacity()

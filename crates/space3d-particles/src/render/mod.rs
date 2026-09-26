@@ -541,6 +541,8 @@ pub(crate) struct ParticlesNode {
     sort_rows: Vec<[f32; 4]>,
     /// The GPU sort's jobs this frame, and its state (per renderer).
     sort_jobs: Vec<SortJob>,
+    /// `instances.capacity()` when the CPU sort's per-particle buffers were last sized for it.
+    sort_reserved: usize,
     gpu_sort: Option<GpuSort>,
     warned_sort: bool,
     /// Bumped whenever the CPU instance stream is rewritten (pack, bridges).
@@ -597,6 +599,7 @@ impl ParticlesNode {
             sort_source: (u64::MAX, Vec::new(), Vec::new()),
             sort_rows: Vec::new(),
             sort_jobs: Vec::new(),
+            sort_reserved: 0,
             gpu_sort: None,
             warned_sort: false,
             pack_gen: 0,
@@ -1354,6 +1357,16 @@ impl RenderNode for ParticlesNode {
         let Some(sim) = self.simulate(ctx, rebuilt) else {
             return;
         };
+        // The CPU-sorted particles of `ByDistance` layers are a subset of the frame's
+        // instances: their buffers grow with the instance stream, not at every new peak of
+        // their own (which the steady state would count as allocations).
+        if self.instances.capacity() != self.sort_reserved {
+            self.sort_reserved = self.instances.capacity();
+            let n = self.sort_reserved;
+            crate::runtime::reserve_to(&mut self.sorted_instances, n);
+            crate::runtime::reserve_to(&mut self.sorted_uploaded, n);
+            crate::runtime::reserve_to(&mut self.sort_keys, n);
+        }
         self.enabled = sim.settings.enabled;
         self.plan_views(ctx, &sim.settings);
         let (bytes, created) = if ctx.frame.device_lost {

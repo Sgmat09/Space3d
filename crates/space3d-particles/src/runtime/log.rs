@@ -184,6 +184,14 @@ impl TickLog {
     }
 
     /// Sum of the vectors' capacities (reallocation tracking).
+    /// Room for a tick of `instances` rows and `entries` spawn records and clears (a log
+    /// replayed every frame holds one tick).
+    pub fn reserve_tick(&mut self, instances: usize, entries: usize) {
+        super::reserve_to(&mut self.rows, instances);
+        super::reserve_to(&mut self.records, entries);
+        super::reserve_to(&mut self.clears, entries);
+    }
+
     pub fn capacity(&self) -> usize {
         self.frames.capacity()
             + self.records.capacity()

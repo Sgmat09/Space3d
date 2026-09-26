@@ -119,6 +119,59 @@ fn battle_steady_state() {
     assert_eq!(report.particles.refused, 0);
 }
 
+/// The steady state of the tiers below High, which run the CPU particle backend (Low, and
+/// every tier without compute: ANGLE / WebGL2) or a smaller load: after ten seconds nothing
+/// grows for fifteen more. The Battle's load is random (hits, bolts, missiles by tick hash),
+/// so it keeps setting small new peaks of effect instances; the collections sized by those
+/// (free lists, finish events, the entity map, the sort buffers) used to grow at them 10–20 s
+/// in (Low: at 7 frames of 1500), and now grow only with the instance and entry tables.
+#[test]
+fn battle_steady_state_low_and_medium() {
+    let small = ShowcaseContent::generate(ContentOptions {
+        texture_size: 256,
+        sky_face_size: 256,
+    });
+    for quality in [GraphicsQuality::Low, GraphicsQuality::Medium] {
+        let scene = BattleScene {
+            quality,
+            hud: false,
+            ..BattleScene::default()
+        };
+        let mut app = match headless_battle(960, 540, &scene, &small) {
+            Ok(app) => app,
+            Err(e) => {
+                eprintln!("skipping: no GPU adapter ({e})");
+                return;
+            }
+        };
+        app.step_ticks(600);
+        let (mut particles, mut render, mut textures) = (Vec::new(), 0, 0);
+        for frame in 0..900 {
+            app.step_ticks(1);
+            let s = app.resources.expect::<Renderer>().stats();
+            render += s.cpu_reallocations;
+            textures += s.textures_created;
+            let p = app
+                .resources
+                .expect::<space3d_particles::ParticleStats>()
+                .cpu_reallocations;
+            if p > 0 {
+                particles.push(frame);
+            }
+        }
+        let stats = app.resources.expect::<space3d_particles::ParticleStats>();
+        eprintln!(
+            "{quality}: {:?} backend, {} effects, {} layer instances; particle reallocations at frames {particles:?}, render {render}, textures {textures}",
+            stats.backend, stats.effects, stats.layer_instances
+        );
+        assert!(
+            particles.is_empty(),
+            "{quality}: ParticleStats::cpu_reallocations at frames {particles:?}"
+        );
+        assert_eq!((render, textures), (0, 0), "{quality}: RenderStats");
+    }
+}
+
 /// The Dev gates: GPU ≤ 3.0 ms, CPU `render_frame` ≤ 1.5 ms at High (1080p, loaded GPU).
 #[test]
 #[ignore = "perf gate: run alone with --ignored --nocapture"]

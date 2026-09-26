@@ -298,6 +298,9 @@ pub(crate) struct Runtime {
     pub device: Option<crate::TickDevice>,
     /// Emitters new this tick (scratch: started after the others, the most visible first).
     new_emitters: Vec<NewEmitter>,
+    /// Capacities of `instances`, `entries` and `tracks` when their companions were last
+    /// reserved ([`Self::reserve_companions`]).
+    companions: (usize, usize, usize),
     /// Seconds from the frame time the emitters' `Transform`s stand for (where `Stage::Update`
     /// left them) to the end of this tick: how far a tick extrapolates the motion measured
     /// between frames (set by the tick system; 0 extrapolates nothing).
@@ -473,7 +476,52 @@ fn lod_scale(lod: &ParticleLod, distance: f32) -> f32 {
     1.0 + (lod.min_scale.clamp(0.0, 1.0) - 1.0) * t
 }
 
+/// Grow `v` to hold `n` elements (no-op when it does).
+pub(crate) fn reserve_to<T>(v: &mut Vec<T>, n: usize) {
+    if v.capacity() < n {
+        v.reserve(n - v.len());
+    }
+}
+
 impl Runtime {
+    /// Size the collections whose length is bounded by the effect instances, the layer
+    /// instances or the ribbon tracks (free lists, the pool's free ranges, finish events, the
+    /// entity map, a tick's log) for the capacity of those, whenever that grows. They would
+    /// otherwise grow on their own, at a new peak of their own length long after the load
+    /// stopped growing (the Battle at Low, 10–20 s in: the entry free list at 320, the finish
+    /// list at 16, the entity map), which the steady state counts as allocations (graphics
+    /// spec §4.4). Now they grow only on the tick their primary does.
+    fn reserve_companions(&mut self) {
+        let key = (
+            self.instances.capacity(),
+            self.entries.capacity(),
+            self.tracks.capacity(),
+        );
+        if key == self.companions {
+            return;
+        }
+        self.companions = key;
+        let (instances, entries, tracks) = key;
+        reserve_to(&mut self.paths, instances);
+        reserve_to(&mut self.free_instances, instances);
+        reserve_to(&mut self.finished, instances);
+        reserve_to(&mut self.dead_lights, instances);
+        reserve_to(&mut self.new_emitters, instances);
+        // At most half full: a map whose tombstones use up its growth room then rehashes in
+        // place instead of growing.
+        if self.by_entity.capacity() < 2 * instances {
+            self.by_entity.reserve(2 * instances - self.by_entity.len());
+            self.track_by_entity();
+        }
+        reserve_to(&mut self.free_entries, entries);
+        self.released_entries
+            .reserve(entries.saturating_sub(self.released_entries.len()));
+        self.pool.reserve(entries + 1);
+        self.log.reserve_tick(instances, entries);
+        reserve_to(&mut self.free_tracks, tracks);
+        self.ribbon_pool.reserve(tracks + 1);
+    }
+
     fn capacities(&self) -> [usize; 9] {
         [
             self.instances.capacity() + self.paths.capacity(),
@@ -1193,6 +1241,7 @@ impl Runtime {
             .unwrap_or(1);
         self.log.trim(window.saturating_add(1) as usize);
         self.time += dt as f64;
+        self.reserve_companions();
         let after = self.capacities();
         self.reallocations += before.iter().zip(&after).filter(|(a, b)| a != b).count() as u32;
     }

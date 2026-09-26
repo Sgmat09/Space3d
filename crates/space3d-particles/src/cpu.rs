@@ -315,6 +315,9 @@ impl CpuSim {
     /// that grew.
     pub fn replay(&mut self, rt: &mut Runtime, max_catchup: u32) -> u32 {
         let before = self.capacities();
+        // By instance and by entry: sized with the runtime's (grown on the frame it grew).
+        crate::runtime::reserve_to(&mut self.xf, rt.instances.capacity());
+        crate::runtime::reserve_to(&mut self.drag, rt.entries.capacity());
         self.ticks = 0;
         let log = &mut rt.log;
         if log.frames.is_empty() {
