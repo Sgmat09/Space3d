@@ -1,7 +1,7 @@
 //! The GL backend — wgpu's WebGL2 / GLES 3.0 path, where particles run on the CPU backend and
 //! scene depth is sampled without a depth attachment — renders particles like the default
-//! backend: exact blend modes, the manual depth test and soft fade, and every built-in effect
-//! within a perceptual tolerance.
+//! backend: exact blend modes, the manual depth test and soft fade, every built-in effect, and
+//! distortion layers and per-particle sorting through post, within a perceptual tolerance.
 //!
 //! Skips without a GL adapter. On macOS, build wgpu's ANGLE support and put ANGLE's
 //! `libEGL.dylib`/`libGLESv2.dylib` (shipped with Chrome and Electron apps) on the dyld path:
@@ -131,4 +131,60 @@ fn gl_builtins_match_the_default_backend() {
         let diff = compare_images(&a, &b, &CompareOptions::perceptual());
         assert!(diff.passed, "{name}: {}", diff.summary());
     }
+}
+
+/// Distortion layers (into post's distortion buffer) and per-particle sorting (on the CPU on
+/// GL) through `PostProcess::default()`: an explosion's shockwave and a warp's vortex over a
+/// striped backdrop, and a sorted smoke cloud, look the same on GL and on the default backend.
+#[test]
+fn gl_distortion_and_sorting_match_the_default_backend() {
+    let scene = |app: &mut App| {
+        let cam = camera(
+            app,
+            Vec3::new(0.0, 90.0, 120.0),
+            Vec3::ZERO,
+            Vec4::new(0.01, 0.012, 0.02, 1.0),
+        );
+        app.world
+            .insert_one(
+                cam,
+                PostProcess {
+                    dither: false,
+                    ..PostProcess::default()
+                },
+            )
+            .unwrap();
+        // Unlit stripes below the effects: what the distortion bends.
+        let mesh = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_mesh(MeshData::plane(1.0));
+        for i in 0..12 {
+            app.world.spawn((
+                Transform::from_xyz(-110.0 + 20.0 * i as f32, -30.0, 0.0).with_scale(Vec3::new(6.0, 1.0, 300.0)),
+                Mesh3d(mesh),
+                Material::unlit(Vec4::new(0.3, 0.35, 0.5, 1.0)),
+            ));
+        }
+        app.spawn_effect(builtin::EXPLOSION, EffectSpawn::at(Vec3::new(-40.0, 0.0, 0.0)).seed(3));
+        app.spawn_effect(
+            builtin::WARP_IN,
+            EffectSpawn::at(Vec3::new(45.0, 0.0, -10.0)).scale(0.3).seed(4),
+        );
+        app.step_ticks(24);
+        render(app)
+    };
+    let Some(mut gl) = gl_app(ParticleSettings::default()) else {
+        return;
+    };
+    let a = scene(&mut gl);
+    assert_eq!(gl.resources.expect::<RenderStats>().distortion_passes, 1);
+    assert_eq!(gpu_errors(&gl), 0);
+    drop(gl);
+    let Some(mut native) = app(W, H) else { return };
+    let b = scene(&mut native);
+    dump(&a, "gl_distortion");
+    dump(&b, "native_distortion");
+    let diff = compare_images(&a, &b, &CompareOptions::perceptual());
+    assert!(diff.passed, "{}", diff.summary());
 }

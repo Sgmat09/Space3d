@@ -9,10 +9,11 @@ mode. The normative design is
 
 Status: milestones PA0 (runtime, CPU simulation, effect library), PA1 (CPU backend rendering,
 prefabs), PA2 (the GPU compute backend: 100k+ particles, budgets, parity with the CPU backend),
-the M1.1 polish (sub-pixel sprites, exact sub-tick emission, throttle response) and PA3
-(ribbons, beams, textures and flipbooks, light flashes, 14 built-ins, the `.pfx.ron` asset
-loader) are in. Distortion layers, per-particle sorting and LOD calibration (PA4) follow; the API
-below does not change for them.
+the M1.1 polish (sub-pixel sprites, exact sub-tick emission, throttle response), PA3 (ribbons,
+beams, textures and flipbooks, light flashes, 14 built-ins, the `.pfx.ron` asset loader) and PA4
+(distortion layers — shockwaves and heat haze through post's distortion buffer —, per-particle
+back-to-front sorting, quality presets and LOD calibrated with the Battle scene, HDR calibration
+against `Bloom::glow()`) are in.
 
 ## Quick start
 
@@ -186,7 +187,12 @@ the vertex shader reads, so the CPU never evaluates them per particle.
 * **Order**: particles draw after the built-in transparent meshes, in one render node slot:
   `SpriteRender::order` first, then alpha/premultiplied before additive, then emitters back to
   front for sorted layers. `Material::render_order` orders meshes only (two independent order
-  spaces; interleaving needs OIT, deferred).
+  spaces; interleaving needs OIT, deferred). `SpriteRender::sort` (see "Sorting"): `Auto` (the
+  default: `None` for additive layers, `ByEmitter` otherwise), `None` (spawn order), `ByEmitter`
+  (emitters back to front, each emitter's particles oldest first) or `ByDistance` (every
+  particle back to front, per view).
+* **Target**: `SpriteRender::target` (`SpriteRender::distortion(strength)`) draws the layer into
+  the post distortion buffer instead of color (see "Distortion").
 
 ### Ribbons (trails)
 
@@ -283,6 +289,71 @@ the inverse square of the distance, so a flash lighting a hull 20–40 units awa
 in the hundreds to thousands (`EXPLOSION` 4000, `DEBRIS_SPARKS` 3500, `EMP` 60 000, the tinted
 `HIT_SPARK` 250).
 
+### Distortion
+
+A sprite layer with `target: Distortion { strength }` (`SpriteRender::distortion(strength)`)
+bends the image behind it instead of drawing light: a shockwave's lens, a heat haze. It is
+drawn in the node's Distortion slot into the post group's distortion buffer (post's PO5 writer
+API: `DISTORTION_WGSL`, `DISTORTION_BLEND`, graphics spec §1.8), which the composite applies —
+so only cameras with a `PostProcess` whose `distortion` is enabled show it, and the pass exists
+only while such a camera sees a distortion layer. Layers draw as one batch per layer (their
+offsets add up; order does not matter), on both backends and the WebGL2 path.
+
+* **Direction from the shape.** `Ring`: toward the ring's center (the image under the band is
+  pushed outward: a shockwave); `Vortex`: around the center (a swirl, turning with the twist's
+  sign); `Texture`: its RG channels (0.5 = none, 0 and 1 = −/+ along the image's U and V, like
+  `DistortionMaterial`'s normal mode), alpha weighting; the others (`Glow`, `Streak`, `Smoke`):
+  heat haze, a smooth random field seeded per particle that drifts across it as it ages.
+  Directions laid out on the sprite (ring, vortex, texture) reach the screen through the inverse
+  of the sprite's screen-space Jacobian with their length kept, so they follow its rotation and
+  plane facing, and a sprite seen edge-on writes nothing.
+* **Strength and weight.** `strength` is the offset at full weight in view heights (0.01 = 1 %
+  of the view's height: 10.8 px at 1080p; the buffer holds ±0.0625 per axis). The weight is the
+  shape's coverage × the opacity over life (`color_over_life` alpha × `alpha_over_life` × tint
+  alpha) × the near fade; the color's RGB and `intensity` do not matter.
+* **Depth.** `soft_distance` fades the offset in behind geometry (0: hidden behind anything
+  closer), against the view's scene depth, and post's foreground guard keeps a haze behind a
+  ship from dragging the ship's edge over the background; without sampled depth (GL with MSAA)
+  it is not occluded, as for `DistortionMaterial`. Fragments below half an encoding step skip
+  the depth reads.
+* **Accuracy**: a texture writer of 0.04 view heights moves a 128-px view's edges by 5.114 px
+  against 5.114 expected on both backends and the WebGL2 path
+  (`tests/distortion.rs::distortion_layer_shifts_the_background`); without post, or with its
+  distortion off, the image is bit-identical to the scene without the layer
+  (`distortion_layers_never_draw_in_color`).
+
+The built-ins carry them: `EXPLOSION`'s shockwave (a ring of 0.03, 0.45 s), `WARP_IN` /
+`WARP_OUT`'s twisting vortex (0.025) and shockwave (0.03), `EMP`'s shock front (0.025) and
+`ENGINE_EXHAUST` / `ENGINE_AFTERBURNER`'s heat haze behind the flame (0.007 / 0.01). Story
+`Engine/Particles/Features/Distortion` shows them over a grid.
+
+### Sorting
+
+Additive layers need no order. Alpha and premultiplied layers draw back to front per emitter by
+default (`ByEmitter`, free: an emitter's particles come oldest first out of its ring). Where
+emitters interpenetrate — two explosions' smoke clouds drifting into each other, a core inside a
+ring — per-emitter order draws one whole emitter over the other. `SortMode::ByDistance` sorts
+every particle instead: the layer's emitters draw as one group whose particles each view draws
+farthest first (view depth; ties by instance order, so it is deterministic):
+
+* **CPU backend and direct draws** (render-time bridges): sorted on the CPU into a per-view
+  copy, rebuilt only when the particles or the views changed.
+* **GPU backend**: a bitonic sort of `(depth, index)` keys per (view, group) in one compute pass
+  (`particles.sort`, `shaders/sort.wgsl`): the group's capacity rounded up to a power of two
+  (≤ 65 536; larger groups draw unsorted, warned once), 512-key blocks sorted in workgroup
+  memory, global steps and local merges beyond — 1 dispatch up to 512 particles, 3 at 1024, 6
+  at 2048, 10 at 4096, 21 at 16 384 — then gathered into a per-view region drawn with the same
+  indirect arguments. A frame whose compacted particles and views did not change sorts nothing.
+* `tests/sorting.rs`: every checked pixel of 80 overlapping alpha discs seen from both sides
+  shows the nearest one (2 of 8883 misordered at disc rims; spawn order misorders 4514), on both
+  backends, and 3000 discs (4096 keys) through the global steps; idle frames dispatch and upload
+  nothing.
+
+The built-ins sort their lingering smoke this way (`EXPLOSION`'s smoke, `DEBRIS_SPARKS`' smoke,
+`MISSILE_TRAIL`'s puffs); the fireball keeps its age order (the freshest, hottest billows on
+top). Story `Engine/Particles/Features/Sorting`: a core inside a ring, per emitter and per
+particle. Weighted-blended OIT stays deferred (design-particles §8.7).
+
 ### Soft particles and scene depth
 
 With `ParticleSettings::soft_particles` (default on) the node's Transparent slot reads scene
@@ -306,6 +377,17 @@ tonemapper, so they look like meshes in every mode: linear HDR into the HDR scen
 values above 1 feed bloom), tonemapped per fragment in the Ldr fallback, sRGB-encoded where the
 target needs it. Direct mode has no tonemapper: there each sprite soft-clips with `1 − e^−x`
 (`ParticleSettings::direct_soft_clip`, default on), the game's current look.
+
+**Calibration against `Bloom::glow()`** (story `Engine/Particles/Features/HDR Bloom`: small,
+wide and cored glows at radiance 0.25 … 16). The bloom thresholds every scene pixel on its own
+(post's position-stable prefilter): nothing below its knee (0.5) blooms, from 1 the glow grows
+with the energy above the threshold whatever the sprite's size (a 1–4 px spark gets 2–3× the
+glow it got at M1, a large sprite the same), and from about 4 a sprite reads white-hot through
+AgX. So author bodies and smoke below 1 (they never bloom: the explosion's smoke peaks at 0.07),
+what should glow softly at 2–5, and cores, sparks and flashes at 5–16; the built-ins follow
+that: every built-in has a layer at 4 or more (a core, a flash, sparks; the repair beam's
+filament, the softest, peaks at 4.5) and none of its smoke reaches 1
+(`registry::tests::builtins_are_calibrated_for_bloom`).
 
 **Authoring for HDR.** The built-ins are calibrated for the HDR frame a game with `PostProcess`
 renders (AgX + `Bloom::glow()`, threshold 1): what should glow is authored well above 1 (laser
@@ -335,18 +417,18 @@ in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's
 
 | handle | what | spawn |
 |---|---|---|
-| `EXPLOSION` | flash, afterglow, fireball billows (premultiplied), hot core, sparks, embers, two shockwave rings, smoke; a light flash (0.6 s) lights the hulls around it | `EffectSpawn::at(p).scale(hull / 40)` |
+| `EXPLOSION` | flash, afterglow, fireball billows (premultiplied), hot core, sparks, embers, two shockwave rings, smoke sorted per particle; a light flash (0.6 s) lights the hulls around it; a distortion shockwave bends the space behind the blast front; `EffectPriority::High` | `EffectSpawn::at(p).scale(hull / 40)` |
 | `HIT_SPARK` | flash, sparks thrown along −Z, a ring, smoke, a short light flash of the tint; tinted | `.facing(-bolt_dir).tint(color)` |
 | `SHIELD_RIPPLE` | focused arc toward −Z, faint bubble, surface flash, streaks; local-space | `.facing(-bolt_dir).scale(radius / 20).follow(ship)` |
-| `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash (white-hot core, blue halo), two rings | `EffectSpawn::at(portal)` |
-| `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow; `rate_scale` = throttle: the plume stays dense and gets shorter, narrower and dimmer at partial throttle (one flame, never puffs; `tests/render.rs::exhaust_stays_continuous_at_partial_throttle`). Near-neutral (white-hot): the flame takes its hue from the tint | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
+| `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash (white-hot core, blue halo), two rings; distortion: the vortex twists the space around the portal and a shockwave pushes it outward | `EffectSpawn::at(portal)` |
+| `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow, heat haze (distortion) in the flame's wake; `rate_scale` = throttle: the plume stays dense and gets shorter, narrower and dimmer at partial throttle (one flame, never puffs; `tests/render.rs::exhaust_stays_continuous_at_partial_throttle`). Near-neutral (white-hot): the flame takes its hue from the tint. `EffectPriority::Low`: engines yield the budget to combat effects | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
 | `LASER_TRAIL` | looping white-hot head + a ribbon of glow along the bolt's path, 0.15 s long, reaching the bolt's render position at any speed (it was a chain of sprite glows per unit of distance, 581 pool slots and render-time bridges per bolt; the ribbon looks the same for 5 slots and 64 ribbon points) | `.follow(bolt).tint(color)` (a saturated tint: the game's pure primaries such as `(1, 0, 0)` stay the most saturated); the bolt may move in any stage |
 | `LASER_BEAM` | looping continuous laser to its `ParticleBeam` end: a wide glow of the tint around a white-hot core, flowing noise, a slight flicker, round glows at the gun and the hit, a muzzle glow | `EffectSpawn::from_transform(gun).follow(ship).beam_to(BeamEnd::Entity(hit_point)).tint(color).keep()` |
 | `LASER_SHOT` | a hitscan shot: the same beam from muzzle to hit for 0.12 s, fading as it thins, muzzle flash, hot glow on the hit (one-shot) | `EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color)`, with a `HIT_SPARK` at the hit |
-| `MISSILE_TRAIL` | looping: a white-hot flame and short glowing wake on the missile, sparks, and a smoke ribbon along its path that widens, breaks up and fades over 1.6 s, with puffs; the smoke drains when the missile is gone | `EffectSpawn::at(Vec3::ZERO).follow(missile)` (missile facing −Z) |
-| `DEBRIS_SPARKS` | a hull breaking apart: hot chunks tumbling and cooling to dark plating, sparks, flickering embers, smoke and a light flash that catches the hull | `.facing(-hit_dir).scale(hull / 40)` |
-| `ENGINE_AFTERBURNER` | looping boost over `ENGINE_EXHAUST`: a long white-hot plume, three shock diamonds riding the nozzle, a ribbon trail along the path, heat sparks; `rate_scale` = boost (0..1.5: longer and brighter, never thinner) | like `ENGINE_EXHAUST`, `.tint(engine color)` |
-| `EMP` | an electromagnetic pulse: a white-cyan flash with a strong light flash, a fast shock ring and a fainter one, crackling arcs, flickering motes; tinted | `EffectSpawn::at(center).scale(radius / 80)` |
+| `MISSILE_TRAIL` | looping: a white-hot flame and short glowing wake on the missile, sparks, and a smoke ribbon along its path that widens, breaks up and fades over 1.6 s, with puffs (sorted per particle: crossing trails interleave); the smoke drains when the missile is gone | `EffectSpawn::at(Vec3::ZERO).follow(missile)` (missile facing −Z) |
+| `DEBRIS_SPARKS` | a hull breaking apart: hot chunks tumbling and cooling to dark plating, sparks, flickering embers, smoke (sorted per particle) and a light flash that catches the hull | `.facing(-hit_dir).scale(hull / 40)` |
+| `ENGINE_AFTERBURNER` | looping boost over `ENGINE_EXHAUST`: a long white-hot plume, three shock diamonds riding the nozzle, a ribbon trail along the path, heat sparks, strong heat haze (distortion); `rate_scale` = boost (0..1.5: longer and brighter, never thinner); `EffectPriority::Low` | like `ENGINE_EXHAUST`, `.tint(engine color)` |
+| `EMP` | an electromagnetic pulse: a white-cyan flash with a strong light flash, a fast shock ring and a fainter one, a shock front that bends the space behind it (distortion), crackling arcs, flickering motes; tinted; `EffectPriority::High` | `EffectSpawn::at(center).scale(radius / 80)` |
 | `REPAIR_BEAM` | looping green beam to its `ParticleBeam` end: a soft stream flowing toward the target, a wavering bright filament (jitter), round glows at both ends, a gentle pulse; tinted | like `LASER_BEAM`, `BeamEnd::Entity(dock_point)` |
 
 An emitter whose handle has no effect data — a removed effect, `EffectHandle::INVALID`, a
@@ -355,10 +437,12 @@ built-in without `ParticlesPlugin::builtins` — plays nothing and finishes on i
 runs, so a `spawn_effect` entity is despawned instead of staying forever.
 
 Stories: `Engine/Particles/Builtin/*` (Direct mode; one per built-in), `Engine/Particles/HDR/*`
-(the same through `PostProcess::default()`), `Engine/Particles/Features/*` (blend modes, soft
-particles, shapes, curves, facing, local vs world, ribbons, beams, flipbook, light flashes, CPU
-backend) and `Engine/Particles/Stress/100k` (tag `perf`: 100 000 particles on the GPU backend) in
-the engine storybook (`space3d stories`, the editor's storybook viewer, golden tests).
+(the same through `PostProcess::default()`: bloom, and the distortion layers), `Engine/Particles/Features/*` (blend modes, soft
+particles, shapes, curves, facing, local vs world, ribbons, beams, flipbook, light flashes,
+distortion, sorting, HDR bloom, CPU backend) and `Engine/Particles/Stress/{100k, Battle}` (tag
+`perf`: 100 000 particles on the GPU backend; the Battle scene's particle load through the game's
+camera, per quality tier) in the engine storybook (`space3d stories`, the editor's storybook
+viewer, golden tests).
 
 Examples (they honour `SPACE3D_HEADLESS` and `SPACE3D_EXIT_AFTER_FRAMES`, and never take focus
 when run by tools):
@@ -432,15 +516,15 @@ when run by tools):
   on the web). The tick system uses the budget of the backend the renderer resolves to. Each
   layer instance reserves a ring sized from its rates, bursts and life (§5.1 of the area
   design); over the budget rings shrink to 1/8 before a layer instance is refused
-  (`ParticleStats::{shrunk, refused}`, logged once per effect). `EffectPriority::Low` stops at
-  75 % of the pool, `Normal` at 90 %, `High` may use it all. Slots a built-in reserves per
-  instance (`runtime::tests::builtin_slots`; ribbon points in parentheses): `EXPLOSION` 81,
-  `HIT_SPARK` 16, `SHIELD_RIPPLE` 8, `WARP_IN` / `WARP_OUT` 27, `ENGINE_EXHAUST` 148 (its rates
-  at the afterburner's `max_rate_scale` 2: the plume's `2^0.25`), `LASER_TRAIL` 5 (64),
-  `LASER_BEAM` 7, `LASER_SHOT` 1, `MISSILE_TRAIL` 23 (192), `DEBRIS_SPARKS` 78,
-  `ENGINE_AFTERBURNER` 196 (96), `EMP` 63, `REPAIR_BEAM` 8. The CPU backend's web budget
-  (8192 × 90 %) holds, for example, 30 exhausts and 40 laser trails at once; the GPU pool
-  (262 144) is not a practical limit for them. Ribbon points come from their own pool,
+  (`ParticleStats::{shrunk, refused}`, logged once per effect; a looping instance retries a
+  refused layer every 15 ticks). `EffectPriority::Low` stops at 75 % of the pool, `Normal` at
+  90 %, `High` may use it all (the engines are `Low`, explosions and EMPs `High`). Slots a
+  built-in reserves per instance at quality 1 (`runtime::tests::builtin_slots`; ribbon points in
+  parentheses): `EXPLOSION` 82, `HIT_SPARK` 16, `SHIELD_RIPPLE` 8, `WARP_IN` / `WARP_OUT` 29,
+  `ENGINE_EXHAUST` 164 (its rates at the afterburner's `max_rate_scale` 2: the plume's
+  `2^0.25`), `LASER_TRAIL` 5 (64), `LASER_BEAM` 7, `LASER_SHOT` 1, `MISSILE_TRAIL` 23 (192),
+  `DEBRIS_SPARKS` 78, `ENGINE_AFTERBURNER` 215 (96), `EMP` 64, `REPAIR_BEAM` 8; `lod` layers
+  reserve for their quality × LOD level (below). Ribbon points come from their own pool,
   `max_ribbon_segments` (65 536: about a thousand laser trails): a ribbon that does not fit is
   refused (`ParticleStats::refused`, warned once per effect).
 * `ParticleStats` (resource, per rendered frame): backend, live effects and layer instances,
@@ -450,6 +534,50 @@ when run by tools):
   uploaded, `cpu_reallocations` (0 in the steady state).
   The frame's `RenderStats` counts the GPU backend's compute passes (`compute_passes`, reported
   with `PrepareContext::count_compute_passes`) and dispatches (`node_dispatches`).
+
+### Quality, LOD and budgets
+
+`ParticleSettings::for_quality(GraphicsQuality)` (graphics spec §4.4; calibrated with the
+Battle scene, `tests/battle.rs`):
+
+| | Low (WebGL2 / C-class) | Medium (iGPU, Apple, mobile) | High (dGPU) |
+|---|---|---|---|
+| backend, budget | CPU, 16 384 (8 192 on the web) | GPU, 262 144 (65 536 on Android / iOS) | GPU, 262 144 |
+| `quality` | 0.25 (0.125 on the web) | 1 (0.75 on mobile) | 1 |
+| `lod` (distance from the primary camera) | 1000 → 2500, × 0.25 | 1200 → 3000, × 0.5 | off |
+| `offscreen_scale` | 0 (off-screen engines emit nothing) | 0.5 (0.125 on mobile) | 1 |
+| `max_ribbon_segments` | 16 384 | 65 536 | 65 536 |
+| `max_screen_size` | 0.6 | 1 | 1 |
+
+* **What scales.** `quality` × the distance LOD (`ParticleLod`) × `offscreen_scale` (an emitter
+  outside the primary camera's view — at the renderer's aspect ratio, grown by a quarter on
+  each side — counts as off screen) multiply the spawn counts of `lod` layers (bursts keep at
+  least one particle). The LOD distances are for a top-down camera 400–1000 units above the
+  flight plane (SpaceCorps2027's battle view: everything on screen stays at full rate).
+* **Rings follow the level.** A `lod` layer reserves its ring for its emitter's level — `q/2^k`,
+  the smallest of the quality `q` … `q/16` that holds quality × LOD, or none at all at 0 — so
+  thinned emitters also cost less of the budget. A looping emitter restarts with bigger rings
+  when it moves past its level (it came into view or closer, or `quality` rose), with smaller
+  ones when it falls two levels below (its old particles drain meanwhile; the margin around the
+  view puts the restart off screen). A thinned layer draws its fewer particles `(1/level)^¼`
+  bigger and brighter, so a sparse plume stays continuous (at quality 0.25 an exhaust looks
+  close to full; at 0.125 it just starts to bead).
+* **Visible first.** Under a LOD, the emitters new in a tick start the most visible first, so a
+  full budget refuses what is least seen.
+
+The Battle scene (`testing::battle`: 300 ships with three engine exhausts each, 20 boosting,
+64 ribbons, 16 beams, 30 explosions a second plus the missiles', 120 hits a second with shield
+ripples, debris, warps and EMPs; the game's battle camera at 640 × 360), 5 s in:
+
+| tier | alive | reserved / budget | refused, shrunk | engines in view burning | explosions playing |
+|---|---|---|---|---|---|
+| High | 101 976 | 169 814 / 262 144 | 0, 0 | 119 of 119 | 188 of 188 |
+| Medium | 60 674 | 108 054 / 262 144 | 0, 0 | 119 of 119 | 188 of 188 |
+| Medium (mobile) | 22 084 | 45 114 / 65 536 | 0, 0 | 119 of 119 | 188 of 188 |
+| Low | 4 931 | 9 784 / 16 384 | 0, 0 | 119 of 119 | 188 of 188 |
+| Low (web) | 2 663 | 5 624 / 8 192 | 0, 0 | 119 of 119 | 188 of 188 |
+
+Story `Engine/Particles/Stress/Battle` renders it (knob `quality`).
 
 ### The GPU backend
 
@@ -498,6 +626,7 @@ paravirtual GPUs) cannot measure Dev-machine budgets. Run it alone on an idle De
 
 ```sh
 cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --nocapture
+cargo test -p space3d-particles --test battle battle_gpu_cost -- --ignored --nocapture
 ```
 
 
@@ -514,7 +643,9 @@ cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --noca
 | render-time bridges of a Battle fleet moved in `Update`: 300 engine exhausts at 150 units/s and 20 bolts' sprite trails (2260 particles built and packed) | 0.10–0.12 ms (0.15–0.16 ms before) | ≤ 0.15 ms (`runtime::tests::bridges_of_a_battle_fleet_within_budget`); **on top of** the `prepare` line, see below |
 | ribbons and beams of a Battle frame, built on the CPU every frame (both backends): 20 `LASER_TRAIL`s at 1500 units/s, 10 `MISSILE_TRAIL`s, 10 `ENGINE_AFTERBURNER` trails, 6 `LASER_BEAM`s and 4 `REPAIR_BEAM`s (1870 points, 17 draws) | 37 µs (about 20 ns a point, test profile) | ≤ 0.1 ms (`render::strips::tests::strips_of_a_battle_within_budget`) |
 | a procedural built-in texture (`Fireball16`: 16 frames of 64² with mips), generated once per process when an effect using it is registered | about 4 ms, never in a render frame | — |
-| allocations per frame, ~1000 particles, 89 draws (4 of them ribbons and beams), the exhaust moved in `Update`, light flashes spawned and despawned (wgpu's bookkeeping; our code: 0) | CPU backend 213, GPU backend 335 (a direct draw and upload for the exhaust's bridge; 184 / 307 before the scene had ribbons and beams) | pinned +10 % (`tests/alloc.rs`) |
+| allocations per frame, ~1000 particles, 57–60 draws (4 of them ribbons and beams), the exhaust moved in `Update`, light flashes spawned and despawned (wgpu's bookkeeping; our code: 0) | CPU backend 176, GPU backend 329 (the smoke's sort pass; 213 / 335 before, when the smoke drew one draw per emitter) | pinned +10 % (`tests/alloc.rs`) |
+| the Battle scene at 1080p through `PostProcess::default()` (`tests/battle.rs::battle_gpu_cost`, 102k alive, 105 draws, 12 dispatches per tick): throughput of the frozen frame, back to back | particle draws 0.93–0.95 ms; distortion writers (the Distortion pass and the composite's taps) −0.03 … 0.11 ms, within noise | draws ≤ 1.2 ms (spec §4.4: the whole Transparent phase, T1); distortion ≤ 0.3 ms (T1: 0.15 for the reference scene's 2 shockwaves; about 14 here) |
+| the same, per tick (in-frame `GpuTimings` scopes, which on Apple GPUs include their overlap with the neighbouring passes) | `particles.sim` 0.04 + `particles.compact` 0.06 + `particles.sort` 0.18–0.20 ms; as throughput, ticking frames with the smoke sorted per particle take no longer than with it per emitter (4.45 vs 4.71 ms: the sorted smoke draws once instead of once per explosion) | ≤ 0.4 ms (reported) |
 
 **Bridges are not free, plainly.** A game that moves its ships and bolts in `Stage::Update`
 (SpaceCorps2027 does) bridges every moving world-space emitter on every frame, on the CPU, on
@@ -560,7 +691,9 @@ explicit gradients; half floats packed in instances (flipbook ages, strip widths
 with integer arithmetic. The sprite and strip shaders translate to GLSL ES 3.00 in every
 variant (tested) and need no `f16` capability. On
 GL scene depth is sampled without an attachment and tested in the shader; with MSAA on GL there
-is no soft fade (hard test only). The GL backend (ANGLE, GLES 3.0) renders the particle scenes
+is no soft fade (hard test only). Distortion layers work there too (post's `Rgba8Unorm`
+distortion buffer needs no float target; occluded at 1×, not with MSAA, as for
+`DistortionMaterial`), and `ByDistance` layers sort on the CPU (there is no compute). The GL backend (ANGLE, GLES 3.0) renders the particle scenes
 and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 
 ## Migrating the game's effects
@@ -579,4 +712,6 @@ and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 | lasers drawn in the egui overlay | `builtin::LASER_SHOT` per hitscan shot (`EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color)`, it despawns itself), or `LASER_BEAM` for a held laser (`beam_to(BeamEnd::Entity(..))`, looping: stop or despawn it); they are HDR particles now, so they bloom and sit in the scene's depth |
 | missiles, heavy hits, EMPs, repairs | `MISSILE_TRAIL` (follow the missile), `DEBRIS_SPARKS`, `EMP`, `REPAIR_BEAM` |
 | `1 − e^−x` soft clip in the overlay | `direct_soft_clip` in Direct mode; with `PostProcess` the tonemapper and bloom take over |
+| the game's graphics quality setting | `ParticleSettings::for_quality(GraphicsQuality::…)` (Low on WebGL2: the CPU backend, 16k / 8k on the web, quality 0.25 / 0.125, off-screen engines culled) |
+| heat haze, shockwaves (none in the game today) | built in: `EXPLOSION`, `WARP_IN` / `WARP_OUT`, `EMP`, `ENGINE_EXHAUST`, `ENGINE_AFTERBURNER` bend the image behind them through `PostProcess` (distortion on by default); custom ones with `SpriteRender::distortion(strength)` or `DistortionMaterial` meshes |
 | the battle camera's look | choose it explicitly: `PostProcess::default().with_tonemapper(Tonemapper::AgXPunchy).with_exposure(0.5)` keeps faction exhaust, lasers and fire saturated; the default `AgX` turns them pastel (frame.md, "Choose the look explicitly") |

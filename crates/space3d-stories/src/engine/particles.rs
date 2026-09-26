@@ -1763,6 +1763,9 @@ fn stress_battle() -> Story {
     .tag("perf")
     .size(320, 180)
     .ticks(120)
+    // 100k particles: other drivers round a few of them differently (GL: 0.2 % of the pixels
+    // by at most 3 levels).
+    .tolerance(0.005)
 }
 
 fn cpu_backend() -> Story {

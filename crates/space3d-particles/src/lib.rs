@@ -270,7 +270,8 @@ pub struct ParticleSettings {
     pub max_particles_cpu: u32,
     /// Ribbon segment budget. Default 65 536.
     pub max_ribbon_segments: u32,
-    /// 0..=1: scales the spawn counts of `lod` layers. Default 1.
+    /// 0..=1: scales the spawn counts of `lod` layers, and the rings they reserve (a thinned
+    /// layer draws its fewer particles a little bigger and brighter). Default 1.
     pub quality: f32,
     /// Distance-based rate scaling (off by default).
     pub lod: ParticleLod,

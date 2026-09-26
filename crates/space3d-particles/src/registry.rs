@@ -372,6 +372,53 @@ pub mod builtin {
 mod tests {
     use super::*;
 
+    /// HDR calibration against `Bloom::glow()` (threshold 1, knee from 0.5; story
+    /// `Engine/Particles/Features/HDR Bloom`): every built-in has a layer at 4 or more of peak
+    /// radiance (a core, a flash, sparks, a filament: it blooms and reads near white), and none of its smoke
+    /// reaches 1 (smoke never blooms). Peak radiance: the layer's intensity × its brightest
+    /// color channel over life × its brightest start color, or its white core, untinted.
+    #[test]
+    fn builtins_are_calibrated_for_bloom() {
+        use crate::curve::Gradient;
+        use crate::effect::{SpriteShape, SpriteTarget};
+        let peak = |g: &Gradient, intensity: f32| {
+            g.keys.iter().map(|(_, c)| c[0].max(c[1]).max(c[2])).fold(0.0, f32::max) * intensity
+        };
+        for h in builtin::ALL {
+            let fx = builtin::effect(h).unwrap();
+            let mut hottest = 0.0f32;
+            for l in &fx.layers {
+                if !matches!(l.render.target, SpriteTarget::Color) {
+                    continue;
+                }
+                let start = l
+                    .start_color
+                    .a
+                    .iter()
+                    .chain(&l.start_color.b)
+                    .take(3)
+                    .fold(0.0f32, |m, &c| m.max(c));
+                // A glow's or streak's white-hot core adds `core` × intensity at its center.
+                let core = match l.render.shape {
+                    SpriteShape::Glow { core, .. } | SpriteShape::Streak { core, .. } => core * l.intensity,
+                    _ => 0.0,
+                };
+                let p = (peak(&l.color_over_life, l.intensity) * start.max(1.0)).max(core);
+                hottest = hottest.max(p);
+                let smoke = matches!(l.render.shape, SpriteShape::Smoke { .. })
+                    && (l.name.contains("smoke") || l.name.contains("puffs"));
+                assert!(!smoke || p < 1.0, "{} {}: smoke at {p}", fx.name, l.name);
+            }
+            for r in &fx.ribbons {
+                hottest = hottest.max(peak(&r.color_over_life, r.intensity));
+            }
+            for b in &fx.beams {
+                hottest = hottest.max(peak(&b.color, b.intensity));
+            }
+            assert!(hottest >= 4.0, "{}: hottest layer {hottest}", fx.name);
+        }
+    }
+
     #[test]
     fn registry_add_set_remove() {
         let mut fx = ParticleEffects::default();

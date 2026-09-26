@@ -136,7 +136,7 @@ fn by_distance_draws_back_to_front_per_view() {
                     "{backend:?}: spawn order should misorder ({bad} of {checked})"
                 );
             }
-            if backend == ParticleBackend::Gpu && sort == SortMode::ByDistance {
+            if stats(&app).backend == Some(ParticleBackend::Gpu) && sort == SortMode::ByDistance {
                 // A frame with a tick: simulate, mark, scatter, and a sort dispatch per view
                 // (128 keys each: one block).
                 app.step_ticks(1);
@@ -191,7 +191,7 @@ fn gpu_sort_of_large_groups() {
         };
         scene_of(&mut app, SortMode::ByDistance, 3000, 0.25);
         app.step_ticks(35);
-        if backend == ParticleBackend::Gpu {
+        if stats(&app).backend == Some(ParticleBackend::Gpu) {
             // Simulate, mark, scatter; two views of 4096 keys: 1 + (1 + 1) + (2 + 1) + (3 + 1)
             // dispatches each.
             assert_eq!(stats(&app).dispatches, 3 + 2 * 10, "{:?}", stats(&app));

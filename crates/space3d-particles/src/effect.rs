@@ -699,9 +699,14 @@ pub enum SpriteTarget {
     /// Scene color.
     #[default]
     Color,
-    /// The post distortion buffer (`DISTORTION_WGSL`); only post cameras show it.
+    /// The post group's distortion buffer (post's writer API, `DISTORTION_WGSL`): the layer
+    /// bends the image behind it instead of drawing light, seen only by cameras whose
+    /// `PostProcess` enables distortion. The shape gives the direction: `Ring` pushes the image
+    /// under its band outward (a shockwave), `Vortex` swirls it, a texture offsets it by its RG
+    /// channels (0.5 = none), the other shapes shimmer it like heat; the weight is the shape ×
+    /// the opacity over life × the near fade, faded against scene depth by `soft_distance`.
     Distortion {
-        /// Offset at full alpha, in view heights.
+        /// Offset at full weight, in view heights (0.01 = 1 % of the view's height).
         strength: f32,
     },
 }
@@ -884,7 +889,9 @@ pub enum SortMode {
     None,
     /// Emitters back to front.
     ByEmitter,
-    /// Particles back to front (GPU sort).
+    /// Particles back to front in every view: the layer's emitters draw as one group whose
+    /// particles are sorted by view depth (ties by instance order: deterministic) — on the CPU
+    /// for direct draws, with a bitonic sort on the GPU backend (groups of at most 65 536).
     ByDistance,
 }
 
