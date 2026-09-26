@@ -548,7 +548,7 @@ Dev machine (M4 Max, Metal), release, frames back to back; load averages 4–9. 
 | gate / measurement | measured | status |
 |---|---|---|
 | shadow 2048², 100k instanced casters ≤ 0.30 ms (`shadow` GPU scope; 100k cube entities — one instanced batch — on a 400 × 400 field, all inside the map, `ShadowFit::top_down`, PCF9; median of 120 frames) | **0.276 ms** (min 0.27, 3 runs) on `GpuMultiDraw` | met |
-| the same cubes from one explicit `InstanceBuffer<InstanceCompact>` (recorded) | 0.66 ms; its camera `scene` pass is slower by the same factor (0.94 vs 0.63 ms), with a matrix layout too (0.63 ms), on `CpuDirect` more so (1.46 ms) | recorded: explicit buffers draw about 2.4× slower than the ECS buffer in every pass, shadow or not — a finding for the instancing code, not the shadow |
+| the same cubes from one explicit `InstanceBuffer<InstanceCompact>` (recorded) | 0.66 ms; its camera `scene` pass is slower by the same factor (0.94 vs 0.63 ms), with a matrix layout too (0.63 ms), on `CpuDirect` more so (1.46 ms) | recorded at PM5; **not reproduced** at the M2 merge (explicit = ECS within noise, see "M2 merge" below): most likely measured under other GPU load |
 | forward full-screen lit pixels, all maps + IBL + PCF9 vs today's shader ≤ +0.20 ms (as in PM4, plus the sun's 2048² shadow with the 9-tap filter on every pixel) | `scene` 0.169 → 0.288 ms; median paired difference **+0.119 ms** (2 runs identical) | met (the first PCF version, a loop over dynamically indexed vectors, cost +0.24 ms; the unrolled kernels +0.03 ms over PM4) |
 | ECS 100k static PBR entities ≤ 2.5 ms (`materials/ecs_pbr/100k`) | 2.27 ms | met |
 | shadow view CPU at 100k ECS (`materials/shadow_view/ecs{,_off}/100k`: the render stage with and without the shadow, camera seeing 4.7k of 100k cubes) | `CpuDirect` 1.59 → 2.00 ms (**+0.40 ms**: the depth view culls every caster on the CPU like a camera); best path (`GpuMultiDraw`) 1.64 → 1.74 ms (**+0.10 ms**, no extra dispatch) | design budget +0.4 ms: met |
@@ -560,3 +560,29 @@ Dev machine (M4 Max, Metal), release, frames back to back; load averages 4–9. 
 Memory: a shadow map is `map_size²` × 4 B (`Depth32Float`): 16.8 MB at 2048², 4.2 MB at 1024²,
 plus one render pass per frame (≈ 2.8 MB of Metal driver memory per frame in flight, see "F7 /
 F8 and M1.1").
+
+### M2 merge — gates re-measured on the merged tree (post + materials + particles)
+
+Foundation maintainer, `graphics` after merging graphics-post, graphics-materials and
+graphics-particles (commits 8ae4b22, 4c54e68, f31dfe1). Dev machine (M4 Max, Metal), release,
+each gate run alone, but the GPU was shared: another app kept it at 72–78 % device utilization
+(`ioreg` "Device Utilization %") and the load average was 5–8.
+
+| gate (spec §4.4) | command | measured | result |
+|---|---|---|---|
+| shadow 2048², 100k instanced casters ≤ 0.30 ms | `--test shadows -- --ignored shadow_map_gate` | ECS 0.277 / 0.277 / 0.278 ms (3 runs, `GpuMultiDraw`) | met |
+| forward full screen, all maps + IBL + PCF9 ≤ +0.20 ms | `--test environment -- --ignored forward_full_screen_gate` | legacy 0.181 → 0.298 ms, paired +0.121 ms | met |
+| IBL bake ≤ 3 ms (1024² faces) | `--test environment -- --ignored ibl_bake_gate` | compute 0.98 ms (upload 0.32 + bake 0.66); fragment path 5.5 ms (recorded) | met |
+| all post ≤ 0.60 ms | `cargo bench -p space3d-render --bench post -- post/gate` | 0.405 ms over Direct (throughput) | met |
+| particles 100k: sim + compaction ≤ 0.06 ms, draw ≤ 0.40 ms | `-p space3d-particles --lib -- --ignored gpu_100k_within_budget` | 0.048 ms; 0.382 ms into the HDR scene texture | met |
+| bloom 6 levels at 1080p ≤ 0.20 ms | `--lib -- --ignored bloom_gate_1080p` | best 0.193 ms in the first invocation; 0.211 and 0.232 ms (best of 3 runs each) in the next two | soft: the test's own note says 30–70 % device utilization from other apps reads 0.19–0.30 ms; the lane measured 0.15–0.17 ms on an idle GPU |
+
+**Explicit instance buffers vs ECS** (PM5 recorded explicit buffers as 2.4× slower in every
+pass): not reproduced. The same 100k cubes from one `InstanceBuffer<InstanceCompact>`: shadow
+pass 0.275 ms vs ECS 0.277 ms on `GpuMultiDraw`, 0.324 vs 0.275 ms on `CpuDirect`; the camera's
+`scene` pass 0.46–0.51 ms for both, on both paths (3 runs each).
+
+Allocations per frame: every allocation test (`space3d-render` `alloc`, `alloc_frame`,
+`alloc_materials`, `alloc_post`; `space3d-particles` `alloc`; `space3d-core` `alloc_transforms`)
+passes its lane's bound on the merged tree, on Metal and on ANGLE (GL).
+

@@ -606,8 +606,8 @@ fn render_to_image_is_deterministic_with_all_features() {
 /// `shadow` pass (GPU timestamps) of 100 000 cube entities (one instanced batch) all inside the
 /// map (a 400 × 400 field under a top-down camera), with the default filter; median of 120
 /// frames rendered back to back. For the record, the same cubes from one explicit
-/// `InstanceBuffer<InstanceCompact>`: explicit buffers draw about 2.4× slower than the ECS
-/// buffer in every pass, the camera's too (docs/performance.md, P-MAT PM5/PM6).
+/// `InstanceBuffer<InstanceCompact>` (as fast as the ECS buffer on the merged M2 tree, 0.275 vs
+/// 0.277 ms; the 2.4× gap recorded at PM5 did not reproduce: docs/performance.md, "M2 merge").
 /// Needs `TIMESTAMP_QUERY`; run alone:
 /// `cargo test -p space3d-render --release --test shadows -- --ignored --nocapture shadow_map_gate`.
 #[test]

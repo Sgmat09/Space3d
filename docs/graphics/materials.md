@@ -391,8 +391,8 @@ the prewarm builds no pipeline for them (`prewarm_builds_what_materials_draw_wit
   the shadow 1/4/9/16 comparisons per lit pixel. A 1080p screen of mapped, IBL-lit, shadowed
   (PCF9) Standard pixels costs +0.12 ms of GPU over the legacy shader on the dev machine
   (`forward_full_screen_gate`, gate +0.20 ms). The shadow map of 100k cube entities costs
-  0.28 ms at 2048² (`shadow_map_gate`, gate 0.30 ms; explicit instance buffers draw slower, in
-  the camera pass too); the depth view adds 0.1 ms of CPU at 100k entities on GPU draw paths and
+  0.28 ms at 2048² (`shadow_map_gate`, gate 0.30 ms; the same cubes from an explicit instance
+  buffer cost the same); the depth view adds 0.1 ms of CPU at 100k entities on GPU draw paths and
   0.4 ms on `CpuDirect` (`materials/shadow_view/*`). A bake is one-time: 1024² LDR faces → 256² specular + 32² irradiance
   in about 1 ms of GPU on the dev machine with compute (`ibl_bake_gate`, gate ≤ 3 ms), a few ms
   with render passes (each pass has a fixed cost of tens of µs on Metal: 102 of them for this
