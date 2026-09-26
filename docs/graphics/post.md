@@ -376,7 +376,7 @@ Cost (Apple M4 Max, loaded, 1080p rect, `post::exposure::tests::exposure_gpu_tim
 0.008 ms of GPU, render passes 0.14 ms (mostly the passes' fixed overhead); spec §4.4 budgets
 0.05 ms on T1. Memory: E (4 bytes, two on the render-pass path) and a 16-byte state per camera,
 one shared 2 KiB histogram; the render-pass levels come from the frame's pool (1.05 MB of
-`Rgba16Float` at 1080p, shared by same-size groups). Uploads: the group's 80-byte parameters
+`Rgba16Float` at 1080p, shared by same-size groups, counted in `RenderStats::target_bytes`). Uploads: the group's 80-byte parameters
 when the settings or the rect change; per frame only the 16 bytes of adaptation factors when
 `dt` changes (never with a fixed tick rate) — the steady state creates, reallocates and uploads
 nothing (`auto_exposure_history_and_steady_state`, both paths).

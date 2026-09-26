@@ -30,6 +30,8 @@ struct Slot {
     state: Arc<AtomicU8>,
     /// Camera, exposure compensation (stops) and E format of each copy, in order.
     cameras: Vec<(Entity, f32, wgpu::TextureFormat)>,
+    /// Renderer frame the copies were recorded in.
+    frame: u64,
 }
 
 /// Ring of exposure readback buffers (see the module docs).
@@ -41,7 +43,7 @@ pub(crate) struct ExposureReadback {
     /// Cameras every slot holds room for.
     capacity: usize,
     /// Latest exposure (stops, compensation included) per camera, with the renderer frame it
-    /// was stored in.
+    /// comes from (slots can finish in any order: an older copy never replaces a newer value).
     values: FastMap<Entity, (f32, u64)>,
     tick: u64,
     /// Collections that grew (`RenderStats::cpu_reallocations`).
@@ -51,7 +53,6 @@ pub(crate) struct ExposureReadback {
 impl ExposureReadback {
     /// Read every copy the GPU has finished (never waits).
     pub fn collect(&mut self) {
-        let tick = self.tick;
         for s in &mut self.slots {
             match s.state.load(Ordering::Acquire) {
                 READY => {
@@ -65,8 +66,11 @@ impl ExposureReadback {
                                 }
                                 _ => f32::from_le_bytes([view[at], view[at + 1], view[at + 2], view[at + 3]]),
                             };
+                            if self.values.get(&camera).is_some_and(|(_, f)| *f > s.frame) {
+                                continue;
+                            }
                             let capacity = self.values.capacity();
-                            self.values.insert(camera, (ev + compensation, tick));
+                            self.values.insert(camera, (ev + compensation, s.frame));
                             self.reallocations += u32::from(self.values.capacity() != capacity);
                         }
                     }
@@ -113,6 +117,7 @@ impl ExposureReadback {
         }
         let s = &mut self.slots[i];
         s.cameras.clear();
+        s.frame = self.tick;
         s.state.store(PENDING, Ordering::Release);
         let state = s.state.clone();
         let buffer = s.buffer.as_ref().expect("just ensured");

@@ -244,6 +244,10 @@ pub(crate) struct Meters {
     created: u32,
     /// Renderer frames (eviction clock; never feeds pixels).
     tick: u64,
+    /// The pooled levels (generation, bytes) of the last `encode` on the render-pass path (for
+    /// `RenderStats::target_bytes`): the first `pooled_len`.
+    pooled: [(u64, u64); 8],
+    pooled_len: usize,
     /// Collections that grew (`RenderStats::cpu_reallocations`).
     pub reallocations: u32,
 }
@@ -263,6 +267,8 @@ impl Meters {
             generation: 0,
             created: 0,
             tick: 0,
+            pooled: [(0, 0); 8],
+            pooled_len: 0,
             reallocations: 0,
         }
     }
@@ -492,6 +498,7 @@ impl Meters {
         replay: bool,
     ) -> Option<(wgpu::TextureView, u64)> {
         let tick = self.tick;
+        self.pooled_len = 0;
         if replay {
             let s = self.cameras.get(&camera)?;
             return s.current().map(|t| (t.view.clone(), t.generation));
@@ -516,6 +523,8 @@ impl Meters {
             source_bgs,
             generation,
             created,
+            pooled,
+            pooled_len,
             ..
         } = self;
         let state = cameras.get_mut(&camera)?;
@@ -651,7 +660,11 @@ impl Meters {
                             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                         },
                     );
+                    // Rgba16Float: 8 bytes per texel (`RenderStats::target_bytes`).
+                    let bytes = 8 * size.0 as u64 * size.1 as u64;
+                    pooled[i] = (cx.pool.get(levels[i]).generation, bytes);
                 }
+                *pooled_len = n;
                 let previous = state.current;
                 let next = 1 - previous;
                 let prev_view = &state.textures[previous].as_ref()?.view;
@@ -728,6 +741,11 @@ impl Meters {
     pub(crate) fn texture(&self, camera: Entity) -> Option<(&wgpu::Texture, wgpu::TextureFormat)> {
         let s = self.cameras.get(&camera)?;
         s.current().map(|t| (&t.texture, s.format))
+    }
+
+    /// The pooled textures (generation, bytes) the last `encode` used.
+    pub(crate) fn pooled(&self) -> &[(u64, u64)] {
+        &self.pooled[..self.pooled_len]
     }
 
     /// Textures created since the last call.

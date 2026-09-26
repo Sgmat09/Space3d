@@ -1013,6 +1013,10 @@ impl PostState {
             let e = self
                 .meters
                 .encode(cx, input.camera, plan, scene, group.scene_rect, input.replay)?;
+            for i in 0..self.meters.pooled().len() {
+                let (generation, bytes) = self.meters.pooled()[i];
+                self.count_target(cx.stats, input.replay, generation, bytes);
+            }
             if self.read_exposure
                 && !input.replay
                 && let Some((texture, format)) = self.meters.texture(input.camera)
