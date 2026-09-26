@@ -2,12 +2,14 @@
 
 This is the contract of the graphics upgrade (normative spec: [`docs/design/graphics.md`](../design/graphics.md),
 §2 and §3.6). The public API of every area was frozen at milestone F2: every type, trait and
-function exists and compiles, with neutral stubs (`STUB(<owner>)` comments) where the owning area
-has not implemented the behaviour yet. Stubs never panic.
+function existed and compiled from then on, with neutral stubs (`STUB(<owner>)` comments, never
+panicking) until the owning area implemented it. Since M2 nothing is a stub any more: the tree
+has no `STUB(` marker, `todo!` or `unimplemented!` in `crates/` or `examples/`, and every area
+(frame, lighting, shadows, IBL, post, particles) runs.
 
 ## Semver policy (spec §2.7)
 
-Code written against Space3d a614a02 (what SpaceCorps2027 pins at its HEAD 25b240c; it pinned
+Code written against Space3d 80ab72b (what SpaceCorps2027 pins at its HEAD b120d9b; it pinned
 249c874 when the spec was written, and `api_compat_249c874.rs` keeps that name) keeps compiling
 and renders the same pixels by default — with up to 16 point lights. With more, each view is lit
 by the 16 nearest to its camera instead of the first 16 in query order (spec D19, §2.7): a scene
@@ -82,10 +84,11 @@ the game.
 | `lighting/api.rs` | P-MAT | cubemaps, `Skybox`, `EnvironmentLight`, `DirectionalShadow`, `LightingSettings` |
 | `post/api.rs` | P-POST | `PostProcess` and every post type, `DISTORTION_WGSL` |
 
-Crate-internal contracts between the frame and the areas (spec §2.6) have fixed signatures and
-stub bodies: `lighting::Lighting` (+ `DepthViewRequest`, `ViewResources`, `LightingPrepare`),
+Crate-internal contracts between the frame and the areas (spec §2.6) have fixed signatures:
+`lighting::Lighting` (+ `DepthViewRequest`, `ViewResources`, `LightingPrepare`),
 `post::PostState` (+ `PostGroupInput`, `PostGroupPlan`, `PostGroupNeeds`, `PostEncode`),
-`frame::extract::source_casts`, `frame::targets::TexturePool`.
+`frame::extract::source_casts`, `frame::targets::TexturePool`. They started as stubs at F2; all
+are implemented (lighting and shadows by P-MAT, post by P-POST, the rest by F).
 
 Additions made by the foundation since F2 (additive):
 

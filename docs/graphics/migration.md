@@ -7,9 +7,10 @@ shadow, the particle library (engines, lasers, explosions, shields, warps), dist
 post chain. Each step is independent and shippable on its own; the order below gives the biggest
 visual win first. The overview of every feature is [`../graphics.md`](../graphics.md).
 
-**Where the game is.** At its HEAD (199cd9a) the game pins Space3d `0463134` (graphics M1 and the
-keyboard-layout work on main) and has already done parts of this guide: the flight, backdrop,
-viewer and preview cameras have a `PostProcess` (`game/look.rs`: `KhronosPbrNeutral` over a
+**Where the game is.** At its HEAD (b120d9b) the game pins Space3d `80ab72b` (graphics M1 and
+main's keyboard-layout work up to the pinned fake layouts and the macOS ISO / JIS keys, plus the
+headless pacing; the graphics branch has merged all of it) and has already done parts of this
+guide: the flight, backdrop, viewer and preview cameras have a `PostProcess` (`game/look.rs`: `KhronosPbrNeutral` over a
 full-frame lift, `TONE_LIFT`, bloom, FXAA), the graphics-quality setting drives
 `FrameSettings::render_scale` (`ui/render_scale.rs` is gone), `game/additive.rs` draws in
 `OverlayStage::HdrScene`, the effects are particles (`game/fx.rs` with its own `.pfx.ron`
@@ -47,7 +48,7 @@ order (spec D19).
 ## 0. Update the engine
 
 ```toml
-# Cargo.toml (workspace): from rev 0463134 (M1) to the M2 merge
+# Cargo.toml (workspace): from rev 80ab72b (M1 + main) to the M2 merge
 space3d = { git = "https://github.com/SpaceCorps/Space3d", rev = "<graphics M2 merge>", default-features = false,
             features = ["render", "platform", "assets", "audio", "net", "ui", "github", "particles"] }
 ```
@@ -291,8 +292,11 @@ or build it from the six images the game already loads:
   sun ends up in the wrong place.
 * **What stays.** The nebula veils, star layers, planet, debris and grid are geometry in the scene
   (parallax): keep them. Remove the six `SkyFace` quads and the `SKYBOX_HALF` constraint on `FAR`.
-* **Memory.** An 8-bit 1024² sky is 25 MB with mips; the environment bake adds ~4 MB. The presets'
-  recommended face sizes: 512 (Low) / 1024 / 2048.
+* **Memory.** An 8-bit 1024² sky is 25 MB of faces and 33.5 MB with its mips (six faces × 1024²
+  × 4 B × 4/3); the environment bake adds about 4.2 MB, so one sector's sky costs about 38 MB
+  (`RenderStats::lighting_bytes`: 37.8 MB for the game's M-1 sky loaded from its `.skybox`
+  manifest). An `Rgba16Float` sky doubles the faces (67 MB at 1024²). The presets' recommended
+  face sizes: 512 (Low, 8.4 MB with mips) / 1024 / 2048.
 
 `Engine/Environment/Skybox`, `Engine/Environment/IBL Spheres`, `Engine/Showcase/*`.
 
@@ -334,7 +338,10 @@ from `prepare_scene`, no `1 − e^−x` soft clip outside Direct mode, `Rgba16Fl
 plus the engine render scale of step 2.
 
 **b) Replace the sprites with the particle library** (GPU simulated, 100k+, depth-tested, soft
-against hulls, lit flashes, distortion, deterministic on the fixed tick):
+against hulls, lit flashes, distortion, deterministic on the fixed tick). Written against the
+game's `fx::Effect` at b120d9b (`client/src/game/fx.rs`; the functions below compile in a module
+next to it, with `use super::fx::{self, Effect}` and `super::scene::AvatarIndex`); the game's own
+`fx::play` already does this with its own effects:
 
 ```rust
 use space3d::particles::prelude::*;
@@ -349,25 +356,35 @@ fn play(ctx: &mut SystemCtx, effect: fx::Effect) {
         Effect::Impact { at, dir, color } => {
             ctx.spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(at).facing(-dir).tint(color.extend(1.0)));
         }
-        Effect::ShieldHit { center, radius, dir, ship } => {
-            // World `center` and `dir` on a moving ship: `follow_world` converts them into the
-            // ship's space (plain `follow` takes the transform as local: at(center).follow(ship)
-            // would play at twice the ship's position, game#1).
-            ctx.spawn_effect(
-                builtin::SHIELD_RIPPLE,
-                EffectSpawn::at(center).facing(-dir).scale(radius / 20.0).follow_world(ship, &ctx.world),
-            );
+        Effect::ShieldHit { center, radius, dir, target } => {
+            // `target` is the ship's net id (0: none). World `center` and `dir` on a moving ship:
+            // `follow_world` converts them into the ship's space (plain `follow` takes the
+            // transform as local: at(center).follow(ship) would play at twice the ship's
+            // position, game#1).
+            let ship = (target != 0)
+                .then(|| ctx.resources.expect::<AvatarIndex>().by_id.get(&target).copied())
+                .flatten();
+            let spawn = EffectSpawn::at(center).facing(-dir).scale(radius / 20.0);
+            let spawn = match ship {
+                Some(ship) => spawn.follow_world(ship, ctx.world),
+                None => spawn,
+            };
+            ctx.spawn_effect(builtin::SHIELD_RIPPLE, spawn);
         }
         Effect::Warp { at, scale, arriving } => {
             let fx = if arriving { builtin::WARP_IN } else { builtin::WARP_OUT };
             ctx.spawn_effect(fx, EffectSpawn::at(at).scale(scale));
         }
-        Effect::Tracer { from, to, color } => {
-            // Hitscan lasers leave egui: a 0.12 s beam that despawns itself.
-            ctx.spawn_effect(builtin::LASER_SHOT, EffectSpawn::at(from).beam_to(BeamEnd::World(to)).tint(color.extend(1.0)));
+        Effect::Muzzle { at, dir, color } => {
+            // The game's own `spacecorps/muzzle` (`Effects::muzzle`); or a hit spark's flash.
+            ctx.spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(at).facing(dir).tint(color.extend(1.0)).scale(0.5));
         }
-        Effect::Muzzle { .. } => { /* the shot's beam starts with a flash */ }
     }
+}
+
+// Hitscan lasers (drawn with egui today): a 0.12 s beam that despawns itself.
+fn laser(ctx: &mut SystemCtx, from: Vec3, to: Vec3, color: Vec3) {
+    ctx.spawn_effect(builtin::LASER_SHOT, EffectSpawn::at(from).beam_to(BeamEnd::World(to)).tint(color.extend(1.0)));
 }
 
 // Engines: one looping emitter per nozzle, following the ship; throttle → rate, faction color → tint.
@@ -490,7 +507,7 @@ signatures, every node's pipelines (particles, sky) and the post pipelines.
 
 | | done when |
 |---|---|
-| 0 | the game builds against M2 (from rev 0463134) and looks the same |
+| 0 | the game builds against M2 (from rev 80ab72b) and looks the same |
 | 1 | done at M1 (`PostProcess` on every camera); M2: `KhronosPbrNeutralNoToe` replaces Neutral + `TONE_LIFT` (or AgX + `ColorGrading::vivid()`) |
 | 2 | Settings › Graphics drives `GraphicsQuality::apply` + `ParticleSettings::for_quality_on` (render scale done at M1); the grow-only budget workaround removed |
 | 3 | ship materials get their maps (`apply_material_maps`, emissive factor seeded where there is a map) and tangents; the maps are no longer discarded |

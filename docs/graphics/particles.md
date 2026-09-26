@@ -619,7 +619,15 @@ when run by tools):
   way the live particles are dropped (the GPU pool is not read back).
 * Budgets: `ParticleSettings::max_particles` (GPU: 262 144, 65 536 on Android and iOS, within
   the device's storage binding and buffer limits) and `max_particles_cpu` (16 384 native, 8 192
-  on the web). The tick system uses the budget of the backend the renderer resolves to. Each
+  on the web). The tick system uses the budget of the backend the renderer's device resolves
+  to, whether or not the renderer is in the world while the app ticks: a renderer held aside
+  (`TestApp`'s render-on-demand mode) leaves a `RendererDevice` resource, and the runtime keeps
+  the last device it saw; `DownlevelOverride::no_compute` resolves to the CPU backend with or
+  without one. Before any device is known (the web runner's frames while its renderer is
+  created) the budget is the smaller of the two, since rings keep the slots they reserved
+  (`tests/determinism.rs::the_budget_is_the_same_on_demand_and_every_tick`: render-every-tick
+  equals render-on-demand, spec §4.3; the Battle with `webgl2()` on demand used to reserve
+  165 971 slots against a budget of 16 384). Each
   layer instance reserves a ring sized from its rates, bursts and life (§5.1 of the area
   design); over the budget rings shrink to 1/8 before a layer instance is refused
   (`ParticleStats::{shrunk, refused}`, logged once per effect; a looping instance retries a
@@ -657,7 +665,11 @@ when run by tools):
   reserved: the simulated part of the pool), alive particles (CPU: this frame; GPU: read back from the draw
   arguments 1–3 frames late, `alive_frame` says which), ticks replayed, catch-up resets,
   compute dispatches, draw calls, `ribbon_segments` (ribbon and beam segments drawn), bytes
-  uploaded, `cpu_reallocations` (0 in the steady state).
+  uploaded, `cpu_reallocations` (0 in the steady state: the collections whose length the
+  effect instances, layer instances or ribbon tracks bound — free lists, the pool's free
+  ranges, finish events, the entity map, the CPU sort — grow with those tables, not at every
+  small new peak of a random load; `perf_graphics.rs::battle_steady_state_low_and_medium`, and
+  `battle_steady_state` on ANGLE).
   The frame's `RenderStats` counts the GPU backend's compute passes (`compute_passes`, reported
   with `PrepareContext::count_compute_passes`) and dispatches (`node_dispatches`).
 
