@@ -209,10 +209,20 @@ struct TexBind {
     group: wgpu::BindGroup,
 }
 
+/// Bytes between consecutive `size`-byte uniforms bound at dynamic offsets aligned to `align`.
+fn uniform_stride(size: usize, align: u64) -> u64 {
+    (size as u64).next_multiple_of(align.max(1))
+}
+
 /// GPU state of one renderer.
 struct Gpu {
     renderer: u64,
-    align: u64,
+    /// Bytes between two layers' draw parameters and between two views' flags: their size
+    /// rounded up to the dynamic offset alignment. The alignment alone is not enough: a
+    /// WebGL2 device may report 32 bytes (Chrome's ANGLE on Metal), less than the 112-byte
+    /// draw parameters, whose slots then overlapped and overran their buffer.
+    draw_stride: u64,
+    view_stride: u64,
     bind_layout: wgpu::BindGroupLayout,
     /// Pipeline layouts: untextured, with a `texture_2d`, with a `texture_2d_array` (group 3).
     pipeline_layouts: [wgpu::PipelineLayout; 3],
@@ -335,7 +345,8 @@ impl Gpu {
         });
         Self {
             renderer,
-            align,
+            draw_stride: uniform_stride(std::mem::size_of::<GpuDrawParams>(), align),
+            view_stride: uniform_stride(std::mem::size_of::<GpuParticleView>(), align),
             bind_layout,
             pipeline_layouts,
             tex_layouts,
@@ -1179,13 +1190,13 @@ impl ParticlesNode {
         }
 
         // Draw parameters, one aligned slot per render layer.
-        let align = gpu.align;
+        let (draw_stride, view_stride) = (gpu.draw_stride, gpu.view_stride);
         if gpu.draws_version != self.layers.version {
             let n = self.layers.params.len().max(1) as u64;
             if ensure_buffer(
                 device,
                 &mut gpu.draws,
-                n * align,
+                n * draw_stride,
                 wgpu::BufferUsages::UNIFORM,
                 "space3d particles draws",
             ) {
@@ -1195,7 +1206,8 @@ impl ParticlesNode {
             gpu.bytes.clear();
             for p in &self.layers.params {
                 gpu.bytes.extend_from_slice(bytemuck::bytes_of(p));
-                gpu.bytes.resize(gpu.bytes.len().next_multiple_of(align as usize), 0);
+                gpu.bytes
+                    .resize(gpu.bytes.len().next_multiple_of(draw_stride as usize), 0);
             }
             if let (Some((buffer, _)), false) = (&gpu.draws, gpu.bytes.is_empty()) {
                 ctx.upload(buffer, 0, &gpu.bytes);
@@ -1209,7 +1221,7 @@ impl ParticlesNode {
         if ensure_buffer(
             device,
             &mut gpu.views,
-            n * align,
+            n * view_stride,
             wgpu::BufferUsages::UNIFORM,
             "space3d particles views",
         ) {
@@ -1220,7 +1232,7 @@ impl ParticlesNode {
         if let Some((buffer, _)) = &gpu.views {
             for (i, u) in self.view_uniforms.iter().enumerate() {
                 if gpu.view_mirror.get(i) != Some(u) {
-                    ctx.upload(buffer, i as u64 * align, bytemuck::bytes_of(u));
+                    ctx.upload(buffer, i as u64 * view_stride, bytemuck::bytes_of(u));
                     bytes += std::mem::size_of::<GpuParticleView>() as u64;
                     if i < gpu.view_mirror.len() {
                         gpu.view_mirror[i] = *u;
@@ -1523,7 +1535,7 @@ impl ParticlesNode {
         let indirect = self.gpu_sim.as_ref().and_then(GpuSim::draw_buffers);
         pass.set_bind_group(0, view_bind_group, &[view_offset]);
         pass.set_bind_group(1, scene_bind_group, &[]);
-        let view_uniform = (list.uniform as u64 * gpu.align) as u32;
+        let view_uniform = (list.uniform as u64 * gpu.view_stride) as u32;
         let mut current: Option<usize> = None;
         let mut bound_tex: Option<TexKey> = None;
         for &i in &self.view_items[range] {
@@ -1559,7 +1571,11 @@ impl ParticlesNode {
             let Some(bind_group) = &gpu.bind_group else {
                 return;
             };
-            pass.set_bind_group(2, bind_group, &[view_uniform, (item.layer as u64 * gpu.align) as u32]);
+            pass.set_bind_group(
+                2,
+                bind_group,
+                &[view_uniform, (item.layer as u64 * gpu.draw_stride) as u32],
+            );
             match kind {
                 DrawKind::Strip => {
                     // Segment k: point k from slot 0, point k + 1 from slot 1.
@@ -1785,5 +1801,30 @@ mod tests {
         assert!(SLOTS_SOFT[0].reads.contains(SceneReads::DEPTH));
         assert!(!SLOTS_HARD[0].reads.contains(SceneReads::DEPTH));
         assert_eq!(SLOTS_SOFT[1].phase, RenderPhase::Distortion);
+    }
+
+    /// Per-layer draw parameters and per-view flags sit at dynamic offsets one stride apart:
+    /// their size rounded up to the device's uniform offset alignment. Chrome's WebGL2 on
+    /// ANGLE / Metal reports 32 bytes, less than the 112-byte draw parameters: with the
+    /// alignment as the stride the slots overlapped (every layer but the first drew with its
+    /// neighbours' parameters) and the upload overran the buffer (a validation error on the
+    /// graphics showcase's first frame: 9344 bytes into 4096).
+    #[test]
+    fn uniform_strides_hold_a_whole_slot() {
+        for align in [16u64, 32, 64, 128, 256] {
+            for size in [
+                std::mem::size_of::<GpuDrawParams>(),
+                std::mem::size_of::<GpuParticleView>(),
+            ] {
+                let stride = uniform_stride(size, align);
+                assert!(
+                    stride >= size as u64 && stride.is_multiple_of(align),
+                    "{size} B at {align}: {stride}"
+                );
+                assert!(stride < size as u64 + align, "tight: {size} B at {align}: {stride}");
+            }
+        }
+        assert_eq!(uniform_stride(std::mem::size_of::<GpuDrawParams>(), 32), 128);
+        assert_eq!(uniform_stride(std::mem::size_of::<GpuDrawParams>(), 256), 256);
     }
 }
