@@ -14,9 +14,16 @@
 //! The keyboard layout's OS table ([`crate::layout`]) is read on the event-loop thread at the
 //! first resume and on focus gain, and its id is re-checked at most once per second (cheap:
 //! no per-frame OS calls).
+//!
+//! Held mouse buttons are checked against the OS before each frame (macOS, Windows; one OS
+//! call per frame, none while no button is held): a button whose release event never arrived is
+//! released as a cancel once the OS has shown it up for a moment (`crate::os_buttons`). A focus
+//! loss or suspension releases every held key and button ([`Input::release_all`]; mouse buttons
+//! as cancels).
 
 use crate::input::{Input, KeyEvent, MouseButton, TouchPhase};
 use crate::layout::LayoutWatch;
+use crate::os_buttons::ButtonReconciler;
 use crate::window::{PlatformEvent, WindowPlugin, WindowState};
 use glam::{UVec2, Vec2};
 use space3d_core::{App, Events};
@@ -45,6 +52,7 @@ pub(crate) struct WinitRunner {
     applied_cursor: (bool, bool),
     surface_retry: SurfaceRetry,
     layout_watch: LayoutWatch,
+    buttons: ButtonReconciler,
     #[cfg(target_arch = "wasm32")]
     pending: std::rc::Rc<std::cell::RefCell<Option<Result<Renderer, space3d_render::RenderError>>>>,
 }
@@ -154,6 +162,7 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         applied_cursor: (true, false),
         surface_retry: SurfaceRetry::default(),
         layout_watch: LayoutWatch::default(),
+        buttons: ButtonReconciler::default(),
         #[cfg(target_arch = "wasm32")]
         pending: Default::default(),
     };
@@ -353,6 +362,9 @@ impl WinitRunner {
         self.last_frame = Some(now);
         self.recover_surface(now);
         self.poll_layout(now, false);
+        // Held buttons the OS has let go of without a release event (see `os_buttons`).
+        let input = self.app.resources.init::<Input>();
+        self.buttons.reconcile(input, now, crate::os_buttons::query);
         if let Some(w) = &self.window {
             w.pre_present_notify();
         }
