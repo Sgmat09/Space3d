@@ -48,8 +48,10 @@ const MAX_KEY_EVENTS: usize = 256;
 
 /// One keyboard event as the OS reported it: the physical key plus what it means on the
 /// player's keyboard layout. Recorded by the runner (and [`Input::inject_key_event`]) in
-/// [`Input::key_events`]; see [`crate::layout`] for physical vs logical keys.
+/// [`Input::key_events`]; see [`crate::layout`] for physical vs logical keys. Build one with
+/// [`KeyEvent::press`] / [`KeyEvent::release`] and the `with_*` methods.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyEvent {
     /// The physical key (its position; layout-independent). What [`Input::pressed`] and
     /// [`Binding::Key`] use.
@@ -571,20 +573,23 @@ impl Input {
 
     /// Learn what a pressed key types: the modifier-free key where the platform reports it,
     /// else the logical key when neither Shift nor Alt/AltGr/Option is held; plus the
-    /// shifted character when only Shift is held.
+    /// shifted character when only Shift is held. Caps Lock is undone for letters (the
+    /// logical key of the fallback is lowered, the shifted character raised).
     fn learn_label(&mut self, event: &KeyEvent) {
+        use crate::layout::{logical_key_label, shifted_case, unshifted_case};
         use KeyCode as K;
         let shift = self.any_pressed([K::ShiftLeft, K::ShiftRight]);
         let alt = self.any_pressed([K::AltLeft, K::AltRight]);
         let other = self.any_pressed([K::ControlLeft, K::ControlRight, K::SuperLeft, K::SuperRight]);
         let unshifted = match &event.key_without_modifiers {
-            Some(key) => crate::layout::logical_key_label(key),
-            None if !shift && !alt => crate::layout::logical_key_label(&event.logical_key),
+            Some(key) => logical_key_label(key),
+            None if !shift && !alt => logical_key_label(&event.logical_key).map(|s| unshifted_case(&s)),
             None => None,
         };
         let shifted = (shift && !alt && !other)
-            .then(|| crate::layout::logical_key_label(&event.logical_key))
-            .flatten();
+            .then(|| logical_key_label(&event.logical_key))
+            .flatten()
+            .map(|s| shifted_case(&s));
         self.layout
             .learn(event.physical, unshifted.as_deref(), shifted.as_deref());
     }
@@ -992,6 +997,29 @@ mod tests {
                 .with_text(None),
         );
         assert_eq!(i.key_label(KeyCode::BracketLeft).as_deref(), Some("^"));
+    }
+
+    #[test]
+    fn caps_lock_does_not_teach_upper_case_labels() {
+        let mut i = Input::default();
+        // Web/mobile (no modifier-free key), Caps Lock on: "A" is typed, "a" is the label.
+        i.inject_key_event(KeyEvent::press(KeyCode::KeyA, ch("A")).with_key_without_modifiers(None));
+        assert_eq!(i.text(), "A");
+        assert_eq!(i.key_label(KeyCode::KeyA).as_deref(), Some("a"));
+        assert_eq!(i.key_cap(KeyCode::KeyA), "A");
+        // AZERTY on the web, Caps Lock on: "É" on the digit row is still the "é" key.
+        i.inject_key_event(KeyEvent::press(KeyCode::Digit2, ch("É")).with_key_without_modifiers(None));
+        assert_eq!(i.key_label(KeyCode::Digit2).as_deref(), Some("é"));
+        // Windows/Linux/web, Caps Lock + Shift types "q": Shift's character is "Q".
+        i.inject_key_down(KeyCode::ShiftLeft);
+        i.inject_key_event(KeyEvent::press(KeyCode::KeyQ, ch("q")).with_logical_key(ch("q")));
+        let q = i.key_label_info(KeyCode::KeyQ).unwrap();
+        assert_eq!((q.text.as_str(), q.shifted.as_deref()), ("q", Some("Q")));
+        assert_eq!(i.key_cap(KeyCode::KeyQ), "Q");
+        // Desktop reports the modifier-free key: taken as is.
+        i.inject_key_up(KeyCode::ShiftLeft);
+        i.inject_key_event(KeyEvent::press(KeyCode::KeyW, ch("w")).with_logical_key(ch("W")));
+        assert_eq!(i.key_label(KeyCode::KeyW).as_deref(), Some("w"));
     }
 
     #[test]

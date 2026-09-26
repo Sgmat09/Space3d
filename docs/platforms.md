@@ -165,21 +165,51 @@ apps: `Ctrl/Cmd+Z/A/C/V/X` act on the keys labelled Z/A/C/V/X (on AZERTY, undo i
 QWERTY's W position). Layouts without Latin letters (Cyrillic, Greek, …) fall back to the
 physical key, so shortcuts still work in the QWERTY positions.
 
+Hotkeys read from egui follow the layout too: `i.key_pressed(egui::Key::M)` fires on the key
+*labelled* M — `KeyCode::Semicolon` on AZERTY, `KeyU` for `G` on Dvorak — where it used to fire
+on physical `KeyM`. Code that compares such a hotkey with physical-key bindings (skip the hotkey
+while an action is bound to the same key) must translate it first, or the two disagree on
+other layouts:
+
+```rust
+let input = ctx.resources.expect::<Input>();
+// The physical key egui reads as M right now (None: the key labelled M is not known yet).
+let m_key = space3d_ui::physical_key_for_egui_key(input, egui::Key::M);
+let m_free = m_key.is_none_or(|k| !bound_to_an_action(k));
+```
+
+Alternatively read position-based hotkeys from `Input::just_pressed(KeyCode::KeyM)` and show
+`Input::key_cap(KeyCode::KeyM)`.
+
 **Where labels come from.** Learned labels (from key events on the current layout) win over the
 OS table; the OS table is read by the window runner on the event-loop thread at start-up, on
 focus gain and when the layout id changes (checked at most once per second) — never per frame.
 
 | platform | OS table | layout switch detected | notes |
 |---|---|---|---|
-| macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate` | yes (input source id) | first query at start-up initializes Text Input Services (~35 ms, once); IMEs report the layout they type through |
+| macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate`, main thread only | yes (input source id, keyboard type) | first query at start-up initializes Text Input Services (~35 ms, once); IMEs report the layout they type through; ISO keyboards: see below |
 | Windows | `MapVirtualKeyExW` + `ToUnicodeEx` for the thread's `HKL` | yes (`HKL`) | |
 | Web | `navigator.keyboard.getLayoutMap()` (Chromium-based browsers), async | on focus | Firefox/Safari, or iframes without the `keyboard-map` permission: learned only; no shifted characters |
 | Linux X11/Wayland | none (no hard `libxkbcommon` dependency) | no | learned from winit's `key_without_modifiers` |
 | Android, iOS | none | no | learned from unmodified presses (Shift/Alt presses only teach the shifted character) |
 
-Limitations: without an OS table a character key has no label until the player presses it once;
-after an undetected layout switch the old learned labels stay until each key is pressed again;
-key-cap capitalization without a known shifted character is a heuristic (letter rows only).
+Limitations:
+
+* Without an OS table a character key has no label until the player presses it once; after an
+  undetected layout switch the old learned labels stay until each key is pressed again (a key
+  that types a new character forgets the shifted character learned on the old layout).
+* Key-cap capitalization without a known shifted character is a heuristic (letter rows only).
+* Caps Lock on the web and mobile: letters are learned in lower case (`"A"` → `"a"`), but where
+  Caps Lock also locks Shift on other keys (the digit row of Windows AZERTY) a press teaches the
+  shifted character until the key is pressed without Caps Lock.
+* macOS Text Input Sources are main-thread only (macOS 14+ aborts the process otherwise): the
+  runner reads them on the event-loop thread, and `Input::refresh_keyboard_layout` reads nothing
+  on other threads (headless tests on libtest threads use learned labels only).
+* macOS ISO keyboards (most European Macs): winit reports both the key left of `1` (`§` on US,
+  `@` on French, `^` on German Macs) and the key right of left Shift (`<`) as
+  `KeyCode::Backquote`, so a `Backquote` binding fires on either and `IntlBackslash` never
+  fires. `key_label(Backquote)` names the key left of `1` (the W3C `Backquote` position) and is
+  not learned from presses, which would flip it between the two keys.
 
 ## CI and releases
 

@@ -70,6 +70,11 @@ input.inject_key_event(KeyEvent::press(KeyCode::Digit2, LogicalKey::Character("Ã
 assert_eq!(input.key_cap(KeyCode::KeyW), "Z");     // learned from the event
 ```
 
+Tests on libtest threads never read the developer's own layout on macOS (Text Input Sources
+are main-thread only), so learned labels keep them deterministic. The OS tables themselves are
+tested on the main thread by `crates/space3d-platform/tests/os_layout.rs`, a custom harness
+(`harness = false`); it skips on macOS without a GUI login session.
+
 ## Golden screenshots
 
 ```rust

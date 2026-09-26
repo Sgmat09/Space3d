@@ -28,8 +28,12 @@
 //!
 //! Text and editing shortcuts follow the layout instead: the UI (egui) receives the logical
 //! key, so `Ctrl/Cmd+Z` undoes with the key *labelled* Z (physical `KeyW` on AZERTY), as in
-//! native apps. Games with letter-mnemonic commands ("I" for inventory) can match
-//! [`Input::logical_key`](crate::Input::logical_key) instead of the physical key.
+//! native apps, and an egui hotkey read (`key_pressed(egui::Key::M)`) fires on the key
+//! labelled M (`KeyCode::Semicolon` on AZERTY). Code that relates such reads to physical
+//! bindings (e.g. "is this key already bound?") must translate them first
+//! (`space3d_ui::physical_key_for_egui_key`). Games with letter-mnemonic commands ("I" for
+//! inventory) can match [`Input::logical_key`](crate::Input::logical_key) instead of the
+//! physical key.
 //!
 //! # Key labels
 //!
@@ -50,20 +54,32 @@
 //!
 //! | platform | OS table | layout changes |
 //! |---|---|---|
-//! | macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate` | polled once per second and on focus (input source id) |
+//! | macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate` (main thread) | polled once per second and on focus (input source id, keyboard type) |
 //! | Windows | `MapVirtualKeyExW` + `ToUnicodeEx` for the thread's `HKL` | polled once per second and on focus (`HKL`) |
 //! | Web | `navigator.keyboard.getLayoutMap()` (Chromium-based browsers; async) | re-read on focus |
 //! | Linux (X11/Wayland) | none: learned only (winit reports `key_without_modifiers`) | learned labels update on the next press |
 //! | Android, iOS | none: learned only (logical key of unmodified presses) | learned labels update on the next press |
 //!
-//! Limitations: learned labels only exist for keys pressed at least once; a layout switch that
-//! the platform cannot report (Linux, mobile, Firefox/Safari) keeps the previous learned labels
-//! until each key is pressed again; the first OS query on macOS initializes the Text Input
-//! Services (tens of ms, once, at start-up); input methods (IME) report the layout they type
-//! through (e.g. romaji for Japanese).
+//! Limitations:
+//!
+//! * learned labels only exist for keys pressed at least once; after a layout switch that the
+//!   platform cannot report (Linux, mobile, Firefox/Safari) the previous learned labels stay
+//!   until each key is pressed again (a key that types a new character forgets its old shifted
+//!   one);
+//! * without a modifier-free key (web, mobile), Caps Lock is undone for letters (`"A"` is
+//!   learned as `"a"`), but where Caps Lock locks Shift on other keys (the digit row of Windows
+//!   AZERTY) such a press teaches the shifted character until the key is pressed without it;
+//! * macOS reads Text Input Sources on the main thread only (macOS 14+ aborts the process on
+//!   other threads): [`KeyboardLayout::refresh_from_os`] reads nothing elsewhere. The first
+//!   query initializes the Text Input Services (tens of ms, once, at start-up);
+//! * macOS ISO keyboards (most European Macs): winit reports both the key left of `1` (`§`,
+//!   `@`, `^`) and the key right of left Shift (`<`) as [`KeyCode::Backquote`] (never
+//!   `IntlBackslash`), so a `Backquote` binding fires on either. Its label is the key left of
+//!   `1` (the W3C `Backquote` position), from the OS table, and is not learned from presses;
+//! * input methods (IME) report the layout they type through (e.g. romaji for Japanese).
 
 use crate::input::KeyCode;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use winit::keyboard::{Key as LogicalKey, KeyLocation, NamedKey};
 
@@ -274,6 +290,7 @@ pub fn english_key_name(key: KeyCode) -> Option<&'static str> {
 
 /// Where a [`KeyLabel`] came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum KeyLabelSource {
     /// The operating system's table of the current layout (macOS, Windows, Chromium).
     Os,
@@ -285,6 +302,7 @@ pub enum KeyLabelSource {
 
 /// What a physical key prints on the current keyboard layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyLabel {
     /// The physical key.
     pub key: KeyCode,
@@ -298,6 +316,16 @@ pub struct KeyLabel {
 }
 
 impl KeyLabel {
+    /// A label (custom platforms, tests): `key` types `text`, and `shifted` with Shift.
+    pub fn new(key: KeyCode, text: impl Into<String>, shifted: Option<String>, source: KeyLabelSource) -> Self {
+        Self {
+            key,
+            text: text.into(),
+            shifted,
+            source,
+        }
+    }
+
     /// Text for a key cap: letters upper-cased as keyboards print them (`"Q"`), everything
     /// else as typed (`"é"`, `"-"`, `"Space"`). A letter is upper-cased when Shift is known to
     /// type its upper case, or — when the shifted character is unknown — on the letter rows
@@ -339,7 +367,15 @@ struct Learned {
 #[derive(Clone, Debug, Default)]
 pub struct KeyboardLayout {
     os_id: Option<String>,
+    /// What the platform's layout check returned when the OS table was read (layout id, plus
+    /// the keyboard type on macOS); `refresh_from_os` re-reads the table when it changes.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    os_check: Option<String>,
     os: HashMap<KeyCode, (String, Option<String>)>,
+    /// Keys that stand for more than one physical key on this keyboard (macOS ISO keyboards:
+    /// `Backquote`). Their label comes from the OS table only: learning would flip it between
+    /// the keys.
+    ambiguous: HashSet<KeyCode>,
     learned: HashMap<KeyCode, Learned>,
     generation: u64,
 }
@@ -373,25 +409,34 @@ impl KeyboardLayout {
     }
 
     /// Record what `key` typed: `unshifted` without modifiers, `shifted` with Shift only.
-    /// Ignored for keys that are not [`writing_system_keys`] and for text that is not a
-    /// printable label (control characters, private-use glyphs). Returns whether a label
-    /// changed.
+    /// Ignored for keys that are not [`writing_system_keys`], for text that is not a printable
+    /// label (control characters, private-use glyphs) and for keys the OS table marks as
+    /// standing for several physical keys (macOS ISO `Backquote`). A new character that
+    /// replaces a different learned one means the layout changed, so the other half learned
+    /// on the old layout is dropped unless given too. Returns whether a label changed.
     pub fn learn(&mut self, key: KeyCode, unshifted: Option<&str>, shifted: Option<&str>) -> bool {
-        if !is_writing_system_key(key) {
+        if !is_writing_system_key(key) || (self.ambiguous.contains(&key) && self.os.contains_key(&key)) {
             return false;
         }
         let unshifted = unshifted.and_then(normalize_label);
         let shifted = shifted.and_then(normalize_label);
-        if unshifted.is_none() && shifted.is_none() {
+        let (has_unshifted, has_shifted) = (unshifted.is_some(), shifted.is_some());
+        if !has_unshifted && !has_shifted {
             return false;
         }
         let entry = self.learned.entry(key).or_default();
         let before = entry.clone();
-        if unshifted.is_some() {
-            entry.unshifted = unshifted;
+        if let Some(text) = unshifted {
+            if !has_shifted && entry.unshifted.as_ref().is_some_and(|old| *old != text) {
+                entry.shifted = None;
+            }
+            entry.unshifted = Some(text);
         }
-        if shifted.is_some() {
-            entry.shifted = shifted;
+        if let Some(text) = shifted {
+            if !has_unshifted && entry.shifted.as_ref().is_some_and(|old| *old != text) {
+                entry.unshifted = None;
+            }
+            entry.shifted = Some(text);
         }
         let changed = *entry != before;
         if changed {
@@ -410,6 +455,17 @@ impl KeyboardLayout {
         id: Option<String>,
         labels: impl IntoIterator<Item = (KeyCode, String, Option<String>)>,
     ) -> bool {
+        self.os_check = None;
+        self.set_os_table(id, labels, [])
+    }
+
+    /// [`Self::set_os_layout`] plus the keys that stand for several physical keys.
+    fn set_os_table(
+        &mut self,
+        id: Option<String>,
+        labels: impl IntoIterator<Item = (KeyCode, String, Option<String>)>,
+        ambiguous: impl IntoIterator<Item = KeyCode>,
+    ) -> bool {
         let mut table = HashMap::new();
         for (key, unshifted, shifted) in labels {
             if !is_writing_system_key(key) {
@@ -419,11 +475,13 @@ impl KeyboardLayout {
                 table.insert(key, (text, shifted.as_deref().and_then(normalize_label)));
             }
         }
-        if id == self.os_id && table == self.os {
+        let ambiguous: HashSet<KeyCode> = ambiguous.into_iter().collect();
+        if id == self.os_id && table == self.os && ambiguous == self.ambiguous {
             return false;
         }
         self.os_id = id;
         self.os = table;
+        self.ambiguous = ambiguous;
         self.learned.clear();
         self.generation += 1;
         true
@@ -431,9 +489,11 @@ impl KeyboardLayout {
 
     /// Forget the OS table (labels fall back to learned ones).
     pub fn clear_os_layout(&mut self) {
-        if self.os_id.is_some() || !self.os.is_empty() {
+        self.os_check = None;
+        if self.os_id.is_some() || !self.os.is_empty() || !self.ambiguous.is_empty() {
             self.os_id = None;
             self.os.clear();
+            self.ambiguous.clear();
             self.generation += 1;
         }
     }
@@ -464,18 +524,19 @@ impl KeyboardLayout {
 
     /// Re-read the OS table if the platform has one and the layout changed (or none is
     /// loaded). Synchronous on macOS and Windows — call it on the main (event loop) thread,
-    /// as the window runner does; on the web it applies the result of the previous request
-    /// and starts a new asynchronous one; elsewhere it does nothing. Returns whether the
-    /// labels changed.
+    /// as the window runner does; on macOS it reads nothing off the main thread (Text Input
+    /// Sources are main-thread only: macOS 14+ aborts the process otherwise). On the web it
+    /// applies the result of the previous request and starts a new asynchronous one;
+    /// elsewhere it does nothing. Returns whether the labels changed.
     pub fn refresh_from_os(&mut self) -> bool {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            let id = os::current_layout_id();
-            if id.is_some() && self.has_os_layout() && id.as_deref() == self.os_layout_id() {
+            let check = os::layout_check();
+            if check.is_some() && self.has_os_layout() && check == self.os_check {
                 return false;
             }
             match os::read_layout() {
-                Some(layout) => self.set_os_layout(layout.id, layout.keys),
+                Some(layout) => self.apply_os_layout(layout),
                 None => false,
             }
         }
@@ -491,9 +552,19 @@ impl KeyboardLayout {
         }
     }
 
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows", target_arch = "wasm32")),
+        allow(dead_code)
+    )]
+    fn apply_os_layout(&mut self, layout: OsLayout) -> bool {
+        let changed = self.set_os_table(layout.id, layout.keys, layout.ambiguous);
+        self.os_check = layout.check;
+        changed
+    }
+
     #[cfg(target_arch = "wasm32")]
     fn apply_web_result(&mut self) -> bool {
-        web::take().is_some_and(|layout| self.set_os_layout(layout.id, layout.keys))
+        web::take().is_some_and(|layout| self.apply_os_layout(layout))
     }
 }
 
@@ -504,7 +575,23 @@ impl KeyboardLayout {
 )]
 pub(crate) struct OsLayout {
     pub id: Option<String>,
+    /// The platform's layout check at the time of reading (see `KeyboardLayout::os_check`).
+    pub check: Option<String>,
     pub keys: Vec<(KeyCode, String, Option<String>)>,
+    /// Keys that stand for several physical keys on this keyboard.
+    pub ambiguous: Vec<KeyCode>,
+}
+
+/// Test support (macOS; call on the main thread): the OS table of the installed layout `id`
+/// (e.g. `"com.apple.keylayout.French"`) without selecting it, as read for keyboard type
+/// `keyboard_type` (`None`: the current keyboard's). Not a stable API.
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+pub fn __installed_macos_layout(id: &str, keyboard_type: Option<u8>) -> Option<KeyboardLayout> {
+    let layout = macos::read_installed(id, keyboard_type)?;
+    let mut labels = KeyboardLayout::default();
+    labels.apply_os_layout(layout);
+    Some(labels)
 }
 
 #[cfg(target_os = "macos")]
@@ -558,6 +645,48 @@ pub(crate) fn normalize_label(s: &str) -> Option<String> {
     };
     let ok = !s.is_empty() && s.chars().all(|c| !c.is_control() && !private_use(c));
     ok.then(|| s.to_owned())
+}
+
+/// `s` in the other case when it is one cased letter that round-trips (`"A"` ↔ `"a"`; not
+/// `"µ"`, `"ß"`, `"ı"`), else unchanged. `upper`: to upper case.
+fn letter_case(s: &str, upper: bool) -> String {
+    fn one(s: String) -> Option<char> {
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        }
+    }
+    let convert = |c: char, upper: bool| -> String {
+        if upper {
+            c.to_uppercase().collect()
+        } else {
+            c.to_lowercase().collect()
+        }
+    };
+    let Some(c) = one(s.to_owned()) else {
+        return s.to_owned();
+    };
+    let in_other_case = if upper { c.is_lowercase() } else { c.is_uppercase() };
+    if !in_other_case {
+        return s.to_owned();
+    }
+    match one(convert(c, upper)) {
+        Some(other) if one(convert(other, !upper)) == Some(c) => other.to_string(),
+        _ => s.to_owned(),
+    }
+}
+
+/// An unshifted label seen through Caps Lock (web and mobile report no modifier-free key):
+/// unshifted letters are lower case, so an upper-case letter is lowered.
+pub(crate) fn unshifted_case(s: &str) -> String {
+    letter_case(s, false)
+}
+
+/// A shifted label seen through Caps Lock (Shift + Caps Lock types lower case on Windows,
+/// Linux and the web): Shift types upper-case letters, so a lower-case letter is raised.
+pub(crate) fn shifted_case(s: &str) -> String {
+    letter_case(s, true)
 }
 
 /// Runner hook: keeps [`KeyboardLayout`]'s OS table current without per-frame OS calls.
@@ -674,12 +803,101 @@ mod tests {
     }
 
     #[test]
+    fn a_new_character_drops_the_other_half_learned_on_the_old_layout() {
+        let mut l = KeyboardLayout::default();
+        // QWERTY: "a" / "A".
+        assert!(l.learn(KeyCode::KeyA, Some("a"), Some("A")));
+        // Undetected switch to AZERTY (Linux, Firefox, mobile), unshifted press only.
+        assert!(l.learn(KeyCode::KeyA, Some("q"), None));
+        let a = l.label(KeyCode::KeyA).unwrap();
+        assert_eq!(
+            (a.text.as_str(), a.shifted.as_deref()),
+            ("q", None),
+            "stale \"A\" dropped"
+        );
+        assert_eq!(a.cap(), "Q");
+        assert!(l.learn(KeyCode::KeyA, None, Some("Q")));
+        assert_eq!(l.label(KeyCode::KeyA).unwrap().shifted.as_deref(), Some("Q"));
+        // The same character again keeps the other half.
+        assert!(!l.learn(KeyCode::KeyA, Some("q"), None));
+        assert_eq!(l.label(KeyCode::KeyA).unwrap().shifted.as_deref(), Some("Q"));
+        // Web/mobile back on QWERTY, shifted press first: the old unshifted "q" is dropped.
+        assert!(l.learn(KeyCode::KeyA, None, Some("A")));
+        assert_eq!(l.label(KeyCode::KeyA), None, "unshifted unknown again");
+        assert!(l.learn(KeyCode::KeyA, Some("a"), None));
+        let a = l.label(KeyCode::KeyA).unwrap();
+        assert_eq!(
+            (a.text.as_str(), a.shifted.as_deref()),
+            ("a", Some("A")),
+            "first unshifted keeps shifted"
+        );
+    }
+
+    #[test]
+    fn ambiguous_keys_keep_their_os_label() {
+        let mut l = KeyboardLayout::default();
+        // macOS ISO French: Backquote is both the key left of 1 ("@") and right of Shift ("<").
+        assert!(l.set_os_table(
+            Some("fr".into()),
+            [
+                (KeyCode::Backquote, "@".into(), Some("#".into())),
+                (KeyCode::KeyA, "q".into(), Some("Q".into())),
+            ],
+            [KeyCode::Backquote],
+        ));
+        let g = l.generation();
+        assert!(!l.learn(KeyCode::Backquote, Some("<"), Some(">")));
+        assert_eq!(l.generation(), g);
+        let b = l.label(KeyCode::Backquote).unwrap();
+        assert_eq!((b.text.as_str(), b.source), ("@", KeyLabelSource::Os));
+        assert!(l.learn(KeyCode::KeyA, Some("a"), None), "other keys still learn");
+        // Same table, other keyboard type (ANSI): no longer ambiguous, labels change.
+        assert!(l.set_os_table(
+            Some("fr".into()),
+            [
+                (KeyCode::Backquote, "<".into(), Some(">".into())),
+                (KeyCode::KeyA, "q".into(), Some("Q".into())),
+            ],
+            [],
+        ));
+        assert!(l.learn(KeyCode::Backquote, Some("x"), None));
+        // A table set through the public API (custom platforms) has no ambiguous keys.
+        l.set_os_layout(Some("fr".into()), [(KeyCode::Backquote, "@".into(), None)]);
+        assert!(l.learn(KeyCode::Backquote, Some("<"), None));
+        // Clearing the table forgets the ambiguity with it.
+        l.set_os_table(
+            Some("fr".into()),
+            [(KeyCode::Backquote, "@".into(), None)],
+            [KeyCode::Backquote],
+        );
+        l.clear_os_layout();
+        assert!(l.learn(KeyCode::Backquote, Some("<"), None), "no OS table: learned");
+    }
+
+    #[test]
+    fn caps_lock_case_is_undone_for_letters_only() {
+        assert_eq!(unshifted_case("A"), "a");
+        assert_eq!(unshifted_case("É"), "é");
+        assert_eq!(unshifted_case("Я"), "я");
+        assert_eq!(unshifted_case("a"), "a");
+        assert_eq!(unshifted_case("2"), "2");
+        assert_eq!(unshifted_case("AB"), "AB", "not one letter");
+        assert_eq!(shifted_case("a"), "A");
+        assert_eq!(shifted_case("ö"), "Ö");
+        assert_eq!(
+            shifted_case("µ"),
+            "µ",
+            "micro sign (AZERTY Shift+*) has no own upper case"
+        );
+        assert_eq!(shifted_case("ß"), "ß", "upper case is two letters");
+        assert_eq!(shifted_case("ı"), "ı", "dotless i does not round-trip");
+        assert_eq!(shifted_case("?"), "?");
+    }
+
+    #[test]
     fn key_caps() {
-        let label = |key, text: &str, shifted: Option<&str>| KeyLabel {
-            key,
-            text: text.into(),
-            shifted: shifted.map(Into::into),
-            source: KeyLabelSource::Learned,
+        let label = |key, text: &str, shifted: Option<&str>| {
+            KeyLabel::new(key, text, shifted.map(Into::into), KeyLabelSource::Learned)
         };
         assert_eq!(label(KeyCode::KeyA, "q", None).cap(), "Q");
         assert_eq!(label(KeyCode::KeyA, "q", Some("Q")).cap(), "Q");
@@ -689,12 +907,9 @@ mod tests {
         assert_eq!(label(KeyCode::Minus, "ß", Some("?")).cap(), "ß");
         assert_eq!(label(KeyCode::KeyZ, "я", None).cap(), "Я", "Cyrillic");
         assert_eq!(label(KeyCode::Comma, ",", None).cap(), ",");
-        let named = KeyLabel {
-            key: KeyCode::Space,
-            text: "Space".into(),
-            shifted: None,
-            source: KeyLabelSource::Named,
-        };
-        assert_eq!(named.cap(), "Space");
+        assert_eq!(
+            KeyLabel::new(KeyCode::Space, "Space", None, KeyLabelSource::Named).cap(),
+            "Space"
+        );
     }
 }

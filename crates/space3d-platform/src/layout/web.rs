@@ -74,5 +74,10 @@ async fn fetch() -> Result<Option<OsLayout>, JsValue> {
             keys.push((code, text, None));
         }
     }
-    Ok(Some(OsLayout { id: None, keys }))
+    Ok(Some(OsLayout {
+        id: None,
+        check: None,
+        keys,
+        ambiguous: Vec::new(),
+    }))
 }

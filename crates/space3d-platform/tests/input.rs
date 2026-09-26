@@ -225,33 +225,3 @@ fn a_new_os_layout_replaces_learned_labels() {
     assert_eq!(input.key_label(KeyCode::KeyA).as_deref(), Some("a"));
     assert_eq!(input.key_label_info(KeyCode::KeyA).unwrap().source, KeyLabelSource::Os);
 }
-
-#[test]
-fn os_keyboard_layout_labels_key_a_on_macos() {
-    if !cfg!(target_os = "macos") {
-        eprintln!("skipping: the OS keyboard layout table is tested on macOS");
-        return;
-    }
-    let mut input = Input::default();
-    assert!(input.refresh_keyboard_layout(), "layout table read from the OS");
-    let id = input
-        .keyboard_layout()
-        .os_layout_id()
-        .expect("input source id")
-        .to_owned();
-    let label = input.key_label_info(KeyCode::KeyA).expect("KeyA labelled");
-    assert_eq!(label.source, KeyLabelSource::Os);
-    assert!(!label.text.is_empty());
-    assert!(!input.key_cap(KeyCode::KeyA).is_empty());
-    eprintln!(
-        "layout {id}: KeyA = {:?} (shifted {:?}), KeyQ = {:?}, KeyZ = {:?}, Digit2 = {:?}",
-        label.text,
-        label.shifted,
-        input.key_label(KeyCode::KeyQ),
-        input.key_label(KeyCode::KeyZ),
-        input.key_label(KeyCode::Digit2),
-    );
-    let count = writing_system_keys().filter(|&k| input.key_label(k).is_some()).count();
-    assert!(count >= 40, "most writing-system keys labelled ({count})");
-    assert!(!input.refresh_keyboard_layout(), "same layout: table not re-read");
-}

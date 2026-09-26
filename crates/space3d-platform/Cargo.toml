@@ -33,5 +33,11 @@ windows-sys = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse"]
 image.workspace = true
 space3d-tasks.workspace = true
 
+# OS keyboard-layout tables, read on the main thread (macOS Text Input Sources are
+# main-thread only; libtest runs tests on worker threads).
+[[test]]
+name = "os_layout"
+harness = false
+
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-native-activity"] }

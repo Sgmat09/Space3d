@@ -11,7 +11,9 @@
 //! has no egui equivalent (non-Latin layouts, AZERTY's digit row) or no logical key was
 //! recorded (legacy `inject_key_*` events), the physical key is used for both — so `Ctrl/Cmd+Z`
 //! undoes with the key labelled Z (physical `KeyW` on AZERTY), and on a Cyrillic layout with the
-//! key in Z's position. A key's release reuses the egui key of its press.
+//! key in Z's position. A key's release reuses the egui key of its press. Hotkeys read from
+//! egui (`key_pressed(egui::Key::M)`) therefore fire on the key labelled M; to compare them
+//! with physical-key bindings, translate with [`physical_key_for_egui_key`].
 //!
 //! `Input` drops the OS's key repeats (a held key is simply "pressed"), but egui text fields
 //! only act on key *presses*, so held editing/navigation keys ([`REPEAT_KEYS`]: Backspace,
@@ -20,7 +22,7 @@
 //! deterministic under `App::step_ticks`.
 
 use space3d_core::glam::Vec2;
-use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton, NamedKey};
+use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton, NamedKey, is_writing_system_key, writing_system_keys};
 
 /// Map a logical (layout) key to an egui key — the mapping egui-winit uses: characters by
 /// [`egui::Key::from_name`] (`"z"` → `Z`, `"?"` → `Questionmark`), named keys (Enter, arrows,
@@ -111,6 +113,27 @@ fn press_key(input: &Input, code: KeyCode) -> Option<egui::Key> {
             egui_logical_key(&e.logical_key).or_else(|| e.key_without_modifiers.as_ref().and_then(egui_logical_key))
         })
         .or_else(|| egui_key(code))
+}
+
+/// The physical key that sends `key` to egui on the player's current layout when pressed
+/// without modifiers — the inverse of the translation above. Relates egui key reads
+/// (`i.key_pressed(egui::Key::M)`) to physical-key bindings ([`space3d_platform::Binding::Key`],
+/// [`Input::pressed`]): on AZERTY egui's `M` is `KeyCode::Semicolon`, on Dvorak `G` is
+/// `KeyCode::KeyU`, on QWERTY and QWERTZ it is `KeyCode::KeyM`.
+///
+/// It is the writing-system key whose layout label ([`Input::key_label`]) egui reads as
+/// `key`; else the physical key [`egui_key`] maps to `key`, unless the layout makes that key
+/// send another egui key (a label egui has no key for, such as Cyrillic `я` in Z's position,
+/// still sends the physical key's). `None` when the layout moved `key` to a position whose
+/// label is still unknown (no OS table, key not pressed yet), or no key sends it.
+pub fn physical_key_for_egui_key(input: &Input, key: egui::Key) -> Option<KeyCode> {
+    let sends = |label: String| egui_logical_key(&LogicalKey::Character(label.into()));
+    if let Some(code) = writing_system_keys().find(|&k| input.key_label(k).and_then(sends) == Some(key)) {
+        return Some(code);
+    }
+    KEYS.iter().copied().find(|&code| {
+        egui_key(code) == Some(key) && (!is_writing_system_key(code) || input.key_label(code).and_then(sends).is_none())
+    })
 }
 
 /// Map a physical key to the egui key it produces (US layout for punctuation).
@@ -843,6 +866,80 @@ mod tests {
         input.inject_key_tap_logical(KeyCode::KeyX, ch("x"));
         let ev = translate_frame(&mut t, &mut input, "");
         assert!(ev.contains(&egui::Event::Copy) && ev.contains(&egui::Event::Cut));
+    }
+
+    #[test]
+    fn physical_key_for_egui_key_inverts_the_translation() {
+        use egui::Key as E;
+        type Layout = &'static [(KeyCode, &'static str)];
+        type Expected = &'static [(E, Option<KeyCode>)];
+        // (layout, keys taught, egui key → expected physical key)
+        let cases: [(&str, Layout, Expected); 6] = [
+            (
+                "unknown (US assumed)",
+                &[],
+                &[(E::M, Some(KeyCode::KeyM)), (E::G, Some(KeyCode::KeyG))],
+            ),
+            (
+                "AZERTY",
+                &[(KeyCode::Semicolon, "m"), (KeyCode::KeyM, ","), (KeyCode::KeyW, "z")],
+                &[
+                    (E::M, Some(KeyCode::Semicolon)),
+                    (E::Comma, Some(KeyCode::KeyM)),
+                    (E::Z, Some(KeyCode::KeyW)),
+                    (E::L, Some(KeyCode::KeyL)),
+                ],
+            ),
+            (
+                "AZERTY, M's position not seen yet",
+                &[(KeyCode::KeyM, ",")],
+                &[(E::M, None)],
+            ),
+            (
+                "Dvorak",
+                &[
+                    (KeyCode::KeyU, "g"),
+                    (KeyCode::KeyP, "l"),
+                    (KeyCode::KeyG, "i"),
+                    (KeyCode::KeyL, "n"),
+                ],
+                &[(E::G, Some(KeyCode::KeyU)), (E::L, Some(KeyCode::KeyP))],
+            ),
+            (
+                "Cyrillic",
+                &[(KeyCode::KeyM, "ь"), (KeyCode::KeyZ, "я")],
+                &[(E::M, Some(KeyCode::KeyM)), (E::Z, Some(KeyCode::KeyZ))],
+            ),
+            (
+                "named keys",
+                &[],
+                &[
+                    (E::Enter, Some(KeyCode::Enter)),
+                    (E::Escape, Some(KeyCode::Escape)),
+                    (E::F1, Some(KeyCode::F1)),
+                ],
+            ),
+        ];
+        for (name, taught, expected) in cases {
+            let mut input = Input::default();
+            for &(code, c) in taught {
+                input.inject_key_tap_logical(code, ch(c));
+            }
+            input.end_frame();
+            for &(key, want) in expected {
+                assert_eq!(physical_key_for_egui_key(&input, key), want, "{name}: {key:?}");
+                // Pressing that key sends `key` to egui.
+                let Some(code) = want else { continue };
+                let label = input.key_label(code).filter(|_| is_writing_system_key(code));
+                let mut t = InputTranslator::default();
+                match label {
+                    Some(l) => input.inject_key_tap_logical(code, ch(&l)),
+                    None => input.inject_key_tap(code),
+                }
+                let ev = translate_frame(&mut t, &mut input, "");
+                assert_eq!(keys(&ev)[0].0, key, "{name}: {code:?} sends {key:?}");
+            }
+        }
     }
 
     #[test]
