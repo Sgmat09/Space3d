@@ -19,12 +19,14 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | `shader.rs` | `CustomShader`: user WGSL hooks spliced into the forward shader |
 | `settings.rs`, `caps.rs`, `output.rs`, `node.rs`, `timing.rs`, `quality.rs` | graphics API (frame): `FrameSettings`/`CameraFrame`, `GraphicsCaps`, `OutputEncoding`/`Tonemapper`/`OUTPUT_WGSL`, the render-node API, `GpuTimings` and the `GpuTimer` recording them, `GraphicsQuality` (see `docs/graphics/api.md`) |
 | `testing.rs` | doc-hidden hooks of the crate's own integration tests (depth views injected without the lighting) |
-| `material.rs`, `lighting/`, `post/` | graphics API hubs of the materials and post areas (`BlendMode`…, cubemaps/`Skybox`/shadows/`LightingSettings`, `PostProcess`…) and their crate-internal frame contracts (`Lighting`, `PostState`) |
+| `material.rs` | material API of the materials area: `BlendMode`, `ShadowMode`, `MapMask`, `TextureTransform`, `MeshExtras` (details: `docs/graphics/materials.md`) |
+| `lighting/` | the materials area's lighting behind the `Lighting` frame contract: `api.rs` (cubemaps, `Skybox`, `EnvironmentLight`, `DirectionalShadow`, `LightingSettings`…), `cubemap.rs` (cubemap uploads, panorama → faces on the GPU), `environment.rs` (IBL bake: prefiltered specular + irradiance cubes, compute or per-face render passes, the BRDF LUT), `skybox.rs` (the built-in `space3d/skybox` node), `shadow.rs` (the directional shadow: caster light, texel-snapped fit, the map; one depth view), `tests.rs` (`docs/graphics/materials.md`) |
+| `post/` | the post area behind the `PostState` frame contract: `api.rs` (`PostProcess`, `Bloom`, `AutoExposure`, `ColorGrading`, `ColorLut`, `Distortion`…, `DISTORTION_WGSL`), `mod.rs` (per-group planning and encoding), `chain.rs`, `bloom.rs`, `exposure.rs` + `readback.rs` (auto exposure and its non-blocking readback), `grading.rs`, `lut.rs`, `fxaa.rs`, `distortion_mesh.rs` (the built-in `space3d/distortion-meshes` node) (`docs/graphics/post.md`) |
 | `readback.rs` | non-blocking readback of GPU-culled visible counts for `RenderStats` |
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
 | `dirty.rs` | `DirtyRanges`: sorted, coalescing range set |
 | `stats.rs` | `RenderStats`, `DrawPath` |
-| `shaders/` | `forward.wgsl` (template), `depth.wgsl` (depth-only template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `frame/depth_resolve.wgsl` (minimum of a multisampled depth's samples), `post/composite.wgsl` (scene texture → display target), `post/distortion.wgsl` |
+| `shaders/` | `forward.wgsl` (template), `depth.wgsl` (depth-only template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `frame/depth_resolve.wgsl` (minimum of a multisampled depth's samples); materials area: `sky.wgsl`, `ibl_bake{,_compute,_fragment}.wgsl`, `brdf_lut.bin` (64² split-sum table); post area: `post/composite.wgsl` (scene texture → display target: exposure, bloom, distortion apply, grading, tonemap), `post/{bloom,exposure,exposure_common,exposure_dl,fxaa,distortion,distortion_mesh}.wgsl` |
 
 ## Frame data flow
 
@@ -442,7 +444,11 @@ resources, depth views the neutral ones (the shadow map is their attachment). Ev
 records its bind group index (`ViewData::bind_group`), so built-in draws, node draws and
 HdrScene overlays bind the right one.
 
-**Depth views** (`frame/depth.rs`) are views without color: each request of
+**Depth views** (`frame/depth.rs`) are views without color. Today the lighting requests one:
+the directional shadow (`lighting/shadow.rs`: the lowest-entity `DirectionalLight` with a
+`DirectionalShadow`, fitted per `ShadowFit` and snapped to whole texels; casters by
+`extract::source_casts` from `ShadowMode` and the blend mode; the raster slope bias scales with
+the filter's reach). Each request of
 `Lighting::depth_views` (or of `crate::testing`) gets a `GpuView` slot after the camera views'
 (its `view_proj` the light matrix, all other fields zero), and its draws go through the camera
 views' source loop (`FrameState::record_sources`) with the request's frustum and only the
@@ -453,8 +459,8 @@ and indirect args after the camera views' (the stats readback copies the camera 
 only). On `CpuDirect` its sources are CPU-culled like a camera's. After the culling compute and
 before the first camera view, each depth view is one depth-only pass (clear 1.0, store) with
 `Pipelines::depth`: `shaders/depth.wgsl` composed with the instance layout, `PassKind::Depth`
-(vertex stage only, group 0 only) or `DepthMask` (the material in group 1, `fs_mask` discarding
-below the cutoff; `extract::caster_pass` picks it), depth test `Less` with writes, the
+(vertex stage only, group 0 only) or `DepthMask` (alpha-masked casters: the material's texture
+set in group 1, `fs_mask` discarding below its `alpha_cutoff`; `extract::caster_pass` picks it), depth test `Less` with writes, the
 request's depth bias, back faces culled unless double-sided; cached per (key, bias). Custom
 shaders are not applied (vertex hooks do not displace shadows). Depth views are never part of
 node phases, overlays, post or capture replays. `RenderStats::{depth_views, shadow_casters,
