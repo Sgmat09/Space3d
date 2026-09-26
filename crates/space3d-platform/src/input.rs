@@ -17,13 +17,148 @@
 //! assert!(app.resources.expect::<ActionState>().pressed("jump"));
 //! assert!(!app.resources.expect::<ActionState>().just_pressed("jump"));
 //! ```
+//!
+//! Keys are **physical** ([`KeyCode`]: the key's position). The runner also records what each
+//! key means on the player's layout ([`KeyEvent`], [`Input::key_events`],
+//! [`Input::logical_key`]) and what it prints ([`Input::key_label`]); see
+//! [`crate::layout`]. Tests inject layout-aware events with [`Input::inject_key_event`]:
+//!
+//! ```
+//! use space3d_platform::*;
+//! let mut input = Input::default();
+//! // AZERTY: the key in QWERTY's `A` position types "q".
+//! input.inject_key_tap_logical(KeyCode::KeyA, LogicalKey::Character("q".into()));
+//! assert!(input.just_pressed(KeyCode::KeyA));
+//! assert_eq!(input.key_label(KeyCode::KeyA).as_deref(), Some("q"));
+//! assert_eq!(input.key_cap(KeyCode::KeyA), "Q");
+//! assert_eq!(input.text(), "q");
+//! ```
 
+use crate::layout::{KeyLabel, KeyLabelSource, KeyLocation, KeyboardLayout, LogicalKey, english_key_name};
 use glam::Vec2;
 use space3d_core::{App, Plugin, Stage};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 pub use winit::keyboard::KeyCode;
+
+/// Upper bound on [`Input::key_events`] kept per frame (a frame never sees this many; it only
+/// bounds memory when `end_frame` is not called).
+const MAX_KEY_EVENTS: usize = 256;
+
+/// One keyboard event as the OS reported it: the physical key plus what it means on the
+/// player's keyboard layout. Recorded by the runner (and [`Input::inject_key_event`]) in
+/// [`Input::key_events`]; see [`crate::layout`] for physical vs logical keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyEvent {
+    /// The physical key (its position; layout-independent). What [`Input::pressed`] and
+    /// [`Binding::Key`] use.
+    pub physical: KeyCode,
+    /// What the key means on the current layout, with Shift / AltGr / Option applied (not
+    /// Ctrl): winit's `logical_key`. `Dead` for dead keys.
+    pub logical_key: LogicalKey,
+    /// The layout's key ignoring every modifier (winit's `key_without_modifiers`; never
+    /// `Dead`). Desktop only: `None` on the web, Android and iOS.
+    pub key_without_modifiers: Option<LogicalKey>,
+    /// Text the press produced, if any.
+    pub text: Option<String>,
+    /// Left/right/numpad variant of keys that exist more than once.
+    pub location: KeyLocation,
+    /// Key went down (`false`: up).
+    pub pressed: bool,
+    /// OS auto-repeat of a held key.
+    pub repeat: bool,
+}
+
+impl KeyEvent {
+    /// A press of `physical` that types `key` on the current layout (both
+    /// [`logical_key`](Self::logical_key) and [`key_without_modifiers`](Self::key_without_modifiers);
+    /// the text is the key's text, e.g. `"q"`, `" "` for Space).
+    pub fn press(physical: KeyCode, key: LogicalKey) -> Self {
+        Self {
+            physical,
+            text: key.to_text().map(str::to_owned),
+            key_without_modifiers: Some(key.clone()),
+            logical_key: key,
+            location: default_location(physical),
+            pressed: true,
+            repeat: false,
+        }
+    }
+
+    /// A release of `physical` (see [`KeyEvent::press`]; no text).
+    pub fn release(physical: KeyCode, key: LogicalKey) -> Self {
+        Self {
+            pressed: false,
+            text: None,
+            ..Self::press(physical, key)
+        }
+    }
+
+    /// Replace the logical key (e.g. the shifted character, or `Dead`).
+    pub fn with_logical_key(mut self, key: LogicalKey) -> Self {
+        self.logical_key = key;
+        self
+    }
+
+    /// Replace the modifier-free key (`None`: platform without it).
+    pub fn with_key_without_modifiers(mut self, key: Option<LogicalKey>) -> Self {
+        self.key_without_modifiers = key;
+        self
+    }
+
+    /// Replace the produced text.
+    pub fn with_text(mut self, text: Option<&str>) -> Self {
+        self.text = text.map(str::to_owned);
+        self
+    }
+
+    /// Replace the key location.
+    pub fn with_location(mut self, location: KeyLocation) -> Self {
+        self.location = location;
+        self
+    }
+
+    /// Mark as an OS auto-repeat.
+    pub fn with_repeat(mut self, repeat: bool) -> Self {
+        self.repeat = repeat;
+        self
+    }
+
+    /// The layout's key for bindings and shortcuts: [`key_without_modifiers`](Self::key_without_modifiers)
+    /// where the platform reports it, else [`logical_key`](Self::logical_key).
+    pub fn key(&self) -> &LogicalKey {
+        self.key_without_modifiers.as_ref().unwrap_or(&self.logical_key)
+    }
+}
+
+fn default_location(key: KeyCode) -> KeyLocation {
+    use KeyCode as K;
+    match key {
+        K::ShiftLeft | K::ControlLeft | K::AltLeft | K::SuperLeft => KeyLocation::Left,
+        K::ShiftRight | K::ControlRight | K::AltRight | K::SuperRight => KeyLocation::Right,
+        K::NumLock
+        | K::Numpad0
+        | K::Numpad1
+        | K::Numpad2
+        | K::Numpad3
+        | K::Numpad4
+        | K::Numpad5
+        | K::Numpad6
+        | K::Numpad7
+        | K::Numpad8
+        | K::Numpad9
+        | K::NumpadAdd
+        | K::NumpadSubtract
+        | K::NumpadMultiply
+        | K::NumpadDivide
+        | K::NumpadDecimal
+        | K::NumpadComma
+        | K::NumpadEqual
+        | K::NumpadEnter => KeyLocation::Numpad,
+        _ => KeyLocation::Standard,
+    }
+}
 
 /// Mouse buttons.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -233,6 +368,9 @@ pub struct Input {
     text: String,
     gamepads: HashMap<u32, Gamepad>,
     window_size: Vec2,
+    key_events: Vec<KeyEvent>,
+    logical_keys: HashMap<KeyCode, LogicalKey>,
+    layout: KeyboardLayout,
 }
 
 impl Input {
@@ -315,6 +453,74 @@ impl Input {
         self.window_size
     }
 
+    // ---- keyboard layout ----------------------------------------------------------------
+
+    /// This frame's keyboard events in order, with their logical keys (runner and
+    /// [`Self::inject_key_event`]; the plain `inject_key_*` methods add none). Cleared in
+    /// `end_frame`.
+    pub fn key_events(&self) -> &[KeyEvent] {
+        &self.key_events
+    }
+
+    /// The layout's key ([`KeyEvent::key`]) of the most recent event of physical `key`, e.g.
+    /// `Character("z")` for `KeyCode::KeyW` on AZERTY. Kept after release; `None` until the
+    /// key produced a [`KeyEvent`].
+    pub fn logical_key(&self, key: KeyCode) -> Option<&LogicalKey> {
+        self.logical_keys.get(&key)
+    }
+
+    /// What physical `key` prints on the current layout without modifiers (`"q"` for
+    /// `KeyA` on AZERTY; dead keys: the base character), or the English name of a
+    /// non-character key (`"Space"`, `"Enter"`, `"Shift"`, `"F1"` — localize those). `None`
+    /// while a character key's label is unknown (no OS table and not pressed yet). See
+    /// [`crate::layout`].
+    pub fn key_label(&self, key: KeyCode) -> Option<String> {
+        self.key_label_info(key).map(|l| l.text)
+    }
+
+    /// [`Self::key_label`] with the shifted character and the label's source.
+    pub fn key_label_info(&self, key: KeyCode) -> Option<KeyLabel> {
+        if crate::layout::is_writing_system_key(key) {
+            return self.layout.label(key);
+        }
+        english_key_name(key).map(|name| KeyLabel {
+            key,
+            text: name.to_owned(),
+            shifted: None,
+            source: KeyLabelSource::Named,
+        })
+    }
+
+    /// Key-cap text for physical `key`, never empty: [`KeyLabel::cap`] of the layout label
+    /// (`"Q"` for `KeyA` on AZERTY), else the US QWERTY character of that position (`"A"`),
+    /// else the key code name.
+    pub fn key_cap(&self, key: KeyCode) -> String {
+        if let Some(label) = self.key_label_info(key) {
+            return label.cap();
+        }
+        match crate::layout::us_qwerty_label(key) {
+            Some(us) => us.to_uppercase(),
+            None => format!("{key:?}"),
+        }
+    }
+
+    /// The keyboard layout labels (OS table + learned).
+    pub fn keyboard_layout(&self) -> &KeyboardLayout {
+        &self.layout
+    }
+
+    /// Mutable keyboard layout labels (custom platforms, tests).
+    pub fn keyboard_layout_mut(&mut self) -> &mut KeyboardLayout {
+        &mut self.layout
+    }
+
+    /// Re-read the OS layout table now (see [`KeyboardLayout::refresh_from_os`]; the window
+    /// runner already does this at start-up, on focus and on layout changes). Returns whether
+    /// the labels changed.
+    pub fn refresh_keyboard_layout(&mut self) -> bool {
+        self.layout.refresh_from_os()
+    }
+
     // ---- injection (runner, tests, replays) ---------------------------------------------
 
     /// Key down.
@@ -329,6 +535,58 @@ impl Input {
     pub fn inject_key_tap(&mut self, key: KeyCode) {
         self.keys.press(key);
         self.keys.release(key);
+    }
+    /// A keyboard event with its logical key (what the runner feeds): presses/releases the
+    /// physical key, appends the text of presses to [`Self::text`], records the event in
+    /// [`Self::key_events`] and learns the key's label (see [`crate::layout`]).
+    pub fn inject_key_event(&mut self, event: KeyEvent) {
+        if event.pressed {
+            self.keys.press(event.physical);
+            if let Some(text) = &event.text {
+                self.text.push_str(text);
+            }
+            self.learn_label(&event);
+        } else {
+            self.keys.release(event.physical);
+        }
+        self.logical_keys.insert(event.physical, event.key().clone());
+        if self.key_events.len() >= MAX_KEY_EVENTS {
+            self.key_events.remove(0);
+        }
+        self.key_events.push(event);
+    }
+    /// Key down on a layout where it types `logical` ([`KeyEvent::press`]).
+    pub fn inject_key_down_logical(&mut self, key: KeyCode, logical: LogicalKey) {
+        self.inject_key_event(KeyEvent::press(key, logical));
+    }
+    /// Key up ([`KeyEvent::release`]).
+    pub fn inject_key_up_logical(&mut self, key: KeyCode, logical: LogicalKey) {
+        self.inject_key_event(KeyEvent::release(key, logical));
+    }
+    /// Down + up within one frame, typing `logical`.
+    pub fn inject_key_tap_logical(&mut self, key: KeyCode, logical: LogicalKey) {
+        self.inject_key_down_logical(key, logical.clone());
+        self.inject_key_up_logical(key, logical);
+    }
+
+    /// Learn what a pressed key types: the modifier-free key where the platform reports it,
+    /// else the logical key when neither Shift nor Alt/AltGr/Option is held; plus the
+    /// shifted character when only Shift is held.
+    fn learn_label(&mut self, event: &KeyEvent) {
+        use KeyCode as K;
+        let shift = self.any_pressed([K::ShiftLeft, K::ShiftRight]);
+        let alt = self.any_pressed([K::AltLeft, K::AltRight]);
+        let other = self.any_pressed([K::ControlLeft, K::ControlRight, K::SuperLeft, K::SuperRight]);
+        let unshifted = match &event.key_without_modifiers {
+            Some(key) => crate::layout::logical_key_label(key),
+            None if !shift && !alt => crate::layout::logical_key_label(&event.logical_key),
+            None => None,
+        };
+        let shifted = (shift && !alt && !other)
+            .then(|| crate::layout::logical_key_label(&event.logical_key))
+            .flatten();
+        self.layout
+            .learn(event.physical, unshifted.as_deref(), shifted.as_deref());
     }
     /// Mouse button down.
     pub fn inject_mouse_button_down(&mut self, b: MouseButton) {
@@ -437,6 +695,7 @@ impl Input {
         self.started_touches.clear();
         self.ended_touches.clear();
         self.text.clear();
+        self.key_events.clear();
         for t in &mut self.touches {
             t.delta = Vec2::ZERO;
         }
@@ -651,6 +910,7 @@ impl Plugin for InputPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::NamedKey;
 
     #[test]
     fn key_edges_and_end_frame() {
@@ -664,6 +924,103 @@ mod tests {
         assert!(!i.pressed(KeyCode::KeyW) && i.just_released(KeyCode::KeyW));
         i.inject_key_tap(KeyCode::Space);
         assert!(i.just_pressed(KeyCode::Space) && i.just_released(KeyCode::Space) && !i.pressed(KeyCode::Space));
+    }
+
+    fn ch(s: &str) -> LogicalKey {
+        LogicalKey::Character(s.into())
+    }
+
+    #[test]
+    fn key_events_press_record_and_learn() {
+        let mut i = Input::default();
+        // AZERTY: QWERTY's A position types "q"; the physical key is what is held.
+        i.inject_key_down_logical(KeyCode::KeyA, ch("q"));
+        assert!(i.pressed(KeyCode::KeyA) && i.just_pressed(KeyCode::KeyA));
+        assert_eq!(i.text(), "q");
+        assert_eq!(i.key_events().len(), 1);
+        assert_eq!(i.key_events()[0].physical, KeyCode::KeyA);
+        assert_eq!(i.logical_key(KeyCode::KeyA), Some(&ch("q")));
+        assert_eq!(i.key_label(KeyCode::KeyA).as_deref(), Some("q"));
+        assert_eq!(i.key_label_info(KeyCode::KeyA).unwrap().source, KeyLabelSource::Learned);
+        i.inject_key_event(KeyEvent::press(KeyCode::KeyA, ch("q")).with_repeat(true));
+        assert_eq!(i.text(), "qq", "OS repeats type");
+        i.end_frame();
+        assert!(i.key_events().is_empty() && i.text().is_empty());
+        assert!(i.pressed(KeyCode::KeyA), "held");
+        i.inject_key_up_logical(KeyCode::KeyA, ch("q"));
+        assert!(i.just_released(KeyCode::KeyA));
+        assert!(!i.key_events()[0].pressed);
+        assert_eq!(i.text(), "", "releases type nothing");
+        assert_eq!(i.logical_key(KeyCode::KeyA), Some(&ch("q")), "kept after release");
+        // Legacy injection adds no event and keeps the learned label.
+        i.end_frame();
+        i.inject_key_tap(KeyCode::KeyA);
+        assert!(i.key_events().is_empty());
+        assert_eq!(i.key_cap(KeyCode::KeyA), "Q");
+    }
+
+    #[test]
+    fn shifted_and_modified_presses() {
+        let mut i = Input::default();
+        // Desktop AZERTY, Shift held: the modifier-free key is still "é", the logical key "2".
+        i.inject_key_down(KeyCode::ShiftLeft);
+        i.inject_key_event(KeyEvent::press(KeyCode::Digit2, ch("é")).with_logical_key(ch("2")));
+        let l = i.key_label_info(KeyCode::Digit2).unwrap();
+        assert_eq!((l.text.as_str(), l.shifted.as_deref()), ("é", Some("2")));
+        assert_eq!(i.key_cap(KeyCode::Digit2), "é", "shift types a digit, not É");
+        // Web/mobile (no modifier-free key): a shifted press only teaches the shifted value.
+        i.inject_key_event(
+            KeyEvent::press(KeyCode::KeyQ, ch("A"))
+                .with_key_without_modifiers(None)
+                .with_text(Some("A")),
+        );
+        assert_eq!(i.key_label(KeyCode::KeyQ), None, "unshifted still unknown");
+        assert_eq!(i.key_cap(KeyCode::KeyQ), "Q", "US fallback for the position");
+        i.inject_key_up(KeyCode::ShiftLeft);
+        i.inject_key_event(KeyEvent::press(KeyCode::KeyQ, ch("a")).with_key_without_modifiers(None));
+        let l = i.key_label_info(KeyCode::KeyQ).unwrap();
+        assert_eq!((l.text.as_str(), l.shifted.as_deref()), ("a", Some("A")));
+        // Option/AltGr characters are not labels (macOS Option+Z = "Ω").
+        i.inject_key_down(KeyCode::AltLeft);
+        i.inject_key_event(KeyEvent::press(KeyCode::KeyZ, ch("Ω")).with_key_without_modifiers(None));
+        assert_eq!(i.key_label(KeyCode::KeyZ), None);
+        // Dead keys learn their base character.
+        i.inject_key_up(KeyCode::AltLeft);
+        i.inject_key_event(
+            KeyEvent::press(KeyCode::BracketLeft, LogicalKey::Dead(Some('^')))
+                .with_key_without_modifiers(None)
+                .with_text(None),
+        );
+        assert_eq!(i.key_label(KeyCode::BracketLeft).as_deref(), Some("^"));
+    }
+
+    #[test]
+    fn named_keys_and_fallbacks() {
+        let mut i = Input::default();
+        assert_eq!(i.key_label(KeyCode::Space).as_deref(), Some("Space"));
+        assert_eq!(i.key_label(KeyCode::F1).as_deref(), Some("F1"));
+        assert_eq!(i.key_label(KeyCode::Enter).as_deref(), Some("Enter"));
+        assert_eq!(i.key_label(KeyCode::KeyW), None, "unknown layout");
+        assert_eq!(i.key_cap(KeyCode::KeyW), "W");
+        assert_eq!(i.key_cap(KeyCode::Semicolon), ";");
+        assert_eq!(i.key_cap(KeyCode::Lang5), "Lang5");
+        // Named keys are never learned (Space types " ").
+        i.inject_key_tap_logical(KeyCode::Space, LogicalKey::Named(NamedKey::Space));
+        assert_eq!(i.text(), " ");
+        assert_eq!(i.key_label(KeyCode::Space).as_deref(), Some("Space"));
+        assert_eq!(i.key_events()[0].location, KeyLocation::Standard);
+        i.inject_key_tap_logical(KeyCode::Numpad1, ch("1"));
+        assert_eq!(i.key_events()[2].location, KeyLocation::Numpad);
+        assert_eq!(i.key_label(KeyCode::Numpad1).as_deref(), Some("Numpad 1"));
+    }
+
+    #[test]
+    fn key_event_list_is_bounded() {
+        let mut i = Input::default();
+        for _ in 0..(MAX_KEY_EVENTS + 10) {
+            i.inject_key_tap_logical(KeyCode::KeyB, ch("b"));
+        }
+        assert_eq!(i.key_events().len(), MAX_KEY_EVENTS);
     }
 
     #[test]

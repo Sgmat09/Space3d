@@ -4,12 +4,18 @@
 //! * `resumed` — create the window once; create the [`Renderer`] (blocking on native,
 //!   asynchronously on the web) or, on mobile resume, recreate its surface.
 //! * `suspended` — drop the surface (Android destroys the native window in background).
-//! * `window_event` — feed [`Input`], track size/DPI/focus, render on `RedrawRequested`.
+//! * `window_event` — feed [`Input`] (keyboard events with their logical keys), track
+//!   size/DPI/focus, render on `RedrawRequested`.
 //!   Before rendering, a surface the renderer dropped as lost (Vulkan `SURFACE_LOST`, DX12)
 //!   is recreated, at most once per `SurfaceRetry::INTERVAL`.
 //! * `about_to_wait` — request the next redraw (continuous rendering).
+//!
+//! The keyboard layout's OS table ([`crate::layout`]) is read on the event-loop thread at the
+//! first resume and on focus gain, and its id is re-checked at most once per second (cheap:
+//! no per-frame OS calls).
 
-use crate::input::{Input, MouseButton, TouchPhase};
+use crate::input::{Input, KeyEvent, MouseButton, TouchPhase};
+use crate::layout::LayoutWatch;
 use crate::window::{PlatformEvent, WindowPlugin, WindowState};
 use glam::{UVec2, Vec2};
 use space3d_core::{App, Events};
@@ -37,6 +43,7 @@ pub(crate) struct WinitRunner {
     applied_title: String,
     applied_cursor: (bool, bool),
     surface_retry: SurfaceRetry,
+    layout_watch: LayoutWatch,
     #[cfg(target_arch = "wasm32")]
     pending: std::rc::Rc<std::cell::RefCell<Option<Result<Renderer, space3d_render::RenderError>>>>,
 }
@@ -145,6 +152,7 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         exiting: false,
         applied_cursor: (true, false),
         surface_retry: SurfaceRetry::default(),
+        layout_watch: LayoutWatch::default(),
         #[cfg(target_arch = "wasm32")]
         pending: Default::default(),
     };
@@ -174,6 +182,12 @@ impl WinitRunner {
 
     fn state(&mut self) -> &mut WindowState {
         self.app.resources.expect_mut::<WindowState>()
+    }
+
+    /// Keep the keyboard layout's OS table current (`force`: start-up, focus gain).
+    fn poll_layout(&mut self, now: Instant, force: bool) {
+        let layout = self.app.resources.init::<Input>().keyboard_layout_mut();
+        self.layout_watch.poll(now, force, layout);
     }
 
     fn renderer_config(&self, size: UVec2) -> RendererConfig {
@@ -337,6 +351,7 @@ impl WinitRunner {
         let dt = self.last_frame.map_or(Duration::ZERO, |last| now - last);
         self.last_frame = Some(now);
         self.recover_surface(now);
+        self.poll_layout(now, false);
         if let Some(w) = &self.window {
             w.pre_present_notify();
         }
@@ -393,6 +408,7 @@ impl ApplicationHandler for WinitRunner {
             s.scale_factor = scale;
         }
         self.ensure_renderer(event_loop, &window);
+        self.poll_layout(Instant::now(), true);
         let size = window.inner_size();
         self.on_resize(UVec2::new(size.width, size.height));
         self.send(PlatformEvent::Resumed);
@@ -428,22 +444,35 @@ impl ApplicationHandler for WinitRunner {
             }
             WindowEvent::Focused(focused) => {
                 self.state().focused = focused;
-                if !focused {
+                if focused {
+                    // The layout may have been switched while another app had focus.
+                    self.poll_layout(Instant::now(), true);
+                } else {
                     self.input().release_all();
                 }
                 self.send(PlatformEvent::Focused(focused));
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    if pressed {
-                        self.input().inject_key_down(code);
-                    } else {
-                        self.input().inject_key_up(code);
+                match event.physical_key {
+                    PhysicalKey::Code(code) => {
+                        let key_event = KeyEvent {
+                            physical: code,
+                            key_without_modifiers: key_without_modifiers(&event),
+                            logical_key: event.logical_key,
+                            text: event.text.map(|t| t.to_string()),
+                            location: event.location,
+                            pressed,
+                            repeat: event.repeat,
+                        };
+                        // Presses/releases the physical key, appends the text, learns the label.
+                        self.input().inject_key_event(key_event);
                     }
-                }
-                if pressed && let Some(text) = &event.text {
-                    self.input().inject_text(text);
+                    PhysicalKey::Unidentified(_) => {
+                        if pressed && let Some(text) = &event.text {
+                            self.input().inject_text(text);
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -495,6 +524,43 @@ impl ApplicationHandler for WinitRunner {
             w.request_redraw();
         }
     }
+}
+
+/// winit's `key_without_modifiers` where the platform has it (Windows, macOS, X11, Wayland).
+#[cfg(any(
+    target_os = "windows",
+    target_os = "macos",
+    all(
+        unix,
+        not(any(
+            target_os = "ios",
+            target_os = "android",
+            target_os = "emscripten",
+            target_os = "redox"
+        ))
+    )
+))]
+fn key_without_modifiers(event: &winit::event::KeyEvent) -> Option<winit::keyboard::Key> {
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    Some(event.key_without_modifiers())
+}
+
+/// Web, Android, iOS: not reported (the logical key is used instead).
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "macos",
+    all(
+        unix,
+        not(any(
+            target_os = "ios",
+            target_os = "android",
+            target_os = "emscripten",
+            target_os = "redox"
+        ))
+    )
+)))]
+fn key_without_modifiers(_event: &winit::event::KeyEvent) -> Option<winit::keyboard::Key> {
+    None
 }
 
 #[cfg(test)]

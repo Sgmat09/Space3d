@@ -5086,6 +5086,7 @@ dependencies = [
  "console_error_panic_hook",
  "glam 0.33.9",
  "image",
+ "js-sys",
  "pollster",
  "space3d-core",
  "space3d-render",
@@ -5096,6 +5097,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

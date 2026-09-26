@@ -108,3 +108,150 @@ fn window_plugin_registers_resources_without_opening_a_window() {
     // Stepping without `run()` works headlessly (no renderer → render system is a no-op).
     app.step_ticks(2);
 }
+
+fn ch(s: &str) -> LogicalKey {
+    LogicalKey::Character(s.into())
+}
+
+/// Tap every `(physical key, character)` pair of a layout, one per frame, as the runner would.
+fn type_layout(app: &mut App, keys: &[(KeyCode, &str)]) {
+    for &(code, c) in keys {
+        app.resources.expect_mut::<Input>().inject_key_tap_logical(code, ch(c));
+        app.step_ticks(1);
+    }
+}
+
+#[test]
+fn physical_bindings_ignore_the_layout_and_labels_follow_it() {
+    let mut app = app();
+    app.resources
+        .expect_mut::<ActionMap>()
+        .bind("forward", Binding::Key(KeyCode::KeyW));
+    // AZERTY: QWERTY's W position is labelled Z. The action is bound to the position.
+    app.resources
+        .expect_mut::<Input>()
+        .inject_key_down_logical(KeyCode::KeyW, ch("z"));
+    app.step_ticks(1);
+    assert!(app.resources.expect::<ActionState>().just_pressed("forward"));
+    {
+        let input = app.resources.expect::<Input>();
+        assert!(input.key_events().is_empty(), "events live one frame");
+        assert_eq!(input.logical_key(KeyCode::KeyW), Some(&ch("z")));
+        assert_eq!(input.key_cap(KeyCode::KeyW), "Z", "show the player the Z key");
+    }
+    app.resources
+        .expect_mut::<Input>()
+        .inject_key_up_logical(KeyCode::KeyW, ch("z"));
+    app.step_ticks(1);
+    assert!(app.resources.expect::<ActionState>().just_released("forward"));
+}
+
+#[test]
+fn injected_layouts_teach_key_labels() {
+    // (layout, physical key → what it types unshifted)
+    let layouts: [(&str, &[(KeyCode, &str)]); 4] = [
+        (
+            "AZERTY",
+            &[
+                (KeyCode::KeyQ, "a"),
+                (KeyCode::KeyW, "z"),
+                (KeyCode::KeyA, "q"),
+                (KeyCode::KeyZ, "w"),
+                (KeyCode::Semicolon, "m"),
+                (KeyCode::KeyM, ","),
+                (KeyCode::Digit1, "&"),
+                (KeyCode::Digit2, "é"),
+            ],
+        ),
+        (
+            "QWERTZ",
+            &[
+                (KeyCode::KeyY, "z"),
+                (KeyCode::KeyZ, "y"),
+                (KeyCode::Semicolon, "ö"),
+                (KeyCode::Minus, "ß"),
+                (KeyCode::Equal, "´"),
+            ],
+        ),
+        (
+            "JIS",
+            &[
+                (KeyCode::IntlYen, "¥"),
+                (KeyCode::IntlRo, "\\"),
+                (KeyCode::Quote, ":"),
+                (KeyCode::BracketLeft, "@"),
+                (KeyCode::Equal, "^"),
+            ],
+        ),
+        (
+            "Dvorak",
+            &[
+                (KeyCode::KeyQ, "'"),
+                (KeyCode::KeyS, "o"),
+                (KeyCode::KeyV, "k"),
+                (KeyCode::Period, "v"),
+                (KeyCode::KeyZ, ";"),
+            ],
+        ),
+    ];
+    for (name, keys) in layouts {
+        let mut app = app();
+        type_layout(&mut app, keys);
+        let input = app.resources.expect::<Input>();
+        for &(code, c) in keys {
+            let label = input
+                .key_label_info(code)
+                .unwrap_or_else(|| panic!("{name}: {code:?} unlabelled"));
+            assert_eq!(label.text, c, "{name}: {code:?}");
+            assert_eq!(label.source, KeyLabelSource::Learned);
+        }
+        // Keys never pressed on this layout stay unknown (no OS table in tests).
+        assert_eq!(input.key_label(KeyCode::KeyP), None, "{name}");
+        assert_eq!(input.key_label(KeyCode::Space).as_deref(), Some("Space"));
+    }
+}
+
+#[test]
+fn a_new_os_layout_replaces_learned_labels() {
+    let mut app = app();
+    type_layout(&mut app, &[(KeyCode::KeyA, "q")]);
+    let input = app.resources.expect_mut::<Input>();
+    let g = input.keyboard_layout().generation();
+    // The player switches to US; the platform reports the new table.
+    input
+        .keyboard_layout_mut()
+        .set_os_layout(Some("us".into()), [(KeyCode::KeyA, "a".into(), Some("A".into()))]);
+    assert!(input.keyboard_layout().generation() > g);
+    assert_eq!(input.key_label(KeyCode::KeyA).as_deref(), Some("a"));
+    assert_eq!(input.key_label_info(KeyCode::KeyA).unwrap().source, KeyLabelSource::Os);
+}
+
+#[test]
+fn os_keyboard_layout_labels_key_a_on_macos() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipping: the OS keyboard layout table is tested on macOS");
+        return;
+    }
+    let mut input = Input::default();
+    assert!(input.refresh_keyboard_layout(), "layout table read from the OS");
+    let id = input
+        .keyboard_layout()
+        .os_layout_id()
+        .expect("input source id")
+        .to_owned();
+    let label = input.key_label_info(KeyCode::KeyA).expect("KeyA labelled");
+    assert_eq!(label.source, KeyLabelSource::Os);
+    assert!(!label.text.is_empty());
+    assert!(!input.key_cap(KeyCode::KeyA).is_empty());
+    eprintln!(
+        "layout {id}: KeyA = {:?} (shifted {:?}), KeyQ = {:?}, KeyZ = {:?}, Digit2 = {:?}",
+        label.text,
+        label.shifted,
+        input.key_label(KeyCode::KeyQ),
+        input.key_label(KeyCode::KeyZ),
+        input.key_label(KeyCode::Digit2),
+    );
+    let count = writing_system_keys().filter(|&k| input.key_label(k).is_some()).count();
+    assert!(count >= 40, "most writing-system keys labelled ({count})");
+    assert!(!input.refresh_keyboard_layout(), "same layout: table not re-read");
+}
