@@ -557,7 +557,8 @@ fn grading_scene(app: &mut App) {
         .enumerate()
     {
         app.world.spawn((
-            at(Vec3::new(-2.0 + 4.0 * i as f32, 0.8, -7.0))
+            // Apart in depth: coplanar overlaps would z-fight differently per backend.
+            at(Vec3::new(-2.0 + 4.0 * i as f32, 0.8, -7.0 - 0.6 * i as f32))
                 .with_rotation(Quat::from_rotation_z(0.4 - 0.8 * i as f32))
                 .with_scale(Vec3::new(5.0, 3.0, 0.1)),
             Mesh3d(cube),

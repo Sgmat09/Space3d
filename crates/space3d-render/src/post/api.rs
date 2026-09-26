@@ -272,9 +272,11 @@ pub enum Metering {
 }
 
 /// Bloom (Jimenez, "Next-Generation Post Processing in Call of Duty: Advanced Warfare", 2014):
-/// the exposed scene above a soft-knee threshold (Karis-averaged on the first level, so single
-/// hot pixels do not flicker), a chain of 13-tap downsamples and 3×3 tent upsamples blended by
-/// `scatter`, added after exposure (or mixed in, [`BloomComposite::EnergyConserving`]).
+/// every pixel's exposed radiance above a soft-knee threshold (softly limited above 32, so a
+/// stray specular spike cannot flare into a large blob), a chain of 13-tap downsamples and 3×3
+/// tent upsamples blended by `scatter`, added after exposure (or mixed in,
+/// [`BloomComposite::EnergyConserving`]). The glow is proportional to the energy above the
+/// threshold whatever the source's size, and does not shimmer as small sources move.
 ///
 /// Works in Hdr mode; off in the Ldr fallback (no float render targets or `HdrMode::Ldr`,
 /// warned once). Each post group has its own chain, clamped to its rect: split screens never

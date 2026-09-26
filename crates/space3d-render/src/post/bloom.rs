@@ -6,7 +6,8 @@
 //! A post group's chain is one pooled texture (`TexturePool`, per-level views) of
 //! `GraphicsCaps::bloom_format`: level 0 has the reference chain's heights (half the rect at
 //! 1080p, capped at `Bloom::max_mip_height`; [`chain_size`]); every further level halves it.
-//! Passes: one prefilter (S → exactly half the rect: exposure, soft threshold, Karis average),
+//! Passes: one prefilter (S → exactly half the rect: exposure, soft threshold and the firefly
+//! limit per pixel, then a 4 × 4 tent),
 //! an area resample of its output into level 0 when level 0 has another size (720p, 900p,
 //! 1440p, 4K, …), `mips − 1` downsamples and `mips − 1` upsamples blended by `scatter` — 11
 //! render passes for the default 6 levels at 1080p, 10 (with the resample) for the 5 of 720p.
@@ -84,17 +85,16 @@ pub(crate) struct ChainSize {
 /// while the smallest one has fewer than 2 pixels on its short side. Level `k` is
 /// `max(1, level0 >> k)` (the texture's mip chain).
 ///
-/// The prefilter's 13 taps (bilinear taps half a destination texel apart, Karis-weighted and
-/// thresholded per box) weigh every source pixel alike only at exactly 2× reduction: at 2.67×
-/// (720p, 1440p, 360p) or 4× (4K) they leave gaps, and a 1–2 px bright source gets a full, a
-/// double or no halo depending on its position (moving, it blinks); at 1.67× (900p) the halo
-/// still varies by a quarter. So the prefilter always halves the rect exactly (`half`, rounded
-/// up), and when level 0 has another size an area resample makes level 0 from it: each level-0
-/// pixel averages the pixels under its box, fractional ones by their overlap, so every pixel
-/// keeps its energy wherever it sits. (Resampling S to twice level 0 before the prefilter
-/// instead would keep its threshold boxes at 1080p's fraction of the frame at 1440p and 4K,
-/// but a small source split across resampled pixels then thresholds differently at every
-/// position: its halo varied by half.)
+/// The prefilter's tent (4 × 4 pixels per destination pixel) weighs every source pixel alike
+/// only at exactly 2× reduction: at 2.67× (720p, 1440p, 360p) or 4× (4K) a fixed footprint
+/// leaves gaps, and a 1–2 px bright source gets a full, a double or no halo depending on its
+/// position (moving, it blinks). So the prefilter always halves the rect exactly (`half`,
+/// rounded up), and when level 0 has another size an area resample makes level 0 from it: each
+/// level-0 pixel averages the pixels under its box, fractional ones by their overlap, so every
+/// pixel keeps its energy wherever it sits. (Resampling S to twice level 0 before the prefilter
+/// instead would keep its footprint at 1080p's fraction of the frame at 1440p and 4K, but a
+/// small source split across resampled pixels then thresholds differently at every position:
+/// its halo varied by half.)
 pub(crate) fn chain_size(rect: (u32, u32), bloom: &Bloom) -> ChainSize {
     let (rw, rh) = (rect.0.max(1), rect.1.max(1));
     let cap = bloom.max_mip_height.max(1);
@@ -188,7 +188,8 @@ pub(crate) fn passes(
     let (size, mips) = (chain.size, chain.mips);
     let texel = |(w, h): (u32, u32)| [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32];
     let [sx, sy] = texel(scene_size);
-    // Half a destination texel, in source pixels: the 13 taps sit ±1 and ±2 steps away.
+    // Half a destination texel, in source pixels (the 13-tap downsamples' step; the prefilter
+    // always halves and loads its pixels).
     let step = |src_h: f32, dst_h: u32| 0.5 * src_h / dst_h.max(1) as f32;
     let prefiltered = chain.half.unwrap_or(size);
     emit(GpuBloomPass {
@@ -513,11 +514,13 @@ impl BloomState {
                 .entry(plan.format)
                 .or_insert_with(|| BloomPipelines::new(cx.device, module, layout, plan.format))
         };
+        // Unit tests read level 0 back.
+        let copy = if cfg!(test) { U::COPY_SRC } else { U::empty() };
         let desc = |size, mips| PoolDesc {
             size,
             format: plan.format,
             mips,
-            usage: U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+            usage: U::RENDER_ATTACHMENT | U::TEXTURE_BINDING | copy,
         };
         let index = cx.pool.acquire(cx.device, desc(plan.size, plan.mips));
         let half = plan.half.map(|size| cx.pool.acquire(cx.device, desc(size, 1)));
@@ -1124,6 +1127,279 @@ mod tests {
             "bloom {best:.3} ms > {:.3} ms",
             GATE_MS * scale
         );
+    }
+
+    /// Level 0 of the chain (after the upsamples) for a `size` scene texture holding `radiance`
+    /// on the pixels of `lit`, black elsewhere, exposure 1: `(level 0 size, texels)`, read back
+    /// in `Rgba16Float`. `None` without an adapter.
+    fn level0_of(
+        r: &crate::Renderer,
+        size: (u32, u32),
+        lit: &[(u32, u32)],
+        radiance: f32,
+        bloom: &Bloom,
+    ) -> Option<((u32, u32), Vec<f32>)> {
+        use wgpu::TextureUsages as U;
+        let (device, queue) = (r.device(), r.queue());
+        let scene_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bloom motion scene"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: U::TEXTURE_BINDING | U::COPY_DST,
+            view_formats: &[],
+        });
+        let mut data = vec![0u16; (size.0 * size.1 * 4) as usize];
+        let one = crate::instance::f32_to_f16(1.0);
+        for i in 0..(size.0 * size.1) as usize {
+            data[i * 4 + 3] = one;
+        }
+        let v = crate::instance::f32_to_f16(radiance);
+        for &(x, y) in lit {
+            let i = ((y * size.0 + x) * 4) as usize;
+            data[i..i + 3].copy_from_slice(&[v; 3]);
+        }
+        queue.write_texture(
+            scene_texture.as_image_copy(),
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.0 * 8),
+                rows_per_image: None,
+            },
+            scene_texture.size(),
+        );
+        let scene = scene_texture.create_view(&Default::default());
+        let exposure = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("bloom motion exposure"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: U::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let align = device.limits().min_uniform_buffer_offset_alignment as usize;
+        let mut state = BloomState::new(device, align);
+        let chain = chain_size(size, bloom);
+        let (mut reallocs, mut n) = (0, 0);
+        let slot = state.slot;
+        let params = &mut state.params;
+        passes(size, [0, 0, size.0, size.1], &chain, bloom, (1.0, false), |p| {
+            params.write_at(n * slot, bytemuck::bytes_of(&p), &mut reallocs);
+            n += 1;
+        });
+        state.slots = n as u32;
+        let plan = BloomPlan {
+            format: wgpu::TextureFormat::Rgba16Float,
+            size: chain.size,
+            mips: chain.mips,
+            merged: chain.merged,
+            half: chain.half,
+            first_slot: 0,
+            scatter: bloom.scatter,
+        };
+        let mut pool = crate::frame::TexturePool::default();
+        let mut stats = crate::RenderStats::default();
+        let mut up = Uploader::new(device);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        state.flush(device, &mut encoder, &mut up, &sampler);
+        let (level0, _) = {
+            let mut cx = PostEncode {
+                device,
+                queue,
+                encoder: &mut encoder,
+                stats: &mut stats,
+                pool: &mut pool,
+            };
+            state.encode(&mut cx, (&scene, 1), &plan, (&exposure, 0), 0, None)?
+        };
+        let texture = level0.texture();
+        let (w, h) = chain.size;
+        let row = (w * 8).next_multiple_of(256);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bloom motion readback"),
+            size: (row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        up.finish();
+        queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let bytes = buffer.slice(..).get_mapped_range().expect("mapped");
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let at = (y * row + x * 8) as usize;
+                out.push(crate::instance::f16_to_f32(u16::from_le_bytes([
+                    bytes[at],
+                    bytes[at + 1],
+                ])));
+            }
+        }
+        assert_eq!(r.gpu_error_count(), 0);
+        Some((chain.size, out))
+    }
+
+    /// The light bloom adds to a `size` frame (the composite's bilinear sampling of level 0 at
+    /// every pixel center, summed): the red channel.
+    fn added_light(size: (u32, u32), level: (u32, u32), texels: &[f32]) -> f64 {
+        let (lw, lh) = (level.0 as f32, level.1 as f32);
+        let at = |x: i64, y: i64| {
+            let x = x.clamp(0, level.0 as i64 - 1) as usize;
+            let y = y.clamp(0, level.1 as i64 - 1) as usize;
+            texels[y * level.0 as usize + x] as f64
+        };
+        let mut sum = 0.0;
+        for py in 0..size.1 {
+            for px in 0..size.0 {
+                let u = (px as f32 + 0.5) / size.0 as f32 * lw - 0.5;
+                let v = (py as f32 + 0.5) / size.1 as f32 * lh - 0.5;
+                let (x0, y0) = (u.floor(), v.floor());
+                let (fx, fy) = ((u - x0) as f64, (v - y0) as f64);
+                let (x0, y0) = (x0 as i64, y0 as i64);
+                sum += at(x0, y0) * (1.0 - fx) * (1.0 - fy)
+                    + at(x0 + 1, y0) * fx * (1.0 - fy)
+                    + at(x0, y0 + 1) * (1.0 - fx) * fy
+                    + at(x0 + 1, y0 + 1) * fx * fy;
+            }
+        }
+        sum
+    }
+
+    /// Sub-pixel motion (the M1 review's shimmer finding): a `px` × `px` source of radiance
+    /// `radiance`, rasterized (whole pixels), moved one pixel at a time over 8 positions of each
+    /// axis (every phase of the prefilter's 2 × 2 blocks and of level 0's texels); returns the
+    /// spread `(max − min) / mean` of the light bloom adds.
+    fn motion_spread(r: &crate::Renderer, size: (u32, u32), px: u32, radiance: f32, bloom: &Bloom) -> Option<f32> {
+        let mut added = Vec::new();
+        for step in 0..8u32 {
+            let (x0, y0) = (size.0 / 2 + step, size.1 / 2 + step / 2);
+            let lit: Vec<(u32, u32)> = (0..px)
+                .flat_map(|dy| (0..px).map(move |dx| (x0 + dx, y0 + dy)))
+                .collect();
+            let (level, texels) = level0_of(r, size, &lit, radiance, bloom)?;
+            added.push(added_light(size, level, &texels));
+        }
+        let mean = added.iter().sum::<f64>() / added.len() as f64;
+        let (lo, hi) = added
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+        Some(((hi - lo) / mean) as f32)
+    }
+
+    /// The M1 review's shimmer finding: a small bright source moving over the pixel grid (every
+    /// phase of the prefilter's 2 × 2 blocks and of level 0's texels) gets the same added light
+    /// (M1: 2 px sources varied by 11 %, 4 px ones by 4 %, at 720p, 1080p and 1440p). The
+    /// prefilter is exact at 1080p; at 720p and 1440p the resample into level 0 and the
+    /// composite's magnification by 2.67 leave about 1 %.
+    #[test]
+    fn bloom_is_stable_under_motion() {
+        let Ok(r) = pollster::block_on(crate::Renderer::new_headless(8, 8)) else {
+            eprintln!("skipping GPU test: no adapter available");
+            return;
+        };
+        let glow = Bloom::glow();
+        for size in [(1280, 720), (1920, 1080), (2560, 1440)] {
+            let limit = if size.1 == 1080 { 0.002 } else { 0.02 };
+            for (px, radiance) in [(1, 30.0), (2, 10.0), (3, 6.0), (4, 4.0)] {
+                let spread = motion_spread(&r, size, px, radiance, &glow).expect("chain");
+                eprintln!("{size:?}: {px} px of {radiance}: spread {:.2} %", spread * 100.0);
+                assert!(spread <= limit, "{size:?}, {px} px: {spread}");
+            }
+        }
+    }
+
+    /// The glow is proportional to the energy above the threshold whatever the source's size
+    /// (M1: 1–2 px sources got a third of it, 8 px ones 70 %), and a hot pixel is limited: a
+    /// pixel of 500 glows like one of about 63.
+    #[test]
+    fn bloom_energy_is_proportional_and_limited() {
+        let Ok(r) = pollster::block_on(crate::Renderer::new_headless(8, 8)) else {
+            eprintln!("skipping GPU test: no adapter available");
+            return;
+        };
+        let glow = Bloom::glow();
+        let size = (1920, 1080);
+        let added = |px: u32, radiance: f32| {
+            let lit: Vec<(u32, u32)> = (0..px)
+                .flat_map(|dy| (0..px).map(move |dx| (960 + dx, 540 + dy)))
+                .collect();
+            let (level, texels) = level0_of(&r, size, &lit, radiance, &glow).expect("chain");
+            added_light(size, level, &texels)
+        };
+        for (px, radiance) in [(1u32, 30.0f32), (2, 10.0), (4, 4.0), (8, 4.0), (32, 4.0)] {
+            let above = (px * px) as f64 * (radiance as f64 - 1.0);
+            let ratio = added(px, radiance) / above;
+            assert!((ratio - 1.0).abs() < 0.02, "{px} px of {radiance}: {ratio}");
+        }
+        let spike = added(1, 500.0);
+        let limited = limit(Vec3::splat(499.0)).x as f64;
+        assert!((spike / limited - 1.0).abs() < 0.02, "{spike} vs {limited}");
+        assert!(limited < 64.0);
+    }
+
+    /// CPU mirror of `bloom_limit` in bloom.wgsl.
+    fn limit(c: Vec3) -> Vec3 {
+        const KNEE: f32 = 32.0;
+        let br = c.max_element();
+        if br <= KNEE {
+            return c;
+        }
+        let x = br - KNEE;
+        c * ((KNEE + x / (1.0 + x / KNEE)) / br)
+    }
+
+    #[test]
+    fn firefly_limit_is_continuous_and_bounded() {
+        assert_eq!(limit(Vec3::new(20.0, 5.0, 1.0)), Vec3::new(20.0, 5.0, 1.0));
+        let at = |v: f32| limit(Vec3::splat(v)).x;
+        assert!((at(32.0 + 1e-3) - 32.0).abs() < 1e-2, "continuous at the knee");
+        // Slope 1 at the knee, falling; never above 64.
+        assert!((at(33.0) - at(32.0) - 1.0).abs() < 0.05);
+        let mut last = 0.0;
+        for v in [1.0, 10.0, 32.0, 40.0, 64.0, 100.0, 1e3, 1e5] {
+            assert!(at(v) >= last && at(v) < 64.0, "{v}: {}", at(v));
+            last = at(v);
+        }
+        // The hue is kept.
+        let c = limit(Vec3::new(200.0, 100.0, 50.0));
+        assert!((c.y / c.x - 0.5).abs() < 1e-6 && (c.z / c.x - 0.25).abs() < 1e-6);
     }
 
     #[test]

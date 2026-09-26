@@ -846,6 +846,190 @@ pub(crate) fn histogram_target(samples: impl IntoIterator<Item = (f32, f32)>, ae
 mod tests {
     use super::*;
 
+    /// GPU milliseconds of metering a 1920 × 1080 rect on `path`, the GPU loaded: `rounds`
+    /// command buffers of `runs` meterings between two empty timestamped passes, best round.
+    /// `None` without an adapter, `TIMESTAMP_QUERY` or the path.
+    fn gpu_ms_per_metering(path: MeterPath, runs: u32, rounds: u32) -> Option<f64> {
+        let r = pollster::block_on(crate::Renderer::new_headless(64, 64)).ok()?;
+        let caps = r.graphics_caps().clone();
+        if !caps.timestamps {
+            return None;
+        }
+        let format = caps.exposure_format?;
+        if path == MeterPath::Compute && !(caps.compute_histogram && format == wgpu::TextureFormat::R32Float) {
+            return None;
+        }
+        let (device, queue) = (r.device(), r.queue());
+        let size = (1920u32, 1080u32);
+        let scene_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("exposure gate scene"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // A gradient over 12 stops: every bin range is used.
+        let mut data = Vec::with_capacity((size.0 * size.1 * 4) as usize);
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let v = crate::instance::f32_to_f16((x as f32 / size.0 as f32 * 12.0 - 8.0 + y as f32 * 1e-3).exp2());
+                data.extend_from_slice(&[v, v, v, crate::instance::f32_to_f16(1.0)]);
+            }
+        }
+        queue.write_texture(
+            scene_texture.as_image_copy(),
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.0 * 8),
+                rows_per_image: None,
+            },
+            scene_texture.size(),
+        );
+        let scene = scene_texture.create_view(&Default::default());
+        let align = device.limits().min_uniform_buffer_offset_alignment as usize;
+        let mut meters = Meters::new(align);
+        let camera = space3d_core::World::new().spawn(());
+        let rect = [0, 0, size.0, size.1];
+        let mut reallocs = 0;
+        meters.begin_frame();
+        let plan = meters.plan(
+            camera,
+            rect,
+            &AutoExposure::on(),
+            (path, format),
+            1.0 / 60.0,
+            &mut reallocs,
+        );
+        let mut up = Uploader::new(device);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        meters.flush(device, &mut encoder, &mut up);
+        up.finish();
+        queue.submit([encoder.finish()]);
+        let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("exposure gate"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2 * rounds,
+        });
+        let bytes = 16 * rounds as u64;
+        let buffer = |usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("exposure gate"),
+                size: bytes,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let resolve = buffer(wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
+        let read = buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        let marker = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("exposure gate marker"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let mut pool = crate::frame::TexturePool::default();
+        let mut stats = crate::RenderStats::default();
+        let mut record = |encoder: &mut wgpu::CommandEncoder, timed: Option<u32>| {
+            let mark = |encoder: &mut wgpu::CommandEncoder, begin: Option<u32>, end: Option<u32>| {
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &marker,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
+                        query_set: &queries,
+                        beginning_of_pass_write_index: begin,
+                        end_of_pass_write_index: end,
+                    }),
+                    ..Default::default()
+                });
+            };
+            if let Some(round) = timed {
+                mark(encoder, None, Some(2 * round));
+            }
+            for _ in 0..runs {
+                pool.begin_frame(0);
+                let mut cx = PostEncode {
+                    device,
+                    queue,
+                    encoder,
+                    stats: &mut stats,
+                    pool: &mut pool,
+                };
+                meters
+                    .encode(&mut cx, camera, plan, (&scene, 1), rect, false)
+                    .expect("metered");
+                pool.release_all();
+            }
+            if let Some(round) = timed {
+                mark(encoder, Some(2 * round + 1), None);
+            }
+        };
+        for _ in 0..30 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            record(&mut encoder, None);
+            queue.submit([encoder.finish()]);
+        }
+        for round in 0..rounds {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            record(&mut encoder, Some(round));
+            queue.submit([encoder.finish()]);
+        }
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.resolve_query_set(&queries, 0..2 * rounds, &resolve, 0);
+        encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, bytes);
+        queue.submit([encoder.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let t: Vec<u64> = bytemuck::pod_collect_to_vec(&read.slice(..).get_mapped_range().expect("mapped"));
+        let period = queue.get_timestamp_period() as f64 * 1e-6;
+        let best = t
+            .chunks(2)
+            .map(|p| p[1].saturating_sub(p[0]) as f64 * period / runs as f64)
+            .filter(|ms| *ms > 0.0)
+            .fold(f64::MAX, f64::min);
+        assert_eq!(r.gpu_error_count(), 0);
+        Some(best)
+    }
+
+    /// Measurement (spec §4.4: auto exposure 0.05 ms on T1, 0.15 ms on T2): metering a 1080p
+    /// rect on each path, the GPU loaded. Run alone: `cargo test -p space3d-render --lib
+    /// exposure_gpu_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf measurement: run alone with --ignored"]
+    fn exposure_gpu_time() {
+        for path in [MeterPath::Compute, MeterPath::RenderPasses] {
+            match gpu_ms_per_metering(path, 10, 30) {
+                Some(ms) => eprintln!("{path:?}: {ms:.4} ms GPU per 1080p metering (loaded)"),
+                None => eprintln!("{path:?}: not measurable here"),
+            }
+        }
+    }
+
     #[test]
     fn gpu_exposure_matches_wgsl() {
         for src in [compute_source(), downlevel_source()] {
