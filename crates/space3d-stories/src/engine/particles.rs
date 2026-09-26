@@ -11,13 +11,13 @@ use crate::{KnobValues, Story};
 use space3d_core::prelude::*;
 use space3d_particles::prelude::*;
 use space3d_particles::{
-    BuiltinTexture, Curve, EmitDirection, EmitShape, Facing, FadeCurve, Flicker, Flipbook, FlipbookMode, FloatRange,
-    Force, Gradient, LightFlash, ParticleBackend, ParticleBlend, RibbonFacing, RibbonProfile, RibbonUv,
-    SimulationSpace, Spawn, SpriteRender, SpriteShape, SpriteTexture,
+    BuiltinTexture, ColorRange, Curve, EmitDirection, EmitShape, Facing, FadeCurve, Flicker, Flipbook, FlipbookMode,
+    FloatRange, Force, Gradient, LightFlash, ParticleBackend, ParticleBlend, RibbonFacing, RibbonProfile, RibbonUv,
+    SimulationSpace, SortMode, Spawn, SpriteRender, SpriteShape, SpriteTexture,
 };
 use space3d_render::{
-    Camera3d, DownlevelOverride, FrameSettings, Material, Mesh3d, PostProcess, Projection, RenderTarget,
-    RenderTargetDesc, Tonemapper,
+    Camera3d, Distortion, DownlevelOverride, FrameSettings, GraphicsQuality, Material, Mesh3d, PostProcess,
+    Projection, RenderAssets, RenderTarget, RenderTargetDesc, TextureSource, Tonemapper,
 };
 
 /// This area's stories, in registry order.
@@ -52,8 +52,12 @@ pub(crate) fn stories() -> Vec<Story> {
         beams(),
         flipbook(),
         light_flashes(),
+        distortion(),
+        sorting(),
+        hdr_bloom(),
         cpu_backend(),
         stress_100k(),
+        stress_battle(),
     ]);
     stories
 }
@@ -274,7 +278,13 @@ fn hit_spark(hdr: bool) -> Story {
 
 fn engine_exhaust(hdr: bool) -> Story {
     builtin_story("Engine Exhaust", hdr, |app, k| {
-        plugin(app, ParticleSettings::default());
+        plugin(
+            app,
+            ParticleSettings {
+                quality: k.f32("quality"),
+                ..Default::default()
+            },
+        );
         lights(app);
         let cam = top_camera(app, 190.0);
         circling_ship(app, 55.0, 0.03, k.f32("throttle"), k.color("color"));
@@ -286,10 +296,12 @@ fn engine_exhaust(hdr: bool) -> Story {
          from the tint (`color` × 2, any faction color), inheriting part of the ship's velocity, \
          sparks, and a local-space glow riding the nozzle. Emission is spread over each tick's \
          motion, so the plume never clumps; `throttle` drives `ParticleEmitter::rate_scale` \
-         (0..2).",
+         (0..2); `quality` is `ParticleSettings::quality` (`for_quality`: 0.25 on Low, 0.125 on \
+         the web).",
         hdr,
     ))
     .knob_f32("throttle", 1.0, 0.0..=2.0)
+    .knob_f32("quality", 1.0, 0.0..=1.0)
     .knob_color("color", ION_BLUE)
     .tag("particles")
     .size(320, 180)
@@ -1493,6 +1505,264 @@ fn light_flashes() -> Story {
     .tag("particles")
     .size(320, 180)
     .ticks(4)
+}
+
+/// A grid far below the flight plane (`size` world units, a line every `cell`; below the reach
+/// of the effects' big camera-facing glows, which it would cut), unlit and dim: a backdrop that
+/// shows how distortion bends the image behind an effect.
+fn grid_backdrop(app: &mut App, size: f32, cell: f32) {
+    let n = 512u32;
+    let cells = (size / cell).round().max(1.0) as u32;
+    let step = n / cells;
+    let mut image = ImageData::new(n, n);
+    for y in 0..n {
+        for x in 0..n {
+            let line = x % step < 2 || y % step < 2;
+            let c = if line { [70, 92, 130, 255] } else { [10, 12, 20, 255] };
+            image.pixels[((y * n + x) * 4) as usize..][..4].copy_from_slice(&c);
+        }
+    }
+    let texture = app
+        .resources
+        .init::<RenderAssets>()
+        .add_texture(TextureSource::from_image(image));
+    let plane = mesh(app, MeshData::plane(size));
+    app.world.spawn((
+        Name("grid".into()),
+        Transform::from_xyz(0.0, -80.0, 0.0),
+        Mesh3d(plane),
+        Material::unlit(Vec4::ONE).with_texture(texture),
+    ));
+}
+
+fn distortion() -> Story {
+    Story::new("Engine/Particles/Features/Distortion", |app, k| {
+        plugin(app, ParticleSettings::default());
+        lights(app);
+        grid_backdrop(app, 640.0, 20.0);
+        let cam = top_camera(app, 230.0);
+        let post = PostProcess::default().with_distortion(Distortion {
+            enabled: k.bool("distortion"),
+            strength: k.f32("strength"),
+            ..Distortion::default()
+        });
+        let _ = app.world.insert_one(cam, post);
+        // An explosion's shockwave and heat shimmer (left), a ship's engine heat haze (middle,
+        // flying toward the camera's top) and a warp's twisting vortex (right).
+        app.spawn_effect(
+            builtin::EXPLOSION,
+            EffectSpawn::at(Vec3::new(-75.0, 0.0, 5.0)).scale(0.7).seed(71),
+        );
+        let ship = hull(
+            app,
+            Transform::from_xyz(0.0, 0.0, -15.0).with_rotation(heading(Vec3::new(0.25, 0.0, -1.0))),
+        );
+        for x in [-6.0, 6.0] {
+            let e = app.spawn_effect(
+                builtin::ENGINE_EXHAUST,
+                EffectSpawn::from_transform(Transform::from_xyz(x, 0.0, 21.0))
+                    .follow(ship)
+                    .tint(Vec4::new(0.3, 0.9, 2.0, 1.0))
+                    .seed(72 + (x > 0.0) as u32)
+                    .keep(),
+            );
+            if let Ok(mut em) = app.world.get::<&mut ParticleEmitter>(e) {
+                em.rate_scale = 1.6;
+            }
+        }
+        app.spawn_effect(
+            builtin::WARP_IN,
+            EffectSpawn::at(Vec3::new(80.0, 0.0, -10.0)).scale(0.35).seed(74),
+        );
+    })
+    .description(
+        "Distortion layers (`SpriteRender::distortion(strength)`, `SpriteTarget::Distortion`):          sprites drawn into the post group's distortion buffer instead of color, which the          composite applies (post's PO5). The built-ins carry them: `EXPLOSION`'s shockwave and          heat shimmer (left, 0.3 s in), `ENGINE_EXHAUST`'s heat haze behind a ship (middle) and          `WARP_IN`'s twisting vortex (right), over a grid on the flight plane. Ring shapes push          the image outward, vortices swirl it, glows shimmer it like heat; closer geometry is          never bent, and cameras without `PostProcess` draw nothing of them. `distortion`          toggles `PostProcess::distortion`, `strength` scales every offset.",
+    )
+    .knob_bool("distortion", true)
+    .knob_f32("strength", 1.0, 0.0..=3.0)
+    .tag("particles")
+    .size(320, 180)
+    .ticks(18)
+}
+
+/// Premultiplied smoke puffs of `color` sorted by `sort`: `n` of `size` in `shape`.
+fn smoke_puffs(color: Vec4, sort: SortMode, shape: EmitShape, n: u32, size: (f32, f32)) -> ParticleEffect {
+    ParticleEffect::new("sorting puffs").layer(ParticleLayer {
+        lod: false,
+        shape,
+        size: FloatRange::new(size.0, size.1),
+        rotation: FloatRange::new(0.0, std::f32::consts::TAU),
+        color_over_life: Gradient::constant(color),
+        start_color: ColorRange {
+            a: [0.8, 0.8, 0.8, 1.0],
+            b: [1.2, 1.2, 1.2, 1.0],
+        },
+        coverage: FloatRange::new(0.8, 0.95),
+        render: SpriteRender {
+            shape: SpriteShape::Smoke {
+                breakup: 0.5,
+                hot_core: 0.0,
+            },
+            blend: ParticleBlend::Premultiplied,
+            sort,
+            ..SpriteRender::default()
+        },
+        ..ParticleLayer::burst(n, 100.0)
+    })
+}
+
+fn sorting() -> Story {
+    Story::new("Engine/Particles/Features/Sorting", |app, _| {
+        plugin(app, ParticleSettings::default());
+        app.world.spawn((
+            Name("camera".into()),
+            Transform::from_xyz(0.0, 18.0, 88.0).looking_at(Vec3::ZERO, Vec3::Y),
+            Camera3d::default().with_clear_color(Vec4::new(0.05, 0.06, 0.09, 1.0)),
+        ));
+        // A warm core inside a cool ring of smoke, twice: two layers sorted per emitter (left),
+        // and one layer sorted per particle (right: both emitters in one sorted group).
+        let warm = Vec4::new(0.6, 0.24, 0.06, 1.0);
+        let cool = Vec4::new(0.14, 0.24, 0.4, 1.0);
+        let ring = EmitShape::Ring {
+            radius: 17.0,
+            width: 3.0,
+            arc: std::f32::consts::TAU,
+        };
+        let core = EmitShape::Sphere {
+            radius: 8.0,
+            inner: 0.0,
+        };
+        for (x, sort) in [(-28.0, SortMode::ByEmitter), (28.0, SortMode::ByDistance)] {
+            let effects = app.resources.expect_mut::<ParticleEffects>();
+            let (a, b) = (
+                effects
+                    .add(smoke_puffs(warm, sort, core, 80, (7.0, 10.0)))
+                    .expect("valid"),
+                effects
+                    .add(smoke_puffs(cool, sort, ring, 140, (5.0, 7.0)))
+                    .expect("valid"),
+            );
+            app.spawn_effect(a, EffectSpawn::at(Vec3::new(x, 0.0, 0.0)).seed(81).keep());
+            app.spawn_effect(b, EffectSpawn::at(Vec3::new(x, 0.0, 0.0)).seed(82).keep());
+        }
+    })
+    .description(
+        "Per-particle sorting (`SortMode::ByDistance`): a warm core of premultiplied smoke inside \
+         a cool ring of it, seen from above the ring's plane. Left, sorted per emitter \
+         (`ByEmitter`, the default for alpha layers): each emitter draws as a whole, so the ring \
+         covers the core also where it passes behind it. Right, `ByDistance`: every view draws \
+         the layer's particles farthest first (on the CPU for direct draws, with a bitonic sort \
+         on the GPU backend), so the ring passes in front of the core and behind it. The \
+         built-ins sort their lingering smoke this way.",
+    )
+    .tag("particles")
+    .size(320, 180)
+    .ticks(2)
+}
+
+fn hdr_bloom() -> Story {
+    Story::new("Engine/Particles/Features/HDR Bloom", |app, k| {
+        plugin(app, ParticleSettings::default());
+        let cam = front_camera(app, 100.0);
+        let tonemapper = match k.choice("tonemapper") {
+            1 => Tonemapper::AgXPunchy,
+            2 => Tonemapper::AcesFitted,
+            _ => Tonemapper::AgX,
+        };
+        let mut post = PostProcess::default()
+            .with_tonemapper(tonemapper)
+            .with_exposure(k.f32("exposure"));
+        if !k.bool("bloom") {
+            post = post.without_bloom();
+        }
+        let _ = app.world.insert_one(cam, post);
+        // Rows of sprites whose peak radiance doubles from column to column: 0.25 … 16
+        // (`Bloom::glow()` starts at 1 with a knee from 0.5).
+        let row = |color: Vec4, size: f32, core: f32| ParticleLayer {
+            lod: false,
+            size: FloatRange::constant(size),
+            color_over_life: Gradient::constant(color),
+            render: SpriteRender::additive(SpriteShape::Glow { core, hardness: 0.0 }),
+            ..ParticleLayer::burst(1, 100.0)
+        };
+        let rows = [
+            (26.0, row(Vec4::new(1.0, 0.45, 0.12, 1.0), 3.0, 0.0)),
+            (5.0, row(Vec4::new(0.15, 0.55, 1.0, 1.0), 14.0, 0.0)),
+            (-22.0, row(Vec4::new(1.0, 0.5, 0.15, 1.0), 16.0, 2.0)),
+        ];
+        for (r, (y, layer)) in rows.into_iter().enumerate() {
+            let fx = app
+                .resources
+                .expect_mut::<ParticleEffects>()
+                .add(ParticleEffect::new("hdr row").layer(layer))
+                .expect("valid");
+            for i in 0..7 {
+                let radiance = 0.25 * 2f32.powi(i);
+                app.spawn_effect(
+                    fx,
+                    EffectSpawn::at(Vec3::new(-72.0 + 24.0 * i as f32, y, 0.0))
+                        .tint(Vec4::new(radiance, radiance, radiance, 1.0))
+                        .seed(90 + 10 * r as u32 + i as u32)
+                        .keep(),
+                );
+            }
+        }
+    })
+    .description(
+        "HDR intensity calibration against `Bloom::glow()` (threshold 1, knee 0.5, additive \
+         0.35) and AgX: sprites whose peak radiance doubles from column to column, 0.25, 0.5, 1, \
+         2, 4, 8 and 16 — small sparks (top), wide glows (middle) and glows with a white-hot \
+         core of 2× (bottom). Below the knee (0.5) nothing blooms; from 1 the glow grows with \
+         the energy above the threshold whatever the sprite's size, and from about 4 a sprite \
+         reads white-hot: the built-ins author bodies below 1, what should glow at 2–5 and \
+         cores, sparks and flashes at 5–16. `bloom`, `tonemapper` and `exposure` to compare.",
+    )
+    .knob_choice("tonemapper", &LOOKS, 0)
+    .knob_bool("bloom", true)
+    .knob_f32("exposure", 0.0, -2.0..=2.0)
+    .tag("particles")
+    .size(320, 180)
+    .ticks(2)
+}
+
+fn stress_battle() -> Story {
+    Story::new("Engine/Particles/Stress/Battle", |app, k| {
+        let quality = match k.choice("quality") {
+            0 => GraphicsQuality::Low,
+            1 => GraphicsQuality::Medium,
+            _ => GraphicsQuality::High,
+        };
+        plugin(app, ParticleSettings::for_quality(quality));
+        lights(app);
+        let pitch = 70f32.to_radians();
+        let cam = app.world.spawn((
+            Name("camera".into()),
+            Transform::from_xyz(0.0, 432.0 * pitch.sin(), 432.0 * pitch.cos()).looking_at(Vec3::ZERO, Vec3::Y),
+            Camera3d::default().with_clear_color(SPACE),
+        ));
+        let _ = app.world.insert_one(
+            cam,
+            PostProcess::default()
+                .with_tonemapper(Tonemapper::AgXPunchy)
+                .with_exposure(0.5),
+        );
+        space3d_particles::testing::battle(app, space3d_particles::testing::Battle::default());
+    })
+    .description(
+        "The particle load of the graphics spec's Battle reference scene (`testing::battle`), \
+         2 s in, through the game's battle camera and the recommended battle look (AgX punchy, \
+         +0.5 EV): 300 ships with three engine exhausts each (20 of them boosting), a laser bolt \
+         with its trail every tick, missiles trailing smoke into explosions, held lasers and \
+         repair beams, 30 explosions a second, hit sparks and shield ripples, debris, warps and \
+         EMPs — 100k particles at `quality` High. Lower tiers \
+         (`ParticleSettings::for_quality`) thin the off-screen emitters and the spawn counts to \
+         their budgets (Low: the CPU backend's 16k) without dropping what is in view.",
+    )
+    .knob_choice("quality", &["Low", "Medium", "High"], 2)
+    .tag("particles")
+    .tag("perf")
+    .size(320, 180)
+    .ticks(120)
 }
 
 fn cpu_backend() -> Story {

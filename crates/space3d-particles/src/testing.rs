@@ -199,10 +199,21 @@ pub fn battle(app: &mut App, b: Battle) {
         }
         ships.push(ship);
     }
-    // Held lasers and repair beams between neighbouring ships.
-    let n = ships.len().max(1);
+    // Held lasers and repair beams between a ship and its nearest neighbour.
+    let n = ships.len();
     for i in 0..(b.beams.0 + b.beams.1) as usize {
-        let (from, to) = (ships[(i * 7) % n], ships[(i * 7 + 1) % n]);
+        if n < 2 {
+            break;
+        }
+        let k = (i * 7) % n;
+        let near = (0..n)
+            .filter(|&j| j != k)
+            .min_by(|&x, &y| {
+                let d = |j: usize| orbits[j].anchor.distance_squared(orbits[k].anchor);
+                d(x).total_cmp(&d(y))
+            })
+            .unwrap_or(k);
+        let (from, to) = (ships[k], ships[near]);
         let (fx, tint) = if i < b.beams.0 as usize {
             (builtin::LASER_BEAM, lasers[i % 3])
         } else {
