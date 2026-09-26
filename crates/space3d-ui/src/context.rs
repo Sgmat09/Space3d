@@ -345,9 +345,11 @@ pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator,
     let injected = std::mem::take(&mut e.injected);
 
     let mut events = Vec::new();
-    if let Some(input) = sys.resources.get::<Input>() {
-        translator.translate(input, ppp, time, &clipboard, &mut events);
-    }
+    translator.focus(focused, &mut events);
+    let cancelled = sys
+        .resources
+        .get::<Input>()
+        .is_some_and(|input| translator.translate(input, ppp, time, &clipboard, &mut events));
     events.extend(injected);
     if let Some(o) = sys.resources.get_mut::<RenderOverlays>() {
         o.set_scale_factor(ppp);
@@ -381,6 +383,11 @@ pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator,
     e.screen_size_px = size;
     e.available_rect = screen;
     e.root_uis = 0;
+    if cancelled && e.ctx.plugin_opt::<egui::DragAndDrop>().is_some() {
+        // A release was cancelled (focus loss, a release only the OS saw): whatever was being
+        // dragged is dropped nowhere.
+        egui::DragAndDrop::clear_payload(&e.ctx);
+    }
     e.ctx.begin_pass(raw);
     e.in_pass = true;
     // `run_ui`'s top-level ui, handed to the plugins' begin hooks now and end hooks in

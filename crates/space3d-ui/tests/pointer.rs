@@ -1,9 +1,11 @@
-//! The pointer through egui: plugin pass hooks (label selection, drag-and-drop, debug text).
-//! Headless: no GPU, no window.
+//! The pointer through egui: plugin pass hooks (label selection, drag-and-drop, debug text),
+//! button events in order, window focus, releases outside the window and cancelled releases
+//! (focus loss, releases only the OS saw). Headless: no GPU, no window; focus changes are
+//! driven like the window runner does (`WindowState::focused` + `Input::release_all`).
 
 use space3d_core::glam::UVec2;
 use space3d_core::prelude::*;
-use space3d_platform::{Input, MouseButton, WindowState};
+use space3d_platform::{Input, KeyCode, MouseButton, WindowState};
 use space3d_ui::*;
 use std::sync::{Arc, Mutex};
 
@@ -174,6 +176,18 @@ fn click(app: &mut App, p: egui::Pos2) {
     up(app, MouseButton::Left);
 }
 
+/// The window loses the focus: what the window runner does on `WindowEvent::Focused(false)`.
+fn blur(app: &mut App) {
+    app.resources.expect_mut::<WindowState>().focused = false;
+    input(app).release_all();
+    app.step_ticks(1);
+}
+
+fn refocus(app: &mut App) {
+    app.resources.expect_mut::<WindowState>().focused = true;
+    app.step_ticks(1);
+}
+
 /// Move over every row, one per frame, no button held: whether egui held the primary button
 /// after each move.
 fn sweep(app: &mut App) -> Vec<bool> {
@@ -325,4 +339,327 @@ fn custom_plugin_hooks_run_once_per_pass() {
     e.register_pass_hooks::<OtherHookLog>();
     app.step_ticks(2);
     assert_eq!(*other.lock().unwrap(), ["begin", "end"].repeat(2));
+}
+
+// ---- 3. button events in order --------------------------------------------------------------
+
+/// A release and a new press within one frame (the second click of a fast double click) leave
+/// egui's button down, like `Input`'s: the old translation sent the press before the release.
+#[test]
+fn release_and_press_in_one_frame_keep_the_button_down() {
+    let mut app = page_app();
+    let empty = egui::pos2(900.0, 600.0);
+    to(&mut app, empty);
+    down(&mut app, MouseButton::Left);
+    assert!(page(&app).primary_down);
+    let input = input(&mut app);
+    input.inject_mouse_button_up(MouseButton::Left);
+    input.inject_mouse_button_down(MouseButton::Left);
+    app.step_ticks(1);
+    assert!(input_pressed(&mut app, MouseButton::Left));
+    assert!(page(&app).primary_down, "egui holds the button like Input");
+}
+
+fn input_pressed(app: &mut App, b: MouseButton) -> bool {
+    input(app).mouse_pressed(b)
+}
+
+/// Double-click-and-drag: the second press follows the first release in the same frame and the
+/// drag that follows moves the slider.
+#[test]
+fn double_click_and_drag_keeps_dragging() {
+    let mut app = page_app();
+    let slider = page(&app).slider_rect;
+    let start = slider.center();
+    to(&mut app, start);
+    down(&mut app, MouseButton::Left);
+    let input = input(&mut app);
+    input.inject_mouse_button_up(MouseButton::Left);
+    input.inject_mouse_button_down(MouseButton::Left);
+    app.step_ticks(1);
+    let before = page(&app).slider;
+    to(&mut app, start + egui::vec2(30.0, 0.0));
+    to(&mut app, start + egui::vec2(60.0, 0.0));
+    assert!(
+        page(&app).slider > before,
+        "the drag after the double click moved the slider"
+    );
+    up(&mut app, MouseButton::Left);
+}
+
+// ---- 4. window focus ------------------------------------------------------------------------
+
+/// egui forgets keys it holds when the window loses the focus (`Event::WindowFocused(false)`).
+#[test]
+fn focus_loss_reaches_egui() {
+    let mut app = page_app();
+    // A key egui holds that `Input` knows nothing of (an IME, a custom platform...).
+    app.resources.expect_mut::<EguiContext>().push_event(egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    input(&mut app).inject_key_down(KeyCode::ShiftLeft);
+    app.step_ticks(1);
+    assert!(ctx(&app).input(|i| i.key_down(egui::Key::A) && i.modifiers.shift));
+    blur(&mut app);
+    let (focused, a_down, events) = ctx(&app).input(|i| (i.focused, i.key_down(egui::Key::A), i.raw.events.clone()));
+    assert!(!focused);
+    assert!(events.contains(&egui::Event::WindowFocused(false)), "{events:?}");
+    assert!(!a_down, "egui forgot the key");
+    refocus(&mut app);
+    let events = ctx(&app).input(|i| i.raw.events.clone());
+    assert!(events.contains(&egui::Event::WindowFocused(true)), "{events:?}");
+    app.step_ticks(1);
+    let events = ctx(&app).input(|i| i.raw.events.clone());
+    assert!(
+        !events.iter().any(|e| matches!(e, egui::Event::WindowFocused(_))),
+        "sent on changes only"
+    );
+}
+
+// ---- 5. releases outside the window ---------------------------------------------------------
+
+/// A drag that ends outside the window: the release is sent where the pointer was last seen and
+/// the pointer is gone again afterwards — not at (0, 0), where the corner window would get
+/// the hover and the pointer would be over the UI.
+#[test]
+fn release_outside_the_window_is_not_sent_to_the_corner() {
+    let mut app = page_app();
+    let slider = page(&app).slider_rect;
+    to(&mut app, slider.center());
+    down(&mut app, MouseButton::Left);
+    let edge = egui::pos2(1275.0, slider.center().y);
+    to(&mut app, edge);
+    let dragged_to = page(&app).slider;
+    assert_eq!(dragged_to, 100.0, "the slider followed");
+    input(&mut app).inject_mouse_left();
+    app.step_ticks(1);
+    up(&mut app, MouseButton::Left);
+    let (hover, interact) = ctx(&app).input(|i| (i.pointer.hover_pos(), i.pointer.interact_pos()));
+    assert_eq!(hover, None, "the pointer is still outside");
+    assert_eq!(interact, Some(edge), "released where it was last seen");
+    assert!(!page(&app).primary_down);
+    assert!(!page(&app).corner_hovered);
+    assert_eq!(page(&app).slider, dragged_to, "the release did not move the slider");
+    app.step_ticks(1);
+    let e = app.resources.expect::<EguiContext>();
+    assert!(!e.is_pointer_over_ui() && !e.wants_pointer_input());
+    assert!(!page(&app).corner_hovered);
+    assert_eq!(ctx(&app).input(|i| i.pointer.interact_pos()), None);
+}
+
+// ---- cancelled releases ---------------------------------------------------------------------
+
+/// A button pressed, then the window loses the focus: the release that `Input` gets is no
+/// click (switching away cancels, like native apps).
+#[test]
+fn focus_loss_release_is_not_a_click() {
+    let mut app = page_app();
+    let button = page(&app).button.center();
+    to(&mut app, button);
+    down(&mut app, MouseButton::Left);
+    assert!(page(&app).primary_down);
+    blur(&mut app);
+    assert!(!input_pressed(&mut app, MouseButton::Left), "Input released it");
+    assert!(!page(&app).primary_down, "egui too");
+    assert_eq!(page(&app).clicks, 0, "no click");
+    refocus(&mut app);
+    click(&mut app, button);
+    assert_eq!(page(&app).clicks, 1, "a real click after the focus came back");
+    assert_eq!(page(&app).double_clicks, 0, "and not a double click");
+}
+
+/// A drag-and-drop over a drop zone, then the focus goes: nothing is dropped, the payload ends.
+#[test]
+fn focus_loss_cancels_drag_and_drop() {
+    let mut app = page_app();
+    let source = page(&app).source.center();
+    let zone = page(&app).zone.center();
+    to(&mut app, source);
+    down(&mut app, MouseButton::Left);
+    for k in 1..=4 {
+        to(&mut app, source + (zone - source) * (k as f32 / 4.0));
+    }
+    assert!(has_payload(&app), "dragging over the zone");
+    blur(&mut app);
+    assert_eq!(page(&app).dropped, 0, "no drop");
+    assert!(!has_payload(&app), "the payload ends");
+    refocus(&mut app);
+    app.step_ticks(2);
+    assert_eq!(page(&app).dropped, 0);
+    assert!(!page(&app).primary_down);
+
+    // A real drop still works.
+    to(&mut app, source);
+    down(&mut app, MouseButton::Left);
+    for k in 1..=4 {
+        to(&mut app, source + (zone - source) * (k as f32 / 4.0));
+    }
+    up(&mut app, MouseButton::Left);
+    assert_eq!(page(&app).dropped, 1);
+}
+
+/// A slider dragged when the focus goes stops where it was, and does not follow the pointer
+/// after.
+#[test]
+fn focus_loss_stops_a_slider_where_it_was() {
+    let mut app = page_app();
+    let slider = page(&app).slider_rect.center();
+    to(&mut app, slider);
+    down(&mut app, MouseButton::Left);
+    to(&mut app, slider + egui::vec2(20.0, 0.0));
+    let value = page(&app).slider;
+    assert!(value > 50.0, "{value}");
+    blur(&mut app);
+    assert_eq!(page(&app).slider, value, "unchanged by the cancel");
+    to(&mut app, slider - egui::vec2(40.0, 0.0));
+    refocus(&mut app);
+    to(&mut app, slider - egui::vec2(60.0, 0.0));
+    assert_eq!(page(&app).slider, value, "the drag ended with the focus loss");
+    assert_eq!(page(&app).highlighted, 0);
+}
+
+/// A release only the OS saw (the release event went elsewhere) is treated like a focus loss:
+/// no click, no drop.
+#[test]
+fn os_reconciled_release_is_neither_click_nor_drop() {
+    use space3d_platform::MouseButtonCause;
+    let mut app = page_app();
+    let button = page(&app).button.center();
+    to(&mut app, button);
+    down(&mut app, MouseButton::Left);
+    input(&mut app).release_mouse_button(MouseButton::Left, MouseButtonCause::OsReconciled);
+    app.step_ticks(1);
+    assert!(!page(&app).primary_down);
+    assert_eq!(page(&app).clicks, 0, "no click");
+
+    let source = page(&app).source.center();
+    let zone = page(&app).zone.center();
+    to(&mut app, source);
+    down(&mut app, MouseButton::Left);
+    for k in 1..=4 {
+        to(&mut app, source + (zone - source) * (k as f32 / 4.0));
+    }
+    assert!(has_payload(&app));
+    input(&mut app).release_mouse_button(MouseButton::Left, MouseButtonCause::OsReconciled);
+    app.step_ticks(1);
+    assert_eq!(page(&app).dropped, 0, "no drop");
+    assert!(!has_payload(&app));
+    click(&mut app, button);
+    assert_eq!(page(&app).clicks, 1);
+}
+
+/// Games see the focus loss's releases as cancels in `Input::mouse_button_events`.
+#[test]
+fn games_can_tell_cancelled_releases_apart() {
+    let mut app = page_app();
+    app.init_resource::<Vec<(bool, bool)>>();
+    app.add_system(Stage::Update, |sys| {
+        let seen: Vec<(bool, bool)> = sys
+            .resources
+            .expect::<Input>()
+            .mouse_button_events()
+            .iter()
+            .map(|e| (e.pressed, e.cancelled()))
+            .collect();
+        sys.resources.expect_mut::<Vec<(bool, bool)>>().extend(seen);
+    });
+    click(&mut app, egui::pos2(900.0, 600.0));
+    down(&mut app, MouseButton::Left);
+    blur(&mut app);
+    assert_eq!(
+        *app.resources.expect::<Vec<(bool, bool)>>(),
+        [(true, false), (false, false), (true, false), (false, true)]
+    );
+}
+
+/// A selectable label pressed when the focus goes: nothing gets selected afterwards.
+#[test]
+fn focus_loss_during_a_press_on_text_selects_nothing() {
+    let mut app = page_app();
+    let at = first_row(&app);
+    to(&mut app, at);
+    down(&mut app, MouseButton::Left);
+    blur(&mut app);
+    refocus(&mut app);
+    assert_eq!(sweep(&mut app), [false; ROWS]);
+    assert_eq!(page(&app).highlighted, 0);
+}
+
+/// A window dragged by its title bar stops with the focus loss; clicks work once it is back,
+/// and a text field keeps the keyboard across the focus change.
+#[test]
+fn focus_loss_ends_a_window_drag_and_text_fields_keep_the_keyboard() {
+    #[derive(Default)]
+    struct Win {
+        rect: Option<egui::Rect>,
+        text: String,
+        field: Option<egui::Rect>,
+        field_focused: bool,
+    }
+    let mut app = App::new();
+    app.add_plugin(UiPlugin::deterministic());
+    app.insert_resource(window_state());
+    app.init_resource::<Win>();
+    app.add_ui_system(|ctx: &egui::Context, sys: &mut SystemCtx| {
+        let win = sys.resources.expect_mut::<Win>();
+        let shown = egui::Window::new("Drag me")
+            .default_pos([400.0, 200.0])
+            .show(ctx, |ui| {
+                let r = ui.text_edit_singleline(&mut win.text);
+                win.field = Some(r.rect);
+                win.field_focused = r.has_focus();
+            });
+        win.rect = shown.map(|s| s.response.rect);
+    });
+    app.step_ticks(2);
+    let win = |app: &App| app.resources.expect::<Win>().rect.unwrap();
+    let bar = win(&app).center_top() + egui::vec2(0.0, 8.0);
+    to(&mut app, bar);
+    down(&mut app, MouseButton::Left);
+    for k in 1..=4 {
+        to(&mut app, bar + egui::vec2(20.0, 10.0) * k as f32);
+    }
+    let moved_to = win(&app);
+    assert!(moved_to.min.x > 450.0, "{moved_to:?}");
+    blur(&mut app);
+    for k in 1..=4 {
+        to(&mut app, bar + egui::vec2(-20.0, 30.0) * k as f32);
+    }
+    refocus(&mut app);
+    to(&mut app, bar);
+    assert_eq!(win(&app), moved_to, "the drag ended with the focus loss");
+
+    let field = app.resources.expect::<Win>().field.unwrap().center();
+    click(&mut app, field);
+    assert!(app.resources.expect::<Win>().field_focused);
+    input(&mut app).inject_text("ab");
+    app.step_ticks(1);
+    blur(&mut app);
+    refocus(&mut app);
+    input(&mut app).inject_text("c");
+    app.step_ticks(1);
+    assert_eq!(app.resources.expect::<Win>().text, "abc");
+}
+
+/// A button released while the UI was disabled does not stay held in egui.
+#[test]
+fn a_release_while_the_ui_is_disabled_does_not_stick() {
+    let mut app = page_app();
+    let button = page(&app).button.center();
+    to(&mut app, button);
+    down(&mut app, MouseButton::Left);
+    app.resources.expect_mut::<EguiContext>().set_enabled(false);
+    up(&mut app, MouseButton::Left);
+    app.resources.expect_mut::<EguiContext>().set_enabled(true);
+    app.step_ticks(1);
+    assert!(!page(&app).primary_down);
+    assert_eq!(page(&app).clicks, 0, "a cancel: the release was not seen");
+    sweep(&mut app);
+    assert_eq!(page(&app).highlighted, 0);
+    click(&mut app, button);
+    assert_eq!(page(&app).clicks, 1);
 }
