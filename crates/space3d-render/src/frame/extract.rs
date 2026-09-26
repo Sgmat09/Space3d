@@ -216,26 +216,6 @@ impl MaterialKey {
             shader: m.shader,
         }
     }
-
-    /// Slot in [`MaterialTable`]'s direct-mapped cache (a cheap multiplicative hash).
-    pub(super) fn cache_slot(&self) -> usize {
-        let handle = |t: Option<TextureHandle>| t.map_or(0, |t| (t.index() + 1) ^ t.generation().rotate_left(16));
-        let sh = self
-            .shader
-            .map_or(0, |s| (s.index() + 1) ^ s.generation().rotate_left(16));
-        let bits = self.flags as u32
-            | (self.blend.class_bits() as u32) << 8
-            | (self.uv1_maps as u32) << 16
-            | (self.render_order as u16 as u32) << 8;
-        let mut h = (bits ^ sh.rotate_left(8)).wrapping_mul(0x9E37_79B1);
-        for t in self.maps {
-            h = (h.rotate_left(5) ^ handle(t)).wrapping_mul(0x9E37_79B1);
-        }
-        for w in self.words {
-            h = (h.rotate_left(5) ^ w).wrapping_mul(0x9E37_79B1);
-        }
-        (h >> (32 - MATERIAL_CACHE.trailing_zeros())) as usize
-    }
 }
 
 pub(super) struct MatEntry {
@@ -323,9 +303,9 @@ impl TextureSetEntry {
 /// Slots of the direct-mapped cache in front of the material map (a power of two).
 const MATERIAL_CACHE: usize = 64;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct CachedMaterial {
-    pub(super) key: MaterialKey,
+    pub(super) material: Material,
     pub(super) id: u32,
     pub(super) class: u8,
     /// Frame whose `last_used` this entry already refreshed.
@@ -336,18 +316,18 @@ pub(super) struct CachedMaterial {
 /// sets to one bind group each.
 ///
 /// Every ECS entity carries its `Material` by value, so interning runs once per entity per
-/// frame. The last material seen answers most of those with one comparison of the material
-/// (neighbouring entities mostly share materials); a small direct-mapped cache of keys answers
-/// almost all the others (a scene rarely uses more materials at once than the cache has slots);
-/// only misses hash and probe the map.
+/// frame. The last material seen answers most of those with one branch-free comparison of the
+/// material (neighbouring entities mostly share materials); a small direct-mapped cache of
+/// materials, addressed by a cheap hash of their fields, answers almost all the others (a
+/// scene rarely uses more materials at once than the cache has slots); only misses build a
+/// [`MaterialKey`] and probe the map.
 pub(crate) struct MaterialTable {
     pub(super) map: FastMap<MaterialKey, u32>,
     pub(super) entries: Vec<MatEntry>,
     pub(super) free: Vec<u32>,
     pub(super) cache: [Option<CachedMaterial>; MATERIAL_CACHE],
-    pub(super) last: Option<CachedMaterial>,
-    /// The material `last` was interned for (the per-entity fast path compares it).
-    pub(super) last_material: Option<Material>,
+    /// The cache slot of the last material interned (the per-entity fast path compares it).
+    pub(super) last: Option<usize>,
     /// Interns that missed the cache (tests).
     pub(super) misses: u64,
     /// Texture sets by maps, and the sets.
@@ -381,9 +361,8 @@ impl Default for MaterialTable {
             map: FastMap::default(),
             entries: Vec::new(),
             free: Vec::new(),
-            cache: [None; MATERIAL_CACHE],
+            cache: std::array::from_fn(|_| None),
             last: None,
-            last_material: None,
             misses: 0,
             set_map: FastMap::default(),
             sets: Vec::new(),
@@ -399,6 +378,79 @@ impl Default for MaterialTable {
             ext_warned: Vec::new(),
         }
     }
+}
+
+/// Slot of `m` in [`MaterialTable`]'s direct-mapped cache: a cheap hash of the fields that
+/// usually tell materials apart (rotate-xor folds, which pipeline, and one multiply). Equal
+/// materials land in the same slot; the rest only matters for how well the cache spreads.
+#[inline]
+fn cache_slot(m: &Material) -> usize {
+    let handle = |t: Option<TextureHandle>| t.map_or(0, |t| (t.index() + 1) ^ t.generation().rotate_left(16));
+    let b = m.base_color;
+    let e = m.emissive;
+    let mut h = (m.unlit as u32) | (m.double_sided as u32) << 1 | (m.alpha_blend as u32) << 2;
+    h ^= m.blend.class_bits() as u32 ^ (m.render_order as u16 as u32) << 16;
+    h ^= m
+        .shader
+        .map_or(0, |s| (s.index() + 1) ^ s.generation().rotate_left(16))
+        .rotate_left(8);
+    for (i, w) in [b.x, b.y, b.z, b.w, m.metallic, m.roughness, e.x, e.y, e.z]
+        .into_iter()
+        .enumerate()
+    {
+        h ^= w.to_bits().rotate_left(7 * i as u32 + 1);
+    }
+    for (i, t) in [
+        m.base_color_texture,
+        m.normal_texture,
+        m.metallic_roughness_texture,
+        m.occlusion_texture,
+        m.emissive_texture,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        h ^= handle(t).rotate_left(5 * i as u32 + 3);
+    }
+    let h = h.wrapping_mul(0x9E37_79B1) ^ (h >> 15);
+    (h.wrapping_mul(0x85EB_CA6B) >> (32 - MATERIAL_CACHE.trailing_zeros())) as usize
+}
+
+/// Whether two materials are the same for interning (their `MaterialKey`s are equal): every
+/// field compared by bits, folded without branches — the per-entity fast path of
+/// [`MaterialTable::intern`], so it must stay cheaper than building a key.
+#[inline(always)]
+fn same_material(a: &Material, b: &Material) -> bool {
+    let f = |x: f32, y: f32| x.to_bits() ^ y.to_bits();
+    let h = |x: Option<TextureHandle>, y: Option<TextureHandle>| (x != y) as u32;
+    let (ab, bb, ae, be) = (a.base_color, b.base_color, a.emissive, b.emissive);
+    let (at, bt) = (a.uv_transform, b.uv_transform);
+    let floats = f(ab.x, bb.x)
+        | f(ab.y, bb.y)
+        | f(ab.z, bb.z)
+        | f(ab.w, bb.w)
+        | f(a.metallic, b.metallic)
+        | f(a.roughness, b.roughness)
+        | f(ae.x, be.x)
+        | f(ae.y, be.y)
+        | f(ae.z, be.z)
+        | f(a.normal_scale, b.normal_scale)
+        | f(a.occlusion_strength, b.occlusion_strength)
+        | f(a.alpha_cutoff, b.alpha_cutoff)
+        | f(at.offset.x, bt.offset.x)
+        | f(at.offset.y, bt.offset.y)
+        | f(at.rotation, bt.rotation)
+        | f(at.scale.x, bt.scale.x)
+        | f(at.scale.y, bt.scale.y);
+    let maps = h(a.base_color_texture, b.base_color_texture)
+        | h(a.normal_texture, b.normal_texture)
+        | h(a.metallic_roughness_texture, b.metallic_roughness_texture)
+        | h(a.occlusion_texture, b.occlusion_texture)
+        | h(a.emissive_texture, b.emissive_texture);
+    let small = ((a.unlit ^ b.unlit) | (a.double_sided ^ b.double_sided) | (a.alpha_blend ^ b.alpha_blend)) as u32
+        | (a.uv1_maps.0 ^ b.uv1_maps.0) as u32
+        | (a.render_order ^ b.render_order) as u16 as u32;
+    floats | small | maps == 0 && a.shader == b.shader && a.blend == b.blend && a.shadows == b.shadows
 }
 
 /// The `FLAG_*` bits a material asks for (before its set's availability).
@@ -451,7 +503,7 @@ fn gpu_material(m: &Material, flags: u32) -> GpuMaterial {
 
 impl MaterialTable {
     /// Material id and pipeline class of `m`, allocating a uniform slot for new materials.
-    #[inline]
+    #[inline(always)]
     pub(super) fn intern(
         &mut self,
         m: &Material,
@@ -460,10 +512,13 @@ impl MaterialTable {
         stride: usize,
         cpu_reallocs: &mut u32,
     ) -> (u32, u8) {
-        match &self.last {
-            Some(l) if l.frame == frame && self.last_material.as_ref() == Some(m) => (l.id, l.class),
-            _ => self.intern_cached(m, frame, buf, stride, cpu_reallocs),
+        if let Some(c) = self.last.and_then(|slot| self.cache[slot].as_ref())
+            && c.frame == frame
+            && same_material(&c.material, m)
+        {
+            return (c.id, c.class);
         }
+        self.intern_cached(m, frame, buf, stride, cpu_reallocs)
     }
 
     /// [`Self::intern`] when the material differs from the previous one (kept out of line so
@@ -477,24 +532,27 @@ impl MaterialTable {
         stride: usize,
         cpu_reallocs: &mut u32,
     ) -> (u32, u8) {
-        let key = MaterialKey::new(m);
-        self.last_material = Some(m.clone());
-        let slot = key.cache_slot();
+        let slot = cache_slot(m);
         if let Some(c) = &mut self.cache[slot]
-            && c.key == key
+            && same_material(&c.material, m)
         {
             if c.frame != frame {
                 c.frame = frame;
                 self.entries[c.id as usize].last_used = frame;
             }
-            self.last = Some(*c);
+            self.last = Some(slot);
             return (c.id, c.class);
         }
         self.misses += 1;
+        let key = MaterialKey::new(m);
         let (id, class) = self.intern_slow(m, key, frame, buf, stride, cpu_reallocs);
-        let c = CachedMaterial { key, id, class, frame };
-        self.cache[slot] = Some(c);
-        self.last = Some(c);
+        self.cache[slot] = Some(CachedMaterial {
+            material: m.clone(),
+            id,
+            class,
+            frame,
+        });
+        self.last = Some(slot);
         (id, class)
     }
 
@@ -579,9 +637,8 @@ impl MaterialTable {
         }
         if freed {
             // Freed ids get reused for other materials: forget every cached key → id.
-            self.cache = [None; MATERIAL_CACHE];
+            self.cache = std::array::from_fn(|_| None);
             self.last = None;
-            self.last_material = None;
             self.set_refs.clear();
             self.set_refs.resize(self.sets.len(), false);
             for e in self.entries.iter().filter(|e| e.live) {
@@ -1363,6 +1420,14 @@ mod material_tests {
             let k = MaterialKey::new(v);
             assert!(!keys.contains(&k), "{v:?}");
             keys.push(k);
+        }
+        // The per-entity fast path agrees with the keys.
+        let all: Vec<&Material> = std::iter::once(&base).chain(&variants).collect();
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(same_material(a, b), i == j, "{a:?} vs {b:?}");
+            }
+            assert!(same_material(a, &(*a).clone()));
         }
         let mut table = MaterialTable::default();
         let mut buf = TrackedBuffer::new("test", wgpu::BufferUsages::UNIFORM);

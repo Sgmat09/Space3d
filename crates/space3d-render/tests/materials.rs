@@ -769,3 +769,60 @@ fn ext_stream_follows_arena_growth_and_updates() {
     assert_eq!(px(&updated, 8, 16)[..3], [255, 0, 0]);
     assert_eq!(px(&updated, 24, 16)[..3], [0, 0, 255]);
 }
+
+/// A static scene with every map, the extension stream and a sorted transparent batch uploads
+/// nothing once warm (texture sets resolved, uniforms and sorted instances diffed), creates no
+/// texture and reallocates nothing.
+#[test]
+fn static_scene_with_maps_uploads_nothing() {
+    let Some(mut app) = app_with(64, 64, 1) else { return };
+    app.resources.expect_mut::<LightingSettings>().transparent_sort =
+        TransparentSort::PerInstance { max_instances: 64 };
+    app.world.spawn((
+        Transform::from_xyz(0.0, 0.0, 6.0),
+        Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 0.0, 1.0)),
+    ));
+    spawn_sun(&mut app);
+    let map = normal_map(&mut app, Vec3::new(0.3, 0.1, 1.0));
+    let orm = linear_image(&mut app, [200, 128, 255, 255]);
+    let tex = red_blue(&mut app);
+    let extras = MeshExtras::new()
+        .with_tangents(vec![[1.0, 0.0, 0.0, 1.0]; 4])
+        .with_uvs1(vec![[0.75, 0.5]; 4]);
+    let a = app.resources.expect_mut::<RenderAssets>();
+    let mesh = a.add_mesh_with(quad(0.4, Vec3::Z), extras);
+    let material = Material::color(Vec4::ONE)
+        .with_normal_map(map, 1.0)
+        .with_orm_map(orm)
+        .with_emissive_map(tex, Vec3::splat(0.5))
+        .with_uv1_maps(MapMask::EMISSIVE);
+    for i in 0..6 {
+        app.world.spawn((
+            Transform::from_xyz(i as f32 - 2.5, 0.8, 0.0),
+            Mesh3d(mesh),
+            material.clone(),
+        ));
+        app.world.spawn((
+            Transform::from_xyz(i as f32 * 0.3 - 0.8, -0.8, -(i as f32) * 0.2),
+            Mesh3d(mesh),
+            Material::unlit(Vec4::new(0.2, 0.9, 0.4, 0.5)).with_blend(BlendMode::AlphaBlend),
+        ));
+    }
+    for _ in 0..4 {
+        render(&mut app);
+    }
+    for _ in 0..3 {
+        render(&mut app);
+        let s = stats(&app);
+        assert_eq!(
+            (
+                s.bytes_uploaded,
+                s.textures_created,
+                s.cpu_reallocations,
+                s.buffer_reallocations
+            ),
+            (0, 0, 0, 0),
+            "{s:?}"
+        );
+    }
+}
