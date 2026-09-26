@@ -7,7 +7,8 @@
 //! (manual), the tonemapper and dither work since the frame milestone F4, bloom since PO1, FXAA,
 //! vignette, chromatic aberration and film grain since PO3, auto exposure since PO2, color
 //! grading (white balance, saturation, contrast, lift/gamma/gain, 3D LUTs, WGSL hooks) since
-//! PO4; the distortion apply arrives with PO5 (docs/graphics/post.md).
+//! PO4, distortion (the composite's apply, [`DistortionMaterial`] meshes and the writer API
+//! [`DISTORTION_WGSL`] for render nodes such as particles) since PO5 (docs/graphics/post.md).
 
 use crate::assets::{AddressMode, FilterMode, SamplerSettings, TextureSource};
 use crate::handles::{ShaderHandle, TextureHandle};
@@ -506,20 +507,26 @@ pub enum DistortionResolution {
 
 /// Component: draws the entity's mesh (`Mesh3d` + `GlobalTransform`, optional `Visibility`; no
 /// `Material` needed) into the distortion buffer of every post camera that sees it (node
-/// `"space3d/distortion-meshes"`), instead of into color. Occluded by scene depth where the
-/// device can sample it.
+/// `"space3d/distortion-meshes"`), instead of into color — with a `Material` too, it draws in
+/// both. Occluded by scene depth where the device can sample it (not on GL with MSAA).
+///
+/// Offsets are laid out in the mesh's UV space and turned onto the screen with it (a rotated
+/// quad rotates its haze and its ring). Vertex color alpha weights the offset (paint 0 where it
+/// should fade out). Seen through a camera whose `PostProcess::distortion` is enabled only.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DistortionMaterial {
     /// Offset in view heights at full strength (0.01 = 1 % of the screen height). Default 0.01.
     pub strength: f32,
     /// Offset direction.
     pub mode: DistortionMode,
-    /// `Normal` mode: RG offsets (linear texture, 0.5 = none); `None` = built-in value noise.
+    /// `Normal` mode: RG offsets (0.5 = none, 0 and 1 = −/+ `strength` along U and V); sampled
+    /// with the texture's sampler (use `AddressMode::Repeat` to scroll), sRGB formats read back
+    /// as their stored values. `None` = built-in value noise (repeats every UV unit).
     pub texture: Option<TextureHandle>,
-    /// UV scroll per second (heat haze). Default (0, 0.35).
+    /// UV scroll per second (heat haze), by render time (`FrameInfo::time`). Default (0, 0.35).
     pub scroll: Vec2,
-    /// Fade over this many world units where the mesh meets scene geometry (0 = hard).
-    /// Default 0.
+    /// Fade over this many world units where the mesh meets scene geometry (0 = hard: hidden
+    /// behind anything closer). Default 0.
     pub soft_depth: f32,
 }
 
@@ -539,11 +546,14 @@ impl Default for DistortionMaterial {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub enum DistortionMode {
-    /// Offset from a texture or noise (heat haze).
+    /// Offset from a texture or noise (heat haze), feathered over the outer 0.2 of the UV
+    /// square so the mesh has no visible edge.
     #[default]
     Normal,
     /// Push away from the mesh's UV center with a smooth ring profile between two UV radii
-    /// (shockwaves, warp rings on a quad).
+    /// (shockwaves, warp rings on a quad: `MeshData::plane` has its UV center in the middle, a
+    /// UV radius of 0.5 touching its edges): the image under the ring moves outward by up to
+    /// `strength`, peaking halfway between the radii.
     Radial {
         /// Inner UV radius.
         inner: f32,
@@ -552,12 +562,42 @@ pub enum DistortionMode {
     },
 }
 
-/// Format of the distortion buffer (signed offsets split into positive and negative channels).
+/// Format of the distortion buffer (signed offsets split into positive and negative channels:
+/// R = +x, G = +y, B = −x, A = −y, each 0..1 of [`DISTORTION_WGSL`]'s `DISTORTION_RANGE`).
 pub const DISTORTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// WGSL for distortion writers (requires `VIEW_WGSL` and `scene_wgsl` first):
-/// `const DISTORTION_RANGE = 0.0625;`, `distortion_encode(offset_view_heights, weight)`,
-/// `distortion_depth_fade(frag_position, db_size, softness)`. Blend One/One.
+/// `DISTORTION_RANGE` of [`DISTORTION_WGSL`]: the largest offset per axis, in view heights.
+pub(crate) const DISTORTION_RANGE: f32 = 0.0625;
+
+/// Blend state of every distortion writer: `One + One` on color and alpha, so overlapping
+/// writers add their offsets (each axis saturates at `±DISTORTION_RANGE`).
+pub const DISTORTION_BLEND: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
+
+/// WGSL for distortion writers — render nodes drawing in [`crate::RenderPhase::Distortion`]
+/// (particles, user nodes) — to put after `VIEW_WGSL` and `scene_wgsl(&ctx.target)`:
+/// * `const DISTORTION_RANGE = 0.0625;` the largest offset per axis, in view heights;
+/// * `distortion_encode(offset: vec2<f32>, weight: f32) -> vec4<f32>`: the fragment output for
+///   an offset in view heights (+x right, +y up) scaled by `weight`;
+/// * `s3d_distortion_decode(texel) -> vec2<f32>`: its inverse;
+/// * `distortion_depth_fade(frag: vec4<f32>, db_size: vec2<f32>, softness: f32) -> f32`: 0 where
+///   scene depth is in front of the fragment (`frag` = `@builtin(position)`, `db_size` =
+///   `DrawContext::target_size`), fading in over `softness` world units; 1 without depth.
+///
+/// An offset is where a pixel looks: the composite shows at each pixel the scene `offset` away,
+/// so the image under a writer appears moved by −offset (bloom moves with it). Draw with
+/// [`DISTORTION_BLEND`], into [`DISTORTION_FORMAT`], single-sample, no depth attachment (see
+/// `docs/graphics/post.md`, "Distortion").
 pub const DISTORTION_WGSL: &str = include_str!("../shaders/post/distortion.wgsl");
 
 /// Grading in the composite (no extra pass): white balance → saturation → contrast (linear HDR,

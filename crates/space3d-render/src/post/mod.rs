@@ -9,9 +9,12 @@
 //! `shaders/post/composite.wgsl`); the post milestones add the effects: bloom (PO1,
 //! `bloom.rs`), FXAA (`fxaa.rs`) and the vignette, chromatic aberration and film grain in the
 //! composite (PO3), auto exposure (PO2, `exposure.rs`, read back by `readback.rs`) and color
-//! grading with 3D LUTs and WGSL hooks in the composite (PO4, `grading.rs`, `lut.rs`); the
-//! distortion apply is `STUB(P-POST)` until PO5. Distortion buffers are real (the frame's
-//! Distortion phase plumbing, F5, clears and writes them).
+//! grading with 3D LUTs and WGSL hooks in the composite (PO4, `grading.rs`, `lut.rs`), and
+//! distortion (PO5): the frame's Distortion phase (F5) clears each post group's persistent
+//! distortion buffer and draws the writers into it — `DistortionMaterial` meshes through the
+//! built-in node (`distortion_mesh.rs`), particles and user nodes through `DISTORTION_WGSL` —
+//! and the composite samples the scene, its chromatic split and the bloom where the buffer
+//! points.
 
 pub(crate) mod api;
 mod bloom;
@@ -557,7 +560,8 @@ impl PostState {
         group: &PostGroupPlan,
         reallocs: &mut u32,
     ) -> PostGroupNeeds {
-        let _ = world; // STUB(P-POST): distortion writers (PO5)
+        // The Distortion phase's writers are nodes: the frame finds them (`group.distortion`).
+        let _ = world;
         let s = &group.settings;
         let effects = !group.passthrough && s.enabled;
         let scene_rect = clip_rect(group.scene_rect, group.scene_size);
@@ -1003,8 +1007,9 @@ impl PostState {
         })
     }
 
-    /// Record meter → bloom → composite (→ FXAA) for one post group into the frame encoder.
-    /// Bloom (PO1), the composite, FXAA and the lens effects (PO3); STUB(P-POST): metering (PO2).
+    /// Record meter → bloom → composite (→ FXAA) for one post group into the frame encoder: auto
+    /// exposure (PO2), bloom (PO1), the composite with the lens effects (PO3), grading (PO4)
+    /// and the distortion apply (PO5), FXAA (PO3).
     pub fn encode_group(&mut self, cx: &mut PostEncode<'_>, input: &PostGroupInput<'_>) {
         if self.params_bg.is_none() {
             return;
@@ -1078,10 +1083,14 @@ impl PostState {
         };
         let frame = self.frame;
         let (inputs_bgl, dummy) = (&self.inputs_bgl, &self.dummy);
-        let distortion = input
-            .distortion
-            .and_then(|_| self.distortion.get(&input.camera))
-            .map_or(0, |t| t.generation);
+        let distortion_target = input.distortion.and_then(|_| self.distortion.get(&input.camera));
+        let distortion = distortion_target.map_or(0, |t| t.generation);
+        if let Some(t) = distortion_target
+            && !input.replay
+        {
+            // Rgba8Unorm: 4 bytes per texel.
+            cx.stats.target_bytes += 4 * t.size.0 as u64 * t.size.1 as u64;
+        }
         let key = (
             input.scene_generation,
             distortion,

@@ -1757,3 +1757,422 @@ pub mod cases {
         app.resources.expect_mut::<RenderSettings>().draw_path = Some(path);
     }
 }
+
+/// Distortion (PO5) test bodies, shared by `tests/post_distortion.rs` and the GL run.
+///
+/// The scenes are 128 × 128 under the orthographic camera 2 units high (64 px per unit): a bright
+/// top-right quadrant (radiance 1, edges at pixel 64) behind a 1 × 1 `DistortionMaterial` quad
+/// centered on the view whose constant texture looks `(+1, +1) × strength` view heights away
+/// (right and up). The composite shows at each pixel the scene that far away, so the quadrant's
+/// vertical edge appears moved left and its horizontal edge down by `strength × 128` pixels
+/// (5.11 px at strength 0.04, after the buffer's 8-bit encoding), measured to sub-pixel precision
+/// from the linear light of a window of pixels around each edge.
+pub mod distortion {
+    use super::*;
+
+    pub const S: u32 = 128;
+    const BLACK: Vec4 = Vec4::new(0.0, 0.0, 0.0, 1.0);
+    /// The writer's strength (view heights) and the shift it produces in pixels: the encoded
+    /// value round(0.04 / 0.0625 × 255) = 163 decodes to 163 / 255 × 0.0625 view heights.
+    pub const STRENGTH: f32 = 0.04;
+    pub fn expected_shift(height: u32) -> f32 {
+        (STRENGTH / 0.0625 * 255.0).round() / 255.0 * 0.0625 * height as f32
+    }
+
+    /// Post without bloom, tonemapping or dither: displayed = radiance.
+    pub fn plain_post() -> PostProcess {
+        post(Bloom::glow()).without_bloom()
+    }
+
+    /// An unlit quad of radiance `color` centered at `center` (z included), facing the camera.
+    pub fn quad_at(app: &mut App, color: f32, center: Vec3, size: Vec2) -> Entity {
+        let mesh = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_mesh(MeshData::plane(1.0));
+        app.world.spawn((
+            Transform::from_xyz(center.x, center.y, center.z)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::new(size.x, 1.0, size.y)),
+            Mesh3d(mesh),
+            Material::unlit(Vec4::new(color, color, color, 1.0)),
+        ))
+    }
+
+    /// A 4 × 4 linear texture of constant red and green (`DistortionMode::Normal` offsets).
+    pub fn offset_texture(app: &mut App, r: u8, g: u8) -> TextureHandle {
+        let mut img = ImageData::new(4, 4);
+        for p in img.pixels.as_chunks_mut::<4>().0 {
+            *p = [r, g, 0, 255];
+        }
+        app.resources
+            .expect_mut::<RenderAssets>()
+            .add_texture(TextureSource::from_image_linear(img))
+    }
+
+    /// A `DistortionMaterial` plane (no `Material`: not drawn in color) of `size` at `center`,
+    /// facing the camera: U to the right, V down the screen.
+    pub fn writer(app: &mut App, center: Vec3, size: Vec2, material: DistortionMaterial) -> Entity {
+        let mesh = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_mesh(MeshData::plane(1.0));
+        app.world.spawn((
+            Transform::from_xyz(center.x, center.y, center.z)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::new(size.x, 1.0, size.y)),
+            Mesh3d(mesh),
+            material,
+        ))
+    }
+
+    /// The constant writer: looks (+1, +1) × `STRENGTH` view heights away (texture (255, 0):
+    /// +U, −V, i.e. right and up).
+    pub fn constant(app: &mut App) -> DistortionMaterial {
+        DistortionMaterial {
+            strength: STRENGTH,
+            texture: Some(offset_texture(app, 255, 0)),
+            scroll: Vec2::ZERO,
+            ..DistortionMaterial::default()
+        }
+    }
+
+    /// The standard scene: camera (post `p`), the bright quadrant at depth `z_back`, the
+    /// constant writer at z = 0.
+    pub fn scene(app: &mut App, p: PostProcess, z_back: f32) -> (Entity, Entity) {
+        quad_at(app, 1.0, Vec3::new(0.5, 0.5, z_back), Vec2::ONE);
+        let cam = camera(app, 0.0, BLACK, Some(p));
+        let m = constant(app);
+        let w = writer(app, Vec3::ZERO, Vec2::ONE, m);
+        (cam, w)
+    }
+
+    /// Sub-pixel x of a dark → bright edge in row `y` within `[x0, x1)`: x1 − Σ linear value of
+    /// `channel` (exact for a bilinearly sampled step).
+    pub fn edge_x(img: &ImageData, y: u32, x0: u32, x1: u32, channel: usize) -> f32 {
+        x1 as f32 - (x0..x1).map(|x| lin(img, x, y)[channel]).sum::<f32>()
+    }
+
+    /// Sub-pixel y of a bright → dark edge (bright above) in column `x` within `[y0, y1)`.
+    pub fn edge_y(img: &ImageData, x: u32, y0: u32, y1: u32, channel: usize) -> f32 {
+        y0 as f32 + (y0..y1).map(|y| lin(img, x, y)[channel]).sum::<f32>()
+    }
+
+    /// Mean vertical-edge x over the rows `rows` and horizontal-edge y over the columns `cols`
+    /// (the writer's full-strength region), in `channel`.
+    pub fn edges(img: &ImageData, channel: usize) -> (f32, f32) {
+        let rows = 46..58u32;
+        let cols = 66..80u32;
+        let x = rows.clone().map(|y| edge_x(img, y, 48, 80, channel)).sum::<f32>() / rows.len() as f32;
+        let y = cols.clone().map(|x| edge_y(img, x, 48, 80, channel)).sum::<f32>() / cols.len() as f32;
+        (x, y)
+    }
+
+    fn stats(app: &App) -> RenderStats {
+        app.resources.expect::<RenderStats>().clone()
+    }
+
+    fn assert_near(actual: f32, expected: f32, tolerance: f32, what: &str) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{what}: {actual} px, expected {expected} ± {tolerance}"
+        );
+    }
+
+    /// `distortion_shifts_the_background` (spec PO5, ±1 px): the quadrant's edges move by the
+    /// written offset where the writer is (left and down: the pixels look right and up), and
+    /// stay exactly where they were elsewhere; pixels away from the writer are bit-identical
+    /// to the scene without it. `setup` adjusts the app (downlevel overrides, render scale).
+    pub fn distortion_shifts_the_background(make: MakeApp, setup: fn(&mut App)) {
+        let Some(mut app) = make(S, S) else { return };
+        setup(&mut app);
+        let (_, w) = scene(&mut app, plain_post(), -1.0);
+        let img = render(&mut app);
+        assert_eq!(stats(&app).distortion_passes, 1, "one Distortion pass");
+        let shift = expected_shift(S);
+        let (x, y) = edges(&img, 0);
+        eprintln!("edges at ({x}, {y}), expected ({}, {})", 64.0 - shift, 64.0 + shift);
+        assert_near(x, 64.0 - shift, 1.0, "vertical edge");
+        assert_near(y, 64.0 + shift, 1.0, "horizontal edge");
+        // Away from the writer (rows above it): the edge is where it was.
+        assert_near(edge_x(&img, 10, 48, 80, 0), 64.0, 0.02, "undistorted edge");
+        app.world.despawn(w).unwrap();
+        let plain = render(&mut app);
+        assert_eq!(stats(&app).distortion_passes, 0);
+        assert_near(edges(&plain, 0).0, 64.0, 0.02, "without the writer");
+        for y in (0..28).chain(100..S) {
+            for x in 0..S {
+                assert_eq!(img.get(x, y), plain.get(x, y), "({x}, {y}) is away from the writer");
+            }
+        }
+    }
+
+    /// The distortion's spectral split: with `chromatic` c, red looks (1 − c) and blue (1 + c)
+    /// times as far as green (spec §1.9: the CA split of the distorted lookup).
+    pub fn distortion_chromatic_split(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        let mut p = plain_post();
+        p.distortion.chromatic = 0.5;
+        scene(&mut app, p, -1.0);
+        let img = render(&mut app);
+        let shift = expected_shift(S);
+        for (channel, k) in [(0, 0.5), (1, 1.0), (2, 1.5)] {
+            let (x, y) = edges(&img, channel);
+            assert_near(x, 64.0 - shift * k, 1.0, &format!("channel {channel} vertical"));
+            assert_near(y, 64.0 + shift * k, 1.0, &format!("channel {channel} horizontal"));
+        }
+        // `Distortion::strength` scales every offset.
+        p.distortion.chromatic = 0.0;
+        p.distortion.strength = 0.5;
+        let cam = app.world.query::<(Entity, &Camera3d)>().iter().next().unwrap().0;
+        set_post(&mut app, cam, p);
+        let (x, _) = edges(&render(&mut app), 1);
+        assert_near(x, 64.0 - shift * 0.5, 1.0, "half strength");
+    }
+
+    /// `distortion_occluded_by_closer_geometry`: an occluder in front of the writer (two
+    /// panels, 0.5 and 0.25, meeting at pixel 56) is not distorted — its interior is identical
+    /// to the render without the writer — while behind the writer it is. `msaa`: the same with
+    /// 4× MSAA (a depth resolve where the device samples multisampled depth; on GL no occlusion,
+    /// documented).
+    pub fn distortion_occluded_by_closer_geometry(make: MakeApp, setup: fn(&mut App), occluded: bool) {
+        let Some(mut app) = make(S, S) else { return };
+        setup(&mut app);
+        let (_, w) = scene(&mut app, plain_post(), -1.0);
+        // Panels over rows 48..80: x 40..56 (0.5) and 56..72 (0.25), in front (z = 1).
+        let left = quad_at(&mut app, 0.5, Vec3::new(-0.25, 0.0, 1.0), Vec2::new(0.25, 0.5));
+        let right = quad_at(&mut app, 0.25, Vec3::new(0.0, 0.0, 1.0), Vec2::new(0.25, 0.5));
+        let img = render(&mut app);
+        app.world.despawn(w).unwrap();
+        let plain = render(&mut app);
+        // Interior of the panels (2 px from their outline: the half-resolution buffer is sampled
+        // bilinearly across it).
+        let interior = |a: &ImageData, b: &ImageData| {
+            let mut d = 0u8;
+            for y in 52..76 {
+                for x in 44..70 {
+                    let (p, q) = (a.get(x, y), b.get(x, y));
+                    for c in 0..3 {
+                        d = d.max(p[c].abs_diff(q[c]));
+                    }
+                }
+            }
+            d
+        };
+        if occluded {
+            assert_eq!(interior(&img, &plain), 0, "the closer panels are not distorted");
+        } else {
+            assert!(
+                interior(&img, &plain) > 50,
+                "no occlusion without sampled depth (GL + MSAA)"
+            );
+        }
+        // Behind the writer the same panels are distorted: their inner edge moves left.
+        let m = constant(&mut app);
+        writer(&mut app, Vec3::ZERO, Vec2::ONE, m);
+        for (panel, x) in [(left, -0.25), (right, 0.0)] {
+            app.world
+                .insert_one(
+                    panel,
+                    Transform::from_xyz(x, 0.0, -0.5)
+                        .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                        .with_scale(Vec3::new(0.25, 1.0, 0.5)),
+                )
+                .unwrap();
+        }
+        let behind = render(&mut app);
+        assert!(interior(&behind, &plain) > 50, "panels behind the writer are distorted");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// `hdr_scene_overlays_are_distorted`: an HdrScene overlay is part of the scene color, so
+    /// it moves with the background; an AfterTonemap one is drawn after post and does not.
+    pub fn hdr_scene_overlays_are_distorted(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        let m = constant(&mut app);
+        writer(&mut app, Vec3::ZERO, Vec2::ONE, m);
+        // The bright quadrant, drawn by an overlay instead of a mesh.
+        let overlays = app.resources.expect_mut::<RenderOverlays>();
+        overlays.insert(
+            "fill",
+            0,
+            FillOverlay::new(OverlayStage::HdrScene, [64, 0, 64, 64], [1.0, 1.0, 1.0, 1.0]),
+        );
+        let img = render(&mut app);
+        let shift = expected_shift(S);
+        let (x, y) = edges(&img, 0);
+        assert_near(x, 64.0 - shift, 1.0, "HdrScene overlay, vertical edge");
+        assert_near(y, 64.0 + shift, 1.0, "HdrScene overlay, horizontal edge");
+        let overlays = app.resources.expect_mut::<RenderOverlays>();
+        overlays.insert(
+            "fill",
+            0,
+            FillOverlay::new(OverlayStage::AfterTonemap, [64, 0, 64, 64], [1.0, 1.0, 1.0, 1.0]),
+        );
+        let (x, y) = edges(&render(&mut app), 0);
+        assert_near(x, 64.0, 0.02, "AfterTonemap overlay, vertical edge");
+        assert_near(y, 64.0, 0.02, "AfterTonemap overlay, horizontal edge");
+    }
+
+    /// `no_distortion_pass_without_writers`: distortion is on by default and costs nothing
+    /// without a writer with work in the post camera's view: no Distortion pass (and a
+    /// bit-identical image) without writers, with the writer hidden or off-screen, with
+    /// `Distortion::enabled` false, and for a camera without post (Direct mode).
+    pub fn no_distortion_pass_without_writers(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        quad_at(&mut app, 1.0, Vec3::new(0.5, 0.5, -1.0), Vec2::ONE);
+        let cam = camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        let plain = render(&mut app);
+        let s = stats(&app);
+        assert_eq!((s.distortion_passes, s.post_passes), (0, 1), "{s:?}");
+        let bytes = s.target_bytes;
+        let m = constant(&mut app);
+        let w = writer(&mut app, Vec3::ZERO, Vec2::ONE, m);
+        assert_ne!(render(&mut app), plain);
+        let s = stats(&app);
+        assert_eq!((s.distortion_passes, s.post_passes), (1, 1), "{s:?}");
+        assert_eq!(
+            s.target_bytes,
+            bytes + 64 * 64 * 4,
+            "a half-resolution Rgba8Unorm buffer"
+        );
+        for (what, change) in [
+            ("hidden", 0),
+            ("off-screen", 1),
+            ("distortion disabled", 2),
+            ("no post", 3),
+        ] {
+            match change {
+                0 => app.world.insert_one(w, Visibility::Hidden).unwrap(),
+                1 => {
+                    app.world.insert_one(w, Visibility::Visible).unwrap();
+                    app.world.get::<&mut Transform>(w).unwrap().translation.x = 5.0;
+                }
+                2 => {
+                    app.world.get::<&mut Transform>(w).unwrap().translation.x = 0.0;
+                    let mut p = plain_post();
+                    p.distortion.enabled = false;
+                    set_post(&mut app, cam, p);
+                }
+                _ => {
+                    app.world.remove_one::<PostProcess>(cam).unwrap();
+                }
+            }
+            let img = render(&mut app);
+            assert_eq!(stats(&app).distortion_passes, 0, "{what}");
+            if change < 3 {
+                assert_eq!(img, plain, "{what}: bit-identical");
+            }
+        }
+        // A camera without post never draws distortion writers: Direct mode, as before.
+        assert_eq!(stats(&app).post_passes, 0);
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// `DistortionMode::Radial` pushes the image under its ring outward: the quadrant's edge,
+    /// crossing the ring to the right of its center, moves right (the pixels look toward the
+    /// center); inside the inner radius and outside the outer one nothing moves.
+    pub fn radial_distortion_pushes_outward(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        quad_at(&mut app, 1.0, Vec3::new(0.5, 0.5, -1.0), Vec2::ONE);
+        camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        // Ring centered 0.25 units left of the edge, radii 0.1 … 0.5 (UV = units: a 1 × 1 quad).
+        writer(
+            &mut app,
+            Vec3::new(-0.25, 0.25, 0.0),
+            Vec2::ONE,
+            DistortionMaterial {
+                strength: STRENGTH,
+                mode: DistortionMode::Radial { inner: 0.1, outer: 0.5 },
+                ..DistortionMaterial::default()
+            },
+        );
+        let img = render(&mut app);
+        // Row through the ring's center (y = 0.25 units: pixel 48): the edge at 64 is 0.25 units
+        // (UV) from the center, where the ring profile sin²(π × 0.375) = 0.854 looks toward the
+        // center: pushed right by about 0.854 × 5.12 px (the profile falls across the edge's
+        // footprint, so allow ±1 px).
+        let x = (46..50).map(|y| edge_x(&img, y, 56, 88, 0)).sum::<f32>() / 4.0;
+        let push = 0.854 * expected_shift(S);
+        assert_near(x, 64.0 + push, 1.0, "pushed outward");
+        // Far above the ring: unchanged.
+        assert_near(edge_x(&img, 4, 48, 80, 0), 64.0, 0.02, "outside the ring");
+    }
+
+    /// Split screen: the writer in the left post group looks right, past its rect's right edge
+    /// into the right group's pixels: the composite clamps the lookup to the rect, so no pixel of
+    /// the right view (bright) appears in the left one; the right group has no Distortion pass
+    /// of its own and is exactly as without the writer.
+    pub fn distortion_does_not_bleed_across_viewports(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        // The right camera looks at a bright wall far away from the left one's scene.
+        quad_at(&mut app, 1.0, Vec3::new(100.0, 0.0, -1.0), Vec2::splat(4.0));
+        let left = camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        let right = camera(&mut app, 100.0, BLACK, Some(plain_post()));
+        for (e, viewport, order) in [(left, [0.0, 0.0, 0.5, 1.0], 0), (right, [0.5, 0.0, 0.5, 1.0], 1)] {
+            let mut c = app.world.get::<&mut Camera3d>(e).unwrap();
+            c.viewport = Some(viewport);
+            c.order = order;
+        }
+        let m = constant(&mut app);
+        // At the left view's right edge (its 64-px-wide rect is 1 unit wide: x 0.25 … 0.5).
+        let w = writer(&mut app, Vec3::new(0.375, 0.0, 0.0), Vec2::new(0.5, 1.0), m);
+        let img = render(&mut app);
+        assert_eq!(stats(&app).distortion_passes, 1, "only the left group has a writer");
+        for y in 0..S {
+            for x in 0..64 {
+                assert_eq!(lin(&img, x, y), Vec3::ZERO, "({x}, {y}) of the left view");
+            }
+        }
+        app.world.despawn(w).unwrap();
+        let plain = render(&mut app);
+        for y in 0..S {
+            for x in 64..S {
+                assert_eq!(img.get(x, y), plain.get(x, y), "({x}, {y}) of the right view");
+            }
+        }
+    }
+
+    /// A still scene with a distortion writer (no scroll) reaches a steady state: no textures,
+    /// reallocations or uploads, and the same image every frame; a scrolling haze (noise) uploads
+    /// its 96-byte instance each frame the render time moves, and `render_to_image` twice at the
+    /// same time is identical.
+    pub fn distortion_steady_state(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        let (_, w) = scene(&mut app, plain_post(), -1.0);
+        let first = render(&mut app);
+        for _ in 0..4 {
+            render(&mut app);
+        }
+        let s = stats(&app);
+        assert_eq!(
+            (
+                s.textures_created,
+                s.cpu_reallocations,
+                s.buffer_reallocations,
+                s.bytes_uploaded
+            ),
+            (0, 0, 0, 0),
+            "{s:?}"
+        );
+        assert_eq!(render(&mut app), first, "deterministic");
+        // A heat haze: the built-in noise scrolled by render time.
+        app.world
+            .insert_one(
+                w,
+                DistortionMaterial {
+                    strength: 0.02,
+                    ..DistortionMaterial::default()
+                },
+            )
+            .unwrap();
+        let a = render(&mut app);
+        assert_eq!(render(&mut app), a, "the same render time: the same haze");
+        assert_eq!(stats(&app).bytes_uploaded, 0);
+        app.step_ticks(6);
+        let b = render(&mut app);
+        assert_ne!(a, b, "the haze scrolls with render time");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+}

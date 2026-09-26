@@ -5,8 +5,10 @@
 // Only explicit-LOD sampling and loads: no derivatives, so no uniformity constraints
 // (WebGL2-safe).
 //
-// Order (normative): S at the rect [+ chromatic aberration taps] → un-premultiply (transparent
-// groups) → exposure (manual, or 2^(E + compensation) with auto exposure) → bloom → vignette →
+// Order (normative): the distortion offset → S at the rect [+ chromatic aberration taps] →
+// un-premultiply (transparent
+// groups) → exposure (manual, or 2^(E + compensation) with auto exposure) → bloom (at the same
+// offset) → vignette →
 // white balance × saturation, contrast → `post_hdr_hook` → tonemap → lift/gamma/gain, LUT (in
 // the sRGB-encoded display space) → `post_ldr_hook` → in the last pass: grain → dither → encode
 // → re-premultiply. The grading hooks (`ColorGrading::shader`, spliced at the HOOKS marker at
@@ -38,7 +40,7 @@ struct PostParams {
     exposure: vec4<f32>,        // linear multiplier (the compensation with auto exposure), -, bloom intensity, bloom mode (0 add, 1 mix)
     vignette: vec4<f32>,        // intensity, smoothness, roundness, center.x
     vignette_color: vec4<f32>,  // linear multiplier at full vignette (rgb), center.y
-    lens: vec4<f32>,            // chromatic aberration scale (S px⁻²), -, distortion scale, distortion chromatic
+    lens: vec4<f32>,            // chromatic aberration scale (S px⁻²), -, distortion scale (view heights per encoded unit), distortion chromatic split
     grain: vec4<f32>,           // intensity, cell size (D px), luminance response, -
     grade_matrix: mat3x3<f32>,  // white balance × saturation (linear HDR)
     lift_contrast: vec4<f32>,   // lift (offset), contrast (log2, around middle grey)
@@ -186,13 +188,28 @@ fn post_bloom(s: vec2<f32>) -> vec3<f32> {
     return g0.y * (g0.x * a + g1.x * b) + g1.y * (g0.x * c + g1.x * d);
 }
 
-// Chromatic aberration: red and blue sampled `off` apart around `s`, radially from the rect's
-// center and growing with r² (`lens.x` puts intensity × 2 % of the rect width at the corners).
-fn post_chromatic(s: vec2<f32>, c: vec4<f32>) -> vec4<f32> {
-    let d = s - (post.src_rect.xy + post.src_rect.zw * 0.5);
-    let off = d * (dot(d, d) * post.lens.x);
-    let r = post_scene_bilinear(s - off).r;
-    let b = post_scene_bilinear(s + off).b;
+// The distortion at S position `s` (the undistorted pixel), in S pixels: the post group's
+// distortion buffer (split signs, DISTORTION_WGSL; half or full resolution over the rect,
+// sampled bilinearly) holds where each pixel looks, in view heights with +y up.
+fn post_distortion(s: vec2<f32>) -> vec2<f32> {
+    let uv = (s - post.src_rect.xy) / post.src_rect.zw;
+    let d = textureSampleLevel(distortion_tex, post_sampler, uv, 0.0);
+    let o = (d.rg - d.ba) * post.lens.z;
+    return vec2<f32>(o.x, -o.y) * post.src_rect.w;
+}
+
+// Red and blue apart from green, which is sampled at `s0 + ds`: chromatic aberration (radially
+// from the rect's center, growing with r²: `lens.x` puts intensity × 2 % of the rect width at
+// the corners) and the distortion's spectral split (R and B at (1 ∓ lens.w) × the offset `ds`).
+fn post_chromatic(s0: vec2<f32>, ds: vec2<f32>, c: vec4<f32>) -> vec4<f32> {
+    var off = vec2<f32>(0.0);
+    if (post_has(S3D_POST_CA)) {
+        let d = s0 + ds - (post.src_rect.xy + post.src_rect.zw * 0.5);
+        off = d * (dot(d, d) * post.lens.x);
+    }
+    let k = post.lens.w;
+    let r = post_scene_bilinear(s0 + ds * (1.0 - k) - off).r;
+    let b = post_scene_bilinear(s0 + ds * (1.0 + k) + off).b;
     return vec4<f32>(r, c.g, b, c.a);
 }
 
@@ -256,10 +273,22 @@ fn post_finish(rgb_in: vec3<f32>, px_f: vec2<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_composite(in: FullscreenOut) -> @location(0) vec4<f32> {
-    let s = post_scene_pos(in.pos.xy);
-    var c = post_scene(s);
-    if (post_has(S3D_POST_CA)) {
-        c = post_chromatic(s, c);
+    let s0 = post_scene_pos(in.pos.xy);
+    var ds = vec2<f32>(0.0);
+    if (post_has(S3D_POST_DISTORTION)) {
+        ds = post_distortion(s0);
+    }
+    // Where no writer drew, exactly the undistorted pixel; elsewhere a bilinear tap.
+    let distorted = any(ds != vec2<f32>(0.0));
+    let s = s0 + ds;
+    var c: vec4<f32>;
+    if (distorted) {
+        c = post_scene_bilinear(s);
+    } else {
+        c = post_scene(s);
+    }
+    if (post_has(S3D_POST_CA) || (distorted && post.lens.w > 0.0)) {
+        c = post_chromatic(s0, ds, c);
     }
     let a = select(1.0, c.a, post_has(S3D_POST_SCENE_ALPHA));
     var rgb = c.rgb;

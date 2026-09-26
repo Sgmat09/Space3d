@@ -116,9 +116,12 @@ impl GpuPost {
         if plan.scene_rect[2..] == plan.output_rect[2..] {
             flags |= bits::EXACT;
         }
-        // The distortion buffer is bound and written this frame (applying it is the post
-        // area's: STUB(P-POST) PO5).
-        if plan.distortion && effects {
+        // The distortion buffer is written this frame: the composite samples `S` (and the
+        // bloom) where it points, `lens.z` view heights per encoded unit, with the chromatic
+        // split `lens.w`.
+        let d = &s.distortion;
+        let distortion = plan.distortion && effects && d.enabled && d.strength.is_finite() && d.strength != 0.0;
+        if distortion {
             flags |= bits::DISTORTION;
         }
         // The Ldr fallback exposes and tonemaps per fragment already; passthrough copies.
@@ -133,6 +136,14 @@ impl GpuPost {
         let out = rect(plan.output_rect);
         let src = rect(plan.scene_rect);
         let mut p = GpuPost::zeroed();
+        if distortion {
+            p.lens[2] = super::api::DISTORTION_RANGE * d.strength;
+            p.lens[3] = if d.chromatic.is_finite() {
+                d.chromatic.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+        }
         p.out_rect = out;
         p.src_rect = src;
         p.src_texel = [1.0 / sw, 1.0 / sh, out[2] / out[3].max(1.0), plan.output_size.1 as f32];
