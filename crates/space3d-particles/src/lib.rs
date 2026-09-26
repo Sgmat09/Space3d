@@ -107,6 +107,13 @@ impl ParticlesPlugin {
     /// local-space layers and meshes draw (the crate docs, "How it works").
     pub const TICK_ORDER: i32 = 1000;
 
+    /// Order of [`frame_motion_system`] in `Stage::PostUpdate`: last, so it measures the motion
+    /// gameplay gave the emitters in this frame's `Update` and `PostUpdate` (poses that stand
+    /// for the frame's time, after its ticks ran). An emitter moved in `PreUpdate`, in
+    /// `FixedUpdate`, or between `App::update` calls (a test stepping ticks) sets the pose the
+    /// next ticks read, exactly as before.
+    pub const FRAME_MOTION_ORDER: i32 = i32::MAX;
+
     /// The defaults.
     pub fn new() -> Self {
         Self::default()
@@ -137,6 +144,12 @@ impl Plugin for ParticlesPlugin {
         }
         if self.tick_system {
             app.add_system_ordered(Stage::FixedUpdate, Self::TICK_ORDER, "particles::tick", tick_system);
+            app.add_system_ordered(
+                Stage::PostUpdate,
+                Self::FRAME_MOTION_ORDER,
+                "particles::frame_motion",
+                frame_motion_system,
+            );
         }
         // `.pfx.ron` effects, when the app has an asset server (add `AssetsPlugin` first).
         #[cfg(feature = "assets")]
@@ -174,6 +187,12 @@ pub fn tick_system(ctx: &mut SystemCtx) {
         };
         let dt = res.get::<Time>().map_or(0.0, Time::fixed_delta_secs);
         let rt = &mut runtime.rt;
+        // From the frame time `Stage::Update` left the emitters at (the previous frame's) to
+        // the end of this tick: how far the motion measured in that frame is extrapolated.
+        rt.ahead = res.get::<Time>().map_or(0.0, |t| {
+            let lag = t.accumulated().saturating_sub(t.fixed_delta).as_secs_f32();
+            (t.delta_secs() - lag).clamp(0.0, t.delta_secs())
+        });
         rt.budget = Some(pool_budget(settings, res));
         rt.aspect = res.get::<Renderer>().map_or(0.0, |r| {
             let (w, h) = r.size();
@@ -181,12 +200,14 @@ pub fn tick_system(ctx: &mut SystemCtx) {
         });
         rt.tick(world, settings, effects, dt);
         let (live, layers) = rt.counts();
-        let (total, reserved, spawned) = (rt.pool.total(), rt.pool.reserved(), rt.spawned);
+        let (total, reserved, spawned) = (rt.pool_capacity(), rt.pool.reserved(), rt.spawned);
+        let high = rt.pool.high_water();
         if let Some(stats) = res.get_mut::<ParticleStats>() {
             stats.effects = live;
             stats.layer_instances = layers;
             stats.pool_capacity = total;
             stats.pool_reserved = reserved;
+            stats.pool_high_water = high;
             stats.spawned = spawned;
         }
         if rt.finished.is_empty() {
@@ -227,6 +248,27 @@ pub fn tick_system(ctx: &mut SystemCtx) {
             _ => {}
         }
     }
+}
+
+/// Measures how every emitter moved after this frame's fixed ticks (gameplay in `Stage::Update`,
+/// where SpaceCorps2027 moves its ships and bolts, and `PostUpdate`): the next frame's ticks
+/// extrapolate such an emitter's pose by that velocity to each tick's own time, so a frame
+/// running two or more ticks (30 or 45 fps at the 60 Hz tick) spreads its emission evenly
+/// instead of laying it all on the first tick and stacking the others' on one point (game#2).
+/// Only steady motion is extrapolated (two frames that agree), never a teleport, a start or a
+/// stop. Emitters moved on the tick, in `PreUpdate`, between `App::update` calls, or not at
+/// all measure no such motion and are unchanged. Registered by the plugin last in
+/// `Stage::PostUpdate` (with [`tick_system`], [`ParticlesPlugin::FRAME_MOTION_ORDER`]);
+/// register it there yourself when you place `tick_system`. Allocates nothing.
+pub fn frame_motion_system(ctx: &mut SystemCtx) {
+    let world = &*ctx.world;
+    ctx.resources.scope::<runtime::ParticleRuntime, _>(|res, runtime| {
+        if !res.get::<ParticleSettings>().is_some_and(|s| s.enabled) {
+            return;
+        }
+        let delta = res.get::<Time>().map_or(0.0, Time::delta_secs);
+        runtime.rt.observe_frame(world, delta);
+    });
 }
 
 /// The backend `wanted` resolves to on a device with (`Some(true)`) or without culling-class

@@ -68,6 +68,15 @@ impl Time {
         (self.accumulator.as_nanos() / self.fixed_delta.as_nanos()).min(u128::from(u32::MAX)) as u32
     }
 
+    /// Time accumulated toward fixed steps and not consumed yet. From `PreUpdate` it is the
+    /// [`Self::pending_steps`] whole steps this frame's `FixedUpdate` runs take plus the
+    /// fraction left for [`Self::alpha`]; inside a `FixedUpdate` run it still includes that
+    /// run's step, so the run ends `accumulated() - fixed_delta` before the frame's time
+    /// (`elapsed`), and `delta - (accumulated() - fixed_delta)` after the previous frame's.
+    pub fn accumulated(&self) -> Duration {
+        self.accumulator
+    }
+
     /// Drop the pending whole fixed steps of this frame beyond `keep` (call from `PreUpdate`).
     /// For a system that just realigned the simulation with an external clock (a network
     /// resync after a long frame), the backlog is already accounted for and running it would

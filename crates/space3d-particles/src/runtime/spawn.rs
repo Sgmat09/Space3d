@@ -32,6 +32,9 @@ pub(crate) struct SpawnTick {
     pub distance: f32,
     /// Seconds already lived at the end of the tick (prewarm).
     pub extra_age: f32,
+    /// × the time rate: the distance moved this tick against the smoothed speed
+    /// (`ParticleEmitter::velocity_smoothing`), 1 without pacing.
+    pub pace: f32,
 }
 
 /// `n` scaled by `mul`, kept at ≥ 1 when `n` ≥ 1 and `mul` > 0 (bursts never vanish).
@@ -117,7 +120,7 @@ pub(crate) fn continuous(c: &Continuous, acc: &mut u64, s: &SpawnTick, rate_shar
         throttle.powf(c.rate_exponent.max(0.0) as f64)
     };
     let span = hi - lo;
-    let rate = c.rate.max(0.0) as f64 * rate_throttle * s.mul as f64 * span * rate_share;
+    let rate = c.rate.max(0.0) as f64 * rate_throttle * s.mul as f64 * span * rate_share * s.pace.max(0.0) as f64;
     let dist = c.per_distance.max(0.0) as f64 * rate_throttle * s.mul as f64 * s.distance as f64 * span / dt;
     let inc = ((rate + dist) * ONE).round().min(u64::MAX as f64 / 4.0) as u64;
     let phase = *acc & FRACTION;
@@ -233,6 +236,7 @@ mod tests {
             mul: 1.0,
             distance: 0.0,
             extra_age: 0.0,
+            pace: 1.0,
         }
     }
 

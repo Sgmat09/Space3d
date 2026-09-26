@@ -46,8 +46,8 @@ use space3d_core::{Entity, GlobalTransform, Parent, Time, Transform};
 use space3d_render::wgpu;
 use space3d_render::{
     Aabb, DISTORTION_BLEND, DISTORTION_WGSL, DepthAccess, DrawContext, FrameMode, OUTPUT_WGSL, OutputEncoding,
-    PassTarget, PhaseSlot, PrepareContext, RenderNode, RenderNodes, RenderPhase, SceneReads, SlotMask, VIEW_WGSL,
-    ViewPrepareContext, scene_wgsl_for,
+    PassTarget, PhaseSlot, PrepareContext, RenderNode, RenderNodes, RenderPhase, SceneReads, SlotMask, Tonemapper,
+    VIEW_WGSL, ViewInfo, ViewPrepareContext, scene_wgsl_for,
 };
 use strips::{POINT_SIZE, StripInput, StripPoint, StripScratch};
 
@@ -964,7 +964,7 @@ impl ParticlesNode {
                 sorted: (sorted_start, self.sorted_draws.len() as u32),
                 uniform: vi as u32,
             });
-            let soft_clip = settings.direct_soft_clip && v.mode == FrameMode::Direct;
+            let soft_clip = settings.direct_soft_clip && soft_clips(v);
             self.view_uniforms.push(GpuParticleView {
                 flags: [soft_clip as u32, settings.soft_particles as u32, 0, 0],
                 params: [settings.max_screen_size.max(0.0), 0.0, 0.0, 0.0],
@@ -1323,6 +1323,18 @@ impl ParticlesNode {
     }
 }
 
+/// Whether `direct_soft_clip` applies in view `v`: its colors reach the display without a
+/// tonemapper — Direct mode, and the Ldr passthrough of a render scale below 1 without post
+/// (game#3: the same look at every render scale). Not in Hdr mode, nor in the Ldr fallback of
+/// a post camera, whose tonemapper runs per fragment (`OutputEncoding::Tonemapped`).
+fn soft_clips(v: &ViewInfo) -> bool {
+    match v.mode {
+        FrameMode::Direct => true,
+        FrameMode::Hdr => false,
+        _ => v.output != OutputEncoding::Tonemapped || v.tonemapper == Tonemapper::None,
+    }
+}
+
 impl RenderNode for ParticlesNode {
     fn slots(&self) -> &[PhaseSlot] {
         if self.soft { &SLOTS_SOFT } else { &SLOTS_HARD }
@@ -1363,8 +1375,13 @@ impl RenderNode for ParticlesNode {
                 backend,
                 effects,
                 layer_instances,
-                pool_capacity: rt.pool.total(),
+                pool_capacity: rt.pool_capacity(),
                 pool_reserved: rt.pool.reserved(),
+                pool_allocated: match &self.gpu_sim {
+                    Some(g) if backend == Some(ParticleBackend::Gpu) => g.pool_slots(),
+                    _ => self.sim.pool.len() as u32,
+                },
+                pool_high_water: rt.pool.high_water(),
                 alive: sim.alive,
                 alive_frame: sim.alive_frame,
                 spawned: rt.spawned,

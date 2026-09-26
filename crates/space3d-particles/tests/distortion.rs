@@ -398,3 +398,44 @@ fn heat_haze_is_deterministic() {
         .count();
     assert!(diff < 20, "the backends agree ({diff} channels differ)");
 }
+
+/// Heat haze never bends the image by more than a fraction (0.12) of the sprite's on-screen
+/// radius: a small writer (radius 6.4 px) asking for 0.05 view heights (6.4 px) moves a
+/// vertical edge by under a pixel, where a large one (radius 48 px) at the same strength moves
+/// it by several (the engine plume under its own haze, reviewer round M2).
+#[test]
+fn heat_haze_bends_at_most_a_fraction_of_its_size() {
+    let mut shifts = Vec::new();
+    for size in [0.2f32, 1.5] {
+        let Some(mut app) = app_with(S, S, settings()) else {
+            return;
+        };
+        quad_at(&mut app, 1.0, Vec3::new(0.5, 0.0, -1.0), Vec2::new(1.0, 2.0));
+        camera(&mut app, Some(plain_post()));
+        let haze = effect(
+            &mut app,
+            writer_layer(
+                SpriteShape::Glow {
+                    core: 0.0,
+                    hardness: 0.0,
+                },
+                size,
+                0.05,
+            ),
+        );
+        app.step_ticks(1);
+        let plain = render(&mut app);
+        app.spawn_effect(haze, EffectSpawn::at(Vec3::ZERO).seed(5).keep());
+        app.step_ticks(3);
+        let img = render(&mut app);
+        dump(&img, &format!("distortion_haze_cap_{size}"));
+        let max = (8..120u32)
+            .map(|y| (edge_x(&img, y, 16, 112) - edge_x(&plain, y, 16, 112)).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("heat sprite {size}: edge moved up to {max:.2} px");
+        shifts.push(max);
+        assert_eq!(gpu_errors(&app), 0);
+    }
+    assert!(shifts[0] < 1.0 && shifts[0] > 0.02, "small haze: {shifts:?}");
+    assert!(shifts[1] > 2.0, "large haze still bends: {shifts:?}");
+}

@@ -26,12 +26,18 @@ app.add_plugin(ParticlesPlugin::default()); // next to RenderPlugin / DefaultPlu
 // One call per effect (an entity is spawned and despawned when the effect has played):
 ctx.spawn_effect(builtin::EXPLOSION, EffectSpawn::at(pos).scale(2.0));
 ctx.spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(hit).facing(-bolt_dir).tint(laser_color));
+// With `follow`, the transform is local to the followed entity: `at(Vec3::ZERO)` plays at the
+// ship, `at_local(offset)` at an offset from it; `follow_world` converts a world transform.
 ctx.spawn_effect(
     builtin::SHIELD_RIPPLE,
-    EffectSpawn::at(ship_pos).facing(-bolt_dir).scale(shield_radius / 20.0).follow(ship),
+    EffectSpawn::at(Vec3::ZERO).facing(-bolt_dir_local).scale(shield_radius / 20.0).follow(ship),
+);
+ctx.spawn_effect(
+    builtin::SHIELD_RIPPLE, // the same from a world hit point and direction on a moving ship
+    EffectSpawn::at(hit).facing(-bolt_dir).follow_world(ship, &ctx.world),
 );
 ctx.spawn_effect(builtin::WARP_IN, EffectSpawn::at(portal));
-ctx.spawn_effect(builtin::LASER_TRAIL, EffectSpawn::at(muzzle).follow(bolt).tint(tier_color));
+ctx.spawn_effect(builtin::LASER_TRAIL, EffectSpawn::at_local(Vec3::ZERO).follow(bolt).tint(tier_color));
 ctx.spawn_effect(builtin::MISSILE_TRAIL, EffectSpawn::at(Vec3::ZERO).follow(missile));
 ctx.spawn_effect(builtin::DEBRIS_SPARKS, EffectSpawn::at(hit).facing(-bolt_dir).scale(hull / 40.0));
 ctx.spawn_effect(builtin::EMP, EffectSpawn::at(center).scale(radius / 80.0));
@@ -52,10 +58,20 @@ world.get::<&mut ParticleEmitter>(exhaust)?.rate_scale = throttle; // 0..2
 ```
 
 `SpawnEffect` is implemented for `World`, `App` and `SystemCtx`. `EffectSpawn` builders:
-`at`, `from_transform`, `facing(dir)` (local −Z along `dir`), `follow(entity)` (inserted as
-`Parent`: the emitter moves with it), `tint`, `scale`, `velocity`, `seed`, `prewarm(secs)`,
-`keep()` (do not despawn when finished; the default for `spawn_effect` is `Despawn`),
-`beam_to(end)` (inserts `ParticleBeam { end, width_scale: 1.0 }`: where the effect's beams end).
+`at`, `at_local`, `from_transform`, `facing(dir)` (local −Z along `dir`), `follow(entity)`
+(inserted as `Parent`: the emitter moves with it), `follow_world(entity, &world)`, `tint`,
+`scale`, `velocity`, `seed`, `prewarm(secs)`, `keep()` (do not despawn when finished; the
+default for `spawn_effect` is `Despawn`), `beam_to(end)` (inserts
+`ParticleBeam { end, width_scale: 1.0 }`: where the effect's beams end).
+
+**Which space.** The spawn's transform becomes the emitter entity's `Transform`: a world
+transform on its own, and **local to the followed entity** with `follow` (it is that entity's
+child). `EffectSpawn::at(ship_pos).follow(ship)` therefore plays at twice the ship's position;
+use `at(Vec3::ZERO)` or `at_local(offset)` for an offset from the entity, or build the spawn in
+world space (`at(hit).facing(world_dir)`) and attach it with `follow_world(ship, &world)`, which
+converts the transform into the ship's local space from its current pose (its `Transform` and
+`Parent` chain) — position, facing and scale. (`at` keeps its meaning with `follow` so code
+already passing local offsets, `at(Vec3::Y * 6.0).follow(root)`, keeps working.)
 
 ## Emitters
 
@@ -74,6 +90,31 @@ chain every tick (exact, not last frame's `GlobalTransform`):
 | `finish` | `Keep`, `Despawn` or `RemoveEmitter` once a non-looping effect has fully played |
 | `on_remove` | `Drain` (particles play out) or `Clear` when the component or entity goes away |
 | `restart` | bump it (`restart()`) to start over; the old particles drain |
+| `velocity_smoothing` | seconds (0: off): paces the time rate of world-space layers by the distance each tick moved against the speed low-passed over this time, so an emitter moving in steps keeps an even trail ("Uneven motion" below) |
+
+**Moving emitters.** The tick reads each emitter's pose through its `Parent` chain of
+`Transform`s. Move emitters in `Stage::FixedUpdate` (or `PreUpdate`) and every tick emits from
+exactly the pose of its time. Gameplay that moves them in `Stage::Update` (as SpaceCorps2027
+does) sets one pose per frame, which stands for the end of the *previous* frame when the next
+frame's ticks run; a frame running two ticks (30 fps at the 60 Hz tick; one or two at 45 fps)
+would lay its whole motion on the first tick and stack the second tick's particles on one point
+— beads one frame of motion apart. The plugin measures such motion at the end of every frame
+(`frame_motion_system`, last in `PostUpdate`) and each tick extrapolates the pose by it to the
+tick's own time, so the trail is as even at 30 and 45 fps as at 60 (game#2:
+`update_moved_emitters_do_not_bead_at_low_frame_rates`: gaps of 0.833 ± 0.000 units at 30, 45,
+60 and 144 fps, against 0.00–1.67 before). Only steady motion is extrapolated (two frames that
+agree within a quarter): a teleport, a start or a stop is laid as it happened. Poses set between
+`App::update` calls (tests stepping ticks) are read as the next ticks' poses, not extrapolated.
+
+**Uneven motion.** Particles emitted in a tick are spread along that tick's motion, so the
+*time* rate's density follows the speed: an emitter easing toward 20 Hz server updates (a long
+tick, then short or still ones) lays sparse stretches and beads where it paused (ENGINE_EXHAUST's
+old 180/s + 0.4/unit plume in 7.5-unit steps: 8, 2, 2 particles per 2.5 units). Two remedies:
+lay the trail mostly per unit of distance (`rate_per_distance`, below, which is spatial by
+construction), or set `ParticleEmitter::velocity_smoothing` (0.1–0.2 s covers 20 Hz steps): each
+tick then emits its time rate in proportion to its distance against the smoothed speed — 4, 4, 4
+for the same steps, the same count (`velocity_smoothing_evens_out_stepped_motion`). An emitter
+that stops dead thins its time-rate emission for about twice the smoothing time.
 
 An emitter whose parent disappears is *orphaned*: it stops where it was, drains, then finishes
 (a destroyed ship's exhaust lingers and fades). `ParticleEffectFinished { entity, effect }` is
@@ -308,7 +349,15 @@ offsets add up; order does not matter), on both backends and the WebGL2 path.
   of the sprite's screen-space Jacobian with their length kept, so they follow its rotation and
   plane facing, and a sprite seen edge-on writes nothing.
 * **Strength and weight.** `strength` is the offset at full weight in view heights (0.01 = 1 %
-  of the view's height: 10.8 px at 1080p; the buffer holds ±0.0625 per axis). The weight is the
+  of the view's height: 10.8 px at 1080p; the buffer holds ±0.0625 per axis), **capped by the
+  sprite's own size**: at most 0.12 × its on-screen radius for heat haze (`Glow`, `Streak`,
+  `Smoke`) and 0.5 × for `Ring`, `Vortex` and textures. A view-height strength is the same
+  number of pixels whatever the sprite's projected size, so at game scale (1.4 px per unit) an
+  engine's 0.007 haze moved its 6-px plume by 5 px — the flame itself, which writes no depth
+  and cannot be guarded, bent into a squiggle. Capped, a small or distant writer shimmers what
+  is behind it and a large or close one bends it by its full strength
+  (`heat_haze_bends_at_most_a_fraction_of_its_size`: a 6.4-px-radius haze asking for 6.4 px
+  moves an edge by 0.53 px, a 48-px one by 5.25). The weight is the
   shape's coverage × the opacity over life (`color_over_life` alpha × `alpha_over_life` × tint
   alpha) × the near fade; the color's RGB and `intensity` do not matter.
 * **Depth.** `soft_distance` fades the offset in behind geometry (0: hidden behind anything
@@ -324,7 +373,8 @@ offsets add up; order does not matter), on both backends and the WebGL2 path.
 
 The built-ins carry them: `EXPLOSION`'s shockwave (a ring of 0.03, 0.45 s), `WARP_IN` /
 `WARP_OUT`'s twisting vortex (0.025) and shockwave (0.03), `EMP`'s shock front (0.025) and
-`ENGINE_EXHAUST` / `ENGINE_AFTERBURNER`'s heat haze behind the flame (0.007 / 0.01). Story
+`ENGINE_EXHAUST` / `ENGINE_AFTERBURNER`'s heat haze behind the flame (0.004 / 0.006, starting
+5–6 units behind the nozzle). Story
 `Engine/Particles/Features/Distortion` shows them over a grid.
 
 ### Sorting
@@ -375,8 +425,13 @@ scene pass (hard test only, no extra pass).
 Particles call the frame's output tail (`s3d_output`) with the pass encoding, exposure and
 tonemapper, so they look like meshes in every mode: linear HDR into the HDR scene texture (their
 values above 1 feed bloom), tonemapped per fragment in the Ldr fallback, sRGB-encoded where the
-target needs it. Direct mode has no tonemapper: there each sprite soft-clips with `1 − e^−x`
-(`ParticleSettings::direct_soft_clip`, default on), the game's current look.
+target needs it. Where the view has no tonemapper — Direct mode, and the Ldr passthrough of a
+render scale below 1 without post (`FrameSettings::render_scale`) — each sprite soft-clips with
+`1 − e^−x` (`ParticleSettings::direct_soft_clip`, default on, the game's LDR look), so HDR
+sprites look the same at every render scale: an additive (4, 2, 0.5) dot is sRGB (253, 239, 168)
+at render scale 1 and 0.5, where it clamped to (255, 255, 188) at 0.5 before
+(`tests/render.rs::soft_clip_applies_at_every_render_scale_without_post`, game#3). With post
+(or the Ldr fallback of a post camera) the tonemapper does this job and nothing is clipped.
 
 **Calibration against `Bloom::glow()`** (story `Engine/Particles/Features/HDR Bloom`: small,
 wide and cored glows at radiance 0.25 … 16). The bloom thresholds every scene pixel on its own
@@ -413,7 +468,25 @@ scenes in Direct mode.
 ## Built-in effects
 
 `builtin::*` handles are reserved (registered when `ParticlesPlugin::builtins`); the data is RON
-in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's recipes:
+in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's recipes.
+
+**Reference view.** The built-ins are sized for SpaceCorps2027's top-down battle camera:
+**1.4 px per world unit** (1280 × 720 with the camera about 430 units up at a 70° pitch) with
+**40-unit hulls** at `scale` 1 (`EffectSpawn::scale(hull / 40.0)` for other hulls, and for
+closer cameras). At that view:
+
+| effect | size at the reference view |
+|---|---|
+| `EXPLOSION` | fire about 3 hulls across, shockwaves ending at 4–5 (160–225 units), soft fronts with a faint fill; the fireball burns out within 0.8–1.25 s, the smoke lingers |
+| `HIT_SPARK` | sparks 2.4 units wide (3–4 px), a soft filled burst (no crisp circle) |
+| `SHIELD_RIPPLE` | soft arc and bubble bands (thickness 0.16 / 0.14 with a fill), streaks 2.2 units (3 px) |
+| `WARP_IN` / `WARP_OUT` | the vortex about 4 hulls across (150 units, collapsing to 18), rings ending at 128 and 160 units, flash 130 / core 56 units |
+| `ENGINE_EXHAUST` | a plume of 4–6-unit glows, one per unit flown |
+
+Nothing in a built-in is a thin crisp ring at that scale (a 1–2 px circle reads as a selection
+marker, not energy), and sparks and streaks are at least 3 px wide (thinner ones twinkle as the
+camera pans). Before M2's retune `WARP_IN` spanned 214–419 units (5–10 hulls), `EXPLOSION`'s
+shockwave 400 and its fireball stayed opaque for 1.4–2.1 s.
 
 | handle | what | spawn |
 |---|---|---|
@@ -421,11 +494,11 @@ in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's
 | `HIT_SPARK` | flash, sparks thrown along −Z, a ring, smoke, a short light flash of the tint; tinted | `.facing(-bolt_dir).tint(color)` |
 | `SHIELD_RIPPLE` | focused arc toward −Z, faint bubble, surface flash, streaks; local-space | `.facing(-bolt_dir).scale(radius / 20).follow(ship)` |
 | `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash (white-hot core, blue halo), two rings; distortion: the vortex twists the space around the portal and a shockwave pushes it outward | `EffectSpawn::at(portal)` |
-| `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow, heat haze (distortion) in the flame's wake; `rate_scale` = throttle: the plume stays dense and gets shorter, narrower and dimmer at partial throttle (one flame, never puffs; `tests/render.rs::exhaust_stays_continuous_at_partial_throttle`). Near-neutral (white-hot): the flame takes its hue from the tint. `EffectPriority::Low`: engines yield the budget to combat effects | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
+| `ENGINE_EXHAUST` | looping plume along +Z laid per unit flown (1 per unit) plus a time rate (160/s at full throttle), sparks, nozzle glow, heat haze (distortion) behind the flame; `rate_scale` = throttle: the plume stays dense and gets shorter, narrower and dimmer at partial throttle (one flame, never puffs; `tests/render.rs::exhaust_stays_continuous_at_partial_throttle`). Near-neutral (white-hot): the flame takes its hue from the tint. `EffectPriority::Low`: engines yield the budget to combat effects | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
 | `LASER_TRAIL` | looping white-hot head + a ribbon of glow along the bolt's path, 0.15 s long, reaching the bolt's render position at any speed (it was a chain of sprite glows per unit of distance, 581 pool slots and render-time bridges per bolt; the ribbon looks the same for 5 slots and 64 ribbon points) | `.follow(bolt).tint(color)` (a saturated tint: the game's pure primaries such as `(1, 0, 0)` stay the most saturated); the bolt may move in any stage |
 | `LASER_BEAM` | looping continuous laser to its `ParticleBeam` end: a wide glow of the tint around a white-hot core, flowing noise, a slight flicker, round glows at the gun and the hit, a muzzle glow | `EffectSpawn::from_transform(gun).follow(ship).beam_to(BeamEnd::Entity(hit_point)).tint(color).keep()` |
 | `LASER_SHOT` | a hitscan shot: the same beam from muzzle to hit for 0.12 s, fading as it thins, muzzle flash, hot glow on the hit (one-shot) | `EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color)`, with a `HIT_SPARK` at the hit |
-| `MISSILE_TRAIL` | looping: a white-hot flame and short glowing wake on the missile, sparks, and a smoke ribbon along its path that widens, breaks up and fades over 1.6 s, with puffs (sorted per particle: crossing trails interleave); the smoke drains when the missile is gone | `EffectSpawn::at(Vec3::ZERO).follow(missile)` (missile facing −Z) |
+| `MISSILE_TRAIL` | looping: a white-hot flame and short glowing wake on the missile, sparks, and a smoke ribbon along its path that widens, breaks up and fades over 1.1 s, with soft puffs of the same grey scattered along it (random spacing and offsets, fading in: volume, not knots on a string; sorted per particle: crossing trails interleave); the smoke drains when the missile is gone | `EffectSpawn::at(Vec3::ZERO).follow(missile)` (missile facing −Z) |
 | `DEBRIS_SPARKS` | a hull breaking apart: hot chunks tumbling and cooling to dark plating, sparks, flickering embers, smoke (sorted per particle) and a light flash that catches the hull | `.facing(-hit_dir).scale(hull / 40)` |
 | `ENGINE_AFTERBURNER` | looping boost over `ENGINE_EXHAUST`: a long white-hot plume, three shock diamonds riding the nozzle, a ribbon trail along the path, heat sparks, strong heat haze (distortion); `rate_scale` = boost (0..1.5: longer and brighter, never thinner); `EffectPriority::Low` | like `ENGINE_EXHAUST`, `.tint(engine color)` |
 | `EMP` | an electromagnetic pulse: a white-cyan flash with a strong light flash, a fast shock ring and a fainter one, a shock front that bends the space behind it (distortion), crackling arcs, flickering motes; tinted; `EffectPriority::High` | `EffectSpawn::at(center).scale(radius / 80)` |
@@ -487,7 +560,16 @@ when run by tools):
   `FixedUpdate`, `PreUpdate` and `Update`, at 60 and 120 Hz, both backends). Bridges are built
   on the CPU (a frame of motion's worth of particles per moving emitter) and drawn as direct
   draws on both backends; bursts and the simulation itself stay on the tick. A sprite trail that
-  must reach a fast emitter emits per distance (`Spawn::rate_per_distance`). A **ribbon** needs
+  must reach a fast emitter emits per distance (`Spawn::rate_per_distance`).
+* **Plumes and trails: lay them per distance.** A time rate places particles by time, so their
+  spacing along the path is the emitter's speed over the rate, and every uneven frame, tick or
+  speed step shows as beads. What reads as one continuous flame at any frame rate and speed
+  (the game's own exhaust, game#12): emit mostly **per unit of distance flown**
+  (`rate_per_distance` about 1 per unit), make the **cores wider than their spacing** (glows of
+  4–8 units for a spacing of about 1), and add a **small time rate** for the plume of a ship at
+  rest. `ENGINE_EXHAUST` does this (1 per unit + 160/s at full throttle, 4–6-unit glows).
+  Distance rings are sized for `Spawn::max_speed` (100 units/s by default, 75 for the exhaust)
+  and grow with a looping emitter's speed ("Budgets", below). A **ribbon** needs
   no bridge: its head is drawn at the render pose (`LASER_TRAIL` is a ribbon now; the same
   `tests/follow.rs` checks it).
 * The render node replays the pending ticks inside the render frame. Particle *k* of a layer
@@ -523,14 +605,34 @@ when run by tools):
   90 %, `High` may use it all (the engines are `Low`, explosions and EMPs `High`). Slots a
   built-in reserves per instance at quality 1 (`runtime::tests::builtin_slots`; ribbon points in
   parentheses): `EXPLOSION` 82, `HIT_SPARK` 16, `SHIELD_RIPPLE` 8, `WARP_IN` / `WARP_OUT` 29,
-  `ENGINE_EXHAUST` 164 (its rates at the afterburner's `max_rate_scale` 2: the plume's
-  `2^0.25`), `LASER_TRAIL` 5 (64), `LASER_BEAM` 7, `LASER_SHOT` 1, `MISSILE_TRAIL` 23 (192),
-  `DEBRIS_SPARKS` 78, `ENGINE_AFTERBURNER` 215 (96), `EMP` 64, `REPAIR_BEAM` 8; `lod` layers
+  `ENGINE_EXHAUST` 171 (its rates at the afterburner's `max_rate_scale` 2: the plume's
+  `2^0.25`, the distance rate at 75 units/s), `LASER_TRAIL` 5 (64), `LASER_BEAM` 7, `LASER_SHOT`
+  1, `MISSILE_TRAIL` 56 (192), `DEBRIS_SPARKS` 78, `ENGINE_AFTERBURNER` 215 (96), `EMP` 64,
+  `REPAIR_BEAM` 8; `lod` layers
   reserve for their quality × LOD level (below). Ribbon points come from their own pool,
   `max_ribbon_segments` (65 536: about a thousand laser trails): a ribbon that does not fit is
   refused (`ParticleStats::refused`, warned once per effect).
+* **Distance rings and speed** (game#10). A `rate_per_distance` layer's ring holds
+  `rate_per_distance × max_rate_scale × Spawn::max_speed × life` particles: it is sized for an
+  emitter flying at `max_speed`, **100 units/s by default**. A **looping** effect whose emitter
+  flies faster for three ticks in a row restarts with rings for its speed (the next
+  power-of-two multiple of `max_speed` covering 1.25 × it, up to 64×; the old particles drain,
+  as for a LOD change; a single jump such as a teleport does not count). A **one-shot** effect
+  cannot restart: a faster emitter wraps its ring and the oldest particles of its trail vanish
+  early — set `max_speed` (or `ParticleLayer::capacity`) for trails on fast bolts. The repro
+  (1.2 per unit, `max_rate_scale` 2, throttle 2, life 0.1 s, 600 units/s) kept 26 of 144
+  particles (a 10-unit trail instead of 60) and now keeps all 144 with rings for 800 units/s
+  (`runtime::tests::distance_rings_grow_with_the_emitter_speed`).
+* **Lowering the budget at runtime** (game#14; a graphics menu switching tiers). A budget
+  lowered after the pool grew applies at once: new rings are reserved under the lowered budget
+  (shrunk, then refused, as always), rings reserved before keep their slots and drain, and the
+  pool's free tail beyond the budget is given back (the simulated extent, `pool_high_water`,
+  drops with it; `a_lowered_budget_is_enforced`, `tests/budget.rs::lowered_max_particles_is_enforced`).
+  The GPU pool buffer keeps its size (`pool_allocated`).
 * `ParticleStats` (resource, per rendered frame): backend, live effects and layer instances,
-  pool capacity / reserved, alive particles (CPU: this frame; GPU: read back from the draw
+  `pool_capacity` (the budget in force), `pool_reserved`, `pool_allocated` (slots the GPU pool
+  buffer or the CPU pool holds memory for), `pool_high_water` (one past the highest slot
+  reserved: the simulated part of the pool), alive particles (CPU: this frame; GPU: read back from the draw
   arguments 1–3 frames late, `alive_frame` says which), ticks replayed, catch-up resets,
   compute dispatches, draw calls, `ribbon_segments` (ribbon and beam segments drawn), bytes
   uploaded, `cpu_reallocations` (0 in the steady state).
@@ -707,13 +809,13 @@ and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 | `fx::particles::Fade` | `Curve::Preset(FadeCurve::…)` (`Flicker` = `Linear` + `Flicker`) |
 | `fx::Effect::Explosion { at, scale }` | `spawn_effect(builtin::EXPLOSION, EffectSpawn::at(at).scale(scale))` |
 | `fx::Effect::Impact { at, dir, color }` | `spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(at).facing(-dir).tint(color.extend(1.0)))` (the game's `color` is a `Vec3`; `tint` takes linear RGBA) |
-| `fx::Effect::ShieldHit { center, radius, dir }` | `spawn_effect(builtin::SHIELD_RIPPLE, EffectSpawn::at(center).facing(-dir).scale(radius / 20.0).follow(ship))` |
+| `fx::Effect::ShieldHit { center, radius, dir }` | `spawn_effect(builtin::SHIELD_RIPPLE, EffectSpawn::at(center).facing(-dir).scale(radius / 20.0).follow_world(ship, &ctx.world))` (`follow_world`: `center` and `dir` are world space; plain `follow` would take them as local to the ship and play at twice its position) |
 | warp / portal jumps | `builtin::WARP_IN` / `WARP_OUT` |
 | engine trails and nozzle flames | `ParticleEmitter::new(builtin::ENGINE_EXHAUST)` per nozzle, `rate_scale` = throttle, `tint` = `engine_color(e).extend(1.0)` (the plume is neutral: the tier and faction colors come through); boosting: `ENGINE_AFTERBURNER` on the same nozzles |
 | bolt afterglow | `builtin::LASER_TRAIL` following the bolt, which `fx::animate` keeps moving in `Stage::Update` (a ribbon: its head is the bolt's render position, so the trail reaches the head at any frame rate) |
 | lasers drawn in the egui overlay | `builtin::LASER_SHOT` per hitscan shot (`EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color)`, it despawns itself), or `LASER_BEAM` for a held laser (`beam_to(BeamEnd::Entity(..))`, looping: stop or despawn it); they are HDR particles now, so they bloom and sit in the scene's depth |
 | missiles, heavy hits, EMPs, repairs | `MISSILE_TRAIL` (follow the missile), `DEBRIS_SPARKS`, `EMP`, `REPAIR_BEAM` |
-| `1 − e^−x` soft clip in the overlay | `direct_soft_clip` in Direct mode; with `PostProcess` the tonemapper and bloom take over |
+| `1 − e^−x` soft clip in the overlay | `direct_soft_clip` in Direct mode and at render scales below 1 without post; with `PostProcess` the tonemapper and bloom take over |
 | the game's graphics quality setting | `ParticleSettings::for_quality(GraphicsQuality::…)` (Low on WebGL2: the CPU backend, 16k / 8k on the web, quality 0.25 / 0.125, off-screen engines culled) |
 | heat haze, shockwaves (none in the game today) | built in: `EXPLOSION`, `WARP_IN` / `WARP_OUT`, `EMP`, `ENGINE_EXHAUST`, `ENGINE_AFTERBURNER` bend the image behind them through `PostProcess` (distortion on by default); custom ones with `SpriteRender::distortion(strength)` or `DistortionMaterial` meshes |
-| the battle camera's look | choose it explicitly: `PostProcess::default().with_tonemapper(Tonemapper::AgXPunchy).with_exposure(0.5)` keeps faction exhaust, lasers and fire saturated; the default `AgX` turns them pastel (frame.md, "Choose the look explicitly") |
+| the battle camera's look | choose it explicitly (frame.md, "Choose the look explicitly"): `AgXPunchy` + 0.5 EV keeps faction exhaust, lasers and fire saturated but skews dim saturated nebulae toward their strongest channel; plain `AgX` with `ColorGrading::vivid()` keeps both; `KhronosPbrNeutralNoToe` passes display-authored art unchanged |

@@ -255,7 +255,10 @@ pub struct ParticleLayer {
     pub tinted: bool,
     /// Quality / LOD may reduce counts. Default true.
     pub lod: bool,
-    /// Override the computed ring size.
+    /// Override the computed ring size: the most particles of one layer instance alive at
+    /// once (older ones are overwritten). Computed by default from the rates at
+    /// `max_rate_scale`, the bursts and the life window, with `rate_per_distance` taken at
+    /// [`Spawn::max_speed`] (100 units/s unless set).
     pub capacity: Option<u32>,
     /// How `ParticleEmitter::rate_scale` (the throttle) drives the layer: by default only its
     /// rates, linearly.
@@ -437,10 +440,20 @@ impl ParticleLayer {
 pub struct Spawn {
     /// Particles per second.
     pub rate: f32,
-    /// Particles per world unit the emitter moves.
+    /// Particles per world unit the emitter moves. The layer's ring is sized for an emitter
+    /// flying at [`Self::max_speed`]; see there.
     pub rate_per_distance: f32,
     /// Upper bound of `ParticleEmitter::rate_scale`. Default 1.
     pub max_rate_scale: f32,
+    /// Fastest emitter speed (world units per second) the ring of a `rate_per_distance` layer
+    /// is sized for: `rate_per_distance × max_rate_scale × max_speed × life` particles.
+    /// Default 100. A **looping** effect whose emitter keeps flying faster (three ticks in a
+    /// row) restarts with rings for its speed (the next power-of-two multiple of `max_speed`
+    /// covering 1.25 × the speed, up to 64×; the old particles drain, as for a LOD change); a
+    /// **one-shot** effect cannot, and a faster emitter wraps its ring: the oldest particles
+    /// of the trail disappear early. Set it (or `ParticleLayer::capacity`) for trails on fast
+    /// bolts and afterburning ships.
+    pub max_speed: f32,
     /// Bursts.
     pub bursts: Vec<Burst>,
 }
@@ -451,6 +464,7 @@ impl Default for Spawn {
             rate: 0.0,
             rate_per_distance: 0.0,
             max_rate_scale: 1.0,
+            max_speed: 100.0,
             bursts: Vec::new(),
         }
     }
@@ -706,7 +720,11 @@ pub enum SpriteTarget {
     /// channels (0.5 = none), the other shapes shimmer it like heat; the weight is the shape ×
     /// the opacity over life × the near fade, faded against scene depth by `soft_distance`.
     Distortion {
-        /// Offset at full weight, in view heights (0.01 = 1 % of the view's height).
+        /// Offset at full weight, in view heights (0.01 = 1 % of the view's height), at most
+        /// 0.12 × the sprite's on-screen radius for heat haze (`Glow`, `Streak`, `Smoke`) and
+        /// 0.5 × for `Ring`, `Vortex` and textures: a sprite never bends the image by more than
+        /// a fraction of its own size, so small, distant or top-down writers shimmer instead of
+        /// shifting what they cover (an engine plume under its own haze) by their width.
         strength: f32,
     },
 }

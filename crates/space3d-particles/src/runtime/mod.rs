@@ -16,7 +16,7 @@ mod spawn;
 mod tests;
 
 pub(crate) use alloc::RangeAllocator;
-pub(crate) use layer::{LayerSim, capacity, window_ticks};
+pub(crate) use layer::{LayerSim, capacity, ring_speed_for, window_ticks};
 pub(crate) use log::{SpawnRecord, TickLog, WorldAttractor, XformRow};
 pub(crate) use path::Path;
 pub(crate) use ribbon::{RibbonPoint, Track};
@@ -136,12 +136,38 @@ pub(crate) struct Instance {
     pub prev_rot: Quat,
     pub pos: Vec3,
     pub rot: Quat,
+    /// World pose read at the last tick or frame observation, before the extrapolation
+    /// ([`Runtime::observe_frame`]).
+    pub raw_pos: Vec3,
+    pub raw_rot: Quat,
+    /// Velocity and spin (scaled axis per second) of the motion outside the fixed tick, measured
+    /// between frames (an emitter moved in `Stage::Update`): each tick extrapolates the pose by
+    /// them to its own time ([`Runtime::ahead`]).
+    pub frame_vel: Vec3,
+    pub frame_spin: Vec3,
+    /// The last measurement of that motion (the extrapolation uses it only while the next one
+    /// agrees: steady motion, not a teleport, a start or a stop).
+    pub measured_vel: Vec3,
+    pub measured_spin: Vec3,
     pub velocity: Vec3,
     /// World distance the emitter moved in the last tick (the render-time bridge's share of a
     /// tick's time-rate emission).
     pub distance: f32,
     /// Quality × LOD rate multiplier of the last tick.
     pub quality: f32,
+    /// Distance moved per tick, low-passed over `ParticleEmitter::velocity_smoothing` (−1
+    /// before the first motion): what the time rate is paced against.
+    pub smoothed: f32,
+    /// × the time rate this tick (pacing; 1 without).
+    pub pace: f32,
+    /// Speed (units/s) the `rate_per_distance` rings are sized for (0: the layers'
+    /// `Spawn::max_speed`).
+    pub ring_speed: f32,
+    /// Consecutive ticks the emitter flew faster than its rings hold.
+    pub fast_ticks: u8,
+    /// The effect has enabled `rate_per_distance` layers sized by speed (no explicit
+    /// `capacity`), and the smallest `max_speed` among them.
+    pub dist_speed: Option<f32>,
     /// The quality × LOD level its `lod` layers' rings are sized for ([`ring_level`]).
     pub ring: f32,
     /// A layer was refused (budget): a looping instance retries it every
@@ -226,6 +252,12 @@ pub(crate) struct Runtime {
     /// Pool budget for the resolved backend (set by the tick system; `None`:
     /// `ParticleSettings::max_particles_cpu`).
     pub budget: Option<u32>,
+    /// The budget in force ([`Self::set_budget`]): new rings are reserved under it even when
+    /// the pool is larger (a budget lowered after the pool grew).
+    limit: Option<u32>,
+    /// Largest `by_entity.capacity()` seen: the map reallocates only beyond it (its
+    /// `capacity()` also moves with tombstones, without allocating).
+    by_entity_cap: usize,
     /// Entries freed at a tick, reusable once the log no longer holds that tick.
     released_entries: VecDeque<(u64, u32)>,
     free_entries: Vec<u32>,
@@ -256,6 +288,10 @@ pub(crate) struct Runtime {
     pub aspect: f32,
     /// Emitters new this tick (scratch: started after the others, the most visible first).
     new_emitters: Vec<NewEmitter>,
+    /// Seconds from the frame time the emitters' `Transform`s stand for (where `Stage::Update`
+    /// left them) to the end of this tick: how far a tick extrapolates the motion measured
+    /// between frames (set by the tick system; 0 extrapolates nothing).
+    pub ahead: f32,
 }
 
 /// World position and rotation of an entity with `t` and `parent`, through the `Parent` chain
@@ -337,9 +373,14 @@ struct NewEmitter {
     em: ParticleEmitter,
     pos: Vec3,
     rot: Quat,
+    /// The pose read (before the extrapolation).
+    raw: (Vec3, Quat),
     broken: bool,
     hidden: bool,
     quality: f32,
+    /// Speed its distance rings are sized for (0: the layers' `max_speed`; set when an
+    /// instance restarts for its speed).
+    ring_speed: f32,
 }
 
 /// Ticks between a looping instance's retries of layers its budget refused.
@@ -363,6 +404,35 @@ pub(crate) fn ring_level(q: f32, t: f32) -> f32 {
     q / (1u32 << k) as f32
 }
 
+/// Speed below which pacing treats an emitter as still (units/s): the softening of
+/// [`pace`]'s ratio, so a still emitter emits at its plain time rate.
+const PACE_STILL_SPEED: f32 = 8.0;
+
+/// The time-rate multiplier of an instance that moved `distance` this tick of `dt` seconds with
+/// `ParticleEmitter::velocity_smoothing` `tau` (updating its low-passed distance): `(d + k) /
+/// (d̄ + k)`, the distance against the smoothed one, softened by `k` = [`PACE_STILL_SPEED`] ×
+/// `dt`, within 0..4. 1 without pacing or before the emitter first moved (the smoothing starts
+/// from its first motion).
+fn pace(inst: &mut Instance, tau: f32, distance: f32, dt: f32) -> f32 {
+    if tau.is_nan() || tau <= 0.0 || dt <= 0.0 || !distance.is_finite() || inst.orphaned {
+        inst.smoothed = -1.0;
+        return 1.0;
+    }
+    if inst.smoothed < 0.0 {
+        if distance > 0.0 {
+            inst.smoothed = distance;
+        }
+        return 1.0;
+    }
+    let a = 1.0 - (-dt / tau).exp();
+    let before = inst.smoothed;
+    inst.smoothed += a * (distance - inst.smoothed);
+    // Against the mean of the smoothed distance before and after this tick: the ratio then
+    // averages to 1 over steady periodic motion (either end alone biases it by about ±10 %).
+    let k = PACE_STILL_SPEED * dt;
+    ((distance + k) / (0.5 * (before + inst.smoothed) + k)).clamp(0.0, 4.0)
+}
+
 /// LOD multiplier at `distance` (1 at `near`, `min_scale` at `far`).
 fn lod_scale(lod: &ParticleLod, distance: f32) -> f32 {
     if !lod.near.is_finite() || distance <= lod.near {
@@ -376,11 +446,10 @@ fn lod_scale(lod: &ParticleLod, distance: f32) -> f32 {
 }
 
 impl Runtime {
-    fn capacities(&self) -> [usize; 10] {
+    fn capacities(&self) -> [usize; 9] {
         [
             self.instances.capacity() + self.paths.capacity(),
             self.free_instances.capacity(),
-            self.by_entity.capacity(),
             self.entries.capacity(),
             self.released_entries.capacity() + self.free_entries.capacity(),
             self.pool.capacity(),
@@ -391,9 +460,29 @@ impl Runtime {
         ]
     }
 
-    /// Particle budget of the pool.
+    /// Particle budget of the pool: the pool grows to it, and a lower budget than the pool
+    /// holds limits new reservations at once (live rings above it drain) and gives the free
+    /// tail of the pool back (game#14).
     pub fn set_budget(&mut self, budget: u32) {
         self.pool.grow_to(budget);
+        self.pool.shrink_to(budget);
+        self.limit = Some(budget);
+    }
+
+    /// The pool capacity in force: the budget, within the pool's size.
+    pub fn pool_capacity(&self) -> u32 {
+        self.limit.map_or(self.pool.total(), |l| l.min(self.pool.total()))
+    }
+
+    /// Count a reallocation of `by_entity` (its capacity beyond any seen before).
+    fn track_by_entity(&mut self) {
+        let cap = self.by_entity.capacity();
+        if cap > self.by_entity_cap {
+            if self.by_entity_cap > 0 {
+                self.reallocations += 1;
+            }
+            self.by_entity_cap = cap;
+        }
     }
 
     /// Entries freed at ticks the log no longer holds become reusable.
@@ -426,7 +515,7 @@ impl Runtime {
     /// Reserve a ring for `cap` slots under the budget and the priority's share of it, shrinking
     /// to 1/2, 1/4 and 1/8 before refusing (design-particles §5 step 1).
     fn reserve(&mut self, cap: u32, priority: EffectPriority) -> Option<(u32, u32)> {
-        let limit = (self.pool.total() as f32 * priority_limit(priority)) as u32;
+        let limit = (self.pool_capacity() as f32 * priority_limit(priority)) as u32;
         for shift in 0..4 {
             let c = (cap >> shift).max(1);
             if self.pool.reserved() + c > limit {
@@ -454,6 +543,7 @@ impl Runtime {
         rot: Quat,
         settings: &ParticleSettings,
         ring: f32,
+        ring_speed: f32,
     ) -> u32 {
         let seed = em.seed.unwrap_or_else(|| {
             let bits = entity.to_bits().get();
@@ -503,9 +593,20 @@ impl Runtime {
             prev_rot: rot,
             pos,
             rot,
+            raw_pos: pos,
+            raw_rot: rot,
+            frame_vel: Vec3::ZERO,
+            frame_spin: Vec3::ZERO,
+            measured_vel: Vec3::ZERO,
+            measured_spin: Vec3::ZERO,
             velocity: em.velocity,
             distance: 0.0,
             quality: 1.0,
+            smoothed: -1.0,
+            pace: 1.0,
+            ring_speed,
+            fast_ticks: 0,
+            dist_speed: None,
             ring,
             missing: false,
             lod_layers: false,
@@ -531,7 +632,28 @@ impl Runtime {
         };
         self.allocate_layers(i, handle, effect, false);
         self.by_entity.insert(entity, i);
+        self.track_by_entity();
         i
+    }
+
+    /// Whether looping instance `i`, whose emitter moved `speed` units/s this tick, should
+    /// restart with bigger `rate_per_distance` rings: it flew faster than they hold for three
+    /// ticks in a row (a single jump, a teleport, does not count) and bigger rings exist.
+    fn distance_rings_outgrown(&mut self, i: u32, speed: f32) -> bool {
+        let inst = &mut self.instances[i as usize];
+        let Some(base) = inst.dist_speed else {
+            return false;
+        };
+        if !inst.looping || !inst.attached || inst.finished || inst.orphaned || !speed.is_finite() {
+            return false;
+        }
+        let held = inst.ring_speed.max(base);
+        if speed <= held || ring_speed_for(base, speed) <= held {
+            inst.fast_ticks = 0;
+            return false;
+        }
+        inst.fast_ticks = inst.fast_ticks.saturating_add(1);
+        inst.fast_ticks >= 3
     }
 
     /// Whether looping instance `i` should restart with rings for the quality × LOD multiplier
@@ -552,6 +674,7 @@ impl Runtime {
     fn allocate_layers(&mut self, i: u32, handle: EffectHandle, effect: &ParticleEffect, retry: bool) {
         let seed = self.instances[i as usize].seed;
         let ring = self.instances[i as usize].ring;
+        let ring_speed = self.instances[i as usize].ring_speed;
         let old = self.instances[i as usize];
         let held = if retry { old.n_entries as usize } else { 0 };
         let mut entries = [u32::MAX; MAX_LAYERS_PER_EFFECT];
@@ -573,7 +696,7 @@ impl Runtime {
                 continue;
             }
             let q = if layer.lod { ring } else { 1.0 };
-            let cap = layer::capacity_at(layer, q);
+            let cap = layer::capacity_for(layer, q, ring_speed);
             let Some((base, c)) = self.reserve(cap, effect.priority) else {
                 missing = true;
                 if retry {
@@ -617,6 +740,18 @@ impl Runtime {
         inst.n_entries = n as u8;
         inst.missing = missing;
         inst.lod_layers = effect.layers.iter().any(|l| l.enabled && l.lod);
+        inst.dist_speed = effect
+            .layers
+            .iter()
+            .filter(|l| l.enabled && l.capacity.is_none() && l.spawn.rate_per_distance > 0.0)
+            .map(|l| {
+                if l.spawn.max_speed > 0.0 && l.spawn.max_speed.is_finite() {
+                    l.spawn.max_speed
+                } else {
+                    layer::V_REF
+                }
+            })
+            .reduce(f32::min);
         if !retry {
             self.allocate_tracks(i, handle, effect);
         }
@@ -879,18 +1014,40 @@ impl Runtime {
         let mut new = std::mem::take(&mut self.new_emitters);
         new.clear();
         for (entity, em, tr, parent, vis) in query.iter() {
-            let (pos, rot, broken) = world_pose(world, tr, parent);
+            let (raw_pos, raw_rot, broken) = world_pose(world, tr, parent);
+            let mut found = self.by_entity.get(&entity).copied();
+            let (pos, rot) = match found {
+                Some(i) => self.extrapolate(i, raw_pos, raw_rot, broken),
+                None => (raw_pos, raw_rot),
+            };
             // Quality × LOD (distance, off screen) of this emitter this tick.
             let lod = camera.map_or(1.0, |c| c.lod(settings, pos));
             let quality = settings.quality.clamp(0.0, 1.0) * lod;
-            let mut found = self.by_entity.get(&entity).copied();
+            // The emitter's speed this tick (for rings sized by speed).
+            let mut speed = 0.0;
             if let Some(i) = found {
                 let inst = &self.instances[i as usize];
-                // Another effect, a restart, or (looping) `lod` rings sized for another LOD
-                // level: the old instance drains and a new one plays on.
-                if inst.effect != em.effect || inst.restart != em.restart || self.lod_rings_outgrown(i, quality) {
+                if dt > 0.0 && !inst.orphaned {
+                    speed = pos.distance(inst.pos) / dt;
+                }
+                // Another effect, a restart, (looping) `lod` rings sized for another LOD level,
+                // or distance rings too small for its speed: the old instance drains and a new
+                // one plays on.
+                let restart = inst.effect != em.effect || inst.restart != em.restart;
+                if restart || self.lod_rings_outgrown(i, quality) || self.distance_rings_outgrown(i, speed) {
+                    if !restart {
+                        // Rings for the speed it flies at (and never smaller than before).
+                        let inst = &self.instances[i as usize];
+                        if let Some(base) = inst.dist_speed {
+                            speed = ring_speed_for(base, speed).max(inst.ring_speed);
+                        }
+                    } else {
+                        speed = 0.0;
+                    }
                     self.detach(i, OnRemove::Drain);
                     found = None;
+                } else {
+                    speed = 0.0;
                 }
             }
             let emitter = NewEmitter {
@@ -898,9 +1055,11 @@ impl Runtime {
                 em: em.clone(),
                 pos,
                 rot,
+                raw: (raw_pos, raw_rot),
                 broken,
                 hidden: vis == Some(&Visibility::Hidden),
                 quality,
+                ring_speed: speed,
             };
             match found {
                 Some(i) => self.play(i, &emitter, effects, dt),
@@ -1004,6 +1163,65 @@ impl Runtime {
         self.time += dt as f64;
         let after = self.capacities();
         self.reallocations += before.iter().zip(&after).filter(|(a, b)| a != b).count() as u32;
+    }
+
+    /// The pose instance `i` emits from this tick, for the pose read (`raw_*`): extrapolated
+    /// by the motion measured between frames ([`Self::observe_frame`]) to the end of the tick
+    /// ([`Self::ahead`]). Gameplay that moves an emitter in `Stage::Update` sets one pose per
+    /// frame; without this, every tick of a frame running two or more read that pose, the first
+    /// laid the whole frame's motion and the others stacked their particles on one point (beads
+    /// one frame of motion apart at 30 or 45 fps). An emitter moved on the tick (or still)
+    /// measures no such motion and emits from exactly the pose read.
+    fn extrapolate(&mut self, i: u32, raw_pos: Vec3, raw_rot: Quat, broken: bool) -> (Vec3, Quat) {
+        let ahead = self.ahead;
+        let inst = &mut self.instances[i as usize];
+        inst.raw_pos = raw_pos;
+        inst.raw_rot = raw_rot;
+        if broken || ahead <= 0.0 || !inst.attached || (inst.frame_vel == Vec3::ZERO && inst.frame_spin == Vec3::ZERO) {
+            return (raw_pos, raw_rot);
+        }
+        (
+            raw_pos + inst.frame_vel * ahead,
+            (Quat::from_scaled_axis(inst.frame_spin * ahead) * raw_rot).normalize(),
+        )
+    }
+
+    /// Measure the motion of every emitter since the last tick or frame observation, at the
+    /// end of the frame (`frame_motion_system`, last in `Stage::PostUpdate`): motion gameplay
+    /// gave it after the ticks, over this frame's `delta` (`Time::delta`), which the next
+    /// frame's ticks extrapolate ([`Self::extrapolate`]). Allocates nothing.
+    pub fn observe_frame(&mut self, world: &World, delta: f32) {
+        let span = delta;
+        for inst in &mut self.instances {
+            if !inst.live || !inst.attached || inst.orphaned || inst.finished {
+                continue;
+            }
+            let Ok(t) = world.get::<&Transform>(inst.entity) else {
+                continue;
+            };
+            let parent = world.get::<&Parent>(inst.entity).ok();
+            let (pos, rot, broken) = world_pose(world, &t, parent.as_deref());
+            let (mut vel, mut spin) = (Vec3::ZERO, Vec3::ZERO);
+            if !broken && span > 0.0 {
+                vel = (pos - inst.raw_pos) / span;
+                // The shorter way round.
+                let d = rot * inst.raw_rot.inverse();
+                let d = if d.w < 0.0 { -d } else { d };
+                spin = d.to_scaled_axis() / span;
+            }
+            if !vel.is_finite() || !spin.is_finite() {
+                (vel, spin) = (Vec3::ZERO, Vec3::ZERO);
+            }
+            // Extrapolate only steady motion: this frame's measurement agrees with the last one
+            // (within a quarter). A teleport, a start or a stop is laid as it happened, never
+            // projected a frame past it.
+            let agrees = |a: Vec3, b: Vec3| (a - b).length() <= 0.25 * a.length().max(b.length());
+            let steady = agrees(vel, inst.measured_vel) && agrees(spin, inst.measured_spin);
+            (inst.frame_vel, inst.frame_spin) = if steady { (vel, spin) } else { (Vec3::ZERO, Vec3::ZERO) };
+            (inst.measured_vel, inst.measured_spin) = (vel, spin);
+            inst.raw_pos = pos;
+            inst.raw_rot = rot;
+        }
     }
 
     /// Append this tick's ribbon points of instance `i` (its pose at the end of the tick).
@@ -1143,7 +1361,19 @@ impl Runtime {
             }
         };
         let ring = ring_level(settings.quality, n.quality);
-        let i = self.create(n.entity, em, em.effect, effect, n.pos, n.rot, settings, ring);
+        let i = self.create(
+            n.entity,
+            em,
+            em.effect,
+            effect,
+            n.pos,
+            n.rot,
+            settings,
+            ring,
+            n.ring_speed,
+        );
+        let inst = &mut self.instances[i as usize];
+        (inst.raw_pos, inst.raw_rot) = n.raw;
         if em.prewarm > 0.0 && dt > 0.0 {
             self.prewarm(i, effect, em.prewarm, dt, settings);
         }
@@ -1191,6 +1421,7 @@ impl Runtime {
         };
         inst.distance = distance;
         inst.quality = n.quality;
+        inst.pace = pace(inst, em.velocity_smoothing, distance, dt);
         let Some(effect) = effects.get(em.effect) else {
             return;
         };
@@ -1228,6 +1459,11 @@ impl Runtime {
                     mul,
                     distance,
                     extra_age,
+                    pace: if layer.space == crate::effect::SimulationSpace::World {
+                        inst.pace
+                    } else {
+                        1.0
+                    },
                 },
                 &mut self.log,
             );
@@ -1350,6 +1586,7 @@ impl Runtime {
             mul: if c.lod { inst.quality.min(e.quality_cap) } else { 1.0 } * e.rate_mul,
             distance: gap,
             extra_age: 0.0,
+            pace: inst.pace,
         };
         let mut acc = e.acc;
         let (n, t0, t1) = spawn::continuous(c, &mut acc, &tick, share)?;

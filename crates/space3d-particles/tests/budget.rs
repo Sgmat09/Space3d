@@ -147,3 +147,51 @@ fn the_pool_stays_within_the_storage_binding_limit() {
     assert!(s.alive > 1500, "{s:?}");
     assert_eq!(gpu_errors(&app), 0);
 }
+
+/// game#14 on the GPU backend: a `max_particles` lowered after the pool grew is enforced at
+/// once (new rings stop at the lowered budget: shrunk, then refused), and the stats report the
+/// budget in force (`pool_capacity`), the slots the pool buffer holds (`pool_allocated`) and
+/// the simulated extent (`pool_high_water`).
+#[test]
+fn lowered_max_particles_is_enforced() {
+    let Some(mut app) = gpu_app(ParticleSettings {
+        max_particles: 262_144,
+        ..ParticleSettings::default()
+    }) else {
+        return;
+    };
+    camera(
+        &mut app,
+        Vec3::new(0.0, 0.0, 30.0),
+        Vec3::ZERO,
+        Vec4::new(0.0, 0.0, 0.0, 1.0),
+    );
+    let fx = ring(&mut app, EffectPriority::Normal);
+    app.step_ticks(1);
+    render(&mut app);
+    let s = stats(&app);
+    assert_eq!(s.pool_capacity, 262_144, "{s:?}");
+    app.resources.expect_mut::<ParticleSettings>().max_particles = 4_000;
+    for _ in 0..20 {
+        app.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).keep());
+    }
+    app.step_ticks(1);
+    render(&mut app);
+    let s = stats(&app);
+    eprintln!("{s:?}");
+    assert_eq!(s.pool_capacity, 4_000);
+    assert!(s.pool_reserved <= 4_000, "{s:?}");
+    // Ten rings of 400 fit 4000 at `Normal` priority (90 %): nine; the other eleven were
+    // refused (counted in the frame that ticked).
+    assert_eq!(
+        (s.effects, s.layer_instances),
+        (20, 9),
+        "the lowered budget binds: {s:?}"
+    );
+    assert!(
+        s.pool_high_water <= 4_000 && s.pool_high_water >= s.pool_reserved,
+        "{s:?}"
+    );
+    assert!(s.pool_allocated >= s.pool_high_water, "{s:?}");
+    assert_eq!(gpu_errors(&app), 0);
+}

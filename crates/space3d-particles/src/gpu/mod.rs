@@ -338,6 +338,11 @@ impl GpuSim {
     }
 
     /// The work buffer (indirect args) and the instance buffer, once compacted.
+    /// Pool slots the pool buffer holds.
+    pub fn pool_slots(&self) -> u32 {
+        (self.pool.size / PARTICLE_SIZE) as u32
+    }
+
     pub fn draw_buffers(&self) -> Option<(&wgpu::Buffer, &wgpu::Buffer)> {
         Some((self.work.buffer.as_ref()?, self.instances.buffer.as_ref()?))
     }

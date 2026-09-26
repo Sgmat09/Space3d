@@ -12,10 +12,18 @@ pub struct ParticleStats {
     pub effects: u32,
     /// Live layer instances.
     pub layer_instances: u32,
-    /// Particle pool capacity.
+    /// Particle pool capacity in force: the budget (`ParticleSettings::max_particles` or
+    /// `max_particles_cpu` for the backend), also after it was lowered.
     pub pool_capacity: u32,
-    /// Pool slots reserved by live layer instances.
+    /// Pool slots reserved by live layer instances (rings reserved before a budget was
+    /// lowered may exceed `pool_capacity` until they drain).
     pub pool_reserved: u32,
+    /// Pool slots the backend holds memory for: the GPU pool buffer or the CPU pool (it grows
+    /// with `pool_high_water`, up to the budget).
+    pub pool_allocated: u32,
+    /// One past the highest pool slot reserved so far (the simulated part of the pool); it
+    /// drops when a lowered budget cuts the free tail.
+    pub pool_high_water: u32,
     /// Alive particles (CPU: exact, this frame; GPU: read back 1–3 frames late).
     pub alive: u32,
     /// Frame `alive` was measured in.

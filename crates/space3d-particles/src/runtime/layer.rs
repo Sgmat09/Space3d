@@ -10,8 +10,26 @@ use space3d_core::glam::{Vec3, Vec4};
 
 /// Largest ring per layer instance.
 pub(crate) const MAX_LAYER_CAPACITY: u32 = 65_536;
-/// Reference emitter speed for `rate_per_distance` capacities (world units per second).
-const V_REF: f32 = 100.0;
+/// Default emitter speed `rate_per_distance` rings are sized for (world units per second):
+/// `Spawn::max_speed`'s default. A looping instance whose emitter keeps flying faster restarts
+/// with rings for its speed ([`ring_speed_for`]).
+pub(crate) const V_REF: f32 = 100.0;
+/// Largest speed a looping instance's rings grow to (`V_REF × 2^6`).
+const MAX_RING_SPEED_LEVEL: u32 = 6;
+
+/// The speed rings are sized for to hold a trail laid at `speed` (units/s): the layers'
+/// `max_speed` `base` doubled until it covers 1.25 × `speed` (at most `base × 2^6`).
+pub(crate) fn ring_speed_for(base: f32, speed: f32) -> f32 {
+    let base = if base > 0.0 && base.is_finite() { base } else { V_REF };
+    let mut v = base;
+    for _ in 0..MAX_RING_SPEED_LEVEL {
+        if v >= 1.25 * speed {
+            break;
+        }
+        v *= 2.0;
+    }
+    v
+}
 
 /// Simulation and per-particle attribute parameters of one sprite layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -275,6 +293,12 @@ pub(crate) fn capacity(l: &ParticleLayer) -> u32 {
 /// the spawn scales it (`spawn::scaled_count`: at least 1). `capacity_at(l, 1.0) ==
 /// capacity(l)`; an explicit `ParticleLayer::capacity` scales too.
 pub(crate) fn capacity_at(l: &ParticleLayer, q: f32) -> u32 {
+    capacity_for(l, q, 0.0)
+}
+
+/// [`capacity_at`] with the `rate_per_distance` term sized for an emitter flying at `speed`
+/// (units/s) when that exceeds the layer's `Spawn::max_speed` (the default 100: [`V_REF`]).
+pub(crate) fn capacity_for(l: &ParticleLayer, q: f32, speed: f32) -> u32 {
     let q = q.clamp(0.0, 1.0);
     if let Some(c) = l.capacity {
         let c = if q < 1.0 { (c as f32 * q).ceil() as u32 } else { c };
@@ -289,7 +313,13 @@ pub(crate) fn capacity_at(l: &ParticleLayer, q: f32) -> u32 {
         n += (s.rate as f64 * scale as f64 * win as f64 * 1.05).ceil() + 1.0;
     }
     if s.rate_per_distance > 0.0 && scale > 0.0 {
-        n += (s.rate_per_distance as f64 * scale as f64 * V_REF as f64 * win as f64).ceil() + 1.0;
+        let v = if s.max_speed > 0.0 && s.max_speed.is_finite() {
+            s.max_speed
+        } else {
+            V_REF
+        }
+        .max(speed);
+        n += (s.rate_per_distance as f64 * scale as f64 * v as f64 * win as f64).ceil() + 1.0;
     }
     for b in &s.bursts {
         let overlapping = if b.interval > 0.0 {
@@ -335,5 +365,25 @@ mod tests {
         assert_eq!(window_ticks(0.51, 1.0 / 60.0), 32);
         assert_eq!(window_ticks(0.0, 1.0 / 60.0), 1);
         assert_eq!(window_ticks(1.0, 0.0), u32::MAX);
+    }
+
+    /// game#10: distance rings hold `rate_per_distance × max_speed × life` (default 100 units/s),
+    /// a faster `max_speed` or measured speed sizes them bigger.
+    #[test]
+    fn distance_rings_follow_the_speed() {
+        let mut l = ParticleLayer::continuous(0.0, 0.1);
+        l.spawn.rate_per_distance = 1.2;
+        l.spawn.max_rate_scale = 2.0;
+        let win = window_secs(&l) as f64;
+        let at = |v: f64| (1.2 * 2.0 * v * win).ceil() as u32 + 1;
+        assert_eq!(capacity(&l), at(100.0));
+        assert_eq!(capacity_for(&l, 1.0, 800.0), at(800.0));
+        assert_eq!(capacity_for(&l, 1.0, 50.0), at(100.0), "never below max_speed");
+        l.spawn.max_speed = 600.0;
+        assert_eq!(capacity(&l), at(600.0));
+        assert!(capacity(&l) >= 144, "the 600 u/s repro's 144 particles");
+        assert_eq!(ring_speed_for(100.0, 600.0), 800.0);
+        assert_eq!(ring_speed_for(100.0, 70.0), 100.0);
+        assert_eq!(ring_speed_for(0.0, 1e9), 6400.0);
     }
 }

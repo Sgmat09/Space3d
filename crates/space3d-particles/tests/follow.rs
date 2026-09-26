@@ -25,7 +25,7 @@ const PER_TICK: f32 = 25.0;
 
 /// The bolt row after `frames` frames of `1 / (60 · sub)` s, the bolt moved in `stage` (by
 /// `PER_TICK / sub` per frame, or per tick in `FixedUpdate`): its x in pixels, and the image.
-fn run(backend: ParticleBackend, sprites: bool, stage: Stage, sub: u32, frames: u32) -> Option<(f32, ImageData)> {
+fn run(backend: ParticleBackend, sprites: bool, stage: Stage, sub: f32, frames: u32) -> Option<(f32, ImageData)> {
     let settings = ParticleSettings {
         backend,
         ..ParticleSettings::default()
@@ -55,7 +55,7 @@ fn run(backend: ParticleBackend, sprites: bool, stage: Stage, sub: u32, frames: 
         let x = if fixed {
             START + PER_TICK * (ctx.time().tick + 1) as f32
         } else {
-            START + PER_TICK / sub as f32 * frame as f32
+            START + PER_TICK / sub * frame as f32
         };
         if let Ok(mut t) = ctx.world.get::<&mut Transform>(bolt) {
             t.translation.x = x;
@@ -63,7 +63,7 @@ fn run(backend: ParticleBackend, sprites: bool, stage: Stage, sub: u32, frames: 
     });
     let step = app.resources.expect::<TickRate>().step();
     for _ in 0..frames {
-        app.update(step / sub);
+        app.update(step.div_f32(sub));
     }
     let x = app.world.get::<&Transform>(bolt).unwrap().translation.x;
     let img = render(&mut app);
@@ -97,13 +97,14 @@ fn laser_trail_reaches_its_head_in_every_stage_and_frame_rate() {
             ("pre", Stage::PreUpdate),
             ("update", Stage::Update),
         ] {
-            // 60 Hz; 120 Hz ending on a frame with a tick and on one without.
-            for (sub, frames) in [(1, 9), (2, 17), (2, 18)] {
+            // 60 Hz; 120 Hz ending on a frame with a tick and on one without; 30 Hz (two
+            // ticks a frame: game#2).
+            for (sub, frames) in [(1.0, 9), (2.0, 17), (2.0, 18), (0.5, 5)] {
                 let Some((bolt_px, img)) = run(backend, sprites, stage, sub, frames) else {
                     return;
                 };
                 let kind = if sprites { "sprites" } else { "ribbon" };
-                let what = format!("{kind} {backend:?} {name} {}Hz, {frames} frames", 60 * sub);
+                let what = format!("{kind} {backend:?} {name} {}Hz, {frames} frames", 60.0 * sub);
                 dump(&img, &format!("follow_{kind}_{backend:?}_{name}_{sub}_{frames}"));
                 let (first, last, dark) = scan(&img);
                 assert_eq!(

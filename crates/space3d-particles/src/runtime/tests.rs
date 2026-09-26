@@ -770,8 +770,8 @@ fn ring_levels_quantize_quality_times_lod() {
     let exhaust = crate::registry::builtin::effect(crate::registry::builtin::ENGINE_EXHAUST).unwrap();
     let full: u32 = exhaust.layers.iter().map(capacity).sum();
     let quarter: u32 = exhaust.layers.iter().map(|l| layer::capacity_at(l, 0.25)).sum();
-    assert_eq!(full, 164);
-    assert_eq!(quarter, 47);
+    assert_eq!(full, 171);
+    assert_eq!(quarter, 49);
     let explosion = crate::registry::builtin::effect(crate::registry::builtin::EXPLOSION).unwrap();
     for l in &explosion.layers {
         assert!(layer::capacity_at(l, 0.01) >= 1);
@@ -1084,7 +1084,7 @@ fn bridges_of_20_fast_bolts_within_budget() {
 /// The render-time bridges of a Battle-sized fleet moved in `Stage::Update` (the game's
 /// pattern: every moving world-space emitter is bridged every frame): 300 ships' engine
 /// exhausts (`builtin::ENGINE_EXHAUST`) at 150 units/s and 20 bolts' laser trails at 3200
-/// units/s, each moved one 60 Hz frame after the tick — about 1200 plume particles and 1060
+/// units/s, each moved one 60 Hz frame after the tick — about 1800 exhaust particles and 1060
 /// trail glows, built and packed within 0.15 ms (Dev machine, release: about 0.10 ms, 0.15 ms
 /// before the spawn math skipped directions at rest, libm's `sin`/`cos` and per-particle
 /// constants). The render node adds the render poses, the upload and a draw: about 0.14 ms in
@@ -1099,19 +1099,24 @@ fn bridges_of_a_battle_fleet_within_budget() {
     let trail = h.add(sprite_trail());
     // Ships fly −Z (their exhaust points +Z), bolts +X.
     let mut movers = Vec::new();
+    let mut steps = std::collections::HashMap::new();
     for i in 0..300 {
         let ship = h
             .world
             .spawn((Transform::from_xyz((i % 20) as f32 * 60.0, 0.0, (i / 20) as f32 * 80.0),));
-        h.world
+        let e = h
+            .world
             .spawn_effect(exhaust, EffectSpawn::at(Vec3::new(0.0, 0.0, 3.2)).follow(ship).seed(i));
         movers.push((ship, Vec3::new(0.0, 0.0, -150.0 / 60.0)));
+        steps.insert(e, Vec3::new(0.0, 0.0, -150.0 / 60.0));
     }
     for i in 0..20 {
         let bolt = h.world.spawn((Transform::from_xyz(0.0, 5.0, i as f32 * 10.0),));
-        h.world
+        let e = h
+            .world
             .spawn_effect(trail, EffectSpawn::at(Vec3::ZERO).follow(bolt).seed(1000 + i));
         movers.push((bolt, Vec3::new(3200.0 / 60.0, 0.0, 0.0)));
+        steps.insert(e, Vec3::new(3200.0 / 60.0, 0.0, 0.0));
     }
     for _ in 0..40 {
         for &(e, step) in &movers {
@@ -1119,13 +1124,19 @@ fn bridges_of_a_battle_fleet_within_budget() {
         }
         h.step();
     }
-    // Render poses: one frame of motion past the tick (instances in spawn order: the ships',
-    // then the bolts').
+    // Render poses: one frame of motion past the tick (the exhausts restarted with rings for
+    // their speed once: their first instances drain, standing still).
     let poses: Vec<(Vec3, Quat)> =
         h.rt.instances
             .iter()
-            .enumerate()
-            .map(|(i, inst)| (inst.pos + movers[i].1, inst.rot))
+            .map(|inst| {
+                let step = if inst.attached {
+                    steps.get(&inst.entity).copied()
+                } else {
+                    None
+                };
+                (inst.pos + step.unwrap_or(Vec3::ZERO), inst.rot)
+            })
             .collect();
     let moved = vec![true; poses.len()];
     let (mut keys, mut out, mut items) = (Vec::new(), Vec::new(), Vec::new());
@@ -1153,7 +1164,7 @@ fn bridges_of_a_battle_fleet_within_budget() {
         ms * 1e3,
         budget * 1e3
     );
-    assert!((2000..=2600).contains(&n), "{n}");
+    assert!((2500..=3100).contains(&n), "{n}");
     assert!(ms <= budget, "{ms:.4} ms > {budget:.3} ms");
 }
 
@@ -1171,10 +1182,10 @@ fn builtin_slots() {
         (builtin::SHIELD_RIPPLE, 8, 0),
         (builtin::WARP_IN, 29, 0),
         (builtin::WARP_OUT, 29, 0),
-        (builtin::ENGINE_EXHAUST, 164, 0),
+        (builtin::ENGINE_EXHAUST, 171, 0),
         (builtin::LASER_TRAIL, 5, 64),
         (builtin::LASER_BEAM, 7, 0),
-        (builtin::MISSILE_TRAIL, 23, 192),
+        (builtin::MISSILE_TRAIL, 56, 192),
         (builtin::DEBRIS_SPARKS, 78, 0),
         (builtin::ENGINE_AFTERBURNER, 215, 96),
         (builtin::EMP, 64, 0),
@@ -1190,7 +1201,7 @@ fn builtin_slots() {
     }
     let web = (8192.0 * priority_limit(EffectPriority::Normal)) as u32;
     assert!(
-        30 * 164 + 40 * 5 <= web,
+        30 * 171 + 40 * 5 <= web,
         "30 exhausts and 40 laser trails fit the web budget ({web})"
     );
 
@@ -1440,4 +1451,305 @@ fn hot_reload_structure_change_drains() {
             .any(|(_, p)| p.misc[2] == entry && h.rt.entries[entry as usize].live)
     );
     assert_eq!(h.rt.entries.iter().filter(|x| x.live).count(), 2, "only the new layers");
+}
+
+/// Emission positions of a stream on an emitter moved at 150 units/s, as the CPU backend
+/// simulates them, with the app run at `fps` (App::update, 60 Hz ticks: 2 ticks per frame at
+/// 30 fps, 1 or 2 at 45), the parent moved in `stage`. Returns the gaps between neighbours
+/// (sorted along the motion) after the first half second.
+fn stream_gaps(fps: f64, stage: space3d_core::Stage) -> Vec<f32> {
+    use space3d_core::{App, Stage, SystemCtx};
+    let mut app = App::new();
+    app.add_plugin(crate::ParticlesPlugin::default());
+    let mut layer = ParticleLayer::continuous(180.0, 5.0).speed(0.0);
+    layer.lod = false;
+    layer.capacity = Some(4096);
+    let fx = app
+        .resources
+        .expect_mut::<ParticleEffects>()
+        .add(ParticleEffect {
+            looping: true,
+            ..ParticleEffect::new("stream").layer(layer)
+        })
+        .unwrap();
+    let ship = app.world.spawn((Transform::IDENTITY,));
+    app.spawn_effect(fx, EffectSpawn::at(Vec3::new(0.0, 0.0, 3.2)).follow(ship));
+    let fixed = stage == Stage::FixedUpdate;
+    app.add_system(stage, move |ctx: &mut SystemCtx| {
+        let dt = if fixed {
+            ctx.time().fixed_delta_secs()
+        } else {
+            ctx.time().delta_secs()
+        };
+        if let Ok(mut t) = ctx.world.get::<&mut Transform>(ship) {
+            t.translation.x += 150.0 * dt;
+        }
+    });
+    let mut sim = CpuSim::default();
+    let frame = std::time::Duration::from_secs_f64(1.0 / fps);
+    for _ in 0..(2.0 * fps) as usize {
+        app.update(frame);
+        let rt = &mut app.resources.expect_mut::<ParticleRuntime>().rt;
+        sim.replay(rt, 1200);
+    }
+    let x_now = app.world.get::<&Transform>(ship).unwrap().translation.x;
+    let mut xs: Vec<f32> = sim
+        .pool
+        .iter()
+        .filter(|p| p.alive())
+        .map(|p| p.pos().x)
+        .filter(|&x| x > 75.0 && x < x_now - 10.0)
+        .collect();
+    xs.sort_by(f32::total_cmp);
+    xs.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+/// game#2: an emitter moved in `Stage::Update` whose frames run two fixed ticks (30 fps, and
+/// 45 fps: one or two) emits as evenly as one moved on the tick. Every tick used to read the
+/// same `Transform`: the first laid the whole frame's motion, the second stacked its particles
+/// on one point (beads one frame of motion apart). Each tick now extrapolates the pose by the
+/// velocity measured between frames to the tick's time (`frame_motion_system`).
+#[test]
+fn update_moved_emitters_do_not_bead_at_low_frame_rates() {
+    use space3d_core::Stage;
+    let ideal = 150.0 / 180.0;
+    for (fps, stage) in [
+        (30.0, Stage::FixedUpdate),
+        (30.0, Stage::Update),
+        (45.0, Stage::Update),
+        (60.0, Stage::Update),
+        (144.0, Stage::Update),
+    ] {
+        let gaps = stream_gaps(fps, stage);
+        let n = gaps.len() as f32;
+        let mean = gaps.iter().sum::<f32>() / n;
+        let sd = (gaps.iter().map(|g| (g - mean) * (g - mean)).sum::<f32>() / n).sqrt();
+        let (lo, hi) = gaps.iter().fold((f32::MAX, 0.0f32), |(a, b), &g| (a.min(g), b.max(g)));
+        eprintln!(
+            "{fps} fps {stage:?}: {} gaps, mean {mean:.3} sd {sd:.3} min {lo:.3} max {hi:.3}",
+            gaps.len()
+        );
+        assert!(gaps.len() > 100, "{fps} fps {stage:?}: {} gaps", gaps.len());
+        assert!(
+            (mean - ideal).abs() < 0.02,
+            "{fps} fps {stage:?}: mean gap {mean} (ideal {ideal})"
+        );
+        assert!(
+            sd < 0.05 * ideal && lo > 0.8 * ideal && hi < 1.2 * ideal,
+            "{fps} fps {stage:?}: gaps sd {sd:.3}, {lo:.3}..{hi:.3} (ideal {ideal:.3})"
+        );
+    }
+}
+
+/// game#2, turning: a ship turned in `Stage::Update` at 30 fps (two ticks per frame) lays the
+/// stream of an emitter 20 units off its axis along an even arc.
+#[test]
+fn update_turned_emitters_do_not_bead() {
+    use space3d_core::{App, Stage, SystemCtx};
+    let mut app = App::new();
+    app.add_plugin(crate::ParticlesPlugin::default());
+    let mut layer = ParticleLayer::continuous(180.0, 5.0).speed(0.0);
+    layer.lod = false;
+    layer.capacity = Some(4096);
+    let fx = app
+        .resources
+        .expect_mut::<ParticleEffects>()
+        .add(ParticleEffect {
+            looping: true,
+            ..ParticleEffect::new("stream").layer(layer)
+        })
+        .unwrap();
+    let ship = app.world.spawn((Transform::IDENTITY,));
+    app.spawn_effect(fx, EffectSpawn::at(Vec3::new(0.0, 0.0, 20.0)).follow(ship));
+    app.add_system(Stage::Update, move |ctx: &mut SystemCtx| {
+        let dt = ctx.time().delta_secs();
+        if let Ok(mut t) = ctx.world.get::<&mut Transform>(ship) {
+            t.rotation = Quat::from_rotation_y(1.5 * dt) * t.rotation;
+        }
+    });
+    let mut sim = CpuSim::default();
+    for _ in 0..90 {
+        app.update(std::time::Duration::from_secs_f64(1.0 / 30.0));
+        sim.replay(&mut app.resources.expect_mut::<ParticleRuntime>().rt, 1200);
+    }
+    let mut angles: Vec<f32> = sim
+        .pool
+        .iter()
+        .filter(|p| p.alive())
+        .map(|p| p.pos().x.atan2(p.pos().z))
+        .filter(|a| (0.5..2.5).contains(a))
+        .collect();
+    angles.sort_by(f32::total_cmp);
+    let ideal = 1.5 / 180.0;
+    for w in angles.windows(2) {
+        let g = w[1] - w[0];
+        assert!((g - ideal).abs() < 0.1 * ideal, "arc gap {g} (ideal {ideal})");
+    }
+    assert!(angles.len() > 200, "{}", angles.len());
+}
+
+/// Particles alive per `bin`-unit bin along +X (skipping the first `skip` and taking `take`).
+fn bins(h: &Harness, bin: f32, skip: usize, take: usize) -> Vec<u32> {
+    let mut hist = std::collections::BTreeMap::new();
+    for (_, p) in h.alive() {
+        *hist.entry((p.pos().x / bin).floor() as i32).or_insert(0u32) += 1;
+    }
+    hist.values().copied().skip(skip).take(take).collect()
+}
+
+fn sd(v: &[u32]) -> f32 {
+    let n = v.len() as f32;
+    let mean = v.iter().sum::<u32>() as f32 / n;
+    (v.iter().map(|&c| (c as f32 - mean).powi(2)).sum::<f32>() / n).sqrt()
+}
+
+/// game#8: an emitter stepping toward 20 Hz server updates (7.5 units every third tick, 150
+/// units/s on average) laid ENGINE_EXHAUST's plume rates (180/s + 0.4 per unit) in beads: 6
+/// particles spread over a step and 6 stacked where it paused. With
+/// `ParticleEmitter::velocity_smoothing` the time rate follows the distance of each tick
+/// against the smoothed speed: an even trail, the same count.
+#[test]
+fn velocity_smoothing_evens_out_stepped_motion() {
+    let run = |smoothing: f32| {
+        let mut h = Harness::new();
+        let mut layer = ParticleLayer::continuous(180.0, 3.0).speed(0.0);
+        layer.spawn.rate_per_distance = 0.4;
+        layer.lod = false;
+        layer.capacity = Some(4096);
+        let fx = h.add(ParticleEffect {
+            looping: true,
+            ..ParticleEffect::new("plume").layer(layer)
+        });
+        let e = h.world.spawn((
+            Transform::IDENTITY,
+            ParticleEmitter::new(fx).with_velocity_smoothing(smoothing),
+        ));
+        for t in 1..=150u32 {
+            h.world.get::<&mut Transform>(e).unwrap().translation.x = 7.5 * (t / 3) as f32;
+            h.step();
+        }
+        // After the smoothing settled (the first half second).
+        let b = bins(&h, 2.5, 40, 48);
+        (b.iter().sum::<u32>(), sd(&b), b)
+    };
+    let (n0, sd0, b0) = run(0.0);
+    let (n1, sd1, b1) = run(0.15);
+    eprintln!("steps without smoothing: {b0:?} sd {sd0:.2}\nwith 0.15 s: {b1:?} sd {sd1:.2}");
+    assert!(sd0 > 1.2, "the repro beads: {b0:?}");
+    assert!(sd1 < 0.6, "paced: {b1:?}");
+    assert!(
+        (n1 as f32 - n0 as f32).abs() < 0.05 * n0 as f32,
+        "same count: {n0} vs {n1}"
+    );
+    // A still emitter emits its plain time rate.
+    let mut h = Harness::new();
+    let fx = h.add(ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("still").layer(ParticleLayer::continuous(60.0, 10.0))
+    });
+    h.world.spawn((
+        Transform::IDENTITY,
+        ParticleEmitter::new(fx).with_velocity_smoothing(0.15),
+    ));
+    for _ in 0..60 {
+        h.step();
+    }
+    assert_eq!(h.alive().len(), 60);
+}
+
+/// game#10: a `rate_per_distance` ring is sized for `Spawn::max_speed` (100 units/s by
+/// default); a looping emitter flying at 600 units/s kept only 26 of its 144 particles (a
+/// 10-unit trail instead of 60). It now restarts with rings for its speed after three fast
+/// ticks, and the trail is whole.
+#[test]
+fn distance_rings_grow_with_the_emitter_speed() {
+    let mut h = Harness::new();
+    let mut layer = ParticleLayer::continuous(0.0, 0.1).speed(0.0);
+    layer.spawn.rate_per_distance = 1.2;
+    layer.spawn.max_rate_scale = 2.0;
+    let fx = h.add(ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("fast").layer(layer)
+    });
+    let e = h
+        .world
+        .spawn((Transform::IDENTITY, ParticleEmitter::new(fx).with_rate_scale(2.0)));
+    for t in 1..=60u32 {
+        h.world.get::<&mut Transform>(e).unwrap().translation.x = 10.0 * t as f32;
+        h.step();
+    }
+    let alive = h.alive();
+    let xs: Vec<f32> = alive.iter().map(|(_, p)| p.pos().x).collect();
+    let span = xs.iter().copied().fold(f32::MIN, f32::max) - xs.iter().copied().fold(f32::MAX, f32::min);
+    let reserved = h.rt.state(e).unwrap().reserved;
+    eprintln!(
+        "alive {} (expected 144), trail {span:.1} units, reserved {reserved}",
+        alive.len()
+    );
+    assert!(alive.len() >= 138, "alive {}", alive.len());
+    assert!(span > 56.0, "trail {span}");
+    assert!((144..400).contains(&reserved), "rings for 800 units/s: {reserved}");
+    // A single jump (a teleport) does not grow them.
+    let mut h = Harness::new();
+    let mut layer = ParticleLayer::continuous(0.0, 0.1).speed(0.0);
+    layer.spawn.rate_per_distance = 1.2;
+    let fx = h.add(ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("jump").layer(layer)
+    });
+    let e = h.world.spawn((Transform::IDENTITY, ParticleEmitter::new(fx)));
+    h.step();
+    let before = h.rt.state(e).unwrap().reserved;
+    h.world.get::<&mut Transform>(e).unwrap().translation.x = 5000.0;
+    for _ in 0..10 {
+        h.step();
+    }
+    assert_eq!(h.rt.state(e).unwrap().reserved, before);
+}
+
+/// game#14: lowering the budget after the pool grew limits new rings at once (refused or
+/// shrunk), gives the free tail back, and the stats report the budget in force.
+#[test]
+fn a_lowered_budget_is_enforced() {
+    let mut h = Harness::new();
+    h.settings.max_particles_cpu = 262_144;
+    let fx = h.add(burst(400, 0.5));
+    h.step();
+    assert_eq!(h.rt.pool_capacity(), 262_144);
+    h.settings.max_particles_cpu = 32_768;
+    for _ in 0..120 {
+        h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO));
+    }
+    h.step();
+    assert_eq!(h.rt.pool_capacity(), 32_768);
+    assert!(h.rt.pool.reserved() <= 32_768, "reserved {}", h.rt.pool.reserved());
+    assert!(h.rt.refused + h.rt.shrunk > 0, "the budget binds");
+    assert!(h.rt.pool.total() <= 32_768, "the free tail went: {}", h.rt.pool.total());
+    assert!(h.rt.pool.high_water() <= 32_768);
+    // Raised again: the pool grows back.
+    h.settings.max_particles_cpu = 65_536;
+    h.step();
+    assert_eq!((h.rt.pool_capacity(), h.rt.pool.total()), (65_536, 65_536));
+}
+
+/// A map whose `capacity()` moves with its tombstones (entities spawned and despawned every
+/// tick) is not a reallocation (`ParticleStats::cpu_reallocations` stays 0 in the steady state).
+#[test]
+fn emitter_churn_counts_no_reallocations() {
+    let mut h = Harness::new();
+    let fx = h.add(burst(4, 0.1));
+    let mut live = std::collections::VecDeque::new();
+    for t in 0..600u32 {
+        for _ in 0..3 {
+            live.push_back(h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).keep()));
+        }
+        while live.len() > 30 {
+            let _ = h.world.despawn(live.pop_front().unwrap());
+        }
+        h.step();
+        if t == 300 {
+            h.rt.reallocations = 0;
+        }
+    }
+    assert_eq!(h.rt.reallocations, 0);
 }

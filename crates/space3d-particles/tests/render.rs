@@ -470,3 +470,47 @@ fn shield_flash_reaches_white() {
         assert_eq!(gpu_errors(&app), 0);
     }
 }
+
+/// game#3: `direct_soft_clip` applies wherever the view's colors reach the display without a
+/// tonemapper — Direct mode and the Ldr passthrough of a render scale below 1 without post —
+/// so an HDR additive sprite (4, 2, 0.5) keeps its `1 − e^−x` look at render scale 0.5 instead
+/// of clamping per channel to flat yellow-white; with post (the tonemapper's job) it does not.
+#[test]
+fn soft_clip_applies_at_every_render_scale_without_post() {
+    let mut centers = Vec::new();
+    for (scale, post) in [(1.0f32, false), (0.5, false), (0.5, true)] {
+        let Some(mut app) = app_with(W, H, ParticleSettings::default()) else {
+            return;
+        };
+        app.resources.expect_mut::<FrameSettings>().render_scale = scale;
+        let cam = ortho_camera(&mut app, 10.0, Vec4::new(0.0, 0.0, 0.0, 1.0));
+        if post {
+            app.world
+                .insert_one(cam, PostProcess::passthrough().with_tonemapper(Tonemapper::None))
+                .unwrap();
+        }
+        let fx = effect(
+            &mut app,
+            dot(Vec4::new(4.0, 2.0, 0.5, 1.0), ParticleBlend::Additive, 4.0),
+        );
+        app.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).keep());
+        app.step_ticks(2);
+        let img = render(&mut app);
+        dump(&img, &format!("soft_clip_scale{scale}_post{post}"));
+        centers.push(at(&img, 0.5, 0.5));
+        assert_eq!(gpu_errors(&app), 0);
+    }
+    let soft = [4.0f32, 2.0, 0.5].map(|c| srgb(1.0 - (-c).exp()));
+    eprintln!("centers {centers:?}, soft clip {soft:?}");
+    for (i, what) in [(0, "Direct"), (1, "render scale 0.5 without post")] {
+        for c in 0..3 {
+            assert!(
+                centers[i][c].abs_diff(soft[c]) <= 2,
+                "{what}: {:?} vs soft clip {soft:?}",
+                centers[i]
+            );
+        }
+    }
+    // With post and no tonemapper the scene is clamped (post decides; no soft clip).
+    assert_eq!(&centers[2][..3], &[255, 255, srgb(0.5)], "{:?}", centers[2]);
+}

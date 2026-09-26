@@ -19,6 +19,15 @@
 // Directions laid out on the quad (ring, vortex, texture) are turned onto the screen through the
 // inverse of the quad's screen-space Jacobian, keeping their length: they follow the sprite's
 // rotation and plane facing, and a sprite seen edge-on writes nothing.
+//
+// The strength is in view heights, but no sprite bends the image by more than a fraction of its
+// own on-screen radius (`S3DP_HEAT_REACH` for heat haze, `S3DP_WAVE_REACH` for the directed
+// shapes): a small, distant or top-down writer shimmers what is behind it instead of shifting
+// it by its whole width. Additive light (an engine flame) writes no depth, so the foreground
+// guard cannot keep a haze from dragging the flame it rides on; the cap keeps that drag to a
+// shimmer.
+const S3DP_HEAT_REACH: f32 = 0.12;
+const S3DP_WAVE_REACH: f32 = 0.5;
 
 struct S3dpDistOut {
     @builtin(position) clip: vec4<f32>,
@@ -34,6 +43,8 @@ struct S3dpDistOut {
     @location(7) clip_xyw: vec3<f32>,
     // Age / life.
     @location(8) @interpolate(flat) t: f32,
+    // The sprite's on-screen radius in view heights.
+    @location(9) @interpolate(flat) radius: f32,
 }
 
 @vertex
@@ -50,6 +61,7 @@ fn vs_distortion(in: S3dpIn) -> S3dpDistOut {
     out.frame = s.frame;
     out.clip_xyw = s.clip.xyw;
     out.t = clamp(in.vel_age.w, 0.0, 1.0);
+    out.radius = s.b.x / max(view.viewport.w, 1.0);
     return out;
 }
 
@@ -77,6 +89,7 @@ fn fs_distortion(in: S3dpDistOut) -> @location(0) vec4<f32> {
     let kind = s3dp_draw.mode.z;
     var weight = 0.0;
     var offset = vec2<f32>(0.0);
+    var reach = S3DP_WAVE_REACH;
     if (S3DP_TEXTURED && kind == 5u) {
         let tuv = vec2<f32>(in.uv.x, -in.uv.y) * 0.5 + 0.5;
         let cells = vec2<f32>(max(s3dp_draw.book.y, 1.0), max(s3dp_draw.book.z, 1.0));
@@ -111,12 +124,19 @@ fn fs_distortion(in: S3dpDistOut) -> @location(0) vec4<f32> {
                 let n = vec2<f32>(s3dp_noise(q), s3dp_noise(q.yx * 1.3 + vec2<f32>(17.3, 5.1))) * 2.0 - 1.0;
                 let h = n * 2.2;
                 offset = h / max(1.0, length(h));
+                reach = S3DP_HEAT_REACH;
             }
         }
     }
     // Shape × opacity over life × near fade.
     var w = weight * in.color.a * in.a.y;
-    let o = offset * s3dp_draw.fade.w;
+    var o = offset * s3dp_draw.fade.w;
+    // At most `reach` × the sprite's radius.
+    let cap = reach * in.radius;
+    let len = length(o);
+    if (len > cap) {
+        o = o * (cap / len);
+    }
     // Below half a step of the buffer's encoding: nothing to write (most of a ring's quad, a
     // glow's rim); skip the depth reads.
     if (max(abs(o.x), abs(o.y)) * w < DISTORTION_RANGE * (0.5 / 255.0)) {

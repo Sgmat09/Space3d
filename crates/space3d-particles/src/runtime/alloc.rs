@@ -41,6 +41,30 @@ impl RangeAllocator {
         self.release(added.0, added.1, false);
     }
 
+    /// Shrink the pool toward `total` slots by cutting its free tail (live ranges keep their
+    /// slots: a pool whose tail is still reserved shrinks as those ranges are freed, on a later
+    /// call). The high water follows (the cut slots hold no live particles).
+    pub fn shrink_to(&mut self, total: u32) {
+        if total >= self.total {
+            return;
+        }
+        let Some(&(start, len)) = self.free.last() else {
+            return;
+        };
+        if start + len != self.total {
+            return;
+        }
+        let new_total = total.max(start);
+        if new_total == start {
+            self.free.pop();
+        } else {
+            let last = self.free.len() - 1;
+            self.free[last].1 = new_total - start;
+        }
+        self.total = new_total;
+        self.high_water = self.high_water.min(new_total);
+    }
+
     /// First fit of `len` slots.
     pub fn alloc(&mut self, len: u32) -> Option<u32> {
         if len == 0 {
@@ -118,6 +142,29 @@ mod tests {
         assert_eq!(a.alloc(101), None);
         a.grow_to(150);
         assert_eq!(a.alloc(150), Some(0));
+    }
+
+    /// game#14: a lowered budget gives the free tail back; a reserved tail waits.
+    #[test]
+    fn shrink_cuts_the_free_tail() {
+        let mut a = RangeAllocator::default();
+        a.grow_to(1000);
+        let x = a.alloc(100).unwrap();
+        let y = a.alloc(300).unwrap();
+        assert_eq!((a.total(), a.high_water()), (1000, 400));
+        a.shrink_to(200);
+        assert_eq!((a.total(), a.high_water()), (400, 400), "y is live up to 400");
+        a.free(y, 300);
+        a.shrink_to(200);
+        assert_eq!((a.total(), a.high_water(), a.reserved()), (200, 200, 100));
+        assert_eq!(a.alloc(100), Some(100));
+        assert_eq!(a.alloc(1), None, "full at 200");
+        a.free(x, 100);
+        a.free(100, 100);
+        a.shrink_to(0);
+        assert_eq!((a.total(), a.free.len()), (0, 0));
+        a.grow_to(64);
+        assert_eq!(a.alloc(64), Some(0));
     }
 
     proptest! {
