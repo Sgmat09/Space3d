@@ -10,11 +10,17 @@
 //! SPACE3D_EXIT_AFTER_FRAMES=300 cargo run -p particles   # smoke test: quit after 300 frames
 //! SPACE3D_HEADLESS=1 SPACE3D_EXIT_AFTER_FRAMES=60 cargo run -p particles   # no window (CI)
 //! ```
-//! Controls: `Space` drops an explosion at the center, `E` fires an EMP, `Esc` quits. The
-//! particle stats are printed every two seconds.
+//! The explosions, warps, EMP and engines bend the space behind them (distortion layers through
+//! the camera's `PostProcess`), and the smoke is sorted per particle.
+//!
+//! Controls: `Space` drops an explosion at the center, `E` fires an EMP, `Q` cycles the particle
+//! quality tier (`ParticleSettings::for_quality`: High, Medium, Low — the CPU backend with its
+//! budget), `D` toggles distortion, `Esc` quits. The particle stats are printed every two
+//! seconds.
 
 use space3d::particles::prelude::*;
 use space3d::prelude::*;
+use space3d::render::GraphicsQuality;
 
 /// A ship flying a circle: `radius`, angular `speed` (rad per tick), phase.
 struct Orbit {
@@ -36,7 +42,16 @@ struct Battle {
     blue: Vec<Entity>,
     red: Vec<Entity>,
     report_at: f64,
+    /// Particle quality tier (`Q`): 0 High, 1 Medium, 2 Low.
+    tier: usize,
 }
+
+/// The quality tiers `Q` cycles through.
+const TIERS: [(GraphicsQuality, &str); 3] = [
+    (GraphicsQuality::High, "High"),
+    (GraphicsQuality::Medium, "Medium"),
+    (GraphicsQuality::Low, "Low"),
+];
 
 const BLUE: Vec4 = Vec4::new(0.2, 0.55, 1.0, 1.0);
 const RED: Vec4 = Vec4::new(1.0, 0.12, 0.06, 1.0);
@@ -274,6 +289,20 @@ fn controls(ctx: &mut SystemCtx) {
         input.just_pressed(KeyCode::KeyE),
         input.just_pressed(KeyCode::Escape),
     );
+    let (tier, distortion) = (input.just_pressed(KeyCode::KeyQ), input.just_pressed(KeyCode::KeyD));
+    if tier {
+        let battle = ctx.resources.expect_mut::<Battle>();
+        battle.tier = (battle.tier + 1) % TIERS.len();
+        let (q, name) = TIERS[battle.tier];
+        *ctx.resources.expect_mut::<ParticleSettings>() = ParticleSettings::for_quality(q);
+        println!("particle quality: {name}");
+    }
+    if distortion {
+        for post in ctx.world.query::<&mut PostProcess>().iter() {
+            post.distortion.enabled = !post.distortion.enabled;
+            println!("distortion: {}", if post.distortion.enabled { "on" } else { "off" });
+        }
+    }
     if boom {
         ctx.spawn_effect(builtin::EXPLOSION, EffectSpawn::at(Vec3::ZERO).scale(1.5));
     }
@@ -293,10 +322,18 @@ fn report(ctx: &mut SystemCtx) {
         return;
     }
     battle.report_at = now + 2.0;
+    let tier = TIERS[battle.tier].1;
     if let Some(s) = ctx.resources.get::<ParticleStats>() {
         println!(
-            "particles: {} effects, {} alive ({:?} backend), {} ribbon/beam segments, {} draws, {} dispatches",
-            s.effects, s.alive, s.backend, s.ribbon_segments, s.draw_calls, s.dispatches
+            "particles ({tier}): {} effects, {} alive ({:?} backend), {} reserved of {}, {} ribbon/beam segments, {} draws, {} dispatches",
+            s.effects,
+            s.alive,
+            s.backend,
+            s.pool_reserved,
+            s.pool_capacity,
+            s.ribbon_segments,
+            s.draw_calls,
+            s.dispatches
         );
     }
 }
@@ -306,6 +343,7 @@ space3d::main!(build);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use space3d::particles::ParticleBackend;
 
     fn headless() -> App {
         let mut app = App::new();
@@ -332,6 +370,17 @@ mod tests {
             "Space: an explosion"
         );
         assert!(!app.should_exit());
+        // `Q`: the Medium tier, then Low (the CPU backend's budget); the battle plays on.
+        for (tier, budget_cpu) in [(1, None), (2, Some(16_384))] {
+            app.resources.expect_mut::<Input>().inject_key_tap(KeyCode::KeyQ);
+            app.step_ticks(30);
+            assert_eq!(app.resources.expect::<Battle>().tier, tier);
+            let s = app.resources.expect::<ParticleSettings>();
+            if let Some(b) = budget_cpu {
+                assert_eq!((s.backend, s.max_particles_cpu), (ParticleBackend::Cpu, b));
+            }
+        }
+        assert!(app.world.query::<&ParticleEmitter>().iter().count() >= 20);
         app.resources.expect_mut::<Input>().inject_key_tap(KeyCode::Escape);
         app.step_ticks(1);
         assert!(app.should_exit());
