@@ -193,6 +193,8 @@ fn set_flag(ctx: &egui::Context, id: &str, name: &'static str, on: bool) {
 const FLOATING: &str = "space3d_ui::floating";
 const USER_SIZED: &str = "space3d_ui::user_sized";
 const FREE_EDGE_PRESS: &str = "space3d_ui::free_edge_press";
+/// Where the held press started, when it started on the window.
+const PRESS: &str = "space3d_ui::press";
 
 /// The default size a docked tool window `id` last took (see [`window`]).
 fn applied_default(ctx: &egui::Context, id: &str) -> Option<egui::Vec2> {
@@ -341,26 +343,37 @@ pub(crate) fn window<R>(
             .max(MIN_SIZE.y);
         window = window.resizable([true, false]).min_height(height).max_height(height);
     }
-    // A press that started on the window (or its resize margin) this frame or earlier: only the
-    // user moves a docked window's corner, or resizes it, while one is held.
-    let press = last_rect.and_then(|r| {
-        let grab = r.expand(ctx.global_style().interaction.resize_grab_radius_corner);
-        ctx.input(|i| {
-            let held = i.pointer.any_down() || i.pointer.any_released();
-            i.pointer.press_origin().filter(|&p| held && grab.contains(p))
-        })
+    // A press that started on the window (or its resize margin), held until the frame it is
+    // released: only the user moves a docked window's corner, or resizes it, while one is held.
+    // Whether it did is decided where it started, on the rect of that frame: while an edge is
+    // dragged egui remembers the window where the drag would move it next frame (a docked one
+    // stays put), which a narrowing drag moves away from the press.
+    let (pressed, down, released) =
+        ctx.input(|i| (i.pointer.any_pressed(), i.pointer.any_down(), i.pointer.any_released()));
+    if pressed {
+        let origin = ctx.input(|i| i.pointer.press_origin());
+        let grab = ctx.global_style().interaction.resize_grab_radius_corner;
+        let on = origin.zip(last_rect).filter(|(p, r)| r.expand(grab).contains(*p));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(spec.id).with(PRESS), on.map(|(p, _)| p)));
+        // Resizing by a free edge (one away from the docked corner) leaves the window docked.
+        // egui moves the window's top-left corner before it applies the new size, so while the
+        // edge is dragged the docked corner seems to move with it; such a press must not undock
+        // it.
+        if let Some((p, r)) = on {
+            let resizable = [true, !spec.fit_height];
+            let free = grabs_only_free_edges(&ctx.global_style().interaction, r, p, spec.anchor, resizable);
+            set_flag(ctx, spec.id, FREE_EDGE_PRESS, free);
+        }
+    }
+    let press = ctx.data(|d| {
+        d.get_temp::<Option<egui::Pos2>>(egui::Id::new(spec.id).with(PRESS))
+            .flatten()
     });
-    let pressed_on_window = press.is_some();
-    // Resizing by a free edge (one away from the docked corner) leaves the window docked. egui
-    // moves the window's top-left corner before it applies the new size, so while the edge is
-    // dragged the docked corner seems to move with it; such a press must not undock it. Which
-    // handle a press grabbed is decided where it started, on the rect of that frame.
-    if ctx.input(|i| i.pointer.any_pressed())
-        && let (Some(p), Some(r)) = (press, last_rect)
-    {
-        let resizable = [true, !spec.fit_height];
-        let free = grabs_only_free_edges(&ctx.global_style().interaction, r, p, spec.anchor, resizable);
-        set_flag(ctx, spec.id, FREE_EDGE_PRESS, free);
+    // (egui forgets the press origin on the frame it is released.)
+    let pressed_on_window =
+        press.is_some_and(|p| (down && ctx.input(|i| i.pointer.press_origin()) == Some(p)) || (released && !down));
+    if press.is_some() && !down && !released {
+        ctx.data_mut(|d| d.insert_temp::<Option<egui::Pos2>>(egui::Id::new(spec.id).with(PRESS), None));
     }
     let free_edge_press = pressed_on_window && flag(ctx, spec.id, FREE_EDGE_PRESS);
     // Docked and never resized by the user: when its default size changes (the dock area did,

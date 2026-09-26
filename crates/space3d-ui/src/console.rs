@@ -215,6 +215,25 @@ pub struct Console {
     pending: Vec<String>,
     focus_input: bool,
     input_focused: bool,
+    fit: LogFit,
+}
+
+/// How the console window's height follows from its log, as last drawn (for
+/// [`Console::drawn_height`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct LogFit {
+    /// Height of a log line (0 until drawn).
+    line: f32,
+    /// Height of the log (a whole number of lines) as last drawn.
+    log: f32,
+    /// Height the log had room for (before its 3-line minimum) as last drawn.
+    room: f32,
+    /// Height of the `Ui` the console was last drawn in.
+    ui: f32,
+    /// Height of the console window without its log (0 until drawn in its window).
+    around: f32,
+    /// Height of the console window's contents without the log's room (what the rest reserves).
+    reserved: f32,
 }
 
 impl std::fmt::Debug for Console {
@@ -246,6 +265,7 @@ impl Default for Console {
             pending: Vec::new(),
             focus_input: false,
             input_focused: false,
+            fit: LogFit::default(),
         }
     }
 }
@@ -475,6 +495,20 @@ impl Console {
         self.input_focused
     }
 
+    /// Outer height of the console window when it is given `height` (its log is a whole number
+    /// of lines, at least 3: it gives up the rest of a line, or grows in a tiny window), as last
+    /// drawn; before it was first drawn in its window, an estimate (the tools' density at 1x).
+    pub(crate) fn drawn_height(&self, height: f32) -> f32 {
+        let (line, around, reserved) = match self.fit {
+            fit if fit.line > 0.0 && fit.around > 0.0 => (fit.line, fit.around, fit.reserved),
+            _ => (ESTIMATED_LINE, ESTIMATED_AROUND, ESTIMATED_RESERVED),
+        };
+        // (A hair of tolerance: room for a whole number of lines keeps them all; errs on the
+        // tall side.)
+        let lines = ((height - reserved) / line + 0.01).floor().max(3.0);
+        around + lines * line
+    }
+
     /// Lines shown with the current level and text filter (`filter` lowercased by the caller).
     fn shown<'a>(&'a self, filter: &'a str) -> impl Iterator<Item = &'a LogLine> {
         self.lines.iter().filter(move |l| is_shown(l, self.min_level, filter))
@@ -487,6 +521,7 @@ impl Console {
     /// newest line the oldest shown is never cut. Only the entries in view are laid out: the
     /// others take the height they were measured at (once per entry and log width).
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        self.fit.ui = ui.max_rect().height();
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("space3d_console_level")
                 .selected_text(format!("{:?}", self.min_level))
@@ -531,8 +566,11 @@ impl Console {
             .show(ui, |ui| {
                 // A whole number of lines (the window, as tall as its contents, gives up the
                 // rest).
-                let room = (ui.available_height() - input_height - 4.0).max(3.0 * line);
-                let height = (room / line).floor() * line;
+                let room = ui.available_height() - input_height - 4.0;
+                let height = (room.max(3.0 * line) / line).floor() * line;
+                self.fit.line = line;
+                self.fit.log = height;
+                self.fit.room = room;
                 egui::ScrollArea::vertical()
                     .id_salt("space3d_console_log")
                     .max_height(height)
@@ -714,6 +752,17 @@ fn entry_galley(
 /// Egui id of the console window.
 pub(crate) const CONSOLE_ID: &str = "space3d_console";
 
+/// Height of a log line under the tools' density at 1x (for [`Console::drawn_height`] before
+/// the console was drawn).
+const ESTIMATED_LINE: f32 = 13.0;
+
+/// Height of the console window around its log under the tools' density at 1x.
+const ESTIMATED_AROUND: f32 = 86.0;
+
+/// Height of the console window's contents without the log's room under the tools' density at
+/// 1x.
+const ESTIMATED_RESERVED: f32 = 92.0;
+
 /// Default place of the docked console window in the dock area `dock` in the stacked layout:
 /// bottom-left, 640 pt wide and 40 % of the area's height (140 to 360 pt), [`crate::tool::EDGE`]
 /// in from its edges. (In a short area it may dock beside the other tools instead:
@@ -779,6 +828,14 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
             },
             |ui, _| c.ui(ui),
         );
+        // The window is as tall as its contents: the log and what is around it. The log gets
+        // the whole lines that fit in the window's height less what the rest reserves.
+        if let Some(rect) = ctx.memory(|m| m.area_rect(egui::Id::new(CONSOLE_ID)))
+            && c.fit.line > 0.0
+        {
+            c.fit.around = rect.height() - c.fit.log;
+            c.fit.reserved = c.fit.ui + crate::tool::chrome(&ctx).y - c.fit.room;
+        }
         if !open {
             c.visible = false;
         }
@@ -822,6 +879,48 @@ mod tests {
         assert_eq!(c.history.len(), 5);
         let overlay = app.resources.expect::<crate::DebugOverlay>();
         assert!(overlay.visible && overlay.details, "`debug details` shows the details");
+    }
+
+    /// The console window's height for a given height, as the dock plan predicts it, is the
+    /// height it is drawn at (a whole number of log lines), and the estimate before it was first
+    /// drawn is that at 1x.
+    #[test]
+    fn drawn_height_is_the_height_the_console_is_drawn_at() {
+        for ppp in [1.0f32, 1.5, 2.0] {
+            let mut app = App::new();
+            app.add_plugin(crate::UiPlugin {
+                install_tracing: false,
+                fallback_size: ((1280.0 * ppp) as u32, (1000.0 * ppp) as u32),
+                ..crate::UiPlugin::deterministic().with_pixels_per_point(ppp)
+            });
+            let c = app.resources.expect_mut::<Console>();
+            c.visible = true;
+            c.capture_logs = false;
+            for i in 0..40 {
+                c.print(LogLevel::Info, format!("line {i}"));
+            }
+            for h in (60..380).step_by(11) {
+                let dock = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+                // The console's default height is 40 % of the dock area.
+                let area = egui::Rect::from_min_size(dock.min, egui::vec2(1000.0, h as f32 / 0.4));
+                app.insert_resource(crate::ToolDockArea(area));
+                app.step_ticks(3);
+                let ctx = app.resources.expect::<crate::EguiContext>().ctx().clone();
+                let drawn = ctx.memory(|m| m.area_rect(egui::Id::new(CONSOLE_ID))).expect("shown");
+                let asked = window_rect(area).height();
+                let predicted = app.resources.expect::<Console>().drawn_height(asked);
+                let label = format!(
+                    "{ppp}x, asked {asked}: drawn {drawn:?}, predicted {predicted}, fit {:?}",
+                    app.resources.expect::<Console>().fit
+                );
+                assert!((drawn.height() - predicted).abs() < 0.5, "{label}");
+                assert!(drawn.height() <= asked + 0.5 || asked < 130.0, "{label}");
+                if ppp == 1.0 {
+                    let estimate = Console::default().drawn_height(asked);
+                    assert_eq!(estimate, predicted, "the estimate at 1x: {label}");
+                }
+            }
+        }
     }
 
     #[test]

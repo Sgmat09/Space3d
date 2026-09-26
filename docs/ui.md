@@ -186,7 +186,7 @@ app.add_root_ui_system(|ui: &mut egui::Ui, sys: &mut SystemCtx| {
   smaller — the docked corner goes to the new corner, and a tool the user has not resized takes
   its default size for the new area: the same layout as an app started at that size (the console
   40 % of the new height; a profiler above it, the room left over it). A tool the user resized
-  keeps that size, capped to the area.
+  — larger or smaller — keeps that size, capped to the area.
 * **Dragging a tool undocks it**: it stays where it was put (inside the screen) until its title is
   double-clicked, which docks it again. Clicks inside a docked tool, or resizing it by a free edge
   (the console's top or right edge, the profiler's left edge), leave it docked; resizing it by a
@@ -223,11 +223,14 @@ tools (SpaceCorps2027: 1024 × 233 pt of a 1024 × 640 screen, where the overlay
 300 pt and the console's 40 % used to overlap). The console then docks beside the tools instead
 of under them, so all three stay inside the area and apart:
 
-* **Right of the overlay** when the overlay reaches down into it (the overlay's height, 6 pt and
-  the console's default height are more than the area's height). It stays docked at the bottom.
+* **Right of the overlay** when the overlay reaches down into it: the overlay's height, 6 pt and
+  the console's height as drawn (a whole number of log lines: about 125 pt of its default
+  140 pt) are more than the area's height. It stays docked at the bottom.
 * **Left of the profiler** when the profiler's smallest layout with 3 table rows (about 150 pt,
-  measured as drawn) does not fit above it; the profiler then takes the area's height. The
-  profiler gives up width (440 down to 240 pt) before the console gets narrower than 320 pt.
+  measured as drawn; before its first frames only its message, about 76 pt) does not fit above
+  the console as drawn; the profiler then takes the area's height. The profiler gives up width
+  (440 down to 240 pt) before the console gets narrower than 320 pt; a profiler the user
+  narrowed leaves the console the room.
 * With neither tool above it the console is **as tall as the area** (up to 360 pt) instead of
   40 % of it. In the band above: overlay | console (347 pt wide) | profiler (440 pt), each as tall
   as the area's 221 pt allow.
@@ -239,10 +242,16 @@ of under them, so all three stay inside the area and apart:
   overlay, under the profiler, which shows what rows fit (at least one, about 115 pt) and covers
   the console's top when not even that fits; with the overlay alone the console needs 160 pt
   right of it or keeps its corner under the overlay. The overlay (about 145 pt tall with render
-  stats, 200 with its details) and the smallest profiler and console do not shrink further: in an
-  area shorter than them they reach past its bottom edge.
-* Normal and tall areas keep the layout above: the console moves only when the stacked layout
-  would overlap. Every tool computes the same plan each frame (`space3d-ui/src/dock.rs`).
+  stats, 200 with its details) and the smallest profiler and console do not shrink further. In an
+  area shorter than them (under about 137 pt with the console open) they reach past its edges:
+  the overlay and the profiler past the bottom one (the profiler is cut off there), the
+  console, docked at the bottom, past the top one — its title row is cut off (its key, backquote
+  by default, still closes it), its newest lines and command line stay in the area.
+* Normal and tall areas, and short ones where the stacked layout fits as drawn (a 1100 × 300 pt
+  band), keep the layout above: the console moves only when the stacked layout would overlap.
+  The first tool system to run in a frame computes the plan and the others take it
+  (`space3d-ui/src/dock.rs`); the edges the console docks against beside the others snap to the
+  pixel grid, so the 6 pt gaps stay whole on a dock area off the grid.
 
 * **Debug overlay** (`DebugOverlay`): a small panel at the top-left that never takes the pointer,
   opaque (the renderer blends in linear space, where a translucent black lets a bright scene or
@@ -315,10 +324,16 @@ or the dock area, at the size a fresh start gives them (also when a host sets th
 first frame, as the editor does), while a tool the user resized keeps its size and stays docked;
 a dragged tool floats until its title is double-clicked; tools dock inside a `ToolDockArea`; a
 game window never covers them; in short dock areas — the reported 1024 × 233 band and 800 × 200,
-1280 × 180, 1920 × 260, 640 × 240, 1100 × 300 pt — they dock side by side, inside and apart, and
-dock back when the area gets tall again), the dock plan's unit tests (`dock.rs`: roomy areas stay
-stacked, the band goes side by side, the console moves right of a tall overlay, a tiny area keeps
-the corners), the profiler's
+1280 × 180, 1920 × 260, 640 × 240, 1100 × 280 pt — they dock side by side, inside and apart, the
+full 6 pt apart on an area off the pixel grid, and dock back when the area gets tall again, while
+short areas where the stacked layout fits as drawn — 1100 × 300 pt at 1–2x, 640 × 330 pt with
+nested profiler spans — keep it; a profiler without frames stays above the console; a tool made
+smaller by a free edge keeps that size, and a narrowed profiler leaves the console its room), the
+dock plan's unit tests (`dock.rs`: roomy areas stay stacked, the plan goes by the console's drawn
+height, the band goes side by side, the console moves right of a tall overlay, gaps stay whole on
+the pixel grid, a tiny area keeps the corners), the console's
+`drawn_height_is_the_height_the_console_is_drawn_at` (at 1–2x; the estimate before its first
+frame is exact at 1x), the profiler's
 `table_headers_line_up_with_their_columns` (header titles over their columns with and without a
 scroll bar, and in a narrow table) and `a_short_profiler_leaves_out_its_section_headers` (at
 least 3 rows from about 150 pt; the measured minimum is exact), `crates/space3d-ui/tests/alloc_free.rs` (no allocation while

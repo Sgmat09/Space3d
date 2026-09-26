@@ -5,6 +5,10 @@
 //! space3d-physics, space3d-test, rapier3d, nalgebra, parry3d, three older glam versions, ...:
 //! 24 packages) in SpaceCorps2027's lockfile. A feature that needs another crate's feature
 //! enables that crate too (`stories = ["dep:space3d-stories", "space3d-stories/ui"]`).
+//!
+//! (Dependencies' own weak features are theirs: with `physics`, nalgebra's `std` names
+//! `glam030?/std` .. `glam033?/std` and parry names `spade?/..`, so glam 0.30–0.32, robust and
+//! spade stay listed unbuilt in lockfiles with the default features.)
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 

@@ -676,7 +676,7 @@ fn short_dock_areas_never_overlap() {
         (1920, 260),
         (640, 240),
         (1024, 233),
-        (1100, 300),
+        (1100, 280),
     ] {
         let dock = egui::Rect::from_min_size(egui::pos2(0.0, 300.0), egui::vec2(w as f32, h as f32));
         let mut app = tools_in((w, h + 400), dock);
@@ -686,6 +686,180 @@ fn short_dock_areas_never_overlap() {
         app.step_ticks(20);
         assert_eq!(rects(&app), before, "stable: {label}");
     }
+}
+
+/// The overlay, profiler and console in their corners of `dock` and the full 6 pt apart.
+fn assert_stacked(app: &App, dock: egui::Rect, label: &str) {
+    assert_docked(app, dock, label);
+    let (_, profiler, console) = rects(app);
+    let overlay = area(app, "space3d_debug_overlay");
+    let label = format!("{label}: overlay {overlay:?}, profiler {profiler:?}, console {console:?}");
+    let apart = |a: egui::Rect, b: egui::Rect| !a.expand(EDGE - 0.5).intersects(b);
+    assert!(
+        apart(overlay, profiler) && apart(overlay, console) && apart(profiler, console),
+        "apart: {label}"
+    );
+}
+
+/// A profiler with 14 systems nested 3 deep (a taller flame view), shown.
+fn nested_profiler() -> Profiler {
+    let mut profiler = Profiler::default();
+    for frame in 0..10u64 {
+        let spans = (0..14u32)
+            .map(|i| TimelineSpan {
+                name: Arc::from(format!("game::system_{i}")),
+                start: f64::from(i) * 0.0002,
+                duration: 0.0001 * f64::from(i + 1),
+                depth: i % 3,
+            })
+            .collect();
+        profiler.record(FrameTimeline {
+            index: frame + 1,
+            duration: 0.004,
+            spans,
+        });
+    }
+    profiler.visible = true;
+    profiler.frozen = true;
+    profiler
+}
+
+/// Short areas where the stacked layout fits as the tools are drawn keep it: the console is a
+/// whole number of log lines tall (about 125 pt of its default 140), so the overlay ends above it
+/// in a 1100 × 300 pt band (at any scale), and a profiler with nested spans (3 rows in about
+/// 180 pt) fits above it on a 640 × 330 pt screen. The tools used to go side by side there,
+/// going by the console's default height.
+#[test]
+fn short_areas_where_the_stacked_layout_fits_stay_stacked() {
+    let band = egui::Rect::from_min_size(egui::pos2(0.0, 300.0), egui::vec2(1100.0, 300.0));
+    for ppp in [1.0f32, 1.5, 2.0] {
+        let size = ((1100.0 * ppp) as u32, (700.0 * ppp) as u32);
+        let mut app = tools_app(size, ppp, false);
+        app.insert_resource(window(size));
+        app.insert_resource(space3d_render::RenderStats::default());
+        app.resources.expect_mut::<DebugOverlay>().visible = true;
+        app.insert_resource(ToolDockArea(band));
+        app.step_ticks(6);
+        assert_stacked(&app, band, &format!("1100 x 300 band at {ppp}x"));
+    }
+    let mut app = tools_app((640, 330), 1.0, false);
+    app.insert_resource(window((640, 330)));
+    app.insert_resource(space3d_render::RenderStats::default());
+    app.insert_resource(nested_profiler());
+    app.resources.expect_mut::<DebugOverlay>().visible = true;
+    app.step_ticks(6);
+    assert_stacked(&app, screen(&app), "640 x 330 screen, nested spans");
+    let before = rects(&app);
+    app.step_ticks(20);
+    assert_eq!(rects(&app), before, "stable");
+}
+
+/// On a dock area off the pixel grid (the overlay is drawn half a point right of its corner)
+/// the tools side by side keep the full 6 pt apart.
+#[test]
+fn gaps_stay_whole_on_a_dock_area_off_the_pixel_grid() {
+    let dock = egui::Rect::from_min_size(egui::pos2(37.5, 123.25), egui::vec2(1011.5, 233.5));
+    let app = tools_in((1100, 500), dock);
+    assert_side_by_side(&app, dock, "off the grid");
+    let (_, profiler, console) = rects(&app);
+    let overlay = area(&app, "space3d_debug_overlay");
+    let label = format!("overlay {overlay:?}, console {console:?}, profiler {profiler:?}");
+    assert!(console.left() - overlay.right() >= EDGE - 0.01, "{label}");
+    assert!(profiler.left() - console.right() >= EDGE - 0.01, "{label}");
+}
+
+/// A profiler without frames yet shows only its message: it stays top-right above the console
+/// (which moves right of the overlay) instead of taking a column of the band's height.
+#[test]
+fn a_profiler_without_frames_stays_above_the_console() {
+    let band = egui::Rect::from_min_max(egui::pos2(0.0, 300.0), egui::pos2(1024.0, 533.0));
+    let mut app = tools_app((1024, 640), 1.0, false);
+    app.insert_resource(window((1024, 640)));
+    app.insert_resource(space3d_render::RenderStats::default());
+    let mut empty = Profiler::default();
+    empty.visible = true;
+    app.insert_resource(empty);
+    app.resources.expect_mut::<DebugOverlay>().visible = true;
+    app.insert_resource(ToolDockArea(band));
+    app.step_ticks(6);
+    let (_, profiler, console) = rects(&app);
+    let overlay = area(&app, "space3d_debug_overlay");
+    let label = format!("overlay {overlay:?}, profiler {profiler:?}, console {console:?}");
+    let inside = band.shrink(EDGE - 0.5);
+    let apart = |a: egui::Rect, b: egui::Rect| !a.expand(EDGE - 0.5).intersects(b);
+    for r in [overlay, profiler, console] {
+        assert!(inside.contains_rect(r), "inside: {label}");
+    }
+    assert!(
+        apart(overlay, profiler) && apart(overlay, console) && apart(profiler, console),
+        "apart: {label}"
+    );
+    assert_eq!(profiler.width(), 440.0, "its own width: {label}");
+    assert!(profiler.bottom() < console.top(), "above the console: {label}");
+    assert!(
+        console.left() >= overlay.right() + EDGE - 0.5,
+        "right of the overlay: {label}"
+    );
+}
+
+/// Making a docked tool smaller by a free edge is a resize too (egui remembers a window being
+/// resized where the drag moves it next frame; a narrowing drag moved that off the press, so only
+/// growing counted): in a short band the console takes the room a narrowed profiler leaves, and
+/// both keep the sizes the user gave them when the area changes.
+#[test]
+fn a_tool_the_user_made_smaller_keeps_its_size() {
+    let band = egui::Rect::from_min_max(egui::pos2(0.0, 300.0), egui::pos2(1024.0, 533.0));
+    let tall = egui::Rect::from_min_max(egui::pos2(0.0, 23.0), egui::pos2(1024.0, 640.0));
+    let mut app = tools_in((1024, 640), band);
+    let (_, profiler, console) = rects(&app);
+    // The profiler by its left edge (free: it docks top-right), 150 pt narrower.
+    let edge = egui::pos2(profiler.left() + 1.0, profiler.center().y);
+    drag(&mut app, edge, edge + egui::vec2(150.0, 0.0));
+    app.step_ticks(2);
+    let (_, narrowed, wider) = rects(&app);
+    let label = format!("{profiler:?} -> {narrowed:?}, console {console:?} -> {wider:?}");
+    assert!(
+        (narrowed.width() - (profiler.width() - 150.0)).abs() < 1.5,
+        "resized: {label}"
+    );
+    assert_side_by_side(&app, band, "narrowed profiler");
+    assert!(
+        (narrowed.left() - wider.right() - EDGE).abs() < 1.0,
+        "the console takes the room: {label}"
+    );
+    app.insert_resource(ToolDockArea(tall));
+    app.step_ticks(6);
+    assert_stacked(&app, tall, "tall");
+    let (_, after, console) = rects(&app);
+    assert!(
+        (after.width() - narrowed.width()).abs() < 1.0,
+        "the profiler keeps its width: {narrowed:?} -> {after:?}"
+    );
+
+    // The console by its top edge (free: it docks bottom-left), 40 pt lower.
+    let edge = egui::pos2(console.center().x, console.top() + 1.0);
+    drag(&mut app, edge, edge + egui::vec2(0.0, 40.0));
+    app.step_ticks(2);
+    let (_, _, shorter) = rects(&app);
+    let label = format!("{console:?} -> {shorter:?}");
+    // (The log is a whole number of lines tall: up to a line more.)
+    assert!(
+        (26.0..54.0).contains(&(console.height() - shorter.height())),
+        "resized: {label}"
+    );
+    assert!(
+        shorter.left_bottom().distance(console.left_bottom()) < 1.0,
+        "still docked: {label}"
+    );
+    let other = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1024.0, 640.0));
+    app.insert_resource(ToolDockArea(other));
+    app.step_ticks(6);
+    let (_, _, after) = rects(&app);
+    assert!(
+        (after.height() - shorter.height()).abs() < 1.0,
+        "the console keeps its height: {shorter:?} -> {after:?}"
+    );
+    assert_stacked(&app, other, "another area");
 }
 
 /// When the dock area gets short the tools go side by side; when it gets tall again they dock

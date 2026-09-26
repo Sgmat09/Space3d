@@ -234,16 +234,16 @@ pub struct Profiler {
     timeline: FrameTimeline,
     last_index: Option<u64>,
     frames: u64,
-    fit: TableFit,
+    fit: Option<TableFit>,
 }
 
 /// The profiler's layout as last drawn in its window, for [`Profiler::min_height`].
 #[derive(Clone, Copy, Debug, Default)]
 struct TableFit {
     /// Height from the top of the window's contents to the first table row in the compact layout
-    /// (no section headers); 0 until measured.
+    /// (no section headers); without frames (no table), the height of the contents.
     rows_offset: f32,
-    /// Height of a table row.
+    /// Height of a table row (0 without a table).
     pitch: f32,
 }
 
@@ -333,15 +333,15 @@ impl Profiler {
     }
 
     /// Height of the profiler window with `rows` table rows in its compact layout (see
-    /// [`Self::ui_until`]), as last drawn (estimated before the first time).
+    /// [`Self::ui_until`]; fewer when it has fewer systems), as last drawn (estimated before the
+    /// first time). Without frames yet it has no table: the height of its message.
     pub(crate) fn min_height(&self, ctx: &egui::Context, rows: usize) -> f32 {
-        let (offset, pitch) = if self.fit.pitch > 0.0 {
-            (self.fit.rows_offset, self.fit.pitch)
-        } else {
+        let TableFit { rows_offset, pitch } = self.fit.unwrap_or(TableFit {
             // Header row, separator, toolbar, a one-level flame and the table's header.
-            (85.0, 17.0)
-        };
-        crate::tool::chrome(ctx).y + offset + rows as f32 * pitch
+            rows_offset: 85.0,
+            pitch: 17.0,
+        });
+        crate::tool::chrome(ctx).y + rows_offset + rows.min(self.stats.len().max(1)) as f32 * pitch
     }
 
     /// [`Self::ui`] with the table ending above screen y `max_bottom`. When the sections and
@@ -369,7 +369,11 @@ impl Profiler {
                 })
                 .weak(),
             );
-            return None;
+            // (The whole window is its minimum.)
+            return Some(TableFit {
+                rows_offset: ui.min_rect().bottom() - top,
+                pitch: 0.0,
+            });
         }
         let pitch = table_pitch(ui);
         let spacing = ui.spacing().item_spacing.y;
@@ -751,7 +755,7 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
         |ui, max_bottom| p.ui_until(ui, max_bottom),
     );
     if let Some(Some(fit)) = fit {
-        p.fit = fit;
+        p.fit = Some(fit);
     }
     if !open {
         p.visible = false;
@@ -968,7 +972,7 @@ mod tests {
                     |ui, max_bottom| p.ui_until(ui, max_bottom),
                 );
                 if let Some(Some(fit)) = fit {
-                    p.fit = fit;
+                    p.fit = Some(fit);
                 }
             });
             shapes = out.shapes;

@@ -120,7 +120,10 @@ Default: `render`, `platform`, `assets`, `audio`, `physics`, `scene`, `net`, `db
 Optional: `editor`, `github`, `stories`, `test` (generated projects enable `stories` and
 `editor`, plus `test` for their tests; `stories` holds the engine's UI stories, so it builds
 egui even without `ui`). The engine crates of features you leave off stay out of your
-`Cargo.lock` too. A dedicated server can use
+`Cargo.lock` too, except `space3d-assets` (and its image / glTF / OBJ loaders), which `render`
+lists without building it so that `render` + `assets` get their integration. Third-party crates
+list their own unbuilt optional dependencies: with `physics`, nalgebra and parry add glam
+0.30–0.32, robust and spade. A dedicated server can use
 `space3d = { …, default-features = false, features = ["net"] }` (see
 `examples/multiplayer_chat`).
 
