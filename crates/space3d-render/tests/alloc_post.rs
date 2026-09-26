@@ -216,10 +216,14 @@ fn bloom_allocates_a_small_constant_amount() {
         // Per group (a 320 × 180 or 160 × 180 rect): three levels (prefilter, resample, 2
         // downsamples, 2 upsamples), the composite (and FXAA); at 1080p six levels (11 bloom
         // passes, no resample).
+        let caps = app.resources.expect::<Renderer>().graphics_caps().clone();
+        let compute = caps.compute_histogram && caps.exposure_format == Some(wgpu::TextureFormat::R32Float);
         let passes = match name {
             "cinematic" => 8,
             "bloom 1080p" => 12,
-            // Metering: an 80 × 45 level reduced to 10 × 6, then the adapt pass.
+            // Metering by render passes (no compute, e.g. GL): an 80 × 45 level reduced to
+            // 10 × 6, then the adapt pass.
+            "auto exposure" if !compute => 10,
             "auto exposure (render passes)" => 10,
             _ => 7,
         };
