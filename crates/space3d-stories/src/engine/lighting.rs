@@ -72,8 +72,15 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Linear HDR radiance of the nebula toward the unit direction `d`.
+/// Linear HDR radiance of the nebula toward the unit direction `d`: clouds, core and stars.
+#[cfg(test)]
 fn nebula(d: Vec3) -> Vec3 {
+    nebula_clouds(d) + nebula_stars(d)
+}
+
+/// The nebula's clouds, core and dark sky (smooth: evaluated on a coarse grid and
+/// interpolated by the generators).
+fn nebula_clouds(d: Vec3) -> Vec3 {
     // Clouds concentrate in a tilted band (a galactic plane) and around a bright core.
     let band = Vec3::new(0.25, 1.0, 0.35).normalize();
     let core = Vec3::new(0.55, 0.2, -0.8).normalize();
@@ -91,21 +98,26 @@ fn nebula(d: Vec3) -> Vec3 {
     let teal = Vec3::new(0.06, 0.35, 0.55);
     let tint = magenta.lerp(teal, mix_t);
     let glow = d.dot(core).max(0.0).powf(28.0);
-    let mut c =
-        Vec3::new(0.003, 0.004, 0.01) + tint * density * 0.8 + Vec3::new(1.0, 0.55, 0.3) * glow * (0.5 + 2.0 * density);
-    // Stars: at most one per cell of a 3D grid on the sphere, gaussian, up to 8× white.
+    Vec3::new(0.003, 0.004, 0.01) + tint * density * 0.8 + Vec3::new(1.0, 0.55, 0.3) * glow * (0.5 + 2.0 * density)
+}
+
+/// The nebula's stars: at most one per cell of a 3D grid on the sphere, gaussian (σ = 0.002 rad,
+/// about one texel of a 1024² face, so a star is a soft dot of a few texels instead of a
+/// magnified square), up to 8× white. A star sits in the middle of its cell, so its gaussian has
+/// faded out (below 1 %) before the cell's edge.
+fn nebula_stars(d: Vec3) -> Vec3 {
     let g = 70.0;
     let cell = (d * g).floor();
     let h = hash(cell.x as i32, cell.y as i32, cell.z as i32, 99);
-    if h % 100 < 6 {
-        let r = |i: i32| unit(hash(h as i32, i, 0, 3));
-        let star = ((cell + Vec3::new(r(1), r(2), r(3))) / g).normalize();
-        let dist = (d - star).length();
-        let brightness = 0.6 + 7.4 * r(4).powi(6);
-        let color = Vec3::new(1.0, 0.85, 0.7).lerp(Vec3::new(0.7, 0.85, 1.0), r(5));
-        c += color * brightness * (-(dist / 0.003).powi(2)).exp();
+    if h % 100 >= 6 {
+        return Vec3::ZERO;
     }
-    c
+    let r = |i: i32| unit(hash(h as i32, i, 0, 3));
+    let star = ((cell + Vec3::splat(0.3) + 0.4 * Vec3::new(r(1), r(2), r(3))) / g).normalize();
+    let dist = (d - star).length();
+    let brightness = 0.6 + 7.4 * r(4).powi(6);
+    let color = Vec3::new(1.0, 0.85, 0.7).lerp(Vec3::new(0.7, 0.85, 1.0), r(5));
+    color * brightness * (-(dist / 0.002).powi(2)).exp()
 }
 
 /// Linear HDR radiance of the photo studio toward the unit direction `d`.
@@ -135,40 +147,101 @@ fn studio(d: Vec3) -> Vec3 {
     sky + Vec3::splat(softbox) + strip
 }
 
+/// The direction of panorama coordinates (`u`, `v` in 0..1; longitude 0 = −Z, +X to its right,
+/// top row = +Y).
+fn panorama_dir(u: f32, v: f32) -> Vec3 {
+    let lat = v * std::f32::consts::PI;
+    let lon = (u - 0.5) * std::f32::consts::TAU;
+    Vec3::new(lat.sin() * lon.sin(), lat.cos(), -lat.sin() * lon.cos())
+}
+
 /// A panorama of `f` (longitude 0 = −Z, +X to its right, top row = +Y), `width` × `width / 2`.
 fn panorama(width: u32, f: fn(Vec3) -> Vec3) -> HdrImageData {
     let height = width / 2;
     let mut pixels = Vec::with_capacity((width * height) as usize);
     for y in 0..height {
-        let lat = (y as f32 + 0.5) / height as f32 * std::f32::consts::PI;
         for x in 0..width {
-            let lon = ((x as f32 + 0.5) / width as f32 - 0.5) * std::f32::consts::TAU;
-            let d = Vec3::new(lat.sin() * lon.sin(), lat.cos(), -lat.sin() * lon.cos());
+            let d = panorama_dir((x as f32 + 0.5) / width as f32, (y as f32 + 0.5) / height as f32);
             pixels.push(f(d).extend(1.0).to_array());
         }
     }
     HdrImageData::new(width, height, pixels)
 }
 
-/// Six `Rgba16Float` faces of `f` in wgpu order (the cube-map face table).
-fn faces(size: u32, f: fn(Vec3) -> Vec3) -> CubemapSource {
+/// A panorama of `smooth` evaluated every `step` pixels and interpolated, plus `sharp` at every
+/// pixel.
+fn panorama_split(width: u32, step: u32, smooth: fn(Vec3) -> Vec3, sharp: fn(Vec3) -> Vec3) -> HdrImageData {
+    let height = width / 2;
+    let (cw, ch) = (width.div_ceil(step) + 1, height.div_ceil(step) + 1);
+    let grid: Vec<Vec3> = (0..ch)
+        .flat_map(|y| (0..cw).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let (u, v) = (
+                (x * step) as f32 / width as f32,
+                ((y * step) as f32 / height as f32).min(1.0),
+            );
+            smooth(panorama_dir(u, v))
+        })
+        .collect();
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let (gx, gy) = ((x as f32 + 0.5) / step as f32, (y as f32 + 0.5) / step as f32);
+            let (x0, y0) = (gx.floor() as u32, gy.floor() as u32);
+            let (fx, fy) = (gx.fract(), gy.fract());
+            let at = |x: u32, y: u32| grid[(y.min(ch - 1) * cw + x.min(cw - 1)) as usize];
+            let c = at(x0, y0)
+                .lerp(at(x0 + 1, y0), fx)
+                .lerp(at(x0, y0 + 1).lerp(at(x0 + 1, y0 + 1), fx), fy);
+            let d = panorama_dir((x as f32 + 0.5) / width as f32, (y as f32 + 0.5) / height as f32);
+            pixels.push((c + sharp(d)).extend(1.0).to_array());
+        }
+    }
+    HdrImageData::new(width, height, pixels)
+}
+
+/// Six `size`² `Rgba16Float` faces in wgpu order (the cube-map face table) of `smooth`, evaluated
+/// on a quarter-resolution grid and interpolated, plus `sharp` at every texel.
+fn faces(size: u32, smooth: fn(Vec3) -> Vec3, sharp: fn(Vec3) -> Vec3) -> CubemapSource {
+    let dir = |face: usize, s: f32, t: f32| {
+        match face {
+            0 => Vec3::new(1.0, -t, -s),
+            1 => Vec3::new(-1.0, -t, s),
+            2 => Vec3::new(s, 1.0, t),
+            3 => Vec3::new(s, -1.0, -t),
+            4 => Vec3::new(s, -t, 1.0),
+            _ => Vec3::new(-s, -t, -1.0),
+        }
+        .normalize()
+    };
+    let coarse = (size / 4).max(4);
     let mut data = Vec::with_capacity((size * size * 6 * 8) as usize);
     for face in 0..6 {
+        let grid: Vec<Vec3> = (0..=coarse)
+            .flat_map(|y| (0..=coarse).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                smooth(dir(
+                    face,
+                    x as f32 / coarse as f32 * 2.0 - 1.0,
+                    y as f32 / coarse as f32 * 2.0 - 1.0,
+                ))
+            })
+            .collect();
+        let at = |x: u32, y: u32| grid[(y * (coarse + 1) + x) as usize];
         for y in 0..size {
             for x in 0..size {
                 let s = (x as f32 + 0.5) / size as f32 * 2.0 - 1.0;
                 let t = (y as f32 + 0.5) / size as f32 * 2.0 - 1.0;
-                let d = match face {
-                    0 => Vec3::new(1.0, -t, -s),
-                    1 => Vec3::new(-1.0, -t, s),
-                    2 => Vec3::new(s, 1.0, t),
-                    3 => Vec3::new(s, -1.0, -t),
-                    4 => Vec3::new(s, -t, 1.0),
-                    _ => Vec3::new(-s, -t, -1.0),
-                }
-                .normalize();
-                for c in f(d).extend(1.0).to_array() {
-                    data.extend_from_slice(&f32_to_f16(c).to_le_bytes());
+                let (gx, gy) = ((s + 1.0) * 0.5 * coarse as f32, (t + 1.0) * 0.5 * coarse as f32);
+                let (x0, y0) = (gx.floor().min(coarse as f32 - 1.0), gy.floor().min(coarse as f32 - 1.0));
+                let (fx, fy) = (gx - x0, gy - y0);
+                let (x0, y0) = (x0 as u32, y0 as u32);
+                let c = at(x0, y0)
+                    .lerp(at(x0 + 1, y0), fx)
+                    .lerp(at(x0, y0 + 1).lerp(at(x0 + 1, y0 + 1), fx), fy)
+                    + sharp(dir(face, s, t));
+                for v in c.extend(1.0).to_array() {
+                    data.extend_from_slice(&f32_to_f16(v).to_le_bytes());
                 }
             }
         }
@@ -185,10 +258,11 @@ fn faces(size: u32, f: fn(Vec3) -> Vec3) -> CubemapSource {
     })
 }
 
-/// The nebula panorama (2048 × 1024: 512² faces; generated once per process).
+/// The nebula panorama (4096 × 2048: 1024² faces, so its stars are soft dots at viewer and
+/// screen resolutions; generated once per process, the clouds on a quarter-resolution grid).
 fn nebula_panorama() -> &'static HdrImageData {
     static PANO: OnceLock<HdrImageData> = OnceLock::new();
-    PANO.get_or_init(|| panorama(2048, nebula))
+    PANO.get_or_init(|| panorama_split(4096, 4, nebula_clouds, nebula_stars))
 }
 
 /// The studio panorama (512 × 256, generated once per process).
@@ -218,7 +292,7 @@ fn skybox() -> Story {
         let source = if k.choice("source") == 0 {
             CubemapSource::from_equirect_hdr(nebula_panorama())
         } else {
-            faces(512, nebula)
+            faces(1024, nebula_clouds, nebula_stars)
         };
         let sky = cubemap(app, source);
         let planet = mesh(app, MeshData::sphere(1.0, 48, 24));
@@ -257,8 +331,8 @@ fn skybox() -> Story {
     .description(
         "A procedural HDR nebula (warped value noise, a bright core, stars up to 8× white) as the \
          camera's `Skybox`: drawn after opaque geometry at the far plane, in linear HDR so the \
-         stars bloom. Source: an equirect panorama converted to 256² faces on the GPU, or six \
-         faces uploaded directly (the same picture). Knobs: source, intensity, sky rotation, \
+         stars bloom. Source: a 4096 × 2048 equirect panorama converted to 1024² faces on the \
+         GPU, or six 1024² faces uploaded directly (the same picture). Knobs: source, intensity, sky rotation, \
          camera yaw.",
     )
     .knob_choice("source", &["equirect", "faces"], 0)
