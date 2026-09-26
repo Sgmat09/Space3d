@@ -55,13 +55,14 @@ pub(crate) fn stories() -> Vec<Story> {
 const TIERS: [GraphicsQuality; 4] = GraphicsQuality::ALL;
 const TIER_NAMES: [&str; 4] = ["Low", "Medium", "High", "Ultra"];
 
-/// The stories' content (512² hull maps, 256² sky faces), generated once per process.
+/// The stories' content (512² hull maps, 1024² sky faces: stars stay points at 720p and 1080p
+/// in the viewer and gallery), generated once per process.
 fn story_content() -> &'static ShowcaseContent {
     static CONTENT: OnceLock<ShowcaseContent> = OnceLock::new();
     CONTENT.get_or_init(|| {
         ShowcaseContent::generate(ContentOptions {
             texture_size: 512,
-            sky_face_size: 256,
+            sky_face_size: 1024,
         })
     })
 }

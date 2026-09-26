@@ -47,24 +47,62 @@ fn battle_steady_state() {
         }
     };
     let gpu_particles = app.resources.expect::<Renderer>().graphics_caps().compute;
-    app.step_ticks(120);
+    // Six seconds: the battle's particle load (explosions, missiles, their smoke) builds up for
+    // about five before it is stationary; the growth of the pools and scratch buffers it causes
+    // until then is warm-up.
+    app.step_ticks(360);
     let before = app.resources.expect::<Renderer>().stats().clone();
     let mut reallocations = 0;
     let mut textures = 0;
+    let mut particle_reallocations = 0;
     for _ in 0..30 {
         app.step_ticks(1);
         let s = app.resources.expect::<Renderer>().stats();
         reallocations += s.cpu_reallocations;
         textures += s.textures_created;
+        particle_reallocations += app
+            .resources
+            .expect::<space3d_particles::ParticleStats>()
+            .cpu_reallocations;
     }
     let report = measure_battle(&mut app, 0, 12);
     eprintln!("{report}");
     assert_eq!(report.gpu_errors, 0);
     assert_eq!((reallocations, textures), (0, 0), "steady state: {before:?}");
+    assert_eq!(
+        particle_reallocations, 0,
+        "ParticleStats::cpu_reallocations in the steady state"
+    );
     let s = &report.stats;
-    // The frame and post targets (S, its MSAA copy, depth, bloom, distortion, shadow map,
-    // previews): the T1/T2 VRAM line.
-    assert!(s.target_bytes <= 220_000_000, "{} bytes", s.target_bytes);
+    // VRAM (graphics spec §4.4, T1/T2 ≤ 220 MB of graphics-owned textures): the frame and post
+    // targets (S, its MSAA copy, depth, bloom, distortion, previews) and the shadow map
+    // (`target_bytes`: 146 MB at High, 1080p), plus the sky cubemap and the baked image-based
+    // lighting (`lighting_bytes`: 84 MB — the 1024² HDR sky is `Rgba16Float` with mips, 67 MB,
+    // twice the spec's 33 MB estimate for a 4-byte format; the 512² specular cube 17 MB). That
+    // is 230 MB, over the line by the sky's format (docs/performance.md, "M2 review"); the
+    // particle pool (≈ 23 MB at 262 144) and the driver memory each render pass holds while
+    // its frame is in flight come on top. The assertions pin the parts, so a regression in
+    // either shows.
+    eprintln!(
+        "VRAM textures: targets + shadow {:.1} MB, sky + IBL {:.1} MB",
+        s.target_bytes as f64 / 1e6,
+        s.lighting_bytes as f64 / 1e6
+    );
+    assert!(
+        s.target_bytes >= 16 << 20,
+        "the 2048² shadow map is counted: {}",
+        s.target_bytes
+    );
+    assert!(
+        s.target_bytes <= 150_000_000,
+        "frame, post and shadow targets: {}",
+        s.target_bytes
+    );
+    assert!(
+        s.lighting_bytes > 0 && s.lighting_bytes <= 90_000_000,
+        "sky + IBL: {}",
+        s.lighting_bytes
+    );
     assert_eq!(s.depth_views, 1, "one shadowed sun");
     assert_eq!(s.post_groups, 1, "the battle camera (the previews render without post)");
     assert!(s.views >= 3, "the battle camera and two previews: {}", s.views);

@@ -554,8 +554,10 @@ pub fn hull_maps(n: u32) -> HullMaps {
 
             let ao = 0.3 + 0.7 * smoothstep(0.0, groove * 4.0, d);
             let dirt = (grime - 0.45).max(0.0) * 1.4 + 0.25 * (streaks - 0.5).max(0.0);
+            // Bare metal: a light F0 and a moderately rough lobe, so from the top-down camera it
+            // mirrors the sky's glow and the sun's highlight instead of reading as a hole.
             let color = if bare {
-                Vec3::new(0.5, 0.52, 0.55) * (0.8 + 0.25 * r(2))
+                Vec3::new(0.72, 0.74, 0.78) * (0.85 + 0.2 * r(2))
             } else if trim {
                 Vec3::new(0.1, 0.105, 0.115) * (0.85 + 0.3 * r(2))
             } else {
@@ -566,7 +568,7 @@ pub fn hull_maps(n: u32) -> HullMaps {
             let roughness = if d < groove {
                 0.9
             } else if bare {
-                0.18 + 0.22 * streaks
+                0.3 + 0.25 * streaks
             } else if trim {
                 0.35 + 0.15 * r(3)
             } else {

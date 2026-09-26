@@ -58,6 +58,11 @@ pub fn spawn_sun(world: &mut World, fit: ShadowFit) -> Entity {
     ))
 }
 
+/// Specular image-based lighting × the sky: the top-down camera's reflections look up into
+/// the dim zenith of the nebula (radiance about 0.05), so the lighting environment is authored
+/// brighter than the backdrop, or metal would reflect next to nothing.
+pub const ENV_SPECULAR: f32 = 2.5;
+
 /// The sky as `camera`'s `Skybox` and its image-based lighting (`EnvironmentLight`), and a
 /// faint blue ambient for the shadowed sides.
 pub fn add_environment(world: &mut World, resources: &mut Resources, assets: &ShowcaseAssets, camera: Entity) {
@@ -65,7 +70,7 @@ pub fn add_environment(world: &mut World, resources: &mut Resources, assets: &Sh
         camera,
         (
             Skybox::new(assets.sky),
-            EnvironmentLight::new(assets.sky).with_intensity(0.7, 1.0),
+            EnvironmentLight::new(assets.sky).with_intensity(0.7, ENV_SPECULAR),
         ),
     );
     resources.insert(AmbientLight {
@@ -553,7 +558,7 @@ pub fn spawn_previews(world: &mut World, resources: &mut Resources, assets: &Sho
                         near: 1.0,
                         far: 300.0,
                     }),
-                EnvironmentLight::new(assets.sky).with_intensity(0.7, 1.0),
+                EnvironmentLight::new(assets.sky).with_intensity(0.7, ENV_SPECULAR),
             )),
         );
         quads.push(rt);
