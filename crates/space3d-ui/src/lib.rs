@@ -11,6 +11,13 @@
 //!   headless target — so UI shows up in `render_to_image` screenshots.
 //! * [`UiAppExt::add_ui_system`] registers `|ctx: &egui::Context, sys: &mut SystemCtx|` UI code;
 //!   [`UiAppExt::add_root_ui_system`] gets the frame's root [`egui::Ui`] for panels.
+//! * Pointer: mouse buttons reach egui in the order they happened
+//!   (`space3d_platform::Input::mouse_button_events`), each where the cursor was; a release
+//!   outside the window goes where egui last saw the pointer (no hover at the window's corner);
+//!   `egui::Event::WindowFocused` follows the window's focus. A release that no device event
+//!   reported — the window lost the focus, or the OS shows the button up with no release event —
+//!   is a cancel: egui registers neither a click nor a drop (see `docs/platforms.md`, "Mouse
+//!   buttons, focus and the UI").
 //! * egui plugins get their pass hooks (`on_begin_pass` before the UI systems, `on_end_pass`
 //!   after them), which egui itself only runs from `Context::run_ui`: the built-in ones (label
 //!   text selection, drag-and-drop, `egui::debug_text`) and those added with

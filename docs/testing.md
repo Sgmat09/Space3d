@@ -70,6 +70,14 @@ input.inject_key_event(KeyEvent::press(KeyCode::Digit2, LogicalKey::Character("Ã
 assert_eq!(input.key_cap(KeyCode::KeyW), "Z");     // learned from the event
 ```
 
+Mouse buttons: `Input::mouse_button_events()` lists the frame's presses and releases in order.
+A focus loss is `WindowState::focused = false` plus `Input::release_all()` (what the window
+runner does); its releases are cancels, like a release only the OS saw
+(`Input::release_mouse_button(b, MouseButtonCause::OsReconciled)`): the UI registers no click
+and no drop for them ([Mouse buttons, focus and the UI](platforms.md#mouse-buttons-focus-and-the-ui)).
+The recorder (`InputRecorderPlugin`) keeps per-frame edges: a recorded cancel replays as a plain
+release.
+
 Tests on libtest threads never read the developer's own layout on macOS (Text Input Sources
 are main-thread only), so learned labels keep them deterministic. The OS tables themselves are
 tested on the main thread by `crates/space3d-platform/tests/os_layout.rs`, a custom harness
