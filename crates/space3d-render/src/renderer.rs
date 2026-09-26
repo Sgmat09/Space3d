@@ -329,6 +329,8 @@ pub struct Renderer {
     pub(crate) id: u64,
     /// GPU pass timings (see [`Renderer::gpu_timings`]).
     pub(crate) gpu_timings: crate::timing::GpuTimings,
+    /// Timestamp queries of the frame's passes (`FrameSettings::gpu_timing`).
+    pub(crate) timer: crate::timing::GpuTimer,
     /// `graphics` masked by the last frame's `FrameSettings::downlevel`.
     pub(crate) frame_graphics: crate::caps::GraphicsCaps,
     /// Post-processing state: composite pipelines, per-camera history.
@@ -342,6 +344,11 @@ pub struct Renderer {
     /// Submissions of the last [`crate::frame::MAX_FRAMES_IN_FLIGHT`] frames (slot: frame index
     /// modulo the count): `render_frame` waits for the oldest before it is replaced.
     pub(crate) in_flight: [Option<wgpu::SubmissionIndex>; crate::frame::MAX_FRAMES_IN_FLIGHT],
+    /// Cubemaps, image-based lighting and shadows (graphics spec §2.6): the frame calls it at
+    /// fixed points of `render_frame` and draws the depth views it requests.
+    pub(crate) lighting: crate::lighting::Lighting,
+    /// Depth views injected by [`crate::testing`] (renderer tests), drawn after the lighting's.
+    pub(crate) injected_depth_views: Vec<crate::lighting::DepthViewRequest>,
 }
 
 /// What [`Renderer::prewarm`] builds, in addition to the post pipelines of the current post
@@ -563,7 +570,8 @@ impl Renderer {
                 .get_downlevel_capabilities()
                 .flags
                 .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
-        let pipelines = Pipelines::new(&device, caps.compute && caps.indirect, glsl_es_300);
+        let mut pipelines = Pipelines::new(&device, caps.compute && caps.indirect, glsl_es_300);
+        pipelines.depth_bias_clamp = graphics.depth_bias_clamp;
         let white = white_texture(&device, &queue);
         let mut samplers = SamplerCache::default();
         let white_sampler = samplers.get(&device, Default::default());
@@ -576,6 +584,8 @@ impl Renderer {
         };
         let post = crate::post::PostState::new(&device, &graphics);
         let scene_inputs = crate::frame::SceneInputs::new(&device, &queue, &layouts);
+        let lighting = crate::lighting::Lighting::new(&device, &queue, &graphics);
+        let timer = crate::timing::GpuTimer::new(graphics.timestamps, queue.get_timestamp_period());
         let mut renderer = Self {
             instance,
             adapter,
@@ -599,6 +609,7 @@ impl Renderer {
             layouts,
             id: next_renderer_id(),
             gpu_timings,
+            timer,
             frame_graphics: graphics.clone(),
             graphics,
             post,
@@ -606,6 +617,8 @@ impl Renderer {
             nodes: Default::default(),
             scene_inputs,
             in_flight: Default::default(),
+            lighting,
+            injected_depth_views: Vec::new(),
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;

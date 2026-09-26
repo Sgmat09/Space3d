@@ -16,8 +16,12 @@ pub struct FrameSettings {
     /// Global post-processing switch (graphics menu, A/B comparisons). `false`: every camera
     /// renders as if it had no `PostProcess`. Default true.
     pub post: bool,
-    /// Record GPU pass timestamps into [`crate::GpuTimings`] (needs `TIMESTAMP_QUERY`).
-    /// Default false.
+    /// Record GPU pass timestamps into [`crate::GpuTimings`] (the resource and
+    /// `Renderer::gpu_timings`; needs `TIMESTAMP_QUERY`, see `GraphicsCaps::timestamps`): the
+    /// start and end of every pass (labels in `docs/graphics/frame.md`, "GPU timings"). A frame's
+    /// timings arrive 2–5 frames later: its timestamps are resolved once its GPU work completed.
+    /// Scopes of consecutive passes may overlap on tile-based GPUs (Apple, mobile), so
+    /// `total_ms` is a sum, not the frame's GPU time. Default false (no cost).
     pub gpu_timing: bool,
     /// Read back each post camera's exposure ([`crate::Renderer::camera_exposure`]), 1–3 frames
     /// late. Default false.

@@ -1,29 +1,48 @@
-//! Frame-mode benchmarks at 1080p (graphics spec §4.4 gate "Hdr minimal over Direct").
-//! Skipped (with a message) when no GPU adapter exists.
+//! Frame-mode benchmarks at 1080p (graphics spec §4.4 gates "Hdr minimal over Direct", bloom,
+//! shadow). Skipped (with a message) when no GPU adapter exists.
 //!
-//! * `frame/cpu/{direct,hdr_minimal}`: the render stage on the CPU (extraction, planning,
-//!   recording and submission; the GPU is waited for outside the measurement).
-//! * `frame/gpu/{direct,hdr_minimal}`: the render stage and the wait for the GPU — one frame's
-//!   CPU + GPU latency. The difference between the two modes bounds the HDR path's added GPU
-//!   time (scene texture and composite) from above.
-//! * `frame/throughput/{direct,hdr_minimal}`: frames recorded back to back (a wait every 8th):
-//!   the time per frame is the GPU's when it is the bottleneck.
-//! * `frame/ab` (printed after the criterion groups; run alone with `-- frame/ab`): the two
-//!   modes interleaved round by round, so load changes hit both alike, reporting the median of
-//!   the paired deltas (Hdr minus Direct) for the CPU time, the throughput and the latency; and
-//!   the latency of isolated frames 2 ms apart, where the GPU idles between frames and drops
-//!   to its lowest clocks. The §4.4 gate is measured on the loaded GPU (throughput); the
+//! Modes: `direct` (no post), `hdr_minimal` (a post camera without bloom: the composite only),
+//! `hdr_bloom` (`PostProcess::default()`: the composite and the default `Bloom::glow()` chain),
+//! `depth_view` (Direct plus one 2048² depth view drawing the scene's casters, as a shadow map
+//! does; injected with `space3d_render::testing`).
+//!
+//! * `frame/cpu/<mode>`: the render stage on the CPU (extraction, planning, recording and
+//!   submission; the GPU is waited for outside the measurement).
+//! * `frame/gpu/<mode>`: the render stage and the wait for the GPU — one frame's CPU + GPU
+//!   latency.
+//! * `frame/throughput/<mode>`: frames recorded back to back (a wait every 8th): the time per
+//!   frame is the GPU's when it is the bottleneck.
+//! * `frame/ab` (printed after the criterion groups; run alone with `-- frame/ab`): the modes
+//!   interleaved round by round, so load changes hit all alike, reporting per mode the median
+//!   of the paired deltas against Direct for the CPU time, the throughput and the latency; the
+//!   latency of isolated frames 2 ms apart, where the GPU idles between frames and drops to its
+//!   lowest clocks; and each mode's GPU timings per pass (`FrameSettings::gpu_timing`, loaded
+//!   GPU; medians). The §4.4 gates are measured on the loaded GPU (throughput, timings); the
 //!   isolated figure is reported for reference (every pass costs about 3× more there).
 //!
 //! The scene fills the frame: a lit ground plane, 400 lit cubes (emissive up to 6) and a sun.
-//! `hdr_minimal` is a post camera without bloom (the composite only: exposure, AgX, dither).
 
 use criterion::{Criterion, criterion_group};
 use space3d_core::prelude::*;
 use space3d_render::*;
 use std::time::{Duration, Instant};
 
-fn app(post: bool) -> Option<App> {
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Direct,
+    HdrMinimal,
+    HdrBloom,
+    DepthView,
+}
+
+const MODES: [(&str, Mode); 4] = [
+    ("direct", Mode::Direct),
+    ("hdr_minimal", Mode::HdrMinimal),
+    ("hdr_bloom", Mode::HdrBloom),
+    ("depth_view", Mode::DepthView),
+];
+
+fn app(mode: Mode) -> Option<App> {
     let renderer = match pollster::block_on(Renderer::new_headless(1920, 1080)) {
         Ok(r) => r,
         Err(e) => {
@@ -61,17 +80,35 @@ fn app(post: bool) -> Option<App> {
         Transform::from_xyz(0.0, 1.5, 4.0).looking_at(Vec3::new(0.0, -1.0, -4.0), Vec3::Y),
         Camera3d::default(),
     ));
-    if post {
-        app.world
+    match mode {
+        Mode::Direct => {}
+        Mode::HdrMinimal => app
+            .world
             .insert_one(cam, PostProcess::default().without_bloom())
-            .unwrap();
+            .unwrap(),
+        Mode::HdrBloom => app.world.insert_one(cam, PostProcess::default()).unwrap(),
+        Mode::DepthView => {
+            // The sun's view of the cube field: an orthographic box around it.
+            let view = glam::camera::rh::view::look_at_mat4(Vec3::new(3.0, 10.0, 6.0), Vec3::new(0.0, -1.0, -5.0), Vec3::Y);
+            let proj = glam::camera::rh::proj::directx::orthographic(-12.0, 12.0, -12.0, 12.0, 0.0, 40.0);
+            let bias = wgpu::DepthBiasState {
+                constant: 2,
+                slope_scale: 1.5,
+                clamp: 0.0,
+            };
+            space3d_render::testing::add_depth_view(app.resources.expect_mut::<Renderer>(), proj * view, 2048, bias);
+        }
     }
     for _ in 0..5 {
         app.step_ticks(1);
         wait(&app);
     }
     let s = app.resources.expect::<RenderStats>();
-    assert_eq!(s.intermediate_groups, u32::from(post));
+    assert_eq!(
+        s.intermediate_groups,
+        u32::from(matches!(mode, Mode::HdrMinimal | Mode::HdrBloom))
+    );
+    assert_eq!(s.depth_views, u32::from(mode == Mode::DepthView));
     Some(app)
 }
 
@@ -95,8 +132,8 @@ fn wait(app: &App) {
 fn frame(c: &mut Criterion) {
     let mut group = c.benchmark_group("frame");
     group.sample_size(40);
-    for (name, post) in [("direct", false), ("hdr_minimal", true)] {
-        let Some(mut app) = app(post) else { return };
+    for (name, mode) in MODES {
+        let Some(mut app) = app(mode) else { return };
         group.bench_function(format!("cpu/{name}"), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
@@ -193,50 +230,112 @@ fn idle_round(app: &mut App, idle: Duration) -> f64 {
     median(&mut v)
 }
 
-/// `frame/ab`: Direct and Hdr minimal interleaved (the order alternating per round); medians of
-/// the per-round values and of the paired deltas.
+/// Median GPU milliseconds per pass label over `frames` timed frames back to back (the loaded
+/// GPU), then timing off again.
+fn gpu_timings(app: &mut App, frames: usize) -> Vec<(&'static str, f64)> {
+    app.resources.expect_mut::<FrameSettings>().gpu_timing = true;
+    let spin = Instant::now();
+    while spin.elapsed() < Duration::from_millis(30) {
+        render(app);
+    }
+    let mut samples: Vec<(&'static str, Vec<f64>)> = Vec::new();
+    let mut last = None;
+    let mut i = 0;
+    while samples.first().is_none_or(|(_, v)| v.len() < frames) && i < frames * 4 {
+        render(app);
+        if i % 8 == 7 {
+            wait(app);
+        }
+        i += 1;
+        let t = app.resources.expect::<GpuTimings>();
+        if t.frame == last || t.frame.is_none() {
+            continue;
+        }
+        last = t.frame;
+        let mut per_label: Vec<(&'static str, f64)> = Vec::new();
+        for s in &t.scopes {
+            match per_label.iter_mut().find(|(l, _)| *l == s.label) {
+                Some((_, ms)) => *ms += s.ms as f64,
+                None => per_label.push((s.label, s.ms as f64)),
+            }
+        }
+        for (label, ms) in per_label {
+            match samples.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, v)) => v.push(ms),
+                None => samples.push((label, vec![ms])),
+            }
+        }
+    }
+    wait(app);
+    app.resources.expect_mut::<FrameSettings>().gpu_timing = false;
+    samples.into_iter().map(|(l, mut v)| (l, median(&mut v))).collect()
+}
+
+/// `frame/ab`: the modes interleaved (the order rotating per round); medians of the per-round
+/// values and of the paired deltas against Direct; then each mode's GPU timings per pass.
 fn frame_ab() {
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     if filter.is_some_and(|f| !"frame/ab".contains(f.as_str())) {
         return;
     }
-    let (Some(mut direct), Some(mut hdr)) = (app(false), app(true)) else {
-        return;
-    };
+    let mut apps = Vec::new();
+    for (_, mode) in MODES {
+        let Some(app) = app(mode) else { return };
+        apps.push(app);
+    }
+    let n = apps.len();
     let rounds = 24;
-    let mut values: [[Vec<f64>; 4]; 2] = Default::default();
-    let mut deltas: [Vec<f64>; 4] = Default::default();
-    let mut record = |m: usize, pair: [f64; 2]| {
-        values[0][m].push(pair[0]);
-        values[1][m].push(pair[1]);
-        deltas[m].push(pair[1] - pair[0]);
-    };
+    // values[mode][metric], deltas[mode][metric] (against Direct).
+    let mut values = vec![vec![Vec::new(); 4]; n];
+    let mut deltas = vec![vec![Vec::new(); 4]; n];
     // Loaded GPU, then (separately, so the clocks can drop) isolated frames.
     for r in 0..rounds {
-        let mut round = [[0.0; 3]; 2];
-        for k in if r % 2 == 0 { [0, 1] } else { [1, 0] } {
-            round[k] = ab_round(if k == 0 { &mut direct } else { &mut hdr });
+        let mut round = vec![[0.0; 3]; n];
+        for j in 0..n {
+            let k = (j + r) % n;
+            round[k] = ab_round(&mut apps[k]);
         }
-        for (m, (d, h)) in round[0].into_iter().zip(round[1]).enumerate() {
-            record(m, [d, h]);
+        for k in 0..n {
+            for m in 0..3 {
+                values[k][m].push(round[k][m]);
+                deltas[k][m].push(round[k][m] - round[0][m]);
+            }
         }
     }
     for r in 0..rounds / 2 {
-        let mut pair = [0.0; 2];
-        for k in if r % 2 == 0 { [0, 1] } else { [1, 0] } {
-            pair[k] = idle_round(if k == 0 { &mut direct } else { &mut hdr }, Duration::from_millis(2));
+        let mut round = vec![0.0; n];
+        for j in 0..n {
+            let k = (j + r) % n;
+            round[k] = idle_round(&mut apps[k], Duration::from_millis(2));
         }
-        record(3, pair);
+        for k in 0..n {
+            values[k][3].push(round[k]);
+            deltas[k][3].push(round[k] - round[0]);
+        }
     }
-    println!("frame/ab (interleaved rounds, medians in µs): Direct | Hdr minimal | paired delta");
+    println!("frame/ab (interleaved rounds, medians in µs; the paired delta against Direct in brackets)");
     let labels = ["cpu", "throughput", "latency", "latency, frames 2 ms apart"];
     for (m, label) in labels.iter().enumerate() {
-        println!(
-            "  {label:<28} {:8.1} | {:8.1} | {:+8.1}",
-            median(&mut values[0][m]),
-            median(&mut values[1][m]),
-            median(&mut deltas[m])
-        );
+        let mut line = format!("  {label:<28}");
+        for k in 0..n {
+            let v = median(&mut values[k][m]);
+            if k == 0 {
+                line += &format!(" {}: {v:8.1}", MODES[k].0);
+            } else {
+                line += &format!(" | {}: {v:8.1} ({:+7.1})", MODES[k].0, median(&mut deltas[k][m]));
+            }
+        }
+        println!("{line}");
+    }
+    if !apps[0].resources.expect::<Renderer>().graphics_caps().timestamps {
+        println!("frame/ab: no TIMESTAMP_QUERY, no GPU timings");
+        return;
+    }
+    println!("frame/ab GPU timings (FrameSettings::gpu_timing, loaded GPU, medians in ms):");
+    for (k, app) in apps.iter_mut().enumerate() {
+        let timings = gpu_timings(app, 48);
+        let line: Vec<String> = timings.iter().map(|(l, ms)| format!("{l} {ms:.3}")).collect();
+        println!("  {:<12} {}", MODES[k].0, line.join(", "));
     }
 }
 

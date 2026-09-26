@@ -611,9 +611,10 @@ pub struct PrepareContext<'a> {
     pub layouts: &'a FrameLayouts,
     pub(crate) uploader: &'a mut Uploader,
     pub(crate) stats: &'a mut RenderStats,
+    pub(crate) timing: &'a crate::timing::GpuTimer,
 }
 
-impl PrepareContext<'_> {
+impl<'a> PrepareContext<'a> {
     /// Copy `data` into `buffer` at `offset` through the renderer's staging ring (recorded in the
     /// frame encoder; no per-call allocation; counted in `RenderStats::bytes_uploaded`).
     /// `buffer` needs `COPY_DST`.
@@ -631,16 +632,18 @@ impl PrepareContext<'_> {
         texture_ref(self.assets, handle)
     }
 
-    /// Timestamp writes for a compute pass the caller records (`None` without GPU timing).
-    pub fn compute_timestamps(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
-        let _ = label; // STUB(F8): GpuTimings query set
-        None
+    /// Timestamp writes for a compute pass the caller records into [`Self::encoder`], reported
+    /// as `label` in [`crate::GpuTimings`] (`None` unless `FrameSettings::gpu_timing` is on and
+    /// the device offers `TIMESTAMP_QUERY`). The writes borrow the frame's query set, not this
+    /// context: pass them to `self.encoder.begin_compute_pass`. Call it once per pass, right
+    /// before recording it.
+    pub fn compute_timestamps(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+        self.timing.compute(label, None)
     }
 
-    /// Timestamp writes for a render pass the caller records (`None` without GPU timing).
-    pub fn render_timestamps(&mut self, label: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
-        let _ = label; // STUB(F8): GpuTimings query set
-        None
+    /// Timestamp writes for a render pass the caller records (see [`Self::compute_timestamps`]).
+    pub fn render_timestamps(&mut self, label: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'a>> {
+        self.timing.render(label, None)
     }
 
     /// Add `n` compute dispatches to `RenderStats::node_dispatches`.
@@ -677,18 +680,19 @@ pub struct ViewPrepareContext<'a> {
     /// Graphics capabilities (after downlevel masking).
     pub graphics: &'a GraphicsCaps,
     pub(crate) uploader: &'a mut Uploader,
+    pub(crate) timing: &'a crate::timing::GpuTimer,
 }
 
-impl ViewPrepareContext<'_> {
+impl<'a> ViewPrepareContext<'a> {
     /// Copy through the staging ring (see [`PrepareContext::upload`]).
     pub fn upload(&mut self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
         self.uploader.write(self.encoder, buffer, offset, data);
     }
 
-    /// Timestamp writes for a compute pass the caller records (`None` without GPU timing).
-    pub fn compute_timestamps(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
-        let _ = label; // STUB(F8): GpuTimings query set
-        None
+    /// Timestamp writes for a compute pass the caller records, reported as `label` for this
+    /// view's camera (see [`PrepareContext::compute_timestamps`]).
+    pub fn compute_timestamps(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+        self.timing.compute(label, Some(self.view.camera))
     }
 }
 
