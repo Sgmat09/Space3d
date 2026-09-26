@@ -108,6 +108,19 @@ fn hyphenated_project_resolves() {
         .current_dir(&dir)
         .args(["metadata", "--format-version", "1"]));
     assert!(out.contains(r#""name":"my-game-mobile""#), "{out}");
+    // Kinsoku: the generated `[patch.crates-io]` gives egui this checkout's epaint.
+    assert!(!out.contains("was not used"), "{out}");
+    let meta: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    let epaint: Vec<PathBuf> = meta["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "epaint")
+        .map(|p| PathBuf::from(p["manifest_path"].as_str().unwrap()))
+        .collect();
+    let vendored = workspace_root().join("third_party/epaint/Cargo.toml");
+    assert_eq!(epaint.len(), 1, "{epaint:?}");
+    assert_eq!(epaint[0].canonicalize().unwrap(), vendored.canonicalize().unwrap());
     // Names that would trip the generated CI's `-D warnings` (non_snake_case) are refused.
     let upper = space3d()
         .current_dir(dir.parent().unwrap())

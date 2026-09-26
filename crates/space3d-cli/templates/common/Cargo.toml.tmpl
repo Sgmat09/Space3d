@@ -36,3 +36,10 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# egui's text layout with Space3d's line breaking for Chinese and Japanese (kinsoku): epaint
+# from the same Space3d source as `space3d` above. Keep both on the same revision when you
+# update Space3d (see Space3d's docs/ui.md); `space3d doctor` warns when this is missing or
+# unused.
+[patch.crates-io]
+{{epaint_patch}}

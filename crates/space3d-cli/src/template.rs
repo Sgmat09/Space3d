@@ -79,6 +79,32 @@ impl Space3dSource {
             }
         }
     }
+
+    /// The `[patch.crates-io]` entry that gives egui Space3d's Chinese and Japanese line
+    /// breaking (kinsoku): `epaint` from the same source as `space3d` (a checkout's
+    /// `third_party/epaint`, or the same git repository and revision, where cargo finds the
+    /// package by name). A checkout without `third_party/epaint` gets a commented-out line.
+    pub fn epaint_patch(&self) -> String {
+        match self {
+            Space3dSource::Path(facade) => {
+                let vendored = facade
+                    .parent()
+                    .and_then(Path::parent)
+                    .map(|root| root.join("third_party").join("epaint"))
+                    .filter(|dir| dir.join("Cargo.toml").is_file());
+                match vendored {
+                    Some(dir) => format!(
+                        "epaint = {{ path = {} }}",
+                        toml_string(&dir.to_string_lossy().replace('\\', "/"))
+                    ),
+                    None => "# epaint = { path = \"<Space3d checkout>/third_party/epaint\" }  \
+                             (this checkout has no third_party/epaint)"
+                        .to_owned(),
+                }
+            }
+            Space3dSource::Git { .. } => format!("epaint = {{ {} }}", self.dependency_fields()),
+        }
+    }
 }
 
 /// Drop the Windows verbatim prefix that `canonicalize` adds: `\\?\C:\x` → `C:\x`,
@@ -111,6 +137,7 @@ impl TemplateVars {
         v.insert("title", title_case(name));
         v.insert("template", template.dir_name().to_owned());
         v.insert("space3d_dep", source.dependency_fields());
+        v.insert("epaint_patch", source.epaint_patch());
         v.insert("space3d_version", env!("CARGO_PKG_VERSION").to_owned());
         v.insert(
             "android_package",
@@ -509,6 +536,27 @@ mod tests {
     }
 
     #[test]
+    fn epaint_patch_follows_the_space3d_source() {
+        assert_eq!(git().epaint_patch(), format!("epaint = {{ git = \"{DEFAULT_GIT}\" }}"));
+        let rev = Space3dSource::Git {
+            url: DEFAULT_GIT.into(),
+            branch: None,
+            rev: Some("b00ed35".into()),
+        };
+        assert_eq!(
+            rev.epaint_patch(),
+            format!("epaint = {{ git = \"{DEFAULT_GIT}\", rev = \"b00ed35\" }}")
+        );
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let checkout = Space3dSource::from_checkout(&root).unwrap();
+        let patch = checkout.epaint_patch();
+        assert!(patch.starts_with("epaint = { path = \""), "{patch}");
+        assert!(patch.ends_with("/third_party/epaint\" }"), "{patch}");
+        let old_checkout = Space3dSource::Path(PathBuf::from("/nonexistent/Space3d/crates/space3d"));
+        assert!(old_checkout.epaint_patch().starts_with("# epaint"));
+    }
+
+    #[test]
     fn checkout_detection() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let Space3dSource::Path(p) = Space3dSource::from_checkout(&root).unwrap() else {
@@ -631,6 +679,11 @@ mod tests {
             let manifest: toml::Table = toml::from_str(std::str::from_utf8(manifest).unwrap()).unwrap();
             assert_eq!(manifest["package"]["name"].as_str(), Some("demo_game"));
             assert!(manifest["dependencies"]["space3d"]["git"].as_str().is_some());
+            // Kinsoku: egui's epaint from the same Space3d repository.
+            assert_eq!(
+                manifest["patch"]["crates-io"]["epaint"]["git"].as_str(),
+                Some(DEFAULT_GIT)
+            );
             let main = files.iter().find(|f| f.path == Path::new("src/main.rs")).unwrap();
             assert!(
                 std::str::from_utf8(&main.contents)
