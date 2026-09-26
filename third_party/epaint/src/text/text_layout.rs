@@ -12,6 +12,7 @@ use crate::{
         ByteIndex, ByteRange,
         font::{StyledMetrics, UvRect, is_cjk, is_cjk_break_allowed},
         fonts::FontFaceKey,
+        kinsoku,
     },
 };
 
@@ -1276,11 +1277,25 @@ struct RowBreakCandidates {
     /// Breaking after just random character is some
     /// times necessary.
     any: Option<usize>,
+
+    /// Space3d patch (kinsoku): like `any`, but only where [`kinsoku`] doesn't prohibit a break.
+    any_allowed: Option<usize>,
 }
 
 impl RowBreakCandidates {
     fn add(&mut self, index: usize, glyphs: &[Glyph]) {
         let chr = glyphs[0].chr;
+        // Space3d patch (kinsoku): no break where kinsoku prohibits one (`any` is the last
+        // resort), a word-boundary break where it allows one egui's rules below lack.
+        match glyphs.get(1).map(|next| kinsoku::line_break(chr, next.chr)) {
+            Some(kinsoku::Break::Prohibited) => {
+                self.any = Some(index);
+                return;
+            }
+            Some(kinsoku::Break::Allowed) => self.pre_cjk = Some(index),
+            Some(kinsoku::Break::Upstream) | None => {}
+        }
+        self.any_allowed = Some(index);
         const NON_BREAKING_SPACE: char = '\u{A0}';
         if chr.is_whitespace() && chr != NON_BREAKING_SPACE {
             self.space = Some(index);
@@ -1318,6 +1333,7 @@ impl RowBreakCandidates {
             self.word_boundary()
                 .or(self.dash)
                 .or(self.punctuation)
+                .or(self.any_allowed) // Space3d patch (kinsoku)
                 .or(self.any)
         }
     }
@@ -1330,6 +1346,7 @@ impl RowBreakCandidates {
             dash,
             punctuation,
             any,
+            any_allowed, // Space3d patch (kinsoku)
         } = self;
         if space.is_some_and(|s| s < index) {
             *space = None;
@@ -1348,6 +1365,9 @@ impl RowBreakCandidates {
         }
         if any.is_some_and(|s| s < index) {
             *any = None;
+        }
+        if any_allowed.is_some_and(|s| s < index) {
+            *any_allowed = None;
         }
     }
 }

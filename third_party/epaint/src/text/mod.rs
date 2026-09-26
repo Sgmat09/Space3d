@@ -4,6 +4,7 @@ pub mod cursor;
 mod font;
 mod fonts;
 mod index;
+pub mod kinsoku; // Space3d patch: kinsoku (禁則処理) line breaking for Chinese and Japanese.
 mod text_layout;
 mod text_layout_types;
 
