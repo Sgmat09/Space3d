@@ -155,3 +155,113 @@ fn gl_materials_match_default_backend() {
     let lit = gl_img.pixels.chunks(4).filter(|p| p[0] > 40 || p[1] > 40).count();
     assert!(lit > 300, "{lit}");
 }
+
+/// Six face colors in wgpu order (+X, −X, +Y, −Y, +Z, −Z), sRGB.
+const FACES: [[u8; 4]; 6] = [
+    [230, 40, 40, 255],
+    [40, 220, 220, 255],
+    [40, 220, 40, 255],
+    [220, 40, 220, 255],
+    [40, 60, 230, 255],
+    [230, 220, 40, 255],
+];
+
+/// A camera at the origin with a skybox of six solid faces (90° field of view).
+fn sky_app(backends: Option<wgpu::Backends>) -> Option<(App, Entity, CubemapHandle)> {
+    let mut app = app(backends)?;
+    let faces = std::array::from_fn(|i| ImageData::filled(16, 16, FACES[i]));
+    let cube = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_cubemap(CubemapSource::from_faces(faces).unwrap());
+    let camera = app.world.spawn((
+        Transform::IDENTITY,
+        Camera3d::default()
+            .with_clear_color(Vec4::new(0.0, 0.0, 0.0, 1.0))
+            .with_projection(Projection::Perspective {
+                fov_y: 90f32.to_radians(),
+                near: 0.1,
+                far: 100.0,
+            }),
+        Skybox::new(cube),
+    ));
+    Some((app, camera, cube))
+}
+
+/// On GL a square 6-layer texture is a `TEXTURE_CUBE_MAP`: the skybox shows each face in its
+/// direction (uploads, cube mips rendered face by face, `samplerCube`), and an environment
+/// bakes into cube faces (`framebufferTexture2D` with the face targets) and lights a mirror
+/// sphere like the default backend does.
+#[test]
+fn cube_on_gl_is_texture_cube_map() {
+    let Some((mut gl, camera, cube)) = sky_app(Some(wgpu::Backends::GL)) else {
+        eprintln!("skipping GL test: no GL adapter");
+        return;
+    };
+    let looks = [
+        (Vec3::X, Vec3::Y),
+        (Vec3::NEG_X, Vec3::Y),
+        (Vec3::Y, Vec3::Z),
+        (Vec3::NEG_Y, Vec3::Z),
+        (Vec3::Z, Vec3::Y),
+        (Vec3::NEG_Z, Vec3::Y),
+    ];
+    for (i, (dir, up)) in looks.into_iter().enumerate() {
+        *gl.world.get::<&mut Transform>(camera).unwrap() = Transform::IDENTITY.looking_at(dir, up);
+        let img = render_to_image(&mut gl).expect("GL capture");
+        let (w, h) = (img.width, img.height);
+        let px = img.get(w / 2, h / 2);
+        assert!(
+            px.iter().zip(FACES[i]).all(|(a, b)| a.abs_diff(b) <= 2),
+            "face {i}: {px:?} vs {:?}",
+            FACES[i]
+        );
+    }
+    // Image-based lighting: a smooth metal sphere mirrors the faces, rough dielectric beside it.
+    let scene = |app: &mut App, camera: Entity, cube: CubemapHandle| {
+        let sphere = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_mesh(MeshData::sphere(1.0, 32, 16));
+        for (x, metallic, roughness) in [(-1.2, 1.0, 0.1), (1.2, 0.0, 0.8)] {
+            app.world.spawn((
+                Transform::from_xyz(x, 0.0, -4.0),
+                Mesh3d(sphere),
+                Material::srgb(0.9, 0.9, 0.9).with_metallic_roughness(metallic, roughness),
+            ));
+        }
+        app.insert_resource(LightingSettings {
+            shading: ShadingModel::Standard,
+            ..LightingSettings::default()
+        });
+        *app.world.get::<&mut Transform>(camera).unwrap() = Transform::IDENTITY;
+        app.world.insert_one(camera, EnvironmentLight::new(cube)).unwrap();
+    };
+    scene(&mut gl, camera, cube);
+    let gl_img = render_to_image(&mut gl).expect("GL capture");
+    let r = gl.resources.expect::<Renderer>();
+    assert_eq!(r.environment_state(cube), EnvironmentState::Ready);
+    assert_eq!(r.gpu_error_count(), 0);
+    let Some((mut native, camera, cube)) = sky_app(None) else {
+        return;
+    };
+    if native.resources.expect::<Renderer>().capabilities().adapter.backend == wgpu::Backend::Gl {
+        return;
+    }
+    scene(&mut native, camera, cube);
+    let native_img = render_to_image(&mut native).expect("capture");
+    if let Ok(dir) = std::env::var("SPACE3D_TEST_OUT") {
+        for (name, img) in [("gl", &gl_img), ("native", &native_img)] {
+            image::RgbaImage::from_raw(img.width, img.height, img.pixels.clone())
+                .expect("size")
+                .save(format!("{dir}/gl_environment_{name}.png"))
+                .expect("write png");
+        }
+    }
+    let diff = diff_fraction(&gl_img, &native_img, 6);
+    assert!(
+        diff < 0.02,
+        "GL environment differs from the default backend in {:.2}% of pixels",
+        diff * 100.0
+    );
+}

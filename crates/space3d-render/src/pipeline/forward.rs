@@ -316,8 +316,12 @@ pub(super) fn gles3_translation_error(module: &naga::Module, info: &naga::valid:
 
 /// Resources the forward template declares, `(group, binding, name)`: the only ones in the
 /// forward pipeline layout, so the only ones a custom shader can use.
-pub(super) const TEMPLATE_RESOURCES: [(u32, u32, &str); 12] = [
+pub(super) const TEMPLATE_RESOURCES: [(u32, u32, &str); 16] = [
     (0, 0, "view"),
+    (0, 1, "s3d_env_specular"),
+    (0, 2, "s3d_env_irradiance"),
+    (0, 3, "s3d_brdf_lut"),
+    (0, 4, "s3d_env_sampler"),
     (1, 0, "material"),
     (1, 1, "base_tex"),
     (1, 2, "base_sampler"),
@@ -384,8 +388,9 @@ pub(crate) fn validate_custom_wgsl(src: &str, glsl_es_300: bool) -> Result<Optio
                     });
                     return Err(format!(
                         "custom shaders cannot declare resources: `{name}` ({:?}){at} is not bound \
-                         by the forward pipeline (only `view`, `material`, `base_tex`, \
-                         `base_sampler` and the `s3d_*_tex` / `s3d_*_sampler` material maps are)",
+                         by the forward pipeline (only `view`, the `s3d_env_*` / `s3d_brdf_lut` \
+                         lighting inputs, `material`, `base_tex`, `base_sampler` and the \
+                         `s3d_*_tex` / `s3d_*_sampler` material maps are)",
                         g.space
                     ));
                 }

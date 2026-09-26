@@ -1,7 +1,8 @@
-//! Steady-state heap allocations of the render stage with every material feature of PM1/PM2
+//! Steady-state heap allocations of the render stage with every material feature of PM1–PM4
 //! in use: normal / ORM / emissive maps, UV transforms, the second UV set and vertex tangents
-//! (extension stream), alpha masks, additive and premultiplied blending, and the per-instance
-//! transparent sort of a moving alpha-blended batch. The materials area's per-frame work
+//! (extension stream), alpha masks, additive and premultiplied blending, the per-instance
+//! transparent sort of a moving alpha-blended batch, a skybox and image-based lighting
+//! (Standard shading) from a baked environment. The materials area's per-frame work
 //! allocates nothing (`RenderStats::cpu_reallocations == 0`, texture sets and their bind
 //! groups built once); what remains is wgpu's bookkeeping, pinned by a measured bound and
 //! checked for growth, as in `tests/alloc.rs`.
@@ -51,11 +52,12 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 /// Upper bound of allocations per steady-state frame of this scene: measured on Apple M4 Max /
-/// Metal (wgpu 30.0.1, test profile) plus ~10 %: 100 on the CPU path, 195 on the GPU culling
-/// paths, the same every frame (wgpu and wgpu-hal bookkeeping: see `tests/alloc.rs`). Other
+/// Metal (wgpu 30.0.1, test profile) plus ~10 %: 114 on the CPU path, 208 on the GPU culling
+/// paths, the same every frame (wgpu and wgpu-hal bookkeeping: see `tests/alloc.rs`; the skybox
+/// draw and the 7-binding view bind group of PM3/PM4 added 13–14 to PM2's 100 / 195). Other
 /// backends get twice the headroom; the no-growth checks are backend-independent.
 fn bound(path: DrawPath, backend: wgpu::Backend) -> u64 {
-    let metal = if path.gpu_culling() { 215 } else { 110 };
+    let metal = if path.gpu_culling() { 230 } else { 125 };
     if backend == wgpu::Backend::Metal {
         metal
     } else {
@@ -138,6 +140,16 @@ fn material_features_allocate_nothing_per_frame() {
     },));
     let camera = spawn_camera(&mut app, 12.0);
     spawn_sun(&mut app);
+    // A skybox and an environment (baked in the first frame, then only sampled).
+    app.resources.expect_mut::<LightingSettings>().shading = ShadingModel::Standard;
+    let faces = std::array::from_fn(|i| ImageData::filled(32, 32, [40 * i as u8, 90, 200 - 30 * i as u8, 255]));
+    let sky = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_cubemap(CubemapSource::from_faces(faces).unwrap());
+    app.world
+        .insert(camera, (Skybox::new(sky), EnvironmentLight::new(sky)))
+        .unwrap();
 
     let mut frame = 0u32;
     let mut step = |app: &mut App| -> (u64, u32) {

@@ -3,8 +3,23 @@
 //! [`api`] is the public hub (re-exported from the crate root). The rest is the crate-internal
 //! contract between the frame and the materials area (graphics spec §2.6): the frame calls
 //! [`Lighting`] at fixed points of `render_frame` (steps 4, 5 and 8 of §1.4) and draws the depth
-//! views it requests; the materials area owns the bodies. These are F2 stubs with neutral
-//! results (no environment, no shadows, 1×1 dummies), tagged `STUB(P-MAT)`.
+//! views it requests; the materials area owns the bodies.
+//!
+//! * Step 4, [`Lighting::prepare`]: uploads new cubemaps (radiance cubes, see [`cubemap`]),
+//!   finds the environments the frame's cameras use (`EnvironmentLight`, created on first use:
+//!   skybox-only cubemaps never pay for a bake), and records bake passes — every pass when the
+//!   renderer is headless or `IblSettings::bake_passes_per_frame` is `None`, else that many per
+//!   frame, oldest environment first. An environment is used from the frame its last pass is
+//!   recorded in; until then its camera renders with the previous environment of the same
+//!   cubemap if one is baked (a settings change or a re-upload), else without image-based
+//!   lighting.
+//! * Step 8, [`Lighting::fill_view`] / [`Lighting::view_resources`]: the camera's sky and
+//!   environment fields of `GpuView` and its group-0 bindings 1–4 (the BRDF LUT is always bound:
+//!   `ShadingModel::Standard` uses it for multiple-scattering compensation).
+//! * Environments unused for [`ENV_IDLE_FRAMES`] frames, those of removed cubemaps and those
+//!   superseded by a baked newer one are dropped.
+//! * Directional shadows (depth views, milestone PM5) are still neutral: no depth views, a far
+//!   1×1 shadow map.
 
 pub(crate) mod api;
 pub(crate) mod cubemap;
@@ -14,37 +29,42 @@ mod skybox;
 
 use crate::assets::RenderAssets;
 use crate::caps::GraphicsCaps;
+use crate::components::Camera3d;
 use crate::culling::Frustum;
 use crate::node::{RenderNodes, ViewInfo};
 use crate::pipeline::GpuView;
 use crate::stats::RenderStats;
-use api::LightingSettings;
-use glam::Mat4;
+use api::{CubemapHandle, EnvironmentLight, EnvironmentState, LightingSettings, Skybox};
+use environment::{Baker, Env, EnvKey, Job};
+use glam::{Mat3, Mat4, Quat};
 use space3d_core::{Entity, World};
 
+/// Frames an environment stays cached after its last use.
+pub(crate) const ENV_IDLE_FRAMES: u64 = 600;
+
 /// Inputs of [`Lighting::prepare`] (step 4: cubemap uploads and conversion, IBL bake passes).
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-)]
 pub(crate) struct LightingPrepare<'a> {
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
     pub encoder: &'a mut wgpu::CommandEncoder,
+    /// The frame's world (cameras with an `EnvironmentLight` request their environment).
+    pub world: &'a World,
     pub assets: &'a mut RenderAssets,
     pub settings: &'a LightingSettings,
+    /// The frame's capabilities (after `FrameSettings::downlevel` masking): without
+    /// `hdr_format`, radiance cubes of HDR sources and bakes are `Rgba8UnormSrgb`.
+    pub graphics: &'a GraphicsCaps,
     /// Headless renderers finish every pending bake in the frame it is requested.
     pub headless: bool,
     pub stats: &'a mut RenderStats,
-    /// GPU timings: `timing.render("ibl.bake", None)` as a bake pass's `timestamp_writes`
-    /// (`None` unless `FrameSettings::gpu_timing`).
+    /// GPU timings: the frame's lighting passes are one `"ibl.bake"` scope.
     pub timing: &'a crate::timing::GpuTimer,
 }
 
 /// One depth-only view the frame renders before the camera views (a shadow map).
 #[allow(
     dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
+    reason = "graphics contract (spec §2.6): shadows arrive with milestone PM5"
 )]
 pub(crate) struct DepthViewRequest {
     pub light: Entity,
@@ -60,10 +80,6 @@ pub(crate) struct DepthViewRequest {
 /// keeps one bind group per key (and views-buffer generation): equal keys must mean identical
 /// resources, and a new resource (a re-created shadow map, a baked environment) a new key. The
 /// resources for `None` (depth views) must not include a shadow map a depth view renders into.
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-)]
 pub(crate) struct ViewResources<'a> {
     pub env_specular: &'a wgpu::TextureView,
     pub env_irradiance: &'a wgpu::TextureView,
@@ -74,28 +90,60 @@ pub(crate) struct ViewResources<'a> {
     pub key: u64,
 }
 
+/// A registered cubemap as of the last `prepare`.
+#[derive(Clone, Copy)]
+struct CubeStatus {
+    handle: CubemapHandle,
+    state: EnvironmentState,
+    /// The radiance cube is on the GPU (a skybox can show it).
+    uploaded: bool,
+}
+
 /// Lighting state: cubemaps, the environment cache, the bake queue and the shadow state.
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-)]
 pub(crate) struct Lighting {
     dummy_cube: wgpu::TextureView,
-    dummy_2d: wgpu::TextureView,
     dummy_depth: wgpu::TextureView,
+    brdf_lut: wgpu::TextureView,
     sampler: wgpu::Sampler,
     comparison: wgpu::Sampler,
     depth_views: Vec<DepthViewRequest>,
+    /// Bake pipelines (with the first cubemap).
+    baker: Option<Baker>,
+    /// Uploads planned this frame (recorded all at once).
+    uploads: Vec<Job>,
+    /// Environments, oldest first (the bake queue's order).
+    envs: Vec<Env>,
+    /// This frame's cameras with an environment: (camera, `envs` index of the one to bind).
+    camera_envs: Vec<(Entity, usize)>,
+    /// Registered cubemaps as of the last `prepare` (`environment_state`, sky readiness).
+    states: Vec<CubeStatus>,
+    frame: u64,
+    next_id: u64,
+    /// Warned that HDR cubemaps are stored as LDR (no float render targets).
+    warned_ldr: bool,
+    /// Tests: apply `bake_passes_per_frame` although the renderer is headless.
+    pub(crate) budget_headless: bool,
 }
 
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-)]
+/// A rotation's inverse as `GpuView` matrix columns (world → cubemap).
+fn rotation_columns(q: Quat) -> [[f32; 4]; 3] {
+    let q = if q.length_squared() > 1e-12 {
+        q.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let m = Mat3::from_quat(q).transpose();
+    [
+        m.x_axis.extend(0.0).to_array(),
+        m.y_axis.extend(0.0).to_array(),
+        m.z_axis.extend(0.0).to_array(),
+    ]
+}
+
 impl Lighting {
-    /// Neutral resources (1×1 black environment, far shadow map).
+    /// The BRDF LUT and neutral resources (1×1 black environment, far shadow map).
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, caps: &GraphicsCaps) -> Self {
-        let _ = (queue, caps); // STUB(P-MAT): BRDF LUT upload, format choice from caps
+        let _ = caps;
         let texture = |label, layers, format, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -114,7 +162,6 @@ impl Lighting {
         };
         let sampled = wgpu::TextureUsages::TEXTURE_BINDING;
         let cube = texture("space3d dummy cube", 6, wgpu::TextureFormat::Rgba8Unorm, sampled);
-        let flat = texture("space3d dummy 2d", 1, wgpu::TextureFormat::Rgba8Unorm, sampled);
         let depth = texture(
             "space3d dummy shadow map",
             1,
@@ -126,12 +173,13 @@ impl Lighting {
                 dimension: Some(wgpu::TextureViewDimension::Cube),
                 ..Default::default()
             }),
-            dummy_2d: flat.create_view(&Default::default()),
             dummy_depth: depth.create_view(&Default::default()),
+            brdf_lut: environment::create_brdf_lut(device, queue),
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("space3d environment"),
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 ..Default::default()
             }),
             comparison: device.create_sampler(&wgpu::SamplerDescriptor {
@@ -140,13 +188,236 @@ impl Lighting {
                 ..Default::default()
             }),
             depth_views: Vec::new(),
+            baker: None,
+            uploads: Vec::new(),
+            envs: Vec::new(),
+            camera_envs: Vec::new(),
+            states: Vec::new(),
+            frame: 0,
+            next_id: 1,
+            warned_ldr: false,
+            budget_headless: false,
         }
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     /// Step 4: cubemap uploads and conversion, IBL bake passes (budgeted; all at once when
     /// headless).
     pub fn prepare(&mut self, cx: &mut LightingPrepare<'_>) {
-        let _ = cx; // STUB(P-MAT)
+        self.frame += 1;
+        let frame = self.frame;
+        let hdr = cx.graphics.hdr_format == Some(wgpu::TextureFormat::Rgba16Float);
+        // Compute dispatches (one compute pass) where compute shaders can write storage
+        // textures; fragment passes elsewhere (WebGL2, `DownlevelOverride::no_compute`).
+        let compute = cx.graphics.compute && cx.device.limits().max_storage_textures_per_shader_stage > 0;
+        let capacities = (
+            self.uploads.capacity(),
+            self.camera_envs.capacity(),
+            self.states.capacity(),
+        );
+
+        // Uploads of new and updated cubemaps.
+        let mut pending = std::mem::take(&mut cx.assets.pending_cubemaps);
+        for &h in &pending {
+            let Some(entry) = cx.assets.cubemaps.get_mut(h.raw()) else {
+                continue;
+            };
+            let Some(source) = entry.source.take() else {
+                continue;
+            };
+            let id = self.next_id();
+            let baker = self.baker.get_or_insert_with(|| Baker::new(cx.device));
+            match cubemap::plan_upload(baker, cx.device, cx.queue, &source, hdr, compute, id) {
+                Ok(upload) => {
+                    let format = match &source {
+                        api::CubemapSource::Faces(t) | api::CubemapSource::Equirect { texture: t, .. } => t.format,
+                    };
+                    if !hdr && !self.warned_ldr && cubemap::is_hdr(format) {
+                        self.warned_ldr = true;
+                        tracing::warn!(
+                            "no float render targets: HDR cubemaps are stored as Rgba8UnormSrgb \
+                             (radiance above 1 clamps; environments bake in LDR)"
+                        );
+                    }
+                    cx.stats.bytes_uploaded += upload.bytes;
+                    cx.stats.textures_uploaded += 1;
+                    cx.stats.textures_created += upload.textures;
+                    entry.gpu = Some(upload.gpu);
+                    entry.state = EnvironmentState::Ready;
+                    self.uploads.push(upload.job);
+                }
+                Err(e) => {
+                    tracing::warn!("cubemap {h:?} not uploaded: {e}");
+                    entry.state = EnvironmentState::Failed;
+                }
+            }
+        }
+        pending.clear();
+        cx.assets.pending_cubemaps = pending;
+
+        // Environments: drop those of removed or re-uploaded cubemaps once nothing needs them,
+        // idle ones, and those a baked newer one supersedes.
+        let key = EnvKey::new(&cx.settings.ibl, hdr);
+        let current = |e: &Env, assets: &RenderAssets| {
+            e.key == key && assets.cubemap_gpu(e.cubemap).is_some_and(|g| g.id == e.source)
+        };
+        let assets = &*cx.assets;
+        let mut i = 0;
+        while i < self.envs.len() {
+            let e = &self.envs[i];
+            let live = assets.contains_cubemap(e.cubemap);
+            let idle = e.last_used + ENV_IDLE_FRAMES < frame;
+            let superseded = !current(e, assets)
+                && self
+                    .envs
+                    .iter()
+                    .any(|o| o.cubemap == e.cubemap && o.ready() && current(o, assets));
+            if !live || idle || superseded {
+                self.envs.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // The environments this frame's cameras use (created on first use).
+        self.camera_envs.clear();
+        for (camera, _, light) in cx.world.query::<(Entity, &Camera3d, &EnvironmentLight)>().iter() {
+            let Some(cube) = assets.cubemap_gpu(light.cubemap) else {
+                continue;
+            };
+            let found = self
+                .envs
+                .iter()
+                .position(|e| e.cubemap == light.cubemap && e.source == cube.id && e.key == key);
+            let index = match found {
+                Some(i) => i,
+                None => {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    let baker = self.baker.get_or_insert_with(|| Baker::new(cx.device));
+                    self.envs
+                        .push(Env::new(baker, cx.device, light.cubemap, cube, key, compute, id, frame));
+                    cx.stats.textures_created += 2;
+                    self.envs.len() - 1
+                }
+            };
+            self.envs[index].last_used = frame;
+            self.camera_envs.push((camera, index));
+        }
+
+        // Record: every upload step, then bake steps within the budget (a render pass each on
+        // the fragment path, dispatches in one compute pass on the compute path).
+        let budget = match cx.settings.ibl.bake_passes_per_frame {
+            Some(n) if !cx.headless || self.budget_headless => n,
+            _ => u32::MAX,
+        };
+        let mut passes = 0u32;
+        let mut steps = 0u32;
+        for job in &self.uploads {
+            let (p, s) = job.passes(u32::MAX);
+            passes += p;
+            steps += s;
+        }
+        let mut left = budget;
+        for e in &self.envs {
+            if left == 0 {
+                break;
+            }
+            let (p, s) = e.job.passes(left);
+            passes += p;
+            steps += s;
+            left -= s;
+        }
+        if passes > 0 {
+            let timing = cx.timing;
+            let mut timer = environment::PassTimer::new(timing.span("ibl.bake", None), passes);
+            let baker = self.baker.as_mut().expect("jobs imply the baker");
+            for job in &mut self.uploads {
+                baker.record(cx.device, cx.encoder, job, u32::MAX, &mut timer);
+            }
+            let mut left = budget;
+            for e in &mut self.envs {
+                if left == 0 {
+                    break;
+                }
+                left -= baker.record(cx.device, cx.encoder, &mut e.job, left, &mut timer);
+            }
+            cx.stats.ibl_bake_passes += steps;
+            cx.stats.render_passes += timer.render_passes;
+            cx.stats.fullscreen_passes += timer.render_passes;
+            cx.stats.compute_passes += timer.compute_passes;
+        }
+        self.uploads.clear();
+
+        // Which environment each camera binds: its own once baked, else a baked older one of the
+        // same cubemap.
+        for (_, index) in &mut self.camera_envs {
+            let e = &self.envs[*index];
+            if !e.ready()
+                && let Some(older) = self.envs.iter().position(|o| o.cubemap == e.cubemap && o.ready())
+            {
+                *index = older;
+            }
+        }
+        for &(_, index) in &self.camera_envs {
+            self.envs[index].last_used = frame;
+        }
+
+        // Cubemap states for `environment_state` and the sky.
+        self.states.clear();
+        for (raw, entry) in assets.cubemaps.iter() {
+            let handle = CubemapHandle::from_raw(raw);
+            let state = match &entry.gpu {
+                None if entry.state == EnvironmentState::Failed => EnvironmentState::Failed,
+                None => EnvironmentState::Uploading,
+                Some(g) => self
+                    .envs
+                    .iter()
+                    .find(|e| e.cubemap == handle && e.source == g.id && e.key == key)
+                    .map_or(
+                        EnvironmentState::Baking {
+                            passes_left: key.passes(g.size, compute),
+                        },
+                        Env::state,
+                    ),
+            };
+            self.states.push(CubeStatus {
+                handle,
+                state,
+                uploaded: entry.gpu.is_some(),
+            });
+        }
+        let after = (
+            self.uploads.capacity(),
+            self.camera_envs.capacity(),
+            self.states.capacity(),
+        );
+        if after != capacities {
+            cx.stats.cpu_reallocations += 1;
+        }
+    }
+
+    /// State of `cubemap` as of the last frame (`Missing` for cubemaps the renderer has not
+    /// seen yet or that were removed).
+    pub fn environment_state(&self, cubemap: CubemapHandle) -> EnvironmentState {
+        self.states
+            .iter()
+            .find(|s| s.handle == cubemap)
+            .map_or(EnvironmentState::Missing, |s| s.state)
+    }
+
+    /// The baked environment `camera` binds this frame.
+    fn camera_env(&self, camera: Entity) -> Option<&Env> {
+        self.camera_envs
+            .iter()
+            .find(|(c, _)| *c == camera)
+            .map(|&(_, i)| &self.envs[i])
+            .filter(|e| e.ready())
     }
 
     /// Step 5: this frame's shadow depth views (after camera planning).
@@ -156,27 +427,42 @@ impl Lighting {
         cameras: &[ViewInfo],
         settings: &LightingSettings,
     ) -> &[DepthViewRequest] {
-        let _ = (world, cameras, settings); // STUB(P-MAT)
+        let _ = (world, cameras, settings); // STUB(P-MAT): shadows (PM5)
         self.depth_views.clear();
         &self.depth_views
     }
 
     /// Step 8: fill the environment, sky and shadow fields of a camera's `GpuView` (zero = off).
     pub fn fill_view(&self, world: &World, camera: Entity, view: &mut GpuView) {
-        let _ = (world, camera, view); // STUB(P-MAT)
+        if let Ok(sky) = world.get::<&Skybox>(camera) {
+            let uploaded = self.states.iter().any(|s| s.handle == sky.cubemap && s.uploaded);
+            view.sky_params = [sky.intensity, if uploaded { 1.0 } else { 0.0 }, 0.0, 0.0];
+            view.sky_rotation = rotation_columns(sky.rotation);
+        }
+        if let Some(env) = self.camera_env(camera)
+            && let Ok(light) = world.get::<&EnvironmentLight>(camera)
+        {
+            view.env_params = [
+                light.diffuse_intensity,
+                light.specular_intensity,
+                (env.specular_mips - 1) as f32,
+                1.0,
+            ];
+            view.env_rotation = rotation_columns(light.rotation);
+        }
     }
 
     /// Bindings 1–6 of group 0 for `camera` (`None`: depth views and cameras without lighting).
     pub fn view_resources(&self, camera: Option<Entity>) -> ViewResources<'_> {
-        let _ = camera; // STUB(P-MAT)
+        let env = camera.and_then(|c| self.camera_env(c));
         ViewResources {
-            env_specular: &self.dummy_cube,
-            env_irradiance: &self.dummy_cube,
-            brdf_lut: &self.dummy_2d,
+            env_specular: env.map_or(&self.dummy_cube, |e| &e.specular),
+            env_irradiance: env.map_or(&self.dummy_cube, |e| &e.irradiance),
+            brdf_lut: &self.brdf_lut,
             env_sampler: &self.sampler,
             shadow_map: &self.dummy_depth,
             shadow_sampler: &self.comparison,
-            key: 0,
+            key: env.map_or(0, |e| e.id),
         }
     }
 
@@ -184,29 +470,19 @@ impl Lighting {
     pub fn register_nodes(nodes: &mut RenderNodes) {
         skybox::register(nodes);
     }
+
+    /// Environments cached (tests).
+    #[cfg(test)]
+    pub(crate) fn environment_count(&self) -> usize {
+        self.envs.len()
+    }
+
+    /// The textures of cached environment `i`: (specular, irradiance) (tests).
+    #[cfg(test)]
+    pub(crate) fn environment_textures(&self, i: usize) -> (&wgpu::Texture, &wgpu::Texture) {
+        (&self.envs[i].textures[0], &self.envs[i].textures[1])
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stubs_are_neutral() {
-        let Ok(r) = pollster::block_on(crate::Renderer::new_headless(4, 4)) else {
-            eprintln!("skipping GPU test: no adapter available");
-            return;
-        };
-        let mut lighting = Lighting::new(r.device(), r.queue(), r.graphics_caps());
-        let world = World::new();
-        assert!(
-            lighting
-                .depth_views(&world, &[], &LightingSettings::default())
-                .is_empty()
-        );
-        assert_eq!(lighting.view_resources(None).key, 0);
-        let mut nodes = RenderNodes::default();
-        Lighting::register_nodes(&mut nodes);
-        assert!(nodes.contains("space3d/skybox"));
-        assert_eq!(r.gpu_error_count(), 0);
-    }
-}
+mod tests;

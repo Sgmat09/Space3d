@@ -1,6 +1,7 @@
 // Space3d forward shader: instanced meshes, directional + point lights, metallic/roughness
 // Blinn-Phong with Schlick Fresnel (or GGX with `S3D_SHADING_STANDARD`), material maps
-// (normal, metallic-roughness, occlusion, emissive), linear-space lighting, sRGB output.
+// (normal, metallic-roughness, occlusion, emissive), image-based lighting from the camera's
+// `EnvironmentLight`, linear-space lighting, sRGB output.
 //
 // The INSTANCE marker below is replaced by the renderer with an `InstanceInput` struct and
 // accessor functions generated from the instance layout (see `pipeline/instance.rs`); the CONSTS
@@ -65,6 +66,14 @@ struct MaterialParams {
 }
 
 @group(0) @binding(0) var<uniform> view: View;
+// Image-based lighting (group 0 bindings 1–4; 1×1 black cubes without an environment): the
+// GGX-prefiltered specular cube (roughness × `env_params.z` = its mip), the irradiance cube
+// (cosine-weighted mean radiance) and the split-sum BRDF LUT (n·v, roughness), which
+// `S3D_SHADING_STANDARD` also uses for multiple-scattering compensation.
+@group(0) @binding(1) var s3d_env_specular: texture_cube<f32>;
+@group(0) @binding(2) var s3d_env_irradiance: texture_cube<f32>;
+@group(0) @binding(3) var s3d_brdf_lut: texture_2d<f32>;
+@group(0) @binding(4) var s3d_env_sampler: sampler;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(2) var base_sampler: sampler;
 //#TEXTURE
@@ -178,6 +187,15 @@ fn vs_main(v: VertexInput, inst: InstanceInput) -> VsOut {
     return vertex_hook(v, inst, out);
 }
 
+// Split-sum environment BRDF: (scale, bias) of f0 for n·v and perceptual roughness.
+fn s3d_env_brdf(ndv: f32, roughness: f32) -> vec2<f32> {
+    return textureSampleLevel(s3d_brdf_lut, s3d_env_sampler, vec2<f32>(ndv, roughness), 0.0).rg;
+}
+
+// Energy the single-scattering GGX lobe loses to multiple scattering, per color (Standard
+// shading; set per fragment before the light loops, 1 otherwise).
+var<private> s3d_ms_energy: vec3<f32> = vec3<f32>(1.0);
+
 fn fresnel_schlick(f0: vec3<f32>, cos_theta: f32) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - cos_theta, 5.0);
 }
@@ -219,7 +237,7 @@ fn s3d_brdf_standard(base: vec3<f32>, metallic: f32, roughness: f32, n: vec3<f32
     let f0 = mix(vec3<f32>(0.04), base, metallic);
     let f = fresnel_schlick(f0, vdh);
     let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
-    return (kd * base + S3D_PI * d * vis * f) * ndl;
+    return (kd * base + S3D_PI * d * vis * f * s3d_ms_energy) * ndl;
 }
 
 fn s3d_brdf(base: vec3<f32>, metallic: f32, roughness: f32, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
@@ -227,6 +245,37 @@ fn s3d_brdf(base: vec3<f32>, metallic: f32, roughness: f32, n: vec3<f32>, v: vec
         return s3d_brdf_standard(base, metallic, roughness, n, v, l);
     }
     return brdf(base, metallic, roughness, n, v, l);
+}
+
+// Image-based lighting of a lit fragment (split sum with multiple scattering, Fdez-Agüera 2019):
+// specular = prefiltered radiance × (f0·A + B) (+ the multiply scattered part, lit by the
+// irradiance), diffuse = irradiance × the albedo the specular lobes leave. Energy-conserving: a
+// white or metallic surface in a uniform white environment reflects exactly its radiance.
+// `ao` darkens both (specular with Lagarde's specular occlusion). Rotated by `env_rotation`,
+// scaled by the `EnvironmentLight` intensities.
+fn s3d_ibl(base: vec3<f32>, metallic: f32, roughness: f32, n: vec3<f32>, v: vec3<f32>, ao: f32) -> vec3<f32> {
+    let ndv = clamp(dot(n, v), 1e-4, 1.0);
+    let r = clamp(roughness, 0.0, 1.0);
+    let ab = s3d_env_brdf(ndv, r);
+    let radiance = textureSampleLevel(
+        s3d_env_specular,
+        s3d_env_sampler,
+        view.env_rotation * reflect(-v, n),
+        r * view.env_params.z,
+    ).rgb;
+    let irradiance = textureSampleLevel(s3d_env_irradiance, s3d_env_sampler, view.env_rotation * n, 0.0).rgb;
+    let f0 = mix(vec3<f32>(0.04), base, metallic);
+    let fr = max(vec3<f32>(1.0 - r), f0) - f0;
+    let ks = f0 + fr * pow(1.0 - ndv, 5.0);
+    let fss_ess = ks * ab.x + ab.y;
+    let ems = 1.0 - (ab.x + ab.y);
+    let f_avg = f0 + (vec3<f32>(1.0) - f0) / 21.0;
+    let fms_ems = ems * fss_ess * f_avg / (vec3<f32>(1.0) - f_avg * ems);
+    let kd = base * (1.0 - metallic) * (vec3<f32>(1.0) - fss_ess - fms_ems);
+    let spec_ao = clamp(pow(ndv + ao, exp2(-16.0 * r - 1.0)) - 1.0 + ao, 0.0, 1.0);
+    let specular = (fss_ess * radiance + fms_ems * irradiance) * view.env_params.y * spec_ao;
+    let diffuse = kd * irradiance * view.env_params.x * ao;
+    return specular + diffuse;
 }
 
 // Tangent frame of a normal map at a fragment with the (front-side) normal `n`: the vertex
@@ -335,9 +384,16 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
             occlusion = o.r;
         }
         var acc = view.ambient.rgb * base.rgb;
+        var ao = 1.0;
         if ((flags & S3D_MAP_OCCLUSION) != 0u) {
             // glTF: occlusion darkens indirect (ambient, image-based) light only.
-            acc = acc * (1.0 + material.maps.y * (occlusion - 1.0));
+            ao = 1.0 + material.maps.y * (occlusion - 1.0);
+            acc = acc * ao;
+        }
+        if (S3D_SHADING_STANDARD) {
+            let ab = s3d_env_brdf(clamp(dot(n, v), 1e-4, 1.0), clamp(roughness, 0.045, 1.0));
+            let f0 = mix(vec3<f32>(0.04), base.rgb, metallic);
+            s3d_ms_energy = vec3<f32>(1.0) + f0 * (1.0 / max(ab.x + ab.y, 1e-4) - 1.0);
         }
         for (var i = 0u; i < min(view.counts.x, MAX_DIR_LIGHTS); i++) {
             let light = view.dir_lights[i];
@@ -351,6 +407,9 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
             let falloff = clamp(1.0 - pow(d / range, 4.0), 0.0, 1.0);
             let atten = falloff * falloff / (d * d + 1.0);
             acc += s3d_brdf(base.rgb, metallic, roughness, n, v, to_light / max(d, 1e-4)) * light.color.rgb * atten;
+        }
+        if (view.env_params.w > 0.5) {
+            acc += s3d_ibl(base.rgb, metallic, roughness, n, v, ao);
         }
         rgb = acc + emissive;
     }
