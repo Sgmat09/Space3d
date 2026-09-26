@@ -113,8 +113,20 @@ fn battle_fits_every_quality_tier() {
         ("Low", ParticleSettings::for_quality(GraphicsQuality::Low), 3_500),
         ("Low (web)", web_low, 2_000),
     ];
+    // The GPU tiers need compute: without it (WebGL2 / GLES 3.0, e.g. ANGLE) their settings
+    // fall back to the CPU backend and its budget, which the High and Medium loads do not fit
+    // (quality detection picks Low on such devices).
+    let Some(probe) = app_with(64, 64, ParticleSettings::default()) else {
+        return;
+    };
+    let compute = probe.resources.expect::<Renderer>().graphics_caps().compute;
+    drop(probe);
     for (tier, settings, min_alive) in tiers {
         let gpu = settings.backend != ParticleBackend::Cpu;
+        if gpu && !compute {
+            eprintln!("{tier}: skipped (no compute: the GPU backend is unavailable)");
+            continue;
+        }
         let budget = if gpu {
             settings.max_particles
         } else {
