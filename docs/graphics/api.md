@@ -130,7 +130,20 @@ Additions made by the foundation since F2 (additive):
     problem. F0 had rejected such shaders on every backend, which changed pixels for shaders
     that ran on Metal, Vulkan, DX12 and WebGPU.
   * `FrameLayouts::view` holds binding 0 (`View`) only. The lighting bindings 1–6 of spec §3.4
-    join it with the lighting wiring (F7 / P-MAT PM4), and their docs say so.
+    join it with the lighting wiring (F7 / P-MAT PM4), and their docs say so. *(Done at F7:
+    bindings 1–6 are in the layout.)*
+
+* F7 / F8 (additive):
+  * `FrameLayouts::view` has the lighting bindings 1–6 (environment cubes, BRDF LUT and sampler,
+    shadow map and comparison sampler); shaders declare only what they use.
+  * `PrepareContext::{compute_timestamps, render_timestamps}` and
+    `ViewPrepareContext::compute_timestamps` return writes of lifetime `'a` (the frame's query
+    set), no longer borrowing the context: pass them to `ctx.encoder`. Existing callers compile
+    unchanged.
+  * `GpuTimings` is filled (`FrameSettings::gpu_timing`), 2–5 frames late (the spec said 1–3;
+    see `docs/graphics/frame.md` "GPU timings").
+  * `space3d_render::testing` (doc-hidden, not public API): the depth-view injector of the
+    renderer's own tests.
 
 * Graphics review (visual, perf, compat), all additive:
   * `space3d_core::App::add_system_ordered(stage, order, name, system)`: a stage's systems run
@@ -172,13 +185,13 @@ A builder edits only the files it owns; everything else goes through the foundat
 |---|---|
 | root `Cargo.toml` (workspace deps), `crates/space3d-core/src/data.rs` (`HdrImageData`) | F |
 | `crates/space3d-render/Cargo.toml`, `ARCHITECTURE.md` | F (I merges area summaries) |
-| `src/{lib, settings, caps, output, node, overlay, timing, renderer, stats}.rs` | F |
+| `src/{lib, settings, caps, output, node, overlay, timing, renderer, stats, testing}.rs` | F |
 | `src/quality.rs` | F→I |
 | `src/components.rs` (`Material` fields and docs) | F |
 | `src/material.rs` | F→P-MAT |
-| `src/frame/{mod, plan, views, targets, passes, nodes, tests}.rs` | F |
+| `src/frame/{mod, plan, views, targets, passes, nodes, depth, tests}.rs` | F |
 | `src/frame/{extract, draws}.rs` | F→P-MAT |
-| `src/pipeline/{mod, view}.rs` | F |
+| `src/pipeline/{mod, view, depth}.rs` | F |
 | `src/pipeline/{forward, instance}.rs`, `src/{arena, assets, texture, handles}.rs` | F→P-MAT |
 | `src/lighting/**` | F→P-MAT |
 | `src/post/{mod, api, chain}.rs` | F→P-POST |
@@ -188,7 +201,7 @@ A builder edits only the files it owns; everything else goes through the foundat
 | `src/shaders/{depth, sky, ibl_bake}.wgsl`, `brdf_lut.bin` | F→P-MAT |
 | `src/shaders/post/{composite, distortion}.wgsl` | F→P-POST |
 | `src/shaders/post/{bloom, exposure, exposure_dl, fxaa, distortion_mesh}.wgsl` | P-POST |
-| `tests/{frame_modes, nodes, overlay_stages, depth_views, capture_hdr, alloc_frame, gl, alloc, headless, custom_shader}.rs`, `tests/common/mod.rs` | F |
+| `tests/{frame_modes, nodes, overlay_stages, depth_views, gpu_timings, footprint, capture_hdr, alloc_frame, gl, alloc, headless, custom_shader}.rs`, `tests/common/mod.rs` | F |
 | `tests/{materials, environment, shadows, gltf_render, gl_materials, alloc_materials}.rs`, `tests/common/materials.rs` | P-MAT |
 | `tests/{post, post_distortion, gl_post, alloc_post}.rs`, `tests/common/post.rs` | P-POST |
 | `benches/{instancing, frame}.rs` / `materials.rs` / `post.rs` / `graphics.rs` | F / P-MAT / P-POST / I |

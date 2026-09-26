@@ -36,6 +36,9 @@ pub(crate) struct LightingPrepare<'a> {
     /// Headless renderers finish every pending bake in the frame it is requested.
     pub headless: bool,
     pub stats: &'a mut RenderStats,
+    /// GPU timings: `timing.render("ibl.bake", None)` as a bake pass's `timestamp_writes`
+    /// (`None` unless `FrameSettings::gpu_timing`).
+    pub timing: &'a crate::timing::GpuTimer,
 }
 
 /// One depth-only view the frame renders before the camera views (a shadow map).
@@ -53,7 +56,10 @@ pub(crate) struct DepthViewRequest {
     pub bias: wgpu::DepthBiasState,
 }
 
-/// Bindings 1–6 of group 0 for a camera, and a stable key for bind-group caching.
+/// Bindings 1–6 of group 0 for a camera, and a stable key for bind-group caching. The frame
+/// keeps one bind group per key (and views-buffer generation): equal keys must mean identical
+/// resources, and a new resource (a re-created shadow map, a baked environment) a new key. The
+/// resources for `None` (depth views) must not include a shadow map a depth view renders into.
 #[allow(
     dead_code,
     reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"

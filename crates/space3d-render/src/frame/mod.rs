@@ -19,6 +19,7 @@ use crate::stats::DrawPath;
 use space3d_core::{Resources, World};
 use std::ops::Range;
 
+mod depth;
 mod draws;
 mod extract;
 mod nodes;
@@ -120,7 +121,9 @@ pub(crate) struct FrameState {
     counts: GrowBuffer,
     explicit: Vec<Option<GpuInstances>>,
     materials: MaterialTable,
-    view_bg: Option<(wgpu::BindGroup, u32)>,
+    /// View bind groups (group 0; see `depth::ViewBindGroups`): one per set of lighting
+    /// resources the frame's views bind.
+    view_bgs: depth::ViewBindGroups,
     /// Material bind group per texture: (bind group, materials buffer generation, texture
     /// version, texture is an array — selects the pipeline variant).
     material_bgs: FastMap<Option<TextureHandle>, (wgpu::BindGroup, u32, u32, bool)>,
@@ -175,6 +178,17 @@ pub(crate) struct FrameState {
     views: Vec<ViewData>,
     /// Public description of every view (parallel to `views`), for nodes and overlays.
     view_infos: Vec<crate::node::ViewInfo>,
+    /// The camera views' `GpuView`s (parallel to `views`) until the lighting filled them in
+    /// (`Renderer::write_view_uniforms`).
+    gpu_views: Vec<GpuView>,
+    /// Depth-only views of this frame (shadow maps, graphics spec §1.12), drawn before the
+    /// camera views; their `GpuView` slots follow the camera views'.
+    depth_views: Vec<depth::DepthView>,
+    /// Indirect args of the camera views (the first ones; depth views' follow).
+    camera_args: u32,
+    /// Depth pipeline kind of every caster, instead of `extract::caster_pass` (set through
+    /// `crate::testing`: renderer tests of the `DepthMask` path).
+    pub(crate) force_caster_pass: Option<crate::pipeline::PassKind>,
     /// Slot masks reported by the nodes' `prepare_view`: `views × nodes`, row-major.
     node_masks: Vec<u32>,
     /// Scratch: the pass target of each slot of one node in one view.
@@ -234,6 +248,9 @@ pub(crate) struct FrameState {
     /// Every view renders with this output encoding, linear exposure and tonemapper.
     #[cfg(test)]
     pub(crate) force_output: Option<(crate::output::OutputEncoding, f32, crate::output::Tonemapper)>,
+    /// Depth-view passes recorded so far (tests: capture replays record none).
+    #[cfg(test)]
+    pub(crate) depth_passes_encoded: u64,
 }
 
 fn strided(size: usize, align: usize) -> usize {
@@ -279,7 +296,7 @@ impl FrameState {
             counts: GrowBuffer::new("space3d draw counts", U::INDIRECT | U::COPY_DST | s),
             explicit: Vec::new(),
             materials: MaterialTable::default(),
-            view_bg: None,
+            view_bgs: Default::default(),
             material_bgs: FastMap::default(),
             cull_bgs: FastMap::default(),
             compact_bg: None,
@@ -321,6 +338,10 @@ impl FrameState {
             },
             views: Vec::new(),
             view_infos: Vec::new(),
+            gpu_views: Vec::new(),
+            depth_views: Vec::new(),
+            camera_args: 0,
+            force_caster_pass: None,
             node_masks: Vec::new(),
             slot_targets: Vec::new(),
             resolved_depth: FastMap::default(),
@@ -357,6 +378,8 @@ impl FrameState {
             ecs_reorders: 0,
             #[cfg(test)]
             force_output: None,
+            #[cfg(test)]
+            depth_passes_encoded: 0,
         }
     }
 
@@ -376,7 +399,7 @@ impl FrameState {
     }
 
     /// Capacity snapshot of scratch vectors (to count CPU reallocations).
-    fn capacities(&self) -> [usize; 29] {
+    fn capacities(&self) -> [usize; 32] {
         [
             self.ecs_keys.capacity(),
             self.ecs_rows.capacity(),
@@ -407,6 +430,9 @@ impl FrameState {
             self.view_infos.capacity(),
             self.node_masks.capacity(),
             self.slot_targets.capacity(),
+            self.gpu_views.capacity(),
+            self.depth_views.capacity(),
+            self.view_bgs.capacity(),
         ]
     }
 }
@@ -482,23 +508,6 @@ impl FrameState {
             f.counts.ensure(device, f.run_count as u64 * 4, false, up);
         }
         *reallocs += cpu_reallocs;
-    }
-
-    /// The view bind group (rebuilt when the views buffer was reallocated).
-    pub(super) fn prepare_view_bind_group(&mut self, device: &wgpu::Device, pipelines: &Pipelines) {
-        let f = self;
-        let vgen = f.views_buf.gpu.generation;
-        if f.view_bg.as_ref().is_none_or(|(_, g)| *g != vgen) {
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("space3d view"),
-                layout: &pipelines.view_bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_binding(f.views_buf.buffer(), std::mem::size_of::<GpuView>()),
-                }],
-            });
-            f.view_bg = Some((bg, vgen));
-        }
     }
 }
 
@@ -606,6 +615,15 @@ impl Renderer {
             .cloned()
             .unwrap_or_default();
         self.frame_graphics = self.graphics.masked(frame_settings.downlevel);
+        // GPU timings (spec §2.2.6): publish the newest finished frame's, then time this one.
+        let changed = self.timer.collect(&mut self.gpu_timings);
+        if let Some(t) = resources.get_mut::<crate::timing::GpuTimings>()
+            && (changed || t.supported != self.gpu_timings.supported)
+        {
+            t.clone_from(&self.gpu_timings);
+        }
+        self.timer
+            .begin_frame(&self.device, frame_settings.gpu_timing, self.frame_index);
         self.update_frame_info(resources.get::<space3d_core::Time>());
         self.post.begin_frame(&self.frame.info, &frame_settings);
         self.frame.pool.begin_frame(self.frame_index);
@@ -629,6 +647,22 @@ impl Renderer {
             label: Some("space3d frame"),
         });
         self.upload_assets_into(&mut encoder, &mut assets);
+        // Cubemap conversion and image-based-lighting bakes (spec §1.4 step 4).
+        let lighting_settings = resources
+            .get::<crate::lighting::api::LightingSettings>()
+            .cloned()
+            .unwrap_or_default();
+        let headless = self.surface.is_none();
+        self.lighting.prepare(&mut crate::lighting::LightingPrepare {
+            device: &self.device,
+            queue: &self.queue,
+            encoder: &mut encoder,
+            assets: &mut assets,
+            settings: &lighting_settings,
+            headless,
+            stats: &mut self.stats,
+            timing: &self.timer,
+        });
         for h in buffers.removed.drain(..) {
             if let Some(slot) = self.frame.explicit.get_mut(h.index() as usize) {
                 *slot = None;
@@ -644,10 +678,13 @@ impl Renderer {
             ambient,
             &settings,
             &frame_settings,
+            &lighting_settings,
             &mut encoder,
         );
         self.encode_compute(&mut encoder);
         self.apply_gpu_cull_counts();
+        // Depth views (shadow maps) before every camera view (spec §1.4 step 11).
+        self.encode_depth_views(&mut encoder);
 
         // Acquire the surface only when something presents.
         let mut surface_tex = None;
@@ -688,9 +725,11 @@ impl Renderer {
         });
         self.encode_views(&mut encoder, surface_view.as_ref(), false);
         self.encode_frame_overlays(&mut encoder, surface_view.as_ref());
+        self.timer.end_frame(&mut encoder);
 
         self.uploader.finish();
         let submission = self.queue.submit([encoder.finish()]);
+        self.timer.submitted(&self.queue);
         self.uploader.recall();
         if let Some(t) = surface_tex {
             self.queue.present(t);
@@ -822,6 +861,7 @@ impl Renderer {
         ambient: AmbientLight,
         settings: &RenderSettings,
         frame_settings: &crate::settings::FrameSettings,
+        lighting_settings: &crate::lighting::api::LightingSettings,
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let primary = self.primary_display();
@@ -845,6 +885,9 @@ impl Renderer {
             layouts,
             nodes,
             overlays,
+            lighting,
+            injected_depth_views,
+            timer,
             ..
         } = self;
         let caps_before = f.capacities();
@@ -881,15 +924,33 @@ impl Renderer {
             stats,
             &mut cpu_reallocs,
         );
-        let out_cursor = f.prepare_views(
+        let mut out_cursor = 0;
+        let mut visible_overflow = false;
+        f.prepare_views(
             assets,
             buffers,
             &lights,
             ambient,
             settings.frustum_culling,
             stats,
+            &mut out_cursor,
+            &mut visible_overflow,
             &mut cpu_reallocs,
         );
+        // Depth views (spec §1.4 step 5; shadow maps), then the camera views' uniforms with the
+        // lighting's fields (step 8).
+        let requests = lighting.depth_views(world, &f.view_infos, lighting_settings);
+        f.prepare_depth_views(
+            requests.iter().chain(injected_depth_views.iter()),
+            buffers,
+            settings.frustum_culling,
+            stats,
+            &mut out_cursor,
+            &mut visible_overflow,
+            &mut cpu_reallocs,
+        );
+        f.finish_views(visible_overflow);
+        f.write_view_uniforms(world, lighting, &mut cpu_reallocs);
         // Render nodes (spec §1.4 steps 7–8): `prepare`, then `prepare_view` per camera view.
         f.prepare_nodes(nodes::NodePrepare {
             device,
@@ -906,6 +967,7 @@ impl Renderer {
             nodes,
             overlay_depth: overlays.hdr_scene_depth(),
             frame_index,
+            timing: timer,
         });
         // Post groups (spec §1.4 step 6): their composite parameters, in plan order, and the
         // distortion buffers of the groups whose Distortion phase runs (created here only).
@@ -940,7 +1002,7 @@ impl Renderer {
         // Custom-shader pipelines whose (asynchronous, browser) validation failed since the
         // last frame fall back to the built-in shader before anything is drawn with them.
         pipelines.poll_pending(device);
-        f.prepare_view_bind_group(device, pipelines);
+        f.prepare_view_bind_groups(device, pipelines, lighting, frame_index);
         f.prepare_material_bind_groups(device, assets, pipelines, white, white_sampler);
         f.prepare_feedback(device, assets, pipelines, frame_index);
         f.prepare_cull_bind_groups(device, pipelines, frame_index);

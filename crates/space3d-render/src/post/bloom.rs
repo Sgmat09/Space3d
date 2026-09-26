@@ -1029,6 +1029,7 @@ mod tests {
         state.flush(device, &mut encoder, &mut up, &sampler);
         up.finish();
         queue.submit([encoder.finish()]);
+        let timer = crate::timing::GpuTimer::new(false, 1.0);
         let mut record = |encoder: &mut wgpu::CommandEncoder, timed: Option<u32>| {
             for i in 0..chains {
                 pool.begin_frame(0);
@@ -1038,6 +1039,7 @@ mod tests {
                     encoder,
                     stats: &mut stats,
                     pool: &mut pool,
+                    timing: &timer,
                 };
                 let timestamps = timed.map(|round| ChainTimestamps {
                     query_set: &queries,
@@ -1256,6 +1258,7 @@ mod tests {
         let mut up = Uploader::new(device);
         let mut encoder = device.create_command_encoder(&Default::default());
         state.flush(device, &mut encoder, &mut up, &sampler);
+        let timer = crate::timing::GpuTimer::new(false, 1.0);
         let (level0, _) = {
             let mut cx = PostEncode {
                 device,
@@ -1263,6 +1266,7 @@ mod tests {
                 encoder: &mut encoder,
                 stats: &mut stats,
                 pool: &mut pool,
+                timing: &timer,
             };
             state.encode(&mut cx, (&scene, 1), &plan, (&exposure, 0), 0, None)?
         };

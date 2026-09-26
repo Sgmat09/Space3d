@@ -583,7 +583,7 @@ impl Meters {
                 {
                     let mut pass = cx.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("space3d exposure"),
-                        timestamp_writes: None,
+                        timestamp_writes: cx.timing.compute("post.exposure", Some(camera)),
                     });
                     pass.set_bind_group(0, &bg.0, &[offset]);
                     pass.set_pipeline(&meter.histogram_pipeline);
@@ -670,6 +670,8 @@ impl Meters {
                 let next = 1 - previous;
                 let prev_view = &state.textures[previous].as_ref()?.view;
                 let prev_generation = state.textures[previous].as_ref()?.generation;
+                let timing = cx.timing;
+                let span = timing.span("post.exposure", Some(camera));
                 for pass_index in 0..=n {
                     // 0: S → level 0; 1..n: level i − 1 → level i; n: last level + E → E.
                     let (kind, source, source_generation) = if pass_index == 0 {
@@ -709,6 +711,12 @@ impl Meters {
                     } else {
                         (&cx.pool.get(levels[pass_index]).view, &meter.reduce)
                     };
+                    // One `post.exposure` scope spans the chain's passes.
+                    let timestamp_writes = span.map(|(query_set, begin, end)| wgpu::RenderPassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: (pass_index == 0).then_some(begin),
+                        end_of_pass_write_index: (pass_index == n).then_some(end),
+                    });
                     let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("space3d exposure"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -720,6 +728,7 @@ impl Meters {
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
+                        timestamp_writes,
                         ..Default::default()
                     });
                     pass.set_pipeline(pipeline);
@@ -966,6 +975,7 @@ mod tests {
             .create_view(&Default::default());
         let mut pool = crate::frame::TexturePool::default();
         let mut stats = crate::RenderStats::default();
+        let timer = crate::timing::GpuTimer::new(false, 1.0);
         let mut record = |encoder: &mut wgpu::CommandEncoder, timed: Option<u32>| {
             let mark = |encoder: &mut wgpu::CommandEncoder, begin: Option<u32>, end: Option<u32>| {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -997,6 +1007,7 @@ mod tests {
                     encoder,
                     stats: &mut stats,
                     pool: &mut pool,
+                    timing: &timer,
                 };
                 meters
                     .encode(&mut cx, camera, plan, (&scene, 1), rect, false)

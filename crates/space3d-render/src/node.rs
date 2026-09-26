@@ -611,9 +611,10 @@ pub struct PrepareContext<'a> {
     pub layouts: &'a FrameLayouts,
     pub(crate) uploader: &'a mut Uploader,
     pub(crate) stats: &'a mut RenderStats,
+    pub(crate) timing: &'a crate::timing::GpuTimer,
 }
 
-impl PrepareContext<'_> {
+impl<'a> PrepareContext<'a> {
     /// Copy `data` into `buffer` at `offset` through the renderer's staging ring (recorded in the
     /// frame encoder; no per-call allocation; counted in `RenderStats::bytes_uploaded`).
     /// `buffer` needs `COPY_DST`.
@@ -631,16 +632,18 @@ impl PrepareContext<'_> {
         texture_ref(self.assets, handle)
     }
 
-    /// Timestamp writes for a compute pass the caller records (`None` without GPU timing).
-    pub fn compute_timestamps(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
-        let _ = label; // STUB(F8): GpuTimings query set
-        None
+    /// Timestamp writes for a compute pass the caller records into [`Self::encoder`], reported
+    /// as `label` in [`crate::GpuTimings`] (`None` unless `FrameSettings::gpu_timing` is on and
+    /// the device offers `TIMESTAMP_QUERY`). The writes borrow the frame's query set, not this
+    /// context: pass them to `self.encoder.begin_compute_pass`. Call it once per pass, right
+    /// before recording it.
+    pub fn compute_timestamps(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+        self.timing.compute(label, None)
     }
 
-    /// Timestamp writes for a render pass the caller records (`None` without GPU timing).
-    pub fn render_timestamps(&mut self, label: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
-        let _ = label; // STUB(F8): GpuTimings query set
-        None
+    /// Timestamp writes for a render pass the caller records (see [`Self::compute_timestamps`]).
+    pub fn render_timestamps(&mut self, label: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'a>> {
+        self.timing.render(label, None)
     }
 
     /// Add `n` compute dispatches to `RenderStats::node_dispatches`.
@@ -677,18 +680,19 @@ pub struct ViewPrepareContext<'a> {
     /// Graphics capabilities (after downlevel masking).
     pub graphics: &'a GraphicsCaps,
     pub(crate) uploader: &'a mut Uploader,
+    pub(crate) timing: &'a crate::timing::GpuTimer,
 }
 
-impl ViewPrepareContext<'_> {
+impl<'a> ViewPrepareContext<'a> {
     /// Copy through the staging ring (see [`PrepareContext::upload`]).
     pub fn upload(&mut self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
         self.uploader.write(self.encoder, buffer, offset, data);
     }
 
-    /// Timestamp writes for a compute pass the caller records (`None` without GPU timing).
-    pub fn compute_timestamps(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
-        let _ = label; // STUB(F8): GpuTimings query set
-        None
+    /// Timestamp writes for a compute pass the caller records, reported as `label` for this
+    /// view's camera (see [`PrepareContext::compute_timestamps`]).
+    pub fn compute_timestamps(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+        self.timing.compute(label, Some(self.view.camera))
     }
 }
 
@@ -723,15 +727,12 @@ pub struct DrawContext<'a> {
 /// Shared layouts (renderer lifetime, never recreated).
 #[non_exhaustive]
 pub struct FrameLayouts {
-    /// Group 0: binding 0 the `View` uniform (dynamic offset, VERTEX | FRAGMENT). Identical to
-    /// the forward pipelines' group 0 (a shader may declare only the bindings it uses). Compute
-    /// passes of nodes use their own layouts.
-    ///
-    /// **Not yet:** bindings 1–6 — lighting: environment specular cube, irradiance cube, BRDF
-    /// LUT, environment sampler, shadow map, comparison sampler; FRAGMENT (graphics spec §3.4)
-    /// — join this layout with the lighting wiring (milestones F7 / P-MAT PM4). Until then the
-    /// layout holds binding 0 only, and a pipeline whose shader declares any of bindings 1–6 in
-    /// group 0 fails validation.
+    /// Group 0: binding 0 the `View` uniform (dynamic offset, VERTEX | FRAGMENT); bindings 1–6
+    /// the view's lighting, FRAGMENT: environment specular cube and irradiance cube
+    /// (`texture_cube<f32>`), BRDF LUT (`texture_2d<f32>`), their filtering sampler, shadow map
+    /// (`texture_depth_2d`) and its comparison sampler (graphics spec §3.4; neutral 1×1 dummies
+    /// without an environment or a shadow). Identical to the forward pipelines' group 0: a
+    /// shader declares only the bindings it uses. Compute passes of nodes use their own layouts.
     pub view: wgpu::BindGroupLayout,
     /// Group 1: binding 0 scene depth `texture_2d<f32>` (unfilterable), binding 1 exposure
     /// `texture_2d<f32>` (unfilterable, 1×1, EV in `.r`), binding 2 a non-filtering sampler

@@ -2659,3 +2659,44 @@ fn hdr_scene_overlay_not_replayed_in_hdr() {
         assert_eq!(*kinds.lock().unwrap(), expected, "post {post}");
     }
 }
+
+/// Depth views (shadow maps) are drawn once per frame, before the camera views, and never by a
+/// capture replay (graphics spec §1.12): the replay reuses the frame's maps. Camera views and
+/// depth views bind group 0 from one cache keyed by the lighting's resources (with the neutral
+/// lighting: one bind group for every view).
+#[test]
+fn depth_views_are_never_replayed_and_share_view_bind_groups() {
+    let Some(mut app) = headless_app(32, 32) else { return };
+    let cube = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_mesh(space3d_core::MeshData::cube(1.0));
+    app.world.spawn((
+        space3d_core::Transform::default(),
+        crate::Mesh3d(cube),
+        crate::Material::default(),
+    ));
+    app.world.spawn((
+        space3d_core::Transform::from_xyz(0.0, 0.0, 5.0),
+        crate::Camera3d::default(),
+    ));
+    let light = glam::camera::rh::proj::directx::orthographic(-2.0, 2.0, -2.0, 2.0, 0.0, 10.0)
+        * glam::camera::rh::view::look_at_mat4(glam::Vec3::new(0.0, 5.0, 0.0), glam::Vec3::ZERO, glam::Vec3::NEG_Z);
+    let r = app.resources.expect_mut::<Renderer>();
+    crate::testing::add_depth_view(r, light, 16, Default::default());
+    crate::testing::add_depth_view(r, light, 32, Default::default());
+    crate::render_to_image(&mut app).expect("capture");
+    let r = app.resources.expect_mut::<Renderer>();
+    assert_eq!(r.frame.depth_passes_encoded, 2);
+    assert_eq!(
+        r.frame.view_bgs.len(),
+        1,
+        "camera and depth views share the neutral bind group"
+    );
+    r.frame.force_capture_replay = true;
+    r.capture_blocking().expect("replayed capture");
+    assert_eq!(r.frame.depth_passes_encoded, 2, "the replay draws no depth view");
+    assert_eq!(r.gpu_error_count(), 0);
+    crate::render_to_image(&mut app).expect("capture");
+    assert_eq!(app.resources.expect::<Renderer>().frame.depth_passes_encoded, 4);
+}

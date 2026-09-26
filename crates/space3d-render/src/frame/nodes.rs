@@ -357,6 +357,7 @@ pub(crate) struct NodePrepare<'a> {
     /// Some HdrScene overlay reads scene depth.
     pub overlay_depth: bool,
     pub frame_index: u64,
+    pub timing: &'a crate::timing::GpuTimer,
 }
 
 impl super::FrameState {
@@ -394,6 +395,7 @@ impl super::FrameState {
             nodes,
             overlay_depth,
             frame_index,
+            timing,
         } = cx;
         let n = nodes.len();
         f.node_masks.clear();
@@ -424,6 +426,7 @@ impl super::FrameState {
                     layouts,
                     uploader,
                     stats,
+                    timing,
                 });
             }
         }
@@ -446,6 +449,7 @@ impl super::FrameState {
                     targets: &f.slot_targets,
                     graphics,
                     uploader,
+                    timing,
                 });
                 let mask = mask.0 & valid;
                 f.node_masks[v * n + i] = mask;

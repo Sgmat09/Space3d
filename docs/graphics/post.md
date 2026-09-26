@@ -162,11 +162,13 @@ pixel up to a 3-pixel box), so every pixel keeps its energy wherever it sits
 (`post::bloom::tests::resample_keeps_every_pixel_energy`; on the GPU,
 `bloom_halo_is_independent_of_position` in `tests/post.rs` and `tests/gl_post.rs`: a 1 px
 source's halo stays within 5 % over 12 positions at every ratio, 0.5–3 % measured). It costs
-one more render pass and a pooled texture (below), and the prefilter writes more pixels than
-level 0 has: the M1 review measured the chain 40 % slower at 4K (1920 × 1080 prefilter target
-instead of 960 × 540) and 25 % slower at the `GraphicsQuality::Low` rect (720 × 405 instead of
-480 × 270) than before the half-rect prefilter, and about 7 % more render-thread CPU for the
-extra pass at 1440p. That is the price of a halo that does not blink; at 1080p nothing changed.
+one more render pass, a pooled texture (below) and GPU time where the half rect is larger than
+level 0: nothing at 1080p (no resample), +4 % at 1440p, +25 % at the `GraphicsQuality::Low` rect
+of T3 (1440 × 810: the prefilter writes 720 × 405 instead of 480 × 270) and +40 % at 4K (1920 ×
+1080 instead of 960 × 540) — best-of chain times 0.152 → 0.158, 0.081 → 0.101 and 0.145 →
+0.204 ms against the pre-change chain (M1 review round 3, interleaved sweeps; "Cost"), plus about
+7 % more render-thread CPU for the extra pass at 1440p. That is the price of a halo that does not
+blink.
 
 | rect | chain (level 0, levels; prefilter target) | bloom-added mean luma, `Engine/Post/Bloom` (M1.1; M1; before the half-rect prefilter; before the reference heights) |
 |---|---|---|
@@ -230,13 +232,15 @@ frames. `RenderStats::target_bytes` counts them once per frame.
 | 1280 × 720 (480 × 270, the 540 level merged; half 640 × 360) | 5 | 0.7 + 0.9 = 1.6 MB | 3.2 MB |
 | 1440 × 810, `GraphicsQuality::Low` (480 × 270; half 720 × 405) | 4 | 0.7 + 1.2 = 1.9 MB | 3.7 MB |
 
-**Driver memory per render pass (Metal).** `target_bytes` counts textures only. The M1 review
-measured that each Metal render pass also holds about 3 MB of driver memory (IOAccelerator) per
-frame in flight, whatever its attachment's size: a 1080p bloom chain's 11 passes add 56–61 MB of
-process memory with one frame in flight and about 150 MB with three (a windowed app keeps 2–3),
-per post group (split screen doubles it), against 2.7 MB of `target_bytes`. Budget it in addition
-to the table above (spec §4.4's VRAM line counts textures only). Compute passes cost about
-0.5 MB each: the compute chain planned for the CPU cost (below) would cut this too.
+**Driver memory per render pass (Metal).** `target_bytes` counts textures only. Each of the
+chain's render passes also holds GPU driver memory (IOAccelerator) while its frame is in flight —
+on Metal about 2.8 MB per pass per frame in flight, whatever the attachment's size: the default
+chain's 11–12 passes add about 60 MB to the process at 1080p with one frame in flight and 148 MB
+with three (a window keeps two to three), per post group (split screen doubles it), against 2.7 MB
+of `target_bytes` (`frame.md` "Cost"; `tests/footprint.rs` checks it). Budget it in addition to
+the table above (spec §4.4's VRAM line counts textures only). Compute passes cost about 0.5 MB
+each: a compute chain (one compute pass of dependent dispatches, below) would hold one pass's
+worth.
 
 ### Cost
 
@@ -262,6 +266,11 @@ of its first pass to the end of its last, best of 40:
 | the prefilter alone (1 level), 1080p | 0.07 ms |
 | `GraphicsQuality::Low` settings at 1080p (4 levels, level 0 480 × 270) | 0.08 ms |
 | `GraphicsQuality::High` (7 levels; level 0 still 960 × 540 at 1080p) | 0.17 ms |
+
+In real frames (`frame/ab`'s bloom sweep: the `post.bloom` scope of `GpuTimings`, medians of 48
+frames back to back, machine load ≈ 30, so above the best-of figures): 0.196 ms at 720p (11
+passes with the composite), 0.227 ms at 1080p, 0.254 ms at 1440p, 0.607 ms at 4K (the prefilter
+reads the whole 4K scene) and 0.122 ms for the Low chain at 1440 × 810.
 
 On this GPU the chain costs its 11 dependent render passes (about 14 µs each), not its pixels:
 a 128² chain costs as much as a 1080p one, and the two chain formats cost the same. When

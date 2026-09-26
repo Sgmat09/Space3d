@@ -1004,6 +1004,10 @@ pub struct PrewarmRequest {
 
 /// GPU timestamps per pass, 1–3 frames late (resource + `Renderer::gpu_timings`). One query set (256
 /// timestamps) shared by frame, post, materials and nodes; labels in §4.4.
+/// (Amended at F8: one 256-timestamp query set per timed frame in a ring of 5, resolved once the frame's
+/// GPU work completed — Metal writes render-pass boundary samples asynchronously, so a same-frame resolve
+/// read stale values — hence 2–5 frames late. `PrepareContext`/`ViewPrepareContext` timestamp writes
+/// borrow the query set (lifetime `'a`), not the context.)
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct GpuTimings {
@@ -1925,6 +1929,17 @@ more. Record those figures for reference; they are not the gate.
 * T3 ≤ 48 MB: `S` 9.3, depth 4.7, `L` 4.7, bloom 0.7, DB 0.6, shadow 4.2, IBL 128 ≈ 1, sky 512² ≈ 8.4, CPU
   particles < 1.
 * `RenderStats::target_bytes` reports frame and post targets. `benches/graphics.rs` asserts the T1 figure on Dev.
+* *(Amended at M1.1, measured on Dev: `docs/performance.md` "F7 / F8 and M1.1".)* The figures above are textures.
+  With the half-rect prefilter the bloom chain's textures are 2.8 MB at 1080p (`Rg11b10Ufloat`), 11.1 MB at 4K
+  and, for T3's Low chain at 1440 × 810, 1.9 MB (`Rg11b10Ufloat`) or 3.7 MB (`Rgba16Float`, the format ANGLE and
+  WebGL2 pick) instead of 0.7. On top of textures, every render pass holds GPU driver memory while its frame is
+  in flight — on Metal about 2.8 MB per pass per frame in flight, whatever its size: bloom's 11–12 passes add
+  about 33 MB per frame in flight (+60 MB with one, +148 MB with three frames in flight at 1080p, against
+  2.7 MB of `target_bytes`), the composite and a shadow map's pass about 2.8 MB each. Budgets count
+  `target_bytes + render passes × 2.8 MB × frames in flight` on Apple GPUs (two to three frames in flight with
+  a window); `tests/footprint.rs` checks the bloom share (≤ 80 MB paced, ≤ 200 MB unpaced). The T1/T2 line is
+  therefore met for textures (≈ 220 MB) but not for process memory with bloom on Apple GPUs (+100–150 MB per
+  post group) until the compute chain (one compute pass) lands.
 
 **Passes and wgpu allocations.**
 * Battle frame: about 21 render passes (shadow 1, scene 1, resolve 1, SceneRead 1, distortion 1, overlays-hdr 1,
@@ -2189,7 +2204,9 @@ F-core (F0–F6) gates Phase P. F7 is due before P-MAT PM5; F8 before Phase I.
 * The `GpuView` slot for the light.
 * `RenderStats::{depth_views, shadow_draw_calls, shadow_casters}`.
 * Depth views are never replayed.
-* *Accept* (`tests/depth_views.rs`, via a `#[cfg(test)]` request injector):
+* *Accept* (`tests/depth_views.rs`, via a `#[cfg(test)]` request injector; *amended at F7:* integration
+  tests cannot see `#[cfg(test)]` items, so the injector is the doc-hidden `space3d_render::testing`
+  module, like `space3d_particles::testing`):
   * `depth_view_renders_caster_depth` on every draw path;
   * `depth_views_add_no_dispatches_on_gpu_paths`;
   * `depth_view_culls_offscreen_casters`;
