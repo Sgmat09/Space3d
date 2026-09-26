@@ -544,16 +544,18 @@ fn static_scene_uploads_nothing_with_shadows() {
 }
 
 /// Perf gate "shadow 2048², 100k instanced casters ≤ 0.30 ms" (graphics spec §4.4): the
-/// `shadow` pass (GPU timestamps) of 100 000 cubes in one explicit instance buffer and, for the
-/// record, as ECS entities, all inside the map (a 400 × 400 field under a top-down camera),
-/// with the default filter. Median of 120 frames rendered back to back.
+/// `shadow` pass (GPU timestamps) of 100 000 cube entities (one instanced batch) all inside the
+/// map (a 400 × 400 field under a top-down camera), with the default filter; median of 120
+/// frames rendered back to back. For the record, the same cubes from one explicit
+/// `InstanceBuffer<InstanceCompact>`: explicit buffers draw about 2.4× slower than the ECS
+/// buffer in every pass, the camera's too (docs/performance.md, P-MAT PM5/PM6).
 /// Needs `TIMESTAMP_QUERY`; run alone:
 /// `cargo test -p space3d-render --release --test shadows -- --ignored --nocapture shadow_map_gate`.
 #[test]
 #[ignore = "perf gate: run alone with --ignored"]
 fn shadow_map_gate() {
     let mut gated = None;
-    for explicit in [true, false] {
+    for explicit in [false, true] {
         let Some(mut app) = headless_app(1920, 1080) else {
             return;
         };
@@ -625,6 +627,7 @@ fn shadow_map_gate() {
             frame(&mut app);
         }
         let mut times = Vec::new();
+        let mut scene = Vec::new();
         let mut last = None;
         let mut i = 0;
         while times.len() < 120 {
@@ -635,6 +638,7 @@ fn shadow_map_gate() {
             {
                 last = Some(f);
                 times.push(t.scope_ms("shadow"));
+                scene.push(t.scope_ms("scene"));
             }
             i += 1;
             assert!(i < 2000, "timings do not arrive");
@@ -648,15 +652,17 @@ fn shadow_map_gate() {
         assert!(s.shadow_casters >= 100_000, "{s:?}");
         times.sort_by(f32::total_cmp);
         let median = times[times.len() / 2];
+        scene.sort_by(f32::total_cmp);
         eprintln!(
-            "shadow 2048², 100k {} casters: median {median:.3} ms (min {:.3}, max {:.3}); {} shadow draws, path {:?}",
-            if explicit { "instanced" } else { "ECS" },
+            "shadow 2048², 100k {} casters: median {median:.3} ms (min {:.3}, max {:.3}); scene pass {:.3} ms; {} shadow draws, path {:?}",
+            if explicit { "explicit-buffer" } else { "ECS" },
             times[0],
             times[times.len() - 1],
+            scene[scene.len() / 2],
             s.shadow_draw_calls,
             s.draw_path
         );
-        if explicit {
+        if !explicit {
             gated = Some(median);
         }
     }

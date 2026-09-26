@@ -511,6 +511,11 @@ pub(super) fn material_bgls(device: &wgpu::Device) -> [wgpu::BindGroupLayout; 4]
 }
 
 impl Pipelines {
+    /// Forward and depth pipelines built so far (tests).
+    #[cfg(test)]
+    pub fn pipeline_counts(&self) -> (usize, usize) {
+        (self.forward.len(), self.depth.len())
+    }
     /// Build a forward pipeline. Custom shaders are validated with naga first (including that
     /// they declare no resources the layout lacks; see [`validate_custom_wgsl`] for what is
     /// rejected and what only warned about) and built inside validation and internal

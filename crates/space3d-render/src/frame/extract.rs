@@ -1331,6 +1331,86 @@ impl FrameState {
     }
 }
 
+/// Whether a material casts shadows (`ShadowMode` with `Auto`: lit opaque and alpha-masked
+/// materials).
+fn material_casts(m: &Material) -> bool {
+    match m.shadows {
+        ShadowMode::CastAndReceive | ShadowMode::CastOnly => !m.effective_blend().is_transparent(),
+        ShadowMode::ReceiveOnly | ShadowMode::None => false,
+        _ => !m.unlit && !m.effective_blend().is_transparent(),
+    }
+}
+
+impl MaterialTable {
+    /// The texture kinds (`PipelineKey::kinds`) of `m`'s maps, as its texture set was last
+    /// resolved (0, single-layer maps, for a set no frame has drawn yet).
+    fn known_kinds(&self, m: &Material) -> u8 {
+        let maps: TextureSet = [
+            m.base_color_texture,
+            m.normal_texture,
+            m.metallic_roughness_texture,
+            m.occlusion_texture,
+            m.emissive_texture,
+        ];
+        self.set_map
+            .get(&maps)
+            .and_then(|&i| self.sets.get(i as usize))
+            .filter(|s| s.resolved)
+            .map_or(0, |s| s.kinds)
+    }
+}
+
+impl FrameState {
+    /// `Renderer::prewarm` for one requested material (graphics spec §3.5): its forward pipeline
+    /// for instance layout `layout` and a pass signature (`format`, `samples`, `output`), with
+    /// the class bits the batch would get on that layout (the extension stream only where it
+    /// fits), its maps' texture kinds and the last frame's frame-wide globals (shading model,
+    /// normal maps, the casting light's filter); and, when the last frame drew depth views,
+    /// its depth pipeline as a caster (per depth bias).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prewarm_material(
+        &self,
+        device: &wgpu::Device,
+        pipelines: &mut Pipelines,
+        m: &Material,
+        shader: Option<(ShaderHandle, u32)>,
+        layout: u16,
+        (format, samples, output): (wgpu::TextureFormat, u32, crate::output::OutputEncoding),
+    ) {
+        let mut class = material_class(m);
+        if !crate::pipeline::ext_fits(pipelines.layouts[layout as usize]) {
+            class &= !CLASS_EXT;
+        }
+        let kinds = self.materials.known_kinds(m);
+        let key = crate::pipeline::PipelineKey {
+            layout,
+            class,
+            format,
+            samples,
+            output,
+            kinds,
+            shader,
+            pass: crate::pipeline::PassKind::Forward,
+            globals: self.materials.globals,
+        };
+        pipelines.forward(device, key);
+        if material_casts(m) {
+            let pass = caster_pass(class);
+            for d in &self.depth_views {
+                pipelines.depth(
+                    device,
+                    crate::pipeline::PipelineKey {
+                        pass,
+                        shader: None,
+                        ..key
+                    },
+                    d.bias,
+                );
+            }
+        }
+    }
+}
+
 /// Whether the batches of `material` cast shadows (the depth views' draw filter; blended
 /// batches never reach it).
 pub(crate) fn source_casts(materials: &MaterialTable, material: u32) -> bool {
@@ -1541,5 +1621,71 @@ mod material_tests {
             order,
             ["opaque", "mask", "early additive", "alpha", "additive", "late alpha"]
         );
+    }
+
+    /// `Renderer::prewarm` builds the pipelines a requested material draws with after one
+    /// frame of the scene: the class bits on each layout, its maps' texture kinds (a texture
+    /// array here), the frame-wide globals (Standard shading, the shadow filter) and the caster
+    /// depth pipeline; spawning entities with the materials afterwards builds nothing.
+    #[test]
+    fn prewarm_builds_what_materials_draw_with() {
+        use crate::assets::{RenderAssets, TextureSource};
+        use crate::components::{Camera3d, DirectionalLight, Mesh3d};
+        use crate::lighting::api::{DirectionalShadow, ShadingModel};
+        use space3d_core::{App, ImageData, MeshData, Transform};
+        let mut app = App::new();
+        app.add_plugin(crate::RenderPlugin::default());
+        let Ok(r) = pollster::block_on(crate::Renderer::new_headless(32, 32)) else {
+            eprintln!("skipping GPU test: no adapter available");
+            return;
+        };
+        app.insert_resource(r);
+        app.resources.expect_mut::<LightingSettings>().shading = ShadingModel::Standard;
+        let a = app.resources.expect_mut::<RenderAssets>();
+        let cube = a.add_mesh(MeshData::cube(1.0));
+        let layers = [
+            ImageData::filled(4, 4, [255; 4]),
+            ImageData::filled(4, 4, [200, 90, 40, 255]),
+        ];
+        let skin = a.add_texture(TextureSource::from_layers(&layers).unwrap());
+        let normal = a.add_image_linear(ImageData::filled(4, 4, [128, 128, 255, 255]));
+        let orm = a.add_image_linear(ImageData::filled(4, 4, [255, 200, 30, 255]));
+        let hull = Material::srgb(0.8, 0.8, 0.8)
+            .with_texture(skin)
+            .with_normal_map(normal, 1.0)
+            .with_orm_map(orm);
+        app.world.spawn((Transform::IDENTITY, Mesh3d(cube), hull.clone()));
+        app.world.spawn((
+            Transform::from_xyz(0.0, 3.0, 6.0).looking_at(glam::Vec3::ZERO, glam::Vec3::Y),
+            Camera3d::default(),
+        ));
+        app.world.spawn((
+            Transform::IDENTITY.looking_at(glam::Vec3::new(-0.3, -1.0, -0.4), glam::Vec3::Y),
+            DirectionalLight::default(),
+            DirectionalShadow::new(),
+        ));
+        crate::render_to_image(&mut app).unwrap();
+        let variants = [
+            Material {
+                double_sided: true,
+                ..hull.clone().with_alpha_mask(0.5)
+            },
+            hull.clone().with_blend(BlendMode::AlphaBlend),
+            Material::additive(Vec4::new(1.0, 0.5, 0.1, 1.0)),
+        ];
+        let request = crate::renderer::PrewarmRequest {
+            materials: variants.to_vec(),
+            ..Default::default()
+        };
+        app.resources.expect_mut::<crate::Renderer>().prewarm(&request);
+        let counts = app.resources.expect::<crate::Renderer>().pipelines.pipeline_counts();
+        for (i, m) in variants.into_iter().enumerate() {
+            app.world
+                .spawn((Transform::from_xyz(i as f32 * 1.5 - 1.5, 0.0, 1.0), Mesh3d(cube), m));
+        }
+        crate::render_to_image(&mut app).unwrap();
+        let r = app.resources.expect::<crate::Renderer>();
+        assert_eq!(r.pipelines.pipeline_counts(), counts, "the frame built no pipeline");
+        assert_eq!(r.gpu_error_count(), 0);
     }
 }

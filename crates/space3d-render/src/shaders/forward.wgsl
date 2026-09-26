@@ -287,7 +287,13 @@ fn s3d_ibl(base: vec3<f32>, metallic: f32, roughness: f32, n: vec3<f32>, v: vec3
 
 // Percentage-closer filtering of the shadow map at `uv` for light depth `z` (1 = lit):
 // `S3D_SHADOW_TAPS` bilinear comparisons weighted into a smooth kernel (Castaño 2013) — 1 tap:
-// 2×2 texels, 4 taps: 3×3, 9 taps: 5×5, 16 taps: 7×7 — centered on `uv`.
+// 2×2 texels, 4 taps: 3×3, 9 taps: 5×5, 16 taps: 7×7 — centered on `uv`. Per axis, tap `k` sits
+// `o[k]` texels from `base` with weight `w[k]`; the kernels are unrolled (the override selects
+// one at pipeline creation).
+fn s3d_shadow_tap(base: vec2<f32>, ox: f32, oy: f32, inv: f32, z: f32) -> f32 {
+    return textureSampleCompareLevel(s3d_shadow_map, s3d_shadow_sampler, base + vec2<f32>(ox, oy) * inv, z);
+}
+
 fn s3d_shadow_pcf(uv: vec2<f32>, z: f32) -> f32 {
     if (S3D_SHADOW_TAPS <= 1u) {
         return textureSampleCompareLevel(s3d_shadow_map, s3d_shadow_sampler, uv, z);
@@ -298,58 +304,61 @@ fn s3d_shadow_pcf(uv: vec2<f32>, z: f32) -> f32 {
     let b = floor(p + vec2<f32>(0.5));
     let s = p + vec2<f32>(0.5) - b;
     let base = (b - vec2<f32>(0.5)) * inv;
-    // Per axis: tap weights `w` and tap offsets `o` (texels from `base`).
-    var wx: vec4<f32>;
-    var wy: vec4<f32>;
-    var ox: vec4<f32>;
-    var oy: vec4<f32>;
-    var n = 2u;
-    var norm = 1.0 / 16.0;
     if (S3D_SHADOW_TAPS <= 4u) {
         let w0 = vec2<f32>(3.0) - 2.0 * s;
         let w1 = vec2<f32>(1.0) + 2.0 * s;
         let o0 = (vec2<f32>(2.0) - s) / w0 - 1.0;
         let o1 = s / w1 + 1.0;
-        wx = vec4<f32>(w0.x, w1.x, 0.0, 0.0);
-        wy = vec4<f32>(w0.y, w1.y, 0.0, 0.0);
-        ox = vec4<f32>(o0.x, o1.x, 0.0, 0.0);
-        oy = vec4<f32>(o0.y, o1.y, 0.0, 0.0);
-    } else if (S3D_SHADOW_TAPS <= 9u) {
-        n = 3u;
-        norm = 1.0 / 144.0;
+        var sum = w0.x * w0.y * s3d_shadow_tap(base, o0.x, o0.y, inv, z);
+        sum += w1.x * w0.y * s3d_shadow_tap(base, o1.x, o0.y, inv, z);
+        sum += w0.x * w1.y * s3d_shadow_tap(base, o0.x, o1.y, inv, z);
+        sum += w1.x * w1.y * s3d_shadow_tap(base, o1.x, o1.y, inv, z);
+        return sum * (1.0 / 16.0);
+    }
+    if (S3D_SHADOW_TAPS <= 9u) {
         let w0 = vec2<f32>(4.0) - 3.0 * s;
         let w2 = vec2<f32>(1.0) + 3.0 * s;
         let o0 = (vec2<f32>(3.0) - 2.0 * s) / w0 - 2.0;
         let o1 = (vec2<f32>(3.0) + s) / 7.0;
         let o2 = s / w2 + 2.0;
-        wx = vec4<f32>(w0.x, 7.0, w2.x, 0.0);
-        wy = vec4<f32>(w0.y, 7.0, w2.y, 0.0);
-        ox = vec4<f32>(o0.x, o1.x, o2.x, 0.0);
-        oy = vec4<f32>(o0.y, o1.y, o2.y, 0.0);
-    } else {
-        n = 4u;
-        norm = 1.0 / 2704.0;
-        let w0 = 5.0 * s - 6.0;
-        let w1 = 11.0 * s - 28.0;
-        let w2 = -(11.0 * s + 17.0);
-        let w3 = -(5.0 * s + 1.0);
-        let o0 = (4.0 * s - 5.0) / w0 - 3.0;
-        let o1 = (4.0 * s - 16.0) / w1 - 1.0;
-        let o2 = -(7.0 * s + 5.0) / w2 + 1.0;
-        let o3 = -s / w3 + 3.0;
-        wx = vec4<f32>(w0.x, w1.x, w2.x, w3.x);
-        wy = vec4<f32>(w0.y, w1.y, w2.y, w3.y);
-        ox = vec4<f32>(o0.x, o1.x, o2.x, o3.x);
-        oy = vec4<f32>(o0.y, o1.y, o2.y, o3.y);
+        var row = w0.x * s3d_shadow_tap(base, o0.x, o0.y, inv, z);
+        row += 7.0 * s3d_shadow_tap(base, o1.x, o0.y, inv, z);
+        row += w2.x * s3d_shadow_tap(base, o2.x, o0.y, inv, z);
+        var sum = w0.y * row;
+        row = w0.x * s3d_shadow_tap(base, o0.x, o1.y, inv, z);
+        row += 7.0 * s3d_shadow_tap(base, o1.x, o1.y, inv, z);
+        row += w2.x * s3d_shadow_tap(base, o2.x, o1.y, inv, z);
+        sum += 7.0 * row;
+        row = w0.x * s3d_shadow_tap(base, o0.x, o2.y, inv, z);
+        row += 7.0 * s3d_shadow_tap(base, o1.x, o2.y, inv, z);
+        row += w2.x * s3d_shadow_tap(base, o2.x, o2.y, inv, z);
+        sum += w2.y * row;
+        return sum * (1.0 / 144.0);
     }
-    var sum = 0.0;
-    for (var j = 0u; j < n; j++) {
-        for (var i = 0u; i < n; i++) {
-            let at = base + vec2<f32>(ox[i], oy[j]) * inv;
-            sum += wx[i] * wy[j] * textureSampleCompareLevel(s3d_shadow_map, s3d_shadow_sampler, at, z);
-        }
-    }
-    return sum * norm;
+    let w0 = 5.0 * s - 6.0;
+    let w1 = 11.0 * s - 28.0;
+    let w2 = -(11.0 * s + 17.0);
+    let w3 = -(5.0 * s + 1.0);
+    let o0 = (4.0 * s - 5.0) / w0 - 3.0;
+    let o1 = (4.0 * s - 16.0) / w1 - 1.0;
+    let o2 = -(7.0 * s + 5.0) / w2 + 1.0;
+    let o3 = -s / w3 + 3.0;
+    let ox = vec4<f32>(o0.x, o1.x, o2.x, o3.x);
+    let wx = vec4<f32>(w0.x, w1.x, w2.x, w3.x);
+    var sum = w0.y * s3d_shadow_row4(base, ox, wx, o0.y, inv, z);
+    sum += w1.y * s3d_shadow_row4(base, ox, wx, o1.y, inv, z);
+    sum += w2.y * s3d_shadow_row4(base, ox, wx, o2.y, inv, z);
+    sum += w3.y * s3d_shadow_row4(base, ox, wx, o3.y, inv, z);
+    return sum * (1.0 / 2704.0);
+}
+
+// One row of the 16-tap kernel: four taps at `oy`.
+fn s3d_shadow_row4(base: vec2<f32>, ox: vec4<f32>, wx: vec4<f32>, oy: f32, inv: f32, z: f32) -> f32 {
+    var row = wx.x * s3d_shadow_tap(base, ox.x, oy, inv, z);
+    row += wx.y * s3d_shadow_tap(base, ox.y, oy, inv, z);
+    row += wx.z * s3d_shadow_tap(base, ox.z, oy, inv, z);
+    row += wx.w * s3d_shadow_tap(base, ox.w, oy, inv, z);
+    return row;
 }
 
 // The casting light's shadow at a fragment (1 = lit, 0 = fully shadowed): the world position
