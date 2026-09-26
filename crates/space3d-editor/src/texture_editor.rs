@@ -524,7 +524,9 @@ impl TextureEditor {
         self.dirty = false;
     }
 
-    /// Show the editor window.
+    /// Show the editor window. It sits on egui's foreground layer, with the engine tools (F3 /
+    /// F4 / console): clicking it brings it in front of them, clicking one of them brings that
+    /// one in front.
     pub fn show(&mut self, ctx: &egui::Context) {
         self.show_window(ctx, None);
     }
@@ -547,8 +549,11 @@ impl TextureEditor {
         self.set_max_texture_side(ctx.input(|i| i.max_texture_side));
         self.sync_texture(ctx);
         let mut open = self.open;
+        // On the tools' layer (they are foreground windows so a game's windows never cover
+        // them): the one clicked last is in front.
         let mut window = egui::Window::new("Texture editor")
             .id(egui::Id::new("space3d_texture_editor"))
+            .order(egui::Order::Foreground)
             .open(&mut open)
             .default_size([760.0, 620.0]);
         if let Some(area) = area {

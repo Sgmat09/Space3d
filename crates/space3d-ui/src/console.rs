@@ -202,6 +202,10 @@ pub struct Console {
     /// Off, the console holds only its own lines: command output and [`Console::print`].
     pub capture_logs: bool,
     lines: VecDeque<LogLine>,
+    /// Laid-out height of each of `lines` for `layout` (NaN until measured).
+    heights: VecDeque<f32>,
+    /// What the `heights` were measured for.
+    layout: Option<LogLayout>,
     last_seq: Option<u64>,
     local_seq: u64,
     input: String,
@@ -231,6 +235,8 @@ impl Default for Console {
             filter: String::new(),
             capture_logs: true,
             lines: VecDeque::new(),
+            heights: VecDeque::new(),
+            layout: None,
             last_seq: None,
             local_seq: u64::MAX / 2,
             input: String::new(),
@@ -376,8 +382,10 @@ impl Console {
     fn push_line(&mut self, line: LogLine) {
         if self.lines.len() == LOCAL_CAPACITY {
             self.lines.pop_front();
+            self.heights.pop_front();
         }
         self.lines.push_back(line);
+        self.heights.push_back(f32::NAN);
     }
 
     /// Lines currently held (captured logs and command output), oldest first.
@@ -388,6 +396,7 @@ impl Console {
     /// Remove all lines.
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.heights.clear();
     }
 
     /// Copy new lines from the global log buffer.
@@ -408,6 +417,9 @@ impl Console {
     /// Run queued commands (called by the plugin every frame; call it yourself when using
     /// the console without [`crate::UiPlugin`]).
     pub fn run_pending(sys: &mut SystemCtx) {
+        if sys.resources.get::<Console>().is_none_or(|c| c.pending.is_empty()) {
+            return;
+        }
         let Some(mut console) = sys.resources.remove::<Console>() else {
             return;
         };
@@ -465,20 +477,15 @@ impl Console {
 
     /// Lines shown with the current level and text filter (`filter` lowercased by the caller).
     fn shown<'a>(&'a self, filter: &'a str) -> impl Iterator<Item = &'a LogLine> {
-        self.lines.iter().filter(move |l| {
-            let level = match l.level {
-                LogLevel::Command | LogLevel::Output => true,
-                lvl => lvl >= self.min_level,
-            };
-            level && crate::tool::contains_ignore_case(&l.message, filter)
-        })
+        self.lines.iter().filter(move |l| is_shown(l, self.min_level, filter))
     }
 
     /// Draw the console into `ui`: a toolbar (level, a filter filling the row, clear), the log
     /// and the input line. The log shows one dense monospace line per entry — the level tag in
     /// a column of its own, then target and message; a long entry wraps under its message, the
     /// tag column kept clear — and is a whole number of lines tall, so while it sticks to the
-    /// newest line the oldest shown is never cut.
+    /// newest line the oldest shown is never cut. Only the entries in view are laid out: the
+    /// others take the height they were measured at (once per entry and log width).
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("space3d_console_level")
@@ -508,12 +515,13 @@ impl Console {
         });
         let visuals = ui.visuals().clone();
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        // The height of a one-line entry as laid out (galley rows are rounded to pixels).
-        let line = ui.fonts_mut(|f| {
-            f.layout_no_wrap("0".to_owned(), font.clone(), egui::Color32::WHITE)
+        // A one-line entry's height as laid out (galley rows are rounded to pixels) and the
+        // width of the level tag column.
+        let tag = ui.fonts_mut(|f| {
+            f.layout_no_wrap(LogLevel::Info.tag().to_owned(), font.clone(), egui::Color32::WHITE)
                 .size()
-                .y
         });
+        let line = tag.y;
         let input_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 2.0;
         let filter = self.filter.to_lowercase();
         egui::Frame::new()
@@ -531,29 +539,19 @@ impl Console {
                     .min_scrolled_height(height)
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                    .show_viewport(ui, |ui, viewport| {
                         crate::tool::derived_style(ui, "console_log", |style| {
                             style.spacing.item_spacing.y = 0.0;
                             // Long lines (paths, backtraces) wrap: the log never widens the window.
                             style.wrap_mode = Some(egui::TextWrapMode::Wrap);
                         });
-                        let format = |c| egui::TextFormat::simple(font.clone(), c);
-                        for l in self.shown(&filter) {
-                            let color = l.level.color(&visuals);
-                            ui.horizontal_top(|ui| {
-                                ui.label(egui::text::LayoutJob::single_section(
-                                    l.level.tag().to_owned(),
-                                    format(color),
-                                ));
-                                let mut job = egui::text::LayoutJob::default();
-                                if !matches!(l.level, LogLevel::Command | LogLevel::Output) {
-                                    job.append(&l.target, 0.0, format(visuals.text_color()));
-                                    job.append(": ", 0.0, format(visuals.text_color()));
-                                }
-                                job.append(&l.message, 0.0, format(color));
-                                ui.label(job);
-                            });
-                        }
+                        let layout = LogLayout {
+                            font: font.clone(),
+                            wrap: (ui.available_width() - tag.x - ui.spacing().item_spacing.x).max(tag.x),
+                            line,
+                            pixels_per_point: ui.ctx().pixels_per_point(),
+                        };
+                        self.log_ui(ui, viewport, layout, &visuals, &filter);
                     });
             });
         let edit = egui::TextEdit::singleline(&mut self.input)
@@ -590,6 +588,127 @@ impl Console {
         }
         self.input_focused = response.has_focus() || self.focus_input;
     }
+
+    /// The log's contents in its scroll area: as tall as all shown entries, with only those in
+    /// `viewport` (content coordinates) laid out and drawn.
+    fn log_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        viewport: egui::Rect,
+        layout: LogLayout,
+        visuals: &egui::Visuals,
+        filter: &str,
+    ) {
+        if self.layout.as_ref() != Some(&layout) {
+            self.heights.iter_mut().for_each(|h| *h = f32::NAN);
+            self.layout = Some(layout.clone());
+        }
+        let min_level = self.min_level;
+        let mut total = 0.0;
+        for (l, h) in self.lines.iter().zip(self.heights.iter_mut()) {
+            if is_shown(l, min_level, filter) {
+                if h.is_nan() {
+                    *h = layout.height(&entry_galley(ui, l, &layout, visuals));
+                }
+                total += *h;
+            }
+        }
+        ui.set_height(total);
+
+        // The first entry in view, how many shown entries come before it, and its top.
+        let (mut first, mut skipped, mut top) = (self.lines.len(), 0, 0.0);
+        for (i, (l, h)) in self.lines.iter().zip(&self.heights).enumerate() {
+            if !is_shown(l, min_level, filter) {
+                continue;
+            }
+            if top + h > viewport.min.y {
+                first = i;
+                break;
+            }
+            top += h;
+            skipped += 1;
+        }
+        let area = ui.max_rect();
+        let rect = egui::Rect::from_x_y_ranges(area.x_range(), area.top() + top..=area.top() + viewport.max.y.max(top));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            // The same ids for an entry whichever is first in view.
+            ui.skip_ahead_auto_ids(skipped);
+            let lines = self.lines.range(first..).zip(self.heights.range_mut(first..));
+            for (l, h) in lines.filter(|(l, _)| is_shown(l, min_level, filter)) {
+                if top >= viewport.max.y {
+                    break;
+                }
+                let galley = entry_galley(ui, l, &layout, visuals);
+                let height = layout.height(&galley);
+                if *h != height {
+                    // (The fonts changed.) Right from the next frame.
+                    *h = height;
+                    ui.ctx().request_repaint();
+                }
+                top += height;
+                ui.horizontal_top(|ui| {
+                    ui.label(egui::text::LayoutJob::single_section(
+                        l.level.tag().to_owned(),
+                        egui::TextFormat::simple(layout.font.clone(), l.level.color(visuals)),
+                    ));
+                    ui.label(galley);
+                });
+            }
+        });
+    }
+}
+
+/// Whether the log shows `l` with the level `min_level` and the (lowercase) text `filter`.
+fn is_shown(l: &LogLine, min_level: LogLevel, filter: &str) -> bool {
+    let level = match l.level {
+        LogLevel::Command | LogLevel::Output => true,
+        lvl => lvl >= min_level,
+    };
+    level && crate::tool::contains_ignore_case(&l.message, filter)
+}
+
+/// What the height of a laid-out log entry depends on.
+#[derive(Clone, Debug, PartialEq)]
+struct LogLayout {
+    /// The log's font.
+    font: egui::FontId,
+    /// Width the target and message wrap at (the log's, less the tag column).
+    wrap: f32,
+    /// Height of a one-line entry.
+    line: f32,
+    pixels_per_point: f32,
+}
+
+impl LogLayout {
+    /// Height of an entry laid out as `galley` (at least a line: the tag's).
+    fn height(&self, galley: &egui::Galley) -> f32 {
+        galley.size().y.max(self.line)
+    }
+}
+
+/// The target (normal text color) and message (the level's color) of `l`, wrapped at
+/// `layout.wrap`.
+fn entry_galley(
+    ui: &egui::Ui,
+    l: &LogLine,
+    layout: &LogLayout,
+    visuals: &egui::Visuals,
+) -> std::sync::Arc<egui::Galley> {
+    let format = |c| egui::TextFormat::simple(layout.font.clone(), c);
+    let target = !matches!(l.level, LogLevel::Command | LogLevel::Output);
+    let prefix = if target { l.target.len() + 2 } else { 0 };
+    let mut job = egui::text::LayoutJob {
+        text: String::with_capacity(prefix + l.message.len()),
+        sections: Vec::with_capacity(2),
+        wrap: egui::text::TextWrapping::wrap_at_width(layout.wrap),
+        ..Default::default()
+    };
+    if target {
+        job.append(&l.target, 0.0, format(visuals.text_color()));
+        job.append(": ", 0.0, format(visuals.text_color()));
+    }
+    job.append(&l.message, 0.0, format(l.level.color(visuals)));
+    ui.fonts_mut(|f| f.layout_job(job))
 }
 
 /// Egui id of the console window.
@@ -618,6 +737,7 @@ pub(crate) fn placed_rect(ctx: &egui::Context, dock: egui::Rect) -> egui::Rect {
         bounds.left_bottom(),
         window_rect(dock).size(),
         bounds,
+        true,
     )
 }
 

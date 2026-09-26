@@ -243,6 +243,173 @@ fn docked_tools_follow_the_screen_when_it_is_resized() {
     }
 }
 
+/// Whether `a` and `b` are the same rect up to rounding.
+fn same_rect(a: egui::Rect, b: egui::Rect) -> bool {
+    a.min.distance(b.min) < 1.0 && a.max.distance(b.max) < 1.0
+}
+
+/// A tools app of `size` with the overlay, profiler and console open, after a few frames.
+fn tools_at(size: (u32, u32)) -> App {
+    let mut app = tools_app(size, 1.0, false);
+    app.insert_resource(window(size));
+    app.resources.expect_mut::<DebugOverlay>().visible = true;
+    app.step_ticks(4);
+    app
+}
+
+/// Docked tools the user did not resize take the size they get when the app starts at the new
+/// size: the console its 40 % of the new height, the profiler the room above it (the console
+/// kept its first screen's height, squeezing the profiler on a smaller one).
+#[test]
+fn docked_tools_take_their_default_size_when_the_screen_changes() {
+    for (from, to) in [
+        ((1920, 1080), (1280, 600)),
+        ((1280, 720), (1920, 1080)),
+        ((1280, 600), (640, 400)),
+        ((640, 400), (1280, 720)),
+    ] {
+        let mut app = tools_at(from);
+        resize(&mut app, to);
+        app.step_ticks(3);
+        let fresh = tools_at(to);
+        let (_, profiler, console) = rects(&app);
+        let (_, want_profiler, want_console) = rects(&fresh);
+        let label = format!(
+            "{from:?} -> {to:?}: profiler {profiler:?} (fresh {want_profiler:?}), console {console:?} (fresh \
+             {want_console:?})"
+        );
+        assert!(same_rect(console, want_console), "console: {label}");
+        assert!(same_rect(profiler, want_profiler), "profiler: {label}");
+        assert_docked(&app, screen(&app), &label);
+    }
+    // The same when a host's dock area changes (an editor's panels, or the window under them),
+    // and when the host sets it from the first frame on.
+    let editor = |size: (u32, u32)| {
+        egui::Rect::from_min_max(
+            egui::pos2(210.0, 23.0),
+            egui::pos2(size.0 as f32 - 280.0, size.1 as f32),
+        )
+    };
+    // `late`: the dock area is set during the first frame, after the tools drew (as the editor
+    // does): they start on the whole screen.
+    let fresh_at = |size: (u32, u32), dock: egui::Rect, late: bool| {
+        let mut app = tools_app(size, 1.0, false);
+        app.insert_resource(window(size));
+        app.resources.expect_mut::<DebugOverlay>().visible = true;
+        if late {
+            app.step_ticks(1);
+        }
+        app.insert_resource(ToolDockArea(dock));
+        app.step_ticks(6);
+        rects(&app)
+    };
+    let fresh = |size: (u32, u32), dock: egui::Rect| {
+        let (early, late) = (fresh_at(size, dock, false), fresh_at(size, dock, true));
+        assert!(
+            same_rect(early.1, late.1) && same_rect(early.2, late.2),
+            "{size:?}: dock area from the first frame {early:?}, from the second {late:?}"
+        );
+        early
+    };
+    for (from, to) in [((1920, 1080), (1280, 600)), ((1280, 720), (1920, 1080))] {
+        let mut app = tools_at(from);
+        app.insert_resource(ToolDockArea(editor(from)));
+        app.step_ticks(4);
+        app.resources.expect_mut::<WindowState>().physical_size = UVec2::new(to.0, to.1);
+        app.insert_resource(ToolDockArea(editor(to)));
+        app.step_ticks(6);
+        let ((_, p1, c1), (_, p2, c2)) = (rects(&app), fresh(to, editor(to)));
+        let label = format!("{from:?} -> {to:?}: {p1:?} {c1:?} vs fresh {p2:?} {c2:?}");
+        assert!(same_rect(c1, c2) && same_rect(p1, p2), "{label}");
+        assert_docked(&app, editor(to), &label);
+    }
+    let narrow = egui::Rect::from_min_max(egui::pos2(300.0, 23.0), egui::pos2(900.0, 400.0));
+    let mut app = tools_at((1280, 720));
+    app.insert_resource(ToolDockArea(narrow));
+    app.step_ticks(6);
+    let ((_, p1, c1), (_, p2, c2)) = (rects(&app), fresh((1280, 720), narrow));
+    assert!(
+        same_rect(c1, c2) && same_rect(p1, p2),
+        "{p1:?} {c1:?} vs fresh {p2:?} {c2:?}"
+    );
+}
+
+/// Press at `from`, move to `to` in steps, release (physical pixels, 1 pixel per point).
+fn drag(app: &mut App, from: egui::Pos2, to: egui::Pos2) {
+    pointer_at(app, from);
+    app.resources
+        .expect_mut::<Input>()
+        .inject_mouse_button_down(MouseButton::Left);
+    app.step_ticks(1);
+    for i in 1..=10 {
+        pointer_at(app, from + (to - from) * (i as f32 / 10.0));
+    }
+    app.resources
+        .expect_mut::<Input>()
+        .inject_mouse_button_up(MouseButton::Left);
+    app.step_ticks(2);
+}
+
+/// A tool the user resized keeps that size (capped to the dock area) when the screen changes,
+/// and stays docked when resized by a free edge (egui moves a window's top-left corner a frame
+/// before it applies the new size: the docked corner seemed to move, which undocked the tool).
+#[test]
+fn a_tool_the_user_resized_keeps_its_size() {
+    let mut app = tools_at((1280, 720));
+    let (_, _, console) = rects(&app);
+    // Its top edge 60 pt up.
+    let edge = egui::pos2(console.center().x, console.top() + 1.0);
+    drag(&mut app, edge, edge - egui::vec2(0.0, 60.0));
+    let (_, profiler, resized) = rects(&app);
+    let label = format!("{console:?} -> {resized:?}");
+    // (The log is a whole number of lines tall.)
+    let grown = resized.height() - console.height();
+    assert!((45.0..61.0).contains(&grown), "resized: {label}");
+    assert!(
+        resized.left_bottom().distance(console.left_bottom()) < 1.0,
+        "still docked: {label}"
+    );
+    assert!(
+        profiler.bottom() <= resized.top() - EDGE + 0.5,
+        "the profiler keeps above it"
+    );
+    for size in [(1920, 1080), (1280, 600)] {
+        resize(&mut app, size);
+        app.step_ticks(3);
+        let (screen, profiler, console) = rects(&app);
+        let label = format!("{size:?}: {resized:?} -> {console:?}");
+        assert!((console.size() - resized.size()).length() < 1.0, "same size: {label}");
+        assert!(
+            console
+                .left_bottom()
+                .distance(screen.left_bottom() + egui::vec2(EDGE, -EDGE))
+                < 1.0,
+            "docked: {label}"
+        );
+        assert!(!profiler.intersects(console), "apart: {label}, profiler {profiler:?}");
+    }
+
+    // The profiler by its left edge (free: it docks top-right), 80 pt wider.
+    let (_, profiler, _) = rects(&app);
+    let edge = egui::pos2(profiler.left() + 1.0, profiler.center().y);
+    drag(&mut app, edge, edge - egui::vec2(80.0, 0.0));
+    let (screen, wider, _) = rects(&app);
+    let label = format!("{profiler:?} -> {wider:?}");
+    assert!(
+        (wider.width() - (profiler.width() + 80.0)).abs() < 1.5,
+        "resized: {label}"
+    );
+    let dock = screen.right_top() + egui::vec2(-EDGE, EDGE);
+    assert!(wider.right_top().distance(dock) < 1.0, "still docked: {label}");
+    resize(&mut app, (1600, 900));
+    app.step_ticks(3);
+    let (screen, after, _) = rects(&app);
+    let label = format!("{wider:?} -> {after:?}");
+    assert!((after.width() - wider.width()).abs() < 1.0, "same width: {label}");
+    let dock = screen.right_top() + egui::vec2(-EDGE, EDGE);
+    assert!(after.right_top().distance(dock) < 1.0, "docked: {label}");
+}
+
 /// Where the pointer is, in physical pixels (1 pixel per point).
 fn pointer_at(app: &mut App, p: egui::Pos2) {
     app.resources

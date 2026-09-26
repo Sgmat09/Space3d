@@ -7,7 +7,8 @@
 //!
 //! They dock to the corners of the [`ToolDockArea`] (the whole screen by default), follow it
 //! when it changes (the window or an editor panel is resized) until the user drags them away,
-//! and sit on egui's foreground layer, above the game's own windows.
+//! keep their default size for the current area until the user resizes them, and sit on egui's
+//! foreground layer, above the game's own windows.
 
 use crate::theme::{UiDensity, apply_density, visible_scroll_bars};
 use space3d_core::Resources;
@@ -176,22 +177,45 @@ fn contrast(text: egui::Color32, fill: egui::Color32, alpha: f32) -> f32 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
+/// A per-window flag of the tools (`false` until set).
+fn flag(ctx: &egui::Context, id: &str, name: &'static str) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new(id).with(name)))
+        .unwrap_or(false)
+}
+
+fn set_flag(ctx: &egui::Context, id: &str, name: &'static str, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(id).with(name), on));
+}
+
+const FLOATING: &str = "space3d_ui::floating";
+const USER_SIZED: &str = "space3d_ui::user_sized";
+const FREE_EDGE_PRESS: &str = "space3d_ui::free_edge_press";
+
+/// The default size a docked tool window `id` last took (see [`window`]).
+fn applied_default(ctx: &egui::Context, id: &str) -> Option<egui::Vec2> {
+    ctx.data(|d| d.get_temp::<egui::Vec2>(egui::Id::new(id).with("space3d_ui::default_size")))
+}
+
+fn set_applied_default(ctx: &egui::Context, id: &str, size: egui::Vec2) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(id).with("space3d_ui::default_size"), size));
+}
+
 /// Whether the tool window `id` was dragged away from its dock (it stays where the user put it).
 pub(crate) fn is_floating(ctx: &egui::Context, id: &str) -> bool {
-    ctx.data(|d| d.get_temp::<bool>(floating_id(id))).unwrap_or(false)
+    flag(ctx, id, FLOATING)
 }
 
-fn set_floating(ctx: &egui::Context, id: &str, floating: bool) {
-    ctx.data_mut(|d| d.insert_temp(floating_id(id), floating));
-}
-
-fn floating_id(id: &str) -> egui::Id {
-    egui::Id::new(id).with("space3d_ui::floating")
+/// Whether the user resized the tool window `id` (it keeps that size; otherwise a docked tool
+/// takes its default size for the current dock area).
+pub(crate) fn is_user_sized(ctx: &egui::Context, id: &str) -> bool {
+    flag(ctx, id, USER_SIZED)
 }
 
 /// Where tool window `id` is this frame: where it floats, or docked with its `anchor` corner at
-/// `dock_pos` (the size it had last frame, or `default_size` before its first frame, at most
-/// `bounds`' size).
+/// `dock_pos`, at most `bounds`' size: the size it had last frame (`default_size` before its first
+/// frame). With `follow_default`, a tool the user has not resized takes `default_size` when that
+/// is new (the dock area changed: [`window`] resizes it this frame); its size can end up smaller
+/// than the default (the console is a whole number of log lines tall).
 pub(crate) fn placed_rect(
     ctx: &egui::Context,
     id: &str,
@@ -199,13 +223,20 @@ pub(crate) fn placed_rect(
     dock_pos: egui::Pos2,
     default_size: egui::Vec2,
     bounds: egui::Rect,
+    follow_default: bool,
 ) -> egui::Rect {
     let last = ctx.memory(|m| m.area_rect(egui::Id::new(id)));
     match last {
         Some(rect) if is_floating(ctx, id) => rect,
         _ => {
-            let size = last.map_or(default_size, |r| r.size()).min(bounds.size());
-            anchor.anchor_size(dock_pos, size)
+            let new_default = follow_default
+                && !is_user_sized(ctx, id)
+                && applied_default(ctx, id).is_some_and(|applied| applied != default_size);
+            let size = match last {
+                Some(r) if !new_default => r.size(),
+                _ => default_size,
+            };
+            anchor.anchor_size(dock_pos, size.min(bounds.size()))
         }
     }
 }
@@ -223,8 +254,9 @@ pub(crate) struct ToolWindow<'a> {
     /// Rect a docked window stays inside: the dock area [`EDGE`] in from its edges. A window the
     /// user dragged away stays inside the screen instead.
     pub bounds: egui::Rect,
-    /// Default outer size (frame included). With [`Self::fit_height`], the height the contents
-    /// should stay within.
+    /// Default outer size (frame included): the size of a docked window until the user resizes
+    /// it (it follows the dock area as that changes). With [`Self::fit_height`], the height the
+    /// contents should stay within.
     pub size: egui::Vec2,
     /// The window is exactly as tall as its contents (up to `size.y`) instead of user-resizable
     /// in height. The contents get the bottom they must stay above.
@@ -236,7 +268,8 @@ pub(crate) struct ToolWindow<'a> {
 
 /// A tool window on the foreground layer: compact frame and header row (title, `summary`,
 /// close button) under any global style. `open` is cleared by the close button. While docked it
-/// keeps its `anchor` corner at `dock_pos` (so it follows the dock area); dragging it (or
+/// keeps its `anchor` corner at `dock_pos` (so it follows the dock area) and, until the user
+/// resizes it, its default size `spec.size` (which follows the dock area too); dragging it (or
 /// resizing it by a docked edge) makes it float, double-clicking its title docks it again. The
 /// contents run with the tool density and get the screen y their last row must end above (the
 /// window's largest content bottom).
@@ -251,6 +284,7 @@ pub(crate) fn window<R>(
     let frame = egui::Frame::window(&style).inner_margin(MARGIN).corner_radius(4);
     let chrome = frame.total_margin().sum();
     let floating = is_floating(ctx, spec.id);
+    let user_sized = is_user_sized(ctx, spec.id);
     let bounds = if floating {
         ctx.content_rect().shrink(EDGE)
     } else {
@@ -278,7 +312,8 @@ pub(crate) fn window<R>(
         window = window.current_pos(spec.dock_pos);
     }
     if spec.max_width.is_finite() {
-        window = window.max_width(size.x);
+        // (Not `size.x`: the user may widen the window up to what is in the way.)
+        window = window.max_width(spec.max_width.max(size.x));
     }
     if last_rect.is_none() {
         // egui caps a new window's size by the *global* window margin; asking for the size as
@@ -295,14 +330,43 @@ pub(crate) fn window<R>(
         window = window.resizable([true, false]).min_height(height).max_height(height);
     }
     // A press that started on the window (or its resize margin) this frame or earlier: only the
-    // user moves a docked window's corner while one is held.
-    let pressed_on_window = last_rect.is_some_and(|r| {
+    // user moves a docked window's corner, or resizes it, while one is held.
+    let press = last_rect.and_then(|r| {
         let grab = r.expand(ctx.global_style().interaction.resize_grab_radius_corner);
         ctx.input(|i| {
-            (i.pointer.any_down() || i.pointer.any_released())
-                && i.pointer.press_origin().is_some_and(|p| grab.contains(p))
+            let held = i.pointer.any_down() || i.pointer.any_released();
+            i.pointer.press_origin().filter(|&p| held && grab.contains(p))
         })
     });
+    let pressed_on_window = press.is_some();
+    // Resizing by a free edge (one away from the docked corner) leaves the window docked. egui
+    // moves the window's top-left corner before it applies the new size, so while the edge is
+    // dragged the docked corner seems to move with it; such a press must not undock it. Which
+    // handle a press grabbed is decided where it started, on the rect of that frame.
+    if ctx.input(|i| i.pointer.any_pressed())
+        && let (Some(p), Some(r)) = (press, last_rect)
+    {
+        let resizable = [true, !spec.fit_height];
+        let free = grabs_only_free_edges(&ctx.global_style().interaction, r, p, spec.anchor, resizable);
+        set_flag(ctx, spec.id, FREE_EDGE_PRESS, free);
+    }
+    let free_edge_press = pressed_on_window && flag(ctx, spec.id, FREE_EDGE_PRESS);
+    // Docked and never resized by the user: when its default size changes (the dock area did,
+    // or a host set one after the first frame), the window takes the new one, as if it had
+    // started with it (egui keeps the size of the window's first frame). Its contents may keep
+    // it smaller (the console's whole lines).
+    if !floating && !user_sized && !pressed_on_window {
+        let applied = applied_default(ctx, spec.id);
+        if last_rect.is_some() && applied.is_some_and(|a| a.x != spec.size.x) {
+            window = window.min_width(size.x).max_width(size.x);
+        }
+        if last_rect.is_some() && applied.is_some_and(|a| a.y != spec.size.y) && !spec.fit_height {
+            window = window.min_height(size.y).max_height(size.y);
+        }
+        if applied != Some(spec.size) {
+            set_applied_default(ctx, spec.id, spec.size);
+        }
+    }
     let mut close = false;
     let mut dock = false;
     let out = window.show(ctx, |ui| {
@@ -342,18 +406,83 @@ pub(crate) fn window<R>(
         r
     });
     if let Some(shown) = &out {
-        let corner = spec.anchor.pos_in_rect(&shown.response.rect);
-        if !floating && pressed_on_window && corner.distance(spec.dock_pos) > 0.5 {
-            set_floating(ctx, spec.id, true);
+        let rect = shown.response.rect;
+        let corner = spec.anchor.pos_in_rect(&rect);
+        if !floating && pressed_on_window && !free_edge_press && corner.distance(spec.dock_pos) > 0.5 {
+            set_flag(ctx, spec.id, FLOATING, true);
         } else if dock {
-            set_floating(ctx, spec.id, false);
+            set_flag(ctx, spec.id, FLOATING, false);
             ctx.request_repaint();
+        }
+        // Resized by the user (a height that follows the contents does not count): the window
+        // keeps that size from now on.
+        if pressed_on_window
+            && let Some(last) = last_rect
+            && ((rect.width() - last.width()).abs() > 0.5
+                || (!spec.fit_height && (rect.height() - last.height()).abs() > 0.5))
+        {
+            set_flag(ctx, spec.id, USER_SIZED, true);
         }
     }
     if close {
         *open = false;
     }
     out.and_then(|r| r.inner)
+}
+
+/// Whether a press at `p` grabs a resize handle of the window `rect` (as egui places them: a
+/// corner square, else a side strip, for the `resizable` [x, y] directions) that moves only
+/// edges away from its docked `anchor` corner.
+fn grabs_only_free_edges(
+    interaction: &egui::style::Interaction,
+    rect: egui::Rect,
+    p: egui::Pos2,
+    anchor: egui::Align2,
+    resizable: [bool; 2],
+) -> bool {
+    let (side, corner) = (
+        interaction.resize_grab_radius_side,
+        interaction.resize_grab_radius_corner,
+    );
+    // For each axis: which edge (0 = min, 1 = max) the press is within `radius` of.
+    let near = |radius: f32| {
+        [
+            [
+                (p.x - rect.left()).abs() <= radius,
+                (p.x - rect.right()).abs() <= radius,
+            ],
+            [
+                (p.y - rect.top()).abs() <= radius,
+                (p.y - rect.bottom()).abs() <= radius,
+            ],
+        ]
+    };
+    let (in_corner, on_side) = (near(corner), near(side));
+    let is_corner = in_corner[0].contains(&true) && in_corner[1].contains(&true);
+    let docked = [anchor.x() == egui::Align::Max, anchor.y() == egui::Align::Max].map(usize::from);
+    let mut grabbed = false;
+    for axis in 0..2 {
+        let other = 1 - axis;
+        // A side strip leaves the corner squares to the corners.
+        let edges = if is_corner {
+            in_corner[axis]
+        } else if rect.expand(side).contains(p)
+            && (rect.min[other] + corner..=rect.max[other] - corner).contains(&p[other])
+        {
+            on_side[axis]
+        } else {
+            [false; 2]
+        };
+        for (edge, hit) in edges.into_iter().enumerate() {
+            if hit && resizable[axis] {
+                if edge == docked[axis] {
+                    return false;
+                }
+                grabbed = true;
+            }
+        }
+    }
+    grabbed
 }
 
 /// An 18 pt "×" button (drawn, so it needs no glyph from the game's fonts).
@@ -385,37 +514,53 @@ pub(crate) fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     }
 }
 
-/// `n` with a k / M suffix (`950`, `12.3k`, `4.56M`).
-pub(crate) fn si(n: u64) -> String {
-    match n {
-        n if n >= 1_000_000_000 => format!("{:.2}G", n as f64 / 1e9),
-        n if n >= 1_000_000 => format!("{:.2}M", n as f64 / 1e6),
-        n if n >= 10_000 => format!("{:.1}k", n as f64 / 1e3),
-        n => n.to_string(),
-    }
+/// Write `n` with a k / M / G suffix (`950`, `12.3k`, `4.56M`).
+pub(crate) fn write_si(out: &mut String, n: u64) {
+    use std::fmt::Write as _;
+    let _ = match n {
+        n if n >= 1_000_000_000 => write!(out, "{:.2}G", n as f64 / 1e9),
+        n if n >= 1_000_000 => write!(out, "{:.2}M", n as f64 / 1e6),
+        n if n >= 10_000 => write!(out, "{:.1}k", n as f64 / 1e3),
+        n => write!(out, "{n}"),
+    };
 }
 
-/// Byte count in at most 6 characters, binary units (`512B`, `2.0K`, `598K`, `1.5M`, `2.3G`).
-pub(crate) fn short_bytes(n: u64) -> String {
+/// Write a byte count in at most 6 characters, binary units (`512B`, `2.0K`, `598K`, `1.5M`,
+/// `2.3G`).
+pub(crate) fn write_short_bytes(out: &mut String, n: u64) {
+    use std::fmt::Write as _;
     let n = n as f64;
-    let unit = |v: f64, suffix: &str| {
-        if v < 10.0 {
-            format!("{v:.1}{suffix}")
-        } else {
-            format!("{v:.0}{suffix}")
+    let (v, suffix) = match n {
+        n if n >= (1u64 << 30) as f64 => (n / (1u64 << 30) as f64, "G"),
+        n if n >= (1u64 << 20) as f64 => (n / (1u64 << 20) as f64, "M"),
+        n if n >= 1024.0 => (n / 1024.0, "K"),
+        n => {
+            let _ = write!(out, "{n}B");
+            return;
         }
     };
-    match n {
-        n if n >= (1u64 << 30) as f64 => unit(n / (1u64 << 30) as f64, "G"),
-        n if n >= (1u64 << 20) as f64 => unit(n / (1u64 << 20) as f64, "M"),
-        n if n >= 1024.0 => unit(n / 1024.0, "K"),
-        n => format!("{n}B"),
-    }
+    let _ = if v < 10.0 {
+        write!(out, "{v:.1}{suffix}")
+    } else {
+        write!(out, "{v:.0}{suffix}")
+    };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn si(n: u64) -> String {
+        let mut s = String::new();
+        write_si(&mut s, n);
+        s
+    }
+
+    fn short_bytes(n: u64) -> String {
+        let mut s = String::new();
+        write_short_bytes(&mut s, n);
+        s
+    }
 
     #[test]
     fn number_formats() {

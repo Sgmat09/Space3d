@@ -382,13 +382,24 @@ impl Profiler {
             let r = egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(w, row - 1.0));
             painter.rect_filled(r, 1.0, name_color(&s.name));
             if w > 40.0 {
-                // Truncated with "…" to the span (the full name is in the tooltip).
-                let mut job = egui::text::LayoutJob::single_section(
-                    short_name(&s.name).into_owned(),
-                    egui::TextFormat::simple(font.clone(), egui::Color32::BLACK),
-                );
-                job.wrap = egui::text::TextWrapping::truncate_at_width(w - 6.0);
-                let galley = painter.layout_job(job);
+                // Truncated with "…" to the span (the full name is in the tooltip). A name that
+                // fits keeps the galley of the whole name: the same from frame to frame, where
+                // one truncated to the span's (changing) width is laid out anew.
+                let job = |wrap| {
+                    let mut job = egui::text::LayoutJob::single_section(
+                        short_name(&s.name).into_owned(),
+                        egui::TextFormat::simple(font.clone(), egui::Color32::BLACK),
+                    );
+                    job.wrap = wrap;
+                    painter.layout_job(job)
+                };
+                let whole = job(egui::text::TextWrapping::no_max_width());
+                // (egui wraps at whole points.)
+                let galley = if whole.size().x <= (w - 6.0).round() {
+                    whole
+                } else {
+                    job(egui::text::TextWrapping::truncate_at_width(w - 6.0))
+                };
                 let pos = egui::pos2(r.left() + 3.0, r.center().y - galley.size().y / 2.0);
                 painter
                     .with_clip_rect(r.intersect(rect))
@@ -474,22 +485,10 @@ impl Profiler {
                         let numbers = [(Some(x.avg), s.avg_ms), (x.last, s.last_ms), (x.max, s.max_ms)];
                         for (right, ms) in numbers {
                             if let Some(right) = right {
-                                painter.text(
-                                    egui::pos2(right, y),
-                                    egui::Align2::RIGHT_CENTER,
-                                    format!("{ms:.3}"),
-                                    mono.clone(),
-                                    text,
-                                );
+                                right_aligned(painter, egui::pos2(right, y), format!("{ms:.3}"), &mono, text);
                             }
                         }
-                        painter.text(
-                            egui::pos2(x.calls, y),
-                            egui::Align2::RIGHT_CENTER,
-                            s.calls.to_string(),
-                            mono.clone(),
-                            text,
-                        );
+                        right_aligned(painter, egui::pos2(x.calls, y), s.calls.to_string(), &mono, text);
                         response.on_hover_ui(|ui| {
                             ui.label(&*s.name);
                         });
@@ -525,6 +524,13 @@ impl Profiler {
             egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         );
     }
+}
+
+/// Draw `text` with its right-center at `pos` (like `Painter::text`, without copying `text`).
+fn right_aligned(painter: &egui::Painter, pos: egui::Pos2, text: String, font: &egui::FontId, color: egui::Color32) {
+    let galley = painter.layout_no_wrap(text, font.clone(), color);
+    let rect = egui::Align2::RIGHT_CENTER.anchor_size(pos, galley.size());
+    painter.galley(rect.min, galley, color);
 }
 
 /// Column layout of the profiler table (widths from the monospace digit width).
@@ -729,6 +735,8 @@ fn placement(ctx: &egui::Context, dock: egui::Rect, console_open: bool, overlay_
             pos,
             egui::vec2(width, 0.0),
             bounds,
+            // (Its height follows its contents; its width is set here every frame.)
+            false,
         )
     };
     let mut dock_pos = bounds.right_top();

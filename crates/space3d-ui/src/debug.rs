@@ -186,22 +186,83 @@ pub(crate) const OVERLAY_ID: &str = "space3d_debug_overlay";
 
 /// Overlay text size (points); its own, so a game's text styles never enlarge it.
 const FONT_SIZE: f32 = 11.0;
-/// Label grey: 6:1 on the overlay's fill even over a white scene.
+/// The overlay's fill: opaque. The renderer blends in linear space, where a translucent black
+/// lets a bright scene or window under the overlay through far more than its alpha suggests
+/// (2 % shows as ghost text between the values; 8 % over white is a mid grey).
+const FILL: egui::Color32 = egui::Color32::from_gray(6);
+/// Label grey: 8:1 on the fill.
 const LABEL: egui::Color32 = egui::Color32::from_gray(165);
 const VALUE: egui::Color32 = egui::Color32::from_gray(235);
 /// Characters per label and value column.
 const LABEL_CHARS: usize = 6;
 const VALUE_CHARS: usize = 8;
 
-/// One grid row: label/value pairs in fixed-width monospace columns, values right-aligned.
-fn grid_row(ui: &mut egui::Ui, pairs: &[(&str, &str)]) {
+/// A value of the overlay's grid, written straight into the row's text.
+#[derive(Clone, Copy)]
+enum Value {
+    /// A count with a k / M / G suffix ([`crate::tool::write_si`]).
+    Count(u64),
+    /// Bytes in binary units ([`crate::tool::write_short_bytes`]).
+    Bytes(u64),
+    /// A rate in Hz.
+    Hz(f64),
+    /// A fraction with two decimals.
+    Fraction(f32),
+    /// A number of egui primitives.
+    Primitives(usize),
+}
+
+impl Value {
+    fn write(self, out: &mut String) {
+        use std::fmt::Write as _;
+        match self {
+            Self::Count(n) => crate::tool::write_si(out, n),
+            Self::Bytes(n) => crate::tool::write_short_bytes(out, n),
+            Self::Hz(hz) => {
+                let _ = write!(out, "{hz} Hz");
+            }
+            Self::Fraction(x) => {
+                let _ = write!(out, "{x:.2}");
+            }
+            Self::Primitives(n) => {
+                let _ = write!(out, "{n} prim");
+            }
+        }
+    }
+}
+
+/// One grid row: two label/value pairs in fixed-width monospace columns, values right-aligned.
+/// One text for the row (no string per label or value).
+fn grid_row(ui: &mut egui::Ui, pairs: [(&str, Value); 2]) {
+    use std::fmt::Write as _;
+    const PAD: &str = "        ";
     let font = egui::FontId::monospace(FONT_SIZE);
-    let format = |color| egui::TextFormat::simple(font.clone(), color);
-    let mut job = egui::text::LayoutJob::default();
-    for (i, (label, value)) in pairs.iter().enumerate() {
+    let mut job = egui::text::LayoutJob {
+        // Room for a value longer than its column.
+        text: String::with_capacity(2 * (LABEL_CHARS + VALUE_CHARS + 2) + 8),
+        sections: Vec::with_capacity(2 * pairs.len()),
+        ..Default::default()
+    };
+    let section = |job: &mut egui::text::LayoutJob, start: usize, color| {
+        let byte_range = egui::text::ByteIndex(start)..egui::text::ByteIndex(job.text.len());
+        job.sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range,
+            format: egui::TextFormat::simple(font.clone(), color),
+        });
+    };
+    for (i, (label, value)) in pairs.into_iter().enumerate() {
+        let start = job.text.len();
         let gap = if i == 0 { "" } else { "  " };
-        job.append(&format!("{gap}{label:<LABEL_CHARS$}"), 0.0, format(LABEL));
-        job.append(&format!("{value:>VALUE_CHARS$}"), 0.0, format(VALUE));
+        let _ = write!(job.text, "{gap}{label:<LABEL_CHARS$}");
+        section(&mut job, start, LABEL);
+        let start = job.text.len();
+        value.write(&mut job.text);
+        let chars = job.text[start..].chars().count();
+        if chars < VALUE_CHARS {
+            job.text.insert_str(start, &PAD[..VALUE_CHARS - chars]);
+        }
+        section(&mut job, start, VALUE);
     }
     ui.label(job);
 }
@@ -244,24 +305,24 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx, hint: &str) {
     if !overlay.visible {
         return;
     }
-    let overlay = overlay.clone();
-    let rate = sys.resources.get::<TickRate>().map_or(0.0, |r| r.hz);
-    let stats = sys.resources.get::<RenderStats>().cloned();
-    let ui_stats = sys.resources.get::<EguiContext>().map(EguiContext::stats);
+    let resources = &*sys.resources;
+    let Some(overlay) = resources.get::<DebugOverlay>() else {
+        return;
+    };
+    let rate = resources.get::<TickRate>().map_or(0.0, |r| r.hz);
+    let stats = resources.get::<RenderStats>();
+    let ui_stats = resources.get::<EguiContext>().map(EguiContext::stats);
     let entities = sys.world.len() as u64;
     let edge = crate::tool::EDGE;
-    let dock = crate::tool::dock_rect(sys.resources, &ctx);
+    let dock = crate::tool::dock_rect(resources, &ctx);
 
     egui::Area::new(egui::Id::new(OVERLAY_ID))
         .fixed_pos(dock.left_top() + egui::vec2(edge, edge))
         .order(egui::Order::Foreground)
         .interactable(false)
         .show(&ctx, |ui| {
-            // Practically opaque: the renderer blends in linear space, where even 92 % black
-            // over a white scene is a mid grey that washes the labels out (2.5:1); at 98 %
-            // the labels keep 6:1 over any scene.
             egui::Frame::new()
-                .fill(egui::Color32::from_black_alpha(250))
+                .fill(FILL)
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(22)))
                 .corner_radius(3)
                 .inner_margin(egui::Margin::symmetric(6, 4))
@@ -269,6 +330,8 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx, hint: &str) {
                     crate::tool::derived_style(ui, "overlay", |style| {
                         style.wrap_mode = Some(egui::TextWrapMode::Extend);
                         style.spacing.item_spacing = egui::vec2(4.0, 1.0);
+                        // It never takes the pointer: no text selection to track per label.
+                        style.interaction.selectable_labels = false;
                     });
                     let width = grid_width(ui);
                     let fps = overlay.fps();
@@ -285,18 +348,18 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx, hint: &str) {
                             .color(egui::Color32::WHITE),
                     );
                     overlay.sparkline(ui, egui::vec2(width, 22.0));
-                    let n = |v: u64| crate::tool::si(v);
-                    grid_row(ui, &[("frame", &n(time.frame)), ("tick", &n(time.tick))]);
-                    grid_row(ui, &[("rate", &format!("{rate} Hz")), ("drop", &n(time.dropped_ticks))]);
-                    grid_row(ui, &[("ents", &n(entities)), ("alpha", &format!("{:.2}", time.alpha))]);
-                    if let Some(s) = &stats {
-                        grid_row(ui, &[("draws", &n(s.draw_calls.into())), ("tris", &n(s.triangles))]);
+                    use Value::{Bytes, Count};
+                    grid_row(ui, [("frame", Count(time.frame)), ("tick", Count(time.tick))]);
+                    grid_row(ui, [("rate", Value::Hz(rate)), ("drop", Count(time.dropped_ticks))]);
+                    grid_row(ui, [("ents", Count(entities)), ("alpha", Value::Fraction(time.alpha))]);
+                    if let Some(s) = stats {
                         grid_row(
                             ui,
-                            &[
-                                ("inst", &n(s.instances_drawn)),
-                                ("upload", &crate::tool::short_bytes(s.bytes_uploaded)),
-                            ],
+                            [("draws", Count(s.draw_calls.into())), ("tris", Count(s.triangles))],
+                        );
+                        grid_row(
+                            ui,
+                            [("inst", Count(s.instances_drawn)), ("upload", Bytes(s.bytes_uploaded))],
                         );
                         if overlay.details {
                             let path = format!("{:?}{}", s.draw_path, if s.gpu_culling { " +gpu cull" } else { "" });
@@ -307,17 +370,20 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx, hint: &str) {
                             );
                             grid_row(
                                 ui,
-                                &[
-                                    ("indir", &n(s.indirect_draw_calls.into())),
-                                    ("multi", &n(s.multi_draw_calls.into())),
+                                [
+                                    ("indir", Count(s.indirect_draw_calls.into())),
+                                    ("multi", Count(s.multi_draw_calls.into())),
                                 ],
                             );
-                            grid_row(ui, &[("batch", &n(s.batches.into())), ("views", &n(s.views.into()))]);
                             grid_row(
                                 ui,
-                                &[
-                                    ("culled", &n(s.culled)),
-                                    ("inst B", &crate::tool::short_bytes(s.instance_bytes_uploaded)),
+                                [("batch", Count(s.batches.into())), ("views", Count(s.views.into()))],
+                            );
+                            grid_row(
+                                ui,
+                                [
+                                    ("culled", Count(s.culled)),
+                                    ("inst B", Bytes(s.instance_bytes_uploaded)),
                                 ],
                             );
                         }
@@ -325,9 +391,9 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx, hint: &str) {
                     if let Some(u) = ui_stats {
                         grid_row(
                             ui,
-                            &[
-                                ("egui", &format!("{} prim", u.primitives)),
-                                ("verts", &n(u.vertices as u64)),
+                            [
+                                ("egui", Value::Primitives(u.primitives)),
+                                ("verts", Count(u.vertices as u64)),
                             ],
                         );
                     }

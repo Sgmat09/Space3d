@@ -675,6 +675,89 @@ fn tool_windows_stay_over_the_viewport() {
     }
 }
 
+/// The texture and model editors share the engine tools' foreground layer (the tools sit there
+/// so a game's windows never cover them): the window opened or clicked last is in front, so an
+/// editor window is never stuck under F3 / F4 / the console (they docked over its title bar,
+/// toolbar and canvas for good).
+#[test]
+fn editor_windows_and_engine_tools_come_to_the_front_when_clicked() {
+    let mut app = App::new();
+    app.add_plugin(space3d_ui::UiPlugin {
+        install_tracing: false,
+        fallback_size: (1280, 720),
+        ..space3d_ui::UiPlugin::deterministic()
+    });
+    app.insert_resource(UiTheme::compact());
+    app.add_plugin(EditorPlugin::default());
+    scene(&mut app);
+    app.resources.expect_mut::<space3d_ui::DebugOverlay>().visible = true;
+    app.resources.expect_mut::<space3d_ui::Profiler>().visible = true;
+    app.resources.expect_mut::<space3d_ui::Console>().visible = true;
+    app.step_ticks(6);
+    let ctx = app.resources.expect::<EguiContext>().ctx().clone();
+    let rect = |id: &str| {
+        ctx.memory(|m| m.area_rect(egui::Id::new(id)))
+            .unwrap_or_else(|| panic!("{id} shown"))
+    };
+    let front = || {
+        ctx.memory(|m| m.areas().top_layer_id(egui::Order::Foreground))
+            .map(|l| l.id)
+    };
+    let at = |p: egui::Pos2| ctx.layer_id_at(p).map(|l| l.id);
+    let (texture_editor, profiler) = (
+        egui::Id::new("space3d_texture_editor"),
+        egui::Id::new("space3d_profiler"),
+    );
+
+    // Opened after the tools: in front of all of them.
+    app.resources.expect_mut::<TextureEditor>().open = true;
+    app.step_ticks(4);
+    assert_eq!(front(), Some(texture_editor), "opens in front");
+    let (tex, tools) = (
+        rect("space3d_texture_editor"),
+        [
+            rect("space3d_debug_overlay"),
+            rect("space3d_profiler"),
+            rect("space3d_console"),
+        ],
+    );
+    let both = tex.intersect(tools[1]);
+    assert!(
+        both.is_positive(),
+        "the texture editor {tex:?} overlaps the profiler {:?}",
+        tools[1]
+    );
+    assert_eq!(at(both.center()), Some(texture_editor));
+
+    // A click on the profiler (where the texture editor leaves it free) brings it in front.
+    let y = tools[1].center().y;
+    let free = (tools[1].left() as i32..tools[1].right() as i32)
+        .rev()
+        .map(|x| egui::pos2(x as f32, y))
+        .find(|&p| tools[1].shrink(4.0).contains(p) && !tex.expand(1.0).contains(p))
+        .expect("a part of the profiler outside the texture editor");
+    click_at(&mut app, Vec2::new(free.x, free.y));
+    assert_eq!(front(), Some(profiler));
+    assert_eq!(at(both.center()), Some(profiler));
+    assert_eq!(rect("space3d_profiler"), tools[1], "a click leaves it docked");
+
+    // A click on the texture editor's title bar (clear of the tools) brings it back in front,
+    // above the overlay too.
+    let title = (tex.left() as i32 + 30..tex.right() as i32 - 30)
+        .map(|x| egui::pos2(x as f32, tex.top() + 8.0))
+        .find(|p| tools.iter().all(|t| !t.expand(2.0).contains(*p)))
+        .expect("a part of the title bar clear of the tools");
+    click_at(&mut app, Vec2::new(title.x, title.y));
+    assert_eq!(front(), Some(texture_editor));
+    assert_eq!(at(both.center()), Some(texture_editor));
+
+    // The model editor too.
+    app.resources.expect_mut::<TextureEditor>().open = false;
+    app.resources.expect_mut::<ModelEditor>().open = true;
+    app.step_ticks(4);
+    assert_eq!(front(), Some(egui::Id::new("space3d_model_editor")));
+}
+
 /// The engine tools (F3 overlay, F4 profiler, console) dock inside the editor's viewport: never
 /// over the menu bar, the hierarchy or the inspector, at any window size, and they follow the
 /// viewport when the window is resized. With the editor UI hidden (F1) they use the whole screen.
