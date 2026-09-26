@@ -85,7 +85,9 @@ impl TestAppBuilder {
 
     /// Keep the renderer out of the frame loop and only render in [`TestApp::screenshot`] /
     /// [`TestApp::render_frame`]. Much faster for long simulations; per-frame `RenderStats`
-    /// are then only updated on demand.
+    /// are then only updated on demand. While the renderer is held aside, a
+    /// [`space3d_render::RendererDevice`] resource describes its device, so tick-time state
+    /// sized by the device (the particle budget) matches rendering every tick.
     pub fn render_on_demand(mut self) -> Self {
         self.render_on_demand = true;
         self
@@ -134,7 +136,12 @@ impl TestAppBuilder {
             }
         }
         let stashed = if self.render_on_demand {
-            app.resources.remove::<Renderer>()
+            let r = app.resources.remove::<Renderer>();
+            if let Some(r) = &r {
+                // Tick-time systems sized by the device see it as if the renderer were there.
+                app.resources.insert(space3d_render::RendererDevice::of(r));
+            }
+            r
         } else {
             None
         };
@@ -287,6 +294,7 @@ impl TestApp {
     /// Unwrap (pending scripted input is dropped; a stashed renderer is re-inserted).
     pub fn into_app(mut self) -> App {
         if let Some(r) = self.stashed.take() {
+            self.app.resources.remove::<space3d_render::RendererDevice>();
             self.app.insert_resource(r);
         }
         self.app
@@ -645,6 +653,15 @@ impl TestApp {
             self.app.insert_resource(r);
             let out = f(&mut self.app);
             self.stashed = self.app.resources.remove::<Renderer>();
+            if let Some(r) = &self.stashed {
+                let res = &mut self.app.resources;
+                if res
+                    .get::<space3d_render::RendererDevice>()
+                    .is_none_or(|d| d.size != r.size())
+                {
+                    res.insert(space3d_render::RendererDevice::of(r));
+                }
+            }
             out
         } else {
             f(&mut self.app)

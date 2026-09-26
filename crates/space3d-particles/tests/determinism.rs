@@ -137,3 +137,71 @@ fn backends_draw_the_same_image() {
     let diff = space3d_test::compare_images(&cpu, &gpu, &space3d_test::CompareOptions::default());
     assert!(diff.passed, "{}", diff.summary());
 }
+
+/// 200 engine exhausts (171 slots each: more than the CPU backend's 16 384 budget holds) on a
+/// device with `downlevel` (`None`: the device as it is), ticked `ticks` with the renderer in
+/// the frame loop or held aside (render on demand); the stats after one frame.
+fn exhaust_fleet(downlevel: Option<DownlevelOverride>, on_demand: bool, ticks: u64) -> Option<ParticleStats> {
+    let mut base = App::new();
+    base.add_plugin(ParticlesPlugin::default());
+    let mut builder = TestApp::builder().size(W, H);
+    if on_demand {
+        builder = builder.render_on_demand();
+    }
+    let mut app = builder.build_with(base);
+    app.backend()?;
+    if let Some(downlevel) = downlevel {
+        app.insert_resource(FrameSettings {
+            downlevel,
+            ..FrameSettings::default()
+        });
+    }
+    app.world.spawn((
+        Transform::from_xyz(0.0, 400.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z),
+        Camera3d::default(),
+    ));
+    for i in 0..200 {
+        let at = Vec3::new((i % 20) as f32 * 20.0 - 200.0, 0.0, (i / 20) as f32 * 20.0 - 100.0);
+        app.spawn_effect(builtin::ENGINE_EXHAUST, EffectSpawn::at(at).keep());
+    }
+    app.step_ticks(ticks);
+    app.screenshot()?;
+    Some(app.resources.expect::<ParticleStats>().clone())
+}
+
+/// The pool budget follows the device whether or not the renderer is in the world while the
+/// app ticks (graphics spec §4.3): a render-on-demand app used to size its rings for the GPU
+/// budget (262 144) even with `DownlevelOverride::webgl2()`, and kept them once the CPU
+/// backend took over (the Battle at High: 165 971 slots reserved against a budget of 16 384,
+/// and a different image than rendering every tick).
+#[test]
+fn the_budget_is_the_same_on_demand_and_every_tick() {
+    for downlevel in [None, Some(DownlevelOverride::webgl2())] {
+        let Some(every) = exhaust_fleet(downlevel, false, 30) else {
+            return;
+        };
+        let demand = exhaust_fleet(downlevel, true, 30).unwrap();
+        eprintln!("{downlevel:?}\n  every tick {every:?}\n  on demand {demand:?}");
+        assert_eq!(every.backend, demand.backend, "{downlevel:?}");
+        assert_eq!(
+            (
+                every.pool_capacity,
+                every.pool_reserved,
+                every.effects,
+                every.layer_instances
+            ),
+            (
+                demand.pool_capacity,
+                demand.pool_reserved,
+                demand.effects,
+                demand.layer_instances
+            ),
+            "{downlevel:?}"
+        );
+        assert!(demand.pool_reserved <= demand.pool_capacity, "{demand:?}");
+        if downlevel.is_some() {
+            assert_eq!(demand.backend, Some(ParticleBackend::Cpu));
+            assert_eq!(demand.pool_capacity, ParticleSettings::default().max_particles_cpu);
+        }
+    }
+}

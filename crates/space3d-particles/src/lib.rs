@@ -71,7 +71,7 @@ pub use runtime::ParticleRuntime;
 pub use stats::{EffectState, ParticleStats};
 
 use space3d_core::{App, Events, Plugin, Resources, Stage, SystemCtx, Time};
-use space3d_render::{FrameSettings, GraphicsQuality, RenderNodes, Renderer};
+use space3d_render::{FrameSettings, GraphicsQuality, RenderNodes, Renderer, RendererDevice};
 
 /// Adds the particle resources, the fixed-tick emission system and the `"space3d/particles"`
 /// render node. Add it next to `RenderPlugin` (or `DefaultPlugins`); without a renderer effects
@@ -194,11 +194,11 @@ pub fn tick_system(ctx: &mut SystemCtx) {
             let lag = t.accumulated().saturating_sub(t.fixed_delta).as_secs_f32();
             (t.delta_secs() - lag).clamp(0.0, t.delta_secs())
         });
-        rt.budget = Some(pool_budget(settings, res));
-        rt.aspect = res.get::<Renderer>().map_or(0.0, |r| {
-            let (w, h) = r.size();
-            w as f32 / h.max(1) as f32
-        });
+        if let Some(device) = tick_device(res) {
+            rt.device = Some(device);
+        }
+        rt.budget = Some(pool_budget(settings, res, rt.device));
+        rt.aspect = rt.device.map_or(0.0, |d| d.aspect);
         rt.tick(world, settings, effects, dt);
         let (live, layers) = rt.counts();
         let (total, reserved, spawned) = (rt.pool_capacity(), rt.pool.reserved(), rt.spawned);
@@ -281,21 +281,52 @@ pub(crate) fn resolve_backend(wanted: ParticleBackend, compute: Option<bool>) ->
     }
 }
 
-/// Pool budget of the backend the renderer (if any) resolves to: `max_particles_cpu`, or
-/// `max_particles` within the device's storage binding and buffer limits.
-fn pool_budget(settings: &ParticleSettings, res: &Resources) -> u32 {
-    let renderer = res.get::<Renderer>();
+/// What the tick knows of the renderer's device ([`tick_device`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TickDevice {
+    /// Culling-class compute (`GraphicsCaps::compute`).
+    pub compute: bool,
+    /// The GPU pool's largest size within the storage binding and buffer limits.
+    pub pool_limit: u32,
+    /// Width / height of the primary target.
+    pub aspect: f32,
+}
+
+/// The device of the [`Renderer`], or of one held out of the world between frames
+/// ([`RendererDevice`]: render-on-demand tests), so the tick sizes its state the same way
+/// whether or not the renderer is there (render-every-tick equals render-on-demand). `None`
+/// without either; the runtime then keeps the last device it saw.
+fn tick_device(res: &Resources) -> Option<TickDevice> {
+    let device = |caps: &space3d_render::RenderCapabilities, compute: bool, (w, h): (u32, u32)| TickDevice {
+        compute,
+        pool_limit: gpu::pool_limit(caps.max_storage_binding, caps.max_buffer_size),
+        aspect: w as f32 / h.max(1) as f32,
+    };
+    if let Some(r) = res.get::<Renderer>() {
+        return Some(device(r.capabilities(), r.graphics_caps().compute, r.size()));
+    }
+    res.get::<RendererDevice>()
+        .map(|d| device(&d.capabilities, d.graphics.compute, d.size))
+}
+
+/// Pool budget of the backend `device` resolves to: `max_particles_cpu`, or `max_particles`
+/// within the device's storage binding and buffer limits. `FrameSettings::downlevel.no_compute`
+/// resolves to the CPU backend with or without a device. Before any device is known (the web
+/// runner's frames while the renderer is created) the smaller of the two budgets: rings
+/// reserved then keep their slots, so they must fit whichever backend the device picks.
+fn pool_budget(settings: &ParticleSettings, res: &Resources, device: Option<TickDevice>) -> u32 {
     let no_compute = res.get::<FrameSettings>().is_some_and(|f| f.downlevel.no_compute);
-    let compute = renderer.map(|r| r.graphics_caps().compute && !no_compute);
+    let compute = if no_compute {
+        Some(false)
+    } else {
+        device.map(|d| d.compute)
+    };
     match resolve_backend(settings.backend, compute) {
         ParticleBackend::Cpu => settings.max_particles_cpu,
-        _ => {
-            let limit = renderer.map_or(u32::MAX, |r| {
-                let caps = r.capabilities();
-                gpu::pool_limit(caps.max_storage_binding, caps.max_buffer_size)
-            });
-            settings.max_particles.min(limit)
-        }
+        _ => match device {
+            Some(d) => settings.max_particles.min(d.pool_limit),
+            None => settings.max_particles.min(settings.max_particles_cpu),
+        },
     }
 }
 
@@ -514,6 +545,45 @@ mod tests {
         let mut app = App::new();
         app.add_plugin(manual);
         assert!(!app.system_names(Stage::FixedUpdate).contains(&"particles::tick"));
+    }
+
+    /// Without a renderer (the web runner's frames while its renderer is created, a test holding
+    /// it aside) the budget is the CPU backend's until a device is known: rings reserved then
+    /// keep their slots, so they must fit whichever backend the device picks.
+    /// `DownlevelOverride::no_compute` resolves to the CPU backend with or without a device;
+    /// the last device seen is kept while the renderer is away.
+    #[test]
+    fn budget_without_a_renderer() {
+        let mut app = App::new();
+        app.add_plugin(ParticlesPlugin::default());
+        app.step_ticks(1);
+        let cpu = ParticleSettings::default().max_particles_cpu;
+        let stats = |app: &App| app.resources.expect::<ParticleStats>().pool_capacity;
+        assert_eq!(stats(&app), cpu, "no device known yet");
+        let gpu = TickDevice {
+            compute: true,
+            pool_limit: 1 << 20,
+            aspect: 2.0,
+        };
+        app.resources.expect_mut::<ParticleRuntime>().rt.device = Some(gpu);
+        app.step_ticks(1);
+        assert_eq!(
+            stats(&app),
+            ParticleSettings::default().max_particles,
+            "the last device seen"
+        );
+        assert_eq!(app.resources.expect::<ParticleRuntime>().rt.aspect, 2.0);
+        app.insert_resource(FrameSettings {
+            downlevel: space3d_render::DownlevelOverride::webgl2(),
+            ..FrameSettings::default()
+        });
+        app.step_ticks(1);
+        assert_eq!(stats(&app), cpu, "no_compute");
+        let settings = ParticleSettings {
+            backend: ParticleBackend::Cpu,
+            ..ParticleSettings::default()
+        };
+        assert_eq!(pool_budget(&settings, &app.resources, Some(gpu)), cpu);
     }
 
     /// The tick follows emitters to where fixed-tick gameplay systems moved them this tick, even

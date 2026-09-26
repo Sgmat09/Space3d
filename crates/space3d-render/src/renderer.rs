@@ -92,6 +92,33 @@ pub struct RenderCapabilities {
     pub max_buffer_size: u64,
 }
 
+/// The device of a [`Renderer`] held out of the world between frames (resource): the
+/// render-on-demand mode of `space3d_test::TestApp` keeps its renderer aside while the app
+/// ticks and inserts this instead, so tick-time state sized by the device (the particle
+/// budget, the off-screen LOD's aspect ratio) is the same as with the renderer in the world:
+/// render-every-tick equals render-on-demand (graphics spec §4.3). Systems read the
+/// [`Renderer`] first and fall back to this.
+#[derive(Clone, Debug)]
+pub struct RendererDevice {
+    /// [`Renderer::capabilities`].
+    pub capabilities: RenderCapabilities,
+    /// [`Renderer::graphics_caps`].
+    pub graphics: crate::caps::GraphicsCaps,
+    /// [`Renderer::size`].
+    pub size: (u32, u32),
+}
+
+impl RendererDevice {
+    /// The device of `renderer`.
+    pub fn of(renderer: &Renderer) -> Self {
+        Self {
+            capabilities: renderer.capabilities().clone(),
+            graphics: renderer.graphics_caps().clone(),
+            size: renderer.size(),
+        }
+    }
+}
+
 impl RenderCapabilities {
     fn detect(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Self {
         let dl = adapter.get_downlevel_capabilities();

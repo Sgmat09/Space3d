@@ -293,6 +293,9 @@ pub(crate) struct Runtime {
     /// Width / height of the primary target (the renderer's size; 0: unknown, 16:9 is
     /// assumed), for the off-screen LOD.
     pub aspect: f32,
+    /// The renderer's device as the tick system last saw it (kept while the renderer is
+    /// away).
+    pub device: Option<crate::TickDevice>,
     /// Emitters new this tick (scratch: started after the others, the most visible first).
     new_emitters: Vec<NewEmitter>,
     /// Seconds from the frame time the emitters' `Transform`s stand for (where `Stage::Update`

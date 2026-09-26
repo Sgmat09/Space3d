@@ -78,7 +78,9 @@ pub use overlay::{
     OverlayScene, OverlayStage, OverlayTarget, OverlayTargetKind, RENDER_TARGET_FORMAT, RenderOverlay, RenderOverlays,
     SharedOverlay, lock_overlay,
 };
-pub use renderer::{DisplayHandle, PrewarmRequest, RenderCapabilities, RenderError, Renderer, RendererConfig};
+pub use renderer::{
+    DisplayHandle, PrewarmRequest, RenderCapabilities, RenderError, Renderer, RendererConfig, RendererDevice,
+};
 pub use shader::CustomShader;
 pub use stats::{DrawPath, RenderStats};
 
