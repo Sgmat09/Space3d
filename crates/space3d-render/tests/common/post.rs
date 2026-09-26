@@ -1985,6 +1985,36 @@ pub mod distortion {
         assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
     }
 
+    /// The foreground guard: a writer behind the panels that looks left, into them, leaves the
+    /// pixels right of the panels undistorted (it would drag the closer panels over the
+    /// background there), and still distorts where it looks at the background.
+    pub fn foreground_is_not_dragged_over_the_background(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        quad_at(&mut app, 1.0, Vec3::new(0.5, 0.5, -1.0), Vec2::ONE);
+        camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        quad_at(&mut app, 0.25, Vec3::new(0.0, 0.0, 1.0), Vec2::new(0.25, 0.5));
+        let plain = render(&mut app);
+        let left = DistortionMaterial {
+            strength: STRENGTH,
+            texture: Some(offset_texture(&mut app, 0, 128)),
+            scroll: Vec2::ZERO,
+            ..DistortionMaterial::default()
+        };
+        writer(&mut app, Vec3::ZERO, Vec2::ONE, left);
+        let img = render(&mut app);
+        // Right of the panel (x 72 on): the pixels that would look into it keep the background.
+        for y in 52..62 {
+            for x in 72..76 {
+                assert_eq!(img.get(x, y), plain.get(x, y), "({x}, {y}) next to the panel");
+            }
+        }
+        // Farther right the writer looks at the background: the quadrant's edge (x 64, hidden by
+        // the panel in rows 48..80) is not involved, so check the rows above the panel: the edge
+        // moves right (the pixels look left).
+        let x = (46..48).map(|y| edge_x(&img, y, 56, 88, 0)).sum::<f32>() / 2.0;
+        assert_near(x, 64.0 + expected_shift(S), 1.0, "above the panel");
+    }
+
     /// `hdr_scene_overlays_are_distorted`: an HdrScene overlay is part of the scene color, so
     /// it moves with the background; an AfterTonemap one is drawn after post and does not.
     pub fn hdr_scene_overlays_are_distorted(make: MakeApp) {

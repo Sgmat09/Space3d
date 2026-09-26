@@ -592,7 +592,10 @@ pub const DISTORTION_BLEND: wgpu::BlendState = wgpu::BlendState {
 /// * `s3d_distortion_decode(texel) -> vec2<f32>`: its inverse;
 /// * `distortion_depth_fade(frag: vec4<f32>, db_size: vec2<f32>, softness: f32) -> f32`: 0 where
 ///   scene depth is in front of the fragment (`frag` = `@builtin(position)`, `db_size` =
-///   `DrawContext::target_size`), fading in over `softness` world units; 1 without depth.
+///   `DrawContext::target_size`), fading in over `softness` world units; 1 without depth;
+/// * `s3d_distortion_guard(px: vec2<i32>, offset: vec2<f32>, frag_view_depth: f32) -> f32`: 0
+///   when the scene where the pixel would look (scene pixel `px` + `offset`) is closer than the
+///   writer, so a haze behind a ship never drags the ship's pixels over the background.
 ///
 /// An offset is where a pixel looks: the composite shows at each pixel the scene `offset` away,
 /// so the image under a writer appears moved by −offset (bloom moves with it). Draw with

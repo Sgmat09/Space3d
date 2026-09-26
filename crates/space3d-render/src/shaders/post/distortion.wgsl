@@ -39,3 +39,15 @@ fn distortion_depth_fade(frag: vec4<f32>, db_size: vec2<f32>, softness: f32) -> 
     }
     return s3d_soft_fade(px, frag_depth, softness);
 }
+
+// Foreground guard of a writer fragment at scene pixel `px` (view distance `frag_view_depth`)
+// that writes `offset` (view heights): 0 when the scene where the pixel would look is closer to
+// the camera than the writer — so a haze never drags a ship in front of it over the background
+// — else 1 (and 1 without scene depth). Multiply the offset (or the weight) by it.
+fn s3d_distortion_guard(px: vec2<i32>, offset: vec2<f32>, frag_view_depth: f32) -> f32 {
+    if (!s3d_depth_valid()) {
+        return 1.0;
+    }
+    let look = vec2<i32>(floor(vec2<f32>(px) + 0.5 + vec2<f32>(offset.x, -offset.y) * view.viewport.w));
+    return select(1.0, 0.0, s3d_view_depth_at(look) < frag_view_depth);
+}

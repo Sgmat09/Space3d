@@ -77,11 +77,12 @@ fn s3d_dm_value(p: vec2<f32>, period: f32, seed: u32) -> f32 {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-// Built-in heat-haze field: two octaves of value noise per axis, -1..1, repeating every UV unit.
+// Built-in heat-haze field: two octaves of value noise per axis (8 and 16 cells per UV unit),
+// -1..1, repeating every UV unit.
 fn s3d_dm_noise(uv: vec2<f32>) -> vec2<f32> {
-    let p = uv * 6.0;
-    let x = s3d_dm_value(p, 6.0, 0x51u) + 0.5 * s3d_dm_value(p * 2.0, 12.0, 0x93u);
-    let y = s3d_dm_value(p, 6.0, 0x2Du) + 0.5 * s3d_dm_value(p * 2.0, 12.0, 0xC7u);
+    let p = uv * 8.0;
+    let x = s3d_dm_value(p, 8.0, 0x51u) + 0.5 * s3d_dm_value(p * 2.0, 16.0, 0x93u);
+    let y = s3d_dm_value(p, 8.0, 0x2Du) + 0.5 * s3d_dm_value(p * 2.0, 16.0, 0xC7u);
     return vec2<f32>(x, y) * (2.0 / 1.5) - 1.0;
 }
 
@@ -134,7 +135,8 @@ fn fs_distortion(in: DmOut) -> @location(0) vec4<f32> {
     // Screen pixels are y down; offsets are +y up.
     let offset = vec2<f32>(screen.x, -screen.y) * in.params.x * amount * in.weight;
 
-    // Occlusion by scene depth, at the scene pixel under this fragment.
+    // Occlusion by scene depth at the scene pixel under this fragment, and the foreground guard
+    // where it looks.
     var fade = 1.0;
     if (s3d_depth_valid()) {
         let ndc = in.clip.xy / in.clip.z;
@@ -146,6 +148,7 @@ fn fs_distortion(in: DmOut) -> @location(0) vec4<f32> {
         } else {
             fade = select(1.0, 0.0, scene < in.view_depth);
         }
+        fade = fade * s3d_distortion_guard(px, offset, in.view_depth);
     }
     return distortion_encode(offset, fade);
 }

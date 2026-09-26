@@ -101,6 +101,11 @@ fn distortion_occluded_by_closer_geometry_msaa() {
 }
 
 #[test]
+fn foreground_is_not_dragged_over_the_background() {
+    cases::foreground_is_not_dragged_over_the_background(headless_app);
+}
+
+#[test]
 fn hdr_scene_overlays_are_distorted() {
     cases::hdr_scene_overlays_are_distorted(headless_app);
 }

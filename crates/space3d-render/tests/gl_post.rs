@@ -270,6 +270,11 @@ fn gl_distortion_not_occluded_with_msaa() {
 }
 
 #[test]
+fn gl_foreground_is_not_dragged_over_the_background() {
+    distortion::foreground_is_not_dragged_over_the_background(gl_app);
+}
+
+#[test]
 fn gl_hdr_scene_overlays_are_distorted() {
     distortion::hdr_scene_overlays_are_distorted(gl_app);
 }
