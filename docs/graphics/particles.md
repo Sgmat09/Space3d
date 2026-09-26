@@ -449,8 +449,10 @@ when run by tools):
 
 * `cargo run -p particles`: a small space battle through the recommended battle look — engine
   exhausts and afterburners, hitscan shots with hit sparks and shield ripples, a held laser, a
-  repair beam, missiles with smoke trails ending in explosions and debris, an EMP, warps
-  (`Space`: an explosion, `E`: an EMP), with the stats printed every two seconds.
+  repair beam, missiles with smoke trails ending in explosions and debris, an EMP, warps —
+  shockwaves and heat haze bending the space behind them (`Space`: an explosion, `E`: an EMP,
+  `Q`: cycle the quality tier High → Medium → Low, `D`: toggle distortion), with the stats
+  printed every two seconds.
 * `cargo run --release -p particles_stress`: `PARTICLES` (default 200 000, up to about a
   million) GPU particles in four spiral arms, with their stats.
 
