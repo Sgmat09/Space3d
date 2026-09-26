@@ -184,10 +184,12 @@ app.resources.expect_mut::<RenderNodes>().insert("depth-tint", DepthTint { /* �
 `crates/space3d-render/examples/frame_nodes.rs` is this node in full; the `Engine/Frame/Node
 Phases` and `Engine/Frame/Soft Depth` stories show every phase and the depth paths.
 
-Group 0 (`FrameLayouts::view`) holds only binding 0, the `View` uniform, for now. The lighting
-bindings 1–6 (environment cubes, BRDF LUT, shadow map and their samplers) join it with the
-lighting wiring (F7 / P-MAT PM4). Until then, a node shader that declares any of them fails
-pipeline validation.
+Group 0 (`FrameLayouts::view`, the forward pipelines' group 0) holds binding 0, the `View`
+uniform (dynamic offset `ctx.view.view_offset`), and bindings 1–6, the camera's lighting inputs:
+the environment specular and irradiance cubes (`texture_cube<f32>`), the BRDF LUT
+(`texture_2d<f32>`), their filtering sampler, the shadow map (`texture_depth_2d`) and its
+comparison sampler, all fragment-only. A node shader declares only what it uses (`VIEW_WGSL`
+declares binding 0); without an `EnvironmentLight` or a shadow they are neutral 1×1 dummies.
 
 **When nodes are called.** Every rendered frame: `prepare` once per node (after the frame is
 planned, before GPU culling and every pass; compute allowed), then per camera view
@@ -308,7 +310,7 @@ impl RenderOverlay for Additive {
 }
 ```
 
-The four steps to draw it into the HDR scene (bloomed and tonemapped with the scene):
+The steps to draw it into the HDR scene (bloomed and tonemapped with the scene):
 
 1. **Stage, per instance.** `stage()` takes `&self` and is read every frame, so keep the stage
    in the overlay and return it: `fn stage(&self) -> OverlayStage { self.stage }`. Construct the
@@ -339,10 +341,95 @@ The four steps to draw it into the HDR scene (bloomed and tonemapped with the sc
    format (`Rgba16Float`; `Rg11b10Ufloat` with `HdrMode::Compact`; `Rgba8UnormSrgb` in the Ldr
    fallback). Blend state, depth (none) and sample count (1) stay the same.
 
+5. **Render scale through the engine, not a render target.** At Low and Medium quality the
+   game's `client/src/ui/render_scale.rs` points the game camera at an offscreen
+   `RenderTarget::Texture` of 50 % or 75 % and egui paints that texture over the window. The
+   window then has no camera, so the frame has no primary scene view, and HdrScene overlays —
+   which draw after the primary target's last scene view — are skipped: after steps 1–4 the
+   in-world copy draws nothing at those settings. Replace that path with the engine's render
+   scale — `CameraFrame::default().with_render_scale(0.5)` on the game camera, or
+   `FrameSettings::render_scale` — and keep the camera on `RenderTarget::Primary`: the scene
+   renders at the scale into the primary scene texture, the HdrScene overlays draw into it
+   (bloomed and tonemapped with the scene), the composite upscales, and egui stays at full
+   resolution. (Measured with the game's overlay verbatim at 320 × 180: with the render-target
+   path the migrated copy's sprite pixel is `[0, 0, 0]`; with `render_scale(0.5)` it is
+   `[251, 221, 180]`, bloomed. Unmigrated, the priority −100 copy draws under egui's
+   full-screen background image at those settings already — a game issue the engine render
+   scale fixes as well.)
+
 Nothing else changes: priorities (within each stage), the per-kind buffers keyed by
 `OverlayTarget::kind`, the render pass contract. The `Engine/Frame/Overlay Stages` story draws the same sprites both ways
 (`crates/space3d-stories/src/engine/frame/demo.rs`, `AdditiveSprites`: `migrated` switches the
 four steps). Lasers become particle beams instead (particles area).
+
+## Depth views (shadow maps)
+
+A shadow map is a *depth view*: a view the lighting requests for a light
+(`DirectionalShadow`, materials area) that the frame draws before every camera view. Each one
+has its own view uniform (its `view_proj` is the light matrix), its own culling frustum and its
+own draws of the opaque casters (`Material` blending off; the materials' `ShadowMode` decides
+the rest), culled against the *light's* frustum — a ship outside the camera's view still casts
+into the map. On GPU draw paths a depth view is one more frustum in the camera views' culling
+dispatches (up to 64 views share one mark and one scatter dispatch per instance buffer): it adds
+no compute dispatch. On `CpuDirect` (WebGL2) its casters are culled on the CPU like a camera's.
+The pass clears the map to 1.0 and stores it; casters draw with depth-only pipelines (no
+fragment stage; alpha-masked materials sample their base color and discard below the cutoff),
+back faces culled unless double-sided, with the light's depth bias. Depth views never take part
+in node phases, overlays, post or capture replays (a capture reuses the frame's maps).
+
+Camera views then sample the map in their forward pass: group 0 binds each camera's lighting
+resources (environment cubes, BRDF LUT, shadow map and comparison sampler); depth views bind the
+neutral ones (a texture cannot be sampled while it is the pass's depth attachment).
+
+Cost (dev machine, `benches/frame.rs` `depth_view`: one 2048² map of 400 cubes and a ground
+plane over the 1080p frame scene): 0.02 ms of GPU (`GpuTimings` scope `shadow`), +40–50 µs of
+render-thread CPU per frame (the culling of the casters, the pass and its draws), 16.8 MB of map
+and about 23 MB of process memory in all with the pass's Metal driver memory (below). The
+steady state uploads nothing for a still scene and allocates nothing in the renderer
+(`tests/depth_views.rs`, `tests/alloc_frame.rs` "depth_views"). `RenderStats::{depth_views,
+shadow_casters, shadow_draw_calls}` count them (the camera counters `instances`,
+`instances_drawn`, `draw_calls` do not include them).
+
+## GPU timings
+
+```rust
+app.insert_resource(FrameSettings::default().with_gpu_timing(true));
+// later, in any system:
+let t = app.resources.expect::<GpuTimings>();
+println!("bloom {:.3} ms of {:.3}", t.scope_ms("post.bloom"), t.total_ms);
+```
+
+With `FrameSettings::gpu_timing` on and `GraphicsCaps::timestamps` (Vulkan, DX12, Metal,
+browser WebGPU with `timestamp-query`; not WebGL2), every pass writes a GPU timestamp at its
+start and end, and `GpuTimings` (the resource and `Renderer::gpu_timings`) lists one `GpuScope`
+per pass: `label`, the `camera` it belongs to, `ms`.
+
+| label | pass |
+|---|---|
+| `cull` | the GPU culling compute pass (all views) |
+| `shadow` | each depth view |
+| `scene` | each camera view's scene pass (display views included) |
+| `depth_resolve`, `scene_read`, `distortion` | the passes of §"Render nodes" |
+| `overlays.hdr` | the HdrScene overlays |
+| `post.bloom` | a post group's bloom chain (all its passes) |
+| `post.composite`, `post.fxaa` | a post group's composite and FXAA |
+| `overlays` | the AfterTonemap overlays (egui) |
+| `particles.sim`, `particles.compact`, `particles.sort`, `ibl.bake`, … | the areas' own passes |
+
+Nodes time their own passes: `PrepareContext::compute_timestamps(label)` /
+`render_timestamps(label)` (and `ViewPrepareContext::compute_timestamps`, with the view's
+camera) return the writes for one pass — they borrow the frame's query set, not the context,
+so they go straight into `ctx.encoder.begin_compute_pass`.
+
+Timings are 2–5 frames old (`GpuTimings::frame` names the frame): a frame's timestamps are
+resolved only once its GPU work has completed, by a later frame, because Metal writes a render
+pass's boundary samples asynchronously (a resolve in the same command buffer read the scene
+pass's start and end from different frames). Nothing waits for the GPU; the renderer allocates
+nothing for it after the first timed frame (`tests/gpu_timings.rs`, `tests/alloc_frame.rs`
+"timings"). On tile-based GPUs (Apple, mobile) consecutive passes overlap, so scopes can
+overlap and `total_ms` is a sum, not the frame's GPU time. Measure on a loaded GPU (frames back
+to back): an idle GPU drops to low clocks and every pass costs about 3× more. Off (the
+default), timing costs nothing.
 
 ## Capture and tools
 
@@ -356,8 +443,10 @@ four steps). Lasers become particle beams instead (particles area).
   `space3d_core::HdrImageData` (linear floats; `Err` in Direct mode or when the last frame had no
   primary view; after a skipped windowed frame the scene views are rendered first).
 * `RenderStats`: `intermediate_groups`, `post_groups`, `post_passes`, `render_passes`,
-  `fullscreen_passes`, `textures_created` (0 in the steady state), `target_bytes`,
-  `node_draws`, `node_dispatches`, `scene_read_passes`, `depth_resolves`, `distortion_passes`.
+  `fullscreen_passes`, `textures_created` (0 in the steady state), `target_bytes` (the
+  frame's and post's own textures; see "Cost" for the driver memory of their passes),
+  `node_draws`, `node_dispatches`, `scene_read_passes`, `depth_resolves`, `distortion_passes`,
+  `depth_views`, `shadow_casters`, `shadow_draw_calls`.
 * **MSAA on Apple GPUs (Metal):** the first frames after a pipeline's first draw can differ from
   later frames by a few levels on some silhouette pixels. The renderer's inputs and commands
   are the same in every frame (a static scene uploads nothing after its first frame). What
@@ -372,10 +461,36 @@ four steps). Lasers become particle beams instead (particles area).
 
 ## Cost
 
-Measured on the dev machine (Apple M4 Max, 1080p, `benches/frame.rs`, the M1 record in
-[`docs/performance.md`](../performance.md), "Gates at M1 close"): the HDR path with the
-composite only (no bloom or lens effects) adds +13 to +17 µs of render-thread CPU per frame over
-Direct mode on a quiet machine (+19 to +32 µs under heavy load; the gate is +20 µs) and +32 to
-+38 µs of GPU throughput (gate +0.10 ms); the composite's extra render pass is most of the CPU.
-Bloom adds 0.10–0.17 ms of CPU and 0.14–0.17 ms of GPU per post group at 1080p (post.md,
-"Cost"). The steady state allocates nothing in the renderer and creates no textures.
+Measured on the dev machine (Apple M4 Max, 1080p, `benches/frame.rs` `frame/ab`, which interleaves
+the modes and reports paired deltas; the records are in [`docs/performance.md`](../performance.md),
+"Gates at M1 close" and "F7 / F8 and M1.1"):
+
+| over Direct | render-thread CPU per frame | GPU (loaded) |
+|---|---|---|
+| HDR, composite only (`without_bloom()`) | +13 to +17 µs quiet, +19 to +32 µs under heavy load (gate +20 µs) | +32 to +38 µs throughput (gate +0.10 ms) |
+| default bloom (`Bloom::glow()`), per post group, on top of the composite | 0.15–0.18 ms (up to 0.45 ms under very heavy load) | the chain 0.14–0.17 ms at 1080p (`bloom_gate_1080p`; post.md "Cost") |
+| one 2048² depth view (400 casters) | +37 to +46 µs | 0.02 ms (`shadow`) |
+
+The steady state allocates nothing in the renderer and creates no textures.
+
+**Memory beyond `target_bytes`.** `RenderStats::target_bytes` counts the frame's and post's own
+textures (the scene texture, depths, the bloom chain, …). Every render pass also holds GPU driver
+memory while its frame is in flight — on Metal about 2.8 MB per render pass per frame in flight,
+whatever its attachments' size (`tests/footprint.rs`: 11 empty passes into a 32 × 32 texture
+against 1, raw wgpu). A feature's memory is therefore about `target_bytes` plus
+`render_passes × 2.8 MB × frames in flight`: the composite's pass is small next to its scene
+texture, but the default bloom chain's 11–12 passes are about 20× its 2.8 MB of textures. Measured
+at 1080p (process footprint after 600 frames, one scene per process):
+
+| scene | footprint, one frame in flight | three frames in flight (an unpaced loop) | `target_bytes` | render passes |
+|---|---|---|---|---|
+| Direct | 490 MB | — | 0 | 0 |
+| HDR, composite only | 512 MB | 541 MB | 24.9 MB | 1 |
+| default bloom | 572 MB (+60) | 688 MB (+148) | 27.6 MB (+2.7) | 12 |
+| one 2048² depth view | 513 MB (+23) | — | 0 (the map is the lighting's: 16.8 MB) | 1 |
+
+A window keeps two to three frames in flight (`desired_maximum_frame_latency` 2), so budget about
+100–150 MB for a post group's default bloom on Apple GPUs; split screens multiply it. Fewer bloom
+levels (`Bloom::mip_count`, `GraphicsQuality::Low`: 4 levels, 8 passes) cost proportionally less.
+Run `cargo test -p space3d-render --release --test footprint -- --ignored --nocapture` to measure
+(it fails when bloom holds more than 80 MB at one frame in flight or 200 MB at three).
