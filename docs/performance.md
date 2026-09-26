@@ -497,3 +497,24 @@ binary of `graphics` at 62a28d8) run in the same minutes.
 Not measured yet: the GPU cost of a full screen of mapped pixels (the gate "all maps + IBL +
 PCF9 ≤ +0.20 ms" needs PM4/PM5; the maps are sampled behind uniform branches, so map-less
 materials run the original instruction stream).
+
+### P-MAT PM3 / PM4 — skybox, image-based lighting
+
+Dev machine (M4 Max, Metal), release, 1080p headless, frames back to back; load averages 7–33 from
+other lanes' builds and GPU tests. Commands:
+`cargo test -p space3d-render --release --test environment -- --ignored --nocapture ibl_bake_gate`
+and `... forward_full_screen_gate`.
+
+| gate / measurement | measured | status |
+|---|---|---|
+| IBL bake ≤ 3 ms one-time (spec §4.4 T1; 1024² LDR faces → 256² specular + 32² irradiance; `ibl.bake` GPU scope, medians of 5 cubemaps) — default path: compute dispatches | upload (mip chain, 10 dispatches) 0.18–0.32 ms + bake (7 dispatches) 0.52–0.95 ms = **0.69–1.26 ms** over 5 runs | met |
+| the same on the fragment path (WebGL2's; `no_compute` on Metal): a render pass per face and mip | upload 60 passes 1.0–1.2 ms + bake 42 passes 2.2–7.1 ms = **3.4–8.2 ms** | recorded (T3 budget ≤ 50 ms total, ≤ 8 ms per frame with `bake_passes_per_frame`) |
+| per-pass cost on Metal | a 64² cubemap's 66 near-empty passes: 4.2–10.8 ms at load 30, 0.54 ms as 7 compute dispatches | the reason for the compute path |
+| forward full-screen lit pixels, all maps + IBL (+ PCF9 with PM5) vs today's shader ≤ +0.20 ms (a plane filling 1080p, sun + 4 point lights; legacy Classic material without maps or environment vs base color, normal, ORM and emissive maps at 1024², Standard shading and image-based lighting) | `scene` 0.169 → 0.257 ms; median paired difference **+0.088 ms** (3 runs identical; an earlier unpaired run under GPU contention: +0.15 / +0.22) | met without PCF9 (PM5 adds its taps) |
+| steady-state allocations with PM1–PM4 in use (`tests/alloc_materials.rs`: + skybox, environment, Standard shading) | 114 per frame on `CpuDirect`, 208 on the GPU culling paths, constant; 0 in the renderer; live bytes +0 over 90 frames | bound 125 / 230 (PM2's 100 / 195 + the skybox draw and the 7-binding view bind group) |
+| still camera with a skybox and an environment (`environment_steady_state`) | 0 bytes uploaded, 0 textures created, 0 bake steps, identical frames | met |
+| engine goldens (`engine_goldens_are_exact`) | exact: the image-based term and the Standard multiple-scattering factor are behind a uniform branch / an override | met |
+
+Memory (not a gate): a radiance cube is `faces² × 6 × 4/3` texels at 4 B (sRGB) or 8 B
+(`Rgba16Float`): a 1024² LDR sky 33.6 MB, the stories' 512² HDR nebula 16.8 MB; an environment at
+the defaults 4.2 MB (256² × 6 faces × 6 mips + 32² irradiance, `Rgba16Float`); the BRDF LUT 16 KiB.

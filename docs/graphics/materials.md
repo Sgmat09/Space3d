@@ -1,12 +1,12 @@
-# Materials: maps, blend modes, glTF import
+# Materials and lighting: maps, blend modes, glTF import, skybox, image-based lighting
 
 `Material` renders lit or unlit surfaces with a base color, metallic/roughness, emissive and — since
 the graphics upgrade — normal, metallic-roughness, occlusion and emissive maps, five blend modes,
 per-material UV transforms and a second UV set. glTF models "just light up": every standard
 material slot is read and converted. The normative design is
-[`docs/design/graphics.md`](../design/graphics.md) §2.2.8, §2.4 and §5.2 (P-MAT); this page covers
-milestones PM1 (blend modes and maps) and PM2 (glTF import and tangents). Skyboxes, image-based
-lighting and shadows (PM3–PM5) come next.
+[`docs/design/graphics.md`](../design/graphics.md) §2.2.8, §2.2.9, §2.4 and §5.2 (P-MAT); this page
+covers milestones PM1 (blend modes and maps), PM2 (glTF import and tangents), PM3 (cubemaps and the
+skybox) and PM4 (image-based lighting). Shadows (PM5) come next.
 
 A material without maps, with `BlendMode::Opaque` (or the legacy `alpha_blend`), renders exactly —
 bit for bit — as before the upgrade: every map sits behind a uniform flag, and new settings default
@@ -113,8 +113,104 @@ order. Additive batches never need sorting; explicit `InstanceBuffer`s keep thei
 
 * `ShadingModel::Classic` (default): the original Blinn-Phong-style model, pixel-identical.
 * `ShadingModel::Standard`: GGX distribution, height-correlated Smith visibility, Schlick Fresnel,
-  Lambert diffuse — in the same light units (a white Lambert surface facing a light of intensity 1
-  reflects 1). Use it with image-based lighting (PM4) and for the "High" look.
+  Lambert diffuse, and the energy the single-scattering lobe loses to multiple scattering added
+  back (`1 + f0·(1 / (A + B) − 1)` from the BRDF LUT, so rough metals do not darken) — in the same
+  light units (a white Lambert surface facing a light of intensity 1 reflects 1). Use it with
+  image-based lighting and for the "High" look.
+
+Image-based lighting works with both; with `Classic` (Blinn-Phong highlights next to GGX
+reflections) it is an approximation.
+
+## Cubemaps and the skybox
+
+```rust
+use space3d::prelude::*;
+use space3d::render::CubemapSource;
+
+let assets = app.resources.expect_mut::<RenderAssets>();
+// An HDR panorama (.hdr through `space3d::assets::HdrImageLoader`), converted on the GPU:
+let nebula = assets.add_cubemap(CubemapSource::from_equirect_hdr(&hdr)); // faces: width / 4, ≤ 2048
+// or six faces (+X, −X, +Y, −Y, +Z, −Z), or three.js-authored ones (`.skybox` manifests):
+let sky = assets.add_cubemap(CubemapSource::from_faces(faces).unwrap());
+world.spawn((Transform::IDENTITY, Camera3d::default(), Skybox::new(nebula).with_intensity(1.0)));
+```
+
+* **`CubemapSource`**: `from_faces` (sRGB, wgpu / OpenGL face order and orientation),
+  `from_faces_threejs` (faces made for three.js' `CubeTextureLoader`: ±X swapped and every face
+  mirrored, so they look as they do in three.js), `from_equirect_image` (sRGB panorama),
+  `from_equirect_hdr` (linear `Rgba16Float`), `with_face_size` for panoramas, or
+  `CubemapSource::Faces(TextureSource)` in any filterable format (e.g. `Rgba16Float`, BC6H).
+  `space3d::assets::SkyboxLoader` loads a `.skybox` JSON manifest
+  (`{"faces": [...6 images], "convention": "threejs"}`) into `CubemapData`, whose `to_source()`
+  applies the convention.
+* **Orientation.** A panorama's center column (u = 0.5) looks down −Z (the default camera's
+  forward), +X is to its right, its top row is straight up. Faces follow the cube-map face table
+  of every graphics API, which is left-handed: seen from inside in this right-handed world, face
+  images appear mirrored (text reads backwards) — author them for OpenGL/wgpu, or use
+  `from_faces_threejs` for three.js assets. `Skybox::rotation` turns the sky (a right-handed
+  rotation of the sky, e.g. `Quat::from_rotation_y(a)`).
+* **Upload.** The renderer uploads a cubemap in the frame after `add_cubemap` / `update_cubemap`
+  into one *radiance cube*: a 6-layer texture with a full mip chain (a `TEXTURE_CUBE_MAP` on GL).
+  HDR sources stay `Rgba16Float` where the device renders it (`GraphicsCaps::hdr_format`); without
+  float targets they become `Rgba8UnormSrgb` (radiance above 1 clamps; warned once); LDR ones are
+  `Rgba8UnormSrgb`. Panoramas are converted face by face, sampling the panorama mip that matches
+  the face resolution; the mips are rendered from each other (a 2×2 average). All of it runs in
+  that frame (not budgeted: the sky needs the whole cube) — compute dispatches where compute shaders
+  can write storage textures, render passes elsewhere (see [WebGL2](#webgl2-and-gles)).
+* **Skybox** (camera component): drawn by the built-in render node `"space3d/skybox"` in the
+  Skybox phase, after the opaque and alpha-masked meshes and before transparent ones, at the far
+  plane (`LessEqual`, no depth write), so it covers only what nothing opaque drew. It writes linear
+  radiance × `intensity` — unclamped in HDR, so bright stars bloom with post — through the view's
+  output encoding (tonemapped per fragment in the Ldr fallback). Orthographic cameras see a
+  single direction. Replace the node under its name to draw the sky yourself.
+* `RenderAssets::remove_cubemap` frees it; `Renderer::environment_state(h)` reports where it is
+  (below).
+
+Story: `Engine/Environment/Skybox` (a procedural HDR nebula, panorama or faces; intensity,
+rotation, yaw).
+
+## Image-based lighting
+
+```rust
+world.spawn((
+    Transform::IDENTITY,
+    Camera3d::default(),
+    Skybox::new(nebula),
+    EnvironmentLight::new(nebula).with_intensity(1.0, 1.0), // diffuse, specular
+));
+app.insert_resource(LightingSettings { shading: ShadingModel::Standard, ..Default::default() });
+```
+
+`EnvironmentLight` (camera component) lights every lit material the camera draws from a cubemap,
+on top of `AmbientLight` and the lights:
+
+* **Bake** (per cubemap, on the GPU, once): a GGX-prefiltered specular cube
+  (`IblSettings::specular_size`, default 256², down to 8²; mip `m` holds roughness
+  `m / (mips − 1)`; filtered importance sampling with `specular_samples` fixed Hammersley points)
+  and an irradiance cube (`irradiance_size`, 32², `irradiance_samples` cosine-weighted points,
+  stored as the mean radiance E/π). `Rgba16Float`; `Rgba8UnormSrgb` without float targets (the
+  LDR bake). The split-sum BRDF LUT (64² `Rg16Float`, GGX with height-correlated Smith) is
+  precomputed and embedded (`shaders/brdf_lut.bin`, regenerated by the ignored
+  `regenerate_brdf_lut` test).
+* **Shading** (`s3d_ibl` in `forward.wgsl`): specular = prefiltered radiance at roughness ×
+  (f0·A + B) plus the multiply scattered part (Fdez-Agüera 2019), diffuse = irradiance × the albedo
+  the specular lobes leave: a white or metallic surface in a uniform white environment reflects
+  exactly its radiance (`ibl_white_furnace`, ±3 %). Occlusion maps darken both (specular with
+  Lagarde's specular occlusion). `EnvironmentLight::rotation` turns the environment like
+  `Skybox::rotation`.
+* **When.** A cubemap's environment is baked the first frame a camera's `EnvironmentLight` uses it
+  (skybox-only cubemaps never pay for it) — every step at once on headless renderers and by
+  default, or `IblSettings::bake_passes_per_frame` steps per frame (web: `Some(6)`); the camera uses
+  it from the frame its last step is recorded. `Renderer::environment_state(cubemap)`: `Missing`
+  (not seen by a frame yet, or removed), `Baking { passes_left }` (uploaded; the steps left), `Ready`,
+  `Failed` (the upload failed, logged). A re-uploaded cubemap or changed `IblSettings` re-bake while
+  the previous environment stays bound; environments unused for 600 frames are dropped.
+* Views without an `EnvironmentLight` bind 1×1 black cubes and skip the image-based term (a
+  uniform branch): materials render exactly as before.
+
+Stories: `Engine/Environment/IBL Spheres` (gold and red rows, roughness 0 → 1, in a procedural
+photo studio or the nebula) and `Engine/Environment/Nebula Ship` (the test ship lit by the nebula it
+flies in: metal panels reflect the nebula's core, bloom on the engines).
 
 ## glTF import
 
@@ -164,11 +260,28 @@ emissive maps and no `TANGENT` (generated by `space3d-assets/tests/gltf_material
 
 ## WebGL2 and GLES
 
-Everything above works on WebGL2 / GLES 3.0: a material binds 5 textures + the defaults (9 of the
-16 texture units the fragment stage has, counting the view's), no storage buffers, and the
-extension stream is rebound with the mesh arena where `BASE_VERTEX` is missing. Alpha to coverage
-needs MSAA (usually off on the web). Verified on ANGLE (GLES 3.0): `tests/materials.rs` with
-`WGPU_BACKEND=gl` and `tests/gl_materials.rs` (GL vs Metal).
+Everything above works on WebGL2 / GLES 3.0: a material binds 5 textures and the view 3 more
+(environment specular and irradiance cubes, BRDF LUT: 8 of the fragment stage's 16 texture
+units), no storage buffers, and the extension stream is rebound with the mesh arena where
+`BASE_VERTEX` is missing. Alpha to coverage needs MSAA (usually off on the web).
+
+Cubemaps are square 6-layer textures, which wgpu's GL backend creates as `TEXTURE_CUBE_MAP`s. The
+cubemap conversion, mip chain and bake have two paths computing the same texels (same functions,
+same sample sets; `compute_bake_matches_fragment_bake`):
+
+* **Compute** (Vulkan, Metal, DX12, WebGPU, GLES 3.1+ with compute): one dispatch per mip for all
+  six faces, into write-only storage views (`Rgba16Float`; `Rgba8UnormSrgb` cubes are
+  `Rgba8Unorm` textures written through their linear view, with the sRGB encoding in the shader);
+  a frame's dispatches share one compute pass.
+* **Fragment** (WebGL2 / GLES 3.0, or `DownlevelOverride::no_compute`): one render pass per face
+  and mip into a single-layer view (`framebufferTexture2D` with the face target on GL). Set
+  `IblSettings::bake_passes_per_frame` (e.g. `Some(6)`) to spread a bake over frames.
+
+Without float render targets (WebGL2 without `EXT_color_buffer_float`, or `no_float_targets`),
+radiance and environment cubes are `Rgba8UnormSrgb` (values clamp at 1; LDR environments are
+lossless, `ibl_ldr_fallback_close_to_hdr`). Verified on ANGLE (GLES 3.0): `tests/materials.rs`
+and `tests/environment.rs` with `WGPU_BACKEND=gl`, `tests/gl_materials.rs` (GL vs Metal, including
+`cube_on_gl_is_texture_cube_map`), and the storybook.
 
 ## Performance
 
@@ -181,3 +294,13 @@ needs MSAA (usually off on the web). Verified on ANGLE (GLES 3.0): `tests/materi
 * `benches/materials.rs`: `materials/ecs_pbr/100k` (100k static entities, 8 PBR materials with
   maps; gate ≤ 2.5 ms per frame on the dev machine), `materials/ecs_plain/100k`,
   `materials/transparent_sort/4096`. Measured values are in `docs/performance.md`.
+* Image-based lighting costs 3 texture samples per lit pixel, the skybox one per uncovered pixel.
+  A 1080p screen of mapped, IBL-lit Standard pixels costs +0.09 ms of GPU over the legacy shader
+  on the dev machine (`forward_full_screen_gate`, gate +0.20 ms with PM5's shadow taps). A bake is one-time: 1024² LDR faces → 256² specular + 32² irradiance
+  in about 1 ms of GPU on the dev machine with compute (`ibl_bake_gate`, gate ≤ 3 ms), a few ms
+  with render passes (each pass has a fixed cost of tens of µs on Metal: 102 of them for this
+  cubemap, 17 dispatches in one compute pass instead).
+* Memory: a radiance cube is `faces² × 6 × 4/3` texels (4 bytes in sRGB, 8 in `Rgba16Float`:
+  a 1024² LDR sky ≈ 34 MB, 512² ≈ 8 MB — use 512² faces on the web), an environment ≈ 4.2 MB at
+  the default sizes; a still camera with a skybox and an environment uploads nothing and
+  allocates nothing per frame.
