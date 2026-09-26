@@ -49,3 +49,7 @@ harness = false
 [[bench]]
 name = "frame"
 harness = false
+
+[[bench]]
+name = "post"
+harness = false

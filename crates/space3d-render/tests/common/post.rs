@@ -8,6 +8,7 @@
 //! its exposed radiance clamped to 1, and a bloom halo is directly measurable in linear light.
 #![allow(dead_code)]
 
+use space3d_core::HdrImageData;
 use space3d_core::prelude::*;
 use space3d_render::*;
 
@@ -109,6 +110,82 @@ pub fn max_diff(a: &ImageData, b: &ImageData) -> u8 {
         .map(|(x, y)| x.abs_diff(*y))
         .max()
         .unwrap_or(0)
+}
+
+/// Post without tonemapping, dither and bloom, with auto exposure `ae` (enabled).
+pub fn post_ae(ae: AutoExposure) -> PostProcess {
+    post(Bloom::glow()).without_bloom().with_auto_exposure(ae)
+}
+
+/// Whether a renderer meters with the compute histogram (else the render-pass chain, whose
+/// accuracy against the exact metering is ±0.5 EV instead of ±0.1).
+pub fn meters_with_compute(app: &App, settings_no_compute: bool) -> bool {
+    let caps = app.resources.expect::<Renderer>().graphics_caps();
+    !settings_no_compute && caps.compute_histogram && caps.exposure_format == Some(wgpu::TextureFormat::R32Float)
+}
+
+/// The exposure (stops) auto exposure should settle at for an HDR scene capture (the post
+/// group's rect is the whole capture), computed exactly: every pixel whose luminance is above
+/// 2⁻¹⁶ (black is not metered) weighs 1 (`Average`) or 4 at the center falling linearly to 1 at
+/// the corners (`CenterWeighted`); with `trim`, the weight outside the [low, high] percentile
+/// window of the sorted log2 luminances is cut; the weighted mean log2 luminance is exposed to
+/// middle grey and the result clamped. An independent reimplementation of the metering rule
+/// (no histogram bins).
+pub fn reference_ev(scene: &HdrImageData, ae: &AutoExposure, trim: bool) -> f32 {
+    let (w, h) = (scene.width, scene.height);
+    let mut samples: Vec<(f64, f64)> = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let p = scene.pixels[(y * w + x) as usize];
+            let lum = 0.2126 * p[0].max(0.0) + 0.7152 * p[1].max(0.0) + 0.0722 * p[2].max(0.0);
+            if lum.is_nan() || lum <= (-16.0f32).exp2() {
+                continue;
+            }
+            let weight = match ae.metering {
+                Metering::Average => 1.0,
+                _ => {
+                    let d = Vec2::new(
+                        ((x as f32 + 0.5) / w as f32 - 0.5) * 2.0,
+                        ((y as f32 + 0.5) / h as f32 - 0.5) * 2.0,
+                    );
+                    let r = (d.length() * std::f32::consts::FRAC_1_SQRT_2).clamp(0.0, 1.0);
+                    4.0 + (1.0 - 4.0) * r
+                }
+            };
+            samples.push((lum.log2().clamp(-16.0, 16.0) as f64, weight as f64));
+        }
+    }
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: f64 = samples.iter().map(|s| s.1).sum();
+    let (lo, hi) = if trim {
+        (total * ae.low_percentile as f64, total * ae.high_percentile as f64)
+    } else {
+        (0.0, total)
+    };
+    let (mut sw, mut swl, mut incl) = (0.0, 0.0, 0.0);
+    for (l, weight) in samples {
+        let excl = incl;
+        incl += weight;
+        let portion = (incl.min(hi) - excl.max(lo)).max(0.0);
+        sw += portion;
+        swl += portion * l;
+    }
+    let mean = if sw > 0.0 { swl / sw } else { 0.18f64.log2() };
+    ((0.18f64.log2() - mean) as f32).clamp(ae.min_ev, ae.max_ev)
+}
+
+/// The primary post group's scene color `S` of the last frame.
+pub fn scene_hdr(app: &mut App) -> HdrImageData {
+    app.resources
+        .expect_mut::<Renderer>()
+        .capture_scene_hdr_blocking()
+        .expect("scene capture")
+}
+
+/// Log2 of a region's displayed linear value over its radiance: the exposure applied (with
+/// `Tonemapper::None`, below clipping).
+pub fn displayed_ev(img: &ImageData, rect: [u32; 4], radiance: f32) -> f32 {
+    (mean(img, rect).x / radiance).log2()
 }
 
 /// Fills `rect` (target pixels) with the linear color `value`, at `stage`: HdrScene overlays
@@ -1034,11 +1111,1323 @@ pub mod cases {
         assert_eq!(px[32 * 64 + 32][3], 1.0);
     }
 
+    // ---- Auto exposure (PO2) ----
+
+    /// Radiances of the auto-exposure scene at brightness 1: the backdrop (clear color), a grey
+    /// slab, the probe (whose displayed value measures the applied exposure), a bright panel and
+    /// a small light (cut by the high percentile).
+    const AE_BACKDROP: f32 = 0.02;
+    const AE_SLAB: f32 = 0.3;
+    const AE_PROBE: f32 = 0.05;
+    const AE_BRIGHT: f32 = 2.0;
+    const AE_LIGHT: f32 = 60.0;
+    /// Pixels inside the probe quad (in the 128 × 64 frame).
+    const AE_PROBE_RECT: [u32; 4] = [86, 15, 20, 12];
+
+    struct AeScene {
+        camera: Entity,
+        quads: [(Entity, f32); 4],
+    }
+
+    impl AeScene {
+        fn spawn(app: &mut App, post: PostProcess) -> Self {
+            let quads = [
+                (AE_SLAB, Vec2::new(-1.0, 0.0), Vec2::new(1.5, 1.7)),
+                (AE_PROBE, Vec2::new(1.0, 0.35), Vec2::new(0.8, 0.5)),
+                (AE_BRIGHT, Vec2::new(1.0, -0.55), Vec2::new(0.6, 0.4)),
+                (AE_LIGHT, Vec2::new(0.2, 0.7), Vec2::new(0.1, 0.1)),
+            ]
+            .map(|(v, center, size)| (quad(app, Vec3::splat(v), center, size), v));
+            let camera = camera(
+                app,
+                0.0,
+                Vec4::new(AE_BACKDROP, AE_BACKDROP, AE_BACKDROP, 1.0),
+                Some(post),
+            );
+            Self { camera, quads }
+        }
+
+        /// Every radiance × `f`.
+        fn brightness(&self, app: &mut App, f: f32) {
+            for (e, v) in self.quads {
+                app.world
+                    .insert_one(e, Material::unlit(Vec3::splat(v * f).extend(1.0)))
+                    .unwrap();
+            }
+            let b = AE_BACKDROP * f;
+            app.world.get::<&mut Camera3d>(self.camera).unwrap().clear_color = Some(Vec4::new(b, b, b, 1.0));
+        }
+    }
+
+    /// Auto exposure meters the scene like the exact rule (`reference_ev`: percentile window,
+    /// center weighting, black excluded) within ±0.1 EV on the compute path and ±0.5 EV on the
+    /// render-pass path (no percentile window: there it matches the untrimmed rule within
+    /// 0.15 EV): the first frame snaps, a 4× brighter scene is followed gradually (to-bright rate
+    /// 3/s: 1/60 s closes 3.4 % of the gap) and converges, and so does the way back (rate 1/s).
+    /// The composite applies 2^E (the displayed probe) and `camera_exposure` reads it back.
+    pub fn auto_exposure_converges_and_matches_reference(make: MakeApp, no_compute: bool) {
+        let Some(mut app) = make(W, H) else { return };
+        frame_settings(&mut app).read_exposure = true;
+        frame_settings(&mut app).downlevel.no_compute = no_compute;
+        let compute = meters_with_compute(&app, no_compute);
+        let tolerance = if compute { 0.1 } else { 0.5 };
+        let ae = AutoExposure::on();
+        let scene = AeScene::spawn(&mut app, post_ae(ae));
+        app.step_ticks(1);
+        let img = render(&mut app);
+        let hdr = scene_hdr(&mut app);
+        let want = reference_ev(&hdr, &ae, true);
+        let untrimmed = reference_ev(&hdr, &ae, false);
+        let got = displayed_ev(&img, AE_PROBE_RECT, AE_PROBE);
+        eprintln!("compute {compute}: metered {got:.3} EV, reference {want:.3} (untrimmed {untrimmed:.3})");
+        assert!((got - want).abs() <= tolerance, "first frame: {got} vs {want}");
+        if !compute {
+            assert!((got - untrimmed).abs() <= 0.15, "render passes: {got} vs {untrimmed}");
+        }
+        let s = stats(&app);
+        if compute {
+            assert_eq!((s.compute_passes, s.post_passes), (1, 1), "{s:?}");
+        } else {
+            // 128 × 64: a 32 × 16 level, reduced once to 4 × 2, then the adapt pass.
+            assert_eq!((s.compute_passes, s.post_passes), (0, 4), "{s:?}");
+        }
+        // The readback (1–3 frames late) reports the same exposure.
+        app.step_ticks(4);
+        let read = app
+            .resources
+            .expect::<Renderer>()
+            .camera_exposure(scene.camera)
+            .expect("read back");
+        assert!((read - got).abs() < 0.03, "read back {read} vs displayed {got}");
+
+        // 4× brighter: the target drops by 2 EV; the exposure follows gradually.
+        scene.brightness(&mut app, 4.0);
+        app.step_ticks(1);
+        let one = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE * 4.0);
+        assert!(
+            one < got - 0.03 && one > got - 0.2,
+            "one frame later: {one} (from {got})"
+        );
+        app.step_ticks(150);
+        let img = render(&mut app);
+        let want4 = reference_ev(&scene_hdr(&mut app), &ae, true);
+        assert!((want4 - (want - 2.0)).abs() < 0.05, "reference {want4} vs {want} − 2");
+        let got4 = displayed_ev(&img, AE_PROBE_RECT, AE_PROBE * 4.0);
+        assert!(
+            (got4 - want4).abs() <= tolerance,
+            "converged to bright: {got4} vs {want4}"
+        );
+        assert!(
+            (got4 - (got - 2.0)).abs() < 0.06,
+            "the same metering 2 EV lower: {got4} vs {got}"
+        );
+        // Back to dark (rate 1/s: 6 s leave 1/64 of the gap).
+        scene.brightness(&mut app, 1.0);
+        app.step_ticks(360);
+        let back = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE);
+        assert!((back - got).abs() < 0.06, "back: {back} vs {got}");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// `AutoExposure::instant()` converges in the frame the scene changes (even when
+    /// `Time::frame` does not advance), and any camera's first frame snaps: a one-shot capture
+    /// is exposed correctly.
+    pub fn instant_converges_frame_1(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let compute = meters_with_compute(&app, false);
+        let tolerance = if compute { 0.1 } else { 0.5 };
+        let ae = AutoExposure::on();
+        // Default adaptation, first frame (no step: `render_to_image` only).
+        let scene = AeScene::spawn(&mut app, post_ae(ae));
+        let img = render(&mut app);
+        let want = reference_ev(&scene_hdr(&mut app), &ae, true);
+        let first = displayed_ev(&img, AE_PROBE_RECT, AE_PROBE);
+        assert!((first - want).abs() <= tolerance, "snap: {first} vs {want}");
+        // Default adaptation without time: the change is not followed at all.
+        scene.brightness(&mut app, 4.0);
+        let frozen = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE * 4.0);
+        assert!(
+            (frozen - first).abs() < 0.02,
+            "dt = 0 adapts nothing: {frozen} vs {first}"
+        );
+        // Instant: converged in the frame.
+        set_post(&mut app, scene.camera, post_ae(ae.instant()));
+        let now = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE * 4.0);
+        assert!((now - (first - 2.0)).abs() < 0.06, "instant: {now} vs {first} − 2");
+        scene.brightness(&mut app, 1.0);
+        let again = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE);
+        assert!((again - first).abs() < 0.02, "{again} vs {first}");
+    }
+
+    /// With auto exposure and animated grain and dither on, rendering the same frame twice gives
+    /// identical images (no adaptation and the same seeds when `Time::frame` does not advance),
+    /// and so do two apps stepped through the same ticks.
+    pub fn render_to_image_is_idempotent_with_ae_and_grain(make: MakeApp) {
+        let run = |make: MakeApp| {
+            let mut app = make(W, H)?;
+            let post = PostProcess::default()
+                .with_auto_exposure(AutoExposure::on())
+                .with_film_grain(FilmGrain {
+                    enabled: true,
+                    animated: true,
+                    ..FilmGrain::default()
+                });
+            let scene = AeScene::spawn(&mut app, post);
+            app.step_ticks(10);
+            scene.brightness(&mut app, 3.0);
+            app.step_ticks(7);
+            let a = render(&mut app);
+            let b = render(&mut app);
+            assert_eq!(a, b, "render_to_image twice");
+            Some(a)
+        };
+        let Some(first) = run(make) else { return };
+        let second = run(make).expect("adapter");
+        assert_eq!(first, second, "the same ticks give the same image");
+    }
+
+    /// Auto exposure feeds the bloom prefilter: a dim scene is brightened by about 3 EV, so a 0.5
+    /// panel (below the threshold at 0 EV) blooms; with the same compensation but no auto
+    /// exposure it does not.
+    pub fn auto_exposure_feeds_bloom(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        quad(&mut app, Vec3::splat(0.5), Vec2::ZERO, Vec2::splat(0.25));
+        let ae = AutoExposure {
+            metering: Metering::Average,
+            ..AutoExposure::on()
+        };
+        let bloom = Bloom::glow().with_threshold(1.0, 0.0);
+        let cam = camera(
+            &mut app,
+            0.0,
+            Vec4::new(0.02, 0.02, 0.02, 1.0),
+            Some(post(bloom).with_auto_exposure(ae)),
+        );
+        let img = render(&mut app);
+        let bg = lin(&img, 4, 4).x;
+        // Mostly 0.02: exposed toward 0.18, the panel far above 1.
+        assert!(bg > 0.1, "backdrop brightened: {bg}");
+        let halo = lin(&img, 56, 32).x - bg;
+        assert!(halo > 0.02, "the exposed panel blooms: {halo}");
+        set_post(&mut app, cam, post(bloom));
+        let manual = render(&mut app);
+        assert_eq!(lin(&manual, 56, 32).x, lin(&manual, 4, 4).x, "0.5 at 0 EV: no bloom");
+    }
+
+    /// Each post group meters its own rect and keeps its own history: a split screen of a dark
+    /// and a bright view exposes them about 2 EV apart; the Ldr fallback has no auto exposure
+    /// (the manual exposure applies).
+    pub fn auto_exposure_per_post_group(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        frame_settings(&mut app).read_exposure = true;
+        let ae = AutoExposure {
+            metering: Metering::Average,
+            ..AutoExposure::on().instant()
+        };
+        // The left camera sees a 0.05 wall, the right one (x = 50) a 0.2 wall.
+        quad(&mut app, Vec3::splat(0.05), Vec2::ZERO, Vec2::splat(4.0));
+        quad(&mut app, Vec3::splat(0.2), Vec2::new(50.0, 0.0), Vec2::splat(4.0));
+        let left = camera(&mut app, 0.0, BLACK, Some(post_ae(ae)));
+        let right = camera(&mut app, 50.0, BLACK, Some(post_ae(ae)));
+        for (e, viewport, order) in [(left, [0.0, 0.0, 0.5, 1.0], 0), (right, [0.5, 0.0, 0.5, 1.0], 1)] {
+            let mut c = app.world.get::<&mut Camera3d>(e).unwrap();
+            c.viewport = Some(viewport);
+            c.order = order;
+        }
+        let img = render(&mut app);
+        let (l, r) = (lin(&img, 32, 32).x, lin(&img, 96, 32).x);
+        // Both exposed to middle grey.
+        assert!((l - 0.18).abs() < 0.02 && (r - 0.18).abs() < 0.02, "{l} {r}");
+        app.step_ticks(4);
+        let renderer = app.resources.expect::<Renderer>();
+        let (el, er) = (
+            renderer.camera_exposure(left).unwrap(),
+            renderer.camera_exposure(right).unwrap(),
+        );
+        assert!((el - er - 2.0).abs() < 0.1, "{el} vs {er}");
+        // The Ldr fallback: manual exposure, reported as such.
+        frame_settings(&mut app).downlevel.no_float_targets = true;
+        set_post(&mut app, left, post_ae(ae).with_exposure(1.0));
+        app.step_ticks(4);
+        let img = render(&mut app);
+        assert!((lin(&img, 32, 32).x - 0.1).abs() < 0.01, "0.05 at +1 EV");
+        assert_eq!(app.resources.expect::<Renderer>().camera_exposure(left), Some(1.0));
+    }
+
+    /// `Renderer::reset_post_history` and turning auto exposure back on snap to the target;
+    /// after warm-up metering creates no textures, reallocates nothing and a still scene
+    /// uploads nothing (a steady `dt` leaves the adaptation factors unchanged).
+    pub fn auto_exposure_history_and_steady_state(make: MakeApp, no_compute: bool) {
+        let Some(mut app) = make(W, H) else { return };
+        frame_settings(&mut app).downlevel.no_compute = no_compute;
+        frame_settings(&mut app).read_exposure = true;
+        let ae = AutoExposure::on();
+        let scene = AeScene::spawn(&mut app, post_ae(ae));
+        app.step_ticks(3);
+        let settled = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE);
+        scene.brightness(&mut app, 4.0);
+        app.step_ticks(5);
+        let partial = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE * 4.0);
+        assert!(partial > settled - 1.0, "still adapting: {partial} vs {settled}");
+        app.resources.expect_mut::<Renderer>().reset_post_history(scene.camera);
+        app.step_ticks(1);
+        let snapped = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE * 4.0);
+        assert!(
+            (snapped - (settled - 2.0)).abs() < 0.06,
+            "reset snaps: {snapped} vs {settled} − 2"
+        );
+        // Off (manual 0 EV), then on again: snaps.
+        scene.brightness(&mut app, 1.0);
+        set_post(&mut app, scene.camera, post_ae(ae).without_bloom());
+        app.world
+            .get::<&mut PostProcess>(scene.camera)
+            .unwrap()
+            .auto_exposure
+            .enabled = false;
+        app.step_ticks(2);
+        let manual = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE);
+        assert!(manual.abs() < 0.03, "manual 0 EV: {manual}");
+        set_post(&mut app, scene.camera, post_ae(ae));
+        app.step_ticks(1);
+        let on = displayed_ev(&render(&mut app), AE_PROBE_RECT, AE_PROBE);
+        assert!((on - settled).abs() < 0.03, "re-enabled snaps: {on} vs {settled}");
+        // Steady state.
+        app.step_ticks(8);
+        for _ in 0..4 {
+            app.step_ticks(1);
+            let s = stats(&app);
+            assert_eq!(
+                (
+                    s.textures_created,
+                    s.cpu_reallocations,
+                    s.buffer_reallocations,
+                    s.bytes_uploaded
+                ),
+                (0, 0, 0, 0),
+                "{s:?}"
+            );
+        }
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    // ---- Color grading, LUTs, hooks (PO4) ----
+
+    /// Radiance of the grading probe quad (every channel different, all below 1).
+    const GRADE_COLOR: Vec3 = Vec3::new(0.4, 0.2, 0.08);
+
+    fn srgb_encode(v: f32) -> f32 {
+        if v <= 0.0031308 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    /// A grading probe: a quad of `GRADE_COLOR` filling the frame's middle; returns the camera.
+    fn grading_scene(app: &mut App, post: PostProcess) -> Entity {
+        quad(app, GRADE_COLOR, Vec2::ZERO, Vec2::new(2.0, 1.0));
+        camera(app, 0.0, BLACK, Some(post))
+    }
+
+    /// The probe's displayed linear color with `grading` (no tonemapper, no dither, no bloom).
+    fn graded(app: &mut App, cam: Entity, grading: ColorGrading) -> Vec3 {
+        set_post(
+            app,
+            cam,
+            post(Bloom::glow()).without_bloom().with_color_grading(grading),
+        );
+        mean(&render(app), [56, 24, 16, 16])
+    }
+
+    fn assert_close(got: Vec3, want: Vec3, tolerance: f32, what: &str) {
+        assert!((got - want).abs().max_element() <= tolerance, "{what}: {got} vs {want}");
+    }
+
+    /// Saturation, contrast, white balance and lift/gamma/gain do what their formulas say (the
+    /// probe's display value against a CPU computation: within 1.5/255 in the encoded space).
+    pub fn grading_matches_formulas(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let cam = grading_scene(&mut app, post(Bloom::glow()).without_bloom());
+        let c = GRADE_COLOR;
+        let plain = graded(&mut app, cam, ColorGrading::default());
+        assert_close(plain, c, 0.004, "neutral");
+        let luma = c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        let grey = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                saturation: 0.0,
+                ..Default::default()
+            },
+        );
+        assert_close(grey, Vec3::splat(luma), 0.004, "saturation 0");
+        let vivid = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                saturation: 1.5,
+                ..Default::default()
+            },
+        );
+        assert_close(
+            vivid,
+            Vec3::splat(luma) + (c - Vec3::splat(luma)) * 1.5,
+            0.005,
+            "saturation 1.5",
+        );
+        let contrast = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                contrast: 1.5,
+                ..Default::default()
+            },
+        );
+        let k = |v: f32| 0.18 * (v / 0.18).powf(1.5);
+        assert_close(contrast, Vec3::new(k(c.x), k(c.y), k(c.z)), 0.005, "contrast 1.5");
+        let warm = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                temperature: 0.6,
+                ..Default::default()
+            },
+        );
+        assert!(warm.x / warm.z > 1.15 * c.x / c.z, "warmer: {warm} vs {c}");
+        let cool = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                temperature: -0.6,
+                ..Default::default()
+            },
+        );
+        assert!(cool.z / cool.x > 1.15 * c.z / c.x, "cooler: {cool} vs {c}");
+        let magenta = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                tint: 0.6,
+                ..Default::default()
+            },
+        );
+        assert!(magenta.y / magenta.x < 0.95 * c.y / c.x, "magenta: {magenta} vs {c}");
+        // Lift/gamma/gain on the encoded color: (e · gain + lift)^(1 / gamma).
+        let cdl = ColorGrading {
+            lift: Vec3::new(0.05, 0.0, 0.1),
+            gamma: Vec3::new(1.0, 1.6, 0.8),
+            gain: Vec3::new(0.9, 1.1, 1.0),
+            ..Default::default()
+        };
+        let got = graded(&mut app, cam, cdl);
+        let want = Vec3::from_array(std::array::from_fn(|i| {
+            let e = srgb_encode(c[i]) * cdl.gain[i] + cdl.lift[i];
+            srgb_to_linear(e.max(0.0).powf(1.0 / cdl.gamma[i]).min(1.0))
+        }));
+        assert_close(got, want, 0.006, "lift/gamma/gain");
+        // The Ldr fallback grades too (display space, after its per-fragment tonemapping).
+        frame_settings(&mut app).downlevel.no_float_targets = true;
+        let grey = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                saturation: 0.0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            (grey.x - grey.z).abs() < 0.004 && grey.x > 0.05,
+            "Ldr fallback: grey {grey}"
+        );
+    }
+
+    /// A few colored quads and a ramp: the scene the LUT tests compare.
+    fn lut_scene(app: &mut App, post: PostProcess) -> Entity {
+        let colors = [
+            Vec3::new(0.8, 0.1, 0.05),
+            Vec3::new(0.05, 0.6, 0.1),
+            Vec3::new(0.1, 0.2, 0.9),
+            Vec3::new(0.9, 0.85, 0.2),
+            Vec3::new(0.3, 0.3, 0.3),
+            Vec3::new(2.0, 1.2, 0.4),
+        ];
+        for (i, c) in colors.into_iter().enumerate() {
+            let x = -1.6 + i as f32 * 0.64;
+            quad(app, c, Vec2::new(x, 0.3), Vec2::new(0.5, 0.8));
+            quad(
+                app,
+                Vec3::splat(i as f32 / 5.0),
+                Vec2::new(x, -0.6),
+                Vec2::new(0.6, 0.6),
+            );
+        }
+        camera(app, 0.0, Vec4::new(0.01, 0.015, 0.03, 1.0), Some(post))
+    }
+
+    /// An identity LUT changes nothing (8-bit strips of 16 and 32 within 2/255, a `.cube`
+    /// identity within 1/255, an sRGB-format strip within 2/255); after warm-up nothing is
+    /// created or reallocated.
+    pub fn lut_identity_is_neutral(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let base = PostProcess {
+            dither: false,
+            ..PostProcess::default()
+        };
+        let cam = lut_scene(&mut app, base);
+        let plain = render(&mut app);
+        let cube = {
+            let mut s = String::from("LUT_3D_SIZE 17\n");
+            for b in 0..17 {
+                for g in 0..17 {
+                    for r in 0..17 {
+                        s += &format!("{} {} {}\n", r as f32 / 16.0, g as f32 / 16.0, b as f32 / 16.0);
+                    }
+                }
+            }
+            s
+        };
+        let srgb = {
+            let mut t = ColorLut::identity(16);
+            t.format = wgpu::TextureFormat::Rgba8UnormSrgb;
+            // The strip's encoded values, stored as sRGB bytes: sampled (decoded) and
+            // re-encoded by the composite.
+            t
+        };
+        let strips = [
+            (ColorLut::identity(16), 16, 2),
+            (ColorLut::identity(32), 32, 2),
+            (ColorLut::from_cube(&cube).unwrap(), 17, 1),
+            (srgb, 16, 3),
+        ];
+        for (source, n, tolerance) in strips {
+            let format = source.format;
+            let lut = app.resources.expect_mut::<RenderAssets>().add_texture(source);
+            set_post(&mut app, cam, base.with_lut(ColorLut::new(lut, n)));
+            let graded = render(&mut app);
+            let d = max_diff(&plain, &graded);
+            assert!(d <= tolerance, "{format:?} {n}: max difference {d}");
+        }
+        for _ in 0..3 {
+            render(&mut app);
+        }
+        let s = stats(&app);
+        assert_eq!(
+            (s.textures_created, s.cpu_reallocations, s.bytes_uploaded),
+            (0, 0, 0),
+            "{s:?}"
+        );
+    }
+
+    /// A LUT that swaps red and blue turns the red quad blue; contribution 0.5 mixes; a strip of
+    /// the wrong size is ignored.
+    pub fn lut_changes_colors(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let base = post(Bloom::glow()).without_bloom();
+        let cam = grading_scene(&mut app, base);
+        let mut cube = String::from("TITLE \"swap\"\nLUT_3D_SIZE 9\n");
+        for b in 0..9 {
+            for g in 0..9 {
+                for r in 0..9 {
+                    cube += &format!("{} {} {}\n", b as f32 / 8.0, g as f32 / 8.0, r as f32 / 8.0);
+                }
+            }
+        }
+        let lut = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_texture(ColorLut::from_cube(&cube).unwrap());
+        let c = GRADE_COLOR;
+        let swapped = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                lut: Some(ColorLut::new(lut, 9)),
+                ..Default::default()
+            },
+        );
+        assert_close(swapped, Vec3::new(c.z, c.y, c.x), 0.01, "swapped");
+        let half = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                lut: Some(ColorLut {
+                    contribution: 0.5,
+                    ..ColorLut::new(lut, 9)
+                }),
+                ..Default::default()
+            },
+        );
+        // Mixed in the encoded space.
+        let mixed = |a: f32, b: f32| srgb_to_linear((srgb_encode(a) + srgb_encode(b)) * 0.5);
+        assert_close(half, Vec3::new(mixed(c.x, c.z), c.y, mixed(c.z, c.x)), 0.01, "half");
+        let wrong = graded(
+            &mut app,
+            cam,
+            ColorGrading {
+                lut: Some(ColorLut::new(lut, 8)),
+                ..Default::default()
+            },
+        );
+        assert_close(wrong, c, 0.004, "a strip of the wrong size is ignored");
+    }
+
+    /// Grading hooks: `post_hdr_hook` doubling the HDR color equals +1 EV, `post_ldr_hook`
+    /// swapping channels swaps them; a hook that does not compile (or declares a resource) is
+    /// replaced by identity and reported by `Renderer::shader_error`, and a hot-reload fixes it.
+    pub fn invalid_grading_hook_falls_back(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let base = post(Bloom::glow()).without_bloom();
+        let cam = grading_scene(&mut app, base);
+        let plain = render(&mut app);
+        let hdr = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+            "double",
+            "fn post_hdr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> { return c * 2.0; }",
+        ));
+        set_post(
+            &mut app,
+            cam,
+            base.with_color_grading(ColorGrading {
+                shader: Some(hdr),
+                ..Default::default()
+            }),
+        );
+        let doubled = render(&mut app);
+        set_post(&mut app, cam, base.with_exposure(1.0));
+        assert!(max_diff(&doubled, &render(&mut app)) <= 1, "hdr hook × 2 = +1 EV");
+        let ldr = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+            "swap",
+            "fn post_ldr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> { return c.bgr; }",
+        ));
+        let swap = ColorGrading {
+            shader: Some(ldr),
+            ..Default::default()
+        };
+        let swapped = graded(&mut app, cam, swap);
+        let c = GRADE_COLOR;
+        assert_close(swapped, Vec3::new(c.z, c.y, c.x), 0.004, "ldr hook");
+        assert!(app.resources.expect::<Renderer>().shader_error(ldr).is_none());
+        // A syntax error: identity, reported.
+        app.resources.expect_mut::<RenderAssets>().update_shader(
+            ldr,
+            CustomShader::new(
+                "broken",
+                "fn post_ldr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> { return c.bgr + ; }",
+            ),
+        );
+        set_post(&mut app, cam, base.with_color_grading(swap));
+        assert_eq!(render(&mut app), plain, "broken hook: identity");
+        let error = app.resources.expect::<Renderer>().shader_error(ldr).map(str::to_owned);
+        assert!(error.is_some(), "the error is reported");
+        // A resource the composite does not bind: rejected the same way.
+        app.resources.expect_mut::<RenderAssets>().update_shader(
+            ldr,
+            CustomShader::new(
+                "resource",
+                "@group(2) @binding(0) var<uniform> extra: vec4<f32>;\n\
+                 fn post_ldr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> { return c * extra.x; }",
+            ),
+        );
+        assert_eq!(render(&mut app), plain, "resource hook: identity");
+        let error = app
+            .resources
+            .expect::<Renderer>()
+            .shader_error(ldr)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("extra"), "{error}");
+        // Fixed by a hot reload.
+        app.resources.expect_mut::<RenderAssets>().update_shader(
+            ldr,
+            CustomShader::new(
+                "swap again",
+                "fn post_ldr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> { return c.bgr; }",
+            ),
+        );
+        let swapped = mean(&render(&mut app), [56, 24, 16, 16]);
+        assert_close(swapped, Vec3::new(c.z, c.y, c.x), 0.004, "fixed");
+        assert!(app.resources.expect::<Renderer>().shader_error(ldr).is_none());
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
     fn stats(app: &App) -> RenderStats {
         app.resources.expect::<RenderStats>().clone()
     }
 
     fn set_path(app: &mut App, path: DrawPath) {
         app.resources.expect_mut::<RenderSettings>().draw_path = Some(path);
+    }
+}
+
+/// Distortion (PO5) test bodies, shared by `tests/post_distortion.rs` and the GL run.
+///
+/// The scenes are 128 × 128 under the orthographic camera 2 units high (64 px per unit): a bright
+/// top-right quadrant (radiance 1, edges at pixel 64) behind a 1 × 1 `DistortionMaterial` quad
+/// centered on the view whose constant texture looks `(+1, +1) × strength` view heights away
+/// (right and up). The composite shows at each pixel the scene that far away, so the quadrant's
+/// vertical edge appears moved left and its horizontal edge down by `strength × 128` pixels
+/// (5.11 px at strength 0.04, after the buffer's 8-bit encoding), measured to sub-pixel precision
+/// from the linear light of a window of pixels around each edge.
+pub mod distortion {
+    use super::*;
+
+    pub const S: u32 = 128;
+    const BLACK: Vec4 = Vec4::new(0.0, 0.0, 0.0, 1.0);
+    /// The writer's strength (view heights) and the shift it produces in pixels: the encoded
+    /// value round(0.04 / 0.0625 × 255) = 163 decodes to 163 / 255 × 0.0625 view heights.
+    pub const STRENGTH: f32 = 0.04;
+    pub fn expected_shift(height: u32) -> f32 {
+        (STRENGTH / 0.0625 * 255.0).round() / 255.0 * 0.0625 * height as f32
+    }
+
+    /// Post without bloom, tonemapping or dither: displayed = radiance.
+    pub fn plain_post() -> PostProcess {
+        post(Bloom::glow()).without_bloom()
+    }
+
+    /// An unlit quad of radiance `color` centered at `center` (z included), facing the camera.
+    pub fn quad_at(app: &mut App, color: f32, center: Vec3, size: Vec2) -> Entity {
+        let mesh = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_mesh(MeshData::plane(1.0));
+        app.world.spawn((
+            Transform::from_xyz(center.x, center.y, center.z)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::new(size.x, 1.0, size.y)),
+            Mesh3d(mesh),
+            Material::unlit(Vec4::new(color, color, color, 1.0)),
+        ))
+    }
+
+    /// A 4 × 4 linear texture of constant red and green (`DistortionMode::Normal` offsets).
+    pub fn offset_texture(app: &mut App, r: u8, g: u8) -> TextureHandle {
+        let mut img = ImageData::new(4, 4);
+        for p in img.pixels.as_chunks_mut::<4>().0 {
+            *p = [r, g, 0, 255];
+        }
+        app.resources
+            .expect_mut::<RenderAssets>()
+            .add_texture(TextureSource::from_image_linear(img))
+    }
+
+    /// A `DistortionMaterial` plane (no `Material`: not drawn in color) of `size` at `center`,
+    /// facing the camera: U to the right, V down the screen.
+    pub fn writer(app: &mut App, center: Vec3, size: Vec2, material: DistortionMaterial) -> Entity {
+        let mesh = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_mesh(MeshData::plane(1.0));
+        app.world.spawn((
+            Transform::from_xyz(center.x, center.y, center.z)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::new(size.x, 1.0, size.y)),
+            Mesh3d(mesh),
+            material,
+        ))
+    }
+
+    /// The constant writer: looks (+1, +1) × `STRENGTH` view heights away (texture (255, 0):
+    /// +U, −V, i.e. right and up).
+    pub fn constant(app: &mut App) -> DistortionMaterial {
+        DistortionMaterial {
+            strength: STRENGTH,
+            texture: Some(offset_texture(app, 255, 0)),
+            scroll: Vec2::ZERO,
+            ..DistortionMaterial::default()
+        }
+    }
+
+    /// The standard scene: camera (post `p`), the bright quadrant at depth `z_back`, the
+    /// constant writer at z = 0.
+    pub fn scene(app: &mut App, p: PostProcess, z_back: f32) -> (Entity, Entity) {
+        quad_at(app, 1.0, Vec3::new(0.5, 0.5, z_back), Vec2::ONE);
+        let cam = camera(app, 0.0, BLACK, Some(p));
+        let m = constant(app);
+        let w = writer(app, Vec3::ZERO, Vec2::ONE, m);
+        (cam, w)
+    }
+
+    /// Sub-pixel x of a dark → bright edge in row `y` within `[x0, x1)`: x1 − Σ linear value of
+    /// `channel` (exact for a bilinearly sampled step).
+    pub fn edge_x(img: &ImageData, y: u32, x0: u32, x1: u32, channel: usize) -> f32 {
+        x1 as f32 - (x0..x1).map(|x| lin(img, x, y)[channel]).sum::<f32>()
+    }
+
+    /// Sub-pixel y of a bright → dark edge (bright above) in column `x` within `[y0, y1)`.
+    pub fn edge_y(img: &ImageData, x: u32, y0: u32, y1: u32, channel: usize) -> f32 {
+        y0 as f32 + (y0..y1).map(|y| lin(img, x, y)[channel]).sum::<f32>()
+    }
+
+    /// Mean vertical-edge x over the rows `rows` and horizontal-edge y over the columns `cols`
+    /// (the writer's full-strength region), in `channel`.
+    pub fn edges(img: &ImageData, channel: usize) -> (f32, f32) {
+        let rows = 46..58u32;
+        let cols = 66..80u32;
+        let x = rows.clone().map(|y| edge_x(img, y, 48, 80, channel)).sum::<f32>() / rows.len() as f32;
+        let y = cols.clone().map(|x| edge_y(img, x, 48, 80, channel)).sum::<f32>() / cols.len() as f32;
+        (x, y)
+    }
+
+    fn stats(app: &App) -> RenderStats {
+        app.resources.expect::<RenderStats>().clone()
+    }
+
+    fn assert_near(actual: f32, expected: f32, tolerance: f32, what: &str) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{what}: {actual} px, expected {expected} ± {tolerance}"
+        );
+    }
+
+    /// `distortion_shifts_the_background` (spec PO5, ±1 px): the quadrant's edges move by the
+    /// written offset where the writer is (left and down: the pixels look right and up), and
+    /// stay exactly where they were elsewhere; pixels away from the writer are bit-identical
+    /// to the scene without it. `setup` adjusts the app (downlevel overrides, render scale).
+    pub fn distortion_shifts_the_background(make: MakeApp, setup: fn(&mut App)) {
+        let Some(mut app) = make(S, S) else { return };
+        setup(&mut app);
+        let (_, w) = scene(&mut app, plain_post(), -1.0);
+        let img = render(&mut app);
+        assert_eq!(stats(&app).distortion_passes, 1, "one Distortion pass");
+        let shift = expected_shift(S);
+        let (x, y) = edges(&img, 0);
+        eprintln!("edges at ({x}, {y}), expected ({}, {})", 64.0 - shift, 64.0 + shift);
+        assert_near(x, 64.0 - shift, 1.0, "vertical edge");
+        assert_near(y, 64.0 + shift, 1.0, "horizontal edge");
+        // Away from the writer (rows above it): the edge is where it was.
+        assert_near(edge_x(&img, 10, 48, 80, 0), 64.0, 0.02, "undistorted edge");
+        app.world.despawn(w).unwrap();
+        let plain = render(&mut app);
+        assert_eq!(stats(&app).distortion_passes, 0);
+        assert_near(edges(&plain, 0).0, 64.0, 0.02, "without the writer");
+        for y in (0..28).chain(100..S) {
+            for x in 0..S {
+                assert_eq!(img.get(x, y), plain.get(x, y), "({x}, {y}) is away from the writer");
+            }
+        }
+    }
+
+    /// The distortion's spectral split: with `chromatic` c, red looks (1 − c) and blue (1 + c)
+    /// times as far as green (spec §1.9: the CA split of the distorted lookup).
+    pub fn distortion_chromatic_split(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        let mut p = plain_post();
+        p.distortion.chromatic = 0.5;
+        scene(&mut app, p, -1.0);
+        let img = render(&mut app);
+        let shift = expected_shift(S);
+        for (channel, k) in [(0, 0.5), (1, 1.0), (2, 1.5)] {
+            let (x, y) = edges(&img, channel);
+            assert_near(x, 64.0 - shift * k, 1.0, &format!("channel {channel} vertical"));
+            assert_near(y, 64.0 + shift * k, 1.0, &format!("channel {channel} horizontal"));
+        }
+        // `Distortion::strength` scales every offset.
+        p.distortion.chromatic = 0.0;
+        p.distortion.strength = 0.5;
+        let cam = app.world.query::<(Entity, &Camera3d)>().iter().next().unwrap().0;
+        set_post(&mut app, cam, p);
+        let (x, _) = edges(&render(&mut app), 1);
+        assert_near(x, 64.0 - shift * 0.5, 1.0, "half strength");
+    }
+
+    /// `distortion_occluded_by_closer_geometry`: an occluder in front of the writer (two
+    /// panels, 0.5 and 0.25, meeting at pixel 56) is not distorted — its interior is identical
+    /// to the render without the writer — while behind the writer it is. `msaa`: the same with
+    /// 4× MSAA (a depth resolve where the device samples multisampled depth; on GL no occlusion,
+    /// documented).
+    pub fn distortion_occluded_by_closer_geometry(make: MakeApp, setup: fn(&mut App), occluded: bool) {
+        let Some(mut app) = make(S, S) else { return };
+        setup(&mut app);
+        let (_, w) = scene(&mut app, plain_post(), -1.0);
+        // Panels over rows 48..80: x 40..56 (0.5) and 56..72 (0.25), in front (z = 1).
+        let left = quad_at(&mut app, 0.5, Vec3::new(-0.25, 0.0, 1.0), Vec2::new(0.25, 0.5));
+        let right = quad_at(&mut app, 0.25, Vec3::new(0.0, 0.0, 1.0), Vec2::new(0.25, 0.5));
+        let img = render(&mut app);
+        app.world.despawn(w).unwrap();
+        let plain = render(&mut app);
+        // Interior of the panels (2 px from their outline: the half-resolution buffer is sampled
+        // bilinearly across it).
+        let interior = |a: &ImageData, b: &ImageData| {
+            let mut d = 0u8;
+            for y in 52..76 {
+                for x in 44..70 {
+                    let (p, q) = (a.get(x, y), b.get(x, y));
+                    for c in 0..3 {
+                        d = d.max(p[c].abs_diff(q[c]));
+                    }
+                }
+            }
+            d
+        };
+        if occluded {
+            assert_eq!(interior(&img, &plain), 0, "the closer panels are not distorted");
+        } else {
+            assert!(
+                interior(&img, &plain) > 50,
+                "no occlusion without sampled depth (GL + MSAA)"
+            );
+        }
+        // Behind the writer the same panels are distorted: their inner edge moves left.
+        let m = constant(&mut app);
+        writer(&mut app, Vec3::ZERO, Vec2::ONE, m);
+        for (panel, x) in [(left, -0.25), (right, 0.0)] {
+            app.world
+                .insert_one(
+                    panel,
+                    Transform::from_xyz(x, 0.0, -0.5)
+                        .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                        .with_scale(Vec3::new(0.25, 1.0, 0.5)),
+                )
+                .unwrap();
+        }
+        let behind = render(&mut app);
+        assert!(interior(&behind, &plain) > 50, "panels behind the writer are distorted");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// The foreground guard: a writer behind the panels that looks left, into them, leaves the
+    /// pixels right of the panels undistorted (it would drag the closer panels over the
+    /// background there), and still distorts where it looks at the background.
+    pub fn foreground_is_not_dragged_over_the_background(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        quad_at(&mut app, 1.0, Vec3::new(0.5, 0.5, -1.0), Vec2::ONE);
+        camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        quad_at(&mut app, 0.25, Vec3::new(0.0, 0.0, 1.0), Vec2::new(0.25, 0.5));
+        let plain = render(&mut app);
+        let left = DistortionMaterial {
+            strength: STRENGTH,
+            texture: Some(offset_texture(&mut app, 0, 128)),
+            scroll: Vec2::ZERO,
+            ..DistortionMaterial::default()
+        };
+        writer(&mut app, Vec3::ZERO, Vec2::ONE, left);
+        let img = render(&mut app);
+        // Right of the panel (x 72 on): the pixels that would look into it keep the background.
+        for y in 52..62 {
+            for x in 72..76 {
+                assert_eq!(img.get(x, y), plain.get(x, y), "({x}, {y}) next to the panel");
+            }
+        }
+        // Farther right the writer looks at the background: the quadrant's edge (x 64, hidden by
+        // the panel in rows 48..80) is not involved, so check the rows above the panel: the edge
+        // moves right (the pixels look left).
+        let x = (46..48).map(|y| edge_x(&img, y, 56, 88, 0)).sum::<f32>() / 2.0;
+        assert_near(x, 64.0 + expected_shift(S), 1.0, "above the panel");
+    }
+
+    /// `hdr_scene_overlays_are_distorted`: an HdrScene overlay is part of the scene color, so
+    /// it moves with the background; an AfterTonemap one is drawn after post and does not.
+    pub fn hdr_scene_overlays_are_distorted(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        let m = constant(&mut app);
+        writer(&mut app, Vec3::ZERO, Vec2::ONE, m);
+        // The bright quadrant, drawn by an overlay instead of a mesh.
+        let overlays = app.resources.expect_mut::<RenderOverlays>();
+        overlays.insert(
+            "fill",
+            0,
+            FillOverlay::new(OverlayStage::HdrScene, [64, 0, 64, 64], [1.0, 1.0, 1.0, 1.0]),
+        );
+        let img = render(&mut app);
+        let shift = expected_shift(S);
+        let (x, y) = edges(&img, 0);
+        assert_near(x, 64.0 - shift, 1.0, "HdrScene overlay, vertical edge");
+        assert_near(y, 64.0 + shift, 1.0, "HdrScene overlay, horizontal edge");
+        let overlays = app.resources.expect_mut::<RenderOverlays>();
+        overlays.insert(
+            "fill",
+            0,
+            FillOverlay::new(OverlayStage::AfterTonemap, [64, 0, 64, 64], [1.0, 1.0, 1.0, 1.0]),
+        );
+        let (x, y) = edges(&render(&mut app), 0);
+        assert_near(x, 64.0, 0.02, "AfterTonemap overlay, vertical edge");
+        assert_near(y, 64.0, 0.02, "AfterTonemap overlay, horizontal edge");
+    }
+
+    /// `no_distortion_pass_without_writers`: distortion is on by default and costs nothing
+    /// without a writer with work in the post camera's view: no Distortion pass (and a
+    /// bit-identical image) without writers, with the writer hidden or off-screen, with
+    /// `Distortion::enabled` false, and for a camera without post (Direct mode).
+    pub fn no_distortion_pass_without_writers(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        quad_at(&mut app, 1.0, Vec3::new(0.5, 0.5, -1.0), Vec2::ONE);
+        let cam = camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        let plain = render(&mut app);
+        let s = stats(&app);
+        assert_eq!((s.distortion_passes, s.post_passes), (0, 1), "{s:?}");
+        let bytes = s.target_bytes;
+        let m = constant(&mut app);
+        let w = writer(&mut app, Vec3::ZERO, Vec2::ONE, m);
+        assert_ne!(render(&mut app), plain);
+        let s = stats(&app);
+        assert_eq!((s.distortion_passes, s.post_passes), (1, 1), "{s:?}");
+        assert_eq!(
+            s.target_bytes,
+            bytes + 64 * 64 * 4,
+            "a half-resolution Rgba8Unorm buffer"
+        );
+        for (what, change) in [
+            ("hidden", 0),
+            ("off-screen", 1),
+            ("distortion disabled", 2),
+            ("no post", 3),
+        ] {
+            match change {
+                0 => app.world.insert_one(w, Visibility::Hidden).unwrap(),
+                1 => {
+                    app.world.insert_one(w, Visibility::Visible).unwrap();
+                    app.world.get::<&mut Transform>(w).unwrap().translation.x = 5.0;
+                }
+                2 => {
+                    app.world.get::<&mut Transform>(w).unwrap().translation.x = 0.0;
+                    let mut p = plain_post();
+                    p.distortion.enabled = false;
+                    set_post(&mut app, cam, p);
+                }
+                _ => {
+                    app.world.remove_one::<PostProcess>(cam).unwrap();
+                }
+            }
+            let img = render(&mut app);
+            assert_eq!(stats(&app).distortion_passes, 0, "{what}");
+            if change < 3 {
+                assert_eq!(img, plain, "{what}: bit-identical");
+            }
+        }
+        // A camera without post never draws distortion writers: Direct mode, as before.
+        assert_eq!(stats(&app).post_passes, 0);
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// `DistortionMode::Radial` pushes the image under its ring outward: the quadrant's edge,
+    /// crossing the ring to the right of its center, moves right (the pixels look toward the
+    /// center); inside the inner radius and outside the outer one nothing moves.
+    pub fn radial_distortion_pushes_outward(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        quad_at(&mut app, 1.0, Vec3::new(0.5, 0.5, -1.0), Vec2::ONE);
+        camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        // Ring centered 0.25 units left of the edge, radii 0.1 … 0.5 (UV = units: a 1 × 1 quad).
+        writer(
+            &mut app,
+            Vec3::new(-0.25, 0.25, 0.0),
+            Vec2::ONE,
+            DistortionMaterial {
+                strength: STRENGTH,
+                mode: DistortionMode::Radial { inner: 0.1, outer: 0.5 },
+                ..DistortionMaterial::default()
+            },
+        );
+        let img = render(&mut app);
+        // Row through the ring's center (y = 0.25 units: pixel 48): the edge at 64 is 0.25 units
+        // (UV) from the center, where the ring profile sin²(π × 0.375) = 0.854 looks toward the
+        // center: pushed right by about 0.854 × 5.12 px (the profile falls across the edge's
+        // footprint, so allow ±1 px).
+        let x = (46..50).map(|y| edge_x(&img, y, 56, 88, 0)).sum::<f32>() / 4.0;
+        let push = 0.854 * expected_shift(S);
+        assert_near(x, 64.0 + push, 1.0, "pushed outward");
+        // Far above the ring: unchanged.
+        assert_near(edge_x(&img, 4, 48, 80, 0), 64.0, 0.02, "outside the ring");
+    }
+
+    /// Split screen: the writer in the left post group looks right, past its rect's right edge
+    /// into the right group's pixels: the composite clamps the lookup to the rect, so no pixel of
+    /// the right view (bright) appears in the left one; the right group has no Distortion pass
+    /// of its own and is exactly as without the writer.
+    pub fn distortion_does_not_bleed_across_viewports(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        // The right camera looks at a bright wall far away from the left one's scene.
+        quad_at(&mut app, 1.0, Vec3::new(100.0, 0.0, -1.0), Vec2::splat(4.0));
+        let left = camera(&mut app, 0.0, BLACK, Some(plain_post()));
+        let right = camera(&mut app, 100.0, BLACK, Some(plain_post()));
+        for (e, viewport, order) in [(left, [0.0, 0.0, 0.5, 1.0], 0), (right, [0.5, 0.0, 0.5, 1.0], 1)] {
+            let mut c = app.world.get::<&mut Camera3d>(e).unwrap();
+            c.viewport = Some(viewport);
+            c.order = order;
+        }
+        let m = constant(&mut app);
+        // At the left view's right edge (its 64-px-wide rect is 1 unit wide: x 0.25 … 0.5).
+        let w = writer(&mut app, Vec3::new(0.375, 0.0, 0.0), Vec2::new(0.5, 1.0), m);
+        let img = render(&mut app);
+        assert_eq!(stats(&app).distortion_passes, 1, "only the left group has a writer");
+        for y in 0..S {
+            for x in 0..64 {
+                assert_eq!(lin(&img, x, y), Vec3::ZERO, "({x}, {y}) of the left view");
+            }
+        }
+        app.world.despawn(w).unwrap();
+        let plain = render(&mut app);
+        for y in 0..S {
+            for x in 64..S {
+                assert_eq!(img.get(x, y), plain.get(x, y), "({x}, {y}) of the right view");
+            }
+        }
+    }
+
+    /// A still scene with a distortion writer (no scroll) reaches a steady state: no textures,
+    /// reallocations or uploads, and the same image every frame; a scrolling haze (noise) uploads
+    /// its 96-byte instance each frame the render time moves, and `render_to_image` twice at the
+    /// same time is identical.
+    pub fn distortion_steady_state(make: MakeApp) {
+        let Some(mut app) = make(S, S) else { return };
+        let (_, w) = scene(&mut app, plain_post(), -1.0);
+        let first = render(&mut app);
+        for _ in 0..4 {
+            render(&mut app);
+        }
+        let s = stats(&app);
+        assert_eq!(
+            (
+                s.textures_created,
+                s.cpu_reallocations,
+                s.buffer_reallocations,
+                s.bytes_uploaded
+            ),
+            (0, 0, 0, 0),
+            "{s:?}"
+        );
+        assert_eq!(render(&mut app), first, "deterministic");
+        // A heat haze: the built-in noise scrolled by render time.
+        app.world
+            .insert_one(
+                w,
+                DistortionMaterial {
+                    strength: 0.02,
+                    ..DistortionMaterial::default()
+                },
+            )
+            .unwrap();
+        let a = render(&mut app);
+        assert_eq!(render(&mut app), a, "the same render time: the same haze");
+        assert_eq!(stats(&app).bytes_uploaded, 0);
+        app.step_ticks(6);
+        let b = render(&mut app);
+        assert_ne!(a, b, "the haze scrolls with render time");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+}
+
+/// Post hardening (PO6) test bodies: GPU timing labels, pass and memory counts, resizes and
+/// device loss with every effect on.
+pub mod hardening {
+    use super::distortion::{quad_at, writer};
+    use super::*;
+
+    const BLACK: Vec4 = Vec4::new(0.0, 0.0, 0.0, 1.0);
+
+    fn stats(app: &App) -> RenderStats {
+        app.resources.expect::<RenderStats>().clone()
+    }
+
+    /// Every post effect at once: auto exposure (instant), bloom, FXAA, vignette, chromatic
+    /// aberration, grain, grading with a LUT and a distortion writer, over a small lit and
+    /// emissive scene. Returns the camera.
+    pub fn all_post(app: &mut App) -> Entity {
+        quad_at(app, 0.4, Vec3::new(-0.5, 0.2, -1.0), Vec2::new(1.2, 0.8));
+        quad_at(app, 6.0, Vec3::new(0.6, -0.3, -1.0), Vec2::splat(0.2));
+        quad_at(app, 0.1, Vec3::new(0.0, 0.0, -2.0), Vec2::new(6.0, 3.0));
+        let lut = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_texture(ColorLut::identity(16));
+        let mut p = PostProcess::cinematic()
+            .with_auto_exposure(AutoExposure::on().instant())
+            .with_color_grading(ColorGrading {
+                temperature: 0.2,
+                saturation: 1.1,
+                lut: Some(ColorLut::new(lut, 16)),
+                ..ColorGrading::default()
+            });
+        p.distortion.chromatic = 0.3;
+        let cam = camera(app, 0.0, BLACK, Some(p));
+        writer(
+            app,
+            Vec3::ZERO,
+            Vec2::ONE,
+            DistortionMaterial {
+                strength: 0.03,
+                mode: DistortionMode::Radial { inner: 0.2, outer: 0.5 },
+                ..DistortionMaterial::default()
+            },
+        );
+        cam
+    }
+
+    /// Every post pass writes GPU timestamps under its spec §4.4 label, for its camera:
+    /// `post.exposure` (the compute pass, or one span over the render-pass chain),
+    /// `post.bloom` (one span over the chain), `post.composite`, `post.fxaa`, and the frame's
+    /// `distortion`. Skipped without `TIMESTAMP_QUERY`.
+    pub fn post_gpu_timings_are_labelled(make: MakeApp) {
+        let Some(mut app) = make(320, 180) else { return };
+        if !app.resources.expect::<Renderer>().graphics_caps().timestamps {
+            eprintln!("skipping: no TIMESTAMP_QUERY");
+            return;
+        }
+        let cam = all_post(&mut app);
+        app.resources.expect_mut::<FrameSettings>().gpu_timing = true;
+        for no_compute in [false, true] {
+            app.resources.expect_mut::<FrameSettings>().downlevel.no_compute = no_compute;
+            for _ in 0..6 {
+                render(&mut app);
+            }
+            let t = app.resources.expect::<GpuTimings>().clone();
+            eprintln!("no_compute {no_compute}: {:?}", t.scopes);
+            for label in [
+                "post.exposure",
+                "post.bloom",
+                "post.composite",
+                "post.fxaa",
+                "distortion",
+            ] {
+                let scope = t.scopes.iter().find(|s| s.label == label);
+                let scope = scope.unwrap_or_else(|| panic!("no `{label}` scope in {:?}", t.scopes));
+                assert_eq!(scope.camera, Some(cam), "{label}");
+                assert!(scope.ms >= 0.0 && scope.ms < 100.0, "{label}: {} ms", scope.ms);
+            }
+            let exposure = t.scopes.iter().filter(|s| s.label == "post.exposure").count();
+            assert_eq!(exposure, 1, "one exposure scope per group (a span over the chain)");
+        }
+    }
+
+    /// Pass and memory counts at 1920 × 1080 (spec §4.4, design-post §5.6): the composite alone
+    /// is one post pass; bloom adds the 6-level chain (11 passes, 2.76 MB of `Rg11b10Ufloat` or
+    /// twice that in `Rgba16Float`); auto exposure one compute pass (4 render passes, 1.1 MB of
+    /// levels on the render-pass path); FXAA one pass and the 8.3 MB LDR intermediate; distortion
+    /// one Distortion pass and its 2.1 MB half-resolution buffer (8.3 MB at full resolution).
+    pub fn post_pass_and_memory_counts(make: MakeApp) {
+        let Some(mut app) = make(1920, 1080) else { return };
+        quad_at(&mut app, 6.0, Vec3::new(0.3, 0.2, -1.0), Vec2::splat(0.3));
+        let minimal = PostProcess {
+            dither: true,
+            ..PostProcess::default().without_bloom()
+        };
+        let cam = camera(&mut app, 0.0, BLACK, Some(minimal));
+        let caps = app.resources.expect::<Renderer>().graphics_caps().clone();
+        let measure = |app: &mut App, p: PostProcess| {
+            set_post(app, cam, p);
+            render(app);
+            render(app);
+            let s = stats(app);
+            assert_eq!((s.textures_created, s.cpu_reallocations), (0, 0), "{s:?}");
+            s
+        };
+        let base = measure(&mut app, minimal);
+        assert_eq!(
+            (base.post_passes, base.distortion_passes, base.compute_passes),
+            (1, 0, 0)
+        );
+        let bloom = measure(&mut app, minimal.with_bloom(Bloom::glow()));
+        assert_eq!(bloom.post_passes, 12, "prefilter, 5 down, 5 up, composite");
+        let chain_px: u64 = [(960, 540), (480, 270), (240, 135), (120, 67), (60, 33), (30, 16)]
+            .iter()
+            .map(|&(w, h)| w * h)
+            .sum();
+        let texel = match caps.bloom_format {
+            Some(wgpu::TextureFormat::Rg11b10Ufloat) => 4,
+            _ => 8,
+        };
+        assert_eq!(
+            bloom.target_bytes - base.target_bytes,
+            chain_px * texel,
+            "the bloom chain"
+        );
+        let compute = caps.compute_histogram && caps.exposure_format == Some(wgpu::TextureFormat::R32Float);
+        let ae = measure(
+            &mut app,
+            minimal.with_bloom(Bloom::glow()).with_auto_exposure(AutoExposure::on()),
+        );
+        if compute {
+            assert_eq!((ae.post_passes, ae.compute_passes), (12, 1));
+            assert_eq!(ae.target_bytes, bloom.target_bytes, "no pooled levels");
+        } else {
+            // 480 × 270 → 60 × 34 → 8 × 5, then the adapt pass.
+            assert_eq!(ae.post_passes, 16);
+            let levels: u64 = 480 * 270 + 60 * 34 + 8 * 5;
+            assert_eq!(ae.target_bytes - bloom.target_bytes, levels * 8);
+        }
+        let fxaa = measure(&mut app, minimal.with_fxaa(FxaaQuality::Medium));
+        assert_eq!(fxaa.post_passes, 2);
+        assert_eq!(
+            fxaa.target_bytes - base.target_bytes,
+            1920 * 1080 * 4,
+            "the LDR intermediate"
+        );
+        writer(&mut app, Vec3::ZERO, Vec2::ONE, DistortionMaterial::default());
+        let half = measure(&mut app, minimal);
+        assert_eq!((half.post_passes, half.distortion_passes), (1, 1));
+        assert_eq!(
+            half.target_bytes - base.target_bytes,
+            960 * 540 * 4,
+            "half-resolution buffer"
+        );
+        let mut full = minimal;
+        full.distortion.resolution = DistortionResolution::Full;
+        set_post(&mut app, cam, full);
+        render(&mut app);
+        assert_eq!(stats(&app).textures_created, 1, "the buffer is resized once");
+        let full = measure(&mut app, full);
+        assert_eq!(full.target_bytes - base.target_bytes, 1920 * 1080 * 4);
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// `resize_reallocates_once_and_stays_bounded`: 30 resizes with every effect on. Each new
+    /// size reallocates on its first frame only (the next frame creates no texture and
+    /// reallocates nothing), the targets in use stay within a fixed budget per pixel (scene,
+    /// depth, output, bloom chain, LDR intermediate, distortion buffer), and back at the first
+    /// size the frame uses exactly the memory it used before: nothing leaks.
+    pub fn resize_reallocates_once_and_stays_bounded(make: MakeApp) {
+        let Some(mut app) = make(320, 180) else { return };
+        all_post(&mut app);
+        render(&mut app);
+        render(&mut app);
+        let first = stats(&app).target_bytes;
+        for i in 0..30u32 {
+            let (w, h) = (160 + (i * 37) % 320, 90 + (i * 23) % 200);
+            app.resources.expect_mut::<Renderer>().resize(w, h);
+            let img = render(&mut app);
+            assert_eq!((img.width, img.height), (w, h));
+            assert!(stats(&app).textures_created > 0, "{w} × {h}: reallocated");
+            render(&mut app);
+            let s = stats(&app);
+            assert_eq!((s.textures_created, s.cpu_reallocations), (0, 0), "{w} × {h}: once");
+            // Rgba16Float scene 8 + depth 4 + output 4 + LDR 4 + distortion 1 + bloom ≤ 2 bytes
+            // per pixel, and 64 KiB for the small targets.
+            let budget = 24 * w as u64 * h as u64 + (64 << 10);
+            assert!(s.target_bytes <= budget, "{w} × {h}: {} bytes", s.target_bytes);
+        }
+        app.resources.expect_mut::<Renderer>().resize(320, 180);
+        render(&mut app);
+        render(&mut app);
+        assert_eq!(stats(&app).target_bytes, first, "back at 320 × 180");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// A lost device with every effect on (auto exposure read back, bloom, FXAA, grading, LUT,
+    /// distortion meshes) degrades like the rest of the renderer: frames are dropped and
+    /// captures fail, without a panic or a hang.
+    pub fn a_lost_device_degrades_with_every_effect(make: MakeApp) {
+        let Some(mut app) = make(160, 90) else { return };
+        app.resources.expect_mut::<FrameSettings>().read_exposure = true;
+        let cam = all_post(&mut app);
+        render(&mut app);
+        app.resources.expect::<Renderer>().device().destroy();
+        for _ in 0..3 {
+            app.run_stage(Stage::Render);
+        }
+        assert!(render_to_image(&mut app).is_none());
+        // New writers, textures and settings after the loss.
+        writer(
+            &mut app,
+            Vec3::new(0.5, 0.0, 0.0),
+            Vec2::ONE,
+            DistortionMaterial::default(),
+        );
+        set_post(&mut app, cam, PostProcess::default().with_fxaa(FxaaQuality::High));
+        app.resources.expect_mut::<Renderer>().resize(200, 100);
+        for _ in 0..3 {
+            app.run_stage(Stage::Render);
+        }
+        let _ = app.resources.expect::<Renderer>().camera_exposure(cam);
+        assert!(render_to_image(&mut app).is_none());
     }
 }

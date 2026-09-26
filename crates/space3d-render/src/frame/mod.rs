@@ -987,7 +987,7 @@ impl Renderer {
                 passthrough: pg.passthrough,
                 distortion: pg.distortion,
             };
-            post.plan_group(world, &plan, &mut cpu_reallocs);
+            post.plan_group(world, assets, &plan, &mut cpu_reallocs);
             if pg.distortion {
                 // The group's rect in `S` (spec §1.8 as amended): the buffer follows the render
                 // scale, and scene depth maps onto it at a fixed ratio.

@@ -609,7 +609,9 @@ fn hdr_scene_overlay_composes_scene_wgsl() {
             let caps = app.resources.expect::<Renderer>().graphics_caps().clone();
             let cam = scene(&mut app);
             if post {
-                app.world.insert_one(cam, no_dither()).unwrap();
+                // No bloom: the red/blue marks (radiance 1, in the default soft knee) would
+                // glow across their borders.
+                app.world.insert_one(cam, no_dither().without_bloom()).unwrap();
             }
             let what = format!("×{samples} post {post}");
             // The scene alone: geometry is wherever the clear color is not.
