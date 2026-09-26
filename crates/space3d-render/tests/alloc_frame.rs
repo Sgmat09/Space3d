@@ -326,7 +326,14 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
     eprintln!(
         "hdr moving, unpaced: allocations per frame mean {mean:.1} max {max}, {chunks} staging chunks created in {frames} frames ({late_chunks} after the first 100)"
     );
-    assert_eq!(late_chunks, 0, "the staging ring follows an unbounded queue");
+    // Metal falls three frames behind within the first 100 frames. On GL (ANGLE) the queue
+    // reaches that depth only now and then, so the ring may still grow to it later (once per
+    // chunk: a ring that followed an unbounded queue, or churned, would exceed the bound below).
+    let late_bound = if backend == wgpu::Backend::Metal { 0 } else { 2 };
+    assert!(
+        late_chunks <= late_bound,
+        "the staging ring follows an unbounded queue: {late_chunks} chunks created after frame 100"
+    );
     assert!(
         chunks <= 6,
         "{chunks} staging chunks for at most three frames in flight"
