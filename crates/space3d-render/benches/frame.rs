@@ -43,7 +43,11 @@ const MODES: [(&str, Mode); 4] = [
 ];
 
 fn app(mode: Mode) -> Option<App> {
-    let renderer = match pollster::block_on(Renderer::new_headless(1920, 1080)) {
+    sized_app(mode, (1920, 1080))
+}
+
+fn sized_app(mode: Mode, (width, height): (u32, u32)) -> Option<App> {
+    let renderer = match pollster::block_on(Renderer::new_headless(width, height)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("skipping frame benches: {e}");
@@ -89,7 +93,8 @@ fn app(mode: Mode) -> Option<App> {
         Mode::HdrBloom => app.world.insert_one(cam, PostProcess::default()).unwrap(),
         Mode::DepthView => {
             // The sun's view of the cube field: an orthographic box around it.
-            let view = glam::camera::rh::view::look_at_mat4(Vec3::new(3.0, 10.0, 6.0), Vec3::new(0.0, -1.0, -5.0), Vec3::Y);
+            let view =
+                glam::camera::rh::view::look_at_mat4(Vec3::new(3.0, 10.0, 6.0), Vec3::new(0.0, -1.0, -5.0), Vec3::Y);
             let proj = glam::camera::rh::proj::directx::orthographic(-12.0, 12.0, -12.0, 12.0, 0.0, 40.0);
             let bias = wgpu::DepthBiasState {
                 constant: 2,
@@ -336,6 +341,48 @@ fn frame_ab() {
         let timings = gpu_timings(app, 48);
         let line: Vec<String> = timings.iter().map(|(l, ms)| format!("{l} {ms:.3}")).collect();
         println!("  {:<12} {}", MODES[k].0, line.join(", "));
+    }
+    drop(apps);
+    // The default bloom chain at other sizes (the prefilter halves the rect; above 1080p a
+    // resample pass makes level 0 of it), and the Low preset's chain (4 levels, 270 cap) at the
+    // T3 rect (1440 × 810, render scale 0.75 of 1080p).
+    println!("frame/ab bloom GPU time by size (post.bloom, loaded GPU, medians in ms):");
+    for (label, size, low) in [
+        ("1280x720", (1280, 720), false),
+        ("1920x1080", (1920, 1080), false),
+        ("2560x1440", (2560, 1440), false),
+        ("3840x2160", (3840, 2160), false),
+        ("1440x810 Low", (1440, 810), true),
+    ] {
+        let Some(mut app) = sized_app(Mode::HdrBloom, size) else {
+            return;
+        };
+        if low {
+            let cam = app
+                .world
+                .query::<(Entity, &Camera3d)>()
+                .iter()
+                .map(|(e, _)| e)
+                .next()
+                .expect("camera");
+            let mut bloom = Bloom::glow();
+            bloom.mip_count = 4;
+            bloom.max_mip_height = 270;
+            app.world
+                .insert_one(cam, PostProcess::default().with_bloom(bloom))
+                .unwrap();
+        }
+        let timings = gpu_timings(&mut app, 48);
+        let ms = timings
+            .iter()
+            .find(|(l, _)| *l == "post.bloom")
+            .map_or(f64::NAN, |(_, ms)| *ms);
+        let s = app.resources.expect::<RenderStats>();
+        println!(
+            "  {label:<14} post.bloom {ms:.3} ms, {} render passes, target_bytes {:.1} MB",
+            s.render_passes,
+            s.target_bytes as f64 / 1e6
+        );
     }
 }
 
