@@ -18,6 +18,14 @@
 //! assert!(!app.resources.expect::<ActionState>().just_pressed("jump"));
 //! ```
 //!
+//! Mouse buttons also keep their order within a frame: [`Input::mouse_button_events`] lists
+//! each press and release with the cursor position at the time and its cause
+//! ([`MouseButtonCause`]). Buttons released without a release event — the window lost the focus
+//! ([`Input::release_all`]), or the OS reports the button up although its release never arrived
+//! (the window runner checks once per frame on macOS and Windows) — are marked as cancels
+//! ([`MouseButtonEvent::cancelled`]): the UI registers no click and no drop for them, and games
+//! can tell them apart too.
+//!
 //! Keys are **physical** ([`KeyCode`]: the key's position). The runner also records what each
 //! key means on the player's layout ([`KeyEvent`], [`Input::key_events`],
 //! [`Input::logical_key`]) and what it prints ([`Input::key_label`]); see
@@ -45,6 +53,8 @@ pub use winit::keyboard::KeyCode;
 /// Upper bound on [`Input::key_events`] kept per frame (a frame never sees this many; it only
 /// bounds memory when `end_frame` is not called).
 const MAX_KEY_EVENTS: usize = 256;
+/// Upper bound on [`Input::mouse_button_events`] kept per frame (same purpose).
+const MAX_MOUSE_BUTTON_EVENTS: usize = 64;
 
 /// One keyboard event as the OS reported it: the physical key plus what it means on the
 /// player's keyboard layout. Recorded by the runner (and [`Input::inject_key_event`]) in
@@ -190,6 +200,70 @@ impl From<winit::event::MouseButton> for MouseButton {
             W::Forward => Self::Forward,
             W::Other(n) => Self::Other(n),
         }
+    }
+}
+
+impl MouseButton {
+    /// Order of the buttons in [`Input::release_all`]'s events: `Left`, `Right`, `Middle`,
+    /// `Back`, `Forward`, then `Other` by number.
+    fn order(self) -> (u8, u16) {
+        match self {
+            Self::Left => (0, 0),
+            Self::Right => (1, 0),
+            Self::Middle => (2, 0),
+            Self::Back => (3, 0),
+            Self::Forward => (4, 0),
+            Self::Other(n) => (5, n),
+        }
+    }
+}
+
+/// Why a mouse button went down or up ([`MouseButtonEvent::cause`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MouseButtonCause {
+    /// The device: the OS delivered the press or release (the window runner), or a test or
+    /// replay injected it ([`Input::inject_mouse_button_down`], [`Input::inject_mouse_button_up`]).
+    #[default]
+    Device,
+    /// A release because the window lost the focus (or the app was suspended) while the button
+    /// was held ([`Input::release_all`]): the OS sends the release elsewhere, if at all.
+    FocusLost,
+    /// A release because the OS reports the button up although its release event never
+    /// arrived (e.g. macOS Mission Control or a Spaces swipe took the pointer mid-press while
+    /// the window kept the focus). The window runner checks the OS's buttons once per frame on
+    /// macOS and Windows.
+    OsReconciled,
+}
+
+impl MouseButtonCause {
+    /// A synthetic release that cancels what the press started (every cause but
+    /// [`Device`](Self::Device)): like switching away from a native app mid-drag, it is neither
+    /// a click nor a drop. The engine's UI treats it so; game code can too.
+    pub fn is_cancel(self) -> bool {
+        self != Self::Device
+    }
+}
+
+/// One mouse button press or release, in the order of the frame's events
+/// ([`Input::mouse_button_events`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct MouseButtonEvent {
+    /// The button.
+    pub button: MouseButton,
+    /// Went down (`false`: up).
+    pub pressed: bool,
+    /// Cursor position in physical pixels when it happened (`None`: outside the window).
+    pub position: Option<Vec2>,
+    /// Why (device event, focus loss, OS state).
+    pub cause: MouseButtonCause,
+}
+
+impl MouseButtonEvent {
+    /// A release that cancels the press ([`MouseButtonCause::is_cancel`]): no click, no drop.
+    pub fn cancelled(&self) -> bool {
+        !self.pressed && self.cause.is_cancel()
     }
 }
 
@@ -373,6 +447,7 @@ pub struct Input {
     key_events: Vec<KeyEvent>,
     logical_keys: HashMap<KeyCode, LogicalKey>,
     layout: KeyboardLayout,
+    mouse_button_events: Vec<MouseButtonEvent>,
 }
 
 impl Input {
@@ -409,6 +484,17 @@ impl Input {
     /// Mouse button went up this frame.
     pub fn mouse_just_released(&self, b: MouseButton) -> bool {
         self.mouse.just_released(b)
+    }
+    /// This frame's mouse button presses and releases in order, each with the cursor position
+    /// at the time and its cause (a release the focus loss or the OS state caused is a cancel:
+    /// [`MouseButtonEvent::cancelled`]). Only changes are recorded: a press of a held button or
+    /// a release of a button that is up adds nothing. Cleared in `end_frame`.
+    ///
+    /// The per-frame edges ([`Self::mouse_just_pressed`], [`Self::mouse_just_released`]) lose
+    /// the order: a release and a new press in one frame (a fast double click) show both edges
+    /// with the button held; the events say it went up first.
+    pub fn mouse_button_events(&self) -> &[MouseButtonEvent] {
+        &self.mouse_button_events
     }
     /// Cursor position in physical pixels (None when outside the window).
     pub fn mouse_position(&self) -> Option<Vec2> {
@@ -598,13 +684,38 @@ impl Input {
         self.layout
             .learn(event.physical, unshifted.as_deref(), shifted.as_deref());
     }
-    /// Mouse button down.
+    /// Mouse button down (recorded in [`Self::mouse_button_events`] at the cursor position).
     pub fn inject_mouse_button_down(&mut self, b: MouseButton) {
-        self.mouse.press(b);
+        if !self.mouse.pressed(b) {
+            self.mouse.press(b);
+            self.record_mouse_button(b, true, MouseButtonCause::Device);
+        }
     }
-    /// Mouse button up.
+    /// Mouse button up (recorded in [`Self::mouse_button_events`] at the cursor position).
     pub fn inject_mouse_button_up(&mut self, b: MouseButton) {
-        self.mouse.release(b);
+        self.release_mouse_button(b, MouseButtonCause::Device);
+    }
+    /// Mouse button up for `cause`: [`MouseButtonCause::Device`] is
+    /// [`Self::inject_mouse_button_up`]; the others release it as a cancel (no click, no drop in
+    /// the UI), for a release that no device event reported — what the window runner does on a
+    /// focus loss ([`Self::release_all`]) and when the OS shows the button up with no release
+    /// event. Nothing happens while `b` is up.
+    pub fn release_mouse_button(&mut self, b: MouseButton, cause: MouseButtonCause) {
+        if self.mouse.pressed(b) {
+            self.mouse.release(b);
+            self.record_mouse_button(b, false, cause);
+        }
+    }
+    fn record_mouse_button(&mut self, button: MouseButton, pressed: bool, cause: MouseButtonCause) {
+        if self.mouse_button_events.len() >= MAX_MOUSE_BUTTON_EVENTS {
+            self.mouse_button_events.remove(0);
+        }
+        self.mouse_button_events.push(MouseButtonEvent {
+            button,
+            pressed,
+            position: self.mouse_position,
+            cause,
+        });
     }
     /// Cursor moved to `position` (physical pixels); accumulates the delta.
     pub fn inject_mouse_move(&mut self, position: Vec2) {
@@ -687,10 +798,15 @@ impl Input {
     pub fn set_window_size(&mut self, size: Vec2) {
         self.window_size = size;
     }
-    /// Release every held key/button (window focus lost).
+    /// Release every held key/button (window focus lost, app suspended). The mouse buttons'
+    /// releases are cancels ([`MouseButtonCause::FocusLost`] in [`Self::mouse_button_events`]).
     pub fn release_all(&mut self) {
         self.keys.release_all();
-        self.mouse.release_all();
+        let mut held: Vec<MouseButton> = self.mouse.iter_pressed().collect();
+        held.sort_by_key(|b| b.order());
+        for b in held {
+            self.release_mouse_button(b, MouseButtonCause::FocusLost);
+        }
         for pad in self.gamepads.values_mut() {
             pad.buttons.release_all();
         }
@@ -706,6 +822,7 @@ impl Input {
         self.ended_touches.clear();
         self.text.clear();
         self.key_events.clear();
+        self.mouse_button_events.clear();
         for t in &mut self.touches {
             t.delta = Vec2::ZERO;
         }
@@ -1072,6 +1189,88 @@ mod tests {
         assert_eq!(i.mouse_position(), Some(Vec2::new(15.0, 7.0)));
         i.release_all();
         assert!(i.mouse_just_released(MouseButton::Left));
+    }
+
+    #[test]
+    fn mouse_button_events_keep_order_position_and_cause() {
+        let mut i = Input::default();
+        let (a, b) = (Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0));
+        i.inject_mouse_move(a);
+        i.inject_mouse_button_down(MouseButton::Left);
+        i.end_frame();
+        // A fast double click's second click: up, then down again, then a drag.
+        i.inject_mouse_move(b);
+        i.inject_mouse_button_up(MouseButton::Left);
+        i.inject_mouse_button_down(MouseButton::Left);
+        i.inject_mouse_button_down(MouseButton::Left); // held: nothing
+        i.inject_mouse_button_up(MouseButton::Right); // up: nothing
+        let ev = |button, pressed, position, cause| MouseButtonEvent {
+            button,
+            pressed,
+            position,
+            cause,
+        };
+        let device = MouseButtonCause::Device;
+        assert_eq!(
+            i.mouse_button_events(),
+            [
+                ev(MouseButton::Left, false, Some(b), device),
+                ev(MouseButton::Left, true, Some(b), device),
+            ]
+        );
+        assert!(i.mouse_just_pressed(MouseButton::Left) && i.mouse_just_released(MouseButton::Left));
+        assert!(i.mouse_pressed(MouseButton::Left), "the edges alone lose the order");
+        assert!(!i.mouse_button_events().iter().any(MouseButtonEvent::cancelled));
+        i.end_frame();
+        assert!(i.mouse_button_events().is_empty());
+
+        // Focus lost with buttons held, the cursor outside: cancels, in button order.
+        i.inject_mouse_button_down(MouseButton::Other(7));
+        i.inject_mouse_button_down(MouseButton::Right);
+        i.inject_mouse_left();
+        i.end_frame();
+        i.release_all();
+        let focus = MouseButtonCause::FocusLost;
+        assert_eq!(
+            i.mouse_button_events(),
+            [
+                ev(MouseButton::Left, false, None, focus),
+                ev(MouseButton::Right, false, None, focus),
+                ev(MouseButton::Other(7), false, None, focus),
+            ]
+        );
+        assert!(i.mouse_button_events().iter().all(MouseButtonEvent::cancelled));
+        assert!(i.mouse_just_released(MouseButton::Right) && !i.mouse_pressed(MouseButton::Right));
+        i.release_all();
+        assert_eq!(i.mouse_button_events().len(), 3, "nothing left to release");
+
+        // A release only the OS saw.
+        i.end_frame();
+        i.inject_mouse_move(a);
+        i.inject_mouse_button_down(MouseButton::Middle);
+        i.release_mouse_button(MouseButton::Middle, MouseButtonCause::OsReconciled);
+        i.release_mouse_button(MouseButton::Middle, MouseButtonCause::OsReconciled);
+        assert_eq!(
+            i.mouse_button_events(),
+            [
+                ev(MouseButton::Middle, true, Some(a), device),
+                ev(MouseButton::Middle, false, Some(a), MouseButtonCause::OsReconciled),
+            ]
+        );
+        assert!(!i.mouse_button_events()[0].cancelled(), "presses never are");
+        assert!(i.mouse_button_events()[1].cancelled());
+        assert!(!MouseButtonCause::Device.is_cancel());
+        // `Device` is a plain release.
+        i.inject_mouse_button_down(MouseButton::Middle);
+        i.release_mouse_button(MouseButton::Middle, device);
+        assert!(!i.mouse_button_events()[3].cancelled());
+
+        // Bounded when `end_frame` never runs.
+        for _ in 0..(MAX_MOUSE_BUTTON_EVENTS + 10) {
+            i.inject_mouse_button_down(MouseButton::Left);
+            i.inject_mouse_button_up(MouseButton::Left);
+        }
+        assert_eq!(i.mouse_button_events().len(), MAX_MOUSE_BUTTON_EVENTS);
     }
 
     #[test]

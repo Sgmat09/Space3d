@@ -62,7 +62,7 @@ mod window;
 pub use background::{background_mode, set_background_mode};
 pub use input::{
     ActionMap, ActionState, ActionValue, Binding, ButtonState, Gamepad, GamepadAxis, GamepadButton, Input, InputPlugin,
-    KeyCode, KeyEvent, MouseButton, Touch, TouchPhase,
+    KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchPhase,
 };
 pub use layout::{
     KeyLabel, KeyLabelSource, KeyLocation, KeyboardLayout, LogicalKey, NamedKey, english_key_name,
