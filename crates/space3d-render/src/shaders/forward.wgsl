@@ -1,7 +1,8 @@
 // Space3d forward shader: instanced meshes, directional + point lights, metallic/roughness
 // Blinn-Phong with Schlick Fresnel (or GGX with `S3D_SHADING_STANDARD`), material maps
 // (normal, metallic-roughness, occlusion, emissive), image-based lighting from the camera's
-// `EnvironmentLight`, linear-space lighting, sRGB output.
+// `EnvironmentLight`, the shadow of one directional light (PCF with `S3D_SHADOW_TAPS`),
+// linear-space lighting, sRGB output.
 //
 // The INSTANCE marker below is replaced by the renderer with an `InstanceInput` struct and
 // accessor functions generated from the instance layout (see `pipeline/instance.rs`); the CONSTS
@@ -50,6 +51,7 @@ const S3D_UV_TRANSFORM: u32 = 64u;
 const S3D_FIXUP_NORMAL: u32 = 256u;
 const S3D_FIXUP_MR: u32 = 512u;
 const S3D_FIXUP_OCCLUSION: u32 = 1024u;
+const S3D_NO_SHADOW: u32 = 2048u;
 const S3D_PI: f32 = 3.141592653589793;
 
 //#VIEW
@@ -74,6 +76,11 @@ struct MaterialParams {
 @group(0) @binding(2) var s3d_env_irradiance: texture_cube<f32>;
 @group(0) @binding(3) var s3d_brdf_lut: texture_2d<f32>;
 @group(0) @binding(4) var s3d_env_sampler: sampler;
+// The casting directional light's shadow map (group 0 bindings 5–6; a 1×1 map without a
+// shadow, which `shadow_info.x == 0` never reads) and its comparison sampler (LessEqual,
+// bilinear: every tap is a 2×2 PCF).
+@group(0) @binding(5) var s3d_shadow_map: texture_depth_2d;
+@group(0) @binding(6) var s3d_shadow_sampler: sampler_comparison;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(2) var base_sampler: sampler;
 //#TEXTURE
@@ -278,6 +285,96 @@ fn s3d_ibl(base: vec3<f32>, metallic: f32, roughness: f32, n: vec3<f32>, v: vec3
     return specular + diffuse;
 }
 
+// Percentage-closer filtering of the shadow map at `uv` for light depth `z` (1 = lit):
+// `S3D_SHADOW_TAPS` bilinear comparisons weighted into a smooth kernel (Castaño 2013) — 1 tap:
+// 2×2 texels, 4 taps: 3×3, 9 taps: 5×5, 16 taps: 7×7 — centered on `uv`.
+fn s3d_shadow_pcf(uv: vec2<f32>, z: f32) -> f32 {
+    if (S3D_SHADOW_TAPS <= 1u) {
+        return textureSampleCompareLevel(s3d_shadow_map, s3d_shadow_sampler, uv, z);
+    }
+    let size = f32(view.shadow_info.z);
+    let inv = 1.0 / size;
+    let p = uv * size;
+    let b = floor(p + vec2<f32>(0.5));
+    let s = p + vec2<f32>(0.5) - b;
+    let base = (b - vec2<f32>(0.5)) * inv;
+    // Per axis: tap weights `w` and tap offsets `o` (texels from `base`).
+    var wx: vec4<f32>;
+    var wy: vec4<f32>;
+    var ox: vec4<f32>;
+    var oy: vec4<f32>;
+    var n = 2u;
+    var norm = 1.0 / 16.0;
+    if (S3D_SHADOW_TAPS <= 4u) {
+        let w0 = vec2<f32>(3.0) - 2.0 * s;
+        let w1 = vec2<f32>(1.0) + 2.0 * s;
+        let o0 = (vec2<f32>(2.0) - s) / w0 - 1.0;
+        let o1 = s / w1 + 1.0;
+        wx = vec4<f32>(w0.x, w1.x, 0.0, 0.0);
+        wy = vec4<f32>(w0.y, w1.y, 0.0, 0.0);
+        ox = vec4<f32>(o0.x, o1.x, 0.0, 0.0);
+        oy = vec4<f32>(o0.y, o1.y, 0.0, 0.0);
+    } else if (S3D_SHADOW_TAPS <= 9u) {
+        n = 3u;
+        norm = 1.0 / 144.0;
+        let w0 = vec2<f32>(4.0) - 3.0 * s;
+        let w2 = vec2<f32>(1.0) + 3.0 * s;
+        let o0 = (vec2<f32>(3.0) - 2.0 * s) / w0 - 2.0;
+        let o1 = (vec2<f32>(3.0) + s) / 7.0;
+        let o2 = s / w2 + 2.0;
+        wx = vec4<f32>(w0.x, 7.0, w2.x, 0.0);
+        wy = vec4<f32>(w0.y, 7.0, w2.y, 0.0);
+        ox = vec4<f32>(o0.x, o1.x, o2.x, 0.0);
+        oy = vec4<f32>(o0.y, o1.y, o2.y, 0.0);
+    } else {
+        n = 4u;
+        norm = 1.0 / 2704.0;
+        let w0 = 5.0 * s - 6.0;
+        let w1 = 11.0 * s - 28.0;
+        let w2 = -(11.0 * s + 17.0);
+        let w3 = -(5.0 * s + 1.0);
+        let o0 = (4.0 * s - 5.0) / w0 - 3.0;
+        let o1 = (4.0 * s - 16.0) / w1 - 1.0;
+        let o2 = -(7.0 * s + 5.0) / w2 + 1.0;
+        let o3 = -s / w3 + 3.0;
+        wx = vec4<f32>(w0.x, w1.x, w2.x, w3.x);
+        wy = vec4<f32>(w0.y, w1.y, w2.y, w3.y);
+        ox = vec4<f32>(o0.x, o1.x, o2.x, o3.x);
+        oy = vec4<f32>(o0.y, o1.y, o2.y, o3.y);
+    }
+    var sum = 0.0;
+    for (var j = 0u; j < n; j++) {
+        for (var i = 0u; i < n; i++) {
+            let at = base + vec2<f32>(ox[i], oy[j]) * inv;
+            sum += wx[i] * wy[j] * textureSampleCompareLevel(s3d_shadow_map, s3d_shadow_sampler, at, z);
+        }
+    }
+    return sum * norm;
+}
+
+// The casting light's shadow at a fragment (1 = lit, 0 = fully shadowed): the world position
+// moved along the geometric normal `ng` (more at grazing angles to the light direction `l`),
+// compared against the map with the depth bias, filtered, scaled by the strength and faded out
+// over the outer part of the map. 1 without a shadow this frame and for materials that do not
+// receive.
+fn s3d_shadow_factor(world: vec3<f32>, ng: vec3<f32>, l: vec3<f32>) -> f32 {
+    if (S3D_SHADOW_TAPS == 0u || view.shadow_info.x == 0u || (material.flags.x & S3D_NO_SHADOW) != 0u) {
+        return 1.0;
+    }
+    let ndl = clamp(dot(ng, l), 0.0, 1.0);
+    let p = world + ng * (view.shadow_params.y * (1.0 - ndl));
+    let lp = view.shadow_view_proj * vec4<f32>(p, 1.0);
+    let ndc = lp.xyz / lp.w;
+    let edge = max(abs(ndc.x), abs(ndc.y));
+    if (edge >= 1.0) {
+        return 1.0;
+    }
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let lit = s3d_shadow_pcf(uv, clamp(ndc.z - view.shadow_params.x, 0.0, 1.0));
+    let fade = clamp((edge - view.shadow_params.w) / max(1.0 - view.shadow_params.w, 1e-4), 0.0, 1.0);
+    return mix(1.0, lit, view.shadow_params.z * (1.0 - fade));
+}
+
 // Tangent frame of a normal map at a fragment with the (front-side) normal `n`: the vertex
 // tangent (MikkTSpace, `w` = bitangent sign) when the mesh has one (and it is not parallel to
 // the normal), else a cotangent frame from
@@ -395,9 +492,20 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
             let f0 = mix(vec3<f32>(0.04), base.rgb, metallic);
             s3d_ms_energy = vec3<f32>(1.0) + f0 * (1.0 / max(ab.x + ab.y, 1e-4) - 1.0);
         }
+        // The casting light's shadow (directional light `shadow_info.y`).
+        var shadow = 1.0;
+        if (S3D_SHADOW_TAPS != 0u && view.shadow_info.x != 0u) {
+            let ng = normalize(in.normal) * select(-1.0, 1.0, front);
+            let caster = view.dir_lights[min(view.shadow_info.y, MAX_DIR_LIGHTS - 1u)];
+            shadow = s3d_shadow_factor(in.world_pos, ng, -caster.direction.xyz);
+        }
         for (var i = 0u; i < min(view.counts.x, MAX_DIR_LIGHTS); i++) {
             let light = view.dir_lights[i];
-            acc += s3d_brdf(base.rgb, metallic, roughness, n, v, -light.direction.xyz) * light.color.rgb;
+            var radiance = light.color.rgb;
+            if (i == view.shadow_info.y && shadow < 1.0) {
+                radiance = radiance * shadow;
+            }
+            acc += s3d_brdf(base.rgb, metallic, roughness, n, v, -light.direction.xyz) * radiance;
         }
         for (var i = 0u; i < min(view.counts.y, MAX_POINT_LIGHTS); i++) {
             let light = view.point_lights[i];

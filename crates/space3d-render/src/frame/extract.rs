@@ -11,8 +11,8 @@ use crate::handles::{MeshHandle, ShaderHandle, TextureHandle};
 use crate::instance::{BufferUsage, CullSource, ErasedInstanceBuffer, InstanceBuffers, InstancedMesh};
 use crate::lighting::api::{LightingSettings, TransparentSort};
 use crate::material::{
-    BlendMode, CLASS_EXT, FLAG_EMISSIVE, FLAG_FIXUP_SHIFT, FLAG_MAPS, FLAG_METALLIC_ROUGHNESS, FLAG_NORMAL,
-    FLAG_OCCLUSION, FLAG_ORM_PACKED, FLAG_UV_TRANSFORM, MapMask, ShadowMode,
+    BlendMode, CLASS_EXT, FLAG_EMISSIVE, FLAG_FIXUP_SHIFT, FLAG_MAPS, FLAG_METALLIC_ROUGHNESS, FLAG_NO_SHADOW,
+    FLAG_NORMAL, FLAG_OCCLUSION, FLAG_ORM_PACKED, FLAG_UV_TRANSFORM, MapMask, ShadowMode,
 };
 use crate::pipeline::{
     CLASS_BLEND, CLASS_DOUBLE_SIDED, GpuMaterial, KIND_COLOR_LAYERED, KIND_DATA_LAYERED, Pipelines, lighting_globals,
@@ -473,6 +473,9 @@ fn wanted_flags(m: &Material) -> u32 {
     }
     if !m.uv_transform.is_identity() {
         f |= FLAG_UV_TRANSFORM;
+    }
+    if matches!(m.shadows, ShadowMode::CastOnly | ShadowMode::None) {
+        f |= FLAG_NO_SHADOW;
     }
     f
 }
@@ -1075,7 +1078,7 @@ impl FrameState {
         let f = self;
         let mut cpu_reallocs = 0u32;
         let material_stride = f.material_stride();
-        f.materials.globals = lighting_globals(lighting);
+        f.materials.globals = lighting_globals(lighting, crate::lighting::shadow::casting_filter(world));
         f.materials.transparent_sort = lighting.transparent_sort;
         // ---- ECS batching ------------------------------------------------------------
         // (Unused texture sets go with their materials, and with them their bind groups, which

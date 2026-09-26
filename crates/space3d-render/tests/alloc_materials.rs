@@ -1,8 +1,9 @@
-//! Steady-state heap allocations of the render stage with every material feature of PM1–PM4
+//! Steady-state heap allocations of the render stage with every material feature of PM1–PM5
 //! in use: normal / ORM / emissive maps, UV transforms, the second UV set and vertex tangents
 //! (extension stream), alpha masks, additive and premultiplied blending, the per-instance
 //! transparent sort of a moving alpha-blended batch, a skybox and image-based lighting
-//! (Standard shading) from a baked environment. The materials area's per-frame work
+//! (Standard shading) from a baked environment, and the sun's shadow (a depth view refitted
+//! every frame to the moving camera, alpha-masked casters). The materials area's per-frame work
 //! allocates nothing (`RenderStats::cpu_reallocations == 0`, texture sets and their bind
 //! groups built once); what remains is wgpu's bookkeeping, pinned by a measured bound and
 //! checked for growth, as in `tests/alloc.rs`.
@@ -52,12 +53,15 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 /// Upper bound of allocations per steady-state frame of this scene: measured on Apple M4 Max /
-/// Metal (wgpu 30.0.1, test profile) plus ~10 %: 114 on the CPU path, 208 on the GPU culling
-/// paths, the same every frame (wgpu and wgpu-hal bookkeeping: see `tests/alloc.rs`; the skybox
-/// draw and the 7-binding view bind group of PM3/PM4 added 13–14 to PM2's 100 / 195). Other
-/// backends get twice the headroom; the no-growth checks are backend-independent.
+/// Metal (wgpu 30.0.1, test profile) plus ~10 %: 151 on the CPU path, 266 on the GPU culling
+/// paths, the same every frame (wgpu and wgpu-hal bookkeeping: see `tests/alloc.rs`). The
+/// skybox draw and the 7-binding view bind group of PM3/PM4 added 13–14 to PM2's 100 / 195; the
+/// shadow's depth pass and its draws add 37 / 58 (with the light's `strength` at 0 — the light
+/// picked, the pipelines specialized, no depth view — the counts are PM4's 114 / 208 exactly,
+/// so the lighting's own per-frame work allocates nothing). Other backends get twice the
+/// headroom; the no-growth checks are backend-independent.
 fn bound(path: DrawPath, backend: wgpu::Backend) -> u64 {
-    let metal = if path.gpu_culling() { 230 } else { 125 };
+    let metal = if path.gpu_culling() { 290 } else { 165 };
     if backend == wgpu::Backend::Metal {
         metal
     } else {
@@ -139,7 +143,14 @@ fn material_features_allocate_nothing_per_frame() {
         instances,
     },));
     let camera = spawn_camera(&mut app, 12.0);
-    spawn_sun(&mut app);
+    app.world.spawn((
+        Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(-0.3, -1.0, -0.6), Vec3::Y),
+        DirectionalLight {
+            color: Vec3::ONE,
+            intensity: 2.0,
+        },
+        DirectionalShadow::new(),
+    ));
     // A skybox and an environment (baked in the first frame, then only sampled).
     app.resources.expect_mut::<LightingSettings>().shading = ShadingModel::Standard;
     let faces = std::array::from_fn(|i| ImageData::filled(32, 32, [40 * i as u8, 90, 200 - 30 * i as u8, 255]));

@@ -166,7 +166,7 @@ pub(crate) fn forward_shader(layout: &InstanceLayout, kinds: u8, ext: bool, cust
 /// The overrides of a forward pipeline that differ from their defaults: the output encoding
 /// (`S3D_OUTPUT`, `MANUAL_SRGB`), alpha masking (`S3D_ALPHA_MASK`, and
 /// `S3D_ALPHA_TO_COVERAGE` with MSAA) and the frame-wide globals (`S3D_SHADING_STANDARD`,
-/// `S3D_NORMAL_MAPS`; see [`GLOBAL_SHADING_STANDARD`]).
+/// `S3D_NORMAL_MAPS`, `S3D_SHADOW_TAPS`; see [`GLOBAL_SHADING_STANDARD`]).
 pub(crate) fn pipeline_constants(key: &PipelineKey) -> ([(&'static str, f64); 8], usize) {
     let (output, n_out) = output_constants(key.output);
     let mut c = [("", 0.0); 8];
@@ -188,6 +188,10 @@ pub(crate) fn pipeline_constants(key: &PipelineKey) -> ([(&'static str, f64); 8]
     if key.globals & GLOBAL_NO_NORMAL_MAPS != 0 {
         push("S3D_NORMAL_MAPS", 0.0);
     }
+    let taps = shadow_taps(key.globals);
+    if taps != 0 {
+        push("S3D_SHADOW_TAPS", taps as f64);
+    }
     (c, n)
 }
 
@@ -195,9 +199,18 @@ pub(crate) fn pipeline_constants(key: &PipelineKey) -> ([(&'static str, f64); 8]
 pub(crate) const GLOBAL_SHADING_STANDARD: u8 = 1;
 /// `PipelineKey::globals` bit: `LightingSettings::normal_maps` is off.
 pub(crate) const GLOBAL_NO_NORMAL_MAPS: u8 = 2;
+/// `PipelineKey::globals` bits 2..=4: the casting light's filter (0 without a casting light,
+/// then `Hard`, `Pcf4`, `Pcf9`, `Pcf16`), the `S3D_SHADOW_TAPS` override.
+pub(crate) const GLOBAL_SHADOW_SHIFT: u8 = 2;
+const GLOBAL_SHADOW_MASK: u8 = 0b111 << GLOBAL_SHADOW_SHIFT;
 
-/// The frame-wide override bits (`PipelineKey::globals`) of the lighting settings.
-pub(crate) fn lighting_globals(s: &crate::lighting::api::LightingSettings) -> u8 {
+/// The frame-wide override bits (`PipelineKey::globals`) of the lighting settings and the
+/// casting light's filter (`None`: no light casts).
+pub(crate) fn lighting_globals(
+    s: &crate::lighting::api::LightingSettings,
+    shadow: Option<crate::lighting::api::ShadowFilter>,
+) -> u8 {
+    use crate::lighting::api::ShadowFilter;
     let mut g = 0;
     if s.shading == crate::lighting::api::ShadingModel::Standard {
         g |= GLOBAL_SHADING_STANDARD;
@@ -205,7 +218,25 @@ pub(crate) fn lighting_globals(s: &crate::lighting::api::LightingSettings) -> u8
     if !s.normal_maps {
         g |= GLOBAL_NO_NORMAL_MAPS;
     }
-    g
+    let filter: u8 = match shadow {
+        None => 0,
+        Some(ShadowFilter::Hard) => 1,
+        Some(ShadowFilter::Pcf4) => 2,
+        Some(ShadowFilter::Pcf9) => 3,
+        Some(_) => 4,
+    };
+    g | filter << GLOBAL_SHADOW_SHIFT
+}
+
+/// `S3D_SHADOW_TAPS` of a globals set (0: shadows compiled out).
+pub(crate) fn shadow_taps(globals: u8) -> u32 {
+    match (globals & GLOBAL_SHADOW_MASK) >> GLOBAL_SHADOW_SHIFT {
+        0 => 0,
+        1 => 1,
+        2 => 4,
+        3 => 9,
+        _ => 16,
+    }
 }
 
 /// Whether a pipeline class reads the extension vertex stream (`PipelineKey::module_key`).
@@ -316,12 +347,14 @@ pub(super) fn gles3_translation_error(module: &naga::Module, info: &naga::valid:
 
 /// Resources the forward template declares, `(group, binding, name)`: the only ones in the
 /// forward pipeline layout, so the only ones a custom shader can use.
-pub(super) const TEMPLATE_RESOURCES: [(u32, u32, &str); 16] = [
+pub(super) const TEMPLATE_RESOURCES: [(u32, u32, &str); 18] = [
     (0, 0, "view"),
     (0, 1, "s3d_env_specular"),
     (0, 2, "s3d_env_irradiance"),
     (0, 3, "s3d_brdf_lut"),
     (0, 4, "s3d_env_sampler"),
+    (0, 5, "s3d_shadow_map"),
+    (0, 6, "s3d_shadow_sampler"),
     (1, 0, "material"),
     (1, 1, "base_tex"),
     (1, 2, "base_sampler"),
@@ -388,8 +421,8 @@ pub(crate) fn validate_custom_wgsl(src: &str, glsl_es_300: bool) -> Result<Optio
                     });
                     return Err(format!(
                         "custom shaders cannot declare resources: `{name}` ({:?}){at} is not bound \
-                         by the forward pipeline (only `view`, the `s3d_env_*` / `s3d_brdf_lut` \
-                         lighting inputs, `material`, `base_tex`, `base_sampler` and the \
+                         by the forward pipeline (only `view`, the `s3d_env_*` / `s3d_brdf_lut` / \
+                         `s3d_shadow_*` lighting inputs, `material`, `base_tex`, `base_sampler` and the \
                          `s3d_*_tex` / `s3d_*_sampler` material maps are)",
                         g.space
                     ));
@@ -695,6 +728,9 @@ mod tests {
         for output in 0..3u32 {
             for bits in 0..16u32 {
                 let mut c = naga::back::PipelineConstants::default();
+                // Every shadow filter (and none) with several of the other combinations.
+                let taps = [0u32, 1, 4, 9, 16][((bits + output) % 5) as usize];
+                c.insert("S3D_SHADOW_TAPS".into(), taps as f64);
                 c.insert("S3D_OUTPUT".into(), output as f64);
                 c.insert("MANUAL_SRGB".into(), (output == 1) as u32 as f64);
                 c.insert("S3D_ALPHA_MASK".into(), (bits & 1) as f64);
@@ -834,6 +870,7 @@ mod tests {
             ("S3D_FIXUP_NORMAL", 1 << (crate::material::FLAG_FIXUP_SHIFT + 1)),
             ("S3D_FIXUP_MR", 1 << (crate::material::FLAG_FIXUP_SHIFT + 2)),
             ("S3D_FIXUP_OCCLUSION", 1 << (crate::material::FLAG_FIXUP_SHIFT + 3)),
+            ("S3D_NO_SHADOW", crate::material::FLAG_NO_SHADOW),
         ] {
             assert!(src.contains(&format!("const {name}: u32 = {value}u;")), "{name}");
         }
@@ -881,6 +918,21 @@ mod tests {
                 .any(|n| n.contains("COVERAGE"))
         );
         assert!(key(CLASS_EXT, 1, 0).module_key().2 && !key(0, 1, 0).module_key().2);
+        // The casting light's filter: `S3D_SHADOW_TAPS`, nothing without a casting light.
+        use crate::lighting::api::{LightingSettings, ShadowFilter};
+        let settings = LightingSettings::default();
+        assert_eq!(lighting_globals(&settings, None), 0);
+        for (filter, taps) in [
+            (ShadowFilter::Hard, 1),
+            (ShadowFilter::Pcf4, 4),
+            (ShadowFilter::Pcf9, 9),
+            (ShadowFilter::Pcf16, 16),
+        ] {
+            let globals = lighting_globals(&settings, Some(filter));
+            assert_eq!(shadow_taps(globals), taps);
+            assert_eq!(names(key(0, 1, globals))[2..], [format!("S3D_SHADOW_TAPS={taps}")]);
+            assert_eq!(key(0, 1, globals).module_key(), key(0, 1, 0).module_key());
+        }
         let _ = ShadowMode::Auto;
     }
 
@@ -910,7 +962,8 @@ mod tests {
                         continue;
                     }
                     for kinds in 0..4u8 {
-                        for (samples, globals) in [(1, 0), (4, 3)] {
+                        // Globals: none; Standard + no normal maps + the 9-tap shadow.
+                        for (samples, globals) in [(1, 0), (4, 3 | 3 << GLOBAL_SHADOW_SHIFT)] {
                             for shader in [None, Some((handle, 0))] {
                                 let key = PipelineKey {
                                     layout,

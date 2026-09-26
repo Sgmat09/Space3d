@@ -1,4 +1,5 @@
-//! Material maps on wgpu's GL backend (WebGL2 / GLES 3.0 class: 9 of the 16 texture units, no
+//! Material maps and the directional shadow on wgpu's GL backend (WebGL2 / GLES 3.0 class: 9 of the
+//! 16 texture units plus the environment and `sampler2DShadow`, no
 //! `BASE_VERTEX`, texture targets fixed by the layer count) render like the default backend.
 //!
 //! Skips without a GL adapter; on macOS put ANGLE on the dyld path and build with the `angle`
@@ -264,4 +265,84 @@ fn cube_on_gl_is_texture_cube_map() {
         "GL environment differs from the default backend in {:.2}% of pixels",
         diff * 100.0
     );
+}
+
+/// The directional shadow on GL (`sampler2DShadow` with `textureLod`, bilinear comparisons, CPU
+/// culling of the depth view) matches the default backend: a top-down view of casters over a
+/// ground plane, every filter.
+#[test]
+fn shadow_on_gl_matches_default_backend() {
+    let scene = |backends: Option<wgpu::Backends>, filter: ShadowFilter| -> Option<ImageData> {
+        let mut app = app(backends)?;
+        app.world.spawn((
+            Transform::from_xyz(0.0, 20.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z),
+            Camera3d::default()
+                .with_clear_color(Vec4::new(0.0, 0.0, 0.0, 1.0))
+                .with_projection(Projection::Orthographic {
+                    height: 6.0,
+                    near: 0.1,
+                    far: 40.0,
+                }),
+        ));
+        let a = app.resources.expect_mut::<RenderAssets>();
+        let plane = a.add_mesh(MeshData::plane(20.0));
+        let cube = a.add_mesh(MeshData::cube(1.0));
+        let sphere = a.add_mesh(MeshData::sphere(0.5, 24, 12));
+        app.world
+            .spawn((Transform::IDENTITY, Mesh3d(plane), Material::srgb(0.8, 0.8, 0.8)));
+        app.world.spawn((
+            Transform::from_xyz(1.5, 1.0, 0.0),
+            Mesh3d(cube),
+            Material::srgb(0.9, 0.3, 0.2),
+        ));
+        app.world.spawn((
+            Transform::from_xyz(-2.5, 1.5, -1.0),
+            Mesh3d(sphere),
+            Material::srgb(0.2, 0.8, 0.3),
+        ));
+        app.world.spawn((
+            Transform::IDENTITY.looking_at(Vec3::new(-1.0, -1.2, -0.4), Vec3::Y),
+            DirectionalLight {
+                color: Vec3::ONE,
+                intensity: 2.0,
+            },
+            DirectionalShadow::new()
+                .with_map_size(1024)
+                .with_filter(filter)
+                .with_fit(ShadowFit::top_down(0.0, 3.0, 100.0)),
+        ));
+        let img = render_to_image(&mut app).expect("capture");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+        assert_eq!(app.resources.expect::<RenderStats>().depth_views, 1);
+        Some(img)
+    };
+    for filter in [
+        ShadowFilter::Hard,
+        ShadowFilter::Pcf4,
+        ShadowFilter::Pcf9,
+        ShadowFilter::Pcf16,
+    ] {
+        let Some(gl) = scene(Some(wgpu::Backends::GL), filter) else {
+            eprintln!("skipping GL test: no GL adapter");
+            return;
+        };
+        let Some(native) = scene(None, filter) else { return };
+        if let Ok(dir) = std::env::var("SPACE3D_TEST_OUT") {
+            for (name, img) in [("gl", &gl), ("native", &native)] {
+                image::RgbaImage::from_raw(img.width, img.height, img.pixels.clone())
+                    .expect("size")
+                    .save(format!("{dir}/gl_shadow_{filter:?}_{name}.png"))
+                    .expect("write png");
+            }
+        }
+        // The shadows are there (a good share of the ground is dark) and the images agree.
+        let dark = gl.pixels.chunks(4).filter(|p| p[0] < 90 && p[1] < 90).count();
+        assert!(dark > 120, "{filter:?}: {dark} shadowed pixels");
+        let diff = diff_fraction(&gl, &native, 4);
+        assert!(
+            diff < 0.01,
+            "{filter:?}: GL differs from the default backend in {:.2}% of pixels",
+            diff * 100.0
+        );
+    }
 }

@@ -638,11 +638,12 @@ fn ibl_bake_gate() {
 }
 
 /// Perf gate "forward full-screen lit pixels, all maps + IBL + PCF9, vs today's shader ≤ +0.20
-/// ms" (graphics spec §4.4), without PCF9 until shadows (PM5): the `scene` pass of a 1080p view
-/// filled by one plane, lit by a sun and 4 point lights, with a legacy material (Classic, no
-/// maps, no environment) vs every map at 1024² (base color, normal, ORM, emissive), Standard
-/// shading and image-based lighting. Frames alternate between the two; the gate is the median of
-/// 120 paired differences of adjacent frames.
+/// ms" (graphics spec §4.4): the `scene` pass of a 1080p view filled by one plane, lit by a sun
+/// and 4 point lights, with a legacy material (Classic, no maps, no environment, no shadow) vs
+/// every map at 1024² (base color, normal, ORM, emissive), Standard shading, image-based
+/// lighting and the sun's 2048² shadow with the 9-tap filter (its depth pass is timed apart, as
+/// `shadow`). Frames alternate between the two; the gate is the median of 120 paired differences
+/// of adjacent frames.
 /// Needs `TIMESTAMP_QUERY`; run alone:
 /// `cargo test -p space3d-render --release --test environment -- --ignored --nocapture forward_full_screen_gate`.
 #[test]
@@ -696,7 +697,13 @@ fn forward_full_screen_gate() {
             far: 100.0,
         }),
     ));
-    spawn_sun(&mut app);
+    let sun = app.world.spawn((
+        Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(-0.3, -1.0, -0.6), Vec3::Y),
+        DirectionalLight {
+            color: Vec3::ONE,
+            intensity: 2.0,
+        },
+    ));
     for i in 0..4 {
         app.world.spawn((
             Transform::from_xyz(-1.5 + i as f32, 0.3, 1.0),
@@ -716,8 +723,10 @@ fn forward_full_screen_gate() {
         };
         if full {
             app.world.insert_one(camera, EnvironmentLight::new(env)).unwrap();
+            app.world.insert_one(sun, DirectionalShadow::new()).unwrap();
         } else {
             let _ = app.world.remove_one::<EnvironmentLight>(camera);
+            let _ = app.world.remove_one::<DirectionalShadow>(sun);
         }
     };
     let frame = |app: &mut App| {
@@ -769,7 +778,7 @@ fn forward_full_screen_gate() {
     let f = median(timed.iter().filter(|t| t.1).map(|t| t.2).collect());
     let d = median(diffs);
     eprintln!(
-        "scene pass, 1080p full screen: legacy {l:.3} ms, all maps + Standard + IBL {f:.3} ms; paired difference {d:+.3} ms"
+        "scene pass, 1080p full screen: legacy {l:.3} ms, all maps + Standard + IBL + PCF9 {f:.3} ms; paired difference {d:+.3} ms"
     );
     let scale = std::env::var("SPACE3D_PERF_BUDGET_SCALE")
         .ok()

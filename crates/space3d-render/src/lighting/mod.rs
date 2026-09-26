@@ -18,13 +18,15 @@
 //!   `ShadingModel::Standard` uses it for multiple-scattering compensation).
 //! * Environments unused for [`ENV_IDLE_FRAMES`] frames, those of removed cubemaps and those
 //!   superseded by a baked newer one are dropped.
-//! * Directional shadows (depth views, milestone PM5) are still neutral: no depth views, a far
-//!   1×1 shadow map.
+//! * Directional shadows ([`shadow`]): step 4 picks the casting light and keeps its shadow map,
+//!   step 5 ([`Lighting::depth_views`]) fits the map to the frame's cameras and requests it as a
+//!   depth view, step 8 gives every camera view the light matrix and binds the map (group 0
+//!   bindings 5–6; a 1×1 far map without a shadow).
 
 pub(crate) mod api;
 pub(crate) mod cubemap;
 mod environment;
-mod shadow;
+pub(crate) mod shadow;
 mod skybox;
 
 use crate::assets::RenderAssets;
@@ -64,7 +66,7 @@ pub(crate) struct LightingPrepare<'a> {
 /// One depth-only view the frame renders before the camera views (a shadow map).
 #[allow(
     dead_code,
-    reason = "graphics contract (spec §2.6): shadows arrive with milestone PM5"
+    reason = "graphics contract (spec §2.6): `light` and `size` describe the view; the frame reads the rest"
 )]
 pub(crate) struct DepthViewRequest {
     pub light: Entity,
@@ -121,6 +123,14 @@ pub(crate) struct Lighting {
     next_id: u64,
     /// Warned that HDR cubemaps are stored as LDR (no float render targets).
     warned_ldr: bool,
+    /// This frame's casting light (step 4).
+    shadow_light: Option<shadow::CastingLight>,
+    /// Its shadow map (kept for [`ENV_IDLE_FRAMES`] frames without a casting light).
+    shadow_map: Option<shadow::ShadowMap>,
+    /// This frame's fitted shadow (step 5), for the camera views.
+    shadow: Option<shadow::ActiveShadow>,
+    /// Warned that several lights asked to cast.
+    warned_casters: bool,
     /// Tests: apply `bake_passes_per_frame` although the renderer is headless.
     pub(crate) budget_headless: bool,
 }
@@ -182,8 +192,12 @@ impl Lighting {
                 mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 ..Default::default()
             }),
+            // Bilinear comparisons: each tap is a 2×2 PCF (the kernels of `S3D_SHADOW_TAPS`
+            // weigh them).
             comparison: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("space3d shadow comparison"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
                 compare: Some(wgpu::CompareFunction::LessEqual),
                 ..Default::default()
             }),
@@ -196,6 +210,10 @@ impl Lighting {
             frame: 0,
             next_id: 1,
             warned_ldr: false,
+            shadow_light: None,
+            shadow_map: None,
+            shadow: None,
+            warned_casters: false,
             budget_headless: false,
         }
     }
@@ -220,6 +238,7 @@ impl Lighting {
             self.camera_envs.capacity(),
             self.states.capacity(),
         );
+        self.prepare_shadow(cx.device, cx.world, cx.stats);
 
         // Uploads of new and updated cubemaps.
         let mut pending = std::mem::take(&mut cx.assets.pending_cubemaps);
@@ -421,19 +440,77 @@ impl Lighting {
     }
 
     /// Step 5: this frame's shadow depth views (after camera planning).
+    /// The casting light's map is fitted to `cameras` (see [`shadow`]); no request without a
+    /// casting light, a camera to fit to, or with `strength` 0.
     pub fn depth_views(
         &mut self,
         world: &World,
         cameras: &[ViewInfo],
         settings: &LightingSettings,
     ) -> &[DepthViewRequest] {
-        let _ = (world, cameras, settings); // STUB(P-MAT): shadows (PM5)
+        let _ = (world, settings);
         self.depth_views.clear();
+        self.shadow = None;
+        if let (Some(light), Some(map)) = (&self.shadow_light, &self.shadow_map)
+            && light.shadow.strength > 0.0
+            && let Some(fitted) = shadow::fit(light, map.size, cameras)
+        {
+            self.depth_views.push(DepthViewRequest {
+                light: light.entity,
+                view_proj: fitted.view_proj,
+                frustum: Frustum::from_view_proj(&fitted.view_proj),
+                target: map.view.clone(),
+                size: map.size,
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: light.shadow.slope_bias.max(0.0) * shadow::filter_reach(light.shadow.filter),
+                    clamp: 0.01,
+                },
+            });
+            self.shadow = Some(shadow::ActiveShadow::new(light, &fitted, map));
+        }
         &self.depth_views
     }
 
+    /// Step 4 of the shadow: the casting light, and its map (created on first use and when its
+    /// size changes; dropped after [`ENV_IDLE_FRAMES`] frames without a casting light).
+    fn prepare_shadow(&mut self, device: &wgpu::Device, world: &World, stats: &mut RenderStats) {
+        let (light, casters) = shadow::casting_light(world);
+        if casters > 1 && !self.warned_casters {
+            self.warned_casters = true;
+            tracing::warn!("{casters} directional lights have a DirectionalShadow: only one casts (the lowest entity)");
+        }
+        self.shadow_light = light;
+        match &light {
+            Some(l) => {
+                let size = shadow::map_size(l.shadow.map_size, device.limits().max_texture_dimension_2d);
+                if self.shadow_map.as_ref().is_none_or(|m| m.size != size) {
+                    let id = self.next_id();
+                    self.shadow_map = Some(shadow::ShadowMap::new(device, size, id, self.frame));
+                    stats.textures_created += 1;
+                }
+                if let Some(m) = &mut self.shadow_map {
+                    m.last_used = self.frame;
+                }
+            }
+            None => {
+                if self
+                    .shadow_map
+                    .as_ref()
+                    .is_some_and(|m| m.last_used + ENV_IDLE_FRAMES < self.frame)
+                {
+                    self.shadow_map = None;
+                }
+            }
+        }
+    }
+
     /// Step 8: fill the environment, sky and shadow fields of a camera's `GpuView` (zero = off).
+    /// With a shadow, the casting light moves to `dir_lights[0]`.
     pub fn fill_view(&self, world: &World, camera: Entity, view: &mut GpuView) {
+        if let Some(s) = &self.shadow {
+            s.fill(view);
+        }
         if let Ok(sky) = world.get::<&Skybox>(camera) {
             let uploaded = self.states.iter().any(|s| s.handle == sky.cubemap && s.uploaded);
             view.sky_params = [sky.intensity, if uploaded { 1.0 } else { 0.0 }, 0.0, 0.0];
@@ -452,18 +529,29 @@ impl Lighting {
         }
     }
 
-    /// Bindings 1–6 of group 0 for `camera` (`None`: depth views and cameras without lighting).
+    /// Bindings 1–6 of group 0 for `camera` (`None`: depth views, which never sample the map
+    /// they may be rendering). Keys: the environment's id in the low 32 bits, the shadow map's
+    /// above (ids are unique and far below 2³²).
     pub fn view_resources(&self, camera: Option<Entity>) -> ViewResources<'_> {
         let env = camera.and_then(|c| self.camera_env(c));
+        let map = camera
+            .and(self.shadow.as_ref())
+            .and_then(|s| self.shadow_map.as_ref().filter(|m| m.id == s.map));
         ViewResources {
             env_specular: env.map_or(&self.dummy_cube, |e| &e.specular),
             env_irradiance: env.map_or(&self.dummy_cube, |e| &e.irradiance),
             brdf_lut: &self.brdf_lut,
             env_sampler: &self.sampler,
-            shadow_map: &self.dummy_depth,
+            shadow_map: map.map_or(&self.dummy_depth, |m| &m.view),
             shadow_sampler: &self.comparison,
-            key: env.map_or(0, |e| e.id),
+            key: env.map_or(0, |e| e.id & 0xFFFF_FFFF) | map.map_or(0, |m| m.id << 32),
         }
+    }
+
+    /// This frame's shadow map, when a depth view renders it (tests).
+    #[cfg(test)]
+    pub(crate) fn shadow_map_size(&self) -> Option<u32> {
+        self.shadow.and(self.shadow_map.as_ref()).map(|m| m.size)
     }
 
     /// Register the built-in lighting nodes (`"space3d/skybox"`).

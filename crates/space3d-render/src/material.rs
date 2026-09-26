@@ -35,6 +35,8 @@ pub(crate) const FLAG_UV_TRANSFORM: u32 = 1 << 6;
 pub(crate) const FLAG_FIXUP_SHIFT: u32 = 7;
 /// Every map flag.
 pub(crate) const FLAG_MAPS: u32 = FLAG_NORMAL | FLAG_METALLIC_ROUGHNESS | FLAG_OCCLUSION | FLAG_EMISSIVE;
+/// The material does not receive shadows (`ShadowMode::CastOnly` / `None`).
+pub(crate) const FLAG_NO_SHADOW: u32 = 1 << 11;
 
 /// How a material's color combines with what is behind it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -113,12 +115,14 @@ impl BlendMode {
     }
 }
 
-/// Shadow participation of a material.
+/// Shadow participation of a material (only matters while a light has a
+/// [`crate::DirectionalShadow`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ShadowMode {
-    /// Lit opaque and alpha-masked materials cast and receive; unlit and transparent ones do
-    /// neither.
+    /// Lit opaque and alpha-masked materials cast and receive (masked ones cast their cut-out
+    /// shape); lit transparent ones receive but do not cast; unlit ones do neither (sky quads,
+    /// glows, particles).
     #[default]
     Auto,
     /// Cast and receive.

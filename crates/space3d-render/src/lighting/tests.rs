@@ -419,3 +419,47 @@ fn rotations_are_inverted() {
         [1.0, 0.0, 0.0, 0.0]
     );
 }
+
+/// The shadow map follows the casting light: created at the requested (power-of-two) size,
+/// bound to camera views only (depth views get the neutral map), kept while unused for
+/// `ENV_IDLE_FRAMES` frames, then dropped; a light with strength 0 requests no depth view.
+#[test]
+fn shadow_map_follows_the_light() {
+    let Some(mut app) = headless_app(8, 8) else { return };
+    let camera = app.world.spawn((
+        Transform::from_xyz(0.0, 10.0, 0.0).looking_at(glam::Vec3::ZERO, glam::Vec3::NEG_Z),
+        crate::Camera3d::default(),
+    ));
+    let light = app.world.spawn((
+        Transform::IDENTITY.looking_at(glam::Vec3::new(-0.3, -1.0, 0.2), glam::Vec3::Y),
+        crate::DirectionalLight::default(),
+        api::DirectionalShadow::new().with_map_size(300),
+    ));
+    fn lighting(app: &App) -> &Lighting {
+        &app.resources.expect::<Renderer>().lighting
+    }
+    crate::render_to_image(&mut app).unwrap();
+    assert_eq!(lighting(&app).shadow_map_size(), Some(512));
+    let keys = |app: &App| {
+        let l = lighting(app);
+        (l.view_resources(Some(camera)).key, l.view_resources(None).key)
+    };
+    let (camera_key, depth_key) = keys(&app);
+    assert_ne!(camera_key >> 32, 0, "cameras bind the map");
+    assert_eq!(depth_key, 0, "depth views bind the neutral map");
+    // Strength 0: no depth view, no shadow in the views, the map is kept.
+    app.world.get::<&mut api::DirectionalShadow>(light).unwrap().strength = 0.0;
+    crate::render_to_image(&mut app).unwrap();
+    assert_eq!(app.resources.expect::<crate::RenderStats>().depth_views, 0);
+    assert_eq!(lighting(&app).shadow_map_size(), None);
+    assert!(lighting(&app).shadow_map.is_some());
+    assert_eq!(keys(&app).0, 0);
+    app.world.remove_one::<api::DirectionalShadow>(light).unwrap();
+    for _ in 0..ENV_IDLE_FRAMES {
+        crate::render_to_image(&mut app).unwrap();
+    }
+    assert!(lighting(&app).shadow_map.is_some());
+    crate::render_to_image(&mut app).unwrap();
+    assert!(lighting(&app).shadow_map.is_none(), "dropped after the idle frames");
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+}
