@@ -4,17 +4,18 @@
 //! [`material_from_data`] / [`apply_material_maps`] convert material descriptions (graphics
 //! spec §2.4).
 //!
-//! F2 skeleton: the conversion covers every slot, color space and blend mode; MikkTSpace
-//! tangents, texture transforms and samplers per slot land with the materials milestone PM2
-//! (`STUB(P-MAT)`).
+//! The conversion covers every slot (with ORM packing), color space (base color and emissive
+//! sRGB, normal / metallic-roughness / occlusion linear), blend mode, `texCoord` set, the
+//! glTF samplers and `KHR_texture_transform` (one transform per material). Primitives with a
+//! normal map but no `TANGENT` get MikkTSpace tangents in [`prepare_model`].
 
 use crate::loaders::{CubeConvention, CubemapData};
-use crate::model::{AlphaMode, MaterialData, ModelData};
-use glam::{Mat4, Vec3, Vec4};
+use crate::model::{AlphaMode, MaterialData, ModelData, PrimitiveExtras, SamplerData, TextureInfo, WrapMode};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use space3d_core::{Entity, Parent, Transform, World};
 use space3d_render::{
-    BlendMode, CubemapSource, Material, Mesh3d, MeshExtras, MeshHandle, RenderAssets, SamplerSettings, TextureHandle,
-    TextureSource,
+    AddressMode, BlendMode, CubemapSource, FilterMode, MapMask, Material, Mesh3d, MeshExtras, MeshHandle, RenderAssets,
+    SamplerSettings, TextureHandle, TextureSource, TextureTransform,
 };
 use space3d_tasks::Task;
 use std::collections::HashMap;
@@ -45,12 +46,47 @@ pub struct PreparedModel {
     options: ModelUploadOptions,
 }
 
-/// CPU work of an upload (tangents, vertex splitting): run it through
+/// CPU work of an upload: MikkTSpace tangents (splitting vertices at mirrored UVs) for the
+/// primitives with a normal map but no `TANGENT`, when `generate_tangents`. Run it through
 /// [`prepare_model_async`] off the frame (AGENTS rule 2).
 pub fn prepare_model(model: &ModelData, o: &ModelUploadOptions) -> PreparedModel {
-    // STUB(P-MAT): MikkTSpace for normal-mapped primitives lacking TANGENT.
+    let mut model = model.clone();
+    if o.generate_tangents {
+        let normal_mapped = |m: Option<usize>| {
+            m.and_then(|i| model.materials.get(i))
+                .is_some_and(|m| m.normal_texture.is_some())
+        };
+        let wanted: Vec<Vec<bool>> = model
+            .meshes
+            .iter()
+            .map(|mesh| mesh.primitives.iter().map(|p| normal_mapped(p.material)).collect())
+            .collect();
+        for (mesh, wanted) in model.meshes.iter_mut().zip(wanted) {
+            for (p, wanted) in wanted.into_iter().enumerate() {
+                let current = mesh.primitive_extras(p).unwrap_or_default();
+                if !wanted || !current.tangents.is_empty() {
+                    continue;
+                }
+                let prim = &mut mesh.primitives[p];
+                let (data, tangents, sources) = crate::edit::mesh::tangents::mikktspace_with_sources(&prim.mesh);
+                if tangents.is_empty() {
+                    continue;
+                }
+                let uvs1 = if current.uvs1.is_empty() {
+                    Vec::new()
+                } else {
+                    sources.iter().map(|&s| current.uvs1[s as usize]).collect()
+                };
+                prim.mesh = data;
+                if mesh.extras.len() <= p {
+                    mesh.extras.resize(p + 1, PrimitiveExtras::default());
+                }
+                mesh.extras[p] = PrimitiveExtras { tangents, uvs1 };
+            }
+        }
+    }
     PreparedModel {
-        model: model.clone(),
+        model,
         options: o.clone(),
     }
 }
@@ -66,29 +102,31 @@ impl PreparedModel {
     pub fn upload(self, assets: &mut RenderAssets) -> RenderModel {
         let model = &self.model;
         let mut textures = Vec::new();
-        let mut cache: HashMap<(usize, bool), TextureHandle> = HashMap::new();
-        let sampler = self.options.sampler_override;
-        let mut texture = |index: usize, role: TextureRole| -> Option<TextureHandle> {
-            let image = model.images.get(index)?;
-            let srgb = role.is_srgb();
-            Some(*cache.entry((index, srgb)).or_insert_with(|| {
-                let mut source = if srgb {
-                    TextureSource::from_image(image.clone())
-                } else {
-                    TextureSource::from_image_linear(image.clone())
-                };
-                if let Some(s) = sampler {
-                    source.sampler = s;
-                }
-                let h = assets.add_texture(source);
-                textures.push(h);
-                h
-            }))
-        };
+        // One texture per (image, color space, sampler).
+        let mut cache: HashMap<(usize, bool, SamplerSettings), TextureHandle> = HashMap::new();
+        let sampler_override = self.options.sampler_override;
         let materials: Vec<Material> = model
             .materials
             .iter()
-            .map(|m| material_from_data(m, &mut texture))
+            .map(|data| {
+                let mut texture = |index: usize, role: TextureRole| -> Option<TextureHandle> {
+                    let image = model.images.get(index)?;
+                    let srgb = role.is_srgb();
+                    let sampler = sampler_override.unwrap_or_else(|| sampler_settings(&slot(data, role).sampler));
+                    Some(*cache.entry((index, srgb, sampler)).or_insert_with(|| {
+                        let mut source = if srgb {
+                            TextureSource::from_image(image.clone())
+                        } else {
+                            TextureSource::from_image_linear(image.clone())
+                        };
+                        source.sampler = sampler;
+                        let h = assets.add_texture(source);
+                        textures.push(h);
+                        h
+                    }))
+                };
+                material_from_data(data, &mut texture)
+            })
             .collect();
         let mut meshes: HashMap<(usize, usize), MeshHandle> = HashMap::new();
         let mut parts = Vec::new();
@@ -176,6 +214,46 @@ impl TextureRole {
     pub fn is_srgb(self) -> bool {
         matches!(self, Self::BaseColor | Self::Emissive)
     }
+
+    /// The material map of this role.
+    fn map(self) -> MapMask {
+        match self {
+            Self::BaseColor => MapMask::BASE_COLOR,
+            Self::Normal => MapMask::NORMAL,
+            Self::MetallicRoughness => MapMask::METALLIC_ROUGHNESS,
+            Self::Occlusion => MapMask::OCCLUSION,
+            Self::Emissive => MapMask::EMISSIVE,
+        }
+    }
+}
+
+/// The texture details of a material slot.
+fn slot(data: &MaterialData, role: TextureRole) -> &TextureInfo {
+    let t = &data.texture_info;
+    match role {
+        TextureRole::BaseColor => &t.base_color,
+        TextureRole::Normal => &t.normal,
+        TextureRole::MetallicRoughness => &t.metallic_roughness,
+        TextureRole::Occlusion => &t.occlusion,
+        TextureRole::Emissive => &t.emissive,
+    }
+}
+
+/// The renderer's sampler for a glTF sampler: nearest when magnification is nearest; clamped
+/// when both axes clamp (mirrored repeat samples as repeat).
+fn sampler_settings(s: &SamplerData) -> SamplerSettings {
+    SamplerSettings {
+        filter: if s.nearest_mag {
+            FilterMode::Nearest
+        } else {
+            FilterMode::Linear
+        },
+        address: if s.wrap_s == WrapMode::ClampToEdge && s.wrap_t == WrapMode::ClampToEdge {
+            AddressMode::Clamp
+        } else {
+            AddressMode::Repeat
+        },
+    }
 }
 
 /// Full `MaterialData` → `Material` conversion. `texture(image, role)` supplies (or uploads)
@@ -202,6 +280,9 @@ pub fn material_from_data(
         alpha_cutoff,
         ..Material::default()
     };
+    if m.base_color_texture.is_some() && data.texture_info.base_color.tex_coord == 1 {
+        m.uv1_maps = m.uv1_maps | MapMask::BASE_COLOR;
+    }
     apply_material_maps(&mut m, data, texture);
     m
 }
@@ -237,7 +318,42 @@ pub fn apply_material_maps(
     if material.emissive != Vec3::ZERO || data.emissive_texture.is_some() {
         material.emissive *= data.emissive_strength;
     }
-    // STUB(P-MAT): texCoord 1 → uv1_maps, KHR_texture_transform → uv_transform (PM2).
+    // Second UV set (glTF `texCoord` 1) per map.
+    for (role, handle) in [
+        (TextureRole::Normal, material.normal_texture),
+        (TextureRole::MetallicRoughness, material.metallic_roughness_texture),
+        (TextureRole::Occlusion, material.occlusion_texture),
+        (TextureRole::Emissive, material.emissive_texture),
+    ] {
+        if handle.is_some() && slot(data, role).tex_coord == 1 {
+            material.uv1_maps = material.uv1_maps | role.map();
+        }
+    }
+    // One UV transform per material: the base color's, else the first slot with one.
+    let slots = [
+        (data.base_color_texture, &data.texture_info.base_color),
+        (data.normal_texture, &data.texture_info.normal),
+        (data.metallic_roughness_texture, &data.texture_info.metallic_roughness),
+        (data.occlusion_texture, &data.texture_info.occlusion),
+        (data.emissive_texture, &data.texture_info.emissive),
+    ];
+    let mut transforms = slots
+        .iter()
+        .filter(|(image, _)| image.is_some())
+        .filter_map(|(_, info)| info.transform);
+    if let Some(t) = transforms.next() {
+        if transforms.any(|o| (o.offset, o.rotation, o.scale) != (t.offset, t.rotation, t.scale)) {
+            tracing::warn!(
+                material = data.name.as_deref().unwrap_or("?"),
+                "texture slots use different KHR_texture_transforms; the first applies to every map"
+            );
+        }
+        material.uv_transform = TextureTransform {
+            offset: Vec2::from_array(t.offset),
+            rotation: t.rotation,
+            scale: Vec2::from_array(t.scale),
+        };
+    }
 }
 
 /// Spawn `model` under a new root entity at `root`: one child per part (`Mesh3d`, `Material`,
@@ -314,6 +430,40 @@ mod tests {
         let mut custom = Material::srgb(0.2, 0.3, 0.4);
         apply_material_maps(&mut custom, &MaterialData::default(), &mut |_, _| None);
         assert_eq!(custom, Material::srgb(0.2, 0.3, 0.4));
+    }
+
+    /// `prepare_model` generates MikkTSpace tangents for normal-mapped primitives without
+    /// `TANGENT` (carrying the second UV set through vertex splits) and leaves the others.
+    #[test]
+    fn prepare_model_generates_tangents() {
+        let mut model = ModelData::from_mesh(MeshData::cube(1.0));
+        model.meshes[0].primitives.push(crate::model::Primitive {
+            mesh: MeshData::cube(1.0),
+            material: None,
+        });
+        model.images.push(ImageData::new(1, 1));
+        model.materials[0].normal_texture = Some(0);
+        model.meshes[0].extras = vec![PrimitiveExtras {
+            tangents: Vec::new(),
+            uvs1: vec![[0.5, 0.25]; 24],
+        }];
+        let prepared = prepare_model(&model, &ModelUploadOptions::default());
+        let mesh = &prepared.model.meshes[0];
+        let extras = mesh.primitive_extras(0).expect("generated");
+        assert_eq!(extras.tangents.len(), 24);
+        assert_eq!(extras.uvs1, vec![[0.5, 0.25]; 24], "second UV set kept");
+        assert!(extras.tangents.iter().all(|t| t[3] == 1.0));
+        assert_eq!(mesh.primitive_extras(1), None, "no normal map: no tangents");
+        // Given tangents are kept; generation can be turned off.
+        let mut given = model.clone();
+        given.meshes[0].extras[0].tangents = vec![[0.0, 1.0, 0.0, -1.0]; 24];
+        let kept = prepare_model(&given, &ModelUploadOptions::default());
+        assert_eq!(kept.model.meshes[0].extras[0].tangents[0], [0.0, 1.0, 0.0, -1.0]);
+        let off = ModelUploadOptions {
+            generate_tangents: false,
+            ..ModelUploadOptions::default()
+        };
+        assert_eq!(prepare_model(&model, &off).model, model);
     }
 
     #[test]

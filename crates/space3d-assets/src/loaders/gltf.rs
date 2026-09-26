@@ -2,7 +2,10 @@ use super::{finish_mesh, missing_texture, percent_decode};
 use crate::edit::texture::decode_image_with_hint;
 use crate::error::AssetError;
 use crate::loader::{AssetLoader, LoadContext};
-use crate::model::{AlphaMode, MaterialData, ModelData, ModelMesh, NodeData, Primitive};
+use crate::model::{
+    AlphaMode, MaterialData, MaterialTextureInfo, ModelData, ModelMesh, NodeData, Primitive, PrimitiveExtras,
+    SamplerData, TextureInfo, UvTransformData, WrapMode,
+};
 use base64::Engine as _;
 use glam::{Quat, Vec3};
 use gltf::Gltf;
@@ -11,8 +14,11 @@ use space3d_core::{ImageData, MeshData, Transform};
 use std::borrow::Cow;
 
 /// Loads glTF 2.0 (`.gltf` with embedded or external buffers/images, and binary `.glb`)
-/// into [`ModelData`]: triangle meshes, metallic-roughness materials, base-color/normal
-/// textures and the node hierarchy of the default scene.
+/// into [`ModelData`]: triangle meshes (with `TANGENT` and `TEXCOORD_1` as
+/// [`ModelMesh::extras`]), metallic-roughness materials with every texture slot (base color,
+/// metallic-roughness, normal + scale, occlusion + strength, emissive), their `texCoord`
+/// sets, samplers and `KHR_texture_transform`, `KHR_materials_emissive_strength` and
+/// `KHR_materials_unlit`, and the node hierarchy of the default scene.
 #[derive(Clone, Copy, Debug)]
 pub struct GltfLoader {
     /// Decode images (disable when only geometry is needed).
@@ -176,32 +182,12 @@ pub fn load_gltf(bytes: &[u8], ctx: &LoadContext, load_images: bool) -> Result<M
         let i = t.source().index();
         (i < image_count).then_some(i)
     };
-    let materials = doc
-        .materials()
-        .map(|m| {
-            let pbr = m.pbr_metallic_roughness();
-            MaterialData {
-                name: m.name().map(str::to_string),
-                base_color: pbr.base_color_factor(),
-                base_color_texture: pbr.base_color_texture().and_then(|i| tex(i.texture())),
-                metallic: pbr.metallic_factor(),
-                roughness: pbr.roughness_factor(),
-                emissive: m.emissive_factor(),
-                normal_texture: m.normal_texture().and_then(|n| tex(n.texture())),
-                alpha_mode: match m.alpha_mode() {
-                    gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
-                    gltf::material::AlphaMode::Mask => AlphaMode::Mask(m.alpha_cutoff().unwrap_or(0.5)),
-                    gltf::material::AlphaMode::Blend => AlphaMode::Blend,
-                },
-                double_sided: m.double_sided(),
-                ..MaterialData::default() // STUB(P-MAT): the other slots (PM2)
-            }
-        })
-        .collect();
+    let materials = doc.materials().map(|m| material(&m, &tex)).collect();
 
     let mut meshes = Vec::new();
     for mesh in doc.meshes() {
         let mut primitives = Vec::new();
+        let mut extras = Vec::new();
         for prim in mesh.primitives() {
             let mode = prim.mode();
             if !matches!(mode, Mode::Triangles | Mode::TriangleStrip | Mode::TriangleFan) {
@@ -241,16 +227,27 @@ pub fn load_gltf(bytes: &[u8], ctx: &LoadContext, load_images: bool) -> Result<M
                 indices,
             };
             finish_mesh(&mut m);
+            // Streams beyond `MeshData`; `ModelMesh::primitive_extras` drops any whose length no
+            // longer matches (e.g. flat normals recomputed for a primitive without normals).
+            extras.push(PrimitiveExtras {
+                tangents: reader.read_tangents().map(|t| t.collect()).unwrap_or_default(),
+                uvs1: reader
+                    .read_tex_coords(1)
+                    .map(|t| t.into_f32().collect())
+                    .unwrap_or_default(),
+            });
             primitives.push(Primitive {
                 mesh: m,
                 material: prim.material().index(),
             });
         }
+        if extras.iter().all(|e| e.tangents.is_empty() && e.uvs1.is_empty()) {
+            extras.clear();
+        }
         meshes.push(ModelMesh {
             name: mesh.name().map(str::to_string),
             primitives,
-            // STUB(P-MAT): TANGENT, TEXCOORD_1 into `extras` (PM2)
-            ..ModelMesh::default()
+            extras,
         });
     }
 
@@ -290,6 +287,110 @@ pub fn load_gltf(bytes: &[u8], ctx: &LoadContext, load_images: bool) -> Result<M
         nodes,
         roots,
     })
+}
+
+/// A glTF sampler as [`SamplerData`] (the defaults — repeat, linear — without one).
+fn sampler_data(s: gltf::texture::Sampler) -> SamplerData {
+    use gltf::texture::{MagFilter, MinFilter, WrappingMode as W};
+    let wrap = |w: W| match w {
+        W::ClampToEdge => WrapMode::ClampToEdge,
+        W::MirroredRepeat => WrapMode::MirroredRepeat,
+        W::Repeat => WrapMode::Repeat,
+    };
+    SamplerData {
+        wrap_s: wrap(s.wrap_s()),
+        wrap_t: wrap(s.wrap_t()),
+        nearest_mag: s.mag_filter() == Some(MagFilter::Nearest),
+        nearest_min: matches!(
+            s.min_filter(),
+            Some(MinFilter::Nearest | MinFilter::NearestMipmapNearest | MinFilter::NearestMipmapLinear)
+        ),
+    }
+}
+
+/// `KHR_texture_transform` of a slot from its raw extension JSON (the `normalTexture` and
+/// `occlusionTexture` slots have no typed accessor for it).
+fn transform_from_json(v: &serde_json::Value) -> UvTransformData {
+    let pair = |key: &str, default: [f32; 2]| {
+        v.get(key)
+            .and_then(|a| a.as_array())
+            .filter(|a| a.len() == 2)
+            .map_or(default, |a| {
+                [0, 1].map(|i| a[i].as_f64().map_or(default[i], |x| x as f32))
+            })
+    };
+    UvTransformData {
+        offset: pair("offset", [0.0; 2]),
+        rotation: v.get("rotation").and_then(|r| r.as_f64()).unwrap_or(0.0) as f32,
+        scale: pair("scale", [1.0; 2]),
+        tex_coord: v.get("texCoord").and_then(|t| t.as_u64()).map(|t| t as u32),
+    }
+}
+
+/// A texture slot's details: `texCoord` (as overridden by its transform), transform, sampler.
+fn texture_info(tex_coord: u32, texture: &gltf::Texture, transform: Option<UvTransformData>) -> TextureInfo {
+    TextureInfo {
+        tex_coord: transform.and_then(|t| t.tex_coord).unwrap_or(tex_coord),
+        transform,
+        sampler: sampler_data(texture.sampler()),
+    }
+}
+
+/// One glTF material as [`MaterialData`]: every slot (image indices through `tex`), factors,
+/// alpha mode, the per-slot texture details and the supported extensions.
+fn material(m: &gltf::Material, tex: &dyn Fn(gltf::Texture) -> Option<usize>) -> MaterialData {
+    let pbr = m.pbr_metallic_roughness();
+    let info = |i: &gltf::texture::Info| {
+        let t = i.texture_transform().map(|t| UvTransformData {
+            offset: t.offset(),
+            rotation: t.rotation(),
+            scale: t.scale(),
+            tex_coord: t.tex_coord(),
+        });
+        texture_info(i.tex_coord(), &i.texture(), t)
+    };
+    let raw_transform = |v: Option<&serde_json::Value>| v.map(transform_from_json);
+    let base = pbr.base_color_texture();
+    let mr = pbr.metallic_roughness_texture();
+    let normal = m.normal_texture();
+    let occlusion = m.occlusion_texture();
+    let emissive = m.emissive_texture();
+    let texture_info = MaterialTextureInfo {
+        base_color: base.as_ref().map(info).unwrap_or_default(),
+        metallic_roughness: mr.as_ref().map(info).unwrap_or_default(),
+        normal: normal.as_ref().map_or_else(TextureInfo::default, |n| {
+            let t = raw_transform(n.extension_value("KHR_texture_transform"));
+            texture_info(n.tex_coord(), &n.texture(), t)
+        }),
+        occlusion: occlusion.as_ref().map_or_else(TextureInfo::default, |o| {
+            let t = raw_transform(o.extension_value("KHR_texture_transform"));
+            texture_info(o.tex_coord(), &o.texture(), t)
+        }),
+        emissive: emissive.as_ref().map(info).unwrap_or_default(),
+    };
+    MaterialData {
+        name: m.name().map(str::to_string),
+        base_color: pbr.base_color_factor(),
+        base_color_texture: base.and_then(|i| tex(i.texture())),
+        metallic: pbr.metallic_factor(),
+        roughness: pbr.roughness_factor(),
+        emissive: m.emissive_factor(),
+        normal_texture: normal.as_ref().and_then(|n| tex(n.texture())),
+        alpha_mode: match m.alpha_mode() {
+            gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+            gltf::material::AlphaMode::Mask => AlphaMode::Mask(m.alpha_cutoff().unwrap_or(0.5)),
+            gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+        },
+        double_sided: m.double_sided(),
+        metallic_roughness_texture: mr.and_then(|i| tex(i.texture())),
+        occlusion_texture: occlusion.as_ref().and_then(|o| tex(o.texture())),
+        emissive_texture: emissive.and_then(|i| tex(i.texture())),
+        normal_scale: normal.as_ref().map_or(1.0, |n| n.scale()),
+        occlusion_strength: occlusion.as_ref().map_or(1.0, |o| o.strength()),
+        emissive_strength: m.emissive_strength().unwrap_or(1.0),
+        unlit: m.unlit(),
+        texture_info,
+    }
 }
 
 #[cfg(test)]
