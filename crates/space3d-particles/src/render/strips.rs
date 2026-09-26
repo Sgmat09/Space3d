@@ -210,11 +210,15 @@ fn pos_of(p: &StripPoint) -> Vec3 {
     Vec3::new(p.pos_u[0], p.pos_u[1], p.pos_u[2])
 }
 
+/// Whole periods of `u` below `u` (subtracted in f64 before `u` is stored as f32).
+fn u_base(u: f64) -> f64 {
+    (u / U_PERIOD).floor() * U_PERIOD
+}
+
 /// Tangents of the strip `points` (central differences, one-sided at the ends; a zero-length
-/// neighborhood keeps its neighbor's), and `u` rebased by whole periods.
+/// neighborhood keeps its neighbor's).
 fn finish_strip(points: &mut [StripPoint], fallback: Vec3) {
     let n = points.len();
-    let base = (points[0].pos_u[3] as f64 / U_PERIOD).floor() * U_PERIOD;
     let mut last = fallback;
     for j in 0..n {
         let a = pos_of(&points[j.saturating_sub(1)]);
@@ -224,7 +228,6 @@ fn finish_strip(points: &mut [StripPoint], fallback: Vec3) {
         points[j].tan_t[0] = f16_bits(t.x);
         points[j].tan_t[1] = f16_bits(t.y);
         points[j].tan_t[2] = f16_bits(t.z);
-        points[j].pos_u[3] = (points[j].pos_u[3] as f64 - base) as f32;
     }
 }
 
@@ -262,19 +265,14 @@ fn ribbon(input: &StripInput<'_>, tr: &Track, now: f64, out: &mut Vec<StripPoint
     let bits = pcg(tr.serial as u32 ^ 0x51d0_7a11);
     let width = inst.scale.abs();
     let mut newest = None;
+    let mut base = None;
     for j in from..tr.len {
         let p = &rt.points[tr.slot(j)];
         let t = ((now - p.time) / life) as f32;
         let flags = if out.len() == start { START } else { 0 };
-        out.push(point(
-            p.pos,
-            strip_u(layer.uv, p.dist, 1.0 - t.min(1.0), layer.scroll, now),
-            t.max(0.0),
-            p.tint,
-            flags,
-            width,
-            bits,
-        ));
+        let u = strip_u(layer.uv, p.dist, 1.0 - t.min(1.0), layer.scroll, now);
+        let base = *base.get_or_insert(u_base(u));
+        out.push(point(p.pos, u - base, t.max(0.0), p.tint, flags, width, bits));
         newest = Some(p);
     }
     // The head at the emitter's render pose, while it emits.
@@ -288,7 +286,7 @@ fn ribbon(input: &StripInput<'_>, tr: &Track, now: f64, out: &mut Vec<StripPoint
             let tint = if tr.sim.tinted { inst.tint } else { Vec4::ONE };
             out.push(point(
                 head,
-                strip_u(layer.uv, last.dist + d as f64, 1.0, layer.scroll, now),
+                strip_u(layer.uv, last.dist + d as f64, 1.0, layer.scroll, now) - base.unwrap_or(0.0),
                 0.0,
                 tint,
                 CAP,
@@ -354,6 +352,7 @@ fn beam_strip(input: &StripInput<'_>, i: u32, b: u16, now: f64, out: &mut Vec<St
         0
     };
     let first = out.len();
+    let base = u_base(strip_u(layer.uv, 0.0, 0.0, layer.scroll, now));
     for j in 0..=segs {
         let f = j as f32 / segs as f32;
         let mut p = start.lerp(end, f);
@@ -368,7 +367,7 @@ fn beam_strip(input: &StripInput<'_>, i: u32, b: u16, now: f64, out: &mut Vec<St
                 _ if j == segs => CAP,
                 _ => 0,
             };
-        let u = strip_u(layer.uv, length * f as f64, f, layer.scroll, now);
+        let u = strip_u(layer.uv, length * f as f64, f, layer.scroll, now) - base;
         out.push(point(p, u, f, tint, flags, width, seed));
     }
     finish_strip(&mut out[first..], dir);
@@ -376,7 +375,7 @@ fn beam_strip(input: &StripInput<'_>, i: u32, b: u16, now: f64, out: &mut Vec<St
     for (glow, at, f) in [(layer.start_glow, start, 0.0), (layer.end_glow, end, 1.0)] {
         if glow > 0.0 {
             let g = out.len();
-            let u = strip_u(layer.uv, length * f as f64, f, layer.scroll, now);
+            let u = strip_u(layer.uv, length * f as f64, f, layer.scroll, now) - base;
             out.push(point(at, u, f, tint, ALONG | START | CAP, width * glow, seed));
             out.push(point(at, u, f, tint, ALONG | CAP, width * glow, seed));
             finish_strip(&mut out[g..], dir);
