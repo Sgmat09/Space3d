@@ -106,16 +106,24 @@ fn misordered(img: &ImageData, particles: &[SlotState], radius: f32) -> (u32, u3
     (bad, checked)
 }
 
-/// `ByDistance` draws each view's particles farthest first, on both backends: every checked
-/// pixel shows the nearest particle covering it, seen from either side. Without it (spawn order,
-/// `ByEmitter`) many pixels show a farther particle: the sort is what makes the difference.
+/// `ByDistance` draws each view's particles farthest first, on both backends and the WebGL2
+/// path (`DownlevelOverride::webgl2()`: the CPU backend): every checked pixel shows the nearest
+/// particle covering it, seen from either side. Without it (spawn order, `ByEmitter`) many
+/// pixels show a farther particle: the sort is what makes the difference.
 #[test]
 fn by_distance_draws_back_to_front_per_view() {
-    for backend in [ParticleBackend::Gpu, ParticleBackend::Cpu] {
+    for (backend, webgl2) in [
+        (ParticleBackend::Gpu, false),
+        (ParticleBackend::Cpu, false),
+        (ParticleBackend::Auto, true),
+    ] {
         for sort in [SortMode::ByDistance, SortMode::ByEmitter] {
             let Some(mut app) = app_with(W, H, ParticleSettings { backend, ..settings() }) else {
                 return;
             };
+            if webgl2 {
+                app.resources.expect_mut::<FrameSettings>().downlevel = DownlevelOverride::webgl2();
+            }
             scene(&mut app, sort);
             app.step_ticks(36);
             let img = render(&mut app);

@@ -333,14 +333,17 @@ impl ParticleSettings {
     /// | | Low (WebGL2 / C-class) | Medium (iGPU, Apple, mobile) | High (dGPU) |
     /// |---|---|---|---|
     /// | backend, budget | CPU, 16 384 (8 192 on the web) | GPU, 262 144 (65 536 on Android / iOS) | GPU, 262 144 |
-    /// | `quality` (spawn counts of `lod` layers, and their rings) | 0.5 | 1 (0.75 mobile) | 1 |
+    /// | `quality` (spawn counts of `lod` layers, and their rings) | 0.25 (0.125 on the web) | 1 (0.75 mobile) | 1 |
     /// | `lod` (rate × `min_scale` from `far`) | 1000 → 2500, × 0.25 | 1200 → 3000, × 0.5 | off |
+    /// | `offscreen_scale` | 0 (nothing off screen) | 0.5 (0.125 mobile) | 1 |
     /// | `max_ribbon_segments` | 16 384 | 65 536 | 65 536 |
     /// | `max_screen_size` (fill rate) | 0.6 | 1 | 1 |
     ///
     /// The LOD distances are for a top-down camera 400–1000 units above the flight plane (the
-    /// SpaceCorps2027 battle view): emitters on screen keep their full rate, those far off screen
-    /// thin out. Other tiers use the defaults.
+    /// SpaceCorps2027 battle view): emitters on screen keep their full rate, those off screen or
+    /// far away thin out. With these, the Battle scene's 300 ships (900 engines, 30 explosions a
+    /// second, …) keep 100k+ particles at High and fit every tier's budget without refusing a
+    /// layer, every engine in view burning. Other tiers use the defaults.
     pub fn for_quality(q: GraphicsQuality) -> Self {
         let mobile = cfg!(any(target_os = "android", target_os = "ios"));
         let web = cfg!(target_arch = "wasm32");
