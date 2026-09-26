@@ -10,6 +10,39 @@ use space3d_core::glam::Vec3;
 
 const DT: f32 = 1.0 / 60.0;
 
+/// A bolt trail of sprite glows laid per unit of distance (`LASER_TRAIL` before it became a
+/// ribbon): the render-time bridges' heaviest client.
+const SPRITE_TRAIL: &str = r#"ParticleEffect(
+    name: "test/sprite_trail",
+    looping: true,
+    layers: [
+        (
+            name: "trail",
+            spawn: (rate_per_distance: 1.0),
+            lifetime: 0.15,
+            size: 4.0,
+            color_over_life: (keys: [(0.0, (5.0, 5.0, 5.0, 1.0)), (1.0, (0.6, 0.6, 0.6, 1.0))]),
+            alpha_over_life: Preset(Out),
+            capacity: Some(576),
+            render: (shape: Glow(core: 0.35, hardness: 0.0)),
+        ),
+        (
+            name: "head",
+            space: Local,
+            spawn: (rate: 60.0),
+            lifetime: 0.05,
+            size: 6.0,
+            color_over_life: (keys: [(0.0, (8.0, 8.0, 8.0, 1.0))]),
+            alpha_over_life: Preset(InOut),
+            render: (shape: Glow(core: 0.6, hardness: 0.0)),
+        ),
+    ],
+)"#;
+
+fn sprite_trail() -> ParticleEffect {
+    ParticleEffect::from_ron(SPRITE_TRAIL).expect("sprite trail")
+}
+
 struct Harness {
     world: World,
     effects: ParticleEffects,
@@ -813,7 +846,8 @@ fn bridge_previews_the_next_tick() {
     );
 }
 
-/// The render-time bridges' CPU cost: 20 bolts (`builtin::LASER_TRAIL`) at 3200 units/s moved
+/// The render-time bridges' CPU cost: 20 bolts (a sprite trail: glows per unit of distance) at
+/// 3200 units/s moved
 /// one 60 Hz frame (53 units) after the tick, as gameplay in `Stage::Update` does — about 1100
 /// bridged glows per frame, built and packed within 0.1 ms (the graphics spec's budget for the
 /// whole particles `prepare` of a Battle frame on the GPU backend; Dev machine, release).
@@ -822,8 +856,7 @@ fn bridges_of_20_fast_bolts_within_budget() {
     use crate::cpu::{BridgeInput, PackLayer, pack_bridges};
     let mut h = Harness::new();
     h.settings.max_particles_cpu = 65_536;
-    let fx = crate::registry::builtin::effect(crate::registry::builtin::LASER_TRAIL).expect("laser trail");
-    let fx = h.add(fx);
+    let fx = h.add(sprite_trail());
     let bolts: Vec<Entity> = (0..20)
         .map(|i| {
             let b = h.world.spawn((Transform::from_xyz(0.0, 0.0, i as f32 * 10.0),));
@@ -889,7 +922,7 @@ fn bridges_of_a_battle_fleet_within_budget() {
     let mut h = Harness::new();
     h.settings.max_particles_cpu = 262_144;
     let exhaust = h.add(builtin::effect(builtin::ENGINE_EXHAUST).expect("exhaust"));
-    let trail = h.add(builtin::effect(builtin::LASER_TRAIL).expect("laser trail"));
+    let trail = h.add(sprite_trail());
     // Ships fly −Z (their exhaust points +Z), bolts +X.
     let mut movers = Vec::new();
     for i in 0..300 {
@@ -950,37 +983,47 @@ fn bridges_of_a_battle_fleet_within_budget() {
     assert!(ms <= budget, "{ms:.4} ms > {budget:.3} ms");
 }
 
-/// Pool slots each built-in reserves per instance (the sum of its layers' rings: design-particles
-/// §5.1), as documented in docs/graphics/particles.md "Budgets": on the CPU backend's web budget
-/// (8192, `Normal` priority 90 %) that is, e.g., 20 engine exhausts and 4 laser trails at once.
-/// `LASER_TRAIL`'s ring holds a trail at the game's 3200 units/s without overwriting.
+/// Pool slots (and ribbon points) each built-in reserves per instance (the sum of its layers'
+/// rings: design-particles §5.1), as documented in docs/graphics/particles.md "Budgets": on the
+/// CPU backend's web budget (8192, `Normal` priority 90 %) that is, e.g., 30 engine exhausts and
+/// 40 bolts' laser trails at once. A sprite trail's ring holds it at the game's 3200 units/s
+/// without overwriting.
 #[test]
 fn builtin_slots() {
     use crate::registry::builtin;
     let table = [
-        (builtin::EXPLOSION, "explosion", 81),
-        (builtin::HIT_SPARK, "hit_spark", 16),
-        (builtin::SHIELD_RIPPLE, "shield_ripple", 8),
-        (builtin::WARP_IN, "warp_in", 27),
-        (builtin::WARP_OUT, "warp_out", 27),
-        (builtin::ENGINE_EXHAUST, "engine_exhaust", 148),
-        (builtin::LASER_TRAIL, "laser_trail", 581),
+        (builtin::EXPLOSION, 81, 0),
+        (builtin::HIT_SPARK, 16, 0),
+        (builtin::SHIELD_RIPPLE, 8, 0),
+        (builtin::WARP_IN, 27, 0),
+        (builtin::WARP_OUT, 27, 0),
+        (builtin::ENGINE_EXHAUST, 148, 0),
+        (builtin::LASER_TRAIL, 5, 64),
+        (builtin::LASER_BEAM, 7, 0),
+        (builtin::MISSILE_TRAIL, 23, 192),
+        (builtin::DEBRIS_SPARKS, 78, 0),
+        (builtin::ENGINE_AFTERBURNER, 196, 96),
+        (builtin::EMP, 63, 0),
+        (builtin::REPAIR_BEAM, 8, 0),
+        (builtin::LASER_SHOT, 1, 0),
     ];
-    for (h, name, want) in table {
+    assert_eq!(table.len(), builtin::ALL.len());
+    for (h, want, want_points) in table {
         let fx = builtin::effect(h).unwrap();
         let slots: u32 = fx.layers.iter().filter(|l| l.enabled).map(capacity).sum();
-        assert_eq!(slots, want, "{name}");
+        let points: u32 = fx.ribbons.iter().map(|r| r.max_points).sum();
+        assert_eq!((slots, points), (want, want_points), "{}", fx.name);
     }
     let web = (8192.0 * priority_limit(EffectPriority::Normal)) as u32;
     assert!(
-        30 * 148 + 4 * 581 <= web,
-        "30 exhausts and 4 trails fit the web budget ({web})"
+        30 * 148 + 40 * 5 <= web,
+        "30 exhausts and 40 laser trails fit the web budget ({web})"
     );
 
     // A trail at 3200 units/s (and 3800) fills at most its ring.
     for speed in [3200.0f32, 3800.0] {
         let mut h = Harness::new();
-        let fx = h.add(builtin::effect(builtin::LASER_TRAIL).unwrap());
+        let fx = h.add(sprite_trail());
         let bolt = h.world.spawn((Transform::IDENTITY,));
         h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).follow(bolt));
         for t in 1..=60 {
@@ -989,4 +1032,137 @@ fn builtin_slots() {
         }
         assert_eq!(h.sim.overwrites, 0, "{speed} units/s: the ring overwrote live glows");
     }
+}
+
+/// A ribbon records a point whenever its emitter moved `min_distance` (× scale) from the newest
+/// one, stamped with the end-of-tick time, the tint and the distance along the trail; the ring
+/// keeps the newest `max_points`; the effect finishes exactly when the newest point has lived
+/// its `lifetime` after the emitter stopped.
+#[test]
+fn ribbon_tracks_record_and_expire() {
+    use crate::effect::RibbonLayer;
+    let mut h = Harness::new();
+    let fx = h.add(ParticleEffect {
+        duration: 0.5,
+        ..ParticleEffect::new("trail").ribbon(RibbonLayer {
+            min_distance: 1.0,
+            max_points: 8,
+            lifetime: 0.25,
+            ..RibbonLayer::default()
+        })
+    });
+    let e = h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).scale(2.0));
+    let mut last_point = 0;
+    for t in 1..=60u64 {
+        // 1.5 units per tick: a point every 2 ticks (min_distance 1 × scale 2).
+        if t <= 30 {
+            h.world.get::<&mut Transform>(e).unwrap().translation.x = 1.5 * t as f32;
+        }
+        h.step();
+        let i = h.rt.by_entity.get(&e).copied();
+        let Some(i) = i else { break };
+        let inst = h.rt.instances[i as usize];
+        if inst.finished {
+            // The newest point (tick `last_point`) lived its 0.25 s (15 ticks) + 1.
+            assert_eq!(
+                t,
+                last_point + window_ticks(0.25, DT) as u64,
+                "finished on the exact tick"
+            );
+            assert_eq!(inst.n_tracks, 0, "the track is freed");
+            assert_eq!(h.rt.ribbon_pool.reserved(), 0);
+            return;
+        }
+        let tr = h.rt.tracks[inst.tracks[0] as usize];
+        if tr.last_tick == t {
+            last_point = t;
+        }
+        if t == 20 {
+            // Points at ticks 1 (first sight), 3, 5, ..., 19 → 10 recorded, the ring holds 8.
+            assert_eq!(tr.len, 8);
+            let newest = h.rt.points[tr.newest().unwrap()];
+            assert_eq!(newest.pos, Vec3::new(28.5, 0.0, 0.0));
+            assert!((newest.time - 19.0 * DT as f64).abs() < 1e-9, "{}", newest.time);
+            assert!(
+                (newest.dist - 27.0).abs() < 1e-4,
+                "distance along the trail {}",
+                newest.dist
+            );
+            let oldest = h.rt.points[tr.slot(0)];
+            assert_eq!(oldest.pos.x, 7.5, "the ring kept the newest 8");
+        }
+    }
+    panic!("the effect never finished");
+}
+
+/// A light flash is a `PointLight` child entity of the emitter while it plays: spawned on its
+/// first tick with the flash curve's intensity, updated every tick, despawned when it ends; the
+/// effect finishes only after it (then despawns).
+#[test]
+fn light_flash_plays_a_point_light() {
+    use crate::effect::LightFlash;
+    use crate::{ParticleEffectFinished, ParticlesPlugin, builtin};
+    use space3d_core::prelude::{App, EventReader, Events};
+    use space3d_render::PointLight;
+    let mut app = App::new();
+    app.add_plugin(ParticlesPlugin::default());
+    let fx = app
+        .resources
+        .expect_mut::<ParticleEffects>()
+        .add(ParticleEffect {
+            duration: 0.0,
+            light: Some(LightFlash {
+                start: 0.05,
+                duration: 0.2,
+                color: Vec3::new(1.0, 0.5, 0.2),
+                peak: 30.0,
+                range: 40.0,
+                offset: Vec3::new(0.0, 5.0, 0.0),
+                tinted: true,
+                ..LightFlash::default()
+            }),
+            ..ParticleEffect::new("flash")
+        })
+        .unwrap();
+    let e = app.spawn_effect(
+        fx,
+        EffectSpawn::at(Vec3::new(10.0, 0.0, 0.0))
+            .scale(2.0)
+            .tint(space3d_core::glam::Vec4::new(1.0, 1.0, 0.5, 1.0)),
+    );
+    let lights = |app: &App| {
+        app.world
+            .query::<(&PointLight, &Parent, &Transform)>()
+            .iter()
+            .map(|(l, p, t)| (*l, p.0, t.translation))
+            .collect::<Vec<_>>()
+    };
+    let mut reader = EventReader::default();
+    let (mut first, mut last) = (None, None);
+    for t in 1..=40u32 {
+        app.step_ticks(1);
+        let l = lights(&app);
+        let finished = reader
+            .read(app.resources.expect::<Events<ParticleEffectFinished>>())
+            .count();
+        if let Some((light, parent, at)) = l.first() {
+            first.get_or_insert(t);
+            last = Some(t);
+            assert_eq!(parent, &e);
+            assert_eq!(at, &Vec3::new(0.0, 10.0, 0.0), "offset × scale, local to the emitter");
+            assert_eq!(light.range, 80.0);
+            assert_eq!(light.color, Vec3::new(1.0, 0.5, 0.1), "tinted");
+            assert!(light.intensity > 0.0 && light.intensity <= 30.0 * 4.0, "peak × scale²");
+            assert!(app.world.contains(e));
+        }
+        if finished > 0 {
+            assert!(l.is_empty(), "the light went before the effect finished");
+            assert!(!app.world.contains(e), "then the one-shot despawned");
+            // Flash from 0.05 s (tick 3) for 0.2 s (12 ticks).
+            assert_eq!((first, last), (Some(3), Some(14)), "on for the flash only");
+            let _ = builtin::EXPLOSION;
+            return;
+        }
+    }
+    panic!("never finished (lights {first:?}..{last:?})");
 }

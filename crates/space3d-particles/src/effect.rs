@@ -911,10 +911,11 @@ impl Default for RibbonProfile {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum RibbonUv {
-    /// 0..1 over the whole length.
+    /// 0..1 over the whole length (a ribbon's `u` is its points' age / lifetime: 0 at the head).
     #[default]
     Stretch,
-    /// Repeats every `length` world units.
+    /// Repeats every `length` world units (× effect scale for beams: world units), fixed to the
+    /// path: a ribbon's texture stays where it was laid.
     Tile {
         /// Tile length.
         length: f32,
@@ -972,9 +973,9 @@ pub struct RibbonLayer {
     pub texture: Option<SpriteTexture>,
     /// Analytic cross-section.
     pub profile: RibbonProfile,
-    /// UVs along the ribbon.
+    /// UVs along the ribbon (`u` grows toward the head).
     pub uv: RibbonUv,
-    /// U per second.
+    /// The texture and noise move toward the head at this many units of `u` per second.
     pub scroll: f32,
     /// Orientation.
     pub facing: RibbonFacing,
@@ -1050,9 +1051,9 @@ pub struct BeamLayer {
     pub texture: Option<SpriteTexture>,
     /// Analytic cross-section.
     pub profile: RibbonProfile,
-    /// UVs along the beam.
+    /// UVs along the beam (`u` grows toward the end).
     pub uv: RibbonUv,
-    /// U per second.
+    /// The texture and noise flow toward the end at this many units of `u` per second.
     pub scroll: f32,
     /// Orientation.
     pub facing: RibbonFacing,
@@ -1119,7 +1120,10 @@ pub struct LightFlash {
     pub duration: f32,
     /// Linear color.
     pub color: Vec3,
-    /// Peak intensity.
+    /// Peak intensity (`PointLight::intensity`, × effect scale²: the same light at the same
+    /// distance relative to the effect's size). The renderer's point lights fall off with the
+    /// inverse square of the distance: a flash lighting a hull 20–40 units away wants
+    /// hundreds to thousands.
     pub peak: f32,
     /// Intensity over the flash (× peak).
     pub intensity: Curve,

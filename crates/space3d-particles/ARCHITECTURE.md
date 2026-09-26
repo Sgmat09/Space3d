@@ -21,8 +21,9 @@ ParticleEmitter (ECS) ──tick_system (FixedUpdate)──► runtime ──Tic
 | `components.rs` | `ParticleEmitter`, `EffectSpawn`, `SpawnEffect`, `ParticleAttractor`, events |
 | `effect.rs`, `curve.rs` | the serde data model (layers, shapes, forces, curves, sprites) |
 | `registry.rs` | `ParticleEffects` (handles, versions), `builtin` (RON in `assets/particles/`) |
-| `runtime/mod.rs` | instances per emitter, entries (layer instances: ring `base..base+capacity`, spawn index, accumulators, compiled `LayerSim`), finish/orphan/detach, prewarm, hot reload |
-| `runtime/spawn.rs` | one tick of one layer instance: 32.32 rate accumulators, rate per distance, bursts |
+| `runtime/mod.rs` | instances per emitter, entries (layer instances: ring `base..base+capacity`, spawn index, accumulator, compiled `LayerSim`), ribbon tracks, light flashes (`update_lights`), finish/orphan/detach, prewarm, hot reload |
+| `runtime/spawn.rs` | one tick of one layer instance: a 32.32 rate accumulator (time and distance rates) with exact crossing times, bursts, the throttle's rate response |
+| `runtime/ribbon.rs` | ribbon tracks: a ring of points (position, birth, distance along, tint) per ribbon layer instance, appended on the tick |
 | `runtime/log.rs` | `TickLog`: spawn records, emitter frames, clears, world attractors per tick; trimming |
 | `runtime/layer.rs` | `LayerSim` (plain `Copy` params), capacity and life-window bounds |
 | `runtime/alloc.rs` | first-fit range allocator over the pool |
@@ -33,9 +34,13 @@ ParticleEmitter (ECS) ──tick_system (FixedUpdate)──► runtime ──Tic
 | `gpu/readback.rs` | `ParticleStats::alive` from the draw arguments, 1–3 frames late (never waits) |
 | `testing.rs` | hidden test hooks: blocking pool readback (parity), pretend storage limit (budgets) |
 | `rng.rs`, `pack.rs` | PCG streams (bit-identical to WGSL), f16 and octahedral packing |
-| `render/mod.rs` | `ParticlesNode` (`RenderNode`): slots, prepare / prepare_view / prewarm / draw, GPU state |
-| `render/layers.rs` | render layers: draw parameters and the curve LUT per sprite layer |
-| `shaders/sprite.wgsl` | the sprite vertex / fragment shader (composed with the frame's WGSL modules) |
+| `render/mod.rs` | `ParticlesNode` (`RenderNode`): slots, prepare / prepare_view / prewarm / draw, pipelines per (pass, sprite or strip, texture variant), GPU state |
+| `render/layers.rs` | render layers (sprite, ribbon and beam layers): draw parameters, textures and the curve LUT rows |
+| `render/strips.rs` | the frame's ribbons (tracks + a head at the render pose) and beams (render-time end points, jitter, fade, flicker, end glows) as one `StripPoint` stream, CPU-built on both backends |
+| `render/textures.rs` | the procedural built-in textures (generated once per process at effect registration) and the texture bind groups |
+| `shaders/particles.wgsl` | declarations shared by the sprite and strip shaders (group 2, noise, the pixel-footprint widening) |
+| `shaders/sprite.wgsl` | the sprite vertex / fragment shader: analytic shapes, textures and flipbooks, the minimum footprint |
+| `shaders/strip.wgsl` | ribbons and beams: a segment per instance from two bindings of the point stream, shared side vectors (watertight), tail clipping, round caps |
 | `shaders/gpu_common.wgsl`, `simulate.wgsl`, `compact.wgsl` | the compute kernels: `simulate`, `emit` (per tick), `mark`, `scatter` (per frame) |
 
 Invariants:
@@ -59,5 +64,9 @@ Invariants:
   only the curve LUT uses `Queue::write_texture`, when the effects change. The GPU backend's
   per-tick emitter frames are copied between that tick's passes. The runtime resource moves out
   of `Resources` (`mem::take`, no allocation) for the node's `prepare`.
+* **Strips.** Ribbon histories are CPU state appended on the tick (never replayed), beams are
+  rebuilt from the render poses: both are identical on the two backends and for any render
+  cadence (in tests, α = 0). Light flashes are `PointLight` child entities spawned and despawned
+  by the tick system.
 * **Dispatch budget.** 4 per frame with one tick (`simulate`, `emit`, `mark`, `scatter`), 2 more
   per extra tick; kernels use `@workgroup_size(64)` and ≤ 4 storage buffers.

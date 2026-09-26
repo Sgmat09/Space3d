@@ -1,0 +1,10 @@
+[package]
+name = "particles"
+description = "Space3d example: the particle library in a small space battle (engines, lasers, missiles, explosions, EMPs, repairs, warps)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+space3d = { workspace = true, features = ["particles"] }

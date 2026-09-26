@@ -1,14 +1,18 @@
 # Particles
 
-Data-driven particle effects — explosions, hit sparks, shield ripples, warps, engine exhaust,
-laser trails — simulated on the fixed tick and drawn by a render node that matches the frame's
-HDR, tonemapping and scene depth in every mode. The normative design is
+Data-driven particle effects — explosions, hit sparks, shield ripples, warps, engine exhaust and
+afterburners, laser trails, laser beams and shots, missile smoke, debris, EMPs, repair beams —
+made of sprite particles, ribbons (trails), beams and light flashes, simulated on the fixed tick
+and drawn by a render node that matches the frame's HDR, tonemapping and scene depth in every
+mode. The normative design is
 [`docs/design/graphics.md`](../design/graphics.md) §2.5 (with the area design it amends).
 
 Status: milestones PA0 (runtime, CPU simulation, effect library), PA1 (CPU backend rendering,
-prefabs) and PA2 (the GPU compute backend: 100k+ particles, budgets, parity with the CPU
-backend) are in. Ribbons, beams, flipbooks and light flashes (PA3), distortion layers,
-per-particle sorting and LOD calibration (PA4) follow; the API below does not change for them.
+prefabs), PA2 (the GPU compute backend: 100k+ particles, budgets, parity with the CPU backend),
+the M1.1 polish (sub-pixel sprites, exact sub-tick emission, throttle response) and PA3
+(ribbons, beams, textures and flipbooks, light flashes, 14 built-ins) are in. Distortion layers,
+per-particle sorting, LOD calibration (PA4) and the `.pfx.ron` asset loader follow; the API
+below does not change for them.
 
 ## Quick start
 
@@ -27,6 +31,15 @@ ctx.spawn_effect(
 );
 ctx.spawn_effect(builtin::WARP_IN, EffectSpawn::at(portal));
 ctx.spawn_effect(builtin::LASER_TRAIL, EffectSpawn::at(muzzle).follow(bolt).tint(tier_color));
+ctx.spawn_effect(builtin::MISSILE_TRAIL, EffectSpawn::at(Vec3::ZERO).follow(missile));
+ctx.spawn_effect(builtin::DEBRIS_SPARKS, EffectSpawn::at(hit).facing(-bolt_dir).scale(hull / 40.0));
+ctx.spawn_effect(builtin::EMP, EffectSpawn::at(center).scale(radius / 80.0));
+// A hitscan shot (one-shot, 0.12 s) and a continuous beam (looping) to a target:
+ctx.spawn_effect(builtin::LASER_SHOT, EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color));
+let beam = ctx.spawn_effect(
+    builtin::LASER_BEAM,
+    EffectSpawn::from_transform(gun_offset).follow(ship).beam_to(BeamEnd::Entity(target)).keep(),
+);
 
 // A looping emitter on a ship (a child entity), throttled every frame:
 let exhaust = world.spawn((
@@ -40,7 +53,8 @@ world.get::<&mut ParticleEmitter>(exhaust)?.rate_scale = throttle; // 0..2
 `SpawnEffect` is implemented for `World`, `App` and `SystemCtx`. `EffectSpawn` builders:
 `at`, `from_transform`, `facing(dir)` (local −Z along `dir`), `follow(entity)` (inserted as
 `Parent`: the emitter moves with it), `tint`, `scale`, `velocity`, `seed`, `prewarm(secs)`,
-`keep()` (do not despawn when finished; the default for `spawn_effect` is `Despawn`).
+`keep()` (do not despawn when finished; the default for `spawn_effect` is `Despawn`),
+`beam_to(end)` (inserts `ParticleBeam { end, width_scale: 1.0 }`: where the effect's beams end).
 
 ## Emitters
 
@@ -68,8 +82,9 @@ pool slots `reserved`.
 
 ## Authoring effects
 
-An effect is data (`ParticleEffect`, serde, RON): sprite layers (ribbon and beam layers from
-PA3). Every struct has defaults, so RON lists only what differs:
+An effect is data (`ParticleEffect`, serde, RON): sprite `layers`, `ribbons` (trails), `beams`
+and an optional `light` flash (at most 16 layers in all). Every struct has defaults, so RON lists
+only what differs:
 
 ```ron
 ParticleEffect(
@@ -111,7 +126,7 @@ place; a changed structure restarts running instances (their old particles drain
 | look | `size` + `size_over_life`, `aspect`, `rotation` + `angular_velocity`, `random_mirror`, `color_over_life` (linear HDR gradient), `start_color` (random between two), `alpha_over_life`, `coverage` + `coverage_over_life` (premultiplied), `intensity`, `flicker`, `tinted` |
 | quality | `lod` (quality and distance LOD may reduce counts; bursts keep ≥ 1) |
 | throttle | `throttle: ThrottleResponse { rate, speed, size, intensity }`: with the emitter's throttle `t` (`rate_scale`, clamped to `max_rate_scale`) the rates scale by `t^rate` (default 1: linear), initial speeds by `t^speed`, sprite sizes by `t^size` and brightness by `t^intensity` (default 0: no response). `t = 0` emits nothing. A flame keeps its density and gets shorter and dimmer instead: `ENGINE_EXHAUST`'s plume has `(rate: 0.25, speed: 0.6, size: 0.3, intensity: 0.5)`, so partial throttle never breaks it into puffs |
-| render | `SpriteRender { shape, blend, facing, soft_distance, near_fade, order, sort, target, max_screen_size }` |
+| render | `SpriteRender { shape, flipbook, blend, facing, soft_distance, near_fade, order, sort, target, max_screen_size }` |
 
 Random ranges read `1.0` or `(0.5, 1.0)`. Curves: `Constant`, `Linear(a, b)`, `Keys([...])`,
 `Smooth([...])` (Catmull-Rom) and `Preset(FadeCurve)` — the game's fades `Linear`, `Out`,
@@ -129,8 +144,8 @@ the vertex shader reads, so the CPU never evaluates them per particle.
   +X: shield arcs; the band sits inside the rim, which fades over 1.5 pixels),
   `Smoke { breakup, hot_core }` (four noise octaves for the outline; inside, the light follows
   a billow field with a cheap bump light from the sprite's upper left, so a fireball reads as a
-  rolling volume rather than a flat disc), `Vortex { arms, twist }`. `Texture` and
-  flipbooks arrive with PA3 (drawn as a soft glow until then, with a warning).
+  rolling volume rather than a flat disc), `Vortex { arms, twist }`, and `Texture(...)` (see
+  "Textures and flipbooks").
 * **Small sprites**: a sprite keeps a footprint of at least 1.5 pixels radius, dimmed by the
   area it gained (a velocity-stretched streak keeps its length and is dimmed by the width it
   gained), and its gaussian profiles (the glow's halo and white core, the streak's body and hot
@@ -157,6 +172,101 @@ the vertex shader reads, so the CPU never evaluates them per particle.
   `SpriteRender::order` first, then alpha/premultiplied before additive, then emitters back to
   front for sorted layers. `Material::render_order` orders meshes only (two independent order
   spaces; interleaving needs OIT, deferred).
+
+### Ribbons (trails)
+
+A `RibbonLayer` draws a trail behind its emitter: a history of the emitter's positions — a new
+point once it moved `min_distance` (× effect scale) from the newest, or after `max_interval`
+seconds (0: by distance only), at most `max_points` kept — each point living `lifetime` seconds
+and stamped with the emitter's tint of its time. The render node draws the live points as one
+triangle strip up to a **head at the emitter's render pose** (its `GlobalTransform`: the trail
+reaches the emitter whichever stage moves it and at any frame rate, no render-time bridge
+needed), with a round end there:
+
+* **Watertight at any bend**: neighboring segments share each point's position, tangent, width
+  and side vector (across the tangent, facing the camera, or in a `RibbonFacing::Plane`), so
+  there are no gaps and no doubled overlaps (`tests/strips.rs::ribbons_are_watertight_at_bends`:
+  a ¾ circle's center line is lit to within 1 %).
+* **Smooth tail**: the oldest drawn segment is clipped to where its point's age reaches the
+  lifetime, so a trail shortens continuously instead of a point at a time, and is exactly
+  `speed × lifetime` long whatever the point spacing
+  (`ribbon_length_is_its_lifetime_and_its_head_follows_the_emitter`).
+* **Over life**: `width` × `width_over_life`, `color_over_life` (alpha = opacity; the white
+  `profile.core` fades with it), `intensity`; `profile { core, hardness }` is the cross-section
+  (a soft glow, a hard band, a white-hot center line).
+* **Along it**: `uv: Stretch` (0 at the tail … 1 at the head) or `Tile { length }` (fixed to the
+  path: a texture stays where it was laid); `scroll` moves the texture and the `noise` breakup
+  toward the head at that many units of `u` per second; `texture` multiplies the color (layer 0
+  of an array).
+* `blend` as sprites (additive ribbons of a layer share one draw; alpha and premultiplied ones
+  draw one each, back to front with the emitters), `soft_distance`, `order`, `tinted`.
+* A stopped, hidden or orphaned emitter's ribbon drains (no head); the effect finishes once its
+  newest point has lived its lifetime.
+* Never narrower than 1.5 px of half-width on screen, dimmed by the width gained (like sprites:
+  a far-away trail keeps its light and does not stair-step).
+
+Ribbons are built on the CPU at render time on both backends (about 20 ns a point; see
+Performance) from state the fixed tick records; `ParticleSettings::max_ribbon_segments` (65 536)
+bounds the history points reserved and the points drawn per frame.
+
+### Beams
+
+A `BeamLayer` draws a beam from its emitter (+ `offset`) to the entity's `ParticleBeam { end,
+width_scale }` — `BeamEnd::World(p)`, `Local(p)` (in the emitter's frame) or `Entity(e)` (its
+`GlobalTransform`: the beam follows it) — or `length` along the emitter's −Z without one. It is
+rebuilt every frame from the render poses, while the effect emits (a looping effect until it is
+stopped; a non-looping one for its `duration`, its brightness following `fade` over that time: a
+one-shot tracer or hitscan shot):
+
+* `segments` points (1..64) along it; `jitter` moves the inner ones sideways (world units ×
+  scale, zero at the ends) `jitter_hz` times a second: lightning, a wavering energy filament.
+* `color` is a gradient **along** the beam (start → end); `flicker { amplitude, frequency }`
+  pulses its brightness; `noise` breaks it up with value noise scrolling toward the end
+  (`scroll`, `uv: Tile`): flowing energy.
+* Round ends, and optional round glows `start_glow` / `end_glow` (diameters in beam widths): a
+  muzzle, an impact.
+* The same pipeline, width floor and blends as ribbons (`tests/strips.rs::beams_span_their_end_points`,
+  `thin_beams_keep_a_minimum_width_and_their_light`).
+
+End a hitting beam on the hit point (`BeamEnd::World`, or an entity placed on the hull's side)
+rather than on the target's center: the target's depth hides what is inside it.
+
+### Textures and flipbooks
+
+`SpriteShape::Texture(texture)` draws a texture (straight alpha: its color multiplies the
+particle's, its alpha is the shape), from:
+
+* `SpriteTexture::Builtin(..)`: procedural textures generated deterministically when an effect
+  using one is registered (once per process, about 4 ms for a 16-frame one: never in a render
+  frame): `Fireball16` (a fire billow burning from white-hot to smoke over 16 frames),
+  `Smoke16` (a billowing puff thinning over 16 frames), `Sparkle` (a four-point star), `SoftDot`.
+  64² with full mip chains.
+* `SpriteTexture::Handle(h)`: any texture of the renderer's `RenderAssets` (`add_texture`,
+  `TextureSource::from_layers` for arrays), with its own sampler.
+* `SpriteTexture::Path(..)` needs the asset loader, which is not in this version: such layers
+  draw untextured (warned once).
+
+`SpriteRender::flipbook: Some(Flipbook { frames, columns, rows, mode, blend })` animates it:
+frame *k* is cell `k mod (columns × rows)` of array layer `k / (columns × rows)` — so a texture
+array (one frame per layer), a sprite sheet (one layer, `columns × rows` cells) or an array of
+sheets. `mode`: `OverLife { cycles }`, `Fps(fps)`, `Random` (a frame per particle), or
+`RandomStartFps(fps)`; `blend` cross-fades toward the next frame. (For the frames-per-second
+modes the render instance carries the particle's age in seconds, packed with its rotation as two
+half floats.) A texture of 2 or more layers is bound as `texture_2d_array`, a single one as
+`texture_2d` — WebGL2 fixes a texture's target when it is created
+(`tests/flipbook.rs::flipbook_frame_selection` checks both, over life and at frames per second).
+
+### Light flashes
+
+`ParticleEffect::light: Some(LightFlash { start, duration, color, peak, intensity, range,
+offset, tinted })` lights the scene while it plays: a child entity of the emitter carrying an
+ordinary `PointLight` (so meshes are lit by it; the renderer keeps the 16 nearest point lights
+per view beyond 16), spawned when the flash starts, its intensity `peak × intensity(t) × scale²`
+updated every tick, despawned when it ends — the effect finishes only after it
+(`runtime::tests::light_flash_plays_a_point_light`). The renderer's point lights fall off with
+the inverse square of the distance, so a flash lighting a hull 20–40 units away wants a `peak`
+in the hundreds to thousands (`EXPLOSION` 4000, `DEBRIS_SPARKS` 3500, `EMP` 60 000, the tinted
+`HIT_SPARK` 250).
 
 ### Soft particles and scene depth
 
@@ -210,23 +320,40 @@ in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's
 
 | handle | what | spawn |
 |---|---|---|
-| `EXPLOSION` | flash, afterglow, fireball billows (premultiplied), hot core, sparks, embers, two shockwave rings, smoke | `EffectSpawn::at(p).scale(hull / 40)` |
-| `HIT_SPARK` | flash, sparks thrown along −Z, a ring, smoke; tinted | `.facing(-bolt_dir).tint(color)` |
+| `EXPLOSION` | flash, afterglow, fireball billows (premultiplied), hot core, sparks, embers, two shockwave rings, smoke; a light flash (0.6 s) lights the hulls around it | `EffectSpawn::at(p).scale(hull / 40)` |
+| `HIT_SPARK` | flash, sparks thrown along −Z, a ring, smoke, a short light flash of the tint; tinted | `.facing(-bolt_dir).tint(color)` |
 | `SHIELD_RIPPLE` | focused arc toward −Z, faint bubble, surface flash, streaks; local-space | `.facing(-bolt_dir).scale(radius / 20).follow(ship)` |
 | `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash (white-hot core, blue halo), two rings | `EffectSpawn::at(portal)` |
 | `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow; `rate_scale` = throttle: the plume stays dense and gets shorter, narrower and dimmer at partial throttle (one flame, never puffs; `tests/render.rs::exhaust_stays_continuous_at_partial_throttle`). Near-neutral (white-hot): the flame takes its hue from the tint | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
-| `LASER_TRAIL` | looping white-hot head + a continuous beam laid per unit of distance (up to about 3800 units/s) | `.follow(bolt).tint(color)` (a saturated tint: the game's pure primaries such as `(1, 0, 0)` stay the most saturated); the bolt may move in any stage |
-| `LASER_BEAM` | reserved: beams arrive with PA3 (until then an emitter with it plays nothing and finishes at once, warned once) | |
+| `LASER_TRAIL` | looping white-hot head + a ribbon of glow along the bolt's path, 0.15 s long, reaching the bolt's render position at any speed (it was a chain of sprite glows per unit of distance, 581 pool slots and render-time bridges per bolt; the ribbon looks the same for 5 slots and 64 ribbon points) | `.follow(bolt).tint(color)` (a saturated tint: the game's pure primaries such as `(1, 0, 0)` stay the most saturated); the bolt may move in any stage |
+| `LASER_BEAM` | looping continuous laser to its `ParticleBeam` end: a wide glow of the tint around a white-hot core, flowing noise, a slight flicker, round glows at the gun and the hit, a muzzle glow | `EffectSpawn::from_transform(gun).follow(ship).beam_to(BeamEnd::Entity(hit_point)).tint(color).keep()` |
+| `LASER_SHOT` | a hitscan shot: the same beam from muzzle to hit for 0.12 s, fading as it thins, muzzle flash, hot glow on the hit (one-shot) | `EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color)`, with a `HIT_SPARK` at the hit |
+| `MISSILE_TRAIL` | looping: a white-hot flame and short glowing wake on the missile, sparks, and a smoke ribbon along its path that widens, breaks up and fades over 1.6 s, with puffs; the smoke drains when the missile is gone | `EffectSpawn::at(Vec3::ZERO).follow(missile)` (missile facing −Z) |
+| `DEBRIS_SPARKS` | a hull breaking apart: hot chunks tumbling and cooling to dark plating, sparks, flickering embers, smoke and a light flash that catches the hull | `.facing(-hit_dir).scale(hull / 40)` |
+| `ENGINE_AFTERBURNER` | looping boost over `ENGINE_EXHAUST`: a long white-hot plume, three shock diamonds riding the nozzle, a ribbon trail along the path, heat sparks; `rate_scale` = boost (0..1.5: longer and brighter, never thinner) | like `ENGINE_EXHAUST`, `.tint(engine color)` |
+| `EMP` | an electromagnetic pulse: a white-cyan flash with a strong light flash, a fast shock ring and a fainter one, crackling arcs, flickering motes; tinted | `EffectSpawn::at(center).scale(radius / 80)` |
+| `REPAIR_BEAM` | looping green beam to its `ParticleBeam` end: a soft stream flowing toward the target, a wavering bright filament (jitter), round glows at both ends, a gentle pulse; tinted | like `LASER_BEAM`, `BeamEnd::Entity(dock_point)` |
 
-An emitter whose handle has no effect data — a removed effect, `EffectHandle::INVALID`, or
-`LASER_BEAM` before PA3 — plays nothing and finishes on its first tick (warned once per
-handle): the `ParticleEffectFinished` event is sent and its `FinishAction` runs, so a
-`spawn_effect` entity is despawned instead of staying forever.
+An emitter whose handle has no effect data — a removed effect, `EffectHandle::INVALID`, a
+built-in without `ParticlesPlugin::builtins` — plays nothing and finishes on its first tick
+(warned once per handle): the `ParticleEffectFinished` event is sent and its `FinishAction`
+runs, so a `spawn_effect` entity is despawned instead of staying forever.
 
-Stories: `Engine/Particles/Builtin/*` (Direct mode), `Engine/Particles/HDR/*` (the same through
-`PostProcess::default()`), `Engine/Particles/Features/*` and `Engine/Particles/Stress/100k` (tag
-`perf`: 100 000 particles on the GPU backend) in the engine storybook (`space3d stories`, the
-editor's storybook viewer, golden tests).
+Stories: `Engine/Particles/Builtin/*` (Direct mode; one per built-in), `Engine/Particles/HDR/*`
+(the same through `PostProcess::default()`), `Engine/Particles/Features/*` (blend modes, soft
+particles, shapes, curves, facing, local vs world, ribbons, beams, flipbook, light flashes, CPU
+backend) and `Engine/Particles/Stress/100k` (tag `perf`: 100 000 particles on the GPU backend) in
+the engine storybook (`space3d stories`, the editor's storybook viewer, golden tests).
+
+Examples (they honour `SPACE3D_HEADLESS` and `SPACE3D_EXIT_AFTER_FRAMES`, and never take focus
+when run by tools):
+
+* `cargo run -p particles`: a small space battle through the recommended battle look — engine
+  exhausts and afterburners, hitscan shots with hit sparks and shield ripples, a held laser, a
+  repair beam, missiles with smoke trails ending in explosions and debris, an EMP, warps
+  (`Space`: an explosion, `E`: an EMP), with the stats printed every two seconds.
+* `cargo run --release -p particles_stress`: `PARTICLES` (default 200 000, up to about a
+  million) GPU particles in four spiral arms, with their stats.
 
 ## Time model and determinism
 
@@ -255,11 +382,13 @@ editor's storybook viewer, golden tests).
   tick sees the same motion (one frame per tick) it emits exactly those particles into the
   simulation (`runtime::tests::bridge_previews_the_next_tick`); otherwise the next frame's bridge
   starts from the new tick's pose. The trail stays joined to its head at any frame rate and
-  whichever stage moves the emitter (`tests/follow.rs`: `LASER_TRAIL` moved in
+  whichever stage moves the emitter (`tests/follow.rs`: a sprite trail moved in
   `FixedUpdate`, `PreUpdate` and `Update`, at 60 and 120 Hz, both backends). Bridges are built
   on the CPU (a frame of motion's worth of particles per moving emitter) and drawn as direct
-  draws on both backends; bursts and the simulation itself stay on the tick. A trail that must
-  reach a fast emitter emits per distance (`Spawn::rate_per_distance`), like `LASER_TRAIL`.
+  draws on both backends; bursts and the simulation itself stay on the tick. A sprite trail that
+  must reach a fast emitter emits per distance (`Spawn::rate_per_distance`). A **ribbon** needs
+  no bridge: its head is drawn at the render pose (`LASER_TRAIL` is a ribbon now; the same
+  `tests/follow.rs` checks it).
 * The render node replays the pending ticks inside the render frame. Particle *k* of a layer
   instance lands in ring slot `base + k mod capacity`; its random attributes are a PCG hash of
   (layer instance seed, *k*) (bit-identical in Rust and WGSL). The simulated state is a pure
@@ -290,15 +419,20 @@ editor's storybook viewer, golden tests).
   design); over the budget rings shrink to 1/8 before a layer instance is refused
   (`ParticleStats::{shrunk, refused}`, logged once per effect). `EffectPriority::Low` stops at
   75 % of the pool, `Normal` at 90 %, `High` may use it all. Slots a built-in reserves per
-  instance (`runtime::tests::builtin_slots`): `EXPLOSION` 81, `HIT_SPARK` 16, `SHIELD_RIPPLE` 8,
-  `WARP_IN` / `WARP_OUT` 27, `ENGINE_EXHAUST` 148 (its rates at the afterburner's
-  `max_rate_scale` 2: the plume's `2^0.25`), `LASER_TRAIL` 581. The CPU backend's web budget (8192 × 90 %) holds, for
-  example, 30 exhausts and 4 laser trails at once; the GPU pool (262 144) is not a practical
-  limit for them.
+  instance (`runtime::tests::builtin_slots`; ribbon points in parentheses): `EXPLOSION` 81,
+  `HIT_SPARK` 16, `SHIELD_RIPPLE` 8, `WARP_IN` / `WARP_OUT` 27, `ENGINE_EXHAUST` 148 (its rates
+  at the afterburner's `max_rate_scale` 2: the plume's `2^0.25`), `LASER_TRAIL` 5 (64),
+  `LASER_BEAM` 7, `LASER_SHOT` 1, `MISSILE_TRAIL` 23 (192), `DEBRIS_SPARKS` 78,
+  `ENGINE_AFTERBURNER` 196 (96), `EMP` 63, `REPAIR_BEAM` 8. The CPU backend's web budget
+  (8192 × 90 %) holds, for example, 30 exhausts and 40 laser trails at once; the GPU pool
+  (262 144) is not a practical limit for them. Ribbon points come from their own pool,
+  `max_ribbon_segments` (65 536: about a thousand laser trails): a ribbon that does not fit is
+  refused (`ParticleStats::refused`, warned once per effect).
 * `ParticleStats` (resource, per rendered frame): backend, live effects and layer instances,
   pool capacity / reserved, alive particles (CPU: this frame; GPU: read back from the draw
   arguments 1–3 frames late, `alive_frame` says which), ticks replayed, catch-up resets,
-  compute dispatches, draw calls, bytes uploaded, `cpu_reallocations` (0 in the steady state).
+  compute dispatches, draw calls, `ribbon_segments` (ribbon and beam segments drawn), bytes
+  uploaded, `cpu_reallocations` (0 in the steady state).
   The frame's `RenderStats` counts the GPU backend's compute passes (`compute_passes`, reported
   with `PrepareContext::count_compute_passes`) and dispatches (`node_dispatches`).
 
@@ -361,9 +495,11 @@ cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --noca
 | GPU backend CPU cost: `prepare` + draw recording, 500 moving layer instances, one tick (`gpu::tests::gpu_prepare_cpu_time`) | 0.10–0.14 ms idle machine (0.2–0.3 ms under load); moved in `Update` instead (bridged every frame, one particle each): +0.01–0.02 ms | ≤ 0.1 ms (Battle scene, Phase I) |
 | CPU backend: tick + simulate + pack 16 384 particles, one thread (test profile) | 0.28 ms | ≤ 0.35 ms |
 | `tick_system`, 500 layer instances | 13 µs | ≤ 60 µs |
-| render-time bridges: 20 bolts at 3200 units/s moved a frame after the tick (1060 glows built and packed) | 25–30 µs (about 25 ns per glow, one thread; 50–65 µs before the spawn math below) | ≤ 0.1 ms (`runtime::tests::bridges_of_20_fast_bolts_within_budget`) |
-| render-time bridges of a Battle fleet moved in `Update`: 300 engine exhausts at 150 units/s and 20 bolts (2260 particles built and packed) | 0.10–0.12 ms (0.15–0.16 ms before) | ≤ 0.15 ms (`runtime::tests::bridges_of_a_battle_fleet_within_budget`); **on top of** the `prepare` line, see below |
-| allocations per frame, ~1000 particles, 80–90 draws, the exhaust moved in `Update` (wgpu's bookkeeping; our code: 0) | CPU backend 184, GPU backend 307 (a direct draw and upload for the exhaust's bridge) | pinned +10 % (`tests/alloc.rs`) |
+| render-time bridges: 20 bolts' sprite trails (glows per unit of distance, what `LASER_TRAIL` was before it became a ribbon) at 3200 units/s moved a frame after the tick (1060 glows built and packed) | 25–30 µs (about 25 ns per glow, one thread; 50–65 µs before the spawn math below) | ≤ 0.1 ms (`runtime::tests::bridges_of_20_fast_bolts_within_budget`) |
+| render-time bridges of a Battle fleet moved in `Update`: 300 engine exhausts at 150 units/s and 20 bolts' sprite trails (2260 particles built and packed) | 0.10–0.12 ms (0.15–0.16 ms before) | ≤ 0.15 ms (`runtime::tests::bridges_of_a_battle_fleet_within_budget`); **on top of** the `prepare` line, see below |
+| ribbons and beams of a Battle frame, built on the CPU every frame (both backends): 20 `LASER_TRAIL`s at 1500 units/s, 10 `MISSILE_TRAIL`s, 10 `ENGINE_AFTERBURNER` trails, 6 `LASER_BEAM`s and 4 `REPAIR_BEAM`s (1870 points, 17 draws) | 37 µs (about 20 ns a point, test profile) | ≤ 0.1 ms (`render::strips::tests::strips_of_a_battle_within_budget`) |
+| a procedural built-in texture (`Fireball16`: 16 frames of 64² with mips), generated once per process when an effect using it is registered | about 4 ms, never in a render frame | — |
+| allocations per frame, ~1000 particles, 89 draws (4 of them ribbons and beams), the exhaust moved in `Update`, light flashes spawned and despawned (wgpu's bookkeeping; our code: 0) | CPU backend 213, GPU backend 335 (a direct draw and upload for the exhaust's bridge; 184 / 307 before the scene had ribbons and beams) | pinned +10 % (`tests/alloc.rs`) |
 
 **Bridges are not free, plainly.** A game that moves its ships and bolts in `Stage::Update`
 (SpaceCorps2027 does) bridges every moving world-space emitter on every frame, on the CPU, on
@@ -401,9 +537,13 @@ per-pass overhead.
 WebGL2 and GLES 3.0 have no compute shaders: particles run on the CPU backend there (the GPU
 kernels translate to GLSL ES 3.10 for GLES 3.1 devices, tested, and pack half floats with integer
 arithmetic, so they need no `f16` capability either). Vertex formats `Float32x4`, `Float16x4`,
-`Uint32x2` only; ≤ 4 bind groups (view, scene, the particles' LUT and uniforms); the LUT is
-`Rgba16Float` sampled with `textureLod` in the vertex shader; the sprite shader translates to
-GLSL ES 3.00 (tested) and needs no `f16` capability. On
+`Uint32x2` only (a strip segment reads 8 attributes from two bindings of the same buffer, one
+point apart); ≤ 4 bind groups (view, scene, the particles' LUT and uniforms, and a texture for
+textured layers); the LUT is `Rgba16Float` sampled with `textureLod` in the vertex shaders; a
+texture of 2 or more layers is a `texture_2d_array`, a single one a `texture_2d`, sampled with
+explicit gradients; half floats packed in instances (flipbook ages, strip widths) are decoded
+with integer arithmetic. The sprite and strip shaders translate to GLSL ES 3.00 in every
+variant (tested) and need no `f16` capability. On
 GL scene depth is sampled without an attachment and tested in the shader; with MSAA on GL there
 is no soft fade (hard test only). The GL backend (ANGLE, GLES 3.0) renders the particle scenes
 and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
@@ -419,7 +559,9 @@ and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 | `fx::Effect::Impact { at, dir, color }` | `spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(at).facing(-dir).tint(color.extend(1.0)))` (the game's `color` is a `Vec3`; `tint` takes linear RGBA) |
 | `fx::Effect::ShieldHit { center, radius, dir }` | `spawn_effect(builtin::SHIELD_RIPPLE, EffectSpawn::at(center).facing(-dir).scale(radius / 20.0).follow(ship))` |
 | warp / portal jumps | `builtin::WARP_IN` / `WARP_OUT` |
-| engine trails and nozzle flames | `ParticleEmitter::new(builtin::ENGINE_EXHAUST)` per nozzle, `rate_scale` = throttle, `tint` = `engine_color(e).extend(1.0)` (the plume is neutral: the tier and faction colors come through) |
-| bolt afterglow | `builtin::LASER_TRAIL` following the bolt, which `fx::animate` keeps moving in `Stage::Update` (the render-time bridge joins the trail to the head; beams: `LASER_BEAM`, PA3) |
+| engine trails and nozzle flames | `ParticleEmitter::new(builtin::ENGINE_EXHAUST)` per nozzle, `rate_scale` = throttle, `tint` = `engine_color(e).extend(1.0)` (the plume is neutral: the tier and faction colors come through); boosting: `ENGINE_AFTERBURNER` on the same nozzles |
+| bolt afterglow | `builtin::LASER_TRAIL` following the bolt, which `fx::animate` keeps moving in `Stage::Update` (a ribbon: its head is the bolt's render position, so the trail reaches the head at any frame rate) |
+| lasers drawn in the egui overlay | `builtin::LASER_SHOT` per hitscan shot (`EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color)`, it despawns itself), or `LASER_BEAM` for a held laser (`beam_to(BeamEnd::Entity(..))`, looping: stop or despawn it); they are HDR particles now, so they bloom and sit in the scene's depth |
+| missiles, heavy hits, EMPs, repairs | `MISSILE_TRAIL` (follow the missile), `DEBRIS_SPARKS`, `EMP`, `REPAIR_BEAM` |
 | `1 − e^−x` soft clip in the overlay | `direct_soft_clip` in Direct mode; with `PostProcess` the tonemapper and bloom take over |
 | the battle camera's look | choose it explicitly: `PostProcess::default().with_tonemapper(Tonemapper::AgXPunchy).with_exposure(0.5)` keeps faction exhaust, lasers and fire saturated; the default `AgX` turns them pastel (frame.md, "Choose the look explicitly") |

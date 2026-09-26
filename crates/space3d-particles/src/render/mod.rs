@@ -11,9 +11,14 @@
 //!   backends: `Runtime::bridge`), cull and sort the draws of every camera view, and upload what
 //!   changed through the renderer's staging ring. A frame without new ticks, local layers,
 //!   moved emitters or extrapolation uploads nothing.
+//! * Ribbons and beams (`strips`) are built on the CPU every frame there are any, on both
+//!   backends: the ribbon tracks the tick recorded plus a head at each emitter's render pose,
+//!   and beams from the render poses of their ends. Textures (`textures`: the procedural
+//!   built-ins, and assets by handle) get their bind groups before the draws are planned.
 //! * `draw`: bind groups 0 (view) and 1 (scene depth) of the frame, group 2 (LUT, per-view
-//!   flags, per-layer draw parameters), one instanced strip per draw item (an indirect draw on
-//!   the GPU backend, its instance count written by the compaction).
+//!   flags, per-layer draw parameters), group 3 for textured layers, one instanced strip per
+//!   draw item (an indirect draw on the GPU backend, its instance count written by the
+//!   compaction; a strip segment per instance for ribbons and beams).
 //! * Pipelines per `PassTarget`, built in `prewarm` (WebGL2 links programs at creation). The
 //!   shader reads scene depth according to `PassTarget::depth_access`: the hardware test plus
 //!   `s3d_soft_fade` with a read-only attachment, a manual `s3d_scene_occluded` test plus the
@@ -23,6 +28,8 @@
 //!   with `1 − e^−x` (`ParticleSettings::direct_soft_clip`).
 
 mod layers;
+pub(crate) mod strips;
+pub(crate) mod textures;
 
 pub(crate) use layers::RenderLayers;
 
@@ -32,7 +39,7 @@ use crate::cpu::{
 use crate::gpu::{GpuInput, GpuSim, PARTICLE_SIZE};
 use crate::runtime::{ParticleRuntime, Runtime};
 use crate::{ParticleBackend, ParticleEffects, ParticleSettings, ParticleStats, resolve_backend};
-use layers::GpuDrawParams;
+use layers::{GpuDrawParams, LayerKind, TexKey};
 use space3d_core::glam::{Quat, Vec3};
 use space3d_core::{Entity, GlobalTransform, Parent, Time, Transform};
 use space3d_render::wgpu;
@@ -40,13 +47,16 @@ use space3d_render::{
     Aabb, DepthAccess, DrawContext, FrameMode, OUTPUT_WGSL, OutputEncoding, PassTarget, PhaseSlot, PrepareContext,
     RenderNode, RenderNodes, RenderPhase, SceneReads, SlotMask, VIEW_WGSL, ViewPrepareContext, scene_wgsl_for,
 };
+use strips::{POINT_SIZE, StripInput, StripPoint, StripScratch};
 
 /// Name of the node in `RenderNodes`.
 pub(crate) const NODE_NAME: &str = "space3d/particles";
 /// Slot of color sprites.
 pub(crate) const SLOT_COLOR: usize = 0;
 
+const COMMON_WGSL: &str = include_str!("../shaders/particles.wgsl");
 const SPRITE_WGSL: &str = include_str!("../shaders/sprite.wgsl");
+const STRIP_WGSL: &str = include_str!("../shaders/strip.wgsl");
 
 static SLOTS_SOFT: [PhaseSlot; 2] = [
     PhaseSlot::new(RenderPhase::Transparent, 100).reading(SceneReads::DEPTH),
@@ -80,20 +90,78 @@ struct ViewList {
 /// The per-instance vertex layout of `ParticleInstance`.
 const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float16x4, 2 => Float16x4, 3 => Uint32x2];
+/// The two per-instance layouts of a strip segment: its first point, and the next one (the same
+/// buffer, bound one point further).
+const STRIP_A_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float16x4, 2 => Float16x4, 3 => Uint32x2];
+const STRIP_B_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![4 => Float32x4, 5 => Float16x4, 6 => Float16x4, 7 => Uint32x2];
 
-/// The sprite shader for a pass signature.
-pub(crate) fn sprite_shader(target: &PassTarget) -> String {
-    sprite_shader_for(target.output, target.depth_access)
+/// What a pipeline draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DrawKind {
+    /// Sprite billboards (`sprite.wgsl`).
+    Sprite,
+    /// Ribbons and beams (`strip.wgsl`).
+    Strip,
 }
 
-/// The sprite shader for an output encoding and a scene depth access.
-pub(crate) fn sprite_shader_for(output: OutputEncoding, access: DepthAccess) -> String {
+/// The texture binding of a pipeline (group 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TexVariant {
+    /// No texture (three bind groups).
+    None,
+    /// A single-layer texture (`texture_2d`).
+    D2,
+    /// A texture array of 2 or more layers (`texture_2d_array`; flipbook frames).
+    Array,
+}
+
+/// The texture declarations of a variant: `s3dp_tex(uv, layer, ddx, ddy)`.
+fn texture_wgsl(tex: TexVariant) -> &'static str {
+    match tex {
+        TexVariant::None => {
+            "fn s3dp_tex(uv: vec2<f32>, layer: f32, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {\n    return vec4<f32>(1.0);\n}\n"
+        }
+        TexVariant::D2 => {
+            "@group(3) @binding(0) var s3dp_tex_t: texture_2d<f32>;\n@group(3) @binding(1) var s3dp_tex_s: sampler;\n\
+             fn s3dp_tex(uv: vec2<f32>, layer: f32, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {\n    \
+             return textureSampleGrad(s3dp_tex_t, s3dp_tex_s, uv, gx, gy);\n}\n"
+        }
+        TexVariant::Array => {
+            "@group(3) @binding(0) var s3dp_tex_t: texture_2d_array<f32>;\n@group(3) @binding(1) var s3dp_tex_s: sampler;\n\
+             fn s3dp_tex(uv: vec2<f32>, layer: f32, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {\n    \
+             let l = clamp(i32(layer), 0, i32(textureNumLayers(s3dp_tex_t)) - 1);\n    \
+             return textureSampleGrad(s3dp_tex_t, s3dp_tex_s, uv, l, gx, gy);\n}\n"
+        }
+    }
+}
+
+/// The particle shader for a pass signature, a draw kind and a texture variant.
+pub(crate) fn shader_for(output: OutputEncoding, access: DepthAccess, kind: DrawKind, tex: TexVariant) -> String {
     format!(
-        "const S3DP_OUTPUT: u32 = {}u;\nconst S3DP_MANUAL_DEPTH: bool = {};\n{VIEW_WGSL}\n{}\n{OUTPUT_WGSL}\n{SPRITE_WGSL}",
+        "const S3DP_OUTPUT: u32 = {}u;\nconst S3DP_MANUAL_DEPTH: bool = {};\n{VIEW_WGSL}\n{}\n{OUTPUT_WGSL}\n{}\n{COMMON_WGSL}\n{}",
         output.id(),
         access == DepthAccess::SampledOnly,
         scene_wgsl_for(access),
+        texture_wgsl(tex),
+        match kind {
+            DrawKind::Sprite => SPRITE_WGSL,
+            DrawKind::Strip => STRIP_WGSL,
+        },
     )
+}
+
+/// A pipeline's key: pass signature, draw kind, texture variant.
+type PipelineKey = (PassTarget, DrawKind, TexVariant);
+
+/// The bind group of a texture a layer samples (group 3).
+struct TexBind {
+    key: TexKey,
+    /// `TextureRef::version` of an asset texture (0 for built-ins).
+    version: u32,
+    layered: bool,
+    group: wgpu::BindGroup,
 }
 
 /// GPU state of one renderer.
@@ -101,7 +169,15 @@ struct Gpu {
     renderer: u64,
     align: u64,
     bind_layout: wgpu::BindGroupLayout,
-    pipeline_layout: wgpu::PipelineLayout,
+    /// Pipeline layouts: untextured, with a `texture_2d`, with a `texture_2d_array` (group 3).
+    pipeline_layouts: [wgpu::PipelineLayout; 3],
+    /// Group 3 layouts: `texture_2d`, `texture_2d_array`.
+    tex_layouts: [wgpu::BindGroupLayout; 2],
+    /// Sampler of the built-in textures (trilinear; repeats along `u` for strips).
+    tex_sampler: wgpu::Sampler,
+    builtins: Vec<textures::GpuBuiltin>,
+    tex_binds: Vec<TexBind>,
+    strips: Option<(wgpu::Buffer, u64)>,
     sampler: wgpu::Sampler,
     lut: Option<(wgpu::Texture, wgpu::TextureView, u32)>,
     lut_version: Option<u64>,
@@ -111,7 +187,7 @@ struct Gpu {
     view_mirror: Vec<GpuParticleView>,
     instances: Option<(wgpu::Buffer, u64)>,
     bind_group: Option<wgpu::BindGroup>,
-    pipelines: Vec<(PassTarget, wgpu::RenderPipeline)>,
+    pipelines: Vec<(PipelineKey, wgpu::RenderPipeline)>,
     /// Scratch for the draw-parameter upload.
     bytes: Vec<u8>,
 }
@@ -152,10 +228,57 @@ impl Gpu {
                 uniform(3, std::mem::size_of::<GpuDrawParams>() as u64),
             ],
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("space3d particles"),
-            bind_group_layouts: &[Some(view), Some(scene), Some(&bind_layout)],
-            immediate_size: 0,
+        let tex_layout = |dim, label| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: dim,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            })
+        };
+        let tex_layouts = [
+            tex_layout(wgpu::TextureViewDimension::D2, "space3d particles texture"),
+            tex_layout(wgpu::TextureViewDimension::D2Array, "space3d particles texture array"),
+        ];
+        let layout = |tex: Option<&wgpu::BindGroupLayout>| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("space3d particles"),
+                bind_group_layouts: &[Some(view), Some(scene), Some(&bind_layout), tex],
+                immediate_size: 0,
+            })
+        };
+        let pipeline_layouts = [
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("space3d particles"),
+                bind_group_layouts: &[Some(view), Some(scene), Some(&bind_layout)],
+                immediate_size: 0,
+            }),
+            layout(Some(&tex_layouts[0])),
+            layout(Some(&tex_layouts[1])),
+        ];
+        let tex_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("space3d particles textures"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("space3d particles LUT"),
@@ -167,7 +290,12 @@ impl Gpu {
             renderer,
             align,
             bind_layout,
-            pipeline_layout,
+            pipeline_layouts,
+            tex_layouts,
+            tex_sampler,
+            builtins: Vec::new(),
+            tex_binds: Vec::new(),
+            strips: None,
             sampler,
             lut: None,
             lut_version: None,
@@ -182,27 +310,53 @@ impl Gpu {
         }
     }
 
-    /// The pipeline for `target` (built on first use).
-    fn pipeline(&mut self, device: &wgpu::Device, target: PassTarget) -> usize {
-        if let Some(i) = self.pipelines.iter().position(|(t, _)| *t == target) {
+    /// The pipeline for `key` (built on first use).
+    fn pipeline(&mut self, device: &wgpu::Device, key: PipelineKey) -> usize {
+        if let Some(i) = self.pipelines.iter().position(|(k, _)| *k == key) {
             return i;
         }
+        let (target, kind, tex) = key;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("space3d particles sprite"),
-            source: wgpu::ShaderSource::Wgsl(sprite_shader(&target).into()),
+            label: Some("space3d particles"),
+            source: wgpu::ShaderSource::Wgsl(shader_for(target.output, target.depth_access, kind, tex).into()),
         });
+        let layout = &self.pipeline_layouts[match tex {
+            TexVariant::None => 0,
+            TexVariant::D2 => 1,
+            TexVariant::Array => 2,
+        }];
+        let sprite = [Some(wgpu::VertexBufferLayout {
+            array_stride: INSTANCE_SIZE,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &INSTANCE_ATTRIBUTES,
+        })];
+        let strip = [
+            Some(wgpu::VertexBufferLayout {
+                array_stride: POINT_SIZE,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &STRIP_A_ATTRIBUTES,
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: POINT_SIZE,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &STRIP_B_ATTRIBUTES,
+            }),
+        ];
+        let (vs, fs, buffers): (_, _, &[Option<wgpu::VertexBufferLayout<'_>>]) = match kind {
+            DrawKind::Sprite => ("vs_sprite", "fs_sprite", &sprite),
+            DrawKind::Strip => ("vs_strip", "fs_strip", &strip),
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("space3d particles sprite"),
-            layout: Some(&self.pipeline_layout),
+            label: Some(match kind {
+                DrawKind::Sprite => "space3d particles sprite",
+                DrawKind::Strip => "space3d particles strip",
+            }),
+            layout: Some(layout),
             vertex: wgpu::VertexState {
                 module: &module,
-                entry_point: Some("vs_sprite"),
+                entry_point: Some(vs),
                 compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: INSTANCE_SIZE,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &INSTANCE_ATTRIBUTES,
-                })],
+                buffers,
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,
@@ -213,15 +367,28 @@ impl Gpu {
             multisample: target.multisample(),
             fragment: Some(wgpu::FragmentState {
                 module: &module,
-                entry_point: Some("fs_sprite"),
+                entry_point: Some(fs),
                 compilation_options: Default::default(),
                 targets: &[Some(target.color_target(Some(PARTICLE_BLEND)))],
             }),
             multiview_mask: None,
             cache: None,
         });
-        self.pipelines.push((target, pipeline));
+        self.pipelines.push((key, pipeline));
         self.pipelines.len() - 1
+    }
+
+    /// The bind group of texture `key` (and whether it is an array), if ready.
+    fn tex_bind(&self, key: TexKey) -> Option<&TexBind> {
+        self.tex_binds.iter().find(|b| b.key == key)
+    }
+}
+
+/// The pipeline kind of a render layer.
+fn draw_kind(kind: LayerKind) -> DrawKind {
+    match kind {
+        LayerKind::Sprite => DrawKind::Sprite,
+        LayerKind::Ribbon | LayerKind::Beam => DrawKind::Strip,
     }
 }
 
@@ -298,6 +465,12 @@ pub(crate) struct ParticlesNode {
     packed: (usize, usize),
     /// Bridge particles of the last frame.
     bridged: u32,
+    /// The frame's ribbon and beam points (`render::strips`), their scratch and segments.
+    strip_points: Vec<StripPoint>,
+    strip_scratch: StripScratch,
+    segments: u32,
+    /// The strip points changed since they were last uploaded.
+    strips_dirty: bool,
     view_items: Vec<u32>,
     views: Vec<ViewList>,
     view_uniforms: Vec<GpuParticleView>,
@@ -339,6 +512,10 @@ impl ParticlesNode {
             moved: Vec::new(),
             packed: (0, 0),
             bridged: 0,
+            strip_points: Vec::new(),
+            strip_scratch: StripScratch::default(),
+            segments: 0,
+            strips_dirty: false,
             view_items: Vec::new(),
             views: Vec::new(),
             view_uniforms: Vec::new(),
@@ -352,7 +529,7 @@ impl ParticlesNode {
         }
     }
 
-    fn capacities(&self) -> [usize; 8] {
+    fn capacities(&self) -> [usize; 9] {
         [
             self.instances.capacity(),
             self.items.capacity(),
@@ -362,11 +539,12 @@ impl ParticlesNode {
             self.views.capacity(),
             self.view_uniforms.capacity(),
             self.gpu_sim.as_ref().map_or(0, GpuSim::capacities),
+            self.strip_points.capacity() + self.strip_scratch.capacity(),
         ]
     }
 
     /// Replay the log on the frame's backend and build the draw items; publishes nothing.
-    fn simulate(&mut self, ctx: &mut PrepareContext<'_>) -> Option<Simulated> {
+    fn simulate(&mut self, ctx: &mut PrepareContext<'_>, rebuilt: bool) -> Option<Simulated> {
         let settings = ctx.resources.get::<ParticleSettings>().cloned().unwrap_or_default();
         if !ctx.resources.contains::<ParticleRuntime>() {
             return None;
@@ -390,10 +568,6 @@ impl ParticlesNode {
             self.sim.pool.fill(Particle::default());
         }
         self.backend = Some(backend);
-        let rebuilt = ctx
-            .resources
-            .get::<ParticleEffects>()
-            .is_some_and(|fx| self.layers.sync(fx));
         let dt = ctx
             .resources
             .get::<Time>()
@@ -416,11 +590,16 @@ impl ParticlesNode {
             bytes: 0,
         };
         let layers = &self.layers;
-        // Distortion layers draw into the post distortion buffer (PA4), not color.
+        // Distortion layers draw into the post distortion buffer (PA4), not color; textured
+        // layers whose texture is not ready yet wait.
+        let ready = |l: &layers::LayerInfo| {
+            l.texture
+                .is_none_or(|k| self.gpu.as_ref().is_some_and(|g| g.tex_bind(k).is_some()))
+        };
         let layer_of = |e: &crate::runtime::Entry| {
             layers
                 .layer(e.effect, e.layer)
-                .filter(|l| !l.distortion)
+                .filter(|l| !l.distortion && ready(l))
                 .map(|l| l.pack)
         };
         match backend {
@@ -508,6 +687,40 @@ impl ParticlesNode {
             self.dirty = true;
         }
         self.bridged = bridged;
+        // Ribbons and beams: rebuilt every frame there are any (they follow the render poses).
+        let had = !self.strip_points.is_empty();
+        self.segments = 0;
+        if let Some(effects) = ctx.resources.get::<ParticleEffects>()
+            && (self.layers.has_strips() || had)
+        {
+            let start = self.items.len();
+            self.segments = strips::build(
+                &StripInput {
+                    rt: &rt,
+                    effects,
+                    layers: &self.layers,
+                    poses: &self.poses,
+                    world: ctx.world,
+                    extrapolate,
+                    budget: out.settings.max_ribbon_segments,
+                },
+                &mut self.strip_scratch,
+                &mut self.strip_points,
+                &mut self.items,
+            );
+            // Strips whose texture is not ready yet wait.
+            let (gpu, info) = (self.gpu.as_ref(), &self.layers.info);
+            let mut k = start;
+            while k < self.items.len() {
+                let tex = info[self.items[k].layer as usize].texture;
+                if tex.is_some_and(|t| gpu.is_none_or(|g| g.tex_bind(t).is_none())) {
+                    self.items.remove(k);
+                } else {
+                    k += 1;
+                }
+            }
+            self.strips_dirty |= had || !self.strip_points.is_empty();
+        }
         out.reallocs += rt.reallocations;
         rt.reallocations = 0;
         if let Some(r) = ctx.resources.get_mut::<ParticleRuntime>() {
@@ -607,7 +820,10 @@ impl ParticlesNode {
 
     /// Create or refresh the GPU resources and upload what changed; returns the bytes uploaded
     /// and the buffers or textures (re)created.
-    fn upload(&mut self, ctx: &mut PrepareContext<'_>) -> (u64, u32) {
+    /// Create the GPU state for this renderer, the built-in textures the layers use and the
+    /// bind groups of every texture they sample (before the draws are planned, so a texture
+    /// drawn on the first frame is ready then). Returns the textures and bind groups created.
+    fn prepare_textures(&mut self, ctx: &mut PrepareContext<'_>) -> u32 {
         let device = ctx.device;
         if self.gpu.as_ref().is_none_or(|g| g.renderer != ctx.frame.renderer) {
             self.gpu = Some(Gpu::new(
@@ -617,7 +833,72 @@ impl ParticlesNode {
                 &ctx.layouts.scene,
             ));
             self.dirty = true;
+            self.strips_dirty = true;
         }
+        let Some(gpu) = self.gpu.as_mut() else {
+            return 0;
+        };
+        let mut created = 0;
+        for info in &self.layers.info {
+            let Some(key) = info.texture else {
+                continue;
+            };
+            let (view, sampler, layered, version) = match key {
+                TexKey::Builtin(kind) => {
+                    if gpu.tex_bind(key).is_some() {
+                        continue;
+                    }
+                    if !gpu.builtins.iter().any(|b| b.kind == kind) {
+                        gpu.builtins.push(textures::create_builtin(device, ctx.queue, kind));
+                        created += 1;
+                    }
+                    let b = gpu.builtins.iter().find(|b| b.kind == kind).expect("created above");
+                    (b.view.clone(), gpu.tex_sampler.clone(), b.layered, 0)
+                }
+                TexKey::Handle(h) => {
+                    let Some(t) = ctx.texture(h) else {
+                        continue;
+                    };
+                    if gpu
+                        .tex_bind(key)
+                        .is_some_and(|b| b.version == t.version && b.layered == t.layered)
+                    {
+                        continue;
+                    }
+                    (t.view, t.sampler, t.layered, t.version)
+                }
+            };
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("space3d particles texture"),
+                layout: &gpu.tex_layouts[layered as usize],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            created += 1;
+            let bind = TexBind {
+                key,
+                version,
+                layered,
+                group,
+            };
+            match gpu.tex_binds.iter_mut().find(|b| b.key == key) {
+                Some(b) => *b = bind,
+                None => gpu.tex_binds.push(bind),
+            }
+        }
+        created
+    }
+
+    fn upload(&mut self, ctx: &mut PrepareContext<'_>) -> (u64, u32) {
+        let device = ctx.device;
         let Some(gpu) = self.gpu.as_mut() else {
             return (0, 0);
         };
@@ -745,6 +1026,25 @@ impl ParticlesNode {
             self.dirty = false;
         }
 
+        // Ribbon and beam points (rebuilt every frame there are any).
+        if self.strips_dirty {
+            let size = self.strip_points.len() as u64 * POINT_SIZE;
+            if ensure_buffer(
+                device,
+                &mut gpu.strips,
+                size,
+                wgpu::BufferUsages::VERTEX,
+                "space3d particles strips",
+            ) {
+                created += 1;
+            }
+            if let (Some((buffer, _)), true) = (&gpu.strips, size > 0) {
+                ctx.upload(buffer, 0, bytemuck::cast_slice(&self.strip_points));
+                bytes += size;
+            }
+            self.strips_dirty = false;
+        }
+
         if rebind && let (Some((_, lut, _)), Some((draws, _)), Some((views, _))) = (&gpu.lut, &gpu.draws, &gpu.views) {
             gpu.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("space3d particles"),
@@ -788,7 +1088,16 @@ impl RenderNode for ParticlesNode {
 
     fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
         let before = self.capacities();
-        let Some(sim) = self.simulate(ctx) else {
+        let rebuilt = ctx
+            .resources
+            .get::<ParticleEffects>()
+            .is_some_and(|fx| self.layers.sync(fx));
+        let textures = if ctx.frame.device_lost {
+            0
+        } else {
+            self.prepare_textures(ctx)
+        };
+        let Some(sim) = self.simulate(ctx, rebuilt) else {
             return;
         };
         self.enabled = sim.settings.enabled;
@@ -796,7 +1105,8 @@ impl RenderNode for ParticlesNode {
         let (bytes, created) = if ctx.frame.device_lost {
             (0, 0)
         } else {
-            self.upload(ctx)
+            let (b, c) = self.upload(ctx);
+            (b, c + textures)
         };
         let after = self.capacities();
         let node_reallocs = before.iter().zip(&after).filter(|(a, b)| a != b).count() as u32;
@@ -821,7 +1131,7 @@ impl RenderNode for ParticlesNode {
                 catchup_resets: resets,
                 dispatches: sim.dispatches,
                 draw_calls,
-                ribbon_segments: 0,
+                ribbon_segments: self.segments,
                 bytes_uploaded: bytes + sim.bytes,
                 cpu_reallocations: sim.reallocs + node_reallocs + created,
             };
@@ -848,8 +1158,21 @@ impl RenderNode for ParticlesNode {
             return;
         };
         for &(slot, target) in targets {
-            if slot == SLOT_COLOR {
-                gpu.pipeline(device, target);
+            if slot != SLOT_COLOR {
+                continue;
+            }
+            // Untextured sprites always; strips and textured variants the layers use.
+            gpu.pipeline(device, (target, DrawKind::Sprite, TexVariant::None));
+            for info in &self.layers.info {
+                let tex = match info.texture {
+                    None => TexVariant::None,
+                    Some(k) => match gpu.tex_bind(k) {
+                        Some(b) if b.layered => TexVariant::Array,
+                        Some(_) => TexVariant::D2,
+                        None => continue,
+                    },
+                };
+                gpu.pipeline(device, (target, draw_kind(info.kind), tex));
             }
         }
     }
@@ -896,31 +1219,67 @@ impl ParticlesNode {
         if list.end == list.start || gpu.bind_group.is_none() {
             return;
         }
-        let p = gpu.pipeline(device, target);
-        let Some(bind_group) = &gpu.bind_group else {
-            return;
-        };
-        let direct = gpu.instances.as_ref().map(|(b, _)| b);
         let indirect = self.gpu_sim.as_ref().and_then(GpuSim::draw_buffers);
-        pass.set_pipeline(&gpu.pipelines[p].1);
         pass.set_bind_group(0, view_bind_group, &[view_offset]);
         pass.set_bind_group(1, scene_bind_group, &[]);
         let view_uniform = (list.uniform as u64 * gpu.align) as u32;
+        let mut current: Option<usize> = None;
+        let mut bound_tex: Option<TexKey> = None;
         for &i in &self.view_items[list.start as usize..list.end as usize] {
-            let item = &self.items[i as usize];
-            let from = item.first as u64 * INSTANCE_SIZE;
-            let to = from + item.count as u64 * INSTANCE_SIZE;
+            let item = self.items[i as usize];
+            let info = self.layers.info[item.layer as usize];
+            let kind = draw_kind(info.kind);
+            // The texture's bind group (group 3) and variant; a texture not ready is skipped.
+            let tex = match info.texture {
+                None => TexVariant::None,
+                Some(k) => match gpu.tex_bind(k) {
+                    Some(b) if b.layered => TexVariant::Array,
+                    Some(_) => TexVariant::D2,
+                    None => continue,
+                },
+            };
+            let p = gpu.pipeline(device, (target, kind, tex));
+            if current != Some(p) {
+                pass.set_pipeline(&gpu.pipelines[p].1);
+                current = Some(p);
+                bound_tex = None;
+            }
+            if let Some(k) = info.texture
+                && bound_tex != Some(k)
+                && let Some(b) = gpu.tex_bind(k)
+            {
+                pass.set_bind_group(3, &b.group, &[]);
+                bound_tex = Some(k);
+            }
+            let Some(bind_group) = &gpu.bind_group else {
+                return;
+            };
             pass.set_bind_group(2, bind_group, &[view_uniform, (item.layer as u64 * gpu.align) as u32]);
-            if item.args == DIRECT {
-                let Some(instances) = direct else { continue };
-                pass.set_vertex_buffer(0, instances.slice(from..to));
-                pass.draw(0..4, 0..item.count);
-            } else {
-                let (Some((work, instances)), Some(sim)) = (indirect, self.gpu_sim.as_ref()) else {
-                    continue;
-                };
-                pass.set_vertex_buffer(0, instances.slice(from..to));
-                pass.draw_indirect(work, sim.args_offset(item.args));
+            match kind {
+                DrawKind::Strip => {
+                    // Segment k: point k from slot 0, point k + 1 from slot 1.
+                    let Some((strips, _)) = &gpu.strips else { continue };
+                    let from = item.first as u64 * POINT_SIZE;
+                    let len = item.count as u64 * POINT_SIZE;
+                    pass.set_vertex_buffer(0, strips.slice(from..from + len));
+                    pass.set_vertex_buffer(1, strips.slice(from + POINT_SIZE..from + POINT_SIZE + len));
+                    pass.draw(0..4, 0..item.count);
+                }
+                DrawKind::Sprite => {
+                    let from = item.first as u64 * INSTANCE_SIZE;
+                    let to = from + item.count as u64 * INSTANCE_SIZE;
+                    if item.args == DIRECT {
+                        let Some((instances, _)) = &gpu.instances else { continue };
+                        pass.set_vertex_buffer(0, instances.slice(from..to));
+                        pass.draw(0..4, 0..item.count);
+                    } else {
+                        let (Some((work, instances)), Some(sim)) = (indirect, self.gpu_sim.as_ref()) else {
+                            continue;
+                        };
+                        pass.set_vertex_buffer(0, instances.slice(from..to));
+                        pass.draw_indirect(work, sim.args_offset(item.args));
+                    }
+                }
             }
         }
     }
@@ -1003,10 +1362,11 @@ mod tests {
     use super::*;
     use naga::back::glsl;
 
-    /// The sprite shader validates for every depth access and output encoding, and translates
-    /// to GLSL ES 3.00 (WebGL2) for both stages, the way wgpu's GL backend does.
+    /// The sprite and strip shaders validate for every depth access, output encoding and
+    /// texture variant, and translate to GLSL ES 3.00 (WebGL2) for both stages, the way wgpu's GL
+    /// backend does.
     #[test]
-    fn sprite_shader_validates_and_translates_to_webgl2() {
+    fn shaders_validate_and_translate_to_webgl2() {
         let options = glsl::Options {
             version: glsl::Version::Embedded {
                 version: 300,
@@ -1021,12 +1381,15 @@ mod tests {
             DepthAccess::ReadOnlyAttached,
             DepthAccess::SampledOnly,
         ] {
-            for output in [
-                OutputEncoding::Linear,
-                OutputEncoding::ManualSrgb,
-                OutputEncoding::Tonemapped,
+            for (output, kind, tex) in [
+                (OutputEncoding::Linear, DrawKind::Sprite, TexVariant::None),
+                (OutputEncoding::ManualSrgb, DrawKind::Sprite, TexVariant::D2),
+                (OutputEncoding::Tonemapped, DrawKind::Sprite, TexVariant::Array),
+                (OutputEncoding::Linear, DrawKind::Strip, TexVariant::Array),
+                (OutputEncoding::ManualSrgb, DrawKind::Strip, TexVariant::None),
+                (OutputEncoding::Tonemapped, DrawKind::Strip, TexVariant::D2),
             ] {
-                let src = sprite_shader_for(output, access);
+                let src = shader_for(output, access, kind, tex);
                 let module =
                     naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
                 let info = naga::valid::Validator::new(
@@ -1034,10 +1397,14 @@ mod tests {
                     naga::valid::Capabilities::empty(),
                 )
                 .validate(&module)
-                .unwrap_or_else(|e| panic!("{access:?} {output:?}: {e:?}"));
+                .unwrap_or_else(|e| panic!("{access:?} {output:?} {kind:?} {tex:?}: {e:?}"));
+                let entries = match kind {
+                    DrawKind::Sprite => ["vs_sprite", "fs_sprite"],
+                    DrawKind::Strip => ["vs_strip", "fs_strip"],
+                };
                 for (stage, entry) in [
-                    (naga::ShaderStage::Vertex, "vs_sprite"),
-                    (naga::ShaderStage::Fragment, "fs_sprite"),
+                    (naga::ShaderStage::Vertex, entries[0]),
+                    (naga::ShaderStage::Fragment, entries[1]),
                 ] {
                     let pipeline = glsl::PipelineOptions {
                         shader_stage: stage,
@@ -1066,7 +1433,10 @@ mod tests {
         let offsets: Vec<u64> = INSTANCE_ATTRIBUTES.iter().map(|a| a.offset).collect();
         assert_eq!(offsets, [0, 16, 24, 32]);
         assert_eq!(std::mem::size_of::<GpuParticleView>(), 32);
-        assert_eq!(std::mem::size_of::<GpuDrawParams>(), 80);
+        assert_eq!(std::mem::size_of::<GpuDrawParams>(), 112);
+        assert_eq!(POINT_SIZE, 40);
+        let offsets: Vec<u64> = STRIP_B_ATTRIBUTES.iter().map(|a| a.offset).collect();
+        assert_eq!(offsets, [0, 16, 24, 32]);
         assert!(SLOTS_SOFT[0].reads.contains(SceneReads::DEPTH));
         assert!(!SLOTS_HARD[0].reads.contains(SceneReads::DEPTH));
         assert_eq!(SLOTS_SOFT[1].phase, RenderPhase::Distortion);

@@ -55,7 +55,8 @@ pub(crate) struct ParticleInstance {
     pub vel_age: [u16; 4],
     /// `Float16x4`: linear tint (HDR), alpha (coverage for premultiplied layers).
     pub tint: [u16; 4],
-    /// `Uint32x2`: x = rotation (f32 bits, wrapped to ±π), y = random bits.
+    /// `Uint32x2`: x = rotation (f32 bits, wrapped to ±π; for flipbooks played at frames per
+    /// second two halves: rotation, age in seconds), y = random bits.
     pub rot_frame: [u32; 2],
 }
 
@@ -788,11 +789,17 @@ fn pack_particle(
     rot -= TAU * (rot / TAU).round();
     bounds.min = bounds.min.min(pos);
     bounds.max = bounds.max.max(pos);
+    // Flipbooks at frames per second need the age in seconds: rotation and age as halves.
+    let rot_bits = if s.pack_age {
+        f16_bits(rot) as u32 | (f16_bits(age) as u32) << 16
+    } else {
+        rot.to_bits()
+    };
     out.push(ParticleInstance {
         pos_size: [pos.x, pos.y, pos.z, size],
         vel_age: [f16_bits(dir.x), f16_bits(dir.y), f16_bits(dir.z), f16_bits(t)],
         tint: [f16_bits(rgb.x), f16_bits(rgb.y), f16_bits(rgb.z), f16_bits(a)],
-        rot_frame: [rot.to_bits(), pcg(seed.wrapping_add(stream::BITS.wrapping_mul(GOLDEN)))],
+        rot_frame: [rot_bits, pcg(seed.wrapping_add(stream::BITS.wrapping_mul(GOLDEN)))],
     });
 }
 

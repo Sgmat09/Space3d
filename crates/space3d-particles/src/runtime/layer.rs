@@ -58,6 +58,21 @@ pub(crate) struct LayerSim {
     pub spawn: super::spawn::Continuous,
     /// Response to the emitter's throttle.
     pub throttle: ThrottleResponse,
+    /// The render instances carry the particle's age in seconds with its rotation (two
+    /// halves): flipbooks played at frames per second ([`packs_age`]).
+    pub pack_age: bool,
+}
+
+/// Whether a sprite layer's instances carry their age in seconds (a textured flipbook played at
+/// frames per second: `FlipbookMode::{Fps, RandomStartFps}`); the rotation is then a half
+/// float.
+pub(crate) fn packs_age(l: &ParticleLayer) -> bool {
+    use crate::effect::{FlipbookMode, SpriteShape};
+    matches!(l.render.shape, SpriteShape::Texture(_))
+        && matches!(
+            l.render.flipbook.map(|f| f.mode),
+            Some(FlipbookMode::Fps(_) | FlipbookMode::RandomStartFps(_))
+        )
 }
 
 fn pair(r: FloatRange) -> (f32, f32) {
@@ -123,6 +138,7 @@ impl LayerSim {
             reach: Reach::new(l, window_secs(l)),
             spawn: super::spawn::Continuous::new(l),
             throttle: l.throttle,
+            pack_age: packs_age(l),
         }
     }
 

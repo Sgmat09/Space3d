@@ -270,6 +270,11 @@ fn scatter(
     instances[o + 5u] = s3dp_f16x2(dir.z, t);
     instances[o + 6u] = s3dp_f16x2(rgb.r, rgb.g);
     instances[o + 7u] = s3dp_f16x2(rgb.b, a);
-    instances[o + 8u] = bitcast<u32>(rot);
+    // Flipbooks at frames per second: rotation and age in seconds as halves (`cpu::pack`).
+    if ((flags & S3DP_AGE) != 0u) {
+        instances[o + 8u] = s3dp_f16x2(rot, age);
+    } else {
+        instances[o + 8u] = bitcast<u32>(rot);
+    }
     instances[o + 9u] = s3dp_pcg(seed + S3DP_BITS * S3DP_GOLDEN);
 }

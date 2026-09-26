@@ -19,6 +19,8 @@ pub(crate) mod flags {
     pub const TINTED: u32 = 16;
     pub const FLICKERS: u32 = 32;
     pub const PLANE: u32 = 64;
+    /// Rotation and age in seconds as two halves (`LayerSim::pack_age`).
+    pub const AGE: u32 = 128;
 }
 
 /// A table word.
@@ -55,6 +57,9 @@ pub(crate) fn entry_words(e: &Entry, out: &mut [Word]) {
     }
     if s.flicker.is_some() {
         fl |= flags::FLICKERS;
+    }
+    if s.pack_age {
+        fl |= flags::AGE;
     }
     let n_forces = s.forces.iter().take_while(|f| f.is_some()).count() as u32;
     fl |= n_forces << 16;

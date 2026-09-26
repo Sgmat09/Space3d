@@ -1,5 +1,5 @@
 //! Particle stories (`Engine/Particles/*`): the built-in effects, the particle features and a
-//! 100k-particle stress scene (graphics spec §5.2 PA1, PA2). They run on the default backend (the
+//! 100k-particle stress scene (graphics spec §5.2 PA1–PA3). They run on the default backend (the
 //! GPU backend where compute exists; `Features/CPU Backend` forces the CPU one).
 //!
 //! Owner: P-PART (graphics spec §3.6). Compiled with the `particles` feature (part of
@@ -11,8 +11,9 @@ use crate::{KnobValues, Story};
 use space3d_core::prelude::*;
 use space3d_particles::prelude::*;
 use space3d_particles::{
-    Curve, EmitDirection, EmitShape, Facing, FadeCurve, FloatRange, Force, Gradient, ParticleBackend, ParticleBlend,
-    SimulationSpace, Spawn, SpriteRender, SpriteShape,
+    BuiltinTexture, Curve, EmitDirection, EmitShape, Facing, FadeCurve, Flicker, Flipbook, FlipbookMode, FloatRange,
+    Force, Gradient, LightFlash, ParticleBackend, ParticleBlend, RibbonFacing, RibbonProfile, RibbonUv,
+    SimulationSpace, Spawn, SpriteRender, SpriteShape, SpriteTexture,
 };
 use space3d_render::{
     Camera3d, DownlevelOverride, FrameSettings, Material, Mesh3d, PostProcess, Projection, RenderTarget,
@@ -30,6 +31,13 @@ pub(crate) fn stories() -> Vec<Story> {
             warp_in(hdr),
             warp_out(hdr),
             laser_trail(hdr),
+            laser_beam(hdr),
+            laser_shot(hdr),
+            missile_trail(hdr),
+            debris_sparks(hdr),
+            engine_afterburner(hdr),
+            emp(hdr),
+            repair_beam(hdr),
         ]
     };
     let mut stories: Vec<Story> = builtins(false).into_iter().chain(builtins(true)).collect();
@@ -40,6 +48,10 @@ pub(crate) fn stories() -> Vec<Story> {
         curves(),
         facing(),
         local_vs_world(),
+        ribbons(),
+        beams(),
+        flipbook(),
+        light_flashes(),
         cpu_backend(),
         stress_100k(),
     ]);
@@ -396,6 +408,282 @@ fn laser_trail(hdr: bool) -> Story {
     .tag("particles")
     .size(320, 180)
     .ticks(13)
+}
+
+/// A ship firing a continuous `LASER_BEAM` at another: the emitter rides the gun (a child of
+/// the shooter), its `ParticleBeam` ends at the target entity.
+fn laser_beam(hdr: bool) -> Story {
+    builtin_story("Laser Beam", hdr, |app, k| {
+        plugin(app, ParticleSettings::default());
+        lights(app);
+        let cam = top_camera(app, 230.0);
+        let shooter = hull(
+            app,
+            Transform::from_xyz(-90.0, 0.0, 25.0).with_rotation(heading(Vec3::new(1.0, 0.0, -0.3))),
+        );
+        let target = hull(
+            app,
+            Transform::from_xyz(85.0, 0.0, -25.0).with_rotation(heading(Vec3::new(-0.2, 0.0, 1.0))),
+        );
+        // The beam ends on the target's hull side (a point riding the target: an entity).
+        let hit = app.world.spawn((Transform::from_xyz(-7.0, 2.0, 4.0), Parent(target)));
+        let tint = Vec4::from_array(k.color("color"));
+        app.spawn_effect(
+            builtin::LASER_BEAM,
+            EffectSpawn::from_transform(Transform::from_xyz(0.0, 2.0, -21.0))
+                .follow(shooter)
+                .beam_to(BeamEnd::Entity(hit))
+                .tint(tint)
+                .seed(20)
+                .keep(),
+        );
+        cam
+    })
+    .description(builtin_description(
+        "`builtin::LASER_BEAM` from a ship's gun to another ship's hull side (the emitter follows \
+         the shooter, `EffectSpawn::beam_to(BeamEnd::Entity(hit_point))`): a wide glow of the \
+         tint around a white-hot core, energy flowing along it, a slight flicker, a round glow \
+         where it hits and a muzzle glow. Looping; the beam follows both ships as they move.",
+        hdr,
+    ))
+    .knob_color("color", [1.0, 0.1, 0.05, 1.0])
+    .tag("particles")
+    .size(320, 180)
+    .ticks(20)
+}
+
+/// Hitscan `LASER_SHOT`s fired every other tick at three targets: each is at another stage of
+/// its 0.12 s fade.
+fn laser_shot(hdr: bool) -> Story {
+    builtin_story("Laser Shot", hdr, |app, k| {
+        plugin(app, ParticleSettings::default());
+        lights(app);
+        let cam = top_camera(app, 230.0);
+        hull(
+            app,
+            Transform::from_xyz(-100.0, 0.0, 0.0).with_rotation(heading(Vec3::X)),
+        );
+        let tint = Vec4::from_array(k.color("color"));
+        let targets = [
+            Vec3::new(90.0, 0.0, -60.0),
+            Vec3::new(110.0, 0.0, 5.0),
+            Vec3::new(80.0, 0.0, 60.0),
+        ];
+        app.add_system(Stage::FixedUpdate, move |ctx: &mut SystemCtx| {
+            let tick = ctx.time().tick;
+            if tick.is_multiple_of(2) && tick < 6 {
+                let hit = targets[(tick / 2) as usize];
+                ctx.spawn_effect(
+                    builtin::LASER_SHOT,
+                    EffectSpawn::at(Vec3::new(-78.0, 0.0, 0.0))
+                        .beam_to(BeamEnd::World(hit))
+                        .tint(tint)
+                        .seed(tick as u32),
+                );
+                ctx.spawn_effect(
+                    builtin::HIT_SPARK,
+                    EffectSpawn::at(hit)
+                        .facing(Vec3::new(-78.0, 0.0, 0.0) - hit)
+                        .tint(tint)
+                        .seed(tick as u32 + 10),
+                );
+            }
+        });
+        cam
+    })
+    .description(builtin_description(
+        "`builtin::LASER_SHOT`, the hitscan shot: `spawn_effect(builtin::LASER_SHOT, \
+         EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color))` draws the beam for \
+         0.12 s, fading as it thins, with a muzzle flash and a hot glow on the hit (with a \
+         `HIT_SPARK` there). Three shots fired two ticks apart, each at another stage.",
+        hdr,
+    ))
+    .knob_color("color", [0.2, 0.55, 1.0, 1.0])
+    .tag("particles")
+    .size(320, 180)
+    .ticks(6)
+}
+
+/// A missile curving across the view with `MISSILE_TRAIL`.
+fn missile_trail(hdr: bool) -> Story {
+    builtin_story("Missile Trail", hdr, |app, _| {
+        plugin(app, ParticleSettings::default());
+        lights(app);
+        let cam = top_camera(app, 240.0);
+        let body = mesh(app, MeshData::cube(1.0));
+        let missile = app
+            .world
+            .spawn((Name("missile".into()), Transform::from_xyz(-200.0, 0.0, 60.0)));
+        app.world.spawn((
+            Transform::IDENTITY.with_scale(Vec3::new(1.2, 1.2, 5.0)),
+            Mesh3d(body),
+            Material::srgb(0.5, 0.5, 0.55).with_metallic_roughness(0.7, 0.4),
+            Parent(missile),
+        ));
+        app.spawn_effect(
+            builtin::MISSILE_TRAIL,
+            EffectSpawn::at(Vec3::ZERO).follow(missile).seed(21).keep(),
+        );
+        // 420 units/s along an arc of radius 260 (bending right), a second of flight.
+        app.add_system(Stage::FixedUpdate, move |ctx: &mut SystemCtx| {
+            let theta = -0.9 + 420.0 / 260.0 * ctx.time().tick as f32 / 60.0;
+            let pos = Vec3::new(-40.0 + 260.0 * theta.sin(), 0.0, 200.0 - 260.0 * theta.cos());
+            if let Ok(mut tr) = ctx.world.get::<&mut Transform>(missile) {
+                tr.translation = pos;
+                tr.rotation = heading(Vec3::new(theta.cos(), 0.0, theta.sin()));
+            }
+        });
+        cam
+    })
+    .description(builtin_description(
+        "`builtin::MISSILE_TRAIL` following a missile on a curve at 420 units/s \
+         (`EffectSpawn::at(Vec3::ZERO).follow(missile)`): a white-hot flame and a short glowing \
+         wake riding the missile, sparks, and a smoke ribbon laid along its path that widens, \
+         breaks up and fades over 1.6 s, with a few puffs for volume.",
+        hdr,
+    ))
+    .tag("particles")
+    .size(320, 180)
+    .ticks(60)
+}
+
+/// `DEBRIS_SPARKS` breaking off a hull, lighting it (the light flash).
+fn debris_sparks(hdr: bool) -> Story {
+    builtin_story("Debris Sparks", hdr, |app, k| {
+        plugin(app, ParticleSettings::default());
+        sun(app, Vec3::new(-0.4, -1.0, -0.5), 0.8);
+        ambient(app, 0.05);
+        let cam = top_camera(app, 130.0);
+        hull(app, Transform::IDENTITY.with_rotation(Quat::from_rotation_y(0.5)));
+        app.spawn_effect(
+            builtin::DEBRIS_SPARKS,
+            EffectSpawn::at(Vec3::new(-7.0, 3.0, -6.0))
+                .facing(Vec3::new(-1.0, 0.0, -0.3))
+                .scale(k.f32("scale"))
+                .seed(22),
+        );
+        cam
+    })
+    .description(builtin_description(
+        "`builtin::DEBRIS_SPARKS` breaking off a hull (`.facing(toward_the_shooter)`, \
+         `.scale(hull / 40)`): glowing chunks tumbling out and cooling from orange to dark \
+         plating, sparks, flickering embers and a flash whose light (a `PointLight` while it \
+         plays) catches the hull, 0.12 s in.",
+        hdr,
+    ))
+    .knob_f32("scale", 1.0, 0.25..=3.0)
+    .tag("particles")
+    .size(320, 180)
+    .ticks(7)
+}
+
+/// A ship boosting in a circle: `ENGINE_AFTERBURNER` over `ENGINE_EXHAUST` on both nozzles.
+fn engine_afterburner(hdr: bool) -> Story {
+    builtin_story("Engine Afterburner", hdr, |app, k| {
+        plugin(app, ParticleSettings::default());
+        lights(app);
+        let cam = top_camera(app, 240.0);
+        let boost = k.f32("boost");
+        let color = Vec4::from_array(k.color("color")) * Vec4::new(2.0, 2.0, 2.0, 1.0);
+        let ship = circling_ship(app, 70.0, 0.035, 1.0, k.color("color"));
+        for x in [-6.0, 6.0] {
+            let e = app.spawn_effect(
+                builtin::ENGINE_AFTERBURNER,
+                EffectSpawn::from_transform(Transform::from_xyz(x, 0.0, 21.0))
+                    .follow(ship)
+                    .tint(color)
+                    .seed(23 + (x > 0.0) as u32)
+                    .keep(),
+            );
+            if let Ok(mut em) = app.world.get::<&mut ParticleEmitter>(e) {
+                em.rate_scale = boost;
+            }
+        }
+        cam
+    })
+    .description(builtin_description(
+        "`builtin::ENGINE_AFTERBURNER` layered over `ENGINE_EXHAUST` on both nozzles of a ship \
+         flying a circle: a long white-hot plume taking its hue from the tint, three shock \
+         diamonds riding the nozzle, a glowing ribbon trail along the ship's path and heat \
+         sparks. `boost` drives `ParticleEmitter::rate_scale` (0..1.5): the plume keeps its \
+         density and grows longer and brighter.",
+        hdr,
+    ))
+    .knob_f32("boost", 1.0, 0.0..=1.5)
+    .knob_color("color", ION_BLUE)
+    .tag("particles")
+    .size(320, 180)
+    .ticks(90)
+}
+
+/// An `EMP` among a few ships, whose hulls catch its light.
+fn emp(hdr: bool) -> Story {
+    builtin_story("EMP", hdr, |app, k| {
+        plugin(app, ParticleSettings::default());
+        sun(app, Vec3::new(-0.4, -1.0, -0.5), 0.8);
+        ambient(app, 0.05);
+        let cam = top_camera(app, 260.0);
+        for (p, dir) in [
+            (Vec3::new(-75.0, 0.0, -25.0), Vec3::X),
+            (Vec3::new(70.0, 0.0, 40.0), Vec3::new(-0.6, 0.0, -1.0)),
+            (Vec3::new(30.0, 0.0, -70.0), Vec3::new(-1.0, 0.0, 0.3)),
+        ] {
+            hull(app, Transform::from_xyz(p.x, p.y, p.z).with_rotation(heading(dir)));
+        }
+        app.spawn_effect(
+            builtin::EMP,
+            EffectSpawn::at(Vec3::ZERO)
+                .tint(Vec4::from_array(k.color("color")))
+                .seed(25),
+        );
+        cam
+    })
+    .description(builtin_description(
+        "`builtin::EMP` (`.scale(radius / 80)`): a white-cyan flash whose light catches the ships \
+         around it, a fast shock ring on the flight plane with a fainter one behind, crackling \
+         arcs thrown outward and flickering motes of charge, 0.13 s in.",
+        hdr,
+    ))
+    .knob_color("color", [1.0, 1.0, 1.0, 1.0])
+    .tag("particles")
+    .size(320, 180)
+    .ticks(8)
+}
+
+/// A support ship's `REPAIR_BEAM` on a damaged one.
+fn repair_beam(hdr: bool) -> Story {
+    builtin_story("Repair Beam", hdr, |app, _| {
+        plugin(app, ParticleSettings::default());
+        lights(app);
+        let cam = top_camera(app, 230.0);
+        let healer = hull(
+            app,
+            Transform::from_xyz(-95.0, 0.0, -30.0).with_rotation(heading(Vec3::new(1.0, 0.0, 0.4))),
+        );
+        let target = hull(
+            app,
+            Transform::from_xyz(80.0, 0.0, 30.0).with_rotation(heading(Vec3::new(0.3, 0.0, -1.0))),
+        );
+        let dock = app.world.spawn((Transform::from_xyz(-7.0, 3.0, 0.0), Parent(target)));
+        app.spawn_effect(
+            builtin::REPAIR_BEAM,
+            EffectSpawn::from_transform(Transform::from_xyz(0.0, 4.0, -12.0))
+                .follow(healer)
+                .beam_to(BeamEnd::Entity(dock))
+                .seed(26)
+                .keep(),
+        );
+        cam
+    })
+    .description(builtin_description(
+        "`builtin::REPAIR_BEAM` from a support ship to a damaged one (`BeamEnd::Entity`): a soft \
+         green stream flowing toward the target, a bright filament wavering around it \
+         (`jitter`), round glows at both ends and a gentle pulse.",
+        hdr,
+    ))
+    .tag("particles")
+    .size(320, 180)
+    .ticks(30)
 }
 
 /// A static cluster of seven sprites spread along a 90-unit line at `center`.
@@ -885,6 +1173,326 @@ fn local_vs_world() -> Story {
     .tag("particles")
     .size(320, 180)
     .ticks(75)
+}
+
+/// An emitter flying a figure eight of `size` (period `period` ticks) from `phase`.
+fn figure_eight(app: &mut App, e: Entity, center: Vec3, size: Vec2, period: f32, phase: f32) {
+    app.add_system(Stage::FixedUpdate, move |ctx: &mut SystemCtx| {
+        let a = std::f32::consts::TAU * (ctx.time().tick as f32 / period) + phase;
+        let pos = center + Vec3::new(size.x * a.sin(), 0.0, size.y * (2.0 * a).sin() * 0.5);
+        let vel = Vec3::new(size.x * a.cos(), 0.0, size.y * (2.0 * a).cos());
+        if let Ok(mut t) = ctx.world.get::<&mut Transform>(e) {
+            t.translation = pos;
+            t.rotation = heading(vel);
+        }
+    });
+}
+
+fn ribbons() -> Story {
+    Story::new("Engine/Particles/Features/Ribbons", |app, _| {
+        plugin(app, ParticleSettings::default());
+        lights(app);
+        top_camera(app, 260.0);
+        let glow = RibbonLayer {
+            name: "glow".into(),
+            min_distance: 2.0,
+            max_points: 96,
+            lifetime: 1.1,
+            width: 7.0,
+            width_over_life: Curve::Linear(1.0, 0.0),
+            color_over_life: Gradient::linear(Vec4::new(0.6, 1.2, 3.0, 1.0), Vec4::new(0.8, 0.1, 1.2, 0.0)),
+            profile: RibbonProfile {
+                core: 0.5,
+                hardness: 0.0,
+            },
+            ..RibbonLayer::default()
+        };
+        let smoke = RibbonLayer {
+            name: "smoke".into(),
+            min_distance: 3.0,
+            max_points: 96,
+            lifetime: 1.6,
+            width: 6.0,
+            width_over_life: Curve::Linear(0.6, 3.0),
+            color_over_life: Gradient::linear(Vec4::new(0.35, 0.33, 0.32, 0.8), Vec4::new(0.12, 0.12, 0.13, 0.0)),
+            profile: RibbonProfile {
+                core: 0.0,
+                hardness: 0.0,
+            },
+            uv: RibbonUv::Tile { length: 16.0 },
+            noise: 0.75,
+            blend: ParticleBlend::Alpha,
+            facing: RibbonFacing::Plane { normal: Vec3::Y },
+            ..RibbonLayer::default()
+        };
+        let plasma = RibbonLayer {
+            name: "plasma".into(),
+            min_distance: 2.0,
+            max_points: 96,
+            lifetime: 0.9,
+            width: 9.0,
+            width_over_life: Curve::Smooth(vec![(0.0, 0.3), (0.2, 1.0), (1.0, 0.6)]),
+            color_over_life: Gradient::linear(Vec4::new(2.5, 0.4, 1.6, 1.0), Vec4::new(0.4, 0.05, 0.6, 0.0)),
+            profile: RibbonProfile {
+                core: 0.3,
+                hardness: 0.3,
+            },
+            uv: RibbonUv::Tile { length: 10.0 },
+            scroll: 3.0,
+            noise: 0.9,
+            ..RibbonLayer::default()
+        };
+        let effects = app.resources.expect_mut::<ParticleEffects>();
+        let fx = [glow, smoke, plasma].map(|r| {
+            effects
+                .add(ParticleEffect {
+                    looping: true,
+                    ..ParticleEffect::new(r.name.clone()).ribbon(r)
+                })
+                .expect("valid")
+        });
+        for (i, fx) in fx.into_iter().enumerate() {
+            let e = app.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).seed(30 + i as u32).keep());
+            figure_eight(
+                app,
+                e,
+                Vec3::new(0.0, 0.0, -55.0 + 55.0 * i as f32),
+                Vec2::new(150.0, 50.0),
+                150.0,
+                i as f32 * 0.6,
+            );
+        }
+    })
+    .description(
+        "Ribbon layers (`RibbonLayer`) on three emitters flying figure eights: a history of the \
+         emitter's positions drawn as one watertight strip up to its render position, its tail \
+         shortening smoothly to the points' lifetime. Top: an additive camera-facing glow \
+         narrowing over its life. Middle: alpha-blended smoke lying on the flight plane, \
+         widening and broken up by noise fixed to the path (`uv: Tile`). Bottom: a plasma \
+         trail whose noise scrolls toward the head (`scroll`).",
+    )
+    .tag("particles")
+    .size(320, 180)
+    .ticks(110)
+}
+
+fn beams() -> Story {
+    Story::new("Engine/Particles/Features/Beams", |app, _| {
+        plugin(app, ParticleSettings::default());
+        front_camera(app, 120.0);
+        let beam = |b: BeamLayer| ParticleEffect {
+            looping: true,
+            ..ParticleEffect::new(b.name.clone()).beam(b)
+        };
+        let rows = [
+            // A clean laser: hard-edged core, glows at both ends.
+            beam(BeamLayer {
+                name: "laser".into(),
+                width: 3.0,
+                color: Gradient::constant(Vec4::new(3.0, 0.5, 0.3, 1.0)),
+                profile: RibbonProfile {
+                    core: 0.8,
+                    hardness: 0.5,
+                },
+                start_glow: 2.0,
+                end_glow: 3.5,
+                ..BeamLayer::default()
+            }),
+            // Lightning: 32 segments jittered 20 times a second, flickering.
+            beam(BeamLayer {
+                name: "lightning".into(),
+                width: 1.6,
+                segments: 32,
+                jitter: 5.0,
+                jitter_hz: 20.0,
+                color: Gradient::constant(Vec4::new(1.5, 2.5, 5.0, 1.0)),
+                profile: RibbonProfile {
+                    core: 0.8,
+                    hardness: 0.0,
+                },
+                flicker: Some(Flicker {
+                    amplitude: 0.4,
+                    frequency: 25.0,
+                }),
+                end_glow: 4.0,
+                ..BeamLayer::default()
+            }),
+            // An energy stream: noise scrolling toward the end, the color changing along it.
+            beam(BeamLayer {
+                name: "stream".into(),
+                width: 8.0,
+                segments: 8,
+                color: Gradient::linear(Vec4::new(0.3, 2.0, 0.6, 1.0), Vec4::new(0.2, 0.8, 2.4, 1.0)),
+                profile: RibbonProfile {
+                    core: 0.2,
+                    hardness: 0.0,
+                },
+                uv: RibbonUv::Tile { length: 16.0 },
+                scroll: 2.0,
+                noise: 0.8,
+                ..BeamLayer::default()
+            }),
+            // A textured beam: the built-in sparkle tiled along it.
+            beam(BeamLayer {
+                name: "textured".into(),
+                width: 7.0,
+                color: Gradient::constant(Vec4::new(2.0, 1.6, 0.8, 1.0)),
+                texture: Some(SpriteTexture::Builtin(BuiltinTexture::Sparkle)),
+                uv: RibbonUv::Tile { length: 8.0 },
+                ..BeamLayer::default()
+            }),
+        ];
+        let effects = app.resources.expect_mut::<ParticleEffects>();
+        let rows = rows.map(|e| effects.add(e).expect("valid"));
+        for (i, fx) in rows.into_iter().enumerate() {
+            let y = 40.0 - 26.0 * i as f32;
+            app.spawn_effect(
+                fx,
+                EffectSpawn::at(Vec3::new(-85.0, y, 0.0))
+                    .beam_to(BeamEnd::World(Vec3::new(85.0, y + 4.0, 0.0)))
+                    .seed(40 + i as u32)
+                    .keep(),
+            );
+        }
+    })
+    .description(
+        "Beam layers (`BeamLayer`) between two points (`EffectSpawn::beam_to`), rebuilt every \
+         frame from their end points: a laser with a hard core and round glows at both ends; \
+         lightning (32 segments jittered 20 times a second, flickering); an energy stream whose \
+         noise flows toward the end and whose color changes along it; a texture tiled along a \
+         beam.",
+    )
+    .tag("particles")
+    .size(320, 180)
+    .ticks(10)
+}
+
+fn flipbook() -> Story {
+    Story::new("Engine/Particles/Features/Flipbook", |app, _| {
+        plugin(app, ParticleSettings::default());
+        front_camera(app, 60.0);
+        let book = |texture: BuiltinTexture, mode: FlipbookMode, blend: bool| SpriteRender {
+            shape: SpriteShape::Texture(SpriteTexture::Builtin(texture)),
+            flipbook: Some(Flipbook {
+                frames: 16,
+                mode,
+                blend,
+                ..Flipbook::default()
+            }),
+            ..SpriteRender::default()
+        };
+        // Fireballs rising over their life (a new one every 0.2 s: every frame is on screen).
+        let fire = ParticleLayer {
+            lod: false,
+            offset: Vec3::new(-50.0, 6.0, 0.0),
+            shape: EmitShape::Line { length: 0.0 },
+            direction: EmitDirection::Fixed(Vec3::X),
+            speed: FloatRange::constant(30.0),
+            lifetime: FloatRange::constant(3.2),
+            size: FloatRange::constant(9.0),
+            color_over_life: Gradient::constant(Vec4::new(3.0, 3.0, 3.0, 1.0)),
+            render: book(BuiltinTexture::Fireball16, FlipbookMode::OverLife { cycles: 1.0 }, true),
+            ..ParticleLayer::continuous(5.0, 3.2)
+        };
+        // Smoke puffs on random frames (premultiplied: the smoke covers what is behind it).
+        let smoke = ParticleLayer {
+            lod: false,
+            offset: Vec3::new(0.0, -14.0, 0.0),
+            shape: EmitShape::Line { length: 100.0 },
+            size: FloatRange::new(10.0, 14.0),
+            rotation: FloatRange::new(0.0, std::f32::consts::TAU),
+            color_over_life: Gradient::constant(Vec4::new(0.8, 0.8, 0.85, 1.0)),
+            render: SpriteRender {
+                blend: ParticleBlend::Premultiplied,
+                ..book(BuiltinTexture::Smoke16, FlipbookMode::Random, false)
+            },
+            ..ParticleLayer::burst(9, 100.0)
+        };
+        let fx = app
+            .resources
+            .expect_mut::<ParticleEffects>()
+            .add(ParticleEffect {
+                looping: true,
+                ..ParticleEffect::new("flipbooks").layer(fire).layer(smoke)
+            })
+            .expect("valid");
+        app.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).seed(50).keep());
+    })
+    .description(
+        "Flipbooks from texture arrays (the procedural built-ins, 16 frames of 64² each). Top: \
+         `Fireball16` played over each particle's life, blending between frames, a new particle \
+         every 0.2 s (left: young and white-hot; right: burnt out). Bottom: `Smoke16` puffs on \
+         random frames, premultiplied.",
+    )
+    .tag("particles")
+    .size(320, 180)
+    .ticks(200)
+}
+
+fn light_flashes() -> Story {
+    Story::new("Engine/Particles/Features/Light Flashes", |app, _| {
+        plugin(app, ParticleSettings::default());
+        sun(app, Vec3::new(-0.4, -1.0, -0.5), 0.6);
+        ambient(app, 0.04);
+        top_camera(app, 200.0);
+        let ground = mesh(app, MeshData::plane(400.0));
+        app.world.spawn((
+            Transform::from_xyz(0.0, -6.0, 0.0),
+            Mesh3d(ground),
+            Material::srgb(0.2, 0.2, 0.22).with_metallic_roughness(0.1, 0.7),
+        ));
+        for x in [-80.0, 0.0, 80.0] {
+            hull(
+                app,
+                Transform::from_xyz(x, 0.0, -25.0).with_rotation(heading(Vec3::new(0.3, 0.0, 1.0))),
+            );
+        }
+        let flash = |color: Vec3| ParticleEffect {
+            duration: 0.05,
+            light: Some(LightFlash {
+                duration: 0.5,
+                color,
+                peak: 2500.0,
+                range: 120.0,
+                offset: Vec3::new(0.0, 12.0, 0.0),
+                ..LightFlash::default()
+            }),
+            ..ParticleEffect::new("flash").layer(ParticleLayer {
+                lod: false,
+                size: FloatRange::constant(16.0),
+                color_over_life: Gradient::constant((color * 3.0).extend(1.0)),
+                alpha_over_life: Curve::Preset(FadeCurve::Flash),
+                render: SpriteRender::additive(SpriteShape::Glow {
+                    core: 1.5,
+                    hardness: 0.0,
+                }),
+                ..ParticleLayer::burst(1, 0.5)
+            })
+        };
+        let effects = app.resources.expect_mut::<ParticleEffects>();
+        let fx = [
+            Vec3::new(1.0, 0.5, 0.15),
+            Vec3::new(0.2, 0.7, 1.0),
+            Vec3::new(1.0, 0.25, 0.8),
+        ]
+        .map(|c| effects.add(flash(c)).expect("valid"));
+        for (i, fx) in fx.into_iter().enumerate() {
+            app.spawn_effect(
+                fx,
+                EffectSpawn::at(Vec3::new(-80.0 + 80.0 * i as f32, 4.0, 5.0)).seed(60 + i as u32),
+            );
+        }
+    })
+    .description(
+        "Light flashes (`ParticleEffect::light`): while a flash plays, an ordinary `PointLight` \
+         child entity of its emitter lights the scene — here three colored flashes over the \
+         hulls and the ground beside them, 0.07 s in. `peak` follows the `intensity` curve over \
+         the flash, × the effect's scale²; the light is despawned when the flash ends, before \
+         the effect finishes.",
+    )
+    .tag("particles")
+    .size(320, 180)
+    .ticks(4)
 }
 
 fn cpu_backend() -> Story {

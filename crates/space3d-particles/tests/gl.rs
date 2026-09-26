@@ -86,7 +86,8 @@ fn gl_soft_particles_sample_depth_without_an_attachment() {
     assert_eq!(gpu_errors(&app), 0);
 }
 
-/// Every built-in effect, 20 ticks in, looks the same on GL and on the default backend.
+/// Every built-in effect, 20 ticks in, looks the same on GL and on the default backend (beams
+/// reach 400 units along the emitter's −Z, here +X; trails and engines move).
 #[test]
 fn gl_builtins_match_the_default_backend() {
     let scene = |app: &mut App, fx: EffectHandle| {
@@ -97,7 +98,14 @@ fn gl_builtins_match_the_default_backend() {
             Vec4::new(0.01, 0.012, 0.02, 1.0),
         );
         let e = app.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).seed(11).facing(Vec3::X).keep());
-        if fx == builtin::LASER_TRAIL || fx == builtin::ENGINE_EXHAUST {
+        if [
+            builtin::LASER_TRAIL,
+            builtin::ENGINE_EXHAUST,
+            builtin::MISSILE_TRAIL,
+            builtin::ENGINE_AFTERBURNER,
+        ]
+        .contains(&fx)
+        {
             app.add_system(Stage::FixedUpdate, move |ctx: &mut SystemCtx| {
                 let t = ctx.time().tick as f32;
                 if let Ok(mut tr) = ctx.world.get::<&mut Transform>(e) {
@@ -108,15 +116,8 @@ fn gl_builtins_match_the_default_backend() {
         app.step_ticks(20);
         render(app)
     };
-    for (fx, name) in [
-        (builtin::EXPLOSION, "explosion"),
-        (builtin::HIT_SPARK, "hit_spark"),
-        (builtin::SHIELD_RIPPLE, "shield_ripple"),
-        (builtin::WARP_IN, "warp_in"),
-        (builtin::WARP_OUT, "warp_out"),
-        (builtin::ENGINE_EXHAUST, "engine_exhaust"),
-        (builtin::LASER_TRAIL, "laser_trail"),
-    ] {
+    for fx in builtin::ALL {
+        let name = builtin::SOURCES[fx.index() as usize].0.trim_start_matches("space3d/");
         let Some(mut gl) = gl_app(ParticleSettings::default()) else {
             return;
         };

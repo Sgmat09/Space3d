@@ -10,6 +10,7 @@ mod alloc;
 pub(crate) mod layer;
 pub(crate) mod log;
 mod path;
+pub(crate) mod ribbon;
 mod spawn;
 #[cfg(test)]
 mod tests;
@@ -18,15 +19,16 @@ pub(crate) use alloc::RangeAllocator;
 pub(crate) use layer::{LayerSim, capacity, window_ticks};
 pub(crate) use log::{SpawnRecord, TickLog, WorldAttractor, XformRow};
 pub(crate) use path::Path;
+pub(crate) use ribbon::{RibbonPoint, Track};
 
 use crate::components::{FinishAction, OnRemove, ParticleAttractor, ParticleEmitter};
 use crate::effect::{EffectPriority, MAX_LAYERS_PER_EFFECT, ParticleEffect};
 use crate::registry::{EffectHandle, ParticleEffects};
 use crate::stats::EffectState;
 use crate::{ParticleLod, ParticleSettings, rng};
-use space3d_core::glam::{Quat, Vec3, Vec4};
-use space3d_core::{Entity, Parent, Transform, World};
-use space3d_render::{Camera3d, RenderTarget, Visibility};
+use space3d_core::glam::{Mat4, Quat, Vec3, Vec4};
+use space3d_core::{Entity, GlobalTransform, Parent, Transform, World};
+use space3d_render::{Camera3d, PointLight, RenderTarget, Visibility};
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 
@@ -119,6 +121,13 @@ pub(crate) struct Instance {
     pub on_remove: OnRemove,
     pub entries: [u32; MAX_LAYERS_PER_EFFECT],
     pub n_entries: u8,
+    /// Ribbon tracks (indices into `Runtime::tracks`).
+    pub tracks: [u32; MAX_LAYERS_PER_EFFECT],
+    pub n_tracks: u8,
+    /// Effect time at which the light flash ends (0 without one).
+    pub flash_end: f32,
+    /// The light flash's entity while it plays.
+    pub light: Option<Entity>,
     pub prev_pos: Vec3,
     pub prev_rot: Quat,
     pub pos: Vec3,
@@ -149,6 +158,21 @@ impl Instance {
 
     pub(crate) fn entries(&self) -> &[u32] {
         &self.entries[..self.n_entries as usize]
+    }
+
+    pub(crate) fn tracks(&self) -> &[u32] {
+        &self.tracks[..self.n_tracks as usize]
+    }
+
+    /// Emitting at effect time `time` (the start of a tick) for a layer starting at `start`:
+    /// ribbon points and beams.
+    pub(crate) fn emitting_at(&self, start: f32, dt: f32) -> bool {
+        self.emitting() && self.time + dt as f64 >= start as f64
+    }
+
+    /// Emitting now (the render node: beams, ribbon heads).
+    pub(crate) fn is_emitting(&self) -> bool {
+        self.emitting()
     }
 }
 
@@ -199,6 +223,14 @@ pub(crate) struct Runtime {
     pub log: TickLog,
     effects_version: u64,
     pub finished: Vec<Finished>,
+    /// Ribbon tracks (slab) and their point pool.
+    pub tracks: Vec<Track>,
+    free_tracks: Vec<u32>,
+    pub points: Vec<RibbonPoint>,
+    pub ribbon_pool: RangeAllocator,
+    /// Light flash entities to despawn (their instance ended or detached).
+    dead_lights: Vec<Entity>,
+    warned_ribbons: Vec<EffectHandle>,
     /// Particles spawned since the start.
     pub spawned: u64,
     /// Layer instances refused / shrunk since the last render.
@@ -251,7 +283,7 @@ fn lod_scale(lod: &ParticleLod, distance: f32) -> f32 {
 }
 
 impl Runtime {
-    fn capacities(&self) -> [usize; 8] {
+    fn capacities(&self) -> [usize; 10] {
         [
             self.instances.capacity() + self.paths.capacity(),
             self.free_instances.capacity(),
@@ -261,6 +293,8 @@ impl Runtime {
             self.pool.capacity(),
             self.log.capacity(),
             self.finished.capacity(),
+            self.tracks.capacity() + self.free_tracks.capacity() + self.points.capacity(),
+            self.ribbon_pool.capacity() + self.dead_lights.capacity(),
         ]
     }
 
@@ -364,6 +398,13 @@ impl Runtime {
             on_remove: em.on_remove,
             entries: [u32::MAX; MAX_LAYERS_PER_EFFECT],
             n_entries: 0,
+            tracks: [u32::MAX; MAX_LAYERS_PER_EFFECT],
+            n_tracks: 0,
+            flash_end: effect
+                .light
+                .as_ref()
+                .map_or(0.0, |f| f.start.max(0.0) + f.duration.max(0.0)),
+            light: None,
             prev_pos: pos,
             prev_rot: rot,
             pos,
@@ -435,11 +476,85 @@ impl Runtime {
             n += 1;
         }
         self.instances[i as usize].n_entries = n as u8;
+        self.allocate_tracks(i, handle, effect);
+    }
+
+    /// The ribbon tracks of instance `i` (rings in the point pool, under
+    /// `ParticleSettings::max_ribbon_segments`).
+    fn allocate_tracks(&mut self, i: u32, handle: EffectHandle, effect: &ParticleEffect) {
+        let mut n = 0usize;
+        let slots = MAX_LAYERS_PER_EFFECT - self.instances[i as usize].n_entries as usize;
+        for (li, r) in effect.ribbons.iter().enumerate().take(slots) {
+            let sim = ribbon::RibbonSim::new(r);
+            let Some(base) = self.ribbon_pool.alloc(sim.max_points) else {
+                self.refused += 1;
+                if !self.warned_ribbons.contains(&handle) {
+                    self.warned_ribbons.push(handle);
+                    tracing::warn!(
+                        effect = %effect.name,
+                        ribbon = %r.name,
+                        "ribbon budget exhausted: ribbon refused (raise ParticleSettings::max_ribbon_segments)"
+                    );
+                }
+                continue;
+            };
+            let need = (base + sim.max_points) as usize;
+            if self.points.len() < need {
+                self.points.resize(need, RibbonPoint::default());
+            }
+            let track = Track {
+                live: true,
+                serial: self.next_serial,
+                instance: i,
+                effect: handle,
+                layer: li as u16,
+                base,
+                cap: sim.max_points,
+                head: 0,
+                len: 0,
+                last_tick: self.tick,
+                sim,
+            };
+            self.next_serial += 1;
+            let k = match self.free_tracks.pop() {
+                Some(k) => {
+                    self.tracks[k as usize] = track;
+                    k
+                }
+                None => {
+                    self.tracks.push(track);
+                    self.tracks.len() as u32 - 1
+                }
+            };
+            self.instances[i as usize].tracks[n] = k;
+            n += 1;
+        }
+        self.instances[i as usize].n_tracks = n as u8;
+    }
+
+    /// Free the ribbon tracks of instance `i` and its light flash.
+    fn free_tracks(&mut self, i: u32) {
+        let inst = &mut self.instances[i as usize];
+        let n = inst.n_tracks as usize;
+        inst.n_tracks = 0;
+        let tracks = inst.tracks;
+        if let Some(light) = inst.light.take() {
+            self.dead_lights.push(light);
+        }
+        for &k in &tracks[..n] {
+            let tr = &mut self.tracks[k as usize];
+            if tr.live {
+                tr.live = false;
+                self.ribbon_pool.free(tr.base, tr.cap);
+                self.free_tracks.push(k);
+            }
+        }
     }
 
     /// Free the layer instances of `i` (their rings now; the entry slots once the log no longer
     /// references this tick).
     fn free_layers(&mut self, i: u32) {
+        self.free_tracks(i);
         let inst = &mut self.instances[i as usize];
         let n = inst.n_entries as usize;
         inst.n_entries = 0;
@@ -474,6 +589,10 @@ impl Runtime {
             self.by_entity.remove(&inst.entity);
         }
         inst.attached = false;
+        // A detached emitter's light flash goes at once (its entity may be gone).
+        if let Some(light) = inst.light.take() {
+            self.dead_lights.push(light);
+        }
         if on_remove == OnRemove::Clear {
             let n = inst.n_entries as usize;
             let entries = inst.entries;
@@ -508,16 +627,30 @@ impl Runtime {
                 && enabled.zip(inst.entries()).all(|((li, l), &e)| {
                     let entry = &self.entries[e as usize];
                     entry.layer as usize == li && entry.full_capacity == capacity(l)
-                });
+                })
+                && effect.ribbons.len() == inst.n_tracks as usize
+                && effect
+                    .ribbons
+                    .iter()
+                    .zip(inst.tracks())
+                    .all(|(r, &k)| self.tracks[k as usize].cap == ribbon::RibbonSim::new(r).max_points);
             if same {
                 for &e in inst.entries() {
                     let entry = &mut self.entries[e as usize];
                     entry.sim = LayerSim::new(&effect.layers[entry.layer as usize]);
                 }
+                for &k in inst.tracks() {
+                    let tr = &mut self.tracks[k as usize];
+                    tr.sim = ribbon::RibbonSim::new(&effect.ribbons[tr.layer as usize]);
+                }
                 self.entries_version += 1;
                 let inst = &mut self.instances[i as usize];
                 inst.looping = effect.looping;
                 inst.duration = effect.duration;
+                inst.flash_end = effect
+                    .light
+                    .as_ref()
+                    .map_or(0.0, |f| f.start.max(0.0) + f.duration.max(0.0));
             } else if inst.attached {
                 self.detach(i, OnRemove::Drain);
             }
@@ -547,6 +680,7 @@ impl Runtime {
         let t = self.tick;
         let dt = fixed_dt * settings.time_scale.max(0.0);
         self.set_budget(self.budget.unwrap_or(settings.max_particles_cpu));
+        self.ribbon_pool.grow_to(settings.max_ribbon_segments);
         self.release_entries(self.log.first_tick().unwrap_or(t));
         self.sync_effects(effects);
         self.log.begin(t, dt, settings.substeps.max(1), self.time);
@@ -600,9 +734,8 @@ impl Runtime {
                     let effect = match effects.get(em.effect) {
                         Some(effect) => effect,
                         None => {
-                            // A stale handle, one never issued, or a reserved built-in with no
-                            // data (`builtin::LASER_BEAM` before PA3): play nothing and finish
-                            // this tick, so the event is sent and the `FinishAction` runs (a
+                            // A stale handle, one never issued, or a built-in whose data was
+                            // not registered: play nothing and finish this tick, so the event is sent and the `FinishAction` runs (a
                             // `spawn_effect` entity despawns instead of staying forever).
                             if !self.warned_unknown.contains(&em.effect) {
                                 self.warned_unknown.push(em.effect);
@@ -664,6 +797,7 @@ impl Runtime {
                 continue;
             };
             self.schedule(i, effect, dt, quality, distance, 0.0);
+            self.record_ribbons(i, dt);
         }
         drop(query);
 
@@ -716,7 +850,19 @@ impl Runtime {
                 .unwrap_or(0);
             self.paths[i as usize].record(t, window.min(1 << 20), inst.prev_pos, inst.pos, inst.velocity.length());
             let emitting = self.instances[i as usize].emitting();
-            if !emitting && dt > 0.0 && t >= inst.last_spawn_tick.saturating_add(window as u64) {
+            let ribbons_done = inst.tracks().iter().all(|&k| {
+                let tr = &self.tracks[k as usize];
+                tr.len == 0 || t >= tr.last_tick.saturating_add(window_ticks(tr.sim.lifetime, dt) as u64)
+            });
+            let current = &self.instances[i as usize];
+            let light_done = current.light.is_none()
+                && (!current.attached || current.orphaned || current.time >= current.flash_end as f64);
+            if !emitting
+                && dt > 0.0
+                && t >= inst.last_spawn_tick.saturating_add(window as u64)
+                && ribbons_done
+                && light_done
+            {
                 self.finish(i);
             }
         }
@@ -734,6 +880,104 @@ impl Runtime {
         self.time += dt as f64;
         let after = self.capacities();
         self.reallocations += before.iter().zip(&after).filter(|(a, b)| a != b).count() as u32;
+    }
+
+    /// Append this tick's ribbon points of instance `i` (its pose at the end of the tick).
+    fn record_ribbons(&mut self, i: u32, dt: f32) {
+        let inst = self.instances[i as usize];
+        if inst.n_tracks == 0 || dt <= 0.0 {
+            return;
+        }
+        let now = self.time + dt as f64;
+        for &k in inst.tracks() {
+            let tr = self.tracks[k as usize];
+            if !tr.live || !inst.emitting_at(tr.sim.start, dt) {
+                continue;
+            }
+            let pos = inst.pos + inst.rot * (tr.sim.offset * inst.scale);
+            let newest = tr.newest().map(|s| &self.points[s]);
+            let Some(dist) = ribbon::due(&tr.sim, newest, pos, now, inst.scale) else {
+                continue;
+            };
+            let tint = if tr.sim.tinted { inst.tint } else { Vec4::ONE };
+            let slot = (tr.base + tr.head) as usize;
+            self.points[slot] = RibbonPoint {
+                pos,
+                time: now,
+                dist,
+                tint,
+            };
+            let tr = &mut self.tracks[k as usize];
+            tr.head = (tr.head + 1) % tr.cap;
+            tr.len = (tr.len + 1).min(tr.cap);
+            tr.last_tick = self.tick;
+        }
+    }
+
+    /// Play the light flashes: a `PointLight` child entity of each emitter whose flash is on
+    /// (spawned when it starts, updated every tick, despawned when it ends), and despawn the
+    /// lights of instances that ended. Called by the tick system after [`Self::tick`].
+    pub fn update_lights(&mut self, world: &mut World, effects: &ParticleEffects) {
+        let before = self.dead_lights.capacity();
+        for e in self.dead_lights.drain(..) {
+            let _ = world.despawn(e);
+        }
+        for i in 0..self.instances.len() {
+            let inst = self.instances[i];
+            if !inst.live || inst.flash_end <= 0.0 && inst.light.is_none() {
+                continue;
+            }
+            let flash = effects.get(inst.effect).and_then(|e| e.light.as_ref());
+            let tau = inst.time as f32 - flash.map_or(0.0, |f| f.start);
+            let active =
+                flash.filter(|f| inst.attached && !inst.orphaned && !inst.finished && tau >= 0.0 && tau < f.duration);
+            match active {
+                Some(f) => {
+                    let k = f.intensity.eval((tau / f.duration.max(1e-6)).clamp(0.0, 1.0));
+                    let color = if f.tinted {
+                        f.color * inst.tint.truncate()
+                    } else {
+                        f.color
+                    };
+                    let light = PointLight {
+                        color,
+                        // × scale²: the same light at the same distance relative to the effect.
+                        intensity: if inst.hidden {
+                            0.0
+                        } else {
+                            f.peak * k.max(0.0) * inst.scale * inst.scale
+                        },
+                        range: f.range * inst.scale.abs(),
+                    };
+                    let o = f.offset * inst.scale;
+                    let local = Transform::from_xyz(o.x, o.y, o.z);
+                    let alive = inst.light.filter(|&e| world.contains(e));
+                    match alive {
+                        Some(e) => {
+                            if let Ok(mut l) = world.get::<&mut PointLight>(e) {
+                                *l = light;
+                            }
+                            if let Ok(mut t) = world.get::<&mut Transform>(e) {
+                                *t = local;
+                            }
+                        }
+                        None => {
+                            let global = Mat4::from_rotation_translation(inst.rot, inst.pos) * local.matrix();
+                            let e = world.spawn((local, GlobalTransform(global), light, Parent(inst.entity)));
+                            self.instances[i].light = Some(e);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(e) = self.instances[i].light.take() {
+                        let _ = world.despawn(e);
+                    }
+                }
+            }
+        }
+        if self.dead_lights.capacity() != before {
+            self.reallocations += 1;
+        }
     }
 
     /// Emission of instance `i` this tick (records into the log).

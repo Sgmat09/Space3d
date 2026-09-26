@@ -1,39 +1,8 @@
-// Space3d particles: sprite billboards (graphics spec §2.5, design-particles §8.3).
-//
-// Composed per pass signature as: `S3DP_OUTPUT` / `S3DP_MANUAL_DEPTH` consts, `VIEW_WGSL`
-// (group 0), `scene_wgsl(target)` (group 1), `OUTPUT_WGSL`, then this file (group 2).
+// Space3d particles: sprite billboards (graphics spec §2.5, design-particles §8.3), after
+// `particles.wgsl`.
 //
 // One instanced triangle strip of 4 vertices per particle; the corners come from the vertex
-// index and everything else from per-instance attributes and uniforms: the vertex shader reads
-// no storage buffers (WebGL2). Curves are sampled from the LUT in the vertex shader. Blending is
-// premultiplied (`One, OneMinusSrcAlpha`): additive sprites write alpha 0, alpha-blended ones
-// their opacity, premultiplied ones their coverage.
-
-struct S3dpView {
-    // x: 1 = soft-clip the color (`1 − e^−x`, `FrameMode::Direct` only), y: 1 = soft particles.
-    flags: vec4<u32>,
-    // x: largest sprite, as a fraction of the viewport height.
-    params: vec4<f32>,
-}
-
-struct S3dpDraw {
-    // x: color row (LUT v), y: curve row (LUT v), z: intensity, w: aspect.
-    lut: vec4<f32>,
-    // x: blend (0 additive, 1 alpha, 2 premultiplied), y: facing (0 camera, 1 velocity,
-    // 2 plane), z: shape (0 glow, 1 streak, 2 ring, 3 smoke, 4 vortex), w: 0.
-    mode: vec4<u32>,
-    shape: vec4<f32>,
-    // x: seconds of velocity, y: minimum stretch, z: maximum stretch, w: soft distance.
-    stretch: vec4<f32>,
-    // x, y: near fade (invisible at x, full at y; off when y <= x); z: the layer's largest
-    // sprite as a fraction of the viewport height (0: the view's).
-    fade: vec4<f32>,
-}
-
-@group(2) @binding(0) var s3dp_lut: texture_2d<f32>;
-@group(2) @binding(1) var s3dp_lut_sampler: sampler;
-@group(2) @binding(2) var<uniform> s3dp_view: S3dpView;
-@group(2) @binding(3) var<uniform> s3dp_draw: S3dpDraw;
+// index and everything else from per-instance attributes and uniforms.
 
 struct S3dpIn {
     @builtin(vertex_index) vi: u32,
@@ -60,41 +29,58 @@ struct S3dpOut {
     // Positive view distance of the fragment (soft fade).
     @location(4) view_depth: f32,
     @location(5) @interpolate(flat) bits: u32,
+    // Flipbook frames: x this frame, y the next, z the blend toward it.
+    @location(6) @interpolate(flat) frame: vec3<f32>,
 }
 
-// `s3d_pcg` (bit-identical to the Rust `rng::pcg`).
-fn s3dp_pcg(v: u32) -> u32 {
-    let s = v * 747796405u + 2891336453u;
-    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-    return (w >> 22u) ^ w;
+// Flipbook frames `(frame, next, blend)` of a particle at `t` (age / life), `age` seconds old,
+// with random bits `bits` (`S3dpDraw::book`, `book2`).
+fn s3dp_frames(t: f32, age: f32, bits: u32) -> vec3<f32> {
+    let frames = max(s3dp_draw.book.x, 1.0);
+    let mode = u32(s3dp_draw.book.w);
+    var raw = 0.0;
+    var looping = true;
+    switch mode {
+        case 1u: {
+            let cycles = s3dp_draw.book2.x;
+            raw = t * frames * cycles;
+            looping = cycles > 1.0;
+        }
+        case 2u: {
+            raw = age * s3dp_draw.book2.x;
+        }
+        case 3u: {
+            raw = floor(s3dp_rnd(bits, 1u) * frames);
+        }
+        case 4u: {
+            raw = floor(s3dp_rnd(bits, 1u) * frames) + age * s3dp_draw.book2.x;
+        }
+        default: {}
+    }
+    var f0 = floor(raw);
+    let blend = select(0.0, raw - f0, s3dp_draw.book2.y > 0.5 && mode != 3u);
+    var f1 = f0 + 1.0;
+    if (looping) {
+        f0 = f0 - frames * floor(f0 / frames);
+        f1 = f1 - frames * floor(f1 / frames);
+    } else {
+        f0 = min(f0, frames - 1.0);
+        f1 = min(f1, frames - 1.0);
+    }
+    return vec3<f32>(f0, f1, blend);
 }
 
-// Uniform in [0, 1) with 24 bits (the Rust `rng::rnd`).
-fn s3dp_rnd(seed: u32, k: u32) -> f32 {
-    return f32(s3dp_pcg(seed + k * 0x9E3779B9u) >> 8u) * (1.0 / 16777216.0);
-}
-
-fn s3dp_hash(i: vec2<f32>) -> f32 {
-    let c = bitcast<vec2<u32>>(vec2<i32>(i));
-    return f32(s3dp_pcg(c.x ^ s3dp_pcg(c.y)) >> 8u) * (1.0 / 16777216.0);
-}
-
-fn s3dp_noise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = p - i;
-    let w = f * f * (3.0 - 2.0 * f);
-    let a = s3dp_hash(i);
-    let b = s3dp_hash(i + vec2<f32>(1.0, 0.0));
-    let c = s3dp_hash(i + vec2<f32>(0.0, 1.0));
-    let d = s3dp_hash(i + vec2<f32>(1.0, 1.0));
-    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
-}
-
-// In-plane basis of a plane-facing sprite (the Rust `cpu::plane_basis`).
-fn s3dp_plane_basis(n: vec3<f32>) -> mat2x3<f32> {
-    let helper = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.99);
-    let bx = normalize(cross(helper, n));
-    return mat2x3<f32>(bx, cross(n, bx));
+// Texture coordinates and array layer `(u, v, layer)` of flipbook frame `frame` at quad
+// coordinates `uv` (0..1, v down): frames fill the atlas cells of a layer, then the next layer.
+fn s3dp_cell(uv: vec2<f32>, frame: f32) -> vec3<f32> {
+    let cols = max(s3dp_draw.book.y, 1.0);
+    let rows = max(s3dp_draw.book.z, 1.0);
+    let cells = cols * rows;
+    let layer = floor(frame / cells);
+    let cell = frame - layer * cells;
+    let row = floor(cell / cols);
+    let col = cell - row * cols;
+    return vec3<f32>((uv + vec2<f32>(col, row)) / vec2<f32>(cols, rows), layer);
 }
 
 @vertex
@@ -130,7 +116,13 @@ fn vs_sprite(in: S3dpIn) -> S3dpOut {
     }
     var dim = shrink * shrink;
 
-    let rot = bitcast<f32>(in.rot_frame.x);
+    // Flipbooks at frames per second carry rotation and age in seconds as two halves.
+    var rot = bitcast<f32>(in.rot_frame.x);
+    var age_secs = 0.0;
+    if (s3dp_draw.book2.w > 0.5) {
+        rot = s3dp_half(in.rot_frame.x & 0xffffu);
+        age_secs = s3dp_half(in.rot_frame.x >> 16u);
+    }
     let cs = cos(rot);
     let sn = sin(rot);
     let right = vec3<f32>(view.view[0].x, view.view[1].x, view.view[2].x);
@@ -190,22 +182,8 @@ fn vs_sprite(in: S3dpIn) -> S3dpOut {
     out.a = vec4<f32>(coverage, fade, stretch, white);
     out.b = vec4<f32>(px, 0.0, 0.0, 0.0);
     out.bits = in.rot_frame.y;
+    out.frame = s3dp_frames(age, age_secs, in.rot_frame.y);
     return out;
-}
-
-// Smallest sprite footprint, in pixels of radius (see `vs_sprite`).
-const S3DP_MIN_PX: f32 = 1.5;
-// Variance (px²) of the pixel footprint the gaussian profiles are widened by.
-const S3DP_PX_VAR: f32 = 0.16;
-
-// A gaussian `exp(−k·d²)` of a sprite `r` pixels in radius, widened by the pixel footprint
-// (σ² + S3DP_PX_VAR, in pixels) and scaled to keep its light: `(k', k'/k)`. Unchanged for
-// large sprites; a narrow white core on a 2 px spark becomes a wider, dimmer spot instead of a
-// point sampled (or missed) by the pixel centers.
-fn s3dp_widen(k: f32, r: f32) -> vec2<f32> {
-    let r2 = r * r;
-    let kk = k * r2 / (r2 + 2.0 * k * S3DP_PX_VAR);
-    return vec2<f32>(kk, kk / k);
 }
 
 // Shape of a sprite at quad position `uv`: (color weight, white core, coverage mask). `peak`
@@ -321,13 +299,33 @@ fn fs_sprite(in: S3dpOut) -> @location(0) vec4<f32> {
     if (S3DP_MANUAL_DEPTH && s3d_scene_occluded(px, in.clip.z)) {
         discard;
     }
+    // Texture coordinates (v down) and their derivatives, before any non-uniform branch.
+    let tuv = vec2<f32>(in.uv.x, -in.uv.y) * 0.5 + 0.5;
+    let cells = vec2<f32>(max(s3dp_draw.book.y, 1.0), max(s3dp_draw.book.z, 1.0));
+    let gx = dpdx(tuv) / cells;
+    let gy = dpdy(tuv) / cells;
     let peak = max(in.color.r, max(in.color.g, in.color.b)) * in.color.a * view.exposure.x;
-    let s = s3dp_shape(in.uv, in.a.z, in.b.x, in.bits, peak);
+    var s: vec3<f32>;
+    var tex_rgb = vec3<f32>(1.0);
+    if (s3dp_draw.mode.z == 5u) {
+        // A texture (or a flipbook frame of it, blended toward the next): its color multiplies
+        // the particle's, its alpha is the shape (straight alpha).
+        let c0 = s3dp_cell(tuv, in.frame.x);
+        var tex = s3dp_tex(c0.xy, c0.z, gx, gy);
+        if (in.frame.z > 0.0) {
+            let c1 = s3dp_cell(tuv, in.frame.y);
+            tex = mix(tex, s3dp_tex(c1.xy, c1.z, gx, gy), in.frame.z);
+        }
+        s = vec3<f32>(tex.a, 0.0, tex.a);
+        tex_rgb = tex.rgb;
+    } else {
+        s = s3dp_shape(in.uv, in.a.z, in.b.x, in.bits, peak);
+    }
     var fade = in.a.y;
     if (s3dp_view.flags.y != 0u) {
         fade = fade * s3d_soft_fade(px, in.view_depth, s3dp_draw.stretch.w);
     }
-    var rgb = (in.color.rgb * (s.x * in.color.a) + vec3<f32>(s.y * in.a.w)) * fade;
+    var rgb = (in.color.rgb * tex_rgb * (s.x * in.color.a) + vec3<f32>(s.y * in.a.w)) * fade;
     let alpha = clamp(in.a.x * s.z * fade, 0.0, 1.0);
     if (s3dp_view.flags.x != 0u) {
         rgb = vec3<f32>(1.0) - exp(-max(rgb, vec3<f32>(0.0)));

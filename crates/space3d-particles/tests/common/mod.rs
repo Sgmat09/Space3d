@@ -225,3 +225,40 @@ pub fn soft_probe(img: &ImageData) -> ([u8; 4], [u8; 4], [u8; 4]) {
     let px = |x: f32, y: f32| at(img, 0.5 + x * 18.0 / 320.0, 0.5 - y * 18.0 / 180.0);
     (px(-2.5, 0.0), px(2.5, 0.0), px(-2.5, 2.5))
 }
+
+/// A bolt trail of sprite glows laid per unit of distance (`LASER_TRAIL` before it became a
+/// ribbon): what the render-time bridges join to a moving emitter.
+pub const SPRITE_TRAIL: &str = r#"ParticleEffect(
+    name: "test/sprite_trail",
+    looping: true,
+    layers: [
+        (
+            name: "trail",
+            spawn: (rate_per_distance: 1.0),
+            lifetime: 0.15,
+            size: 4.0,
+            color_over_life: (keys: [(0.0, (5.0, 5.0, 5.0, 1.0)), (1.0, (0.6, 0.6, 0.6, 1.0))]),
+            alpha_over_life: Preset(Out),
+            capacity: Some(576),
+            render: (shape: Glow(core: 0.35, hardness: 0.0)),
+        ),
+        (
+            name: "head",
+            space: Local,
+            spawn: (rate: 60.0),
+            lifetime: 0.05,
+            size: 6.0,
+            color_over_life: (keys: [(0.0, (8.0, 8.0, 8.0, 1.0))]),
+            alpha_over_life: Preset(InOut),
+            render: (shape: Glow(core: 0.6, hardness: 0.0)),
+        ),
+    ],
+)"#;
+
+/// Register [`SPRITE_TRAIL`].
+pub fn sprite_trail(app: &mut App) -> EffectHandle {
+    app.resources
+        .expect_mut::<ParticleEffects>()
+        .add(ParticleEffect::from_ron(SPRITE_TRAIL).unwrap())
+        .unwrap()
+}

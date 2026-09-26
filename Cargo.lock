@@ -3536,6 +3536,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "particles"
+version = "0.1.0"
+dependencies = [
+ "space3d",
+]
+
+[[package]]
+name = "particles_stress"
+version = "0.1.0"
+dependencies = [
+ "space3d",
+]
+
+[[package]]
 name = "password-hash"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

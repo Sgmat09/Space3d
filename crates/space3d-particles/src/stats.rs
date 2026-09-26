@@ -34,7 +34,7 @@ pub struct ParticleStats {
     pub dispatches: u32,
     /// Draw calls this frame.
     pub draw_calls: u32,
-    /// Ribbon segments drawn this frame.
+    /// Ribbon and beam segments drawn this frame.
     pub ribbon_segments: u32,
     /// Bytes uploaded this frame.
     pub bytes_uploaded: u64,

@@ -125,16 +125,7 @@ impl Plugin for ParticlesPlugin {
             .add_event::<ParticleEffectFinished>();
         if self.builtins {
             let effects = app.resources.expect_mut::<ParticleEffects>();
-            for handle in [
-                builtin::EXPLOSION,
-                builtin::HIT_SPARK,
-                builtin::SHIELD_RIPPLE,
-                builtin::WARP_IN,
-                builtin::WARP_OUT,
-                builtin::ENGINE_EXHAUST,
-                builtin::LASER_TRAIL,
-                builtin::LASER_BEAM,
-            ] {
+            for handle in builtin::ALL {
                 if let Some(effect) = builtin::effect(handle) {
                     effects.set_builtin(handle, effect);
                 }
@@ -193,6 +184,15 @@ pub fn tick_system(ctx: &mut SystemCtx) {
             });
         }
         true
+    });
+    // Light flashes: `PointLight` child entities of their emitters while they play.
+    let world = &mut *ctx.world;
+    ctx.resources.scope::<runtime::ParticleRuntime, _>(|res, runtime| {
+        if let Some(effects) = res.get::<ParticleEffects>()
+            && res.get::<ParticleSettings>().is_some_and(|s| s.enabled)
+        {
+            runtime.rt.update_lights(world, effects);
+        }
     });
     if !finished {
         return;
@@ -420,16 +420,20 @@ mod tests {
         assert_eq!(inst.prev_pos.x, bolt_x - 25.0);
     }
 
-    /// An emitter whose handle has no effect data (a stale handle, `EffectHandle::INVALID`, or
-    /// `builtin::LASER_BEAM` before PA3) plays nothing and finishes: its event is sent once and
-    /// its `FinishAction` runs, so `spawn_effect` entities do not leak.
+    /// An emitter whose handle has no effect data (a removed effect's stale handle,
+    /// `EffectHandle::INVALID`, a built-in without `ParticlesPlugin::builtins`) plays nothing and
+    /// finishes: its event is sent once and its `FinishAction` runs, so `spawn_effect` entities
+    /// do not leak.
     #[test]
     fn unknown_effect_handles_finish() {
         let mut app = App::new();
         app.add_plugin(ParticlesPlugin::default());
-        let beam = app.spawn_effect(builtin::LASER_BEAM, Vec3::ZERO);
+        let effects = app.resources.expect_mut::<ParticleEffects>();
+        let stale = effects.add(ParticleEffect::new("gone")).unwrap();
+        effects.remove(stale);
+        let beam = app.spawn_effect(stale, Vec3::ZERO);
         let invalid = app.spawn_effect(EffectHandle::INVALID, Vec3::ZERO);
-        let kept = app.spawn_effect(builtin::LASER_BEAM, EffectSpawn::at(Vec3::ZERO).keep());
+        let kept = app.spawn_effect(stale, EffectSpawn::at(Vec3::ZERO).keep());
         let mut reader = EventReader::default();
         app.step_ticks(1);
         let finished: Vec<Entity> = reader
