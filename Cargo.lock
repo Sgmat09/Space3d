@@ -5206,6 +5206,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "space3d-assets",
  "space3d-core",
  "space3d-particles",
  "space3d-physics",

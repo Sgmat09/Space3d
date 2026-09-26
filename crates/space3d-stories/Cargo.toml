@@ -17,6 +17,8 @@ particles = ["dep:space3d-particles"]
 [dependencies]
 space3d-core.workspace = true
 space3d-render.workspace = true
+# The glTF material stories load `assets/ship.glb` through the render bridge.
+space3d-assets = { workspace = true, features = ["render"] }
 space3d-test.workspace = true
 space3d-physics = { workspace = true, optional = true }
 space3d-particles = { workspace = true, optional = true }
