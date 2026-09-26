@@ -152,9 +152,12 @@ world.spawn((Transform::IDENTITY, Camera3d::default(), Skybox::new(nebula).with_
   rotation of the sky, e.g. `Quat::from_rotation_y(a)`).
 * **Upload.** The renderer uploads a cubemap in the frame after `add_cubemap` / `update_cubemap`
   into one *radiance cube*: a 6-layer texture with a full mip chain (a `TEXTURE_CUBE_MAP` on GL).
-  HDR sources stay `Rgba16Float` where the device renders it (`GraphicsCaps::hdr_format`); without
-  float targets they become `Rgba8UnormSrgb` (radiance above 1 clamps; warned once); LDR ones are
-  `Rgba8UnormSrgb`. Panoramas are converted face by face, sampling the panorama mip that matches
+  HDR sources become `Rg11b10Ufloat` where the device renders and filters it
+  (`GraphicsCaps::compact_hdr_format`: half the memory of `Rgba16Float`; its 6- and 5-bit
+  mantissas change a sky's pixels by at most 3–4 levels of 255 after tonemapping), else
+  `Rgba16Float` where that renders (`GraphicsCaps::hdr_format`; GL and WebGL2 without
+  `RG11B10UFLOAT_RENDERABLE`); without float targets they become `Rgba8UnormSrgb` (radiance above
+  1 clamps; warned once); LDR ones are `Rgba8UnormSrgb`. Panoramas are converted face by face, sampling the panorama mip that matches
   the face resolution; the mips are rendered from each other (a 2×2 average). All of it runs in
   that frame (not budgeted: the sky needs the whole cube) — compute dispatches where compute shaders
   can write storage textures, render passes elsewhere (see [WebGL2](#webgl2-and-gles)).
@@ -344,8 +347,9 @@ same sample sets; `compute_bake_matches_fragment_bake`):
 
 * **Compute** (Vulkan, Metal, DX12, WebGPU, GLES 3.1+ with compute): one dispatch per mip for all
   six faces, into write-only storage views (`Rgba16Float`; `Rgba8UnormSrgb` cubes are
-  `Rgba8Unorm` textures written through their linear view, with the sRGB encoding in the shader);
-  a frame's dispatches share one compute pass.
+  `Rgba8Unorm` textures written through their linear view, with the sRGB encoding in the shader;
+  `Rg11b10Ufloat` radiance cubes, which cannot be storage textures, take the fragment path for
+  their conversion and mips); a frame's dispatches share one compute pass.
 * **Fragment** (WebGL2 / GLES 3.0, or `DownlevelOverride::no_compute`): one render pass per face
   and mip into a single-layer view (`framebufferTexture2D` with the face target on GL). Set
   `IblSettings::bake_passes_per_frame` (e.g. `Some(6)`) to spread a bake over frames.
@@ -397,8 +401,9 @@ the prewarm builds no pipeline for them (`prewarm_builds_what_materials_draw_wit
   in about 1 ms of GPU on the dev machine with compute (`ibl_bake_gate`, gate ≤ 3 ms), a few ms
   with render passes (each pass has a fixed cost of tens of µs on Metal: 102 of them for this
   cubemap, 17 dispatches in one compute pass instead).
-* Memory: a radiance cube is `faces² × 6 × 4/3` texels (4 bytes in sRGB, 8 in `Rgba16Float`:
-  a 1024² LDR sky ≈ 34 MB, 512² ≈ 8 MB — use 512² faces on the web), an environment ≈ 4.2 MB at
+* Memory: a radiance cube is `faces² × 6 × 4/3` texels (4 bytes in sRGB and `Rg11b10Ufloat`, 8 in
+  `Rgba16Float`: a 1024² sky ≈ 34 MB, 67 MB as `Rgba16Float`; 512² ≈ 8 MB — use 512² faces on the
+  web), an environment ≈ 4.2 MB at
   the default sizes, a shadow map 16.8 MB at 2048² (4.2 MB at 1024²; kept 600 frames after its
   light stops casting); a still camera with a skybox, an environment and a shadow uploads nothing
   and allocates nothing per frame (the depth pass adds wgpu's per-pass bookkeeping, 37

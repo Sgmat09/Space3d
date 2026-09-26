@@ -230,6 +230,9 @@ impl Lighting {
         self.frame += 1;
         let frame = self.frame;
         let hdr = cx.graphics.hdr_format == Some(wgpu::TextureFormat::Rgba16Float);
+        // HDR skies in `Rg11b10Ufloat` where it renders: half the memory of `Rgba16Float` (a
+        // 1024² sky with mips: 33.5 MB instead of 67).
+        let compact = cx.graphics.compact_hdr_format == Some(wgpu::TextureFormat::Rg11b10Ufloat);
         // Compute dispatches (one compute pass) where compute shaders can write storage
         // textures; fragment passes elsewhere (WebGL2, `DownlevelOverride::no_compute`).
         let compute = cx.graphics.compute && cx.device.limits().max_storage_textures_per_shader_stage > 0;
@@ -251,7 +254,7 @@ impl Lighting {
             };
             let id = self.next_id();
             let baker = self.baker.get_or_insert_with(|| Baker::new(cx.device));
-            match cubemap::plan_upload(baker, cx.device, cx.queue, &source, hdr, compute, id) {
+            match cubemap::plan_upload(baker, cx.device, cx.queue, &source, (hdr, compact), compute, id) {
                 Ok(upload) => {
                     let format = match &source {
                         api::CubemapSource::Faces(t) | api::CubemapSource::Equirect { texture: t, .. } => t.format,

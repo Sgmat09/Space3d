@@ -1951,6 +1951,11 @@ more. Record those figures for reference; they are not the gate.
   (+ the 23 MB particle pool): **over the T1/T2 line by the sky's format** — the 1024² HDR sky is stored as
   `Rgba16Float` with mips (67 MB), where the line above budgets 33 MB (a 4-byte format). Lever: HDR cubemaps
   in `Rg11b10Ufloat` where renderable (deferred, §6.2). `battle_steady_state` pins both parts.
+  *(Amended at the M2 review, round 1.)* The lever landed: HDR radiance cubes are `Rg11b10Ufloat` where it
+  renders and filters (`GraphicsCaps::compact_hdr_format`), else `Rgba16Float`. The Battle at High, 1080p, on
+  Dev: 146.0 MB of targets and shadow + 50.4 MB of sky (33.5 MB) and IBL = 196.4 MB of textures, 219.4 MB with
+  the 23 MB particle pool: **met**. `battle_steady_state` asserts the line where the compact format exists and
+  pins the parts elsewhere (GL: the sky stays `Rgba16Float`, 83.9 MB of sky and IBL).
 * *(Amended at M1.1, measured on Dev: `docs/performance.md` "F7 / F8 and M1.1".)* The figures above are textures.
   With the half-rect prefilter the bloom chain's textures are 2.8 MB at 1080p (`Rg11b10Ufloat`), 11.1 MB at 4K
   and, for T3's Low chain at 1440 × 810, 1.9 MB (`Rg11b10Ufloat`) or 3.7 MB (`Rgba16Float`, the format ANGLE and

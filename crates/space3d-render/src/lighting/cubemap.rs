@@ -4,9 +4,11 @@
 //! On the GPU a cubemap is one *radiance cube*: a square 6-layer texture with a full mip chain
 //! (a `TEXTURE_CUBE_MAP` on GL, which picks the target from the layer count), sampled through a
 //! `Cube` view by the skybox and by environment bakes.
-//! * Format: HDR sources (`Rgba16Float` and other float formats) stay `Rgba16Float` where it can
-//!   be rendered (`GraphicsCaps::hdr_format`), else become `Rgba8UnormSrgb` (values clamp at 1,
-//!   warned once); `Rgba8Unorm` stays linear; everything else becomes `Rgba8UnormSrgb`.
+//! * Format: HDR sources (`Rgba16Float` and other float formats) become `Rg11b10Ufloat` where it
+//!   can be rendered and filtered (`GraphicsCaps::compact_hdr_format`: 4 bytes a texel, half of
+//!   `Rgba16Float`, 6- and 5-bit mantissas are plenty for a sky), else `Rgba16Float` where that
+//!   renders (`GraphicsCaps::hdr_format`), else `Rgba8UnormSrgb` (values clamp at 1, warned
+//!   once); `Rgba8Unorm` stays linear; everything else becomes `Rgba8UnormSrgb`.
 //! * Faces already in that format are uploaded straight into it; others (compressed, other
 //!   float formats, or HDR without float targets) are uploaded into a temporary cube and copied
 //!   face by face. A panorama is uploaded as a 2D texture (with GPU mips where it can be
@@ -109,11 +111,18 @@ pub(super) fn is_hdr(format: wgpu::TextureFormat) -> bool {
     )
 }
 
-/// Format of the radiance cube of a source in `format` (`hdr`: `Rgba16Float` renders).
-pub(crate) fn radiance_format(format: wgpu::TextureFormat, hdr: bool) -> wgpu::TextureFormat {
+/// Format of the radiance cube of a source in `format` (`hdr`: `Rgba16Float` renders;
+/// `compact`: `Rg11b10Ufloat` renders and filters).
+pub(crate) fn radiance_format(format: wgpu::TextureFormat, hdr: bool, compact: bool) -> wgpu::TextureFormat {
     use wgpu::TextureFormat as F;
     if is_hdr(format) {
-        if hdr { F::Rgba16Float } else { F::Rgba8UnormSrgb }
+        if compact {
+            F::Rg11b10Ufloat
+        } else if hdr {
+            F::Rgba16Float
+        } else {
+            F::Rgba8UnormSrgb
+        }
     } else if format == F::Rgba8Unorm {
         F::Rgba8Unorm
     } else {
@@ -227,7 +236,8 @@ pub(super) struct Upload {
     pub textures: u32,
 }
 
-/// Create the radiance cube of `source` (`hdr`: `Rgba16Float` renders), write the pixels it
+/// Create the radiance cube of `source` (`hdr`: `Rgba16Float` renders, `compact`:
+/// `Rg11b10Ufloat` renders; [`radiance_format`]), write the pixels it
 /// takes directly and plan the conversion and mip steps (compute dispatches with `compute`,
 /// else fragment passes; panorama mips are always rendered, and only those the conversion
 /// samples).
@@ -236,7 +246,7 @@ pub(super) fn plan_upload(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     source: &CubemapSource,
-    hdr: bool,
+    (hdr, compact): (bool, bool),
     compute: bool,
     id: u64,
 ) -> Result<Upload, String> {
@@ -262,7 +272,7 @@ pub(super) fn plan_upload(
                     src.format
                 ));
             }
-            let format = radiance_format(src.format, hdr);
+            let format = radiance_format(src.format, hdr, compact);
             let mips = full_mips(size);
             let cube = Target::cube(device, "space3d cubemap", size, mips, format, compute);
             let provided = src.mip_level_count.clamp(1, mips);
@@ -305,7 +315,7 @@ pub(super) fn plan_upload(
                     src.format
                 ));
             }
-            let format = radiance_format(src.format, hdr);
+            let format = radiance_format(src.format, hdr, compact);
             let mips = full_mips(size);
             let cube = Target::cube(device, "space3d cubemap", size, mips, format, compute);
             // A face texel spans 90°/size, a panorama texel 360°/width: the conversion samples
@@ -380,12 +390,13 @@ mod tests {
     #[test]
     fn radiance_formats() {
         use wgpu::TextureFormat as F;
-        assert_eq!(radiance_format(F::Rgba8UnormSrgb, true), F::Rgba8UnormSrgb);
-        assert_eq!(radiance_format(F::Rgba8Unorm, false), F::Rgba8Unorm);
-        assert_eq!(radiance_format(F::Rgba16Float, true), F::Rgba16Float);
-        assert_eq!(radiance_format(F::Rgba16Float, false), F::Rgba8UnormSrgb);
-        assert_eq!(radiance_format(F::Bc6hRgbUfloat, true), F::Rgba16Float);
-        assert_eq!(radiance_format(F::Bc7RgbaUnormSrgb, true), F::Rgba8UnormSrgb);
+        assert_eq!(radiance_format(F::Rgba8UnormSrgb, true, true), F::Rgba8UnormSrgb);
+        assert_eq!(radiance_format(F::Rgba8Unorm, false, false), F::Rgba8Unorm);
+        assert_eq!(radiance_format(F::Rgba16Float, true, false), F::Rgba16Float);
+        assert_eq!(radiance_format(F::Rgba16Float, true, true), F::Rg11b10Ufloat);
+        assert_eq!(radiance_format(F::Rgba16Float, false, false), F::Rgba8UnormSrgb);
+        assert_eq!(radiance_format(F::Bc6hRgbUfloat, true, false), F::Rgba16Float);
+        assert_eq!(radiance_format(F::Bc7RgbaUnormSrgb, true, true), F::Rgba8UnormSrgb);
         assert!(renderable(F::Rgba16Float, true) && !renderable(F::Rgba16Float, false));
     }
 }

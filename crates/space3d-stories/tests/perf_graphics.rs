@@ -76,13 +76,18 @@ fn battle_steady_state() {
     let s = &report.stats;
     // VRAM (graphics spec §4.4, T1/T2 ≤ 220 MB of graphics-owned textures): the frame and post
     // targets (S, its MSAA copy, depth, bloom, distortion, previews) and the shadow map
-    // (`target_bytes`: 146 MB at High, 1080p), plus the sky cubemap and the baked image-based
-    // lighting (`lighting_bytes`: 84 MB — the 1024² HDR sky is `Rgba16Float` with mips, 67 MB,
-    // twice the spec's 33 MB estimate for a 4-byte format; the 512² specular cube 17 MB). That
-    // is 230 MB, over the line by the sky's format (docs/performance.md, "M2 review"); the
-    // particle pool (≈ 23 MB at 262 144) and the driver memory each render pass holds while
-    // its frame is in flight come on top. The assertions pin the parts, so a regression in
-    // either shows.
+    // (`target_bytes`: 146 MB at High, 1080p), the sky cubemap and the baked image-based
+    // lighting (`lighting_bytes`: the 1024² HDR sky is `Rg11b10Ufloat` with mips where that
+    // renders, 33.5 MB, the 512² specular cube 17 MB), and the particle pool (≈ 23 MB at
+    // 262 144). The driver memory each render pass holds while its frame is in flight comes
+    // on top (spec §4.4, M1.1 amendment). Without `Rg11b10Ufloat` (GL) the sky is
+    // `Rgba16Float`, 67 MB: the parts are pinned instead.
+    let compact = app
+        .resources
+        .expect::<Renderer>()
+        .graphics_caps()
+        .compact_hdr_format
+        .is_some();
     eprintln!(
         "VRAM textures: targets + shadow {:.1} MB, sky + IBL {:.1} MB",
         s.target_bytes as f64 / 1e6,
@@ -98,11 +103,21 @@ fn battle_steady_state() {
         "frame, post and shadow targets: {}",
         s.target_bytes
     );
+    let lighting = if compact { 55_000_000 } else { 90_000_000 };
     assert!(
-        s.lighting_bytes > 0 && s.lighting_bytes <= 90_000_000,
+        s.lighting_bytes > 0 && s.lighting_bytes <= lighting,
         "sky + IBL: {}",
         s.lighting_bytes
     );
+    if compact {
+        const POOL: u64 = 23_000_000;
+        assert!(
+            s.target_bytes + s.lighting_bytes + POOL <= 220_000_000,
+            "T1/T2 VRAM line: {} + {} + {POOL}",
+            s.target_bytes,
+            s.lighting_bytes
+        );
+    }
     assert_eq!(s.depth_views, 1, "one shadowed sun");
     assert_eq!(s.post_groups, 1, "the battle camera (the previews render without post)");
     assert!(s.views >= 3, "the battle camera and two previews: {}", s.views);

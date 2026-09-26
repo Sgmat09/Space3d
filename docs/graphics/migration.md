@@ -295,8 +295,9 @@ or build it from the six images the game already loads:
 * **Memory.** An 8-bit 1024² sky is 25 MB of faces and 33.5 MB with its mips (six faces × 1024²
   × 4 B × 4/3); the environment bake adds about 4.2 MB, so one sector's sky costs about 38 MB
   (`RenderStats::lighting_bytes`: 37.8 MB for the game's M-1 sky loaded from its `.skybox`
-  manifest). An `Rgba16Float` sky doubles the faces (67 MB at 1024²). The presets' recommended
-  face sizes: 512 (Low, 8.4 MB with mips) / 1024 / 2048.
+  manifest). An HDR sky costs the same where the device renders `Rg11b10Ufloat` (desktop Metal,
+  Vulkan, D3D12) and twice as much where it is kept `Rgba16Float` (GL, WebGL2: 67 MB at 1024²).
+  The presets' recommended face sizes: 512 (Low, 8.4 MB with mips) / 1024 / 2048.
 
 `Engine/Environment/Skybox`, `Engine/Environment/IBL Spheres`, `Engine/Showcase/*`.
 
