@@ -17,25 +17,33 @@ ParticleEmitter (ECS) ──tick_system (FixedUpdate)──► runtime ──Tic
 
 | module | role |
 |---|---|
-| `lib.rs` | `ParticlesPlugin`, `ParticleSettings`, `tick_system` (events and finish actions) |
+| `lib.rs` | `ParticlesPlugin`, `ParticleSettings` (`for_quality`: the calibrated tiers), `tick_system` (events and finish actions) |
 | `components.rs` | `ParticleEmitter`, `EffectSpawn`, `SpawnEffect`, `ParticleAttractor`, events |
 | `effect.rs`, `curve.rs` | the serde data model (layers, shapes, forces, curves, sprites) |
 | `registry.rs` | `ParticleEffects` (handles, versions), `builtin` (RON in `assets/particles/`) |
-| `runtime/mod.rs` | instances per emitter, entries (layer instances: ring `base..base+capacity`, spawn index, accumulators, compiled `LayerSim`), finish/orphan/detach, prewarm, hot reload |
-| `runtime/spawn.rs` | one tick of one layer instance: 32.32 rate accumulators, rate per distance, bursts |
+| `runtime/mod.rs` | instances per emitter, entries (layer instances: ring `base..base+capacity`, spawn index, accumulator, compiled `LayerSim`), ribbon tracks, light flashes (`update_lights`), finish/orphan/detach, prewarm, hot reload; the LOD (`CameraView`: distance and off screen from the primary camera and the renderer's aspect), ring levels (`ring_level`, restarts when a looping emitter outgrows its level), the visible-first start of new emitters, retries of refused layers |
+| `runtime/spawn.rs` | one tick of one layer instance: a 32.32 rate accumulator (time and distance rates) with exact crossing times, bursts, the throttle's rate response |
+| `runtime/ribbon.rs` | ribbon tracks: a ring of points (position, birth, distance along, tint) per ribbon layer instance, appended on the tick |
 | `runtime/log.rs` | `TickLog`: spawn records, emitter frames, clears, world attractors per tick; trimming |
-| `runtime/layer.rs` | `LayerSim` (plain `Copy` params), capacity and life-window bounds |
+| `runtime/layer.rs` | `LayerSim` (plain `Copy` params), capacity (`capacity_at` a quality level) and life-window bounds |
 | `runtime/alloc.rs` | first-fit range allocator over the pool |
 | `runtime/path.rs` | an emitter's recent path (8 buckets over the life window): the depth-sort center of world-space draws on both backends, the GPU backend's conservative bounds |
 | `cpu.rs` | the CPU backend: `Particle` (48 B), `simulate` / `emit`, the pack into `ParticleInstance` (40 B); sub-tick quantization shared with the GPU |
 | `gpu/mod.rs` | the GPU backend: pool, tables, emitter frames, spawn records, tick uniforms; the per-tick `simulate` / `emit` dispatches, the `mark` / `scatter` compaction, draw planning (jobs, groups, records, conservative bounds) |
 | `gpu/tables.rs` | GPU layouts: entry table (24 words), jobs, spawn records, emitter frames, tick and frame uniforms |
 | `gpu/readback.rs` | `ParticleStats::alive` from the draw arguments, 1–3 frames late (never waits) |
-| `testing.rs` | hidden test hooks: blocking pool readback (parity), pretend storage limit (budgets) |
+| `gpu/sort.rs` | the per-view bitonic sort of `ByDistance` groups (keys, dispatch plan, the sorted instance buffer), skipped when nothing changed |
+| `testing.rs` | hidden test hooks: blocking pool readback (parity), pretend storage limit (budgets), the Battle scene's particle load (`battle`: calibration, perf, the Battle story) |
 | `rng.rs`, `pack.rs` | PCG streams (bit-identical to WGSL), f16 and octahedral packing |
-| `render/mod.rs` | `ParticlesNode` (`RenderNode`): slots, prepare / prepare_view / prewarm / draw, GPU state |
-| `render/layers.rs` | render layers: draw parameters and the curve LUT per sprite layer |
-| `shaders/sprite.wgsl` | the sprite vertex / fragment shader (composed with the frame's WGSL modules) |
+| `render/mod.rs` | `ParticlesNode` (`RenderNode`): slots (Transparent, Distortion), prepare / prepare_view / prewarm / draw, pipelines per (pass, sprite / strip / distortion, texture variant), the per-view draw lists (color, then distortion) and sorted draws (CPU-sorted copies, GPU sort jobs), GPU state |
+| `render/layers.rs` | render layers (sprite, ribbon and beam layers): draw parameters, textures and the curve LUT rows; distortion and sorted flags |
+| `render/strips.rs` | the frame's ribbons (tracks + a head at the render pose) and beams (render-time end points, jitter, fade, flicker, end glows) as one `StripPoint` stream, CPU-built on both backends |
+| `render/textures.rs` | the procedural built-in textures (generated once per process at effect registration) and the texture bind groups |
+| `shaders/particles.wgsl` | declarations shared by the sprite and strip shaders (group 2, noise, the pixel-footprint widening) |
+| `shaders/sprite.wgsl` | the sprite vertex / fragment shader: analytic shapes, textures and flipbooks, the minimum footprint |
+| `shaders/distortion.wgsl` | distortion sprites (after `sprite.wgsl` and `DISTORTION_WGSL`): offsets by shape (ring, vortex, texture, heat haze) through the inverse Jacobian, depth fade and foreground guard |
+| `shaders/sort.wgsl` | the GPU sort's kernels: `sort_local` (512-key blocks in workgroup memory: the initial sort, the merges, the gather) and `sort_global` (one step across blocks) |
+| `shaders/strip.wgsl` | ribbons and beams: a segment per instance from two bindings of the point stream, shared side vectors (watertight), tail clipping, round caps |
 | `shaders/gpu_common.wgsl`, `simulate.wgsl`, `compact.wgsl` | the compute kernels: `simulate`, `emit` (per tick), `mark`, `scatter` (per frame) |
 
 Invariants:
@@ -59,5 +67,16 @@ Invariants:
   only the curve LUT uses `Queue::write_texture`, when the effects change. The GPU backend's
   per-tick emitter frames are copied between that tick's passes. The runtime resource moves out
   of `Resources` (`mem::take`, no allocation) for the node's `prepare`.
+* **Strips.** Ribbon histories are CPU state appended on the tick (never replayed), beams are
+  rebuilt from the render poses: both are identical on the two backends and for any render
+  cadence (in tests, α = 0). Light flashes are `PointLight` child entities spawned and despawned
+  by the tick system.
 * **Dispatch budget.** 4 per frame with one tick (`simulate`, `emit`, `mark`, `scatter`), 2 more
-  per extra tick; kernels use `@workgroup_size(64)` and ≤ 4 storage buffers.
+  per extra tick, plus the sort's per (view, `ByDistance` group) — 1 up to 512 particles, 36 at
+  65 536 — when the compaction or the view changed; kernels use `@workgroup_size(64)` and ≤ 4
+  storage buffers.
+* **Sorting.** Keys are `(order-preserving view depth, instance index)`: unique, so the CPU sort
+  and the GPU's bitonic network give the same order whatever the execution order.
+* **LOD.** Everything the LOD reads comes from ECS transforms, the camera component and the
+  renderer's size: deterministic. Ring levels are powers of two below the quality, so a moving
+  emitter restarts rarely (two levels of hysteresis down); restarts drain like hot reloads.

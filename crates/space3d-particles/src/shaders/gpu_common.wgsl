@@ -52,6 +52,7 @@ const S3DP_PREMULTIPLIED: u32 = 8u;
 const S3DP_TINTED: u32 = 16u;
 const S3DP_FLICKERS: u32 = 32u;
 const S3DP_PLANE: u32 = 64u;
+const S3DP_AGE: u32 = 128u;
 
 fn s3dp_word(e: u32, k: u32) -> vec4<u32> {
     return tables[e * S3DP_ENTRY_WORDS + k];

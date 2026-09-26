@@ -16,9 +16,9 @@ pub(crate) struct SpawnRecord {
     pub first: u64,
     /// Particles.
     pub count: u32,
-    /// Sub-tick span (0..1 of the tick) the particles are spread over.
+    /// Emission time of the first particle, as a fraction (0..1) of the tick.
     pub t0: f32,
-    /// End of the span.
+    /// Emission time of the last particle (the others evenly between: `cpu::subtick`).
     pub t1: f32,
     /// Extra age in seconds (prewarm: particles synthesized for past ticks).
     pub extra_age: f32,
@@ -41,6 +41,8 @@ pub(crate) struct XformRow {
     pub velocity: Vec3,
     /// Uniform effect scale.
     pub scale: f32,
+    /// `ParticleEmitter::rate_scale` (the throttle; `ThrottleResponse::speed` of new particles).
+    pub throttle: f32,
 }
 
 impl XformRow {
@@ -52,6 +54,7 @@ impl XformRow {
         rot: Quat::IDENTITY,
         velocity: Vec3::ZERO,
         scale: 1.0,
+        throttle: 1.0,
     };
 }
 

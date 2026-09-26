@@ -36,6 +36,8 @@
 //!   random attributes come from a PCG hash of (layer instance seed, `k`): deterministic, and
 //!   shared bit for bit with the shaders.
 
+#[cfg(feature = "assets")]
+mod asset;
 mod components;
 mod cpu;
 mod curve;
@@ -50,6 +52,8 @@ mod stats;
 #[doc(hidden)]
 pub mod testing;
 
+#[cfg(feature = "assets")]
+pub use asset::ParticleEffectLoader;
 pub use components::{
     BeamEnd, EffectSpawn, FinishAction, OnRemove, ParticleAttractor, ParticleBeam, ParticleEffectFinished,
     ParticleEmitter, SpawnEffect,
@@ -57,9 +61,10 @@ pub use components::{
 pub use curve::{ColorRange, CountRange, Curve, FadeCurve, FloatRange, Gradient};
 pub use effect::{
     BeamLayer, BuiltinTexture, Burst, EffectPriority, EmitDirection, EmitShape, Facing, Falloff, Flicker, Flipbook,
-    FlipbookMode, Force, LUT_WIDTH, LightFlash, MAX_FLIPBOOK_FRAMES, MAX_FORCES_PER_LAYER, MAX_LAYERS_PER_EFFECT,
-    MAX_RIBBON_POINTS, ParticleBlend, ParticleEffect, ParticleLayer, RibbonFacing, RibbonLayer, RibbonProfile,
-    RibbonUv, SimulationSpace, SortMode, Spawn, SpriteRender, SpriteShape, SpriteTarget, SpriteTexture,
+    FlipbookMode, Force, LUT_WIDTH, LightFlash, MAX_BEAM_SEGMENTS, MAX_FLIPBOOK_FRAMES, MAX_FORCES_PER_LAYER,
+    MAX_LAYERS_PER_EFFECT, MAX_RIBBON_POINTS, ParticleBlend, ParticleEffect, ParticleLayer, RibbonFacing, RibbonLayer,
+    RibbonProfile, RibbonUv, SimulationSpace, SortMode, Spawn, SpriteRender, SpriteShape, SpriteTarget, SpriteTexture,
+    ThrottleResponse,
 };
 pub use registry::{EffectError, EffectHandle, ParticleEffects, builtin};
 pub use runtime::ParticleRuntime;
@@ -124,16 +129,7 @@ impl Plugin for ParticlesPlugin {
             .add_event::<ParticleEffectFinished>();
         if self.builtins {
             let effects = app.resources.expect_mut::<ParticleEffects>();
-            for handle in [
-                builtin::EXPLOSION,
-                builtin::HIT_SPARK,
-                builtin::SHIELD_RIPPLE,
-                builtin::WARP_IN,
-                builtin::WARP_OUT,
-                builtin::ENGINE_EXHAUST,
-                builtin::LASER_TRAIL,
-                builtin::LASER_BEAM,
-            ] {
+            for handle in builtin::ALL {
                 if let Some(effect) = builtin::effect(handle) {
                     effects.set_builtin(handle, effect);
                 }
@@ -141,6 +137,14 @@ impl Plugin for ParticlesPlugin {
         }
         if self.tick_system {
             app.add_system_ordered(Stage::FixedUpdate, Self::TICK_ORDER, "particles::tick", tick_system);
+        }
+        // `.pfx.ron` effects, when the app has an asset server (add `AssetsPlugin` first).
+        #[cfg(feature = "assets")]
+        if app.resources.contains::<space3d_assets::AssetServer>() {
+            use space3d_assets::AssetApp;
+            app.init_asset::<ParticleEffect>()
+                .register_asset_loader(asset::ParticleEffectLoader);
+            app.add_system_named(Stage::Update, "particles::effect_assets", asset::sync_effect_assets);
         }
         // The render node (the frame's `RenderNodes` exists with or without a renderer; a
         // `RenderPlugin` added later keeps it).
@@ -171,6 +175,10 @@ pub fn tick_system(ctx: &mut SystemCtx) {
         let dt = res.get::<Time>().map_or(0.0, Time::fixed_delta_secs);
         let rt = &mut runtime.rt;
         rt.budget = Some(pool_budget(settings, res));
+        rt.aspect = res.get::<Renderer>().map_or(0.0, |r| {
+            let (w, h) = r.size();
+            w as f32 / h.max(1) as f32
+        });
         rt.tick(world, settings, effects, dt);
         let (live, layers) = rt.counts();
         let (total, reserved, spawned) = (rt.pool.total(), rt.pool.reserved(), rt.spawned);
@@ -192,6 +200,16 @@ pub fn tick_system(ctx: &mut SystemCtx) {
             });
         }
         true
+    });
+    // Light flashes: `PointLight` child entities of their emitters while they play.
+    let world = &mut *ctx.world;
+    ctx.resources.scope::<runtime::ParticleRuntime, _>(|res, runtime| {
+        let enabled = res.get::<ParticleSettings>().is_some_and(|s| s.enabled);
+        match res.get::<ParticleEffects>() {
+            Some(effects) if enabled => runtime.rt.update_lights(world, effects),
+            // Disabled: nothing plays, so no flash lights anything either.
+            _ => runtime.rt.remove_lights(world),
+        }
     });
     if !finished {
         return;
@@ -252,10 +270,17 @@ pub struct ParticleSettings {
     pub max_particles_cpu: u32,
     /// Ribbon segment budget. Default 65 536.
     pub max_ribbon_segments: u32,
-    /// 0..=1: scales the spawn counts of `lod` layers. Default 1.
+    /// 0..=1: scales the spawn counts of `lod` layers, and the rings they reserve (a thinned
+    /// layer draws its fewer particles a little bigger and brighter). Default 1.
     pub quality: f32,
     /// Distance-based rate scaling (off by default).
     pub lod: ParticleLod,
+    /// Rate multiplier (0..=1) of `lod` layers whose emitter is off screen: outside the
+    /// primary camera's view (at the renderer's aspect ratio, grown by a quarter on each side).
+    /// Looping emitters get rings for it and restart with bigger ones when they come into view
+    /// (their old particles drain), so a battle's off-screen engines cost a fraction of the
+    /// budget. Default 1 (off).
+    pub offscreen_scale: f32,
     /// 0 freezes every effect (deterministic). Default 1.
     pub time_scale: f32,
     /// Simulation substeps per tick. Default 1.
@@ -288,6 +313,7 @@ impl Default for ParticleSettings {
             max_ribbon_segments: 65_536,
             quality: 1.0,
             lod: ParticleLod::default(),
+            offscreen_scale: 1.0,
             time_scale: 1.0,
             substeps: 1,
             max_catchup_ticks: 1200,
@@ -301,10 +327,54 @@ impl Default for ParticleSettings {
 }
 
 impl ParticleSettings {
-    /// Budgets and backend for a quality tier (graphics spec §4.4).
+    /// Budgets, backend, spawn quality and distance LOD for a quality tier (graphics spec §4.4;
+    /// calibrated with the Battle scene, `tests/battle.rs`):
+    ///
+    /// | | Low (WebGL2 / C-class) | Medium (iGPU, Apple, mobile) | High (dGPU) |
+    /// |---|---|---|---|
+    /// | backend, budget | CPU, 16 384 (8 192 on the web) | GPU, 262 144 (65 536 on Android / iOS) | GPU, 262 144 |
+    /// | `quality` (spawn counts of `lod` layers, and their rings) | 0.25 (0.125 on the web) | 1 (0.75 mobile) | 1 |
+    /// | `lod` (rate × `min_scale` from `far`) | 1000 → 2500, × 0.25 | 1200 → 3000, × 0.5 | off |
+    /// | `offscreen_scale` | 0 (nothing off screen) | 0.5 (0.125 mobile) | 1 |
+    /// | `max_ribbon_segments` | 16 384 | 65 536 | 65 536 |
+    /// | `max_screen_size` (fill rate) | 0.6 | 1 | 1 |
+    ///
+    /// The LOD distances are for a top-down camera 400–1000 units above the flight plane (the
+    /// SpaceCorps2027 battle view): emitters on screen keep their full rate, those off screen or
+    /// far away thin out. With these, the Battle scene's 300 ships (900 engines, 30 explosions a
+    /// second, …) keep 100k+ particles at High and fit every tier's budget without refusing a
+    /// layer, every engine in view burning. Other tiers use the defaults.
     pub fn for_quality(q: GraphicsQuality) -> Self {
-        let _ = q; // STUB(I): the §4.4 preset table
-        Self::default()
+        let mobile = cfg!(any(target_os = "android", target_os = "ios"));
+        let web = cfg!(target_arch = "wasm32");
+        match q {
+            GraphicsQuality::Low => Self {
+                backend: ParticleBackend::Cpu,
+                max_particles_cpu: if web { 8_192 } else { 16_384 },
+                max_ribbon_segments: 16_384,
+                quality: if web { 0.125 } else { 0.25 },
+                lod: ParticleLod {
+                    near: 1000.0,
+                    far: 2500.0,
+                    min_scale: 0.25,
+                },
+                offscreen_scale: 0.0,
+                max_screen_size: 0.6,
+                ..Self::default()
+            },
+            GraphicsQuality::Medium => Self {
+                max_particles: if mobile { 65_536 } else { 262_144 },
+                quality: if mobile { 0.75 } else { 1.0 },
+                lod: ParticleLod {
+                    near: 1200.0,
+                    far: 3000.0,
+                    min_scale: 0.5,
+                },
+                offscreen_scale: if mobile { 0.125 } else { 0.5 },
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
     }
 }
 
@@ -419,16 +489,20 @@ mod tests {
         assert_eq!(inst.prev_pos.x, bolt_x - 25.0);
     }
 
-    /// An emitter whose handle has no effect data (a stale handle, `EffectHandle::INVALID`, or
-    /// `builtin::LASER_BEAM` before PA3) plays nothing and finishes: its event is sent once and
-    /// its `FinishAction` runs, so `spawn_effect` entities do not leak.
+    /// An emitter whose handle has no effect data (a removed effect's stale handle,
+    /// `EffectHandle::INVALID`, a built-in without `ParticlesPlugin::builtins`) plays nothing and
+    /// finishes: its event is sent once and its `FinishAction` runs, so `spawn_effect` entities
+    /// do not leak.
     #[test]
     fn unknown_effect_handles_finish() {
         let mut app = App::new();
         app.add_plugin(ParticlesPlugin::default());
-        let beam = app.spawn_effect(builtin::LASER_BEAM, Vec3::ZERO);
+        let effects = app.resources.expect_mut::<ParticleEffects>();
+        let stale = effects.add(ParticleEffect::new("gone")).unwrap();
+        effects.remove(stale);
+        let beam = app.spawn_effect(stale, Vec3::ZERO);
         let invalid = app.spawn_effect(EffectHandle::INVALID, Vec3::ZERO);
-        let kept = app.spawn_effect(builtin::LASER_BEAM, EffectSpawn::at(Vec3::ZERO).keep());
+        let kept = app.spawn_effect(stale, EffectSpawn::at(Vec3::ZERO).keep());
         let mut reader = EventReader::default();
         app.step_ticks(1);
         let finished: Vec<Entity> = reader

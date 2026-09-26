@@ -24,6 +24,7 @@
 //! positions come from sums of integers, never from the order of atomics.
 
 mod readback;
+pub(crate) mod sort;
 pub(crate) mod tables;
 #[cfg(test)]
 mod tests;
@@ -109,6 +110,8 @@ pub(crate) struct GpuFrameStats {
     pub passes: u32,
     pub bytes: u64,
     pub created: u32,
+    /// The compaction ran (the instance stream changed).
+    pub compacted: bool,
 }
 
 /// Inputs of [`GpuSim::prepare`] owned by the render node.
@@ -405,8 +408,9 @@ impl GpuSim {
                     .unwrap_or((inst.pos, inst.rot));
                 let cap = e.capacity.max(1);
                 let tail = (e.spawned % cap as u64) as u32;
+                let (tint, scale) = rt.draw_tint_scale(e);
                 self.words
-                    .extend(tables::job_words(ei, tail, records, g, inst.tint, pose, inst.scale));
+                    .extend(tables::job_words(ei, tail, records, g, tint, pose, scale));
                 records += cap.div_ceil(LANES);
                 out += cap;
                 let (lo, hi) = rt.entry_bounds(e, input.poses, layer.extent);
@@ -749,6 +753,7 @@ impl GpuSim {
                 pass.set_pipeline(&self.scatter);
                 pass.dispatch_workgroups(x, y, 1);
                 stats.dispatches += 2;
+                stats.compacted = true;
             }
             stats.created += self.readback.record(
                 ctx.device,

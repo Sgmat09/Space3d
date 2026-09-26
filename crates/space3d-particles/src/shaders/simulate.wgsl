@@ -13,7 +13,8 @@ struct S3dpXform {
     prev_rot: vec4<f32>,
     pos: vec4<f32>,
     rot: vec4<f32>,
-    // xyz: velocity (measured motion + `ParticleEmitter::velocity`).
+    // xyz: velocity (measured motion + `ParticleEmitter::velocity`), w: throttle
+    // (`ParticleEmitter::rate_scale`).
     vel: vec4<f32>,
 }
 
@@ -295,10 +296,12 @@ fn emit(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let hi_index = r.b.y + select(0u, 1u, lo_index < r.b.x);
     let seed = s3dp_particle_seed(w0.z, lo_index, hi_index);
 
-    // Sub-tick time (`cpu::subtick`), in integers.
+    // Sub-tick time (`cpu::subtick`), in integers: evenly from the first particle's time to
+    // the last's.
     var fq = r.b.z;
-    if (r.b.w > r.b.z) {
-        fq = r.b.z + ((r.b.w - r.b.z) * (2u * k + 1u)) / (2u * r.c.y);
+    if (r.b.w > r.b.z && r.c.y > 1u) {
+        let n = r.c.y - 1u;
+        fq = r.b.z + ((r.b.w - r.b.z) * min(k, n) + n / 2u) / n;
     }
     let f = f32(fq) * (1.0 / 16384.0);
 
@@ -350,6 +353,17 @@ fn emit(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (w5.w != 0.0) {
         speed_mul = pow(max(scale, 0.0), w5.w);
     }
+    // `ThrottleResponse::speed` (word 21.w) of the throttle (the frame's `vel.w`) clamped to
+    // `Spawn::max_rate_scale` (word 21.z): `LayerSim::speed_throttle`.
+    let w21 = s3dp_wordf(e, 21u);
+    if (w21.w != 0.0) {
+        let throttle = clamp(row.vel.w, 0.0, max(w21.z, 0.0));
+        if (w21.w == 1.0) {
+            speed_mul *= throttle;
+        } else {
+            speed_mul *= pow(throttle, w21.w);
+        }
+    }
     let speed = s3dp_range(seed, S3DP_SPEED, w7.x, w7.y) * speed_mul;
     var pos = origin + s3dp_rotate(rot, offset);
     var vel = s3dp_rotate(rot, dir) * speed;
@@ -358,7 +372,9 @@ fn emit(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     }
     let life = s3dp_range_exact(seed, S3DP_LIFETIME, w6.x, w6.y);
     let delay = s3dp_range_exact(seed, S3DP_DELAY, w6.z, w6.w);
-    let age = f32(16384u - fq) * tick.a.w + bitcast<f32>(r.c.z) - delay;
+    // One explicit rounding (`cpu::spawn_particle`: `mul_add`), which no shader compiler can
+    // contract or reassociate differently.
+    let age = fma(f32(16384u - fq), tick.a.w, bitcast<f32>(r.c.z) - delay);
     if (age > 0.0) {
         let aged = s3dp_pre_age(pos, vel, s3dp_wordf(e, 8u).xyz, w7.w, age);
         pos = aged[0];

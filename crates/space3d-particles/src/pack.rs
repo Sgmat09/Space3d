@@ -42,8 +42,7 @@ pub(crate) fn f16_bits(x: f32) -> u16 {
     sign | h as u16
 }
 
-/// The value of half-float bits (tests).
-#[cfg(test)]
+/// The value of half-float bits.
 pub(crate) fn f16_value(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((h >> 10) & 0x1f) as i32;

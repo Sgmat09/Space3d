@@ -33,6 +33,11 @@ impl RangeAllocator {
         }
         let added = (self.total, total - self.total);
         self.total = total;
+        // Room for a fragmented pool from the start (1 KiB): the free list rarely grows later,
+        // where a steady state would count the growth as an allocation.
+        if self.free.capacity() == 0 {
+            self.free.reserve(128);
+        }
         self.release(added.0, added.1, false);
     }
 

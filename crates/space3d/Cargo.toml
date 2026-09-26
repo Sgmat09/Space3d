@@ -17,8 +17,9 @@ default = ["render", "platform", "assets", "audio", "physics", "scene", "net", "
 render = ["dep:space3d-render", "space3d-assets?/render"]
 ## winit window + input runner (desktop, web, Android, iOS). Implies `render`.
 platform = ["render", "dep:space3d-platform"]
-## Asset server, image/glTF/OBJ loaders, hot reload, texture & mesh editing.
-assets = ["dep:space3d-assets"]
+## Asset server, image/glTF/OBJ loaders, hot reload, texture & mesh editing (with `particles`:
+## `.pfx.ron` effect files).
+assets = ["dep:space3d-assets", "space3d-particles?/assets"]
 ## kira audio with spatial emitters.
 audio = ["dep:space3d-audio"]
 ## rapier rigid bodies, colliders, raycasts.

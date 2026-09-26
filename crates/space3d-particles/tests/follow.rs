@@ -1,11 +1,12 @@
 //! A followed emitter's world-space trail reaches its local-space layers whatever stage moves
-//! the emitter and whatever the frame rate: `builtin::LASER_TRAIL` on a bolt moved at
-//! 1500 units/s in `Stage::FixedUpdate`, `PreUpdate` or `Update` (SpaceCorps2027 moves bolts and
-//! avatars in `Update`), at 60 Hz and at 120 Hz (frames with and without a tick), on both
-//! backends. Emission is decided on the tick; between the pose the last tick read and the render
-//! pose, the render node lays the next tick's emission (the render-time bridge). Before it, an
-//! `Update` mover left a gap of one frame of motion (25 units at 60 Hz) between the trail and
-//! the head.
+//! the emitter and whatever the frame rate: a trail on a bolt moved at 1500 units/s in
+//! `Stage::FixedUpdate`, `PreUpdate` or `Update` (SpaceCorps2027 moves bolts and avatars in
+//! `Update`), at 60 Hz and at 120 Hz (frames with and without a tick), on both backends — the
+//! ribbon of `builtin::LASER_TRAIL` (its head is drawn at the render pose) and a trail of sprite
+//! glows emitted per distance (emission is decided on the tick; between the pose the last tick
+//! read and the render pose, the render node lays the next tick's emission: the render-time
+//! bridge). Before the bridge, an `Update` mover left a gap of one frame of motion (25 units at
+//! 60 Hz) between the trail and the head.
 
 mod common;
 use common::*;
@@ -24,7 +25,7 @@ const PER_TICK: f32 = 25.0;
 
 /// The bolt row after `frames` frames of `1 / (60 · sub)` s, the bolt moved in `stage` (by
 /// `PER_TICK / sub` per frame, or per tick in `FixedUpdate`): its x in pixels, and the image.
-fn run(backend: ParticleBackend, stage: Stage, sub: u32, frames: u32) -> Option<(f32, ImageData)> {
+fn run(backend: ParticleBackend, sprites: bool, stage: Stage, sub: u32, frames: u32) -> Option<(f32, ImageData)> {
     let settings = ParticleSettings {
         backend,
         ..ParticleSettings::default()
@@ -41,7 +42,12 @@ fn run(backend: ParticleBackend, stage: Stage, sub: u32, frames: u32) -> Option<
             }),
     ));
     let bolt = app.world.spawn((Transform::from_xyz(START, 0.0, 0.0),));
-    app.spawn_effect(builtin::LASER_TRAIL, EffectSpawn::at(Vec3::ZERO).follow(bolt).seed(1));
+    let fx = if sprites {
+        sprite_trail(&mut app)
+    } else {
+        builtin::LASER_TRAIL
+    };
+    app.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).follow(bolt).seed(1));
     let fixed = stage == Stage::FixedUpdate;
     let mut frame = 0u32;
     app.add_system(stage, move |ctx: &mut SystemCtx| {
@@ -80,7 +86,12 @@ fn scan(img: &ImageData) -> (u32, u32, u32) {
 
 #[test]
 fn laser_trail_reaches_its_head_in_every_stage_and_frame_rate() {
-    for backend in [ParticleBackend::Cpu, ParticleBackend::Gpu] {
+    for (backend, sprites) in [
+        (ParticleBackend::Cpu, false),
+        (ParticleBackend::Gpu, false),
+        (ParticleBackend::Cpu, true),
+        (ParticleBackend::Gpu, true),
+    ] {
         for (name, stage) in [
             ("fixed", Stage::FixedUpdate),
             ("pre", Stage::PreUpdate),
@@ -88,11 +99,12 @@ fn laser_trail_reaches_its_head_in_every_stage_and_frame_rate() {
         ] {
             // 60 Hz; 120 Hz ending on a frame with a tick and on one without.
             for (sub, frames) in [(1, 9), (2, 17), (2, 18)] {
-                let Some((bolt_px, img)) = run(backend, stage, sub, frames) else {
+                let Some((bolt_px, img)) = run(backend, sprites, stage, sub, frames) else {
                     return;
                 };
-                let what = format!("{backend:?} {name} {}Hz, {frames} frames", 60 * sub);
-                dump(&img, &format!("follow_{backend:?}_{name}_{sub}_{frames}"));
+                let kind = if sprites { "sprites" } else { "ribbon" };
+                let what = format!("{kind} {backend:?} {name} {}Hz, {frames} frames", 60 * sub);
+                dump(&img, &format!("follow_{kind}_{backend:?}_{name}_{sub}_{frames}"));
                 let (first, last, dark) = scan(&img);
                 assert_eq!(
                     dark, 0,

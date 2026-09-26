@@ -19,6 +19,8 @@ pub(crate) mod flags {
     pub const TINTED: u32 = 16;
     pub const FLICKERS: u32 = 32;
     pub const PLANE: u32 = 64;
+    /// Rotation and age in seconds as two halves (`LayerSim::pack_age`).
+    pub const AGE: u32 = 128;
 }
 
 /// A table word.
@@ -55,6 +57,9 @@ pub(crate) fn entry_words(e: &Entry, out: &mut [Word]) {
     }
     if s.flicker.is_some() {
         fl |= flags::FLICKERS;
+    }
+    if s.pack_age {
+        fl |= flags::AGE;
     }
     let n_forces = s.forces.iter().take_while(|f| f.is_some()).count() as u32;
     fl |= n_forces << 16;
@@ -106,7 +111,7 @@ pub(crate) fn entry_words(e: &Entry, out: &mut [Word]) {
     out[19] = f(s.color_a.to_array());
     out[20] = f(s.color_b.to_array());
     let (freq, amp) = s.flicker.map_or((0.0, 0.0), |fl| (fl.frequency, fl.amplitude));
-    out[21] = f([freq, amp, 0.0, 0.0]);
+    out[21] = f([freq, amp, s.spawn.max_rate_scale, s.throttle.speed]);
     let normal = match s.facing {
         Facing::Plane { normal } => normal,
         _ => Vec3::ZERO,
@@ -169,7 +174,7 @@ impl GpuXform {
             prev_rot: r.prev_rot.to_array(),
             pos: p(r.pos, 0.0),
             rot: r.rot.to_array(),
-            vel: p(r.velocity, 0.0),
+            vel: p(r.velocity, r.throttle),
         }
     }
 }

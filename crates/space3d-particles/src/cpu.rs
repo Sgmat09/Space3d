@@ -55,7 +55,8 @@ pub(crate) struct ParticleInstance {
     pub vel_age: [u16; 4],
     /// `Float16x4`: linear tint (HDR), alpha (coverage for premultiplied layers).
     pub tint: [u16; 4],
-    /// `Uint32x2`: x = rotation (f32 bits, wrapped to ±π), y = random bits.
+    /// `Uint32x2`: x = rotation (f32 bits, wrapped to ±π; for flipbooks played at frames per
+    /// second two halves: rotation, age in seconds), y = random bits.
     pub rot_frame: [u32; 2],
 }
 
@@ -72,12 +73,16 @@ pub(crate) fn subtick_q(t: f32) -> u32 {
     (t.clamp(0.0, 1.0) * SUBTICKS as f32).round() as u32
 }
 
-/// Sub-tick time of particle `k` of `count` spread over `t0..t1` (sub-tick units): the middle of
-/// its share of the span, `t0 + (t1 − t0)(2k + 1) / 2count` in integers (`(t1 − t0) ≤ 2¹⁴` and
-/// `2k + 1 < 2¹⁷`, so the product fits a `u32`).
+/// Sub-tick time of particle `k` of `count` emitted evenly from `t0` to `t1` (sub-tick units;
+/// the first particle at `t0`, the last at `t1`): `t0 + (t1 − t0)·k / (count − 1)` rounded to
+/// the nearest, in integers (`t1 − t0 ≤ 2¹⁴` and `k < 2¹⁶`, so the product fits a `u32`). The
+/// scheduler gives a continuous record the times its first and last particles cross the rate
+/// accumulator's integers (`runtime::spawn::continuous`), so the stream is evenly spaced across
+/// ticks at any rate; bursts have `t0 == t1`.
 pub(crate) fn subtick(t0: u32, t1: u32, k: u32, count: u32) -> u32 {
-    if t1 > t0 {
-        t0 + ((t1 - t0) * (2 * k + 1)) / (2 * count)
+    if t1 > t0 && count > 1 {
+        let n = count - 1;
+        t0 + ((t1 - t0) * k.min(n) + n / 2) / n
     } else {
         t0
     }
@@ -516,11 +521,14 @@ fn spawn_particle(
             };
         }
         // `pow` only for a non-zero exponent (`x⁰` is 1 anyway), like the GPU kernel.
-        let speed_mul = if s.speed_exponent != 0.0 {
+        let mut speed_mul = if s.speed_exponent != 0.0 {
             scale.max(0.0).powf(s.speed_exponent)
         } else {
             1.0
         };
+        if s.throttle.speed != 0.0 {
+            speed_mul *= s.speed_throttle(row.throttle);
+        }
         let speed = range(seed, stream::SPEED, s.speed.0, s.speed.1) * speed_mul;
         vel = rot * dir * speed;
     }
@@ -530,9 +538,10 @@ fn spawn_particle(
     }
     let life = range_exact(seed, stream::LIFETIME, s.lifetime.0, s.lifetime.1);
     let delay = range_exact(seed, stream::DELAY, s.delay.0, s.delay.1);
-    // Exact on both backends: an integer times a power-of-two multiple of `dt`, then two
-    // sums (the GPU `emit` kernel evaluates the same expression).
-    let age = (SUBTICKS - fq) as f32 * tick_step + extra_age - delay;
+    // Identical on both backends: one fused multiply-add of an integer, a power-of-two
+    // fraction of `dt` and one difference (the GPU `emit` kernel's explicit `fma`: a shader
+    // compiler may contract or reassociate a plain `a·b + c − d`).
+    let age = ((SUBTICKS - fq) as f32).mul_add(tick_step, extra_age - delay);
     if age > 0.0 {
         (pos, vel) = pre_age(pos, vel, s.gravity, s.drag, age);
     }
@@ -646,8 +655,8 @@ pub(crate) fn pack(
                 .get(e.instance as usize)
                 .copied()
                 .unwrap_or((Vec3::ZERO, Quat::IDENTITY));
-            let inst = &rt.instances[e.instance as usize];
-            pack_entry(input, ei, e, inst.tint, inst.scale, pose, out, &mut bounds);
+            let (tint, scale) = rt.draw_tint_scale(e);
+            pack_entry(input, ei, e, tint, scale, pose, out, &mut bounds);
         }
         let count = out.len() as u32 - start;
         if count > 0 {
@@ -695,7 +704,6 @@ fn pack_entry(
 ) {
     let cap = e.capacity as u64;
     let base = e.base as usize;
-    let tint = if e.sim.tinted { tint } else { Vec4::ONE };
     for j in 0..cap {
         let slot = base + ((e.spawned + j) % cap) as usize;
         let Some(p) = input.pool.get(slot) else {
@@ -781,11 +789,17 @@ fn pack_particle(
     rot -= TAU * (rot / TAU).round();
     bounds.min = bounds.min.min(pos);
     bounds.max = bounds.max.max(pos);
+    // Flipbooks at frames per second need the age in seconds: rotation and age as halves.
+    let rot_bits = if s.pack_age {
+        f16_bits(rot) as u32 | (f16_bits(age) as u32) << 16
+    } else {
+        rot.to_bits()
+    };
     out.push(ParticleInstance {
         pos_size: [pos.x, pos.y, pos.z, size],
         vel_age: [f16_bits(dir.x), f16_bits(dir.y), f16_bits(dir.z), f16_bits(t)],
         tint: [f16_bits(rgb.x), f16_bits(rgb.y), f16_bits(rgb.z), f16_bits(a)],
-        rot_frame: [rot.to_bits(), pcg(seed.wrapping_add(stream::BITS.wrapping_mul(GOLDEN)))],
+        rot_frame: [rot_bits, pcg(seed.wrapping_add(stream::BITS.wrapping_mul(GOLDEN)))],
     });
 }
 
@@ -855,22 +869,12 @@ pub(crate) fn pack_bridges(
             let Some(b) = rt.bridge(e, input.poses, input.dt) else {
                 continue;
             };
-            let inst = &rt.instances[e.instance as usize];
-            let tint = if e.sim.tinted { inst.tint } else { Vec4::ONE };
+            let (tint, scale) = rt.draw_tint_scale(e);
             let (t0, t1) = (subtick_q(b.t0), subtick_q(b.t1));
             for j in 0..b.count {
                 let fq = subtick(t0, t1, j, b.count);
                 let p = spawn_particle(e, ei, &b.row, b.first + j as u64, fq, age_step, 0.0);
-                pack_particle(
-                    &e.sim,
-                    &p,
-                    0.0,
-                    tint,
-                    inst.scale,
-                    (b.row.pos, b.row.rot),
-                    out,
-                    &mut bounds,
-                );
+                pack_particle(&e.sim, &p, 0.0, tint, scale, (b.row.pos, b.row.rot), out, &mut bounds);
             }
         }
         let count = out.len() as u32 - start;

@@ -38,8 +38,8 @@ struct S3dpFrame {
 var<workgroup> s3dp_mask: array<atomic<u32>, 2>;
 var<workgroup> s3dp_prefix: atomic<u32>;
 
-// Job words: (entry, tail, first record, group), tint, (render position, scale), render
-// rotation.
+// Job words: (entry, tail, first record, group), tint (resolved: white for untinted layers,
+// × the throttle's brightness), (render position, scale × the throttle's size), render rotation.
 fn s3dp_job(j: u32, k: u32) -> vec4<u32> {
     return tables[frame.a.x + j * 4u + k];
 }
@@ -244,10 +244,9 @@ fn scatter(
     let ca = s3dp_wordf(e, 19u);
     let cb = s3dp_wordf(e, 20u);
     let start = ca + (cb - ca) * s3dp_rnd(seed, S3DP_COLOR);
-    var tint = vec4<f32>(1.0);
-    if ((flags & S3DP_TINTED) != 0u) {
-        tint = tint_in;
-    }
+    // The job's tint is resolved on the CPU (`Runtime::draw_tint_scale`: white for untinted
+    // layers, times the throttle's brightness response).
+    let tint = tint_in;
     var rgb = tint.rgb * start.rgb;
     if ((flags & S3DP_FLICKERS) != 0u) {
         let fl = s3dp_wordf(e, 21u);
@@ -271,6 +270,11 @@ fn scatter(
     instances[o + 5u] = s3dp_f16x2(dir.z, t);
     instances[o + 6u] = s3dp_f16x2(rgb.r, rgb.g);
     instances[o + 7u] = s3dp_f16x2(rgb.b, a);
-    instances[o + 8u] = bitcast<u32>(rot);
+    // Flipbooks at frames per second: rotation and age in seconds as halves (`cpu::pack`).
+    if ((flags & S3DP_AGE) != 0u) {
+        instances[o + 8u] = s3dp_f16x2(rot, age);
+    } else {
+        instances[o + 8u] = bitcast<u32>(rot);
+    }
     instances[o + 9u] = s3dp_pcg(seed + S3DP_BITS * S3DP_GOLDEN);
 }

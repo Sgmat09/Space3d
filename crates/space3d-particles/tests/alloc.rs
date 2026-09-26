@@ -45,13 +45,23 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// A ship's engine exhaust flying a circle, an explosion restarted every 6 ticks and a hit spark
-/// every 4 at new places (pools of emitters, restarted round-robin: the core's transform
+/// A ship's engine exhaust and missile trail (ribbons) flying a circle with a laser beam to a
+/// fixed point, an explosion restarted every 6 ticks and a hit spark every 4 at new places, with
+/// their light flashes (pools of emitters, restarted round-robin: the core's transform
 /// propagation allocates for newly spawned and parented entities, which is not what this test
-/// measures). Covers bursts, rates, rate per distance, local layers, restarts, draining,
+/// measures). Covers bursts, rates, rate per distance, local layers, ribbons, beams, light
+/// flashes (a `PointLight` entity spawned and despawned per flash), restarts, draining,
 /// finishing and render-time bridges (the ship moves in `Stage::Update`, after the tick).
 fn scene(app: &mut App) {
     let ship = app.spawn_effect(builtin::ENGINE_EXHAUST, EffectSpawn::at(Vec3::ZERO).keep());
+    app.spawn_effect(builtin::MISSILE_TRAIL, EffectSpawn::at(Vec3::ZERO).follow(ship).keep());
+    app.spawn_effect(
+        builtin::LASER_BEAM,
+        EffectSpawn::at(Vec3::ZERO)
+            .follow(ship)
+            .beam_to(BeamEnd::World(Vec3::new(0.0, 0.0, -40.0)))
+            .keep(),
+    );
     let blasts: Vec<Entity> = (0..16)
         .map(|_| app.spawn_effect(builtin::EXPLOSION, EffectSpawn::at(Vec3::ZERO).scale(0.5).keep()))
         .collect();
@@ -139,6 +149,7 @@ fn steady_state_allocations() {
         );
         assert_eq!(stats.backend, Some(backend));
         assert!(stats.alive > 500 && stats.draw_calls > 5, "{stats:?}");
+        assert!(stats.ribbon_segments > 20, "ribbons and beams drawn: {stats:?}");
         assert_eq!(stats.cpu_reallocations, 0, "{stats:?}");
         assert_eq!((render.cpu_reallocations, render.textures_created), (0, 0));
         assert!(second <= first + first / 10, "no growth: {first} → {second}");
@@ -156,12 +167,13 @@ fn steady_state_allocations() {
         assert!(per_frame <= bound, "{per_frame} allocations per frame (bound {bound})");
         if backend == ParticleBackend::Gpu {
             // Graphics spec §4.4: ≤ 5 dispatches for a frame with one tick (4 here), 2 more per
-            // extra tick.
+            // extra tick, plus the sort of the `ByDistance` groups in view (the explosions' and
+            // the missiles' smoke: one dispatch each under 512 particles).
             assert_eq!(stats.ticks_simulated, 1);
-            assert!(stats.dispatches <= 5, "{stats:?}");
-            // The node reports its compute passes (the tick's simulate + emit pass and the
-            // compaction pass) and dispatches in the frame's `RenderStats`.
-            assert_eq!(render.compute_passes, 2, "{render:?}");
+            assert!(stats.dispatches <= 5 + 2, "{stats:?}");
+            // The node reports its compute passes (the tick's simulate + emit pass, the
+            // compaction pass and the sort pass) and dispatches in the frame's `RenderStats`.
+            assert_eq!(render.compute_passes, 3, "{render:?}");
             assert_eq!(render.node_dispatches, stats.dispatches, "{render:?}");
             let renderer = app.resources.remove::<Renderer>().unwrap();
             app.step_ticks(3);
@@ -169,19 +181,22 @@ fn steady_state_allocations() {
             common::render(&mut app);
             let s = app.resources.expect::<ParticleStats>().clone();
             assert_eq!(s.ticks_simulated, 3);
-            assert!(s.dispatches <= 5 + 2 * 2, "{s:?}");
+            assert!(s.dispatches <= 5 + 2 * 2 + 2, "{s:?}");
             let r = app.resources.expect::<RenderStats>();
-            assert!((3..=5).contains(&r.compute_passes), "{r:?}");
+            assert!((4..=6).contains(&r.compute_passes), "{r:?}");
         }
         assert_eq!(gpu_errors(&app), 0);
     }
 }
 
-/// wgpu's allocations per frame of the scene above on Metal with the CPU backend (measured 184
-/// with 80 particle draws and one SceneRead pass), +10 %.
-const METAL_BOUND: u64 = 203;
+/// wgpu's allocations per frame of the scene above on Metal with the CPU backend (measured 213
+/// with 89 particle draws — 4 of them ribbon and beam strips — and one SceneRead pass; 184 before
+/// the scene had ribbons and beams; 176 since the smoke is sorted per particle: one draw per
+/// layer instead of one per emitter), +10 %.
+const METAL_BOUND: u64 = 235;
 
-/// The same with the GPU backend (measured 307: two compute passes with 4 dispatches, the tick's
-/// uploads, the alive-count readback, 89 indirect draws and the direct draw of the exhaust's
-/// render-time bridge — the scene moves it in `Stage::Update`), +10 %.
-const METAL_BOUND_GPU: u64 = 341;
+/// The same with the GPU backend (measured 335: two compute passes with 4 dispatches, the tick's
+/// uploads, the alive-count readback, the indirect draws, the direct draw of the exhaust's
+/// render-time bridge — the scene moves it in `Stage::Update` — and the strip draws; 307 before
+/// the ribbons and beams; 329 with the smoke's sort pass and fewer smoke draws), +10 %.
+const METAL_BOUND_GPU: u64 = 369;
