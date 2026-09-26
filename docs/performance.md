@@ -711,3 +711,61 @@ tombstones as emitters come and go. The map now counts only a capacity beyond an
 `battle_steady_state` asserts 0 over 30 frames after the battle's load has built up (6 s; the
 growth of pools and scratch buffers while explosions, missiles and smoke accumulate over the
 first 5 s is warm-up).
+
+### M2 review, round 1 — steady state off High, the budget without a renderer, VRAM, CA
+
+Graphics maintainer, answering the second round of the M2 review.
+
+**`ParticleStats::cpu_reallocations` off High on Metal.** `battle_steady_state` failed on ANGLE
+(1 reallocation in the 30 measured frames), and long runs at Low and Medium on Metal flagged
+reallocations 10–22 s in (Low: 7 of 1500 frames after a 10 s warm-up, Medium: 2). They were real:
+the Battle's load is random (hits, bolts and missiles by tick hash), so it keeps setting small new
+peaks, and the collections whose length the effect instances, layer instances or ribbon tracks
+bound — the instance and entry free lists, the pool's free ranges, the finish list, the entity
+map, the CPU simulation's per-instance and per-entry tables, the CPU sort's buffers — grew on
+their own at each new peak of their own length long after the instance and entry tables had
+stopped growing. They are now reserved with those tables (the entity map at most half full, so
+its tombstones rehash it in place): the same probe (960 × 540, 600 warm-up ticks + 1500 frames)
+flags nothing at Low, Medium and High on Metal and at High on ANGLE.
+`battle_steady_state_low_and_medium` runs Low and Medium for 900 frames after ten seconds on
+every backend.
+
+**The budget with the renderer held aside (spec §4.3).** The tick sized the particle pool for the
+GPU budget whenever no `Renderer` was in the world — `TestApp::render_on_demand` (every story),
+the web runner's frames while its renderer is created — even with
+`DownlevelOverride::webgl2()`, and the rings it reserved then stayed once the CPU backend took
+over (the Battle at High with webgl2 on demand: 165 971 slots reserved against a budget of
+16 384; the GL story runs simulated their CPU backend in a GPU-sized pool). The tick now reads
+the device from the renderer, the `RendererDevice` a held-aside renderer leaves, or the last
+device it saw; `no_compute` resolves to the CPU backend without a device; before any device the
+budget is the smaller one. `tests/determinism.rs::the_budget_is_the_same_on_demand_and_every_tick`.
+
+**VRAM (spec §4.4, T1/T2 ≤ 220 MB): met.** HDR radiance cubes are `Rg11b10Ufloat` where it
+renders and filters (`GraphicsCaps::compact_hdr_format`), else `Rgba16Float`: the Battle at High,
+1080p, has 146.0 MB of targets and shadow + 50.4 MB of sky (33.5 MB) and IBL = 196.4 MB of
+textures, 219.4 MB with the 23 MB particle pool (230 + 23 before). The sky's pixels move by at
+most 3–4 levels of 255 after tonemapping. GL keeps `Rgba16Float` (83.9 MB of sky and IBL).
+Process memory keeps the per-render-pass driver memory of the M1.1 amendment on top.
+
+**Chromatic aberration.** Round 0's spectral split ran up to 25 taps a pixel apart wherever the
+split exceeded 1.5 px, most of the frame at typical intensities: the composite at 1080p (minimum
+`post.composite` GPU time over about 160 frames per setting, interleaved) cost 0.098 ms at CA
+0.03, 0.126 at 0.15, 0.150 at 0.25, 0.199 at 0.5 and 0.248 at 1.0. With taps at most 1.5 px apart
+and at most 17: 0.098, 0.119, 0.137, 0.172, 0.202 (no CA: 0.091).
+
+**Particle uniforms on WebGL2.** Chrome's WebGL2 on ANGLE / Metal reports a 32-byte uniform
+offset alignment (256 natively): the particle node's 112-byte per-layer parameters, placed at
+multiples of the alignment, overlapped and overran their buffer (a validation error on the
+showcase's first WebGL2 frame in the browser). They are strided by their size rounded up to the
+alignment now. The showcase's web page renders into its own canvas and takes `?webgl2` to test
+that path in a browser with WebGPU.
+
+**Battle gates after round 1** (release `battle_dev_gates`, three runs at a load average of about
+20): High GPU frame 1.59 / 1.59 / 1.56 ms (gate 3.0), CPU `render_frame` 1.48 / 1.46 / 1.48 ms
+(gate 1.5); Medium 1.49 / 1.48 / 1.45 GPU, 1.48 / 1.43 / 1.48 CPU; Low 0.74 / 0.75 / 0.71 GPU,
+0.76 / 0.79 / 0.80 CPU. The 1.5 ms CPU line is met with little margin, as the review found: the
+particles' `prepare` (≈ 1 ms with its strip uploads) and post (≈ 0.35 ms) sub-budgets stay not
+met, their levers (a GPU strip builder with incremental uploads, the compute bloom chain)
+deferred (spec §4.4 amendment). Round 1 adds no per-frame work: the companion reservations run
+only when an instance or entry table grows, the velocity smoothing is a few multiplies per
+emitter per tick.
