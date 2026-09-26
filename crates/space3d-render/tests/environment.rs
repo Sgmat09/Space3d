@@ -416,6 +416,57 @@ fn ibl_ldr_fallback_close_to_hdr() {
     assert!(worst <= 8, "max channel difference {worst}");
 }
 
+/// `DownlevelOverride::webgl2()` (no float targets: the LDR bake; no compute: render-pass bake
+/// steps; no read-only depth) renders the skybox and the image-based lighting of an LDR
+/// environment like the default path.
+#[test]
+fn environment_webgl2_parity() {
+    let render = |webgl2: bool| -> Option<ImageData> {
+        let mut app = headless_app(96, 48)?;
+        if webgl2 {
+            app.insert_resource(FrameSettings::default().with_downlevel(DownlevelOverride::webgl2()));
+        }
+        app.insert_resource(LightingSettings {
+            shading: ShadingModel::Standard,
+            ..LightingSettings::default()
+        });
+        let faces = std::array::from_fn(|i| {
+            let mut img = ImageData::filled(32, 32, FACE_COLORS[i]);
+            for y in (0..32).step_by(4) {
+                for x in 0..32 {
+                    img.set(x, y, [230, 230, 230, 255]);
+                }
+            }
+            img
+        });
+        let env = add_cubemap(&mut app, CubemapSource::from_faces(faces).unwrap());
+        let sphere = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_mesh(MeshData::sphere(1.0, 48, 24));
+        for (i, (metallic, roughness)) in [(1.0, 0.05), (1.0, 0.6), (0.0, 0.3)].into_iter().enumerate() {
+            app.world.spawn((
+                Transform::from_xyz(-2.2 + 2.2 * i as f32, 0.0, -4.0),
+                Mesh3d(sphere),
+                Material::srgb(0.9, 0.85, 0.8).with_metallic_roughness(metallic, roughness),
+            ));
+        }
+        app.world.spawn((
+            Transform::IDENTITY,
+            Camera3d::default(),
+            Skybox::new(env),
+            EnvironmentLight::new(env),
+        ));
+        let img = render_to_image(&mut app)?;
+        assert_eq!(gpu_errors(&app), 0);
+        Some(img)
+    };
+    let Some(default) = render(false) else { return };
+    let webgl2 = render(true).unwrap();
+    let stats = space3d_test::compare_images(&default, &webgl2, &space3d_test::CompareOptions::perceptual());
+    assert!(stats.passed, "webgl2() vs default: {}", stats.summary());
+}
+
 /// A still scene with a skybox and an environment reaches a steady state: nothing uploaded,
 /// no texture created, no bake pass, identical frames.
 #[test]

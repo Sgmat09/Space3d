@@ -254,6 +254,63 @@ fn ibl_sliced_equals_immediate() {
     }
 }
 
+/// `Renderer::environment_state` frame by frame: `Missing` before a frame has seen the cubemap,
+/// `Baking { passes_left }` once uploaded (the whole bake while no camera uses it, then counting
+/// down with `bake_passes_per_frame`), `Ready`, `Baking` again after a re-upload, `Missing` once
+/// removed; a source the upload rejects is `Failed`.
+#[test]
+fn environment_state_transitions() {
+    let Some(mut app) = headless_app(16, 16) else { return };
+    let compute = compute_path(&app, false);
+    app.insert_resource(LightingSettings {
+        ibl: api::IblSettings {
+            bake_passes_per_frame: Some(1),
+            ..Default::default()
+        },
+        ..LightingSettings::default()
+    });
+    app.resources.expect_mut::<Renderer>().lighting.budget_headless = true;
+    let sky = || hdr_faces(16, |face, _, _| 0.1 * face as f32);
+    let cube = app.resources.expect_mut::<RenderAssets>().add_cubemap(sky());
+    let state = |app: &App, h| app.resources.expect::<Renderer>().environment_state(h);
+    assert_eq!(state(&app, cube), EnvironmentState::Missing);
+    crate::render_to_image(&mut app).unwrap();
+    let total = EnvKey::new(&api::IblSettings::default(), true).passes(16, compute);
+    assert_eq!(state(&app, cube), EnvironmentState::Baking { passes_left: total });
+    crate::render_to_image(&mut app).unwrap();
+    assert_eq!(
+        state(&app, cube),
+        EnvironmentState::Baking { passes_left: total },
+        "no camera uses it"
+    );
+    scene(&mut app, cube);
+    for left in (0..total).rev() {
+        crate::render_to_image(&mut app).unwrap();
+        let want = if left == 0 {
+            EnvironmentState::Ready
+        } else {
+            EnvironmentState::Baking { passes_left: left }
+        };
+        assert_eq!(state(&app, cube), want);
+    }
+    app.resources.expect_mut::<RenderAssets>().update_cubemap(cube, sky());
+    crate::render_to_image(&mut app).unwrap();
+    assert_eq!(state(&app, cube), EnvironmentState::Baking { passes_left: total - 1 });
+    app.resources.expect_mut::<RenderAssets>().remove_cubemap(cube);
+    crate::render_to_image(&mut app).unwrap();
+    assert_eq!(state(&app, cube), EnvironmentState::Missing);
+    // Five layers are not a cube.
+    let mut five = TextureSource::from_layers(&vec![ImageData::filled(4, 4, [9, 9, 9, 255]); 5]).unwrap();
+    five.generate_mipmaps = false;
+    let bad = app
+        .resources
+        .expect_mut::<RenderAssets>()
+        .add_cubemap(api::CubemapSource::Faces(five));
+    crate::render_to_image(&mut app).unwrap();
+    assert_eq!(state(&app, bad), EnvironmentState::Failed);
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+}
+
 /// The compute bake (one compute pass) and the fragment bake (a render pass per face and mip,
 /// the WebGL2 path) compute the same texels: same functions, same sample sets.
 #[test]

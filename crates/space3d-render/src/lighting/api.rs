@@ -34,8 +34,10 @@ fn equirect_face_size(width: u32) -> u32 {
 }
 
 impl CubemapSource {
-    /// sRGB faces in wgpu order (+X, −X, +Y, −Y, +Z, −Z); `None` unless all six are square and
-    /// of equal size.
+    /// sRGB faces in wgpu order (+X, −X, +Y, −Y, +Z, −Z) and orientation (the cube-map face
+    /// table of every graphics API, which is left-handed: seen from inside this right-handed
+    /// world a face image appears mirrored); `None` unless all six are square and of equal
+    /// size.
     pub fn from_faces(faces: [ImageData; 6]) -> Option<Self> {
         let size = faces[0].width;
         if size == 0 || faces.iter().any(|f| f.width != size || f.height != size) {
@@ -380,13 +382,13 @@ impl Default for IblSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EnvironmentState {
-    /// No such cubemap.
+    /// No such cubemap (removed, or not seen by a rendered frame yet).
     Missing,
-    /// Registered, not uploaded yet.
+    /// Registered, not on the GPU yet.
     Uploading,
-    /// Uploaded; bake passes remain.
+    /// Uploaded; bake steps remain (all of them until a camera's `EnvironmentLight` uses it).
     Baking {
-        /// Render passes left.
+        /// Steps left: render passes (WebGL2 / GLES 3.0), else compute dispatches.
         passes_left: u32,
     },
     /// Baked: cameras with an `EnvironmentLight` on it use it.
