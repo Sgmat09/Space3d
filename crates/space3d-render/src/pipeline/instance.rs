@@ -202,3 +202,28 @@ pub(crate) fn instance_attributes(layout: &InstanceLayout) -> Vec<wgpu::VertexAt
     }
     out
 }
+
+/// Shader locations the instance attributes of `layout` take (from location 4; a model matrix
+/// takes 4, a degenerate layout its placeholder).
+pub(crate) fn instance_locations(layout: &InstanceLayout) -> u32 {
+    let n: u32 = layout
+        .attributes
+        .iter()
+        .map(|a| match a.semantic {
+            InstanceSemantic::ModelMatrix => 4,
+            _ => 1,
+        })
+        .sum();
+    n.max(1)
+}
+
+/// Most instance locations that leave room for the extension stream's two attributes: WebGPU
+/// and WebGL2 guarantee 16 vertex attributes, and the mesh vertex takes 4.
+pub(crate) const EXT_MAX_INSTANCE_LOCATIONS: u32 = 10;
+
+/// Whether pipelines of `layout` can read the extension vertex stream (tangents, second UV set)
+/// after its instance attributes. Larger layouts draw ext-less: per-pixel tangent frames, and
+/// UV0 for the second UV set's maps.
+pub(crate) fn ext_fits(layout: &InstanceLayout) -> bool {
+    instance_locations(layout) <= EXT_MAX_INSTANCE_LOCATIONS
+}

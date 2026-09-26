@@ -1,9 +1,40 @@
 //! Material types beyond the legacy [`crate::Material`] fields (graphics spec §2.2.8): blend
 //! modes, shadow participation, map masks, UV transforms and extra per-vertex data.
 //!
-//! This is the materials area's API hub (re-exported from the crate root). The renderer's use of
-//! these fields lands with the materials milestones (PM1–PM5); until then they are stored and
-//! compared but do not change rendering (every default reproduces the legacy look).
+//! This is the materials area's API hub (re-exported from the crate root). Every default
+//! reproduces the legacy look bit for bit: a material without maps, with `BlendMode::Opaque`
+//! (or the legacy `alpha_blend`) renders exactly as before the graphics upgrade.
+//!
+//! It also holds the crate-internal encodings of materials shared by extraction, the pipelines
+//! and the forward shader: the pipeline class bits (`CLASS_*`) and the flag bits of the material
+//! uniform (`FLAG_*`, mirrored by the `S3D_*` constants of `forward.wgsl`).
+
+/// Pipeline class bits 2..=4: the blend mode (`BlendMode::class_bits`).
+pub(crate) const CLASS_MODE_SHIFT: u8 = 2;
+/// Mask of the blend-mode bits of a pipeline class.
+pub(crate) const CLASS_MODE_MASK: u8 = 0b111 << CLASS_MODE_SHIFT;
+/// Pipeline class bit 5: the pipeline reads the extension vertex stream (tangents, second UV
+/// set; vertex buffer slot 2).
+pub(crate) const CLASS_EXT: u8 = 1 << 5;
+
+/// Material uniform flags (`MaterialParams::flags.x`): the normal map is bound and used.
+pub(crate) const FLAG_NORMAL: u32 = MapMask::NORMAL.0 as u32;
+/// The metallic-roughness map is bound.
+pub(crate) const FLAG_METALLIC_ROUGHNESS: u32 = MapMask::METALLIC_ROUGHNESS.0 as u32;
+/// The occlusion map is bound.
+pub(crate) const FLAG_OCCLUSION: u32 = MapMask::OCCLUSION.0 as u32;
+/// The emissive map is bound.
+pub(crate) const FLAG_EMISSIVE: u32 = MapMask::EMISSIVE.0 as u32;
+/// Occlusion is the R channel of the metallic-roughness map (one sample).
+pub(crate) const FLAG_ORM_PACKED: u32 = 1 << 5;
+/// `MaterialParams::uv_row0/1` hold a non-identity UV transform.
+pub(crate) const FLAG_UV_TRANSFORM: u32 = 1 << 6;
+/// A data map (normal, metallic-roughness, occlusion) sits in an sRGB texture: the shader
+/// re-encodes its sample (bit `FLAG_FIXUP_SHIFT + slot`: 8 normal, 9 metallic-roughness,
+/// 10 occlusion).
+pub(crate) const FLAG_FIXUP_SHIFT: u32 = 7;
+/// Every map flag.
+pub(crate) const FLAG_MAPS: u32 = FLAG_NORMAL | FLAG_METALLIC_ROUGHNESS | FLAG_OCCLUSION | FLAG_EMISSIVE;
 
 /// How a material's color combines with what is behind it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -53,6 +84,31 @@ impl BlendMode {
                     operation: wgpu::BlendOperation::Add,
                 },
             }),
+        }
+    }
+
+    /// The blend-mode bits of a pipeline class (`CLASS_MODE_MASK`).
+    pub(crate) fn class_bits(self) -> u8 {
+        let code = match self {
+            Self::Opaque => 0,
+            Self::AlphaMask => 1,
+            Self::AlphaBlend => 2,
+            Self::Premultiplied => 3,
+            Self::Additive => 4,
+        };
+        code << CLASS_MODE_SHIFT
+    }
+
+    /// The blend mode of a pipeline class. A transparent class (`CLASS_BLEND`) without mode
+    /// bits is `AlphaBlend` (the class of the legacy `alpha_blend` before blend modes).
+    pub(crate) fn from_class(class: u8) -> Self {
+        match (class & CLASS_MODE_MASK) >> CLASS_MODE_SHIFT {
+            1 => Self::AlphaMask,
+            2 => Self::AlphaBlend,
+            3 => Self::Premultiplied,
+            4 => Self::Additive,
+            _ if class & crate::pipeline::CLASS_BLEND != 0 => Self::AlphaBlend,
+            _ => Self::Opaque,
         }
     }
 }
@@ -131,6 +187,11 @@ impl TextureTransform {
         rotation: 0.0,
         scale: glam::Vec2::ONE,
     };
+
+    /// Whether this is exactly [`Self::IDENTITY`] (the shader then skips the transform).
+    pub(crate) fn is_identity(&self) -> bool {
+        self.offset == glam::Vec2::ZERO && self.rotation == 0.0 && self.scale == glam::Vec2::ONE
+    }
 
     /// The transform as a 3×3 matrix on `(u, v, 1)`: rotation by `r` maps `(u, v)` to
     /// `(u cos r + v sin r, −u sin r + v cos r)` before the offset.

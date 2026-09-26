@@ -159,6 +159,9 @@ pub(crate) struct MeshEntry {
     pub aabb: Aabb,
     pub sphere: Sphere,
     pub triangles: u32,
+    /// Extension vertices waiting for upload with the mesh (`None`: none — the upload clears
+    /// the mesh's range of the extension stream, if that exists).
+    pub ext: Option<Vec<crate::arena::ExtVertex>>,
 }
 
 pub(crate) struct GpuTexture {
@@ -214,7 +217,10 @@ pub struct RenderAssets {
     pub(crate) pending_cubemaps: Vec<crate::handles::CubemapHandle>,
 }
 
-fn mesh_entry(data: MeshData) -> MeshEntry {
+fn mesh_entry(data: MeshData, extras: Option<&crate::material::MeshExtras>) -> MeshEntry {
+    let ext = extras
+        .map(|e| crate::arena::build_ext_vertices(&data, e))
+        .filter(|v| !v.is_empty());
     let (min, max) = if data.positions.is_empty() {
         (Vec3::ZERO, Vec3::ZERO)
     } else {
@@ -231,22 +237,27 @@ fn mesh_entry(data: MeshData) -> MeshEntry {
         aabb,
         cpu: Some(data),
         gpu: None,
+        ext,
     }
 }
 
 impl RenderAssets {
     /// Register a mesh; it is uploaded into the mesh arena on the next frame.
     pub fn add_mesh(&mut self, data: MeshData) -> MeshHandle {
-        let h = MeshHandle::from_raw(self.meshes.insert(mesh_entry(data)));
+        let h = MeshHandle::from_raw(self.meshes.insert(mesh_entry(data, None)));
         self.pending_meshes.push(h);
         h
     }
 
-    /// Register a mesh with extra per-vertex data (tangents, a second UV set). The extra
-    /// stream is uploaded by the materials milestone PM2; until then `extras` is ignored.
+    /// Register a mesh with extra per-vertex data: MikkTSpace tangents (for normal maps; without
+    /// them the tangent frame is derived per pixel) and a second UV set (maps listed in
+    /// `Material::uv1_maps`). Streams whose length is not the mesh's vertex count are ignored.
+    /// They are uploaded with the mesh into the arena's extension stream (16 bytes per vertex,
+    /// allocated only once some mesh has extras).
     pub fn add_mesh_with(&mut self, data: MeshData, extras: crate::material::MeshExtras) -> MeshHandle {
-        let _ = extras; // STUB(P-MAT): ext vertex stream
-        self.add_mesh(data)
+        let h = MeshHandle::from_raw(self.meshes.insert(mesh_entry(data, Some(&extras))));
+        self.pending_meshes.push(h);
+        h
     }
 
     /// [`Self::update_mesh`] with extra per-vertex data (see [`Self::add_mesh_with`]).
@@ -256,20 +267,72 @@ impl RenderAssets {
         data: MeshData,
         extras: crate::material::MeshExtras,
     ) -> bool {
-        let _ = extras; // STUB(P-MAT): ext vertex stream
-        self.update_mesh(handle, data)
+        self.replace_mesh(handle, data, Some(&extras))
     }
 
-    /// Replace a mesh's data (re-uploaded next frame). Returns false for stale handles.
+    /// Replace a mesh's data (re-uploaded next frame; extra per-vertex data it had is dropped).
+    /// Returns false for stale handles.
     pub fn update_mesh(&mut self, handle: MeshHandle, data: MeshData) -> bool {
+        self.replace_mesh(handle, data, None)
+    }
+
+    fn replace_mesh(
+        &mut self,
+        handle: MeshHandle,
+        data: MeshData,
+        extras: Option<&crate::material::MeshExtras>,
+    ) -> bool {
         let Some(e) = self.meshes.get_mut(handle.raw()) else {
             return false;
         };
         let gpu = e.gpu;
-        *e = mesh_entry(data);
+        *e = mesh_entry(data, extras);
         e.gpu = gpu;
         self.pending_meshes.push(handle);
         true
+    }
+
+    /// Write the extension stream of the meshes of `uploaded` that were just placed in the
+    /// arena (called by the mesh upload, after the arena's writes): their extension vertices,
+    /// or zeros (no extension data) over their range when the stream exists. The stream is
+    /// created with the first mesh that has extension data and grows with the vertex buffer.
+    pub(crate) fn upload_extras(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        uploaded: &[MeshHandle],
+        up: &mut crate::gpu::Uploader,
+    ) {
+        let placed = |e: &MeshEntry| e.gpu.is_some() && e.cpu.is_none();
+        let wanted = uploaded
+            .iter()
+            .any(|h| self.meshes.get(h.raw()).is_some_and(|e| placed(e) && e.ext.is_some()));
+        if self.arena.ext.is_none() && !wanted {
+            return;
+        }
+        self.arena.ensure_ext(device, encoder, up);
+        let Some((buffer, _)) = &self.arena.ext else { return };
+        for h in uploaded {
+            let Some(e) = self.meshes.get_mut(h.raw()) else {
+                continue;
+            };
+            if !placed(e) {
+                continue;
+            }
+            let Some(g) = e.gpu else { continue };
+            let offset = g.alloc.base_vertex as u64 * crate::arena::EXT_VERTEX_SIZE;
+            match e.ext.take() {
+                Some(v) if v.len() == g.alloc.vertex_count as usize => {
+                    up.write(encoder, buffer, offset, bytemuck::cast_slice(&v));
+                }
+                _ => {
+                    let size = g.alloc.vertex_count as u64 * crate::arena::EXT_VERTEX_SIZE;
+                    if size > 0 {
+                        encoder.clear_buffer(buffer, offset, Some(size));
+                    }
+                }
+            }
+        }
     }
 
     /// Remove a mesh and free its arena space.
