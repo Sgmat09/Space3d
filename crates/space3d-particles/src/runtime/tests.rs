@@ -779,8 +779,10 @@ fn bridge_previews_the_next_tick() {
     assert_eq!((n, out.len(), items.len()), (b.count, b.count as usize, 1));
     assert_eq!((items[0].first, items[0].count), (0, b.count));
     assert_eq!(b.first, entry.spawned);
+    // Laid from the tick's pose to the render pose (a particle may land exactly on the render
+    // pose: the one whose accumulator crossing ends the span).
     for p in &out {
-        assert!(p.pos_size[0] > 40.0 && p.pos_size[0] < 50.0, "{:?}", p.pos_size);
+        assert!(p.pos_size[0] > 40.0 && p.pos_size[0] <= 50.0, "{:?}", p.pos_size);
     }
 
     // The next tick reads the moved pose and emits exactly the bridge.
@@ -961,7 +963,7 @@ fn builtin_slots() {
         (builtin::SHIELD_RIPPLE, "shield_ripple", 8),
         (builtin::WARP_IN, "warp_in", 27),
         (builtin::WARP_OUT, "warp_out", 27),
-        (builtin::ENGINE_EXHAUST, "engine_exhaust", 237),
+        (builtin::ENGINE_EXHAUST, "engine_exhaust", 148),
         (builtin::LASER_TRAIL, "laser_trail", 581),
     ];
     for (h, name, want) in table {
@@ -971,8 +973,8 @@ fn builtin_slots() {
     }
     let web = (8192.0 * priority_limit(EffectPriority::Normal)) as u32;
     assert!(
-        20 * 237 + 4 * 581 <= web,
-        "20 exhausts and 4 trails fit the web budget ({web})"
+        30 * 148 + 4 * 581 <= web,
+        "30 exhausts and 4 trails fit the web budget ({web})"
     );
 
     // A trail at 3200 units/s (and 3800) fills at most its ring.

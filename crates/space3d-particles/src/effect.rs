@@ -18,6 +18,8 @@ pub const LUT_WIDTH: u32 = 128;
 pub const MAX_FLIPBOOK_FRAMES: u32 = 256;
 /// Most points of a ribbon's history.
 pub const MAX_RIBBON_POINTS: u32 = 1024;
+/// Most segments of a beam.
+pub const MAX_BEAM_SEGMENTS: u32 = 64;
 
 /// A particle effect: what a [`crate::ParticleEmitter`] plays.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -113,23 +115,52 @@ impl ParticleEffect {
             }
         }
         for r in &self.ribbons {
-            if r.max_points > MAX_RIBBON_POINTS {
+            if !(2..=MAX_RIBBON_POINTS).contains(&r.max_points) {
                 return Err(EffectError::Invalid {
                     layer: r.name.clone(),
-                    reason: format!("{} ribbon points (at most {MAX_RIBBON_POINTS})", r.max_points),
+                    reason: format!("{} ribbon points (2 to {MAX_RIBBON_POINTS})", r.max_points),
+                });
+            }
+            if r.lifetime.is_nan() || r.lifetime <= 0.0 {
+                return Err(EffectError::Invalid {
+                    layer: r.name.clone(),
+                    reason: "a ribbon's point lifetime must be positive".into(),
+                });
+            }
+        }
+        for b in &self.beams {
+            if !(1..=MAX_BEAM_SEGMENTS).contains(&b.segments) {
+                return Err(EffectError::Invalid {
+                    layer: b.name.clone(),
+                    reason: format!("{} beam segments (1 to {MAX_BEAM_SEGMENTS})", b.segments),
+                });
+            }
+        }
+        for l in &self.layers {
+            if let Some(f) = &l.render.flipbook
+                && (f.frames == 0 || f.frames > MAX_FLIPBOOK_FRAMES || f.columns == 0 || f.rows == 0)
+            {
+                return Err(EffectError::Invalid {
+                    layer: l.name.clone(),
+                    reason: format!(
+                        "flipbook of {} frames in {}×{} cells (1 to {MAX_FLIPBOOK_FRAMES} frames, at least one cell)",
+                        f.frames, f.columns, f.rows
+                    ),
                 });
             }
         }
         Ok(())
     }
-    /// Longest particle or ribbon point life after the effect starts, delays included.
+    /// Longest particle or ribbon point life after the effect starts, delays included (and the
+    /// light flash's end).
     pub fn max_lifetime(&self) -> f32 {
         let sprites = self
             .layers
             .iter()
             .map(|l| l.start + l.particle_delay.max + l.lifetime.max);
         let ribbons = self.ribbons.iter().map(|r| r.start + r.lifetime);
-        sprites.chain(ribbons).fold(0.0, f32::max)
+        let light = self.light.iter().map(|f| f.start + f.duration);
+        sprites.chain(ribbons).chain(light).fold(0.0, f32::max)
     }
 }
 
@@ -226,6 +257,55 @@ pub struct ParticleLayer {
     pub lod: bool,
     /// Override the computed ring size.
     pub capacity: Option<u32>,
+    /// How `ParticleEmitter::rate_scale` (the throttle) drives the layer: by default only its
+    /// rates, linearly.
+    pub throttle: ThrottleResponse,
+}
+
+/// How a layer responds to its emitter's throttle `t = ParticleEmitter::rate_scale` (clamped to
+/// `Spawn::max_rate_scale`): rates × `t^rate`, initial speeds × `t^speed`, sprite sizes ×
+/// `t^size`, brightness × `t^intensity`. The default (1, 0, 0, 0) scales only the rates. A
+/// flame reads better with a slowly thinning density and a plume that shortens and dims
+/// instead (`ENGINE_EXHAUST`: `(rate: 0.25, speed: 0.6, size: 0.3, intensity: 0.5)`), so it
+/// never breaks into puffs at partial throttle. At `t = 0` nothing is emitted, whatever the
+/// exponents; sizes and brightness apply to live particles at once (the flame responds
+/// instantly), speeds to new ones.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThrottleResponse {
+    /// Exponent of the rates' response. Default 1 (linear).
+    pub rate: f32,
+    /// Exponent of the initial speeds' response. Default 0 (none).
+    pub speed: f32,
+    /// Exponent of the sprite sizes' response. Default 0 (none).
+    pub size: f32,
+    /// Exponent of the brightness response. Default 0 (none).
+    pub intensity: f32,
+}
+
+impl Default for ThrottleResponse {
+    fn default() -> Self {
+        Self {
+            rate: 1.0,
+            speed: 0.0,
+            size: 0.0,
+            intensity: 0.0,
+        }
+    }
+}
+
+impl ThrottleResponse {
+    /// `t^exponent` for a throttle `t` ≥ 0 (1 for a zero exponent, including at `t = 0`: sizes
+    /// and brightness of layers that do not respond stay put).
+    pub(crate) fn factor(t: f32, exponent: f32) -> f32 {
+        if exponent == 0.0 {
+            1.0
+        } else if exponent == 1.0 {
+            t.max(0.0)
+        } else {
+            t.max(0.0).powf(exponent)
+        }
+    }
 }
 
 impl Default for ParticleLayer {
@@ -268,6 +348,7 @@ impl Default for ParticleLayer {
             tinted: true,
             lod: true,
             capacity: None,
+            throttle: ThrottleResponse::default(),
         }
     }
 }
@@ -854,7 +935,14 @@ pub enum RibbonFacing {
     },
 }
 
-/// A trail following the emitter.
+/// A trail following the emitter: a history of the emitter's positions (a point per
+/// `min_distance` moved, or per `max_interval`), each living `lifetime` seconds, drawn as one
+/// continuous strip — watertight at any bend (neighboring segments share each point's side
+/// vector) — from its oldest live point, whose end is clipped to exactly `lifetime` so the tail
+/// shrinks smoothly, to the emitter's render-time position (the head, which follows the emitter
+/// at any frame rate and whichever stage moves it). Width and color over the points' life come
+/// from `width_over_life` and `color_over_life`; `u` runs along the trail (`uv`, `scroll`); the
+/// head end is round. Built on the CPU on both backends.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RibbonLayer {
@@ -864,23 +952,23 @@ pub struct RibbonLayer {
     pub start: f32,
     /// Local offset.
     pub offset: Vec3,
-    /// History ring. Default 64.
+    /// History ring (2 to `MAX_RIBBON_POINTS`). Default 64.
     pub max_points: u32,
-    /// New point after moving this far …
+    /// A new point once the emitter moved this far from the newest (× effect scale) …
     pub min_distance: f32,
-    /// … or after this long (0 = every tick).
+    /// … or once this long passed since it (0: by distance only).
     pub max_interval: f32,
-    /// Point lifetime (trail length in time).
+    /// Point lifetime in seconds (the trail's length in time).
     pub lifetime: f32,
-    /// Width.
+    /// Width in world units (× effect scale).
     pub width: f32,
-    /// Width over life.
+    /// Width multiplier over a point's life.
     pub width_over_life: Curve,
-    /// Color over life.
+    /// Linear HDR color over a point's life (alpha: opacity).
     pub color_over_life: Gradient,
     /// HDR multiplier.
     pub intensity: f32,
-    /// Texture.
+    /// Texture (multiplies the color; `u` along, `v` across).
     pub texture: Option<SpriteTexture>,
     /// Analytic cross-section.
     pub profile: RibbonProfile,
@@ -894,10 +982,12 @@ pub struct RibbonLayer {
     pub blend: ParticleBlend,
     /// Soft depth fade distance.
     pub soft_distance: f32,
-    /// The emitter tint applies.
+    /// The emitter tint applies (each point keeps the tint of its time).
     pub tinted: bool,
     /// Draw order within the particles node.
     pub order: i16,
+    /// 0..1: breaks the strip up with value noise scrolling along it (smoke, plasma).
+    pub noise: f32,
 }
 
 impl Default for RibbonLayer {
@@ -923,29 +1013,36 @@ impl Default for RibbonLayer {
             soft_distance: 0.0,
             tinted: true,
             order: 0,
+            noise: 0.0,
         }
     }
 }
 
-/// A beam (laser) from the emitter to `ParticleBeam::end` (or `length` along −Z).
+/// A beam (laser) from the emitter to `ParticleBeam::end` (or `length` along −Z): a strip of
+/// `segments` segments rebuilt every frame from the render-time end points (hitscan lasers,
+/// tractor and repair beams), with round ends, optional glows at both ends, lightning-style
+/// `jitter`, a brightness `flicker` and scrolling `noise`. Visible while the effect emits (a
+/// non-looping effect's `duration`, faded by `fade` over it: a one-shot tracer).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BeamLayer {
     /// Name.
     pub name: String,
-    /// Width.
+    /// Width in world units (× effect scale × `ParticleBeam::width_scale`).
     pub width: f32,
-    /// Length without a `ParticleBeam`.
+    /// Length without a `ParticleBeam` (× effect scale).
     pub length: f32,
-    /// Color along the beam.
+    /// Linear HDR color along the beam, start (0) to end (1).
     pub color: Gradient,
-    /// Fade over effect time (one-shot tracers).
+    /// Brightness over the effect's time / `duration` (one-shot tracers; looping effects use
+    /// its value at 0).
     pub fade: Curve,
-    /// Segments.
+    /// Segments (1 to `MAX_BEAM_SEGMENTS`).
     pub segments: u32,
-    /// Lightning-style wobble amplitude.
+    /// Lightning-style sideways wobble of the inner points, world units (× effect scale); 0 at
+    /// the ends.
     pub jitter: f32,
-    /// Wobble frequency.
+    /// New wobble this many times per second (0: once).
     pub jitter_hz: f32,
     /// HDR multiplier.
     pub intensity: f32,
@@ -967,6 +1064,16 @@ pub struct BeamLayer {
     pub tinted: bool,
     /// Draw order within the particles node.
     pub order: i16,
+    /// Start point offset from the emitter (emitter-local, × effect scale): a muzzle.
+    pub offset: Vec3,
+    /// Brightness flicker of the whole beam.
+    pub flicker: Option<Flicker>,
+    /// 0..1: breaks the beam up with value noise scrolling along it (`scroll`).
+    pub noise: f32,
+    /// Diameter of a glow at the start, in beam widths (0: none).
+    pub start_glow: f32,
+    /// Diameter of a glow at the end (an impact), in beam widths (0: none).
+    pub end_glow: f32,
 }
 
 impl Default for BeamLayer {
@@ -990,11 +1097,19 @@ impl Default for BeamLayer {
             soft_distance: 0.0,
             tinted: true,
             order: 0,
+            offset: Vec3::ZERO,
+            flicker: None,
+            noise: 0.0,
+            start_glow: 0.0,
+            end_glow: 0.0,
         }
     }
 }
 
-/// A point light flash (an ordinary `PointLight` while it plays).
+/// A point light flash: while it plays, a child entity of the emitter carries an ordinary
+/// `PointLight` (so it lights meshes, shadows aside, and counts toward the renderer's point
+/// lights: the 16 nearest per view beyond 16); it is despawned when the flash ends, and the
+/// effect finishes only after it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LightFlash {
@@ -1008,10 +1123,12 @@ pub struct LightFlash {
     pub peak: f32,
     /// Intensity over the flash (× peak).
     pub intensity: Curve,
-    /// Light range.
+    /// Light range (× effect scale).
     pub range: f32,
-    /// Local offset.
+    /// Local offset (× effect scale).
     pub offset: Vec3,
+    /// The emitter tint's color applies. Default false.
+    pub tinted: bool,
 }
 
 impl Default for LightFlash {
@@ -1024,6 +1141,7 @@ impl Default for LightFlash {
             intensity: Curve::Preset(crate::curve::FadeCurve::Flash),
             range: 10.0,
             offset: Vec3::ZERO,
+            tinted: false,
         }
     }
 }

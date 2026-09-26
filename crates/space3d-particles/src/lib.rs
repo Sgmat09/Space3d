@@ -57,9 +57,10 @@ pub use components::{
 pub use curve::{ColorRange, CountRange, Curve, FadeCurve, FloatRange, Gradient};
 pub use effect::{
     BeamLayer, BuiltinTexture, Burst, EffectPriority, EmitDirection, EmitShape, Facing, Falloff, Flicker, Flipbook,
-    FlipbookMode, Force, LUT_WIDTH, LightFlash, MAX_FLIPBOOK_FRAMES, MAX_FORCES_PER_LAYER, MAX_LAYERS_PER_EFFECT,
-    MAX_RIBBON_POINTS, ParticleBlend, ParticleEffect, ParticleLayer, RibbonFacing, RibbonLayer, RibbonProfile,
-    RibbonUv, SimulationSpace, SortMode, Spawn, SpriteRender, SpriteShape, SpriteTarget, SpriteTexture,
+    FlipbookMode, Force, LUT_WIDTH, LightFlash, MAX_BEAM_SEGMENTS, MAX_FLIPBOOK_FRAMES, MAX_FORCES_PER_LAYER,
+    MAX_LAYERS_PER_EFFECT, MAX_RIBBON_POINTS, ParticleBlend, ParticleEffect, ParticleLayer, RibbonFacing, RibbonLayer,
+    RibbonProfile, RibbonUv, SimulationSpace, SortMode, Spawn, SpriteRender, SpriteShape, SpriteTarget, SpriteTexture,
+    ThrottleResponse,
 };
 pub use registry::{EffectError, EffectHandle, ParticleEffects, builtin};
 pub use runtime::ParticleRuntime;

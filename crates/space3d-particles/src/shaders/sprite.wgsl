@@ -118,14 +118,17 @@ fn vs_sprite(in: S3dpIn) -> S3dpOut {
     let px_per_unit = 0.5 * view.viewport.w * p11 / w;
     var px = half * px_per_unit;
     let facing = s3dp_draw.mode.y;
-    var dim = 1.0;
-    if (px < 0.6) {
-        // Sub-pixel: keep a 0.6 px footprint, dimmed by the lost area (length for streaks).
-        let f = px / 0.6;
-        dim = select(f * f, f, facing == 1u);
-        half = 0.6 / max(px_per_unit, 1e-6);
-        px = 0.6;
+    // Sub-pixel sprites: keep a footprint of at least `S3DP_MIN_PX` pixels radius, dimmed by
+    // the area it gained, so a small spark's total light stays the same wherever it sits on
+    // the pixel grid (smaller footprints are point-sampled at pixel centers: a 1 px sprite on a
+    // pixel corner vanished, and small sprites twinkled while the camera panned).
+    var shrink = 1.0;
+    if (px < S3DP_MIN_PX) {
+        shrink = px / S3DP_MIN_PX;
+        half = S3DP_MIN_PX / max(px_per_unit, 1e-6);
+        px = S3DP_MIN_PX;
     }
+    var dim = shrink * shrink;
 
     let rot = bitcast<f32>(in.rot_frame.x);
     let cs = cos(rot);
@@ -145,6 +148,11 @@ fn vs_sprite(in: S3dpIn) -> S3dpOut {
             ax = cross(ay, back);
             stretch = clamp(1.0 + len * s3dp_draw.stretch.x / max(size, 1e-5), s3dp_draw.stretch.y, s3dp_draw.stretch.z);
         }
+        // A widened streak keeps its length (at least round): dimmed by the width it gained,
+        // and by the length only when it was shorter than the minimum footprint.
+        let kept = stretch * shrink;
+        stretch = max(kept, 1.0);
+        dim = shrink * kept / stretch;
     } else if (facing == 2u) {
         let n = in.vel_age.xyz;
         if (dot(n, n) > 1e-8) {
@@ -185,6 +193,21 @@ fn vs_sprite(in: S3dpIn) -> S3dpOut {
     return out;
 }
 
+// Smallest sprite footprint, in pixels of radius (see `vs_sprite`).
+const S3DP_MIN_PX: f32 = 1.5;
+// Variance (px²) of the pixel footprint the gaussian profiles are widened by.
+const S3DP_PX_VAR: f32 = 0.16;
+
+// A gaussian `exp(−k·d²)` of a sprite `r` pixels in radius, widened by the pixel footprint
+// (σ² + S3DP_PX_VAR, in pixels) and scaled to keep its light: `(k', k'/k)`. Unchanged for
+// large sprites; a narrow white core on a 2 px spark becomes a wider, dimmer spot instead of a
+// point sampled (or missed) by the pixel centers.
+fn s3dp_widen(k: f32, r: f32) -> vec2<f32> {
+    let r2 = r * r;
+    let kk = k * r2 / (r2 + 2.0 * k * S3DP_PX_VAR);
+    return vec2<f32>(kk, kk / k);
+}
+
 // Shape of a sprite at quad position `uv`: (color weight, white core, coverage mask). `peak`
 // is the sprite's brightest channel as the tonemapper sees it (color × opacity × exposure).
 fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32, peak: f32) -> vec3<f32> {
@@ -197,16 +220,22 @@ fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32, peak: f32) -> vec
             // tonemapping keeps a hot head and a thin fading tail instead of an even rod.
             let along = uv.y * stretch;
             let t = clamp((along + stretch) / (2.0 * stretch), 0.0, 1.0);
-            let width = mix(1.0 - 0.75 * p.y, 1.0, t);
+            // The tail narrows to a quarter of the head's width, but never below a pixel of
+            // half-width (a thinner tail is point-sampled and twinkles): the light it would
+            // have had is spread over the wider tail instead.
+            let taper = mix(1.0 - 0.75 * p.y, 1.0, t);
+            let width = max(taper, min(1.0, 1.0 / max(px, 1e-3)));
             let dy = max(abs(along) - (stretch - 1.0), 0.0);
             let d = length(vec2<f32>(uv.x / width, dy));
             if (d >= 1.0) {
                 return vec3<f32>(0.0);
             }
-            let body = exp(-d * d * 4.0) * (1.0 - d * d);
+            let soft = s3dp_widen(4.0, px * width);
+            let white = s3dp_widen(28.0, px * width);
+            let body = exp(-d * d * soft.x) * soft.y * (1.0 - d * d) * (taper / width);
             let k = mix(1.0 - p.y, 1.0, t * t);
             let hot = mix(1.0, t * t * t, p.y);
-            return vec3<f32>(body * k, exp(-d * d * 28.0) * p.x * hot, body * k);
+            return vec3<f32>(body * k, exp(-d * d * white.x) * white.y * p.x * hot, body * k);
         }
         case 2u: {
             // Ring of thickness p.x (fraction of the radius), focused toward +x by p.y, filled
@@ -239,7 +268,16 @@ fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32, peak: f32) -> vec
             if (cov <= 0.001) {
                 return vec3<f32>(0.0);
             }
-            return vec3<f32>(pow(cov, 1.0 + 6.0 * p.y), 0.0, cov);
+            // Billows inside the puff: its light (not its coverage) follows a billow field (two
+            // more noise octaves), brighter where the field rises toward the upper left of the
+            // sprite (a cheap bump light), so a fireball reads as a rolling volume instead of a
+            // flat disc with a noisy rim (the coverage is 1 over the inner third of the radius).
+            let q = uv + seed.yx * 1.3;
+            let coarse = s3dp_noise(q * 3.7);
+            let b = coarse * 0.65 + s3dp_noise(q * 8.3) * 0.35;
+            let lit = coarse - s3dp_noise((q + vec2<f32>(0.09, 0.12)) * 3.7);
+            let billow = clamp(mix(0.6, 1.2, b) + lit * 1.8, 0.4, 1.5);
+            return vec3<f32>(pow(cov, 1.0 + 6.0 * p.y) * billow, 0.0, cov);
         }
         case 4u: {
             // Vortex: p.x spiral arms with p.y turns from rim to center, and a soft core.
@@ -267,10 +305,12 @@ fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32, peak: f32) -> vec
             if (peak > 1.0) {
                 win = win * pow(win, min(0.5 * log2(peak), 3.0));
             }
-            let soft = exp(-d * d * 4.0) * win;
+            let halo = s3dp_widen(4.0, px);
+            let white = s3dp_widen(28.0, px);
+            let soft = exp(-d * d * halo.x) * halo.y * win;
             let hard = clamp((1.0 - d) * px + 0.5, 0.0, 1.0);
             let body = mix(soft, hard, p.y);
-            return vec3<f32>(body, exp(-d * d * 28.0) * p.x, body);
+            return vec3<f32>(body, exp(-d * d * white.x) * white.y * p.x, body);
         }
     }
 }

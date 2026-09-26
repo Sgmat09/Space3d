@@ -69,6 +69,8 @@ pub(crate) struct Continuous {
     pub start: f32,
     /// `ParticleLayer::lod`: quality and LOD scale the rates.
     pub lod: bool,
+    /// `ThrottleResponse::rate`: the rates scale by `throttle^rate_exponent`.
+    pub rate_exponent: f32,
 }
 
 impl Continuous {
@@ -79,21 +81,23 @@ impl Continuous {
             max_rate_scale: l.spawn.max_rate_scale,
             start: l.start,
             lod: l.lod,
+            rate_exponent: l.throttle.rate,
         }
     }
 }
 
-/// The continuous emission of one tick: `(count, t0, t1)`, the particles the rate accumulators
-/// `acc` (time rate, distance rate; advanced) give for the part of the tick inside
-/// `[start, duration)` (endless when looping), and that part as fractions of the tick. The time
-/// rate counts `rate_share` of it: 1 for a tick, less for a render-time bridge that stands for
-/// part of a tick's motion (`Runtime::bridge`). `None` when nothing of the tick emits.
-pub(crate) fn continuous(
-    c: &Continuous,
-    acc: &mut (u64, u64),
-    s: &SpawnTick,
-    rate_share: f64,
-) -> Option<(u64, f32, f32)> {
+/// The continuous emission of one tick: `(count, t0, t1)`, the particles the rate accumulator
+/// `acc` (32.32 fixed point, advanced) gives for the part of the tick inside `[start, duration)`
+/// (endless when looping), and the times of the first and the last of them as fractions of the
+/// tick. The time rate and the distance rate feed one accumulator: both are uniform over the
+/// tick (the emitter's motion is interpolated linearly), so particle `k` of the tick is emitted
+/// exactly when the accumulator crosses its integer, and the crossings are evenly spaced from
+/// `t0` to `t1` ([`crate::cpu::subtick`]). A rate that is not a whole number of particles per
+/// tick (40/s at 60 Hz: 1, 1, 0, …) therefore still emits an even stream instead of beads. The
+/// time rate counts `rate_share` of the span: 1 for a tick, less for a render-time bridge that
+/// stands for part of a tick's motion (`Runtime::bridge`). `None` when nothing of the tick
+/// emits.
+pub(crate) fn continuous(c: &Continuous, acc: &mut u64, s: &SpawnTick, rate_share: f64) -> Option<(u64, f32, f32)> {
     if !s.emitting || s.dt <= 0.0 {
         return None;
     }
@@ -105,15 +109,28 @@ pub(crate) fn continuous(
         return None;
     }
     let throttle = s.rate_scale.clamp(0.0, c.max_rate_scale.max(0.0)) as f64;
+    let rate_throttle = if throttle <= 0.0 {
+        0.0
+    } else if c.rate_exponent == 1.0 {
+        throttle
+    } else {
+        throttle.powf(c.rate_exponent.max(0.0) as f64)
+    };
     let span = hi - lo;
-    let rate = c.rate.max(0.0) as f64 * throttle * s.mul as f64 * span * rate_share;
-    let dist = c.per_distance.max(0.0) as f64 * throttle * s.mul as f64 * s.distance as f64 * span / dt;
-    acc.0 += (rate * ONE).round().min(u64::MAX as f64 / 4.0) as u64;
-    acc.1 += (dist * ONE).round().min(u64::MAX as f64 / 4.0) as u64;
-    let n = (acc.0 >> 32) + (acc.1 >> 32);
-    acc.0 &= FRACTION;
-    acc.1 &= FRACTION;
-    Some((n, ((lo - a) / dt) as f32, ((hi - a) / dt) as f32))
+    let rate = c.rate.max(0.0) as f64 * rate_throttle * s.mul as f64 * span * rate_share;
+    let dist = c.per_distance.max(0.0) as f64 * rate_throttle * s.mul as f64 * s.distance as f64 * span / dt;
+    let inc = ((rate + dist) * ONE).round().min(u64::MAX as f64 / 4.0) as u64;
+    let phase = *acc & FRACTION;
+    *acc = phase + inc;
+    let n = *acc >> 32;
+    *acc &= FRACTION;
+    if n == 0 || inc == 0 {
+        return Some((0, 0.0, 0.0));
+    }
+    // Crossing `k` (0-based) at `((k + 1)·2³² − phase) / inc` of the span.
+    let cross = |k: u64| ((((k + 1) << 32) - phase) as f64 / inc as f64).min(1.0);
+    let at = |x: f64| ((lo - a + x * span) / dt) as f32;
+    Some((n, at(cross(0)), at(cross(n - 1))))
 }
 
 /// Schedule `layer`'s emission for one tick; returns the particles spawned.
@@ -128,9 +145,9 @@ pub(crate) fn spawn_tick(entry: &mut Entry, layer: &ParticleLayer, s: &SpawnTick
     let start = layer.start.max(0.0) as f64;
 
     // Continuous: the part of the tick inside [start, duration) (endless when looping).
-    let mut acc = (entry.rate_acc, entry.dist_acc);
+    let mut acc = entry.acc;
     if let Some((n, t0, t1)) = continuous(&Continuous::new(layer), &mut acc, s, 1.0) {
-        (entry.rate_acc, entry.dist_acc) = acc;
+        entry.acc = acc;
         if n > 0 {
             push(entry, log, n.min(u32::MAX as u64) as u32, t0, t1, s.extra_age, s.entry);
         }
@@ -259,6 +276,62 @@ mod tests {
             ..at(t, dt)
         });
         assert_eq!(n, 0);
+    }
+
+    /// Emission times (in ticks) of every particle of `log`, from its records' first and last
+    /// times through the backends' integer sub-tick spread (`cpu::subtick`).
+    fn emission_times(log: &TickLog) -> Vec<f64> {
+        use crate::cpu::{SUBTICKS, subtick, subtick_q};
+        let mut out = Vec::new();
+        for f in &log.frames {
+            for r in &log.records[f.records.0 as usize..f.records.1 as usize] {
+                let (t0, t1) = (subtick_q(r.t0), subtick_q(r.t1));
+                for k in 0..r.count {
+                    out.push(f.tick as f64 + subtick(t0, t1, k, r.count) as f64 / SUBTICKS as f64);
+                }
+            }
+        }
+        out
+    }
+
+    /// A rate that is not a whole number of particles per tick (40/s at 60 Hz: 1, 1, 0, …)
+    /// emits an evenly spaced stream: each particle at the time the accumulator crosses its
+    /// integer, not in the middle of its tick's share (which paired the particles of
+    /// consecutive ticks into beads with double gaps). Likewise with the throttle, for mixed
+    /// time and distance rates, and at rates above the tick rate.
+    #[test]
+    fn fractional_rates_emit_evenly() {
+        let dt = 1.0 / 60.0;
+        let tol = 2.0 / crate::cpu::SUBTICKS as f64;
+        for (rate, per_distance, distance, throttle) in [
+            (40.0, 0.0, 0.0, 1.0),
+            (45.0, 0.0, 0.0, 1.0),
+            (180.0, 0.0, 0.0, 0.3),
+            (100.0, 0.0, 0.0, 1.0),
+            (30.0, 0.4, 1.5, 1.0),
+            (0.0, 1.0, 0.7, 1.0),
+        ] {
+            let mut layer = ParticleLayer::continuous(rate, 1.0);
+            layer.spawn.rate_per_distance = per_distance;
+            layer.spawn.max_rate_scale = 2.0;
+            let (n, log) = run(&layer, 600, |t| SpawnTick {
+                rate_scale: throttle,
+                distance,
+                ..at(t, dt)
+            });
+            let per_tick = (rate * throttle + per_distance * distance * 60.0 * throttle) as f64 / 60.0;
+            let times = emission_times(&log);
+            assert_eq!(times.len() as u64, n);
+            assert!((n as f64 - 600.0 * per_tick).abs() <= 1.0, "{rate}: {n}");
+            let gap = 1.0 / per_tick;
+            for w in times.windows(2) {
+                assert!(
+                    (w[1] - w[0] - gap).abs() <= tol,
+                    "rate {rate}, per distance {per_distance}, throttle {throttle}: gap {} (want {gap})",
+                    w[1] - w[0]
+                );
+            }
+        }
     }
 
     #[test]

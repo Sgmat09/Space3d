@@ -50,7 +50,7 @@ chain every tick (exact, not last frame's `GlobalTransform`):
 | field | meaning |
 |---|---|
 | `playing` | `false` stops emitting; live particles play out (`stop()`; setting it back after the effect finished plays it again) |
-| `rate_scale` | × continuous rates (throttle), clamped to each layer's `Spawn::max_rate_scale` |
+| `rate_scale` | the throttle: × continuous rates, clamped to each layer's `Spawn::max_rate_scale`; a layer's `throttle` (`ThrottleResponse`) can also make it drive speeds, sizes and brightness |
 | `scale` | sizes, shape extents, offsets, speeds^`speed_scale_exponent` (1 ≈ a 40-unit hull for the built-ins) |
 | `tint` | linear RGBA × every `tinted` layer (rgb may exceed 1) |
 | `velocity` | extra velocity for `inherit_velocity` (the measured motion is added) |
@@ -110,6 +110,7 @@ place; a changed structure restarts running instances (their old particles drain
 | life | `lifetime`, `particle_delay` (appear later, staggered bursts) |
 | look | `size` + `size_over_life`, `aspect`, `rotation` + `angular_velocity`, `random_mirror`, `color_over_life` (linear HDR gradient), `start_color` (random between two), `alpha_over_life`, `coverage` + `coverage_over_life` (premultiplied), `intensity`, `flicker`, `tinted` |
 | quality | `lod` (quality and distance LOD may reduce counts; bursts keep ≥ 1) |
+| throttle | `throttle: ThrottleResponse { rate, speed, size, intensity }`: with the emitter's throttle `t` (`rate_scale`, clamped to `max_rate_scale`) the rates scale by `t^rate` (default 1: linear), initial speeds by `t^speed`, sprite sizes by `t^size` and brightness by `t^intensity` (default 0: no response). `t = 0` emits nothing. A flame keeps its density and gets shorter and dimmer instead: `ENGINE_EXHAUST`'s plume has `(rate: 0.25, speed: 0.6, size: 0.3, intensity: 0.5)`, so partial throttle never breaks it into puffs |
 | render | `SpriteRender { shape, blend, facing, soft_distance, near_fade, order, sort, target, max_screen_size }` |
 
 Random ranges read `1.0` or `(0.5, 1.0)`. Curves: `Constant`, `Linear(a, b)`, `Keys([...])`,
@@ -126,8 +127,20 @@ the vertex shader reads, so the CPU never evaluates them per particle.
   (a capsule whose width and brightness taper toward its tail, with a hot head; pair it with
   `VelocityStretched`), `Ring { thickness, focus, fill }` (focus sharpens it toward the sprite's
   +X: shield arcs; the band sits inside the rim, which fades over 1.5 pixels),
-  `Smoke { breakup, hot_core }` (four noise octaves), `Vortex { arms, twist }`. `Texture` and
+  `Smoke { breakup, hot_core }` (four noise octaves for the outline; inside, the light follows
+  a billow field with a cheap bump light from the sprite's upper left, so a fireball reads as a
+  rolling volume rather than a flat disc), `Vortex { arms, twist }`. `Texture` and
   flipbooks arrive with PA3 (drawn as a soft glow until then, with a warning).
+* **Small sprites**: a sprite keeps a footprint of at least 1.5 pixels radius, dimmed by the
+  area it gained (a velocity-stretched streak keeps its length and is dimmed by the width it
+  gained), and its gaussian profiles (the glow's halo and white core, the streak's body and hot
+  head) are widened by the pixel footprint with their light kept. A spark's total light is then
+  the same wherever it lands on the pixel grid (within 3 % at 1–3 px,
+  `tests/render.rs::small_sprites_keep_their_light_on_any_subpixel_offset`; it was 0–100 % at
+  1 px), so small sparks and embers no longer twinkle or vanish while the camera pans. They
+  look a little softer than a 1-pixel point; brighten them (`intensity`) rather than shrinking
+  them if they must read at a distance. Streak tails never narrow below a pixel of half-width
+  either.
 * **Size clamp**: a sprite is at most `ParticleSettings::max_screen_size` of the viewport high
   (default 1.0, a fill-rate guard); `SpriteRender::max_screen_size` (0 = the setting) raises or
   lowers it per layer — the warp vortices use 4.0, so their collapse keeps its size and timing
@@ -171,15 +184,18 @@ target needs it. Direct mode has no tonemapper: there each sprite soft-clips wit
 
 **Authoring for HDR.** The built-ins are calibrated for the HDR frame a game with `PostProcess`
 renders (AgX + `Bloom::glow()`, threshold 1): what should glow is authored well above 1 (laser
-trail 5× and head 10× the tint, explosion flash 5, sparks and embers up to 15, fireball 4.5), so
+trail 5× and head 8× the tint, explosion flash 5, sparks and embers up to 15, fireball 4.5), so
 it blooms and reaches white, and colors keep their off-channels low (shield blue `(0.12, 0.55,
 2.8)`; tints are best pure primaries like the game's tier colors: a red laser tinted `(1, 0, 0)`
 keeps a `(233, 101, 104)` core where `(1, 0.1, 0.05)` turns `(228, 142, 128)`) so AgX
 desaturates them toward white only where they are hottest. A large flash is a small white-hot
 core over a dimmer saturated halo, not one big bright glow (AgX turns a 280-unit glow of 4.5
 into a flat milky disc): the warp flashes are a blue halo of `(0.3, 0.75, 3)` around a core of
-`(10, 11, 16)` with `core: 3` at 0.43× its size, the shield's impact a `(0.15, 0.7, 4)` glow
-with `core: 2.5`. Plumes and trails are soft glows without cores or rims (`core` only on heads
+`(10, 11, 16)` with `core: 3` (`WARP_IN`'s core is 0.43× its flash's size, `WARP_OUT`'s
+0.5×), the shield's impact a `(0.15, 0.7, 4)` glow with `core: 10` — a white core has to be
+well above its halo's strongest channel to read white through AgX (with `core: 2.5` the impact
+stayed a pale lavender, `(215, 222, 241)`; now `(241, 242, 248)` on its first tick,
+`tests/render.rs::shield_flash_reaches_white`). Plumes and trails are soft glows without cores or rims (`core` only on heads
 and nozzles), so overlapping chains read as one beam or flame instead of beads. For more
 saturation and contrast in effect-heavy scenes, `Tonemapper::AgXPunchy` keeps saturated
 emissives saturated (with half a stop of exposure it is the recommended battle look: frame.md,
@@ -198,7 +214,7 @@ in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's
 | `HIT_SPARK` | flash, sparks thrown along −Z, a ring, smoke; tinted | `.facing(-bolt_dir).tint(color)` |
 | `SHIELD_RIPPLE` | focused arc toward −Z, faint bubble, surface flash, streaks; local-space | `.facing(-bolt_dir).scale(radius / 20).follow(ship)` |
 | `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash (white-hot core, blue halo), two rings | `EffectSpawn::at(portal)` |
-| `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow; `rate_scale` = throttle. Near-neutral (white-hot): the flame takes its hue from the tint | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
+| `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow; `rate_scale` = throttle: the plume stays dense and gets shorter, narrower and dimmer at partial throttle (one flame, never puffs; `tests/render.rs::exhaust_stays_continuous_at_partial_throttle`). Near-neutral (white-hot): the flame takes its hue from the tint | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
 | `LASER_TRAIL` | looping white-hot head + a continuous beam laid per unit of distance (up to about 3800 units/s) | `.follow(bolt).tint(color)` (a saturated tint: the game's pure primaries such as `(1, 0, 0)` stay the most saturated); the bolt may move in any stage |
 | `LASER_BEAM` | reserved: beams arrive with PA3 (until then an emitter with it plays nothing and finishes at once, warned once) | |
 
@@ -218,10 +234,13 @@ editor's storybook viewer, golden tests).
   `App::add_system_ordered`): after every system added to that stage with `add_system` /
   `add_system_named`, whenever they were added, so it sees where fixed-tick gameplay moved each
   emitter this tick. `ParticlesPlugin { tick_system: false, .. }` leaves the placement to you. It
-  follows emitters, decides each tick's emission — exact 32.32 fixed-point rate accumulators
-  (10/s at 60 Hz is exactly 100 particles in 600 ticks), bursts on the tick that contains them
-  with their sub-tick time, emission spread over the emitter's motion within the tick — and
-  records it in a tick log.
+  follows emitters, decides each tick's emission — an exact 32.32 fixed-point rate accumulator
+  (10/s at 60 Hz is exactly 100 particles in 600 ticks) fed by the time rate and the distance
+  rate, each particle emitted at the sub-tick time its accumulator crosses its integer, at the
+  emitter's interpolated pose; bursts on the tick that contains them with their sub-tick time —
+  and records it in a tick log. A rate that is not a whole number of particles per tick (40/s at
+  60 Hz gives 1, 1, 0, …) or a throttled one is therefore an evenly spaced stream (within
+  1/16 384 of a tick), not beads (`runtime::spawn::tests::fractional_rates_emit_evenly`).
 * Emitters may move in any stage. Local-space layers draw at the render pose (the entity's
   `GlobalTransform`, like meshes). An emitter moved after the tick read it — in `Stage::Update`
   (SpaceCorps2027 moves bolts, ships and the camera there), or on frames without a tick when the
@@ -272,9 +291,9 @@ editor's storybook viewer, golden tests).
   (`ParticleStats::{shrunk, refused}`, logged once per effect). `EffectPriority::Low` stops at
   75 % of the pool, `Normal` at 90 %, `High` may use it all. Slots a built-in reserves per
   instance (`runtime::tests::builtin_slots`): `EXPLOSION` 81, `HIT_SPARK` 16, `SHIELD_RIPPLE` 8,
-  `WARP_IN` / `WARP_OUT` 27, `ENGINE_EXHAUST` 237 (its rates × the afterburner's
-  `max_rate_scale` 2), `LASER_TRAIL` 581. The CPU backend's web budget (8192 × 90 %) holds, for
-  example, 20 exhausts and 4 laser trails at once; the GPU pool (262 144) is not a practical
+  `WARP_IN` / `WARP_OUT` 27, `ENGINE_EXHAUST` 148 (its rates at the afterburner's
+  `max_rate_scale` 2: the plume's `2^0.25`), `LASER_TRAIL` 581. The CPU backend's web budget (8192 × 90 %) holds, for
+  example, 30 exhausts and 4 laser trails at once; the GPU pool (262 144) is not a practical
   limit for them.
 * `ParticleStats` (resource, per rendered frame): backend, live effects and layer instances,
   pool capacity / reserved, alive particles (CPU: this frame; GPU: read back from the draw

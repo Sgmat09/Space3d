@@ -405,8 +405,9 @@ impl GpuSim {
                     .unwrap_or((inst.pos, inst.rot));
                 let cap = e.capacity.max(1);
                 let tail = (e.spawned % cap as u64) as u32;
+                let (tint, scale) = rt.draw_tint_scale(e);
                 self.words
-                    .extend(tables::job_words(ei, tail, records, g, inst.tint, pose, inst.scale));
+                    .extend(tables::job_words(ei, tail, records, g, tint, pose, scale));
                 records += cap.div_ceil(LANES);
                 out += cap;
                 let (lo, hi) = rt.entry_bounds(e, input.poses, layer.extent);

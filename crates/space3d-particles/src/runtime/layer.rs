@@ -4,7 +4,7 @@
 use crate::curve::FloatRange;
 use crate::effect::{
     EmitDirection, EmitShape, Facing, Flicker, Force, MAX_FORCES_PER_LAYER, ParticleBlend, ParticleLayer,
-    SimulationSpace,
+    SimulationSpace, ThrottleResponse,
 };
 use space3d_core::glam::{Vec3, Vec4};
 
@@ -56,6 +56,8 @@ pub(crate) struct LayerSim {
     pub reach: Reach,
     /// Continuous emission (the render-time bridge, `Runtime::bridge`).
     pub spawn: super::spawn::Continuous,
+    /// Response to the emitter's throttle.
+    pub throttle: ThrottleResponse,
 }
 
 fn pair(r: FloatRange) -> (f32, f32) {
@@ -120,7 +122,27 @@ impl LayerSim {
             window: window_secs(l),
             reach: Reach::new(l, window_secs(l)),
             spawn: super::spawn::Continuous::new(l),
+            throttle: l.throttle,
         }
+    }
+
+    /// The emitter throttle `rate_scale` clamped to the layer's `Spawn::max_rate_scale`.
+    pub fn throttle_of(&self, rate_scale: f32) -> f32 {
+        rate_scale.clamp(0.0, self.spawn.max_rate_scale.max(0.0))
+    }
+
+    /// Initial speed multiplier of the throttle `rate_scale` (`ThrottleResponse::speed`).
+    pub fn speed_throttle(&self, rate_scale: f32) -> f32 {
+        ThrottleResponse::factor(self.throttle_of(rate_scale), self.throttle.speed)
+    }
+
+    /// `(size, brightness)` multipliers of the throttle `rate_scale`.
+    pub fn draw_throttle(&self, rate_scale: f32) -> (f32, f32) {
+        let t = self.throttle_of(rate_scale);
+        (
+            ThrottleResponse::factor(t, self.throttle.size),
+            ThrottleResponse::factor(t, self.throttle.intensity),
+        )
     }
 }
 
@@ -177,9 +199,11 @@ impl Reach {
         } else {
             0.5 * accel * t * t
         };
+        // The throttle may speed particles up (`ThrottleResponse::speed` above a throttle of 1).
+        let throttle = ThrottleResponse::factor(l.spawn.max_rate_scale.max(1.0), l.throttle.speed).max(1.0);
         Self {
             shape,
-            speed: l.speed.min.abs().max(l.speed.max.abs()),
+            speed: l.speed.min.abs().max(l.speed.max.abs()) * throttle,
             time,
             accel,
         }
@@ -223,7 +247,8 @@ pub(crate) fn window_ticks(window: f32, dt: f32) -> u32 {
     ((window.max(0.0) as f64 / dt as f64).ceil().min(u32::MAX as f64 / 2.0) as u32) + 1
 }
 
-/// Ring size of a layer instance (design-particles §5.1): continuous rate × max rate scale ×
+/// Ring size of a layer instance (design-particles §5.1): continuous rate × the rate at the
+/// largest throttle (`max_rate_scale^ThrottleResponse::rate`, at least 1) ×
 /// window × 1.05, the bursts that can overlap within the window, the distance rate at 100 u/s,
 /// clamped to 1..=65 536; `ParticleLayer::capacity` overrides it.
 pub(crate) fn capacity(l: &ParticleLayer) -> u32 {
@@ -232,7 +257,8 @@ pub(crate) fn capacity(l: &ParticleLayer) -> u32 {
     }
     let win = window_secs(l);
     let s = &l.spawn;
-    let scale = s.max_rate_scale.max(1.0).max(0.0);
+    // The rates at the largest throttle (`ThrottleResponse::rate`), never below 1×.
+    let scale = crate::effect::ThrottleResponse::factor(s.max_rate_scale.max(1.0), l.throttle.rate).max(1.0);
     let mut n = 0.0f64;
     if s.rate > 0.0 {
         n += (s.rate as f64 * scale as f64 * win as f64 * 1.05).ceil() + 1.0;

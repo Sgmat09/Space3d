@@ -54,8 +54,8 @@ pub(crate) struct Entry {
     /// Last tick this layer instance emitted on (its particles are all dead
     /// `window_ticks(sim.window)` ticks later).
     pub last_spawn_tick: u64,
-    pub rate_acc: u64,
-    pub dist_acc: u64,
+    /// Continuous emission accumulator (32.32 fixed point; time and distance rates together).
+    pub acc: u64,
     pub seed: u32,
     /// Budget shrink (`capacity / full_capacity`) applied to spawn counts.
     pub rate_mul: f32,
@@ -86,8 +86,7 @@ impl Entry {
             spawned: 0,
             last_spawn_tick: 0,
             // Half a period: the first particle of a rate comes half its interval in.
-            rate_acc: 1 << 31,
-            dist_acc: 1 << 31,
+            acc: 1 << 31,
             seed,
             rate_mul,
             sim,
@@ -704,6 +703,7 @@ impl Runtime {
                 rot: inst.rot,
                 velocity: inst.velocity,
                 scale: inst.scale,
+                throttle: inst.rate_scale,
             });
             if dt > 0.0 {
                 self.instances[i as usize].time += dt as f64;
@@ -835,7 +835,7 @@ impl Runtime {
             }
         };
         let s = &e.sim;
-        let size = s.size.0.abs().max(s.size.1.abs()) * inst.scale.abs() * sprite;
+        let size = s.size.0.abs().max(s.size.1.abs()) * self.draw_tint_scale(e).1.abs() * sprite;
         let r = Vec3::splat(s.reach(inst.scale, speed) + size);
         (lo - r, hi + r)
     }
@@ -882,7 +882,7 @@ impl Runtime {
             distance: gap,
             extra_age: 0.0,
         };
-        let mut acc = (e.rate_acc, e.dist_acc);
+        let mut acc = e.acc;
         let (n, t0, t1) = spawn::continuous(c, &mut acc, &tick, share)?;
         let count = n.min(e.capacity as u64) as u32;
         (count > 0).then_some(Bridge {
@@ -898,8 +898,21 @@ impl Runtime {
                 rot,
                 velocity: inst.velocity,
                 scale: inst.scale,
+                throttle: inst.rate_scale,
             },
         })
+    }
+
+    /// The tint and effect scale layer instance `e` draws with: the emitter's tint (white for
+    /// untinted layers) and scale, times the layer's response to the throttle
+    /// (`ThrottleResponse::{intensity, size}`).
+    pub fn draw_tint_scale(&self, e: &Entry) -> (Vec4, f32) {
+        let Some(inst) = self.instances.get(e.instance as usize) else {
+            return (Vec4::ONE, 1.0);
+        };
+        let tint = if e.sim.tinted { inst.tint } else { Vec4::ONE };
+        let (size, bright) = e.sim.draw_throttle(inst.rate_scale);
+        ((tint.truncate() * bright).extend(tint.w), inst.scale * size)
     }
 
     /// Layer instance `e` may still have particles alive (it emitted within its life window).
