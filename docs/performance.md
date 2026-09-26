@@ -480,3 +480,22 @@ nothing (`tests/depth_views.rs`), and GPU paths add no culling dispatch.
 76 + timestamp writes, the deferred resolve and the two callbacks wgpu boxes per timed frame),
 bound 110; off, timing costs nothing.
 
+
+### PO5 / PO6 — distortion, the all-post gate
+
+Recorded by the post area (P-POST, M2; `benches/post.rs`, `docs/graphics/post.md` "Hardening").
+Dev machine, release, 1080p headless, load average 11–13 from other builds.
+
+| gate (spec §4.4) | measured | result |
+|---|---|---|
+| all post on (AE compute, bloom, FXAA, CA, grain, grading, LUT, distortion) ≤ 0.60 ms | `post/gate`: 0.387 ms, the paired throughput delta against Direct (frames back to back, interleaved rounds; measured like "Hdr minimal over Direct"); the whole frame takes 0.49 ms of throughput | met |
+
+`post/ab` (throughput per frame over Direct, µs): composite +45.9, bloom +236.8, bloom +
+distortion (two shockwaves and a haze) +264.0, every effect +387.9. The per-pass timestamps of the
+same frames sum to 1.0–1.3 ms: on Apple GPUs a pass's scope includes its overlap with its
+neighbours (bloom's scope reads 0.17 ms alone and 0.30–0.39 ms inside the full chain), so they are
+reference figures, not the gate. Distortion: one render pass (the Distortion pass's own scope 0.05
+ms at 1080p, 0.52 ms at 4K), 2.1 MB of buffer at half resolution, 33 allocations per frame on
+Metal (`tests/alloc_post.rs`: 267 with bloom; every effect 351). Render-stage CPU
+(`post/cpu/*`): composite 0.12 ms, bloom 0.26 ms, every effect 0.25 ms — post's CPU line of the
+Battle budget (≤ 0.05 ms) is still not met; bloom's 11 render passes are most of it.
