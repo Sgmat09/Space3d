@@ -772,7 +772,7 @@ impl PostState {
     }
 
     /// The bloom chain of a post group this frame, its pass uniforms written: bloom enabled
-    /// with a non-zero intensity, in Hdr mode (off in the Ldr fallback, warned once; never in
+    /// with a non-zero intensity, on a rect at least `min_rect_height` tall, in Hdr mode (off in the Ldr fallback, warned once; never in
     /// the passthrough group) where `GraphicsCaps::bloom_format` exists. `auto_exposure`: the
     /// prefilter also multiplies by 2^E.
     fn plan_bloom(&mut self, group: &PostGroupPlan, auto_exposure: bool, reallocs: &mut u32) -> Option<BloomPlan> {
@@ -797,6 +797,9 @@ impl PostState {
             _ => self.frame_caps.bloom_format,
         }?;
         let rect = clip_rect(group.scene_rect, group.scene_size);
+        if rect[3] < b.min_rect_height {
+            return None;
+        }
         let chain = bloom::chain_size((rect[2], rect[3]), b);
         let first_slot = self.bloom.slots;
         let (params, slot) = (&mut self.bloom.params, self.bloom.slot);

@@ -46,6 +46,8 @@ pub(crate) struct GpuCubemap {
     pub mips: u32,
     /// Unique per upload (a re-upload is a new id): environments and bind groups key on it.
     pub id: u64,
+    /// GPU bytes of the cube (every mip; `RenderStats::lighting_bytes`).
+    pub bytes: u64,
 }
 
 impl RenderAssets {
@@ -346,6 +348,7 @@ pub(super) fn plan_upload(
             size: cube.size,
             mips: cube.mips,
             id,
+            bytes: cube.bytes(),
         },
         job: baker.finish(device, plan),
         bytes,

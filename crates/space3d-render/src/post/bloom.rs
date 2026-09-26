@@ -8,9 +8,11 @@
 //! 1080p, capped at `Bloom::max_mip_height`; [`chain_size`]); every further level halves it.
 //! Passes: one prefilter (S → exactly half the rect: exposure, soft threshold and the firefly
 //! limit per pixel, then a 3 × 3 tent),
-//! an area resample of its output into level 0 when level 0 has another size (720p, 900p,
-//! 1440p, 4K, …), `mips − 1` downsamples and `mips − 1` upsamples blended by `scatter` — 11
-//! render passes for the default 6 levels at 1080p, 10 (with the resample) for the 5 of 720p.
+//! an area resample of its output into level 0 when level 0 is smaller (720p, 1440p, 4K, …;
+//! never larger: 900p or High's 720 cap at 1080p use the half rect as level 0), `mips − 1`
+//! downsamples and `mips − 1` upsamples blended by `scatter` — 11 render passes for the default
+//! 6 levels at 1080p, 10 (with the resample) for the 5 of 720p. A rect shorter than
+//! `Bloom::min_rect_height` gets no chain.
 
 use super::PostEncode;
 use super::api::Bloom;
@@ -78,8 +80,9 @@ pub(crate) struct ChainSize {
 /// rect at any resolution only if its height does not depend on the rect, so a smaller rect
 /// keeps the reference heights too: it drops the `n` finest levels, where `2^n` is the power of
 /// two nearest to `max_mip_height / (rect height / 2)`, and level 0 stands for them (resampled
-/// to `max_mip_height / 2^n`: within √2 of half the rect, never above the rect's own size;
-/// their weights merge into it, [`upsample_blend`]). The halo's size and energy relative to
+/// to `max_mip_height / 2^n`, within √2 of half the rect, but never above half the rect: the
+/// prefilter's resolution, so level 0 is never resampled up; their weights merge into it,
+/// [`upsample_blend`]). The halo's size and energy relative to
 /// the frame are then the same at 360p, 720p and 1080p (only the tight glow of the merged
 /// levels widens), and smaller rects cost less. Levels are then dropped from the coarse end
 /// while the smallest one has fewer than 2 pixels on its short side. Level `k` is
@@ -106,9 +109,13 @@ pub(crate) fn chain_size(rect: (u32, u32), bloom: &Bloom) -> ChainSize {
         ((cap as f64 / half).log2().round().max(0.0) as u32).min(levels - 1)
     };
     let height = ((cap as f64 / (1u64 << merged) as f64).round() as u32).max(1);
-    // Never above the rect's own resolution (tiny rects, extreme aspects).
-    let size = if height >= rh {
-        (rw, rh)
+    let half_rect = (rw.div_ceil(2), rh.div_ceil(2));
+    // Never above the prefilter's half-rect resolution: a bigger level 0 would be resampled up
+    // from it, costing a larger target and a pass for no detail (High's 720 cap at 1080p). The
+    // levels then stand within √2 of the reference heights (`merged` rounds to the nearest
+    // power of two).
+    let size = if height >= half_rect.1 {
+        half_rect
     } else {
         (((rw as f64 * height as f64 / rh as f64).round() as u32).max(1), height)
     };
@@ -116,7 +123,6 @@ pub(crate) fn chain_size(rect: (u32, u32), bloom: &Bloom) -> ChainSize {
     while mips > 1 && (size.0 >> (mips - 1)).min(size.1 >> (mips - 1)) < 2 {
         mips -= 1;
     }
-    let half_rect = (rw.div_ceil(2), rh.div_ceil(2));
     ChainSize {
         size,
         mips,
@@ -656,9 +662,10 @@ mod tests {
         assert_eq!(c((2560, 1440)), ((960, 540), 6, 0));
         // Below 1080p the levels keep the reference heights (the halo keeps its size relative to
         // the frame): 720p drops the 540 level (270 is the power of two nearest to its 360),
-        // 900p keeps it (resampled up from 450), 360p and the 180p goldens drop 2 and 3.
+        // 360p and the 180p goldens drop 2 and 3.
         assert_eq!(c((1280, 720)), ((480, 270), 5, 1));
-        assert_eq!(c((1600, 900)), ((960, 540), 6, 0));
+        // 900p: 540 would be resampled up from 450: level 0 is the half rect itself.
+        assert_eq!(c((1600, 900)), ((800, 450), 6, 0));
         assert_eq!(c((640, 360)), ((240, 135), 4, 2));
         assert_eq!(c((320, 180)), ((121, 68), 3, 3));
         for rect in [(1920, 1080), (1280, 720), (640, 360), (320, 180)] {
@@ -672,12 +679,12 @@ mod tests {
         assert_eq!(half((1920, 1080), &glow), None);
         assert_eq!(half((960, 1080), &glow), None);
         assert_eq!(half((1280, 720), &glow), Some((640, 360)));
-        assert_eq!(half((1600, 900), &glow), Some((800, 450)));
+        assert_eq!(half((1600, 900), &glow), None);
         assert_eq!(half((2560, 1440), &glow), Some((1280, 720)));
         assert_eq!(half((3840, 2160), &glow), Some((1920, 1080)));
         assert_eq!(half((320, 180), &glow), Some((160, 90)));
         assert_eq!(half((321, 181), &glow), Some((161, 91)));
-        assert_eq!(half((1920, 1079), &glow), Some((960, 540)));
+        assert_eq!(half((1920, 1079), &glow), None);
         let tall = Bloom {
             max_mip_height: 1080,
             ..glow
@@ -697,7 +704,7 @@ mod tests {
             assert!(mips == 1 || last.0.min(last.1) >= 2, "{rect:?}: {size:?} × {mips}");
             assert!(half.is_none_or(|(w, h)| w >= 1 && h >= 1), "{rect:?}");
         }
-        assert_eq!(c((64, 32)), ((34, 17), 1, 5));
+        assert_eq!(c((64, 32)), ((32, 16), 1, 5));
         assert_eq!(c((1, 1)), ((1, 1), 1, 5));
         assert_eq!(half((1, 1), &glow), None);
         // mip_count 0 and 20 clamp to 1 and 8.
@@ -712,6 +719,26 @@ mod tests {
         };
         let ChainSize { size, mips, merged, .. } = chain_size((1440, 810), &low);
         assert_eq!((size, mips, merged), ((480, 270), 4, 0));
+        // The quality tiers at 1080p: High (7 / 720) and Ultra (8 / 720) run at the half rect
+        // (never a 1280 × 720 level 0 resampled up from 960 × 540), Ultra one level wider.
+        for (mip_count, mips) in [(7, 7), (8, 8)] {
+            let tier = Bloom {
+                mip_count,
+                max_mip_height: 720,
+                ..glow
+            };
+            let ChainSize {
+                size,
+                mips: m,
+                merged,
+                half,
+            } = chain_size((1920, 1080), &tier);
+            assert_eq!(
+                (size, m, merged, half),
+                ((960, 540), mips, 0, None),
+                "{mip_count} levels"
+            );
+        }
     }
 
     /// CPU mirror of `fs_resample` in bloom.wgsl along one axis: the bilinear taps (position,
@@ -882,7 +909,7 @@ mod tests {
             let chain = chain_size((rect[2], rect[3]), &glow);
             let mut all = Vec::new();
             passes(scene, rect, &chain, &glow, (2.0, false), |p| all.push(p));
-            assert_eq!(all.len() as u32, pass_count(chain.mips, true));
+            assert_eq!(all.len() as u32, pass_count(chain.mips, chain.half.is_some()));
             all
         };
         let all = run((1280, 1080), [0, 360, 1280, 720]);
@@ -898,15 +925,14 @@ mod tests {
         // Then the chain as before: the first downsample reads level 0.
         assert_eq!(all[2].src_rect, [0.0, 0.0, 480.0, 270.0]);
         // 4K: 2 × 2 half-resolution pixels per level-0 pixel (2 taps per axis: robust to
-        // rounding; 900p: 1 tap, level 0 is larger than half the rect).
+        // rounding). 900p: level 0 is the half rect, no resample (it would be one up).
         let all = run((3840, 2160), [0, 0, 3840, 2160]);
         assert_eq!(all.len(), 12);
         assert_eq!(all[1].threshold, [2.0, 2.0, 0.0, 0.0]);
         assert_eq!(all[1].flags, [0, 2, 2, 0]);
         let all = run((1600, 900), [0, 0, 1600, 900]);
-        assert_eq!(all[0].src_texel[2], 1.0);
-        assert_eq!(all[1].threshold, [800.0 / 960.0, 450.0 / 540.0, 0.0, 0.0]);
-        assert_eq!(all[1].flags, [0, 1, 1, 0]);
+        assert_eq!(all.len(), 11, "prefilter, 5 downsamples, 5 upsamples");
+        assert_eq!(all[1].src_rect, [0.0, 0.0, 800.0, 450.0]);
     }
 
     /// GPU milliseconds of one bloom chain over a 1920 × 1080 scene texture in `format` with the

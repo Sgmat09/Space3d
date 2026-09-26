@@ -45,18 +45,32 @@ pub enum Tonemapper {
     /// Sobotka AgX (minimal fit, no look): saturated lights go to white without hue skew.
     #[default]
     AgX,
-    /// Khronos PBR Neutral: faithful base colors (UI and product previews).
+    /// Khronos PBR Neutral: faithful base colors (UI and product previews) with a highlight
+    /// roll-off from 0.76. Its **toe** subtracts `x − 6.25·x²` from every channel of a color
+    /// whose weakest channel `x` is below 0.08 (0.04 above): nearly all of a dim, saturated
+    /// color's weakest channel — sRGB (21, 47, 65) becomes (1, 40, 60), a teal nebula a blue
+    /// primary. For dim saturated art use [`Tonemapper::KhronosPbrNeutralNoToe`].
     KhronosPbrNeutral,
     /// AgX with Sobotka's "punchy" look (power 1.35, saturation 1.4 in AgX's log space):
     /// saturated emissives and effects keep their hue (a red laser stays red, blue exhaust
     /// blue) at the cost of darker mid tones (0.18 → 0.12 display-linear, 0.21 with `AgX`).
-    /// A game-look choice for effect-heavy scenes; `AgX` stays the neutral default.
+    /// A game-look choice for effect-heavy scenes; `AgX` stays the neutral default. The look
+    /// also pushes **dim** saturated colors toward their strongest channel: a dim magenta
+    /// nebula, linear (0.84, 0.10, 0.40) × 0.04 (R:B 2.1), comes out at +0.5 EV as sRGB
+    /// (54, 0, 21) (R:B 4.8, green crushed). For dim saturated backdrops prefer `AgX` with
+    /// [`crate::ColorGrading::vivid`] (docs/graphics/frame.md, "Choose the look explicitly").
     AgXPunchy,
+    /// Khronos PBR Neutral without its toe: colors pass **unchanged** below 0.8 (where Neutral
+    /// starts compressing, 0.76, plus the 0.04 the toe subtracts) and the highlights roll off
+    /// to white like Neutral's. Display-authored art (skies, paint, UI previews) keeps its
+    /// exact values, dim saturated colors included (sRGB (21, 47, 65) stays (21, 47, 65)),
+    /// with no full-frame lift to hide Neutral's toe.
+    KhronosPbrNeutralNoToe,
 }
 
 impl Tonemapper {
     /// Operator id of `s3d_tonemap` (`GpuView.output.y`): 0 None, 1 Reinhard, 2 AcesFitted,
-    /// 3 AgX, 4 KhronosPbrNeutral, 5 AgXPunchy.
+    /// 3 AgX, 4 KhronosPbrNeutral, 5 AgXPunchy, 6 KhronosPbrNeutralNoToe.
     pub const fn id(self) -> u32 {
         match self {
             Self::None => 0,
@@ -65,6 +79,7 @@ impl Tonemapper {
             Self::AgX => 3,
             Self::KhronosPbrNeutral => 4,
             Self::AgXPunchy => 5,
+            Self::KhronosPbrNeutralNoToe => 6,
         }
     }
 
@@ -79,6 +94,7 @@ impl Tonemapper {
             Self::AgX => agx_display(agx_curve(c)),
             Self::KhronosPbrNeutral => pbr_neutral(c),
             Self::AgXPunchy => agx_punchy(c),
+            Self::KhronosPbrNeutralNoToe => pbr_neutral_no_toe(c),
         }
     }
 }
@@ -160,6 +176,21 @@ fn pbr_neutral(c_in: Vec3) -> Vec3 {
     c.lerp(Vec3::splat(new_peak), g)
 }
 
+/// `s3d_pbr_neutral_no_toe`: Neutral's roll-off, starting at 0.8, with no toe.
+fn pbr_neutral_no_toe(c_in: Vec3) -> Vec3 {
+    let mut c = c_in;
+    let start = 0.8;
+    let peak = c.max_element();
+    if peak < start {
+        return c;
+    }
+    let d = 1.0 - start;
+    let new_peak = 1.0 - d * d / (peak + d - start);
+    c *= new_peak / peak;
+    let g = 1.0 - 1.0 / (0.15 * (peak - new_peak) + 1.0);
+    c.lerp(Vec3::splat(new_peak), g)
+}
+
 /// PCG hash (`s3d_pcg` in `shaders/common/hash.wgsl`, bit-identical): the seed of every noise
 /// (dither, grain, particles) — see graphics spec §4.3.
 pub(crate) fn pcg(v: u32) -> u32 {
@@ -190,22 +221,27 @@ pub(crate) const HASH_WGSL: &str = include_str!("shaders/common/hash.wgsl");
 mod tests {
     use super::*;
 
-    const ALL: [Tonemapper; 6] = [
+    const ALL: [Tonemapper; 7] = [
         Tonemapper::None,
         Tonemapper::Reinhard,
         Tonemapper::AcesFitted,
         Tonemapper::AgX,
         Tonemapper::KhronosPbrNeutral,
         Tonemapper::AgXPunchy,
+        Tonemapper::KhronosPbrNeutralNoToe,
     ];
 
     #[test]
     fn ids_are_the_shader_constants() {
-        assert_eq!(ALL.map(Tonemapper::id), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(ALL.map(Tonemapper::id), [0, 1, 2, 3, 4, 5, 6]);
         for (t, name) in [
             (Tonemapper::AgX, "S3D_TM_AGX: u32 = 3u"),
             (Tonemapper::KhronosPbrNeutral, "S3D_TM_PBR_NEUTRAL: u32 = 4u"),
             (Tonemapper::AgXPunchy, "S3D_TM_AGX_PUNCHY: u32 = 5u"),
+            (
+                Tonemapper::KhronosPbrNeutralNoToe,
+                "S3D_TM_PBR_NEUTRAL_NO_TOE: u32 = 6u",
+            ),
         ] {
             assert!(OUTPUT_WGSL.contains(name), "{t:?}: {name}");
         }
@@ -264,6 +300,57 @@ mod tests {
         assert!(hot.max_element() <= 1.0 && hot.min_element() > 0.5, "{hot}");
         let grey = |t: Tonemapper| t.apply(Vec3::splat(0.18)).x;
         assert!((grey(Tonemapper::AgX) - 0.21).abs() < 0.01 && (grey(Tonemapper::AgXPunchy) - 0.125).abs() < 0.01);
+    }
+
+    /// game#9 and game#6: the dim, saturated colors of the reported captures through each
+    /// look (sRGB in → sRGB out). Neutral's toe crushes the weakest channel; the toe-less
+    /// Neutral passes them unchanged; AgX Punchy at +0.5 EV skews them toward the strongest
+    /// channel, which plain AgX with the `vivid` grading does far less.
+    #[test]
+    fn dim_saturated_colors() {
+        let to_u8 = |c: Vec3| c.to_array().map(|x| (crate::linear_to_srgb(x) * 255.0).round() as u8);
+        let lin = |s: [u8; 3]| Vec3::from_array(s.map(|v| crate::srgb_to_linear(v as f32 / 255.0)));
+        let teal = lin([21, 47, 65]);
+        assert_eq!(to_u8(Tonemapper::KhronosPbrNeutral.apply(teal)), [1, 40, 60]);
+        assert_eq!(to_u8(Tonemapper::KhronosPbrNeutralNoToe.apply(teal)), [21, 47, 65]);
+        // Unchanged below 0.8, rolled off above like Neutral (never above 1, white at 64).
+        for x in [0.0f32, 0.02, 0.18, 0.5, 0.79] {
+            let c = Vec3::new(x, 0.5 * x, 0.25 * x);
+            assert_eq!(Tonemapper::KhronosPbrNeutralNoToe.apply(c), c);
+        }
+        let hot = Tonemapper::KhronosPbrNeutralNoToe.apply(Vec3::new(64.0, 8.0, 1.0));
+        assert!(hot.min_element() > 0.8 && hot.max_element() <= 1.0, "{hot}");
+        // The M-1 magenta at 4 % (R:B 2.1), a dim teal and a red laser, at +0.5 EV (display
+        // sRGB): AgX Punchy crushes the magenta's green and the teal's red; AgX keeps them
+        // (milky); AgX with `ColorGrading::vivid` keeps them and is more saturated.
+        let e = 0.5f32.exp2();
+        let magenta = Vec3::new(0.84, 0.10, 0.40) * 0.04 * e;
+        let laser = Vec3::new(2.5, 0.625, 0.5) * e;
+        let vivid = crate::ColorGrading::vivid();
+        let look = |t: Tonemapper, g: bool, c: Vec3| to_u8(t.apply(if g { vivid.grade_hdr(c) } else { c }));
+        let sat = |c: [u8; 3]| {
+            let (lo, hi) = (
+                c.iter().min().copied().unwrap_or(0),
+                c.iter().max().copied().unwrap_or(0),
+            );
+            (hi - lo) as f32 / hi.max(1) as f32
+        };
+        let (punchy, plain, graded) = (
+            look(Tonemapper::AgXPunchy, false, magenta),
+            look(Tonemapper::AgX, false, magenta),
+            look(Tonemapper::AgX, true, magenta),
+        );
+        eprintln!("magenta: punchy {punchy:?}, AgX {plain:?}, AgX + vivid {graded:?}");
+        assert_eq!(punchy, [54, 0, 21]);
+        assert_eq!(plain, [70, 10, 41]);
+        assert_eq!(graded, [78, 8, 47]);
+        assert_eq!(look(Tonemapper::AgXPunchy, false, teal * e), [1, 36, 69]);
+        assert_eq!(look(Tonemapper::AgX, true, teal * e), [19, 66, 95]);
+        // The hue (R:B) stays within 5 % of plain AgX's; the saturation rises.
+        let rb = |c: [u8; 3]| c[0] as f32 / c[2] as f32;
+        assert!((rb(graded) / rb(plain) - 1.0).abs() < 0.05, "{graded:?} vs {plain:?}");
+        assert!(sat(graded) > sat(plain));
+        assert!(sat(look(Tonemapper::AgX, true, laser)) > sat(look(Tonemapper::AgX, false, laser)));
     }
 
     #[test]

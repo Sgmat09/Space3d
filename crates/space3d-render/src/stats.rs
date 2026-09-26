@@ -124,8 +124,14 @@ pub struct RenderStats {
     pub ibl_bake_passes: u32,
     /// Frame and post textures created this frame (0 in the steady state).
     pub textures_created: u32,
-    /// Bytes of the frame's and post's own render targets.
+    /// Bytes of the frame's and post's own render targets and of the directional shadow map
+    /// (textures only; see `docs/performance.md` for the driver memory each render pass holds
+    /// while its frame is in flight).
     pub target_bytes: u64,
+    /// Bytes of the lighting area's other GPU textures: uploaded cubemaps (skyboxes,
+    /// environment sources) and baked image-based lighting (specular and irradiance cubes),
+    /// every mip.
+    pub lighting_bytes: u64,
 }
 
 impl RenderStats {

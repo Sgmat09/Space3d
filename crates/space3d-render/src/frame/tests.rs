@@ -1970,6 +1970,7 @@ fn tonemapper_cpu_mirror_matches_gpu() {
         Tonemapper::AgX,
         Tonemapper::KhronosPbrNeutral,
         Tonemapper::AgXPunchy,
+        Tonemapper::KhronosPbrNeutralNoToe,
     ] {
         for exposure in [1.0f32, 0.25] {
             app.resources.expect_mut::<Renderer>().frame.force_output =
@@ -1992,7 +1993,7 @@ fn tonemapper_cpu_mirror_matches_gpu() {
             }
         }
     }
-    assert_eq!(checked, 6 * 2 * 16);
+    assert_eq!(checked, 7 * 2 * 16);
     assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
 }
 

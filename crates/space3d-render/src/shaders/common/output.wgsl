@@ -12,6 +12,7 @@ const S3D_TM_ACES: u32 = 2u;
 const S3D_TM_AGX: u32 = 3u;
 const S3D_TM_PBR_NEUTRAL: u32 = 4u;
 const S3D_TM_AGX_PUNCHY: u32 = 5u;
+const S3D_TM_PBR_NEUTRAL_NO_TOE: u32 = 6u;
 
 fn s3d_luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -104,6 +105,21 @@ fn s3d_pbr_neutral(c_in: vec3<f32>) -> vec3<f32> {
     return mix(c, vec3<f32>(new_peak), g);
 }
 
+// Khronos PBR Neutral's roll-off without its toe: unchanged below 0.8.
+fn s3d_pbr_neutral_no_toe(c_in: vec3<f32>) -> vec3<f32> {
+    var c = c_in;
+    let start = 0.8;
+    let peak = max(c.r, max(c.g, c.b));
+    if (peak < start) {
+        return c;
+    }
+    let d = 1.0 - start;
+    let new_peak = 1.0 - d * d / (peak + d - start);
+    c *= new_peak / peak;
+    let g = 1.0 - 1.0 / (0.15 * (peak - new_peak) + 1.0);
+    return mix(c, vec3<f32>(new_peak), g);
+}
+
 // HDR linear → display-linear 0..1 with operator `op` (`Tonemapper::id`).
 fn s3d_tonemap(op: u32, c_in: vec3<f32>) -> vec3<f32> {
     let c = max(c_in, vec3<f32>(0.0));
@@ -122,6 +138,9 @@ fn s3d_tonemap(op: u32, c_in: vec3<f32>) -> vec3<f32> {
         }
         case 5u: {
             return s3d_agx_punchy(c);
+        }
+        case 6u: {
+            return s3d_pbr_neutral_no_toe(c);
         }
         default: {
             return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));

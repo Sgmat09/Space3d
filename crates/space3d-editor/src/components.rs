@@ -216,11 +216,12 @@ pub(crate) const HDR_MODES: [(HdrMode, &str); 3] = [
 ];
 
 /// `Tonemapper` names.
-pub(crate) const TONEMAPPERS: [(Tonemapper, &str); 6] = [
+pub(crate) const TONEMAPPERS: [(Tonemapper, &str); 7] = [
     (Tonemapper::AgX, "AgX"),
     (Tonemapper::AgXPunchy, "AgXPunchy"),
     (Tonemapper::AcesFitted, "AcesFitted"),
     (Tonemapper::KhronosPbrNeutral, "KhronosPbrNeutral"),
+    (Tonemapper::KhronosPbrNeutralNoToe, "KhronosPbrNeutralNoToe"),
     (Tonemapper::Reinhard, "Reinhard"),
     (Tonemapper::None, "None"),
 ];
@@ -342,6 +343,7 @@ struct BloomRepr {
     composite: String,
     mip_count: u32,
     max_mip_height: u32,
+    min_rect_height: u32,
 }
 
 impl Default for BloomRepr {
@@ -361,6 +363,7 @@ impl BloomRepr {
             composite: name_of(&BLOOM_COMPOSITE, b.composite),
             mip_count: b.mip_count,
             max_mip_height: b.max_mip_height,
+            min_rect_height: b.min_rect_height,
         }
     }
     fn value(&self) -> Bloom {
@@ -373,6 +376,7 @@ impl BloomRepr {
             composite: value_of(&BLOOM_COMPOSITE, &self.composite),
             mip_count: self.mip_count,
             max_mip_height: self.max_mip_height,
+            min_rect_height: self.min_rect_height,
         }
     }
 }

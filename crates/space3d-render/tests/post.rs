@@ -43,6 +43,11 @@ fn bloom_off_in_ldr_fallback() {
 }
 
 #[test]
+fn bloom_skips_small_rects() {
+    cases::bloom_skips_small_rects(headless_app);
+}
+
+#[test]
 fn transparent_rt_bloom_weighted_by_alpha() {
     cases::transparent_rt_bloom_weighted_by_alpha(headless_app);
 }
@@ -186,4 +191,9 @@ fn resize_reallocates_once_and_stays_bounded() {
 #[test]
 fn a_lost_device_degrades_with_every_effect() {
     hardening::a_lost_device_degrades_with_every_effect(headless_app);
+}
+
+#[test]
+fn wide_split_is_a_spectrum() {
+    cases::wide_split_is_a_spectrum(headless_app);
 }

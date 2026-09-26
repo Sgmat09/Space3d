@@ -94,6 +94,11 @@ fn gl_bloom_off_in_ldr_fallback() {
 }
 
 #[test]
+fn gl_bloom_skips_small_rects() {
+    cases::bloom_skips_small_rects(gl_app);
+}
+
+#[test]
 fn gl_transparent_rt_bloom_weighted_by_alpha() {
     cases::transparent_rt_bloom_weighted_by_alpha(gl_app);
 }
@@ -312,4 +317,9 @@ fn gl_resize_reallocates_once_and_stays_bounded() {
 #[test]
 fn gl_a_lost_device_degrades_with_every_effect() {
     hardening::a_lost_device_degrades_with_every_effect(gl_app);
+}
+
+#[test]
+fn gl_wide_split_is_a_spectrum() {
+    cases::wide_split_is_a_spectrum(gl_app);
 }

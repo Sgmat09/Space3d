@@ -229,7 +229,22 @@ pub(super) struct Target {
     pub storage: Option<(wgpu::TextureFormat, bool)>,
 }
 
+/// Bytes of a texture of `format`, mip 0 `w` × `h` × `layers`, with `mips` levels.
+pub(super) fn texture_bytes(format: wgpu::TextureFormat, (w, h): (u32, u32), layers: u32, mips: u32) -> u64 {
+    let texel = format.block_copy_size(None).unwrap_or(4) as u64;
+    (0..mips)
+        .map(|m| ((w >> m).max(1) as u64) * ((h >> m).max(1) as u64))
+        .sum::<u64>()
+        * texel
+        * layers as u64
+}
+
 impl Target {
+    /// Bytes of the cube with every mip.
+    pub fn bytes(&self) -> u64 {
+        texture_bytes(self.format, (self.size, self.size), 6, self.mips)
+    }
+
     /// A cube of `format`; with `compute` (and a storage-capable format), written by compute
     /// dispatches — an `Rgba8UnormSrgb` cube is then an `Rgba8Unorm` texture viewed as sRGB.
     pub fn cube(
@@ -927,6 +942,21 @@ pub(super) struct Env {
 }
 
 impl Env {
+    /// Bytes of its specular and irradiance cubes (every mip).
+    pub fn bytes(&self) -> u64 {
+        self.textures
+            .iter()
+            .map(|t| {
+                texture_bytes(
+                    t.format(),
+                    (t.width(), t.height()),
+                    t.depth_or_array_layers(),
+                    t.mip_level_count(),
+                )
+            })
+            .sum()
+    }
+
     /// Plan the bake of `cube` with `key` (textures and every step; nothing recorded yet), by
     /// compute dispatches with `compute`, else by fragment passes.
     #[allow(clippy::too_many_arguments)]

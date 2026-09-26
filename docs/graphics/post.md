@@ -147,7 +147,9 @@ by a **reference chain** of `mip_count` levels of heights `max_mip_height / 2^k`
 rect gets with the defaults (540, 270, … 17 px). A smaller rect keeps those heights: it drops the
 `n` finest reference levels, where `2^n` is the power of two nearest to
 `max_mip_height / (rect height / 2)`, and its level 0 (`max_mip_height / 2^n` high, within √2 of
-half the rect, never above the rect's own size) stands for them; their weights merge into it
+half the rect, but **never above half the rect**: a larger level 0 would only be resampled up
+from the prefilter's half-resolution output, a bigger target and a pass for no detail — High's
+720 cap gave a 1280 × 720 level 0 at 1080p, more passes and memory than Ultra) stands for them; their weights merge into it
 (the upsample into level 0 blends with `scatter^(n + 1)`), so every level keeps its reference
 weight. The halo's size and energy relative to the frame are the same from 180p to 4K (only the
 tight glow of the merged levels widens), and smaller rects cost fewer passes.
@@ -247,9 +249,9 @@ worth.
 
 ### Cost
 
-Render passes per post group: `2 × levels − 1`, one more for the resample where level 0 is not
-half the rect (11 for the default 6 levels at 1080p, 12 at 1440p and 4K, 10 at 720p, 6 at 180p)
-plus the composite. Their uniforms (one 64-byte slot per pass) are written when the settings or
+Render passes per post group: `2 × levels − 1`, one more for the resample where level 0 is
+smaller than half the rect (11 for the default 6 levels at 1080p, 12 at 1440p and 4K, 10 at
+720p, 6 at 180p; High's 7 levels 13 and Ultra's 8 levels 15 at 1080p) plus the composite. Their uniforms (one 64-byte slot per pass) are written when the settings or
 the rect change, and the per-frame seeds of grain and dither a
 window of 64 frames at a time: a still scene uploads nothing except that window (16 KiB per post
 group, every 64th frame). The steady state creates no textures and reallocates nothing
@@ -290,6 +292,26 @@ lookups and allocates nothing); FXAA adds one more pass, about 0.01 ms. It is ab
 pass of dependent dispatches on class A backends, the render-pass chain kept for WebGL2) would
 cut the CPU, the GPU pass overhead and the per-pass driver memory, and is the planned follow-up
 (not in M2).
+
+### Small views: UI previews and thumbnails
+
+Every render-target camera with a `PostProcess` is a post group of its own, and a chain costs
+its passes, not its pixels (above): a 320 × 192 preview pays about 9 bloom passes plus its
+composite, nearly what the main view pays, for a glow a few pixels wide. Four such previews
+next to a 1280 × 720 main view made the frame 47 render passes against 11 without them
+(SpaceCorps2027's shop, game#15; the Battle's two 256² previews would add 22 passes and put its
+CPU over the 1.5 ms gate, so they render without post). For views shorter than about 240 px:
+
+* turn bloom off on them (`PostProcess::default().without_bloom()`), or keep one
+  `PostProcess` for every camera and set `Bloom::min_rect_height`
+  (`Bloom::glow().with_min_rect_height(240)`): groups whose rect (scene-texture pixels, after
+  the render scale) is shorter get no chain and pay the composite only
+  (`tests/post.rs::bloom_skips_small_rects`);
+* or render them without `PostProcess` at all (Direct mode: no scene texture, no composite).
+
+`min_rect_height` defaults to 0 (every group blooms), so nothing changes for existing cameras.
+Level 0 is never larger than half the rect, so small groups also skip the resample pass they
+used to pay (a 320 × 192 group: 8 passes where it had 9).
 
 ### Gate
 
@@ -334,6 +356,15 @@ luminance to middle grey (0.18) and is clamped to `min_ev..=max_ev`:
 * **Black is not metered** (luminance below 2⁻¹⁶): a starfield on black is exposed for its ships,
   planets and nebulae, not brightened for the void. A frame with nothing metered holds the
   exposure.
+* **A skybox is metered.** Only black is skipped: an HDR sky (a nebula cubemap) is scene
+  luminance like any other, and where it covers most of the frame it sets the exposure. The
+  Battle with `AutoExposure::on()` and no compensation meters its dim nebula to middle grey:
+  mean luma 107.6 at 720p against 59.1 for its authored manual look (the hulls wash out pastel,
+  the nebula turns milky; 77.4 with compensation −1). For sky scenes keep the manual exposure,
+  or give auto exposure a negative compensation (−1 to −1.5 for a dim nebula) and a low
+  `max_ev` (for example 1) so a frame of mostly sky cannot brighten past the authored look.
+  Weighting the sky down needs scene depth in the metering, which post groups do not read yet:
+  `AutoExposure` has no sky weight in this version (deferred).
 * **Percentile window** (compute path): the darkest `low_percentile` (10 %) and the brightest
   `1 − high_percentile` (10 %) of the metered weight are cut, so a small very bright light or a
   deep shadow does not swing the exposure.

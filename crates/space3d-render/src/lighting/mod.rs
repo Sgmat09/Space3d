@@ -328,6 +328,13 @@ impl Lighting {
             self.envs[index].last_used = frame;
             self.camera_envs.push((camera, index));
         }
+        cx.stats.lighting_bytes += self.envs.iter().map(Env::bytes).sum::<u64>()
+            + cx.assets
+                .cubemaps
+                .iter()
+                .filter_map(|(_, e)| e.gpu.as_ref())
+                .map(|g| g.bytes)
+                .sum::<u64>();
 
         // Record: every upload step, then bake steps within the budget (a render pass each on
         // the fragment path, dispatches in one compute pass on the compute path).
@@ -491,6 +498,8 @@ impl Lighting {
                 }
                 if let Some(m) = &mut self.shadow_map {
                     m.last_used = self.frame;
+                    // A render target of the frame like the others (`Depth32Float`).
+                    stats.target_bytes += 4 * m.size as u64 * m.size as u64;
                 }
             }
             None => {

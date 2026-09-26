@@ -23,7 +23,6 @@ const LMS_TO_LIN: Mat3 = Mat3::from_cols(
 /// Rec. 709 luma (the saturation's grey).
 const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 /// Middle grey: contrast pivots around it (log2 space; `post_grade_hdr`).
-#[cfg(test)]
 pub(crate) const PIVOT: f32 = 0.18;
 
 /// LMS of the reference white shifted by `temperature` and `tint` (−1..1 each): the CIE xy of
@@ -95,7 +94,6 @@ fn finite(v: f32, or: f32) -> f32 {
 }
 
 /// CPU mirror of the composite's HDR grading (`post_grade_hdr`): linear HDR in and out.
-#[cfg(test)]
 pub(crate) fn grade_hdr(c: Vec3, g: &ColorGrading) -> Vec3 {
     let c = (hdr_matrix(g) * c).max(Vec3::ZERO);
     let k = contrast(g);

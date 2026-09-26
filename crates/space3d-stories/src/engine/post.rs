@@ -674,21 +674,23 @@ fn color_grading() -> Story {
     .size(320, 180)
 }
 
-const TONEMAPPER_NAMES: [&str; 6] = [
+const TONEMAPPER_NAMES: [&str; 7] = [
     "None",
     "Reinhard",
     "ACES fitted",
     "AgX",
     "Khronos PBR Neutral",
     "AgX punchy",
+    "Khronos PBR Neutral, no toe",
 ];
-const TONEMAPPER_CHOICES: [Tonemapper; 6] = [
+const TONEMAPPER_CHOICES: [Tonemapper; 7] = [
     Tonemapper::None,
     Tonemapper::Reinhard,
     Tonemapper::AcesFitted,
     Tonemapper::AgX,
     Tonemapper::KhronosPbrNeutral,
     Tonemapper::AgXPunchy,
+    Tonemapper::KhronosPbrNeutralNoToe,
 ];
 
 fn tonemappers() -> Story {

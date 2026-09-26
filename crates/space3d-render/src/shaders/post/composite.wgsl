@@ -201,6 +201,10 @@ fn post_distortion(s: vec2<f32>) -> vec2<f32> {
 // Red and blue apart from green, which is sampled at `s0 + ds`: chromatic aberration (radially
 // from the rect's center, growing with r²: `lens.x` puts intensity × 2 % of the rect width at
 // the corners) and the distortion's spectral split (R and B at (1 ∓ lens.w) × the offset `ds`).
+// Up to 1.5 px from green, red and blue are single taps; further apart a spectrum of taps at
+// most a pixel apart (up to 25) spans the split, red fading into green into blue, so a star
+// under a strong shockwave or at a corner smears into a small rainbow instead of splitting into
+// separate red, green and blue dots.
 fn post_chromatic(s0: vec2<f32>, ds: vec2<f32>, c: vec4<f32>) -> vec4<f32> {
     var off = vec2<f32>(0.0);
     if (post_has(S3D_POST_CA)) {
@@ -208,9 +212,29 @@ fn post_chromatic(s0: vec2<f32>, ds: vec2<f32>, c: vec4<f32>) -> vec4<f32> {
         off = d * (dot(d, d) * post.lens.x);
     }
     let k = post.lens.w;
-    let r = post_scene_bilinear(s0 + ds * (1.0 - k) - off).r;
-    let b = post_scene_bilinear(s0 + ds * (1.0 + k) + off).b;
-    return vec4<f32>(r, c.g, b, c.a);
+    // Half the red–blue split, in S pixels.
+    let v = ds * k + off;
+    if (dot(v, v) <= 2.25) {
+        let r = post_scene_bilinear(s0 + ds - v).r;
+        let b = post_scene_bilinear(s0 + ds + v).b;
+        return vec4<f32>(r, c.g, b, c.a);
+    }
+    // Taps at t = k / m, k = −m … m: at most a pixel apart.
+    let m = i32(min(ceil(length(v)), 12.0));
+    var sum = vec3<f32>(0.0);
+    var weight = vec3<f32>(0.0);
+    for (var k = -m; k <= m; k++) {
+        let t = f32(k) / f32(m);
+        // Tents: red on the −v side, green in the middle, blue on the +v side.
+        let w = vec3<f32>(max(-t, 0.0), 1.0 - abs(t), max(t, 0.0));
+        var x = c.rgb;
+        if (k != 0) {
+            x = post_scene_bilinear(s0 + ds + v * t).rgb;
+        }
+        sum += w * x;
+        weight += w;
+    }
+    return vec4<f32>(sum / weight, c.a);
 }
 
 // Vignette multiplier at `uv` (0..1 over the rect in D): 1 inside, `vignette_color` × intensity

@@ -324,13 +324,10 @@ pub mod cases {
         let dim = quad(&mut app, Vec3::splat(0.8), Vec2::new(0.0, 0.0), size);
         let cam = camera(&mut app, 0.0, BLACK, Some(post(hard())));
         let bloomed = render(&mut app);
-        // A 128 × 64 rect: the reference chain's 34-px level (standing for the four finer ones,
-        // resampled from the prefilter's 32-px half of the rect) and its 17-px level.
-        assert_eq!(
-            stats(&app).post_passes,
-            5,
-            "prefilter, resample, 1 down, 1 up, composite"
-        );
+        // A 128 × 64 rect: the reference chain's 34-px level (standing for the four finer ones)
+        // is taken at the prefilter's 32-px half of the rect (never resampled up), then a 16-px
+        // level.
+        assert_eq!(stats(&app).post_passes, 4, "prefilter, 1 down, 1 up, composite");
         set_post(&mut app, cam, post(hard()).without_bloom());
         let plain = render(&mut app);
         assert_eq!(stats(&app).post_passes, 1);
@@ -526,7 +523,7 @@ pub mod cases {
         quad(&mut app, Vec3::splat(8.0), Vec2::ZERO, Vec2::splat(0.25));
         let cam = camera(&mut app, 0.0, BLACK, Some(post(Bloom::glow())));
         let hdr = render(&mut app);
-        assert_eq!(stats(&app).post_passes, 5);
+        assert_eq!(stats(&app).post_passes, 4);
         assert!(max_outside(&hdr, [60, 28, 8, 8], 0) > 0.05, "Hdr: bloom");
         frame_settings(&mut app).downlevel.no_float_targets = true;
         let ldr = render(&mut app);
@@ -543,6 +540,26 @@ pub mod cases {
             .unwrap();
         assert_eq!(render(&mut app), ldr);
         assert_eq!(stats(&app).post_passes, 1);
+    }
+
+    /// game#15: a post group shorter than `Bloom::min_rect_height` gets no bloom chain (a UI
+    /// preview pays its composite only): exactly the image without bloom, one post pass.
+    pub fn bloom_skips_small_rects(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        quad(&mut app, Vec3::splat(8.0), Vec2::ZERO, Vec2::splat(0.25));
+        let cam = camera(&mut app, 0.0, BLACK, Some(post(Bloom::glow())));
+        render(&mut app);
+        assert!(stats(&app).post_passes > 1, "bloom at the default");
+        set_post(&mut app, cam, post(Bloom::glow()).without_bloom());
+        let plain = render(&mut app);
+        set_post(&mut app, cam, post(Bloom::glow().with_min_rect_height(H + 1)));
+        let skipped = render(&mut app);
+        assert_eq!(stats(&app).post_passes, 1, "composite only");
+        assert_eq!(skipped, plain, "exactly no bloom");
+        set_post(&mut app, cam, post(Bloom::glow().with_min_rect_height(H)));
+        render(&mut app);
+        assert!(stats(&app).post_passes > 1, "a rect of exactly the height blooms");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
     }
 
     /// A render target cleared transparent: the composite weights bloom by the scene alpha, so
@@ -609,8 +626,8 @@ pub mod cases {
         let first = render(&mut app);
         let s = stats(&app);
         // 64 × 64 rects: the reference chain's 540 / 2^4 = 34-px level stands for the four
-        // finer ones (resampled from the prefilter's 32 × 32), then its 17-px level: two levels.
-        assert_eq!(s.post_passes, 2 * (2 * 2 - 1 + 1 + 1), "{s:?}");
+        // finer ones (taken at the prefilter's 32 × 32), then a 16-px level: two levels.
+        assert_eq!(s.post_passes, 2 * (2 * 2 - 1 + 1), "{s:?}");
         let with_bloom = s.target_bytes;
         set_post(&mut app, left, post(Bloom::glow()).without_bloom());
         set_post(&mut app, right, PostProcess::default().without_bloom());
@@ -618,10 +635,10 @@ pub mod cases {
         let no_bloom = stats(&app).target_bytes;
         set_post(&mut app, left, post(Bloom::glow()));
         set_post(&mut app, right, PostProcess::default());
-        // One shared chain and half-resolution texture: 34² + 17² + 32² = 2469 pixels of 4
-        // (Rg11b10Ufloat) or 8 (Rgba16Float) bytes.
+        // One shared chain whose level 0 is the half rect (no separate half-resolution
+        // texture): 32² + 16² = 1280 pixels of 4 (Rg11b10Ufloat) or 8 (Rgba16Float) bytes.
         let chain = with_bloom - no_bloom;
-        assert!(chain == 2469 * 4 || chain == 2469 * 8, "{chain} bytes of bloom chain");
+        assert!(chain == 1280 * 4 || chain == 1280 * 8, "{chain} bytes of bloom chain");
         for _ in 0..4 {
             render(&mut app);
         }
@@ -666,7 +683,7 @@ pub mod cases {
             ("2.65×, capped (1440p)", 68, 12),
             ("4×, capped (4K)", 45, 10),
             ("2.65×, merged levels (720p)", 540, 6),
-            ("1.67× (900p)", 108, 12),
+            ("2×, the half rect (900p: never resampled up)", 108, 11),
         ] {
             let bloom = Bloom {
                 max_mip_height,
@@ -728,7 +745,7 @@ pub mod cases {
         };
         set_path(&mut app, DrawPath::CpuDirect);
         assert_eq!(render(&mut app), full);
-        assert_eq!(stats(&app).post_passes, 5);
+        assert_eq!(stats(&app).post_passes, 4);
         frame_settings(&mut app).downlevel = DownlevelOverride::webgl2();
         render(&mut app);
         assert_eq!(stats(&app).post_passes, 1, "Ldr fallback: no bloom");
@@ -980,6 +997,41 @@ pub mod cases {
         assert!(split(100, 128, 0, 24) > 0.5, "corner: {}", split(100, 128, 0, 24));
     }
 
+    /// A wide split (strong chromatic aberration at a corner, or a strong distortion writer
+    /// with `Distortion::chromatic`) smears a point into a spectrum — red into green into blue
+    /// — instead of three separate pure red, green and blue dots (reviewer round M2: stars
+    /// under a warp shockwave read as confetti).
+    pub fn wide_split_is_a_spectrum(make: MakeApp) {
+        // 512 × 256: full chromatic aberration splits the corners by 10 px (intensity × 2 % of
+        // the width), the point below by about 11 px (5.7 each way).
+        let (w, h) = (512, 256);
+        let Some(mut app) = make(w, h) else { return };
+        // A dim point (nothing clamps) near the top-right corner.
+        quad(&mut app, Vec3::splat(0.6), Vec2::new(1.7, 0.75), Vec2::splat(0.02));
+        camera(&mut app, 0.0, BLACK, Some(plain().with_chromatic_aberration(1.0)));
+        let img = render(&mut app);
+        // Lit pixels whose second strongest channel is under a tenth of the strongest ("pure"
+        // red, green or blue dots) against the others.
+        let (mut pure, mut mixed) = (0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let c = lin(&img, x, y);
+                let mut v = [c.x, c.y, c.z];
+                v.sort_by(f32::total_cmp);
+                if v[2] > 0.004 {
+                    if v[1] < 0.1 * v[2] {
+                        pure += 1;
+                    } else {
+                        mixed += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("split pixels: {pure} of one channel, {mixed} mixed");
+        assert!(mixed > 2 * pure && mixed > 6, "{pure} pure, {mixed} mixed");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
     /// Chromatic aberration and FXAA taps stay inside their post group: a white half never
     /// lights the black one, either way round.
     pub fn lens_effects_do_not_bleed_across_viewports(make: MakeApp) {
@@ -1092,8 +1144,8 @@ pub mod cases {
         render(&mut app);
         assert_eq!(
             stats(&app).post_passes,
-            4 + 2,
-            "bloom (2 levels, resampled), composite, FXAA"
+            3 + 2,
+            "bloom (2 levels at the half rect), composite, FXAA"
         );
         let texture = {
             let assets = app.resources.expect::<RenderAssets>();

@@ -35,7 +35,8 @@ applies the exposure and the tonemapper and writes the display target. Tonemappe
 | `AgXPunchy` | AgX with Sobotka's "punchy" look (power 1.35, saturation 1.4 in AgX's log space): saturated emissives and effects keep their hue (a red laser stays red, blue exhaust blue) at the cost of darker mid tones (0.18 → 0.12 display-linear, 0.21 with `AgX`); a game look for effect-heavy scenes |
 | `AcesFitted` | Stephen Hill's filmic ACES fit (contrasty) |
 | `Reinhard` | luminance Reinhard: hue-preserving, never reaches white |
-| `KhronosPbrNeutral` | faithful base colors (UI and product previews) |
+| `KhronosPbrNeutral` | faithful base colors (UI and product previews), highlights rolled off from 0.76; its **toe** crushes dim saturated colors (below) |
+| `KhronosPbrNeutralNoToe` | Neutral without the toe: unchanged below 0.8, the same roll-off above — display-authored art (skies, paint, previews) keeps its exact values |
 | `None` | clamp to 0..1 (with exposure 0: the legacy look through the HDR path, `PostProcess::passthrough()`) |
 
 **Choose the look explicitly.** `AgX` is the default because it is safe for any content: dim
@@ -56,6 +57,27 @@ PostProcess::default()
 (the exposure also lowers the bloom threshold by half a stop: bloom works in exposed units);
 keep `AgX` for dim, atmospheric scenes and menus.
 
+**Dim saturated colors (skies, nebulae).** The punchy look's power and saturation work in AgX's
+curve space, where a dim color sits in the toe: they push its channels apart and crush the
+weakest one. KhronosPbrNeutral's toe subtracts `x − 6.25·x²` from every channel of a color
+whose weakest channel `x` is below 0.08 (0.04 above), nearly all of that channel. Measured
+(sRGB out; `output::tests::dim_saturated_colors`, the GPU composite matches within 2 levels):
+
+| input | `AgXPunchy` +0.5 EV | `AgX` +0.5 EV | `AgX` + `ColorGrading::vivid()` +0.5 EV | `KhronosPbrNeutral` | `KhronosPbrNeutralNoToe` |
+|---|---|---|---|---|---|
+| dim magenta nebula, linear (0.84, 0.10, 0.40) × 0.04 (R:B 2.1) | (54, 0, 21): R:B 4.8 linear, green crushed (4.8 at × 0.04, 6.3 at × 0.02, 8.1 at × 0.01) | (70, 10, 41) | (78, 8, 47) | — | — |
+| dim teal, sRGB (21, 47, 65) | (1, 36, 69) | (25, 62, 89) | (19, 66, 95) | (1, 40, 60) | (21, 47, 65) |
+| red laser, linear (2.5, 0.625, 0.5) | (253, 180, 167) | (241, 200, 193) | (241, 193, 183) | — | — |
+
+So a scene whose backdrop is a dim saturated sky has three honest choices: `AgXPunchy` + 0.5 EV
+for effects that stay saturated, knowing the sky skews toward its strongest channel (the
+reference Battle does this); `AgX` with `ColorGrading::vivid()` (saturation 1.2, contrast 0.95
+before the tonemapper: the sky keeps its hue and gains saturation, bright emissives gain less
+than with Punchy); or `KhronosPbrNeutralNoToe` for art authored for the display, which passes
+through unchanged below 0.8 (no full-frame lift needed to undo Neutral's toe; post's
+`ColorGrading::lift` runs after the tonemapper on encoded color, so it cannot restore a crushed
+channel: +0.018 lifts the teal to about (6, 44, 65), not 21 red).
+
 `Tonemapper::apply` is the CPU mirror of every curve (tests, UI previews). Radiance 1.0 is
 diffuse white at exposure 0; clear colors are radiance too, so they are exposed and tonemapped
 like everything else (`Tonemapper::None` reproduces them).
@@ -65,9 +87,8 @@ menus, A/B comparisons). With either off the camera renders as if it had no `Pos
 
 The composite dithers by default (±1 LSB, seeded by `Time::frame`: `render_to_image` twice gives
 the same image; `dither: false` turns it off). Bloom (`Bloom::glow()` by default), FXAA,
-vignette, chromatic aberration and film grain are configured on the same `PostProcess`
-(`docs/graphics/post.md`); auto exposure, color grading and distortion arrive with the remaining
-post milestones. Whatever is drawn into the HDR scene texture feeds bloom: emissive materials,
+vignette, chromatic aberration, film grain, auto exposure, color grading and distortion are
+configured on the same `PostProcess` (`docs/graphics/post.md`). Whatever is drawn into the HDR scene texture feeds bloom: emissive materials,
 render nodes in the scene phases, `OverlayStage::HdrScene` overlays and particles (the
 `Engine/Frame/Particles Bloom` story: additive sprites above the threshold glow, dim ones do not).
 

@@ -112,7 +112,7 @@ impl PostProcess {
     }
 
     /// Adjust only the performance-relevant fields to a tier: bloom mips and first-level height
-    /// (Low 4 / 270, Medium 6 / 540, High 7 / 720, Ultra 8 / 1080), the FXAA quality when FXAA
+    /// (Low 4 / 270, Medium 6 / 540, High 7 / 720, Ultra 8 / 720), the FXAA quality when FXAA
     /// is on, and no chromatic aberration on Low. [`GraphicsQuality::post`] applies the whole
     /// tier (anti-aliasing, auto exposure and lens effects too).
     pub fn with_quality(mut self, q: GraphicsQuality) -> Self {
@@ -120,7 +120,7 @@ impl PostProcess {
             GraphicsQuality::Low => (4, 270, FxaaQuality::Low),
             GraphicsQuality::Medium => (6, 540, FxaaQuality::Medium),
             GraphicsQuality::High => (7, 720, FxaaQuality::High),
-            _ => (8, 1080, FxaaQuality::Ultra),
+            _ => (8, 720, FxaaQuality::Ultra),
         };
         self.bloom.mip_count = mips;
         self.bloom.max_mip_height = height;
@@ -305,6 +305,12 @@ pub struct Bloom {
     pub mip_count: u32,
     /// Height cap of the first (half-resolution) level. Default 540.
     pub max_mip_height: u32,
+    /// Post groups whose rect (in scene-texture pixels, after the render scale) is shorter
+    /// than this get no bloom. Default 0 (always bloom). A chain costs its render passes,
+    /// not its pixels: about 9 per group whatever its size, so a small render-target preview
+    /// with post pays nearly what the main view does for a glow a few pixels wide. 240 skips
+    /// it for UI previews and thumbnails (docs/graphics/post.md, "Small views").
+    pub min_rect_height: u32,
 }
 
 impl Default for Bloom {
@@ -325,6 +331,7 @@ impl Bloom {
             composite: BloomComposite::Additive,
             mip_count: 6,
             max_mip_height: 540,
+            min_rect_height: 0,
         }
     }
     /// Photographic veil: threshold 0, energy-conserving 0.15, scatter 0.85.
@@ -351,6 +358,11 @@ impl Bloom {
     /// Set [`Self::scatter`].
     pub fn with_scatter(mut self, s: f32) -> Self {
         self.scatter = s;
+        self
+    }
+    /// Set [`Self::min_rect_height`].
+    pub fn with_min_rect_height(mut self, pixels: u32) -> Self {
+        self.min_rect_height = pixels;
         self
     }
 }
@@ -661,6 +673,31 @@ impl ColorGrading {
     /// No-op grading (the composite skips it).
     pub fn is_neutral(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// A vivid look for plain [`Tonemapper::AgX`]: saturation 1.2 and contrast 0.95 in linear
+    /// HDR, before the tonemapper. AgX alone reads milky on saturated art; AgX Punchy (power
+    /// and saturation after the curve) is punchier but pushes **dim** saturated colors toward
+    /// their strongest channel. At +0.5 EV (sRGB out): a dim magenta nebula, linear
+    /// (0.84, 0.10, 0.40) × 0.04, is (54, 0, 21) through Punchy (green crushed, red skewed),
+    /// (70, 10, 41) through AgX and (78, 8, 47) through AgX + vivid (its hue kept, more
+    /// saturated); a dim teal (21, 47, 65) is (1, 36, 69), (25, 62, 89) and (19, 66, 95). Bright
+    /// emissives gain less than with Punchy (a red laser (2.5, 0.625, 0.5): (253, 180, 167)
+    /// Punchy, (241, 200, 193) AgX, (241, 193, 183) vivid) — docs/graphics/frame.md, "Choose
+    /// the look explicitly".
+    pub fn vivid() -> Self {
+        Self {
+            saturation: 1.2,
+            contrast: 0.95,
+            ..Self::default()
+        }
+    }
+
+    /// CPU mirror of the HDR part of the grading (white balance, saturation, contrast — what
+    /// the composite applies before the tonemapper): linear in, linear out. With
+    /// [`Tonemapper::apply`] it predicts a graded look's colors (UI previews, tests).
+    pub fn grade_hdr(&self, linear: Vec3) -> Vec3 {
+        super::grading::grade_hdr(linear, self)
     }
 }
 

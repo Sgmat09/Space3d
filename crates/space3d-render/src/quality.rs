@@ -11,7 +11,7 @@
 //! |---|---|---|---|---|
 //! | render scale (primary) | 0.75 | 1 | 1 | 1 |
 //! | MSAA / AA | 1 + FXAA Low | 4 on tile-based GPUs, else 1 + FXAA Medium | 4 | 4 |
-//! | bloom mips / max mip height | 4 / 270 | 6 / 540 | 7 / 720 | 8 / 1080 |
+//! | bloom mips / max mip height | 4 / 270 | 6 / 540 | 7 / 720 | 8 / 720 |
 //! | auto exposure | off | as authored | as authored | as authored |
 //! | chromatic aberration, film grain | off | as authored | as authored | as authored |
 //! | shadow map / filter | 1024 / Pcf4 | 2048 / Pcf9 | 2048 / Pcf16 | 4096 / Pcf16 |
@@ -115,7 +115,8 @@ impl GraphicsQuality {
 
     /// `base` with this tier's post settings when the camera renders with `msaa_samples`:
     /// * the bloom chain (`PostProcess::with_quality`: Low 4 / 270, Medium 6 / 540, High
-    ///   7 / 720, Ultra 8 / 1080) and the FXAA quality when FXAA is on;
+    ///   7 / 720, Ultra 8 / 720: High's chain plus a wider level) and the FXAA quality when
+    ///   FXAA is on;
     /// * anti-aliasing: Low FXAA Low; Medium FXAA Medium without MSAA; High and Ultra FXAA
     ///   High / Ultra without MSAA (a device without 4× MSAA), else as authored;
     /// * Low turns auto exposure, chromatic aberration and film grain off; the other tiers keep
@@ -433,7 +434,7 @@ mod tests {
             "no MSAA on the device: FXAA"
         );
         let ultra = Q::Ultra.post(authored);
-        assert_eq!(bloom(ultra), (8, 1080));
+        assert_eq!(bloom(ultra), (8, 720));
         assert_eq!(ultra.anti_aliasing, AntiAliasing::Fxaa(FxaaQuality::Ultra));
         let grain = FilmGrain {
             enabled: true,
