@@ -54,6 +54,25 @@ fn fbm(x: f32, y: f32, seed: u32) -> f32 {
     sum / 0.9375
 }
 
+/// Four octaves of value noise (0..1) whose domains are each rotated (by about 37°) and offset
+/// against the previous one: the lattices of the octaves never line up, so a finite difference
+/// of it (the smoke's lighting) shows billows instead of the axis-aligned lattice's 45° streaks.
+fn fbm_rotated(x: f32, y: f32, seed: u32) -> f32 {
+    let (c, s) = (0.8f32, 0.6f32);
+    let (mut px, mut py) = (c * x - s * y, s * x + c * y);
+    let mut sum = 0.0;
+    let mut amp = 0.5;
+    let mut f = 1.0;
+    for o in 0..4u32 {
+        let k = o as f32;
+        sum += amp * noise(px * f + 17.31 * k, py * f + 9.13 * k, seed.wrapping_add(o * 0x9E37));
+        (px, py) = (c * px - s * py, s * px + c * py);
+        f *= 2.03;
+        amp *= 0.5;
+    }
+    sum / 0.9375
+}
+
 fn srgb(c: f32) -> u8 {
     let c = c.clamp(0.0, 1.0);
     let s = if c <= 0.003_130_8 {
@@ -136,9 +155,11 @@ fn texel(kind: BuiltinTexture, frame: u32, frames: u32, x: f32, y: f32) -> ([f32
             let grow = 0.6 + 0.4 * p;
             let (sx, sy) = (x / grow, y / grow);
             let rs = (sx * sx + sy * sy).sqrt();
-            let n = fbm(sx * 2.0 + p * 0.9, sy * 2.0 + p * 0.6, 0x5a0c_e5ed);
-            let lit = n - fbm(sx * 2.0 + p * 0.9 + 0.12, sy * 2.0 + p * 0.6 + 0.16, 0x5a0c_e5ed);
-            let density = smoothstep(1.0, 0.3, rs + (n - 0.5) * 0.9);
+            let n = fbm_rotated(sx * 2.0 + p * 0.9, sy * 2.0 + p * 0.6, 0x5a0c_e5ed);
+            let lit = n - fbm_rotated(sx * 2.0 + p * 0.9 + 0.12, sy * 2.0 + p * 0.6 + 0.16, 0x5a0c_e5ed);
+            // Faded out before the quad's edge (r = 1 at the edge midpoints): a late, spread puff
+            // whose noise reaches past it would otherwise show the quad's straight edges.
+            let density = smoothstep(1.0, 0.3, rs + (n - 0.5) * 0.9) * smoothstep(1.0, 0.8, r);
             let shade = (0.62 + 0.5 * (n - 0.5) + lit * 2.2).clamp(0.3, 1.0);
             ([shade, shade, shade * 1.02], density * (1.0 - 0.6 * p))
         }
