@@ -119,8 +119,11 @@ pixel up to a 3-pixel box), so every pixel keeps its energy wherever it sits
 (`post::bloom::tests::resample_keeps_every_pixel_energy`; on the GPU,
 `bloom_halo_is_independent_of_position` in `tests/post.rs` and `tests/gl_post.rs`: a 1 px
 source's halo stays within 5 % over 12 positions at every ratio, 0.5–3 % measured). It costs
-one more render pass and a pooled texture (below); the chain's GPU time is unchanged within the
-measurement noise (it is bound by its dependent passes, see "Cost").
+one more render pass, a pooled texture (below) and GPU time where the half rect is larger than
+level 0: nothing at 1080p (no resample), +4 % at 1440p, +25 % at the `GraphicsQuality::Low` rect
+of T3 (1440 × 810: the prefilter writes 720 × 405 instead of 480 × 270) and +40 % at 4K (1920 ×
+1080 instead of 960 × 540) — best-of chain times 0.152 → 0.158, 0.081 → 0.101 and 0.145 →
+0.204 ms against the pre-change chain (M1 review round 3, interleaved sweeps; "Cost").
 
 | rect | chain (level 0, levels; prefilter target) | bloom-added mean luma, `Engine/Post/Bloom` (before the half-rect prefilter; before the reference heights) |
 |---|---|---|
@@ -190,6 +193,14 @@ frames. `RenderStats::target_bytes` counts them once per frame.
 | 1280 × 720 (480 × 270, the 540 level merged; half 640 × 360) | 5 | 0.7 + 0.9 = 1.6 MB | 3.2 MB |
 | 1440 × 810, `GraphicsQuality::Low` (480 × 270; half 720 × 405) | 4 | 0.7 + 1.2 = 1.9 MB | 3.7 MB |
 
+These are the textures. Each of the chain's render passes also holds GPU driver memory while
+its frame is in flight — on Metal about 2.8 MB per pass per frame in flight, whatever the
+attachment's size — which `target_bytes` does not count: the default chain's 11–12 passes add
+about 60 MB to the process at 1080p with one frame in flight and 148 MB with three (a window keeps
+two to three), against 2.7 MB of `target_bytes` (`frame.md` "Cost"; `tests/footprint.rs`
+checks it). A compute chain (one compute pass of dependent dispatches, below) would hold one
+pass's worth.
+
 ### Cost
 
 Render passes per post group: `2 × levels − 1`, one more for the resample where level 0 is not
@@ -215,6 +226,11 @@ of its first pass to the end of its last, best of 40:
 | `GraphicsQuality::Low` settings at 1080p (4 levels, level 0 480 × 270) | 0.08 ms |
 | `GraphicsQuality::High` (7 levels; level 0 still 960 × 540 at 1080p) | 0.17 ms |
 
+In real frames (`frame/ab`'s bloom sweep: the `post.bloom` scope of `GpuTimings`, medians of 48
+frames back to back, machine load ≈ 30, so above the best-of figures): 0.196 ms at 720p (11
+passes with the composite), 0.227 ms at 1080p, 0.254 ms at 1440p, 0.607 ms at 4K (the prefilter
+reads the whole 4K scene) and 0.122 ms for the Low chain at 1440 × 810.
+
 On this GPU the chain costs its 11 dependent render passes (about 14 µs each), not its pixels:
 a 128² chain costs as much as a 1080p one, and the two chain formats cost the same. When
 frames are isolated (the GPU idles between them and drops to low clocks) the same chain
@@ -222,9 +238,11 @@ measures about 0.45 ms; as for the composite (`frame.md` "Cost"), the gate uses 
 regime.
 
 CPU (release build, same machine, busy with other builds): with bloom the render stage grows by
-about 0.10 ms per post group over the composite alone, 11 render passes at roughly 10 µs of
-wgpu/Metal pass overhead each (the renderer's own work per pass is a few map lookups and
-allocates nothing); FXAA adds one more pass, about 0.01 ms. That is above the spec's §4.4 line
+0.15–0.18 ms per post group over the composite alone at 1080p (the M1 record in
+`docs/performance.md`; `frame/ab`'s `hdr_bloom` column: +0.16 ms at load 30, up to 0.45 ms under
+very heavy load), 11 render passes at roughly 15 µs of wgpu/Metal pass overhead each (the
+renderer's own work per pass is a few map lookups and allocates nothing); 1440p and 4K add the
+resample pass (+7 %); FXAA adds one more pass, about 0.01 ms. That is above the spec's §4.4 line
 "post ≤ 0.05 ms" of the Battle CPU budget; a compute chain (one compute pass of dependent
 dispatches on class A backends, the render-pass chain kept for WebGL2) would cut both the CPU
 and the GPU pass overhead and is the planned follow-up.

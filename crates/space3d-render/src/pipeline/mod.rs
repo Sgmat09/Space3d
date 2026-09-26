@@ -8,6 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
 use std::sync::Arc;
 
+mod depth;
 mod forward;
 mod instance;
 mod view;
@@ -77,10 +78,6 @@ pub(crate) const CLASS_BLEND: u8 = 2;
 
 /// Kind of pass a mesh pipeline draws in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §3.5): depth-only pipelines arrive with the F7 depth views"
-)]
 pub(crate) enum PassKind {
     /// Color pass (the forward shader).
     #[default]
@@ -302,6 +299,56 @@ pub(crate) struct Pipelines {
     clear: FastMap<(wgpu::TextureFormat, u32), wgpu::RenderPipeline>,
     /// The depth resolve, once a frame needed it.
     depth_resolve: Option<DepthResolve>,
+    /// Layout of `PassKind::Depth` pipelines: group 0 (the view) only.
+    depth_layout: wgpu::PipelineLayout,
+    /// Depth-only pipelines of depth views (see [`Self::depth`]): by key and depth bias
+    /// (constant, slope scale bits, clamp bits).
+    depth: FastMap<(PipelineKey, [u32; 3]), wgpu::RenderPipeline>,
+    /// The device clamps depth bias (`DownlevelFlags::DEPTH_BIAS_CLAMP`); without it a
+    /// requested clamp is dropped (a non-zero clamp would fail validation).
+    pub depth_bias_clamp: bool,
+}
+
+/// Group 0 of forward, depth and node pipelines (graphics spec §3.4): binding 0 the `View`
+/// uniform (dynamic offset, vertex and fragment); bindings 1–6 the lighting inputs (fragment):
+/// environment specular cube, irradiance cube, BRDF LUT, environment sampler, shadow map
+/// (`texture_depth_2d`) and its comparison sampler. Shaders declare only what they use.
+fn view_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    let texture = |binding, sample_type, view_dimension| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: fragment,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let sampler = |binding, ty| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: fragment,
+        ty: wgpu::BindingType::Sampler(ty),
+        count: None,
+    };
+    let float = wgpu::TextureSampleType::Float { filterable: true };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("space3d view"),
+        entries: &[
+            uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                true,
+                std::mem::size_of::<GpuView>() as u64,
+            ),
+            texture(1, float, wgpu::TextureViewDimension::Cube),
+            texture(2, float, wgpu::TextureViewDimension::Cube),
+            texture(3, float, wgpu::TextureViewDimension::D2),
+            sampler(4, wgpu::SamplerBindingType::Filtering),
+            texture(5, wgpu::TextureSampleType::Depth, wgpu::TextureViewDimension::D2),
+            sampler(6, wgpu::SamplerBindingType::Comparison),
+        ],
+    })
 }
 
 /// Bind group layout entry of a filterable float texture of the given view dimension.
@@ -334,15 +381,7 @@ impl Pipelines {
     /// device compiles shaders as GLSL ES 3.00 (WebGL2, GLES 3.0; see
     /// [`forward::validate_custom_wgsl`]).
     pub fn new(device: &wgpu::Device, compute: bool, glsl_es_300: bool) -> Self {
-        let view_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("space3d view"),
-            entries: &[uniform_entry(
-                0,
-                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                true,
-                std::mem::size_of::<GpuView>() as u64,
-            )],
-        });
+        let view_bgl = view_layout(device);
         let material_bgls = forward::material_bgls(device);
         let layouts_by_texture = [0, 1, 2, 3].map(|i| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -350,6 +389,11 @@ impl Pipelines {
                 bind_group_layouts: &[Some(&view_bgl), Some(&material_bgls[i])],
                 immediate_size: 0,
             })
+        });
+        let depth_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("space3d depth"),
+            bind_group_layouts: &[Some(&view_bgl)],
+            immediate_size: 0,
         });
 
         let cull = compute.then(|| {
@@ -498,6 +542,9 @@ impl Pipelines {
             clear_layout,
             clear: FastMap::default(),
             depth_resolve: None,
+            depth_layout,
+            depth: FastMap::default(),
+            depth_bias_clamp: false,
         }
     }
 

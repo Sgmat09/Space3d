@@ -1024,6 +1024,7 @@ mod tests {
         state.flush(device, &mut encoder, &mut up, &sampler);
         up.finish();
         queue.submit([encoder.finish()]);
+        let timer = crate::timing::GpuTimer::new(false, 1.0);
         let mut record = |encoder: &mut wgpu::CommandEncoder, timed: Option<u32>| {
             for i in 0..chains {
                 pool.begin_frame(0);
@@ -1033,6 +1034,7 @@ mod tests {
                     encoder,
                     stats: &mut stats,
                     pool: &mut pool,
+                    timing: &timer,
                 };
                 let timestamps = timed.map(|round| ChainTimestamps {
                     query_set: &queries,

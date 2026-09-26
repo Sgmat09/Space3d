@@ -99,6 +99,9 @@ pub(crate) struct PostEncode<'a> {
     /// acquired here are released after the group.
     #[allow(dead_code, reason = "the post area's effects (PO1–PO3) acquire pooled textures")]
     pub pool: &'a mut crate::frame::TexturePool,
+    /// GPU timings (`FrameSettings::gpu_timing`): labels `post.exposure`, `post.bloom`,
+    /// `post.composite`, `post.fxaa` (graphics spec §4.4).
+    pub timing: &'a crate::timing::GpuTimer,
 }
 
 /// Inputs of one post group's passes.
@@ -669,7 +672,17 @@ impl PostState {
         let group = self.groups.get(input.index).copied().unwrap_or_default();
         let bloom = group.bloom.and_then(|plan| {
             let scene = (input.scene, input.scene_generation);
-            let (view, generation) = self.bloom.encode(cx, scene, &plan, &self.dummy, self.frame, None)?;
+            let timing = cx.timing;
+            let timestamps = timing
+                .span("post.bloom", Some(input.camera))
+                .map(|(query_set, begin, end)| bloom::ChainTimestamps {
+                    query_set,
+                    begin: Some(begin),
+                    end: Some(end),
+                });
+            let (view, generation) = self
+                .bloom
+                .encode(cx, scene, &plan, &self.dummy, self.frame, timestamps)?;
             self.count_target(cx.stats, input.replay, generation, plan.bytes());
             Some((view, generation))
         });
@@ -746,6 +759,7 @@ impl PostState {
         let pipeline = &self.composite[&(composite_format, composite_kind)];
         let pass = FullscreenPass {
             label: "space3d composite",
+            scope: ("post.composite", input.camera),
             target: composite_target,
             load: composite_load,
             viewport: input.output_viewport,
@@ -774,6 +788,7 @@ impl PostState {
         let pipeline = &self.fxaa[&(q, input.output_format, kind)];
         let pass = FullscreenPass {
             label: "space3d fxaa",
+            scope: ("post.fxaa", input.camera),
             target: input.output,
             load: output_load,
             viewport: input.output_viewport,
@@ -825,6 +840,8 @@ impl PostState {
 /// A full-screen post pass: its target, load op and the post group's rect.
 struct FullscreenPass<'a> {
     label: &'static str,
+    /// GPU timing label and camera.
+    scope: (&'static str, Entity),
     target: &'a wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
     viewport: [f32; 4],
@@ -853,6 +870,7 @@ impl FullscreenPass<'_> {
                     store: wgpu::StoreOp::Store,
                 },
             })],
+            timestamp_writes: cx.timing.render(self.scope.0, Some(self.scope.1)),
             ..Default::default()
         });
         let [x, y, w, h] = self.viewport;

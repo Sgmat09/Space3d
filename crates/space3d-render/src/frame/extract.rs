@@ -1328,11 +1328,8 @@ impl FrameState {
     }
 }
 
-/// Whether the batches of `material` cast shadows (the depth views' draw filter).
-#[allow(
-    dead_code,
-    reason = "graphics contract (spec §2.6): wired by the F4–F8 frame milestones"
-)]
+/// Whether the batches of `material` cast shadows (the depth views' draw filter; blended
+/// batches never reach it).
 pub(crate) fn source_casts(materials: &MaterialTable, material: u32) -> bool {
     let Some(e) = materials.entries.get(material as usize) else {
         return false;
@@ -1342,6 +1339,17 @@ pub(crate) fn source_casts(materials: &MaterialTable, material: u32) -> bool {
         ShadowMode::ReceiveOnly | ShadowMode::None => false,
         // Auto: lit opaque and alpha-masked materials (unlit ones, like sky quads, never cast).
         _ => e.key.flags & 1 == 0 && !BlendMode::from_class(e.class).is_transparent(),
+    }
+}
+
+/// The depth pipeline a caster of pipeline class `class` draws with in depth views:
+/// `PassKind::Depth` (vertex only), or `PassKind::DepthMask` for alpha-masked materials (the
+/// depth pass then binds the material's group 1 and discards masked texels).
+pub(crate) fn caster_pass(class: u8) -> crate::pipeline::PassKind {
+    if BlendMode::from_class(class) == BlendMode::AlphaMask {
+        crate::pipeline::PassKind::DepthMask
+    } else {
+        crate::pipeline::PassKind::Depth
     }
 }
 

@@ -55,6 +55,8 @@ mod renderer;
 mod settings;
 mod shader;
 mod stats;
+#[doc(hidden)]
+pub mod testing;
 mod texture;
 mod timing;
 

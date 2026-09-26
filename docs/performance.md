@@ -397,9 +397,10 @@ resample pass of the M1 review's round 2; 211 before).
 | bloom 6 mips @1080p ≤ 0.20 ms | 0.150–0.159 ms, 3 of 3 invocations (device utilization ≈ 40 %); the review: 0.222–0.261 ms, 0 of 3, with another app keeping the GPU 49–57 % busy | met on an idle GPU; a shared GPU pushes it over |
 | Battle CPU "post ≤ 0.05 ms" | bloom alone 0.15–0.17 ms of thread CPU per post group | **not met** (compute chain after M1) |
 
-In real frames bloom costs more GPU than the isolated chain the gate times: `hdr_bloom` minus
-`hdr_minimal` throughput measured +244 µs at load 7.6 and +384 µs at load 40 in the review
-(the chain plus the composite's bloom reads, against a GPU shared with other work).
+In real frames bloom costs more GPU than the isolated chain the gate times: Hdr + bloom minus Hdr
+minimal throughput measured +244 µs at load 7.6 and +384 µs at load 40 in the review's own
+harness (the chain plus the composite's bloom reads, against a GPU shared with other work).
+`frame/ab` has the `hdr_bloom` mode since M1.1 (below) to reproduce it from the tree.
 
 **Particles.** Emitters moved after the tick get a render-time bridge (particles.md "Time
 model"), built on the CPU on both backends: about 25 ns per bridged trail glow and 45 ns per
@@ -412,6 +413,72 @@ the particles node about 0.29 ms of render-thread CPU per frame against 0.14 ms 
 `FixedUpdate` (1080p, HDR + bloom; 0.35–0.44 ms before), so the Battle scene's "particles
 prepare ≤ 0.1 ms" line is missed about 3× until the bridges move to the GPU (particles.md,
 "Bridges are not free").
+
+### F7 / F8 and M1.1 — depth views, GPU timings, bloom memory
+
+`cargo bench -p space3d-render --bench frame -- frame/ab` (1080p headless, release) now
+interleaves four modes — Direct, Hdr minimal, `hdr_bloom` (`PostProcess::default()`: the composite
+and the default bloom) and `depth_view` (Direct plus one 2048² depth view of the scene's 400
+cubes and ground plane, injected with `space3d_render::testing`) — and prints each mode's GPU
+timings per pass (`FrameSettings::gpu_timing`) and the bloom chain's GPU time at other sizes.
+Two runs at load average 29–33 (other builds on the machine); medians in µs, paired deltas
+against Direct in brackets:
+
+| `frame/ab` | Direct | Hdr minimal | Hdr + bloom | depth view |
+|---|---|---|---|---|
+| cpu, load 29 | 78.0 | 100.0 (+19.8) | 271.1 (+179.5) | 110.0 (+36.7) |
+| cpu, load 33 | 207.1 | 243.4 (+39.0) | 697.8 (+489.3) | 227.1 (+45.9) |
+| throughput, load 29 | 130.8 | 163.8 (+33.1) | 420.3 (+293.9) | 172.8 (+43.3) |
+| latency, load 29 | 293.8 | 377.8 (+76.3) | 701.7 (+400.2) | 379.0 (+76.9) |
+| GPU timings, load 29 (ms) | cull 0.013, scene 0.048 | + post.composite 0.099 | + post.bloom 0.216, post.composite 0.068 | + shadow 0.024 |
+
+**Bloom CPU, one figure.** Bloom adds 0.15–0.18 ms of render-thread CPU per post group at 1080p
+over the composite alone (the M1 record 0.15–0.17 ms; +0.16 ms in the load-29 run above; the
+load-33 run, +0.45 ms, shows how far very heavy load pushes it). `docs/graphics/post.md` and
+`docs/graphics/frame.md` quote this figure (post.md said about 0.10 ms, frame.md 0.10–0.17).
+The Battle line "post ≤ 0.05 ms" stays not met (compute chain).
+
+**Bloom by size** (`post.bloom` in frames, medians of 48, load ≈ 30): 720p 0.196 ms, 1080p
+0.227 ms, 1440p 0.254 ms, 4K 0.607 ms, the `GraphicsQuality::Low` chain at the T3 rect
+(1440 × 810, 4 levels, 270 cap) 0.122 ms. The half-rect prefilter of the M1 review's round 2
+costs GPU time wherever the half rect is larger than level 0 (the round-3 review's interleaved
+sweeps, best-of chain times: +4 % at 1440p, +25 % at the Low rect, +40 % at 4K, nothing at 1080p);
+post.md's claim that the chain's time was unchanged held at 1080p only and is corrected. Capping
+the prefilter target at twice level 0, the review's suggestion, changes nothing at these sizes
+(the half rect is at most twice level 0 there); a cheaper prefilter kernel would change the
+halo, so the cost is recorded, not traded.
+
+**Bloom memory** (M1.1 review finding: `target_bytes` counted 2.8 MB). `tests/footprint.rs`
+(`cargo test -p space3d-render --release --test footprint -- --ignored --nocapture`; macOS; each
+scene in its own process, 1080p, footprint after 600 frames):
+
+| scene | one frame in flight | three frames in flight | `target_bytes` | render passes |
+|---|---|---|---|---|
+| Direct | 490.0 MB | — | 0 | 0 |
+| Hdr minimal | 512.2 MB | 540.8 MB | 24.9 MB | 1 |
+| Hdr + bloom | 571.7 MB | 688.4 MB | 27.6 MB | 12 |
+| depth view 2048² | 513.4 MB | — | 0 (the map: 16.8 MB) | 1 |
+| raw wgpu, 1 / 11 empty passes into 32 × 32 | 453.7 / 481.6 MB | — | — | 1 / 11 |
+
+Each Metal render pass holds about 2.8 MB of driver memory per frame in flight, independent of
+its attachment's size: bloom's chain holds +59.5 MB paced and +147.6 MB unpaced against +2.7 MB
+of textures, as the review measured (56–61 / 151 MB). Counted now: the docs (frame.md "Cost",
+post.md) state `target_bytes + render_passes × 2.8 MB × frames in flight`, the spec's §4.4 VRAM
+lines are amended, and the footprint test fails above 80 MB (paced) or 200 MB (unpaced) of bloom.
+Not reduced: every chain level is its own render pass (a level is read while the next is
+written), and the renderer's frames in flight follow the window (two to three); the reduction
+is the planned compute chain (one compute pass of dependent dispatches, about one pass's
+memory), the same follow-up as bloom's CPU.
+
+**Depth views** (F7): one 2048² map adds 0.024 ms of GPU (`shadow`), +37 to +46 µs of CPU per
+frame (culling of the casters, one pass, their draws) and 23 MB of process memory (the map and
+its pass). `tests/alloc_frame.rs` "depth_views": 103 allocations per frame on Metal (Direct 76 +
+the depth pass), bound 113; the renderer's own work allocates nothing, a still scene uploads
+nothing (`tests/depth_views.rs`), and GPU paths add no culling dispatch.
+
+**GPU timings** (F8): `tests/alloc_frame.rs` "timings": 100 allocations per frame on Metal (Direct
+76 + timestamp writes, the deferred resolve and the two callbacks wgpu boxes per timed frame),
+bound 110; off, timing costs nothing.
 
 ### P-MAT PM1 / PM2 — material maps, blend modes, glTF import
 

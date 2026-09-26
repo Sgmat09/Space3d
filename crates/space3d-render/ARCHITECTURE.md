@@ -9,21 +9,22 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | module | role |
 |---|---|
 | `renderer.rs` | `Renderer`: instance/adapter/device/queue, capability detection, surfaces, offscreen target, asset upload, `capture()` |
-| `frame/` | per-frame work: `mod.rs` (`render_frame` orchestration, `FrameState`, `RenderSettings`, uploads, frame facts), `plan.rs` (cameras, viewport rects, the frame plan: target groups, modes, post groups, view roles), `extract.rs` (ECS/explicit extraction, batching, material interning), `views.rs` (lights, `GpuView`s, draw commands, CPU culling, GPU culling jobs/dispatches), `draws.rs` (material bind groups, `encode_draws`), `passes.rs` (view passes with the node phases, depth resolve, SceneRead and Distortion passes, HdrScene overlays, group finish: composites and display views, capture replay), `nodes.rs` (the render-node snapshot and schedule, node `prepare`/`prepare_view`, pass targets and depth-read modes, scene-input bind groups), `targets.rs` (scene textures of intermediate groups, resolved depths, render-target feedback copies, the texture pool), `tests.rs` |
+| `frame/` | per-frame work: `mod.rs` (`render_frame` orchestration, `FrameState`, `RenderSettings`, uploads, frame facts), `plan.rs` (cameras, viewport rects, the frame plan: target groups, modes, post groups, view roles), `extract.rs` (ECS/explicit extraction, batching, material interning), `views.rs` (lights, `GpuView`s, draw commands, CPU culling, GPU culling jobs/dispatches), `draws.rs` (material bind groups, `encode_draws`), `passes.rs` (view passes with the node phases, depth resolve, SceneRead and Distortion passes, HdrScene overlays, group finish: composites and display views, capture replay), `nodes.rs` (the render-node snapshot and schedule, node `prepare`/`prepare_view`, pass targets and depth-read modes, scene-input bind groups), `depth.rs` (depth views — shadow maps — and their pass; the views' group-0 bind groups), `targets.rs` (scene textures of intermediate groups, resolved depths, render-target feedback copies, the texture pool), `tests.rs` |
 | `instance.rs` | `InstanceData` trait, `InstanceLayout`/semantics, built-in formats, `InstanceBuffer<T>`, `InstanceBuffers`, `InstancedMesh` |
 | `gpu.rs` | `Uploader` (staging ring), `GrowBuffer`, `TrackedBuffer` (shadow-diffed uploads), parallel staging copies |
 | `arena.rs` | mesh arena: shared vertex/index buffers, first-fit range allocator, GPU-side growth |
 | `assets.rs` | `RenderAssets`: handle allocation without a GPU, pending uploads, textures/render targets |
 | `texture.rs` | `write_texture` uploads (block-aware pitch), GPU mip generation, sampler cache |
-| `pipeline/` | `mod.rs` (pipeline cache, `PipelineKey`, culling/blit/clear pipelines, culling uniforms), `view.rs` (`GpuView`, lights), `forward.rs` (forward shader composition, `GpuMaterial`, material layouts, forward pipelines, custom-shader validation), `instance.rs` (instance attributes, generated `InstanceInput` WGSL) |
+| `pipeline/` | `mod.rs` (pipeline cache, `PipelineKey`, the view layout, culling/blit/clear pipelines, culling uniforms), `view.rs` (`GpuView`, lights), `forward.rs` (forward shader composition, `GpuMaterial`, material layouts, forward pipelines, custom-shader validation), `depth.rs` (depth-only pipelines of depth views), `instance.rs` (instance attributes, generated `InstanceInput` WGSL) |
 | `shader.rs` | `CustomShader`: user WGSL hooks spliced into the forward shader |
-| `settings.rs`, `caps.rs`, `output.rs`, `node.rs`, `timing.rs`, `quality.rs` | graphics API (frame): `FrameSettings`/`CameraFrame`, `GraphicsCaps`, `OutputEncoding`/`Tonemapper`/`OUTPUT_WGSL`, the render-node API, `GpuTimings`, `GraphicsQuality` (see `docs/graphics/api.md`) |
+| `settings.rs`, `caps.rs`, `output.rs`, `node.rs`, `timing.rs`, `quality.rs` | graphics API (frame): `FrameSettings`/`CameraFrame`, `GraphicsCaps`, `OutputEncoding`/`Tonemapper`/`OUTPUT_WGSL`, the render-node API, `GpuTimings` and the `GpuTimer` recording them, `GraphicsQuality` (see `docs/graphics/api.md`) |
+| `testing.rs` | doc-hidden hooks of the crate's own integration tests (depth views injected without the lighting) |
 | `material.rs`, `lighting/`, `post/` | graphics API hubs of the materials and post areas (`BlendMode`…, cubemaps/`Skybox`/shadows/`LightingSettings`, `PostProcess`…) and their crate-internal frame contracts (`Lighting`, `PostState`) |
 | `readback.rs` | non-blocking readback of GPU-culled visible counts for `RenderStats` |
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
 | `dirty.rs` | `DirtyRanges`: sorted, coalescing range set |
 | `stats.rs` | `RenderStats`, `DrawPath` |
-| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `frame/depth_resolve.wgsl` (minimum of a multisampled depth's samples), `post/composite.wgsl` (scene texture → display target), `post/distortion.wgsl` |
+| `shaders/` | `forward.wgsl` (template), `depth.wgsl` (depth-only template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `frame/depth_resolve.wgsl` (minimum of a multisampled depth's samples), `post/composite.wgsl` (scene texture → display target), `post/distortion.wgsl` |
 
 ## Frame data flow
 
@@ -32,6 +33,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  ───────────────────────────────────────────────────────────────────────────────────────────
  RenderAssets.pending ──► upload_assets_into ──► mesh arena (staging ring)
                                               └► textures (write_texture + GPU mip blit)
+ Lighting::prepare (cubemaps, IBL bakes; the materials area)
 
  World ──┬─ lights (DirectionalLight ≤4, PointLight: 16 nearest per view) ─► GpuView (per camera)
          ├─ cameras (Camera3d + GlobalTransform, sorted by order) ─────► views + frustums
@@ -45,7 +47,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 
  sources sorted by (blend, class, layout, shader + texture kind, material, mesh, buffer)
 
- for each view:
+ for each view (camera views, then the lighting's depth views: shadow maps, opaque casters only):
    CpuDirect:  ECS → per-instance sphere test (one pass, rayon for large batches);
                      all visible → draw from `ecs`
                      partial → visible matrices into `cpu_visible` (diffed)
@@ -61,12 +63,13 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  encoder: [uploads] → copy templates→args → clear counts
           → [render nodes: prepare (compute), prepare_view per view]
           → compute(mark → scan → scatter [+compact]) → copy args → stats readback ring
+          → depth views: one depth-only pass each (clear 1.0, store)
           → per view: [copy own render target → feedback texture] → render pass
                       (first pass into a target clears it; viewport: scissor [+ clear triangle];
                        node slots around the built-in opaque and blended batches)
                       [→ depth resolve → SceneRead pass] [→ Distortion pass]
           → [HdrScene overlays] → post groups' composites → display views
-          → AfterTonemap overlays
+          → AfterTonemap overlays → [resolve completed timed frames' timestamps]
           → submit → present → staging recall
           → wait for the frame submitted 3 frames earlier (at most 3 in flight; native), else poll(Poll)
  next frames: read the mapped args copy (visible counts) into RenderStats
@@ -422,6 +425,59 @@ analytic plane, in-pass fallback, Distortion plumbing, renderer id, poisoning, p
 distortion_buffer_is_sized_from_the_scene_rect, hdr_scene_overlay_not_replayed_in_hdr}`,
 `tests/alloc_frame.rs` ("nodes"), `tests/gl.rs::gl_backend_reads_scene_depth` (ANGLE).
 
+## Depth views, view bind groups and GPU timings
+The lighting (`lighting/mod.rs`, the materials area's contract, graphics spec §2.6) is called at
+fixed points of `render_frame`: `prepare` after the asset uploads (cubemap conversion, IBL
+bakes), `depth_views` once the camera views are recorded (the shadow maps it wants, fitted to
+those views), `fill_view` for each camera's `GpuView` (environment, sky and shadow fields; the
+camera uniforms are written once, after it, so a still scene still uploads nothing) and
+`view_resources` for group 0.
+
+**Group 0** (`Pipelines::view_bgl` = `FrameLayouts::view`) is the view uniform (binding 0,
+dynamic offset) and the lighting inputs (bindings 1–6: environment specular and irradiance
+cubes, BRDF LUT, their sampler, the shadow map and its comparison sampler). Bind groups are
+cached per lighting resource key and views-buffer generation (`frame/depth.rs`
+`ViewBindGroups`, dropped 3 frames after their last use): camera views bind their camera's
+resources, depth views the neutral ones (the shadow map is their attachment). Every view
+records its bind group index (`ViewData::bind_group`), so built-in draws, node draws and
+HdrScene overlays bind the right one.
+
+**Depth views** (`frame/depth.rs`) are views without color: each request of
+`Lighting::depth_views` (or of `crate::testing`) gets a `GpuView` slot after the camera views'
+(its `view_proj` the light matrix, all other fields zero), and its draws go through the camera
+views' source loop (`FrameState::record_sources`) with the request's frustum and only the
+opaque sources whose material casts (`extract::source_casts`). On GPU paths it is one more
+frustum slot: its jobs share the culling dispatches of every view reading the same source
+buffers (no extra dispatch while the frame has at most 64 views), with their own output regions
+and indirect args after the camera views' (the stats readback copies the camera views' args
+only). On `CpuDirect` its sources are CPU-culled like a camera's. After the culling compute and
+before the first camera view, each depth view is one depth-only pass (clear 1.0, store) with
+`Pipelines::depth`: `shaders/depth.wgsl` composed with the instance layout, `PassKind::Depth`
+(vertex stage only, group 0 only) or `DepthMask` (the material in group 1, `fs_mask` discarding
+below the cutoff; `extract::caster_pass` picks it), depth test `Less` with writes, the
+request's depth bias, back faces culled unless double-sided; cached per (key, bias). Custom
+shaders are not applied (vertex hooks do not displace shadows). Depth views are never part of
+node phases, overlays, post or capture replays. `RenderStats::{depth_views, shadow_casters,
+shadow_draw_calls}`.
+
+**GPU timings** (`timing.rs`, `FrameSettings::gpu_timing`): the `GpuTimer` hands out two query
+indices per pass (pass-level `timestamp_writes`: cull, shadow, scene, depth_resolve,
+scene_read, distortion, overlays.hdr, post.*, overlays, nodes' passes through
+`PrepareContext::{compute,render}_timestamps`) from one 256-entry query set per timed frame, in
+a ring of 5. A frame's query set is resolved only after its GPU work completed
+(`Queue::on_submitted_work_done` marks it; the next frame's encoder resolves and copies it,
+mapped on that submission): Metal writes a render pass's boundary samples asynchronously, and a
+resolve in the same command buffer read the scene pass's begin and end from different frames.
+`collect` turns a mapped copy into `GpuTimings` (the resource is updated when it changes), 2–5
+frames late. With every ring entry busy a frame is not timed; timing off records nothing.
+
+Tests: `tests/depth_views.rs` (a probe node samples the map in the camera pass: caster depths on
+every path, blended materials excluded, light-frustum culling on CPU and GPU, no extra dispatch,
+the `DepthMask` pipeline, several maps, a still scene uploading nothing; also on ANGLE),
+`frame::tests::depth_views_are_never_replayed_and_share_view_bind_groups`,
+`pipeline::depth::tests`, `tests/gpu_timings.rs`, `tests/alloc_frame.rs` ("depth_views",
+"timings"), `tests/footprint.rs` (ignored: process memory per mode, macOS).
+
 ## Custom shaders
 A `CustomShader` is WGSL spliced into the built-in forward shader, registered with
 `RenderAssets::add_shader` and selected per material with `Material::with_shader`. It defines
@@ -651,9 +707,9 @@ views), whatever the number of views: 40 explicit buffers seen by 4 views alloca
 per frame on `GpuMultiDraw` (544 when every view had its own dispatches; `CpuDirect`: 124).
 
 `tests/alloc_frame.rs` pins the graphics frame modes the same way: Direct 76, Hdr / Ldr /
-passthrough 106 (one composite pass more) and render nodes 119 (Direct plus one SceneRead pass
-and three node draws) per frame on Metal; the renderer's own work allocates nothing in any of
-them.
+passthrough 106 (one composite pass more), render nodes 119 (Direct plus one SceneRead pass
+and three node draws), a depth view 103 and GPU timings 100 per frame on Metal; the renderer's
+own work allocates nothing in any of them.
 
 `tests/alloc.rs` pins this: a scene with 40k moving ECS entities (two materials, one
 textured), a 100k-instance dynamic buffer rewritten every frame, an f16 buffer and a custom
@@ -795,9 +851,11 @@ the pre-`render-fixes` renderer, with one unordered dispatch per view and buffer
 instances, 2 views) are unchanged within noise (25 → 9 dispatches).
 
 ## Known limitations
-* No shadows, IBL or post-processing; lighting is metallic/roughness Blinn-Phong with Schlick
-  Fresnel, 4 directional + 16 point lights per view (with more, the 16 nearest to the view's
-  camera, in query order; with at most 16, every light in query order).
+* Lighting is metallic/roughness Blinn-Phong with Schlick Fresnel, 4 directional + 16 point
+  lights per view (with more, the 16 nearest to the view's camera, in query order; with at most
+  16, every light in query order). Shadow maps are drawn (depth views) but shading with them,
+  IBL and the skybox are the materials area's (`docs/graphics/materials.md`); post-processing
+  is in `docs/graphics/post.md`.
 * After a `Lost` surface the platform runner attaches a new one on a later redraw (throttled
   to once per second), so the window can stay blank briefly.
 * Layer indices past a texture array's last layer sample the unused padding layer on GL for

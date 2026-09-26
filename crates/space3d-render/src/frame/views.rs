@@ -135,6 +135,9 @@ pub(crate) struct ViewData {
     /// color attachment and a sampled resource in the same pass, so such draws sample a copy
     /// of the target taken just before the pass (its previous content) instead.
     pub(super) feedback: bool,
+    /// Its group-0 bind group (`FrameState::view_bind_group`; set once the views buffer is
+    /// flushed).
+    pub(super) bind_group: usize,
 }
 
 /// One mark and one scatter dispatch: the culling jobs of one source buffer, for the views of
@@ -300,10 +303,346 @@ pub(super) fn write_view_info(
     gv.exposure = [1.0, 0.0, 0.0, 0.0];
 }
 
+/// Instance counts of one view's sources (see [`FrameState::record_sources`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SourceCounts {
+    /// Instances submitted for culling.
+    pub instances: u64,
+    /// Instances drawn: CPU-culled visible ones, and every GPU-culled one (an upper bound until
+    /// the readback).
+    pub drawn: u64,
+    /// Instances rejected by CPU culling.
+    pub culled: u64,
+    pub triangles: u64,
+    /// Of `instances` and `triangles`, the GPU-culled part.
+    pub gpu_submitted: u64,
+    pub gpu_triangles: u64,
+}
+
 impl FrameState {
-    /// One `ViewData` per camera with a live target: its `GpuView`, its draws and, on GPU
-    /// paths, its culling jobs (frustum slot, output region). Returns the bytes of culled
-    /// instances written by the jobs (`cull_out`).
+    /// Record one view's draws of the frame's sources into `draws`, culled against `frustum`:
+    /// on GPU paths a culling job (and indirect draw) per source, whose frustum slot this view
+    /// takes, so the view shares the dispatches of every other view reading the same source
+    /// buffers; on `CpuDirect` (and for sources the GPU culler cannot take) CPU culling and
+    /// direct draws. `depth`: a depth view — only opaque sources whose material casts
+    /// ([`super::extract::source_casts`]) are recorded. Returns the index of the view's first
+    /// blended draw (`draws.len()` without any). `camera_view`: the camera's view matrix, for
+    /// batches sorted back to front per instance (`TransparentSort::PerInstance`; `None` in
+    /// depth views, which draw no blended sources).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_sources(
+        &mut self,
+        frustum: &Frustum,
+        culling: bool,
+        depth: bool,
+        camera_view: Option<glam::Mat4>,
+        buffers: &mut InstanceBuffers,
+        out_cursor: &mut u64,
+        visible_overflow: &mut bool,
+        counts: &mut SourceCounts,
+        cpu_reallocs: &mut u32,
+    ) -> usize {
+        let f = self;
+        let path = f.path;
+        let gpu = path.gpu_culling();
+        let multi = matches!(path, DrawPath::GpuMultiDraw | DrawPath::GpuMultiDrawCount);
+        let mut opaque_end = None;
+        let jobs_start = f.jobs.len();
+        // Current multi-draw run: (layout, class, material, run_base, draw cmd index, first args).
+        let mut run: Option<(u16, u8, u32, u64, usize, u32)> = None;
+
+        for si in 0..f.sources.len() {
+            let s = f.sources[si];
+            if s.count == 0 {
+                continue;
+            }
+            if depth && (s.blend || !super::extract::source_casts(&f.materials, s.material)) {
+                continue;
+            }
+            counts.instances += s.count as u64;
+            // Sources are sorted opaque first: the view's blended draws start here.
+            if s.blend && opaque_end.is_none() {
+                opaque_end = Some(f.draws.len());
+            }
+            let tris = s.triangles as u64;
+            let alloc = s.mesh.alloc;
+            let base_cmd = DrawCmd {
+                layout: s.layout,
+                class: s.class,
+                material: s.material,
+                shader: None,
+                first_index: alloc.first_index,
+                index_count: alloc.index_count,
+                base_vertex: alloc.base_vertex as i32,
+                vb: VertexSource::Ecs,
+                vb_offset: 0,
+                kind: DrawKind::Direct { instances: 0 },
+            };
+
+            // GPU culling writes the visible instances into this view's region of
+            // `cull_out`, which is bound as one storage binding: a region that would end
+            // past it falls back to CPU culling for this view.
+            let run_key = (s.layout, s.class, s.material);
+            let same_run = multi && matches!(run, Some((l, c, m, ..)) if (l, c, m) == run_key);
+            let region_start = if multi && !same_run {
+                align_up(*out_cursor, 256)
+            } else {
+                *out_cursor
+            };
+            let fits = region_start + s.count as u64 * s.stride as u64 <= f.max_storage_binding;
+            // Instances sorted back to front per view (`TransparentSort::PerInstance`) are
+            // culled and ordered on the CPU on every path.
+            let sort = camera_view.filter(|_| f.materials.sorts(&s));
+            if gpu && s.cull != CullSource::None && fits && sort.is_none() {
+                // GPU culling: reserve an output region, emit a job and an indirect draw.
+                if multi && !same_run {
+                    *out_cursor = region_start;
+                    let cmd_index = f.draws.len();
+                    let kind = if path == DrawPath::GpuMultiDrawCount {
+                        DrawKind::MultiCount {
+                            args_first: f.args_count,
+                            count: 0,
+                            run: f.run_count,
+                        }
+                    } else {
+                        DrawKind::Multi {
+                            args_first: f.args_count,
+                            count: 0,
+                        }
+                    };
+                    f.draws.push(DrawCmd {
+                        vb: VertexSource::CullOut,
+                        vb_offset: *out_cursor,
+                        kind,
+                        ..base_cmd
+                    });
+                    run = Some((s.layout, s.class, s.material, *out_cursor, cmd_index, f.args_count));
+                    f.run_count += 1;
+                }
+                let region = *out_cursor;
+                *out_cursor += s.count as u64 * s.stride as u64;
+                let draw = f.args_count;
+                f.args_count += 1;
+                let first_instance = match run {
+                    Some((.., base, _, _)) if multi => ((region - base) / s.stride as u64) as u32,
+                    _ => 0,
+                };
+                let template = wgpu::util::DrawIndexedIndirectArgs {
+                    index_count: alloc.index_count,
+                    instance_count: 0,
+                    first_index: alloc.first_index,
+                    base_vertex: alloc.base_vertex as i32,
+                    first_instance,
+                };
+                f.templates.push(template.as_bytes(), cpu_reallocs);
+                if let Some((.., cmd, _)) = run
+                    && multi
+                {
+                    match &mut f.draws[cmd].kind {
+                        DrawKind::Multi { count, .. } | DrawKind::MultiCount { count, .. } => *count += 1,
+                        _ => {}
+                    }
+                }
+                if !multi {
+                    f.draws.push(DrawCmd {
+                        vb: VertexSource::CullOut,
+                        vb_offset: region,
+                        kind: DrawKind::Indirect { args: draw },
+                        ..base_cmd
+                    });
+                }
+                let (kind, t_off, s_off, s_kind) = cull_job_encoding(s.cull);
+                let sp = s.mesh.sphere;
+                f.jobs.push((
+                    s.buffer,
+                    GpuCullJob {
+                        sphere: [sp.center.x, sp.center.y, sp.center.z, sp.radius],
+                        src_word: s.first * s.stride / 4,
+                        count: s.count,
+                        stride_words: s.stride / 4,
+                        kind,
+                        t_off,
+                        s_off,
+                        s_kind,
+                        dst_word: (region / 4) as u32,
+                        draw,
+                        wg_start: 0,
+                        // Set once the view's frustum slot is known (below).
+                        view: 0,
+                        pad: 0,
+                    },
+                ));
+                // Upper bound until the readback of the visible count (see `render_frame`).
+                counts.drawn += s.count as u64;
+                counts.triangles += s.count as u64 * tris;
+                counts.gpu_submitted += s.count as u64;
+                counts.gpu_triangles += s.count as u64 * tris;
+                continue;
+            }
+
+            // CPU path (or buffers the GPU culler cannot decode).
+            run = None;
+            let mut visible = 0u32;
+            match s.buffer {
+                SourceBuffer::Ecs => {
+                    let range = s.first as usize..(s.first + s.count) as usize;
+                    let order = if f.ecs_overflow {
+                        &f.ecs_cut[range]
+                    } else {
+                        &f.ecs_order[range]
+                    };
+                    visible = if culling {
+                        cull_mask(&f.ecs_matrices, order, s.mesh.sphere, frustum, &mut f.cull_mask) as u32
+                    } else {
+                        s.count
+                    };
+                    // `cpu_visible` holds every view's partially visible batches and
+                    // cannot exceed `max_buffer_size`: a batch that no longer fits is
+                    // drawn whole from `ecs` (unculled, so the image is the same).
+                    if visible < s.count
+                        && visible > 0
+                        && f.cpu_visible.len() as u64 + visible as u64 * 64 > f.max_buffer_size
+                    {
+                        *visible_overflow = true;
+                        visible = s.count;
+                    }
+                    let sorted_fits = f.cpu_visible.len() as u64 + visible as u64 * 64 <= f.max_buffer_size;
+                    if let Some(camera_view) = sort.filter(|_| visible > 0 && sorted_fits) {
+                        // Back to front: the visible instances in view-depth order, copied
+                        // (diffed) into `cpu_visible`.
+                        let mask = culling.then_some(&f.cull_mask[..]);
+                        let sorted =
+                            f.materials
+                                .sort_back_to_front(order, mask, &f.ecs_matrices, camera_view, cpu_reallocs);
+                        let at = f.cpu_visible.len();
+                        let matrices = &f.ecs_matrices;
+                        f.cpu_visible.write_all(
+                            at,
+                            sorted.len(),
+                            sorted.iter().map(|&i| &matrices[i as usize]),
+                            cpu_reallocs,
+                        );
+                        f.draws.push(DrawCmd {
+                            vb: VertexSource::CpuVisible,
+                            vb_offset: at as u64,
+                            kind: DrawKind::Direct { instances: visible },
+                            ..base_cmd
+                        });
+                    } else if visible == s.count {
+                        f.draws.push(DrawCmd {
+                            vb: VertexSource::Ecs,
+                            vb_offset: s.first as u64 * 64,
+                            kind: DrawKind::Direct { instances: visible },
+                            ..base_cmd
+                        });
+                    } else if visible > 0 {
+                        // Partially visible: copy the visible matrices (diffed) into
+                        // `cpu_visible`, in batch order.
+                        let at = f.cpu_visible.len();
+                        let (mask, matrices) = (&f.cull_mask, &f.ecs_matrices);
+                        f.cpu_visible.write_all(
+                            at,
+                            visible as usize,
+                            order
+                                .iter()
+                                .enumerate()
+                                .filter(|(k, _)| mask[k / 64] >> (k % 64) & 1 != 0)
+                                .map(|(_, &i)| &matrices[i as usize]),
+                            cpu_reallocs,
+                        );
+                        f.draws.push(DrawCmd {
+                            vb: VertexSource::CpuVisible,
+                            vb_offset: at as u64,
+                            kind: DrawKind::Direct { instances: visible },
+                            ..base_cmd
+                        });
+                    }
+                }
+                SourceBuffer::Explicit(slot) => {
+                    // Visible runs of culling blocks become one draw each, offset into
+                    // the instance buffer (no `first_instance` needed).
+                    let mut draw = |f: &mut FrameState, start: usize, end: usize| {
+                        let end = end.min(s.count as usize);
+                        f.draws.push(DrawCmd {
+                            vb: VertexSource::Explicit(slot),
+                            vb_offset: (start * s.stride as usize) as u64,
+                            kind: DrawKind::Direct {
+                                instances: (end - start) as u32,
+                            },
+                            ..base_cmd
+                        });
+                        visible += (end - start) as u32;
+                    };
+                    // Bounds are brought up to date here, lazily: only CPU culling reads
+                    // them, and only blocks edited since the last refresh are recomputed.
+                    let bounds = if culling {
+                        let generation = f.explicit[slot as usize].as_ref().map_or(0, |g| g.generation);
+                        buffers
+                            .buffers
+                            .get_mut(crate::handles::RawHandle {
+                                index: slot,
+                                generation,
+                            })
+                            .map(|ib| ib.cull_bounds())
+                    } else {
+                        None
+                    };
+                    let r = s.mesh.sphere.center.length() + s.mesh.sphere.radius;
+                    // Empty boxes: no decodable positions, never culled.
+                    let seen =
+                        |aabb: &Aabb, scale: f32| aabb.is_empty() || frustum.intersects_aabb(&aabb.inflated(r * scale));
+                    match bounds {
+                        Some(CullBounds::User(aabb)) => {
+                            if seen(&aabb, 1.0) {
+                                draw(f, 0, s.count as usize);
+                            }
+                        }
+                        Some(CullBounds::Blocks { total, blocks }) => {
+                            if seen(&total.0, total.1) {
+                                let mut start = None;
+                                for (b, (aabb, scale)) in blocks.iter().enumerate() {
+                                    if seen(aabb, *scale) {
+                                        start.get_or_insert(b);
+                                    } else if let Some(a) = start.take() {
+                                        draw(f, a * CULL_BLOCK, b * CULL_BLOCK);
+                                    }
+                                }
+                                if let Some(a) = start {
+                                    draw(f, a * CULL_BLOCK, s.count as usize);
+                                }
+                            }
+                        }
+                        None => draw(f, 0, s.count as usize),
+                    }
+                }
+            }
+            counts.culled += (s.count - visible) as u64;
+            counts.drawn += visible as u64;
+            counts.triangles += visible as u64 * tris;
+        }
+
+        // This view's frustum, read by its culling jobs. The jobs of all views are grouped
+        // into dispatches once every view is recorded (`prepare_dispatches`).
+        if f.jobs.len() > jobs_start {
+            let planes: GpuFrustum = if culling {
+                frustum.planes.map(|p| p.to_array())
+            } else {
+                [[0.0, 0.0, 0.0, 1.0]; 6]
+            };
+            let slot = f.cull_planes.len() as u32;
+            f.cull_planes.push(planes);
+            for (_, job) in &mut f.jobs[jobs_start..] {
+                job.view = slot;
+            }
+        }
+        opaque_end.unwrap_or(f.draws.len())
+    }
+
+    /// One `ViewData` per camera with a live target: its `GpuView` (kept in `gpu_views` until
+    /// the lighting filled it), its draws and, on GPU paths, its culling jobs (frustum slot,
+    /// output region). `out_cursor` gets the bytes of culled instances written by the jobs
+    /// (`cull_out`), `visible_overflow` whether `cpu_visible` overflowed (see
+    /// [`Self::finish_views`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_views(
         &mut self,
@@ -313,18 +652,18 @@ impl FrameState {
         ambient: AmbientLight,
         culling: bool,
         stats: &mut RenderStats,
+        out_cursor: &mut u64,
+        visible_overflow: &mut bool,
         reallocs: &mut u32,
-    ) -> u64 {
+    ) {
         let f = self;
         let mut cpu_reallocs = 0u32;
-        let path = f.path;
-        let gpu = path.gpu_culling();
-        let multi = matches!(path, DrawPath::GpuMultiDraw | DrawPath::GpuMultiDrawCount);
         let view_stride = f.view_stride();
         let SceneLights { dir, nd } = *lights;
         // ---- views -------------------------------------------------------------------
         f.views.clear();
         f.view_infos.clear();
+        f.gpu_views.clear();
         f.draws.clear();
         #[cfg(test)]
         {
@@ -347,8 +686,8 @@ impl FrameState {
         f.gpu_triangles = 0;
         f.wg_total = 0;
         f.scan = None;
-        let mut out_cursor = 0u64;
-        let mut visible_overflow = false;
+        *out_cursor = 0;
+        *visible_overflow = false;
 
         for ci in 0..f.cameras.len() {
             let cam = f.cameras[ci];
@@ -442,301 +781,28 @@ impl FrameState {
                 gv.exposure = [exposure, exposure.log2(), 0.0, 0.0];
                 gv.output[1] = tonemapper.id();
             }
-            f.views_buf
-                .write_at(view_offset, bytemuck::bytes_of(&gv), &mut cpu_reallocs);
+            // Written once the lighting filled its fields (`Renderer::write_view_uniforms`).
+            f.gpu_views.push(gv);
 
             let draws_start = f.draws.len();
-            let mut opaque_end = None;
-            let jobs_start = f.jobs.len();
-            // Current multi-draw run: (layout, class, material, run_base, draw cmd index, first args).
-            let mut run: Option<(u16, u8, u32, u64, usize, u32)> = None;
-
-            for si in 0..f.sources.len() {
-                let s = f.sources[si];
-                if s.count == 0 {
-                    continue;
-                }
-                stats.instances += s.count as u64;
-                // Sources are sorted opaque first: the view's blended draws start here.
-                if s.blend && opaque_end.is_none() {
-                    opaque_end = Some(f.draws.len());
-                }
-                let tris = s.triangles as u64;
-                let alloc = s.mesh.alloc;
-                let base_cmd = DrawCmd {
-                    layout: s.layout,
-                    class: s.class,
-                    material: s.material,
-                    shader: None,
-                    first_index: alloc.first_index,
-                    index_count: alloc.index_count,
-                    base_vertex: alloc.base_vertex as i32,
-                    vb: VertexSource::Ecs,
-                    vb_offset: 0,
-                    kind: DrawKind::Direct { instances: 0 },
-                };
-
-                // GPU culling writes the visible instances into this view's region of
-                // `cull_out`, which is bound as one storage binding: a region that would end
-                // past it falls back to CPU culling for this view.
-                let run_key = (s.layout, s.class, s.material);
-                let same_run = multi && matches!(run, Some((l, c, m, ..)) if (l, c, m) == run_key);
-                let region_start = if multi && !same_run {
-                    align_up(out_cursor, 256)
-                } else {
-                    out_cursor
-                };
-                let fits = region_start + s.count as u64 * s.stride as u64 <= f.max_storage_binding;
-                // Instances sorted back to front per view (`TransparentSort::PerInstance`) are
-                // culled and ordered on the CPU on every path.
-                let sort = f.materials.sorts(&s);
-                if gpu && s.cull != CullSource::None && fits && !sort {
-                    // GPU culling: reserve an output region, emit a job and an indirect draw.
-                    if multi && !same_run {
-                        out_cursor = region_start;
-                        let cmd_index = f.draws.len();
-                        let kind = if path == DrawPath::GpuMultiDrawCount {
-                            DrawKind::MultiCount {
-                                args_first: f.args_count,
-                                count: 0,
-                                run: f.run_count,
-                            }
-                        } else {
-                            DrawKind::Multi {
-                                args_first: f.args_count,
-                                count: 0,
-                            }
-                        };
-                        f.draws.push(DrawCmd {
-                            vb: VertexSource::CullOut,
-                            vb_offset: out_cursor,
-                            kind,
-                            ..base_cmd
-                        });
-                        run = Some((s.layout, s.class, s.material, out_cursor, cmd_index, f.args_count));
-                        f.run_count += 1;
-                    }
-                    let region = out_cursor;
-                    out_cursor += s.count as u64 * s.stride as u64;
-                    let draw = f.args_count;
-                    f.args_count += 1;
-                    let first_instance = match run {
-                        Some((.., base, _, _)) if multi => ((region - base) / s.stride as u64) as u32,
-                        _ => 0,
-                    };
-                    let template = wgpu::util::DrawIndexedIndirectArgs {
-                        index_count: alloc.index_count,
-                        instance_count: 0,
-                        first_index: alloc.first_index,
-                        base_vertex: alloc.base_vertex as i32,
-                        first_instance,
-                    };
-                    f.templates.push(template.as_bytes(), &mut cpu_reallocs);
-                    if let Some((.., cmd, _)) = run
-                        && multi
-                    {
-                        match &mut f.draws[cmd].kind {
-                            DrawKind::Multi { count, .. } | DrawKind::MultiCount { count, .. } => *count += 1,
-                            _ => {}
-                        }
-                    }
-                    if !multi {
-                        f.draws.push(DrawCmd {
-                            vb: VertexSource::CullOut,
-                            vb_offset: region,
-                            kind: DrawKind::Indirect { args: draw },
-                            ..base_cmd
-                        });
-                    }
-                    let (kind, t_off, s_off, s_kind) = cull_job_encoding(s.cull);
-                    let sp = s.mesh.sphere;
-                    f.jobs.push((
-                        s.buffer,
-                        GpuCullJob {
-                            sphere: [sp.center.x, sp.center.y, sp.center.z, sp.radius],
-                            src_word: s.first * s.stride / 4,
-                            count: s.count,
-                            stride_words: s.stride / 4,
-                            kind,
-                            t_off,
-                            s_off,
-                            s_kind,
-                            dst_word: (region / 4) as u32,
-                            draw,
-                            wg_start: 0,
-                            // Set once the view's frustum slot is known (below).
-                            view: 0,
-                            pad: 0,
-                        },
-                    ));
-                    // Upper bound until the readback of the visible count (see `render_frame`).
-                    stats.instances_drawn += s.count as u64;
-                    stats.triangles += s.count as u64 * tris;
-                    f.gpu_submitted += s.count as u64;
-                    f.gpu_triangles += s.count as u64 * tris;
-                    continue;
-                }
-
-                // CPU path (or buffers the GPU culler cannot decode).
-                run = None;
-                let mut visible = 0u32;
-                match s.buffer {
-                    SourceBuffer::Ecs => {
-                        let range = s.first as usize..(s.first + s.count) as usize;
-                        let order = if f.ecs_overflow {
-                            &f.ecs_cut[range]
-                        } else {
-                            &f.ecs_order[range]
-                        };
-                        visible = if culling {
-                            cull_mask(&f.ecs_matrices, order, s.mesh.sphere, &frustum, &mut f.cull_mask) as u32
-                        } else {
-                            s.count
-                        };
-                        // `cpu_visible` holds every view's partially visible batches and
-                        // cannot exceed `max_buffer_size`: a batch that no longer fits is
-                        // drawn whole from `ecs` (unculled, so the image is the same).
-                        if visible < s.count
-                            && visible > 0
-                            && f.cpu_visible.len() as u64 + visible as u64 * 64 > f.max_buffer_size
-                        {
-                            visible_overflow = true;
-                            visible = s.count;
-                        }
-                        let sorted_fits = f.cpu_visible.len() as u64 + visible as u64 * 64 <= f.max_buffer_size;
-                        if sort && visible > 0 && sorted_fits {
-                            // Back to front: the visible instances in view-depth order, copied
-                            // (diffed) into `cpu_visible`.
-                            let mask = culling.then_some(&f.cull_mask[..]);
-                            let sorted = f.materials.sort_back_to_front(
-                                order,
-                                mask,
-                                &f.ecs_matrices,
-                                camera_view,
-                                &mut cpu_reallocs,
-                            );
-                            let at = f.cpu_visible.len();
-                            let matrices = &f.ecs_matrices;
-                            f.cpu_visible.write_all(
-                                at,
-                                sorted.len(),
-                                sorted.iter().map(|&i| &matrices[i as usize]),
-                                &mut cpu_reallocs,
-                            );
-                            f.draws.push(DrawCmd {
-                                vb: VertexSource::CpuVisible,
-                                vb_offset: at as u64,
-                                kind: DrawKind::Direct { instances: visible },
-                                ..base_cmd
-                            });
-                        } else if visible == s.count {
-                            f.draws.push(DrawCmd {
-                                vb: VertexSource::Ecs,
-                                vb_offset: s.first as u64 * 64,
-                                kind: DrawKind::Direct { instances: visible },
-                                ..base_cmd
-                            });
-                        } else if visible > 0 {
-                            // Partially visible: copy the visible matrices (diffed) into
-                            // `cpu_visible`, in batch order.
-                            let at = f.cpu_visible.len();
-                            let (mask, matrices) = (&f.cull_mask, &f.ecs_matrices);
-                            f.cpu_visible.write_all(
-                                at,
-                                visible as usize,
-                                order
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(k, _)| mask[k / 64] >> (k % 64) & 1 != 0)
-                                    .map(|(_, &i)| &matrices[i as usize]),
-                                &mut cpu_reallocs,
-                            );
-                            f.draws.push(DrawCmd {
-                                vb: VertexSource::CpuVisible,
-                                vb_offset: at as u64,
-                                kind: DrawKind::Direct { instances: visible },
-                                ..base_cmd
-                            });
-                        }
-                    }
-                    SourceBuffer::Explicit(slot) => {
-                        // Visible runs of culling blocks become one draw each, offset into
-                        // the instance buffer (no `first_instance` needed).
-                        let mut draw = |f: &mut FrameState, start: usize, end: usize| {
-                            let end = end.min(s.count as usize);
-                            f.draws.push(DrawCmd {
-                                vb: VertexSource::Explicit(slot),
-                                vb_offset: (start * s.stride as usize) as u64,
-                                kind: DrawKind::Direct {
-                                    instances: (end - start) as u32,
-                                },
-                                ..base_cmd
-                            });
-                            visible += (end - start) as u32;
-                        };
-                        // Bounds are brought up to date here, lazily: only CPU culling reads
-                        // them, and only blocks edited since the last refresh are recomputed.
-                        let bounds = if culling {
-                            let generation = f.explicit[slot as usize].as_ref().map_or(0, |g| g.generation);
-                            buffers
-                                .buffers
-                                .get_mut(crate::handles::RawHandle {
-                                    index: slot,
-                                    generation,
-                                })
-                                .map(|ib| ib.cull_bounds())
-                        } else {
-                            None
-                        };
-                        let r = s.mesh.sphere.center.length() + s.mesh.sphere.radius;
-                        // Empty boxes: no decodable positions, never culled.
-                        let seen = |aabb: &Aabb, scale: f32| {
-                            aabb.is_empty() || frustum.intersects_aabb(&aabb.inflated(r * scale))
-                        };
-                        match bounds {
-                            Some(CullBounds::User(aabb)) => {
-                                if seen(&aabb, 1.0) {
-                                    draw(f, 0, s.count as usize);
-                                }
-                            }
-                            Some(CullBounds::Blocks { total, blocks }) => {
-                                if seen(&total.0, total.1) {
-                                    let mut start = None;
-                                    for (b, (aabb, scale)) in blocks.iter().enumerate() {
-                                        if seen(aabb, *scale) {
-                                            start.get_or_insert(b);
-                                        } else if let Some(a) = start.take() {
-                                            draw(f, a * CULL_BLOCK, b * CULL_BLOCK);
-                                        }
-                                    }
-                                    if let Some(a) = start {
-                                        draw(f, a * CULL_BLOCK, s.count as usize);
-                                    }
-                                }
-                            }
-                            None => draw(f, 0, s.count as usize),
-                        }
-                    }
-                }
-                stats.culled += (s.count - visible) as u64;
-                stats.instances_drawn += visible as u64;
-                stats.triangles += visible as u64 * tris;
-            }
-
-            // This view's frustum, read by its culling jobs. The jobs of all views are grouped
-            // into dispatches after the loop.
-            if f.jobs.len() > jobs_start {
-                let planes: GpuFrustum = if culling {
-                    frustum.planes.map(|p| p.to_array())
-                } else {
-                    [[0.0, 0.0, 0.0, 1.0]; 6]
-                };
-                let slot = f.cull_planes.len() as u32;
-                f.cull_planes.push(planes);
-                for (_, job) in &mut f.jobs[jobs_start..] {
-                    job.view = slot;
-                }
-            }
+            let mut counts = SourceCounts::default();
+            let opaque_end = f.record_sources(
+                &frustum,
+                culling,
+                false,
+                Some(camera_view),
+                buffers,
+                out_cursor,
+                visible_overflow,
+                &mut counts,
+                &mut cpu_reallocs,
+            );
+            stats.instances += counts.instances;
+            stats.instances_drawn += counts.drawn;
+            stats.culled += counts.culled;
+            stats.triangles += counts.triangles;
+            f.gpu_submitted += counts.gpu_submitted;
+            f.gpu_triangles += counts.gpu_triangles;
 
             // (Scene views write `S`: they sample their render target directly.)
             let feedback = match &target {
@@ -801,23 +867,29 @@ impl FrameState {
                 size,
                 view_offset: view_offset as u32,
                 draws: draws_start..f.draws.len(),
-                opaque_end: opaque_end.unwrap_or(f.draws.len()),
+                opaque_end,
                 work: 0,
                 feedback,
+                bind_group: 0,
             });
         }
         stats.views = f.views.len() as u32;
+        // The camera views' indirect args come first: only they feed the stats readback.
+        f.camera_args = f.args_count;
+        *reallocs += cpu_reallocs;
+    }
 
-        if visible_overflow && !f.visible_overflow {
+    /// After every view (camera and depth views) is recorded: log a `cpu_visible` overflow
+    /// once.
+    pub(super) fn finish_views(&mut self, visible_overflow: bool) {
+        if visible_overflow && !self.visible_overflow {
             tracing::warn!(
-                max_buffer_size = f.max_buffer_size,
+                max_buffer_size = self.max_buffer_size,
                 "the partially visible ECS instances of all views exceed the device's \
                  max_buffer_size; the batches past it are drawn unculled"
             );
         }
-        f.visible_overflow = visible_overflow;
-        *reallocs += cpu_reallocs;
-        out_cursor
+        self.visible_overflow = visible_overflow;
     }
 
     /// Group the culling jobs of all views into dispatches (one mark and one scatter per
@@ -1077,7 +1149,7 @@ impl Renderer {
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("space3d cull"),
-            timestamp_writes: None,
+            timestamp_writes: self.timer.compute("cull", None),
         });
         // Each dispatch is its own usage scope, so wgpu orders the passes' storage accesses.
         pass.set_pipeline(&cull.mark);
@@ -1113,11 +1185,12 @@ impl Renderer {
         }
         drop(pass);
         // Visible counts for `RenderStats`, read back without waiting (see `readback.rs`).
+        // (The camera views' args only: depth views' draws are not in `instances_drawn`.)
         self.uploader.reallocations += f.readback.record(
             &self.device,
             encoder,
             f.args.get(),
-            f.args_count,
+            f.camera_args,
             f.gpu_submitted,
             self.frame_index,
         );
