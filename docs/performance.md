@@ -480,7 +480,6 @@ nothing (`tests/depth_views.rs`), and GPU paths add no culling dispatch.
 76 + timestamp writes, the deferred resolve and the two callbacks wgpu boxes per timed frame),
 bound 110; off, timing costs nothing.
 
-
 ### PO5 / PO6 — distortion, the all-post gate
 
 Recorded by the post area (P-POST, M2; `benches/post.rs`, `docs/graphics/post.md` "Hardening").
@@ -499,3 +498,65 @@ ms at 1080p, 0.52 ms at 4K), 2.1 MB of buffer at half resolution, 33 allocations
 Metal (`tests/alloc_post.rs`: 267 with bloom; every effect 351). Render-stage CPU
 (`post/cpu/*`): composite 0.12 ms, bloom 0.26 ms, every effect 0.25 ms — post's CPU line of the
 Battle budget (≤ 0.05 ms) is still not met; bloom's 11 render passes are most of it.
+
+### P-MAT PM1 / PM2 — material maps, blend modes, glTF import
+
+Dev machine as above; measured while other builds kept the machine busy (load averages 12–39),
+so every figure is an interleaved A/B against a pre-materials build (the `instancing` bench
+binary of `graphics` at 62a28d8) run in the same minutes.
+
+| gate / measurement | measured | status |
+|---|---|---|
+| ECS 100k static PBR entities ≤ 2.5 ms (`materials/ecs_pbr/100k`: 4 meshes × 8 materials with ORM, normal and emissive maps and a UV transform, render stage, camera looking away) | 2.23 / 2.35 / 2.34 ms | met |
+| Direct mode unchanged, `extract_upload/ecs_static_mixed/100k` (map-less materials) | 2.13 / 2.21 / 2.22 ms against 2.10–2.27 ms for the pre-materials binary in the same rounds | within noise (the first version of the material key cost +0.8 ms: the per-entity fast path now compares the material field by field without branches, and the cache holds materials, so only real misses build a key) |
+| `materials/transparent_sort/4096` (one 4096-instance alpha batch sorted back to front per frame, camera moving; whole frame) | 0.38–0.41 ms per frame | recorded (the sort is a u64 `sort_unstable` of depth keys; no allocation) |
+| steady-state allocations with every PM1/PM2 feature (`tests/alloc_materials.rs`) | 100 per frame on `CpuDirect`, 195 on the GPU culling paths, constant; 0 in the renderer; live bytes +0 over 90 frames | bound 110 / 215 |
+| static scene with maps (`tests/materials.rs`) | 0 bytes uploaded, 0 textures created once warm | met |
+
+Not measured yet: the GPU cost of a full screen of mapped pixels (the gate "all maps + IBL +
+PCF9 ≤ +0.20 ms" needs PM4/PM5; the maps are sampled behind uniform branches, so map-less
+materials run the original instruction stream).
+
+### P-MAT PM3 / PM4 — skybox, image-based lighting
+
+Dev machine (M4 Max, Metal), release, 1080p headless, frames back to back; load averages 7–33 from
+other lanes' builds and GPU tests. Commands:
+`cargo test -p space3d-render --release --test environment -- --ignored --nocapture ibl_bake_gate`
+and `... forward_full_screen_gate`.
+
+| gate / measurement | measured | status |
+|---|---|---|
+| IBL bake ≤ 3 ms one-time (spec §4.4 T1; 1024² LDR faces → 256² specular + 32² irradiance; `ibl.bake` GPU scope, medians of 5 cubemaps) — default path: compute dispatches | upload (mip chain, 10 dispatches) 0.18–0.32 ms + bake (7 dispatches) 0.52–0.95 ms = **0.69–1.26 ms** over 5 runs | met |
+| the same on the fragment path (WebGL2's; `no_compute` on Metal): a render pass per face and mip | upload 60 passes 1.0–1.2 ms + bake 42 passes 2.2–7.1 ms = **3.4–8.2 ms** | recorded (T3 budget ≤ 50 ms total, ≤ 8 ms per frame with `bake_passes_per_frame`) |
+| per-pass cost on Metal | a 64² cubemap's 66 near-empty passes: 4.2–10.8 ms at load 30, 0.54 ms as 7 compute dispatches | the reason for the compute path |
+| forward full-screen lit pixels, all maps + IBL (+ PCF9 with PM5) vs today's shader ≤ +0.20 ms (a plane filling 1080p, sun + 4 point lights; legacy Classic material without maps or environment vs base color, normal, ORM and emissive maps at 1024², Standard shading and image-based lighting) | `scene` 0.169 → 0.257 ms; median paired difference **+0.088 ms** (3 runs identical; an earlier unpaired run under GPU contention: +0.15 / +0.22) | met without PCF9 (PM5 adds its taps) |
+| steady-state allocations with PM1–PM4 in use (`tests/alloc_materials.rs`: + skybox, environment, Standard shading) | 114 per frame on `CpuDirect`, 208 on the GPU culling paths, constant; 0 in the renderer; live bytes +0 over 90 frames | bound 125 / 230 (PM2's 100 / 195 + the skybox draw and the 7-binding view bind group) |
+| still camera with a skybox and an environment (`environment_steady_state`) | 0 bytes uploaded, 0 textures created, 0 bake steps, identical frames | met |
+| engine goldens (`engine_goldens_are_exact`) | exact: the image-based term and the Standard multiple-scattering factor are behind a uniform branch / an override | met |
+
+Memory (not a gate): a radiance cube is `faces² × 6 × 4/3` texels at 4 B (sRGB) or 8 B
+(`Rgba16Float`): a 1024² LDR sky 33.6 MB, the stories' 512² HDR nebula 16.8 MB; an environment at
+the defaults 4.2 MB (256² × 6 faces × 6 mips + 32² irradiance, `Rgba16Float`); the BRDF LUT 16 KiB.
+
+### P-MAT PM5 / PM6 — directional shadow, hardening
+
+Dev machine (M4 Max, Metal), release, frames back to back; load averages 4–9. Commands:
+`cargo test -p space3d-render --release --test shadows -- --ignored --nocapture shadow_map_gate`,
+`cargo test -p space3d-render --release --test environment -- --ignored --nocapture forward_full_screen_gate`,
+`cargo bench -p space3d-render --bench materials`.
+
+| gate / measurement | measured | status |
+|---|---|---|
+| shadow 2048², 100k instanced casters ≤ 0.30 ms (`shadow` GPU scope; 100k cube entities — one instanced batch — on a 400 × 400 field, all inside the map, `ShadowFit::top_down`, PCF9; median of 120 frames) | **0.276 ms** (min 0.27, 3 runs) on `GpuMultiDraw` | met |
+| the same cubes from one explicit `InstanceBuffer<InstanceCompact>` (recorded) | 0.66 ms; its camera `scene` pass is slower by the same factor (0.94 vs 0.63 ms), with a matrix layout too (0.63 ms), on `CpuDirect` more so (1.46 ms) | recorded: explicit buffers draw about 2.4× slower than the ECS buffer in every pass, shadow or not — a finding for the instancing code, not the shadow |
+| forward full-screen lit pixels, all maps + IBL + PCF9 vs today's shader ≤ +0.20 ms (as in PM4, plus the sun's 2048² shadow with the 9-tap filter on every pixel) | `scene` 0.169 → 0.288 ms; median paired difference **+0.119 ms** (2 runs identical) | met (the first PCF version, a loop over dynamically indexed vectors, cost +0.24 ms; the unrolled kernels +0.03 ms over PM4) |
+| ECS 100k static PBR entities ≤ 2.5 ms (`materials/ecs_pbr/100k`) | 2.27 ms | met |
+| shadow view CPU at 100k ECS (`materials/shadow_view/ecs{,_off}/100k`: the render stage with and without the shadow, camera seeing 4.7k of 100k cubes) | `CpuDirect` 1.59 → 2.00 ms (**+0.40 ms**: the depth view culls every caster on the CPU like a camera); best path (`GpuMultiDraw`) 1.64 → 1.74 ms (**+0.10 ms**, no extra dispatch) | design budget +0.4 ms: met |
+| the same with one explicit 100k-instance buffer (`…/explicit{,_off}/100k`, `CpuDirect`) | 0.31 → 0.48 ms (+0.17 ms) | recorded |
+| steady-state allocations with PM1–PM5 in use (`tests/alloc_materials.rs`: + the sun's shadow, refitted every frame to the moving camera, alpha-masked casters) | 151 per frame on `CpuDirect`, 266 on the GPU culling paths, constant; live bytes +0 over 90 frames. With the shadow's `strength` at 0 (light picked, pipelines specialized, no depth view) exactly PM4's 114 / 208: the lighting's per-frame work allocates nothing, the depth pass and its draws are wgpu's 37 / 58 | bound 165 / 290 |
+| still scene with a shadow (`static_scene_uploads_nothing_with_shadows`, MSAA 4) | 0 bytes uploaded, 0 textures created, 0 reallocations, identical frames; a new `map_size` creates one texture | met |
+| engine goldens (`engine_goldens_are_exact`) | exact (without a casting light `S3D_SHADOW_TAPS` is 0 and the shadow code is compiled out) | met |
+
+Memory: a shadow map is `map_size²` × 4 B (`Depth32Float`): 16.8 MB at 2048², 4.2 MB at 1024²,
+plus one render pass per frame (≈ 2.8 MB of Metal driver memory per frame in flight, see "F7 /
+F8 and M1.1").

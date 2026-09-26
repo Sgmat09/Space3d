@@ -13,7 +13,8 @@ mod forward;
 mod instance;
 mod view;
 
-pub(crate) use forward::GpuMaterial;
+pub(crate) use forward::{GpuMaterial, lighting_globals};
+pub(crate) use instance::ext_fits;
 pub(crate) use view::{GpuDirLight, GpuPointLight, GpuView, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS, VIEW_STRUCTS};
 
 /// Depth buffer format used by every pass.
@@ -91,7 +92,6 @@ pub(crate) enum PassKind {
 /// (`texture_2d_array`; see [`Pipelines::material_bgl`]).
 pub(crate) const KIND_COLOR_LAYERED: u8 = 1;
 /// `PipelineKey::kinds` bit: the data maps (normal, metallic-roughness, occlusion) are arrays.
-#[allow(dead_code, reason = "graphics contract (spec §3.5): material maps arrive with P-MAT")]
 pub(crate) const KIND_DATA_LAYERED: u8 = 2;
 
 /// Everything that selects a forward (or depth) pipeline. Frozen after graphics milestone F3
@@ -119,17 +119,16 @@ pub(crate) struct PipelineKey {
 impl PipelineKey {
     /// The shader module this pipeline is built from (overrides are not part of it).
     pub fn module_key(&self) -> ModuleKey {
-        // The extension vertex stream (tangents, second UV set) arrives with the materials
-        // area, which derives it from the class bits.
-        let ext = false;
+        // The extension vertex stream (tangents, second UV set): a class bit of the materials
+        // area.
+        let ext = forward::class_ext(self.class);
         (self.layout, self.kinds, ext, self.pass, self.shader)
     }
 
     /// Pipeline-overridable constants of this key: only those differing from their defaults
-    /// (at most 2 today; the frame-wide `globals` bits are all at their defaults until the
-    /// materials area defines them).
-    pub fn constants(&self) -> ([(&'static str, f64); 2], usize) {
-        output_constants(self.output)
+    /// (output encoding, alpha mask, frame-wide `globals`; see `forward::pipeline_constants`).
+    pub fn constants(&self) -> ([(&'static str, f64); 8], usize) {
+        forward::pipeline_constants(self)
     }
 }
 
@@ -268,9 +267,10 @@ struct Blit {
 /// Bind group layouts, shaders and cached pipelines.
 pub(crate) struct Pipelines {
     pub view_bgl: wgpu::BindGroupLayout,
-    /// Material layouts: `[single-layer (texture_2d), array (texture_2d_array)]`.
-    material_bgls: [wgpu::BindGroupLayout; 2],
-    layouts_by_texture: [wgpu::PipelineLayout; 2],
+    /// Material layouts by texture kinds (`PipelineKey::kinds`: color maps and data maps
+    /// `texture_2d` or `texture_2d_array`).
+    material_bgls: [wgpu::BindGroupLayout; 4],
+    layouts_by_texture: [wgpu::PipelineLayout; 4],
     shaders: FastMap<ModuleKey, wgpu::ShaderModule>,
     forward: FastMap<PipelineKey, wgpu::RenderPipeline>,
     /// Sources of the custom shaders drawn so far: (version, source).
@@ -383,7 +383,7 @@ impl Pipelines {
     pub fn new(device: &wgpu::Device, compute: bool, glsl_es_300: bool) -> Self {
         let view_bgl = view_layout(device);
         let material_bgls = forward::material_bgls(device);
-        let layouts_by_texture = [0, 1].map(|i| {
+        let layouts_by_texture = [0, 1, 2, 3].map(|i| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("space3d forward"),
                 bind_group_layouts: &[Some(&view_bgl), Some(&material_bgls[i])],
@@ -548,9 +548,9 @@ impl Pipelines {
         }
     }
 
-    /// Material bind group layout for a single-layer (`texture_2d`) or array texture.
-    pub fn material_bgl(&self, layered: bool) -> &wgpu::BindGroupLayout {
-        &self.material_bgls[layered as usize]
+    /// Material bind group layout for texture kinds (`PipelineKey::kinds`).
+    pub fn material_bgl(&self, kinds: u8) -> &wgpu::BindGroupLayout {
+        &self.material_bgls[(kinds & (KIND_COLOR_LAYERED | KIND_DATA_LAYERED)) as usize]
     }
 
     /// Stable id for an instance layout (registers it on first use).
@@ -1001,7 +1001,7 @@ mod tests {
         let hook = "fn fragment_hook(in: VsOut, c: vec4<f32>) -> vec4<f32> { return c * extra; }";
         for decl in [
             "@group(2) @binding(0) var<uniform> extra: vec4<f32>;",
-            "@group(1) @binding(3) var<uniform> extra: vec4<f32>;",
+            "@group(1) @binding(11) var<uniform> extra: vec4<f32>;",
             "@group(0) @binding(1) var<storage, read> extra_buf: array<vec4<f32>>;
              fn extra_at() -> vec4<f32> { return extra_buf[0]; }
              const extra = vec4<f32>(1.0);",
@@ -1238,7 +1238,7 @@ mod tests {
             64 + 16 * 3 + 32 * (MAX_DIR_LIGHTS + MAX_POINT_LIGHTS) + 560
         );
         assert_eq!(std::mem::size_of::<GpuView>(), 1312);
-        assert_eq!(std::mem::size_of::<GpuMaterial>(), 48);
+        assert_eq!(std::mem::size_of::<GpuMaterial>(), 112);
         assert_eq!(std::mem::size_of::<GpuCullParams>(), 32);
         assert_eq!(std::mem::size_of::<GpuFrustum>(), 96);
         // Dynamic offsets of the `frusta` window must be aligned (256 at most in WebGPU).

@@ -145,6 +145,21 @@ impl<T> SlotMap<T> {
     pub fn len(&self) -> usize {
         self.len
     }
+
+    /// Live entries with their handles, in slot order.
+    pub fn iter(&self) -> impl Iterator<Item = (RawHandle, &T)> {
+        self.slots.iter().enumerate().filter_map(|(i, s)| {
+            s.value.as_ref().map(|v| {
+                (
+                    RawHandle {
+                        index: i as u32,
+                        generation: s.generation,
+                    },
+                    v,
+                )
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +179,9 @@ mod tests {
         assert_eq!(m.get(b), Some(&2));
         assert_eq!(m.remove(a), None);
         assert_eq!(m.len(), 1);
+        let c = m.insert(3);
+        let live: Vec<_> = m.iter().map(|(h, v)| (h, *v)).collect();
+        assert_eq!(live, [(b, 2), (c, 3)]);
     }
 
     #[test]

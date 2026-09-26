@@ -184,6 +184,7 @@ impl FrameState {
                 &r.frustum,
                 culling,
                 true,
+                None,
                 buffers,
                 out_cursor,
                 visible_overflow,

@@ -1,5 +1,6 @@
 //! Extraction: ECS entities and explicit instance buffers → batched, sorted sources; material
-//! interning (one uniform slot per distinct material).
+//! interning (one uniform slot per distinct material, one bind group per texture set), the
+//! per-instance transparent sort and the materials' shadow participation.
 
 use super::FrameState;
 use crate::assets::{GpuMesh, RenderAssets};
@@ -8,7 +9,14 @@ use crate::gpu::{GrowBuffer, TrackedBuffer, Uploader};
 use crate::handles::FastMap;
 use crate::handles::{MeshHandle, ShaderHandle, TextureHandle};
 use crate::instance::{BufferUsage, CullSource, ErasedInstanceBuffer, InstanceBuffers, InstancedMesh};
-use crate::pipeline::{CLASS_BLEND, CLASS_DOUBLE_SIDED, GpuMaterial, Pipelines};
+use crate::lighting::api::{LightingSettings, TransparentSort};
+use crate::material::{
+    BlendMode, CLASS_EXT, FLAG_EMISSIVE, FLAG_FIXUP_SHIFT, FLAG_MAPS, FLAG_METALLIC_ROUGHNESS, FLAG_NO_SHADOW,
+    FLAG_NORMAL, FLAG_OCCLUSION, FLAG_ORM_PACKED, FLAG_UV_TRANSFORM, MapMask, ShadowMode,
+};
+use crate::pipeline::{
+    CLASS_BLEND, CLASS_DOUBLE_SIDED, GpuMaterial, KIND_COLOR_LAYERED, KIND_DATA_LAYERED, Pipelines, lighting_globals,
+};
 use crate::stats::RenderStats;
 use space3d_core::{GlobalTransform, World};
 
@@ -140,11 +148,30 @@ pub(super) fn gather_matrices(transforms: &[GlobalTransform], rows: &[u32], dst:
     dst.iter_mut().zip(rows).for_each(copy);
 }
 
+/// The texture maps of a material, by slot: base color, normal, metallic-roughness, occlusion,
+/// emissive (the bindings 1, 3, 5, 7, 9 of the material bind group).
+pub(super) type TextureSet = [Option<TextureHandle>; 5];
+
+/// Slot of the base color map in a [`TextureSet`].
+pub(super) const SLOT_BASE: usize = 0;
+/// Slot of the emissive map.
+pub(super) const SLOT_EMISSIVE: usize = 4;
+/// Slots of the data maps (normal, metallic-roughness, occlusion): linear textures sharing one
+/// texture kind.
+const DATA_SLOTS: std::ops::RangeInclusive<usize> = 1..=3;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct MaterialKey {
-    words: [u32; 9],
+    /// Base color, metallic, roughness, emissive, normal scale, occlusion strength, alpha cutoff,
+    /// UV transform (offset, rotation, scale), as bits.
+    words: [u32; 17],
+    /// Unlit, double-sided, legacy alpha blend.
     flags: u8,
-    texture: Option<TextureHandle>,
+    blend: BlendMode,
+    uv1_maps: u8,
+    shadows: ShadowMode,
+    render_order: i16,
+    maps: TextureSet,
     shader: Option<ShaderHandle>,
 }
 
@@ -152,25 +179,42 @@ impl MaterialKey {
     pub(super) fn new(m: &Material) -> Self {
         let b = m.base_color;
         let e = m.emissive;
+        let t = m.uv_transform;
         Self {
-            words: [b.x, b.y, b.z, b.w, m.metallic, m.roughness, e.x, e.y, e.z].map(f32::to_bits),
+            words: [
+                b.x,
+                b.y,
+                b.z,
+                b.w,
+                m.metallic,
+                m.roughness,
+                e.x,
+                e.y,
+                e.z,
+                m.normal_scale,
+                m.occlusion_strength,
+                m.alpha_cutoff,
+                t.offset.x,
+                t.offset.y,
+                t.rotation,
+                t.scale.x,
+                t.scale.y,
+            ]
+            .map(f32::to_bits),
             flags: (m.unlit as u8) | (m.double_sided as u8) << 1 | (m.alpha_blend as u8) << 2,
-            texture: m.base_color_texture,
+            blend: m.blend,
+            uv1_maps: m.uv1_maps.0,
+            shadows: m.shadows,
+            render_order: m.render_order,
+            maps: [
+                m.base_color_texture,
+                m.normal_texture,
+                m.metallic_roughness_texture,
+                m.occlusion_texture,
+                m.emissive_texture,
+            ],
             shader: m.shader,
         }
-    }
-
-    /// Slot in [`MaterialTable`]'s direct-mapped cache (a cheap multiplicative hash).
-    pub(super) fn cache_slot(&self) -> usize {
-        let t = self.texture.map_or(0, |t| t.index() ^ t.generation().rotate_left(16));
-        let sh = self
-            .shader
-            .map_or(0, |s| (s.index() + 1) ^ s.generation().rotate_left(16));
-        let mut h = (self.flags as u32 ^ t ^ sh.rotate_left(8)).wrapping_mul(0x9E37_79B1);
-        for w in self.words {
-            h = (h.rotate_left(5) ^ w).wrapping_mul(0x9E37_79B1);
-        }
-        (h >> (32 - MATERIAL_CACHE.trailing_zeros())) as usize
     }
 }
 
@@ -179,34 +223,136 @@ pub(super) struct MatEntry {
     pub(super) class: u8,
     pub(super) last_used: u64,
     pub(super) live: bool,
+    /// Texture set (index in [`MaterialTable::sets`]).
+    pub(super) set: u32,
+    /// `FLAG_*` bits the material asks for; the uniform gets those its set can honour
+    /// ([`TextureSetEntry::flags`]).
+    pub(super) wanted: u32,
+    /// The uniform as written into its slot.
+    pub(super) gpu: GpuMaterial,
+}
+
+/// A texture set in use: its maps, what the GPU textures behind them are (resolved in
+/// `extract`, once per frame of use) and its material bind group (built in
+/// `prepare_material_bind_groups`, after the frame's uploads).
+pub(crate) struct TextureSetEntry {
+    pub(super) maps: TextureSet,
+    pub(super) live: bool,
+    /// Last frame the set was resolved against the uploaded textures.
+    pub(super) checked: u64,
+    /// `TextureEntry::version` of every map it was resolved for (`u32::MAX`: no GPU texture).
+    pub(super) versions: [u32; 5],
+    /// Resolved once at least.
+    pub(super) resolved: bool,
+    /// `PipelineKey::kinds`: color maps (base, emissive) and data maps are arrays.
+    pub(super) kinds: u8,
+    /// Slots bound to their texture (bit `slot`); the others get the default of their kind.
+    pub(super) available: u8,
+    /// Data slots whose texture is sRGB-encoded (bit `slot`): the shader re-encodes them.
+    pub(super) srgb: u8,
+    /// A map of the other texture kind than its group was reported.
+    pub(super) warned: bool,
+    /// The bind group, with the materials buffer generation and texture versions it binds.
+    pub(super) bind_group: Option<(wgpu::BindGroup, u32, [u32; 5])>,
+    /// Variant for views drawing into a render target the set samples: that render target is
+    /// replaced by its copy (`feedback`) or the default.
+    pub(super) own_target: Option<OwnTargetBindGroup>,
+}
+
+/// A texture set's bind group for views drawing into one of its maps: (that render target, the
+/// copy bound in its place (`None`: the default), materials buffer generation, texture versions,
+/// bind group).
+pub(super) type OwnTargetBindGroup = (TextureHandle, Option<wgpu::TextureView>, u32, [u32; 5], wgpu::BindGroup);
+
+impl TextureSetEntry {
+    fn new(maps: TextureSet) -> Self {
+        Self {
+            maps,
+            live: true,
+            checked: u64::MAX,
+            versions: [u32::MAX; 5],
+            resolved: false,
+            kinds: 0,
+            available: 0,
+            srgb: 0,
+            warned: false,
+            bind_group: None,
+            own_target: None,
+        }
+    }
+
+    /// The uniform flags (`MaterialParams::flags.x`) of a material asking for `wanted` with this
+    /// set: maps the set cannot bind are dropped (the shader then keeps the factors), ORM
+    /// packing needs both slots, and sRGB data maps get their fixup bits.
+    pub(super) fn flags(&self, wanted: u32) -> u32 {
+        let available = self.available as u32;
+        let mut f = wanted & !(FLAG_MAPS | FLAG_ORM_PACKED) | wanted & FLAG_MAPS & available;
+        let orm = FLAG_METALLIC_ROUGHNESS | FLAG_OCCLUSION;
+        if wanted & FLAG_ORM_PACKED != 0 && f & orm == orm {
+            f |= FLAG_ORM_PACKED;
+        }
+        for slot in DATA_SLOTS {
+            if f & (1 << slot) != 0 && self.srgb & (1 << slot) != 0 {
+                f |= 1 << (FLAG_FIXUP_SHIFT + slot as u32);
+            }
+        }
+        f
+    }
 }
 
 /// Slots of the direct-mapped cache in front of the material map (a power of two).
 const MATERIAL_CACHE: usize = 64;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct CachedMaterial {
-    pub(super) key: MaterialKey,
+    pub(super) material: Material,
     pub(super) id: u32,
     pub(super) class: u8,
     /// Frame whose `last_used` this entry already refreshed.
     pub(super) frame: u64,
 }
 
-/// Interns equal materials to one id / uniform slot so they batch together.
+/// Interns equal materials to one id / uniform slot so they batch together, and their texture
+/// sets to one bind group each.
 ///
 /// Every ECS entity carries its `Material` by value, so interning runs once per entity per
-/// frame. The last material seen and a small direct-mapped cache answer almost all of those
-/// with one key comparison (neighbouring entities mostly share materials, and a scene rarely
-/// uses more materials at once than the cache has slots); only misses hash and probe the map.
+/// frame. The last material seen answers most of those with one branch-free comparison of the
+/// material (neighbouring entities mostly share materials); a small direct-mapped cache of
+/// materials, addressed by a cheap hash of their fields, answers almost all the others (a
+/// scene rarely uses more materials at once than the cache has slots); only misses build a
+/// [`MaterialKey`] and probe the map.
 pub(crate) struct MaterialTable {
     pub(super) map: FastMap<MaterialKey, u32>,
     pub(super) entries: Vec<MatEntry>,
     pub(super) free: Vec<u32>,
     pub(super) cache: [Option<CachedMaterial>; MATERIAL_CACHE],
-    pub(super) last: Option<CachedMaterial>,
+    /// The cache slot of the last material interned (the per-entity fast path compares it).
+    pub(super) last: Option<usize>,
     /// Interns that missed the cache (tests).
     pub(super) misses: u64,
+    /// Texture sets by maps, and the sets.
+    pub(super) set_map: FastMap<TextureSet, u32>,
+    pub(super) sets: Vec<TextureSetEntry>,
+    pub(super) free_sets: Vec<u32>,
+    /// Scratch of the set garbage collection: sets referenced by live materials.
+    set_refs: Vec<bool>,
+    /// Frame-wide override bits of the lighting settings (`PipelineKey::globals`).
+    pub(super) globals: u8,
+    /// Transparent sorting of the lighting settings.
+    pub(super) transparent_sort: TransparentSort,
+    /// Scratch of [`Self::sort_back_to_front`]: keys, then the sorted instances.
+    sort_keys: Vec<u64>,
+    sort_order: Vec<u32>,
+    /// The default of array-kind maps: a 2-layer white `D2Array` (a 1-layer array would be a
+    /// plain 2D texture on GL, which a `sampler2DArray` reads as black). Single-layer maps
+    /// default to the renderer's 1×1 white texture.
+    pub(super) white_array: Option<wgpu::TextureView>,
+    /// The extension stream bound to slot 2 this frame: the arena's, or a zero-filled stand-in
+    /// (capacity in vertices) while no mesh has extension data.
+    pub(super) ext_buffer: Option<wgpu::Buffer>,
+    zero_ext: Option<(wgpu::Buffer, u32)>,
+    /// Instance layouts (ids) whose ext-less pipelines were reported.
+    ext_warned: Vec<u16>,
 }
 
 impl Default for MaterialTable {
@@ -215,16 +361,152 @@ impl Default for MaterialTable {
             map: FastMap::default(),
             entries: Vec::new(),
             free: Vec::new(),
-            cache: [None; MATERIAL_CACHE],
+            cache: std::array::from_fn(|_| None),
             last: None,
             misses: 0,
+            set_map: FastMap::default(),
+            sets: Vec::new(),
+            free_sets: Vec::new(),
+            set_refs: Vec::new(),
+            globals: 0,
+            transparent_sort: TransparentSort::None,
+            sort_keys: Vec::new(),
+            sort_order: Vec::new(),
+            white_array: None,
+            ext_buffer: None,
+            zero_ext: None,
+            ext_warned: Vec::new(),
         }
+    }
+}
+
+/// Slot of `m` in [`MaterialTable`]'s direct-mapped cache: a cheap hash of the fields that
+/// usually tell materials apart (rotate-xor folds, which pipeline, and one multiply). Equal
+/// materials land in the same slot; the rest only matters for how well the cache spreads.
+#[inline]
+fn cache_slot(m: &Material) -> usize {
+    let handle = |t: Option<TextureHandle>| t.map_or(0, |t| (t.index() + 1) ^ t.generation().rotate_left(16));
+    let b = m.base_color;
+    let e = m.emissive;
+    let mut h = (m.unlit as u32) | (m.double_sided as u32) << 1 | (m.alpha_blend as u32) << 2;
+    h ^= m.blend.class_bits() as u32 ^ (m.render_order as u16 as u32) << 16;
+    h ^= m
+        .shader
+        .map_or(0, |s| (s.index() + 1) ^ s.generation().rotate_left(16))
+        .rotate_left(8);
+    for (i, w) in [b.x, b.y, b.z, b.w, m.metallic, m.roughness, e.x, e.y, e.z]
+        .into_iter()
+        .enumerate()
+    {
+        h ^= w.to_bits().rotate_left(7 * i as u32 + 1);
+    }
+    for (i, t) in [
+        m.base_color_texture,
+        m.normal_texture,
+        m.metallic_roughness_texture,
+        m.occlusion_texture,
+        m.emissive_texture,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        h ^= handle(t).rotate_left(5 * i as u32 + 3);
+    }
+    let h = h.wrapping_mul(0x9E37_79B1) ^ (h >> 15);
+    (h.wrapping_mul(0x85EB_CA6B) >> (32 - MATERIAL_CACHE.trailing_zeros())) as usize
+}
+
+/// Whether two materials are the same for interning (their `MaterialKey`s are equal): every
+/// field compared by bits, folded without branches — the per-entity fast path of
+/// [`MaterialTable::intern`], so it must stay cheaper than building a key.
+#[inline(always)]
+fn same_material(a: &Material, b: &Material) -> bool {
+    let f = |x: f32, y: f32| x.to_bits() ^ y.to_bits();
+    let h = |x: Option<TextureHandle>, y: Option<TextureHandle>| (x != y) as u32;
+    let (ab, bb, ae, be) = (a.base_color, b.base_color, a.emissive, b.emissive);
+    let (at, bt) = (a.uv_transform, b.uv_transform);
+    let floats = f(ab.x, bb.x)
+        | f(ab.y, bb.y)
+        | f(ab.z, bb.z)
+        | f(ab.w, bb.w)
+        | f(a.metallic, b.metallic)
+        | f(a.roughness, b.roughness)
+        | f(ae.x, be.x)
+        | f(ae.y, be.y)
+        | f(ae.z, be.z)
+        | f(a.normal_scale, b.normal_scale)
+        | f(a.occlusion_strength, b.occlusion_strength)
+        | f(a.alpha_cutoff, b.alpha_cutoff)
+        | f(at.offset.x, bt.offset.x)
+        | f(at.offset.y, bt.offset.y)
+        | f(at.rotation, bt.rotation)
+        | f(at.scale.x, bt.scale.x)
+        | f(at.scale.y, bt.scale.y);
+    let maps = h(a.base_color_texture, b.base_color_texture)
+        | h(a.normal_texture, b.normal_texture)
+        | h(a.metallic_roughness_texture, b.metallic_roughness_texture)
+        | h(a.occlusion_texture, b.occlusion_texture)
+        | h(a.emissive_texture, b.emissive_texture);
+    let small = ((a.unlit ^ b.unlit) | (a.double_sided ^ b.double_sided) | (a.alpha_blend ^ b.alpha_blend)) as u32
+        | (a.uv1_maps.0 ^ b.uv1_maps.0) as u32
+        | (a.render_order ^ b.render_order) as u16 as u32;
+    floats | small | maps == 0 && a.shader == b.shader && a.blend == b.blend && a.shadows == b.shadows
+}
+
+/// The `FLAG_*` bits a material asks for (before its set's availability).
+fn wanted_flags(m: &Material) -> u32 {
+    let mut f = 0;
+    if m.normal_texture.is_some() {
+        f |= FLAG_NORMAL;
+    }
+    if m.metallic_roughness_texture.is_some() {
+        f |= FLAG_METALLIC_ROUGHNESS;
+    }
+    if m.occlusion_texture.is_some() {
+        f |= FLAG_OCCLUSION;
+        if m.occlusion_texture == m.metallic_roughness_texture {
+            f |= FLAG_ORM_PACKED;
+        }
+    }
+    if m.emissive_texture.is_some() {
+        f |= FLAG_EMISSIVE;
+    }
+    if !m.uv_transform.is_identity() {
+        f |= FLAG_UV_TRANSFORM;
+    }
+    if matches!(m.shadows, ShadowMode::CastOnly | ShadowMode::None) {
+        f |= FLAG_NO_SHADOW;
+    }
+    f
+}
+
+/// The uniform of a material (`flags.x` from `flags`).
+fn gpu_material(m: &Material, flags: u32) -> GpuMaterial {
+    let t = m.uv_transform.matrix();
+    GpuMaterial {
+        base_color: m.base_color.to_array(),
+        emissive: [
+            m.emissive.x,
+            m.emissive.y,
+            m.emissive.z,
+            if m.unlit { 1.0 } else { 0.0 },
+        ],
+        params: [
+            m.metallic,
+            m.roughness,
+            if m.base_color_texture.is_some() { 1.0 } else { 0.0 },
+            0.0,
+        ],
+        maps: [m.normal_scale, m.occlusion_strength, m.alpha_cutoff, 0.0],
+        flags: [flags, m.uv1_maps.0 as u32, 0, 0],
+        uv_row0: [t.x_axis.x, t.y_axis.x, t.z_axis.x, 0.0],
+        uv_row1: [t.x_axis.y, t.y_axis.y, t.z_axis.y, 0.0],
     }
 }
 
 impl MaterialTable {
     /// Material id and pipeline class of `m`, allocating a uniform slot for new materials.
-    #[inline]
+    #[inline(always)]
     pub(super) fn intern(
         &mut self,
         m: &Material,
@@ -233,11 +515,13 @@ impl MaterialTable {
         stride: usize,
         cpu_reallocs: &mut u32,
     ) -> (u32, u8) {
-        let key = MaterialKey::new(m);
-        match &self.last {
-            Some(l) if l.frame == frame && l.key == key => (l.id, l.class),
-            _ => self.intern_cached(m, key, frame, buf, stride, cpu_reallocs),
+        if let Some(c) = self.last.and_then(|slot| self.cache[slot].as_ref())
+            && c.frame == frame
+            && same_material(&c.material, m)
+        {
+            return (c.id, c.class);
         }
+        self.intern_cached(m, frame, buf, stride, cpu_reallocs)
     }
 
     /// [`Self::intern`] when the material differs from the previous one (kept out of line so
@@ -246,28 +530,32 @@ impl MaterialTable {
     fn intern_cached(
         &mut self,
         m: &Material,
-        key: MaterialKey,
         frame: u64,
         buf: &mut TrackedBuffer,
         stride: usize,
         cpu_reallocs: &mut u32,
     ) -> (u32, u8) {
-        let slot = key.cache_slot();
+        let slot = cache_slot(m);
         if let Some(c) = &mut self.cache[slot]
-            && c.key == key
+            && same_material(&c.material, m)
         {
             if c.frame != frame {
                 c.frame = frame;
                 self.entries[c.id as usize].last_used = frame;
             }
-            self.last = Some(*c);
+            self.last = Some(slot);
             return (c.id, c.class);
         }
         self.misses += 1;
+        let key = MaterialKey::new(m);
         let (id, class) = self.intern_slow(m, key, frame, buf, stride, cpu_reallocs);
-        let c = CachedMaterial { key, id, class, frame };
-        self.cache[slot] = Some(c);
-        self.last = Some(c);
+        self.cache[slot] = Some(CachedMaterial {
+            material: m.clone(),
+            id,
+            class,
+            frame,
+        });
+        self.last = Some(slot);
         (id, class)
     }
 
@@ -287,11 +575,17 @@ impl MaterialTable {
             return (id, e.class);
         }
         let class = material_class(m);
+        let set = self.intern_set(key.maps);
+        let wanted = wanted_flags(m);
+        let gpu = gpu_material(m, self.sets[set as usize].flags(wanted));
         let entry = MatEntry {
             key,
             class,
             last_used: frame,
             live: true,
+            set,
+            wanted,
+            gpu,
         };
         let id = match self.free.pop() {
             Some(id) => {
@@ -304,26 +598,32 @@ impl MaterialTable {
             }
         };
         self.map.insert(key, id);
-        let gpu = GpuMaterial {
-            base_color: m.base_color.to_array(),
-            emissive: [
-                m.emissive.x,
-                m.emissive.y,
-                m.emissive.z,
-                if m.unlit { 1.0 } else { 0.0 },
-            ],
-            params: [
-                m.metallic,
-                m.roughness,
-                if m.base_color_texture.is_some() { 1.0 } else { 0.0 },
-                0.0,
-            ],
-        };
         buf.write_at(id as usize * stride, bytemuck::bytes_of(&gpu), cpu_reallocs);
         (id, class)
     }
 
-    /// Drop materials unused for a while so the table does not grow without bound.
+    /// Id of the texture set `maps` (created on first use).
+    fn intern_set(&mut self, maps: TextureSet) -> u32 {
+        if let Some(&id) = self.set_map.get(&maps) {
+            return id;
+        }
+        let entry = TextureSetEntry::new(maps);
+        let id = match self.free_sets.pop() {
+            Some(id) => {
+                self.sets[id as usize] = entry;
+                id
+            }
+            None => {
+                self.sets.push(entry);
+                self.sets.len() as u32 - 1
+            }
+        };
+        self.set_map.insert(maps, id);
+        id
+    }
+
+    /// Drop materials unused for a while so the table does not grow without bound, and the
+    /// texture sets no live material uses (with their bind groups).
     pub(super) fn gc(&mut self, frame: u64) {
         const MAX_IDLE: u64 = 600;
         if !frame.is_multiple_of(256) {
@@ -340,18 +640,292 @@ impl MaterialTable {
         }
         if freed {
             // Freed ids get reused for other materials: forget every cached key → id.
-            self.cache = [None; MATERIAL_CACHE];
+            self.cache = std::array::from_fn(|_| None);
             self.last = None;
+            self.set_refs.clear();
+            self.set_refs.resize(self.sets.len(), false);
+            for e in self.entries.iter().filter(|e| e.live) {
+                self.set_refs[e.set as usize] = true;
+            }
+            for (i, s) in self.sets.iter_mut().enumerate() {
+                if s.live && !self.set_refs[i] {
+                    s.live = false;
+                    s.bind_group = None;
+                    s.own_target = None;
+                    self.set_map.remove(&s.maps);
+                    self.free_sets.push(i as u32);
+                }
+            }
         }
     }
 
+    /// The base color texture of a material.
     pub(super) fn texture(&self, id: u32) -> Option<TextureHandle> {
-        self.entries.get(id as usize).and_then(|e| e.key.texture)
+        self.entries.get(id as usize).and_then(|e| e.key.maps[SLOT_BASE])
     }
 
     pub(super) fn shader(&self, id: u32) -> Option<ShaderHandle> {
         self.entries.get(id as usize).and_then(|e| e.key.shader)
     }
+
+    /// Texture set of a material.
+    pub(super) fn set_of(&self, id: u32) -> u32 {
+        self.entries.get(id as usize).map_or(0, |e| e.set)
+    }
+
+    /// Transparent draw order of a material (`Material::render_order`).
+    pub(super) fn render_order(&self, id: u32) -> i16 {
+        self.entries.get(id as usize).map_or(0, |e| e.key.render_order)
+    }
+
+    /// Resolve the texture set of `material` against the uploaded textures (once per frame):
+    /// texture kinds, which maps can be bound, which data maps are sRGB. When that changes, the
+    /// uniforms of the set's materials are rewritten (their map flags).
+    pub(super) fn resolve_set(
+        &mut self,
+        material: u32,
+        assets: &RenderAssets,
+        frame: u64,
+        buf: &mut TrackedBuffer,
+        stride: usize,
+        cpu_reallocs: &mut u32,
+    ) {
+        let id = self.set_of(material);
+        let Some(set) = self.sets.get_mut(id as usize) else {
+            return;
+        };
+        if set.checked == frame {
+            return;
+        }
+        set.checked = frame;
+        let gpu = set
+            .maps
+            .map(|h| h.and_then(|h| assets.textures.get(h.raw())).filter(|e| e.gpu.is_some()));
+        let versions = gpu.map(|e| e.map_or(u32::MAX, |e| e.version));
+        if set.resolved && versions == set.versions {
+            return;
+        }
+        set.versions = versions;
+        let layered = gpu.map(|e| e.and_then(|e| e.gpu.as_ref()).map(|g| g.layered));
+        // The color kind follows the base color map (else the emissive map), the data kind
+        // the first data map present.
+        let color = layered[SLOT_BASE].or(layered[SLOT_EMISSIVE]).unwrap_or(false);
+        let data = DATA_SLOTS.filter_map(|s| layered[s]).next().unwrap_or(false);
+        let mut available = 0u8;
+        let mut srgb = 0u8;
+        let mut mismatch = false;
+        for (slot, l) in layered.iter().enumerate() {
+            let Some(l) = *l else { continue };
+            let kind = if DATA_SLOTS.contains(&slot) { data } else { color };
+            if l != kind {
+                mismatch = true;
+                continue;
+            }
+            available |= 1 << slot;
+            let format = gpu[slot].and_then(|e| e.gpu.as_ref()).map(|g| g.format);
+            if DATA_SLOTS.contains(&slot) && format.is_some_and(|f| f.is_srgb()) {
+                srgb |= 1 << slot;
+            }
+        }
+        if mismatch && !set.warned {
+            set.warned = true;
+            tracing::warn!(
+                maps = ?set.maps,
+                "a material mixes texture arrays and single-layer textures within its color maps \
+                 (base color, emissive) or its data maps (normal, metallic-roughness, occlusion); \
+                 the maps of the other kind are not sampled"
+            );
+        }
+        if srgb != 0 && set.srgb != srgb {
+            tracing::warn!(
+                maps = ?set.maps,
+                "a normal, metallic-roughness or occlusion map is an sRGB texture; these are \
+                 linear data (upload them with `add_image_linear`): the sample is re-encoded, \
+                 losing precision"
+            );
+        }
+        let changed = !set.resolved || (available, srgb) != (set.available, set.srgb);
+        set.resolved = true;
+        set.kinds = if color { KIND_COLOR_LAYERED } else { 0 } | if data { KIND_DATA_LAYERED } else { 0 };
+        set.available = available;
+        set.srgb = srgb;
+        if !changed {
+            return;
+        }
+        let set = &self.sets[id as usize];
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            if e.live && e.set == id {
+                let flags = set.flags(e.wanted);
+                if flags != e.gpu.flags[0] {
+                    e.gpu.flags[0] = flags;
+                    buf.write_at(i * stride, bytemuck::bytes_of(&e.gpu), cpu_reallocs);
+                }
+            }
+        }
+    }
+
+    /// Whether views draw the instances of `s` back to front (`TransparentSort::PerInstance`:
+    /// ECS batches of alpha-blended or premultiplied materials up to the size limit).
+    pub(super) fn sorts(&self, s: &Source) -> bool {
+        match self.transparent_sort {
+            TransparentSort::PerInstance { max_instances } => {
+                s.blend
+                    && s.buffer == SourceBuffer::Ecs
+                    && s.count <= max_instances
+                    && matches!(
+                        BlendMode::from_class(s.class),
+                        BlendMode::AlphaBlend | BlendMode::Premultiplied
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// The instances of an ECS batch (`order`, those with their `mask` bit when given) sorted
+    /// far to near by the view-space depth of their translation (`view`: world → view);
+    /// equal depths keep batch order. Indices into the ECS matrices.
+    pub(super) fn sort_back_to_front(
+        &mut self,
+        order: &[u32],
+        mask: Option<&[u64]>,
+        matrices: &[[f32; 16]],
+        view: glam::Mat4,
+        cpu_reallocs: &mut u32,
+    ) -> &[u32] {
+        let caps = (self.sort_keys.capacity(), self.sort_order.capacity());
+        let row = view.row(2);
+        self.sort_keys.clear();
+        for (k, &i) in order.iter().enumerate() {
+            if mask.is_some_and(|m| m[k / 64] >> (k % 64) & 1 == 0) {
+                continue;
+            }
+            let m = &matrices[i as usize];
+            let z = row.dot(glam::Vec4::new(m[12], m[13], m[14], 1.0));
+            // Order-preserving f32 → u32: ascending view z = far (most negative) first.
+            let bits = z.to_bits();
+            let key = if bits >> 31 == 1 { !bits } else { bits | 0x8000_0000 };
+            self.sort_keys.push((key as u64) << 32 | k as u64);
+        }
+        self.sort_keys.sort_unstable();
+        self.sort_order.clear();
+        self.sort_order
+            .extend(self.sort_keys.iter().map(|&k| order[(k & 0xFFFF_FFFF) as usize]));
+        if caps != (self.sort_keys.capacity(), self.sort_order.capacity()) {
+            *cpu_reallocs += 1;
+        }
+        &self.sort_order
+    }
+
+    /// The pipeline class of a source of `material` drawn with an instance layout: the
+    /// extension stream is dropped for layouts without room for it (warned once per layout).
+    fn class_for_layout(&mut self, class: u8, layout_id: u16, layout: &crate::instance::InstanceLayout) -> u8 {
+        if class & CLASS_EXT == 0 || crate::pipeline::ext_fits(layout) {
+            return class;
+        }
+        if !self.ext_warned.contains(&layout_id) {
+            self.ext_warned.push(layout_id);
+            tracing::warn!(
+                layout = layout.name,
+                "instance layout uses more than 10 vertex locations: normal maps on it use \
+                 per-pixel tangents and second-UV-set maps sample UV0"
+            );
+        }
+        class & !CLASS_EXT
+    }
+
+    /// Create the default map textures once (the 2-layer white array), and the extension
+    /// stream bound this frame: the arena's, or a zero-filled buffer of its capacity while no
+    /// mesh has extension data but an ext pipeline draws.
+    fn prepare_gpu(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        assets: &RenderAssets,
+        ext_used: bool,
+        up: &mut Uploader,
+    ) {
+        if self.white_array.is_none() {
+            self.white_array = Some(white_array(device, encoder));
+        }
+        self.ext_buffer = match &assets.arena.ext {
+            Some((b, _)) => {
+                self.zero_ext = None;
+                Some(b.clone())
+            }
+            None if ext_used => {
+                let capacity = assets.arena.vertices.capacity().max(1);
+                if self.zero_ext.as_ref().is_none_or(|(_, c)| *c != capacity) {
+                    let b = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("space3d empty extension vertices"),
+                        size: capacity as u64 * crate::arena::EXT_VERTEX_SIZE,
+                        usage: wgpu::BufferUsages::VERTEX,
+                        mapped_at_creation: false,
+                    });
+                    up.reallocations += 1;
+                    self.zero_ext = Some((b, capacity));
+                }
+                self.zero_ext.as_ref().map(|(b, _)| b.clone())
+            }
+            None => None,
+        };
+    }
+}
+
+/// The 2-layer white `Rgba8Unorm` array default of array-kind maps (copied from a small
+/// staging buffer: rows of 256 bytes).
+fn white_array(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("space3d white array"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("space3d white array staging"),
+        size: 512,
+        usage: wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: true,
+    });
+    // (Only a lost device leaves a new buffer unmapped: the copy is then invalid anyway.)
+    if let Ok(mut bytes) = staging.get_mapped_range_mut(..) {
+        for layer in 0..2 {
+            crate::gpu::copy_to_staging(bytes.slice(layer * 256..layer * 256 + 4), &[255; 4]);
+        }
+    }
+    staging.unmap();
+    encoder.copy_buffer_to_texture(
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(1),
+            },
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 2,
+        },
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    })
 }
 
 /// How many instances of each batch (`counts`) to keep so that at most `cap` are kept in
@@ -379,30 +953,63 @@ pub(super) fn fair_share(counts: impl Iterator<Item = u32> + Clone, cap: u64, ke
     }
 }
 
-/// The part of a material's pipeline key that is not its class: its custom shader (slot + 1,
-/// 0 for none) and whether its texture is an array (`texture_2d_array` pipeline variant).
-pub(super) fn pipeline_rank(materials: &MaterialTable, assets: &RenderAssets, material: u32) -> u64 {
+/// The draw-order rank of a source beyond its class and layout: the render order of
+/// transparent batches (bits 48..63, `Material::render_order` + 32768), the custom shader
+/// (slot + 1, 0 for none; bits 2..) and the texture kinds of the material's maps (bits 0..1,
+/// the texture-array pipeline variants).
+pub(super) fn pipeline_rank(materials: &MaterialTable, class: u8, material: u32) -> u64 {
     let shader = materials.shader(material).map_or(0, |h| h.index() as u64 + 1);
-    let layered = materials
-        .texture(material)
-        .and_then(|h| assets.textures.get(h.raw()))
-        .and_then(|e| e.gpu.as_ref())
-        .is_some_and(|g| g.layered);
-    shader << 1 | layered as u64
+    let kinds = materials
+        .sets
+        .get(materials.set_of(material) as usize)
+        .map_or(0, |s| s.kinds);
+    let order = if class & CLASS_BLEND != 0 {
+        (materials.render_order(material) as i32 + 32768) as u64
+    } else {
+        0
+    };
+    order << 48 | shader << 2 | kinds as u64
 }
 
-/// Pipeline class bits of a material (`PipelineKey::class`; the materials area adds bits 2..=5).
+/// Pipeline class bits of a material (`PipelineKey::class`): double-sided, transparent, the
+/// blend mode (`BlendMode::class_bits`) and the extension vertex stream (a normal map, for
+/// vertex tangents, or maps on the second UV set).
 pub(crate) fn material_class(m: &Material) -> u8 {
-    (if m.double_sided { CLASS_DOUBLE_SIDED } else { 0 }) | if m.alpha_blend { CLASS_BLEND } else { 0 }
+    let blend = m.effective_blend();
+    let mut class = blend.class_bits();
+    if m.double_sided {
+        class |= CLASS_DOUBLE_SIDED;
+    }
+    if blend.is_transparent() {
+        class |= CLASS_BLEND;
+    }
+    if m.normal_texture.is_some() || m.uv1_maps != MapMask::NONE {
+        class |= CLASS_EXT;
+    }
+    class
 }
 
-/// Draw order of batches: opaque before blended, then pipeline (class, instance layout,
-/// shader/texture kind), then material, then mesh — so each pipeline is bound once per view
-/// and each material once per pipeline, and multi-draw runs (equal pipeline and material) are
-/// contiguous whatever the spawn order. Buffer and first instance make the order total.
-pub(super) fn source_sort_key(s: &Source) -> (bool, u8, u16, u64, u32, u32, SourceBuffer, u32) {
+/// Draw order of batches (graphics spec §1.7): phase (opaque, then alpha-masked, then
+/// transparent), the transparent render order (`Material::render_order`), alpha-blended and
+/// premultiplied before additive, then pipeline (class, instance layout, shader/texture kinds),
+/// then material, then mesh — so each pipeline is bound once per view and each material once
+/// per pipeline, and multi-draw runs (equal pipeline and material) are contiguous whatever the
+/// spawn order. Buffer and first instance make the order total. With every render order 0 and
+/// no masks or additive materials, this is the order before blend modes existed.
+#[allow(clippy::type_complexity)]
+pub(super) fn source_sort_key(s: &Source) -> (u8, u16, bool, u8, u16, u64, u32, u32, SourceBuffer, u32) {
+    let mode = BlendMode::from_class(s.class);
+    let phase = if s.blend {
+        2
+    } else if mode == BlendMode::AlphaMask {
+        1
+    } else {
+        0
+    };
     (
-        s.blend,
+        phase,
+        (s.pipeline >> 48) as u16,
+        mode == BlendMode::Additive,
         s.class,
         s.layout,
         s.pipeline,
@@ -463,6 +1070,7 @@ impl FrameState {
         encoder: &mut wgpu::CommandEncoder,
         up: &mut Uploader,
         pipelines: &mut Pipelines,
+        lighting: &LightingSettings,
         frame_index: u64,
         stats: &mut RenderStats,
         reallocs: &mut u32,
@@ -470,12 +1078,13 @@ impl FrameState {
         let f = self;
         let mut cpu_reallocs = 0u32;
         let material_stride = f.material_stride();
+        f.materials.globals = lighting_globals(lighting, crate::lighting::shadow::casting_filter(world));
+        f.materials.transparent_sort = lighting.transparent_sort;
         // ---- ECS batching ------------------------------------------------------------
+        // (Unused texture sets go with their materials, and with them their bind groups, which
+        // keep GPU textures alive.)
         f.materials.gc(frame_index);
         if frame_index.is_multiple_of(256) {
-            // Drop bind groups of removed textures (they keep the GPU texture alive).
-            f.material_bgs
-                .retain(|t, _| t.is_none_or(|h| assets.contains_texture(h)));
             // Pipelines of removed custom shaders.
             pipelines.retain_custom(|h| assets.contains_shader(h));
         }
@@ -678,6 +1287,7 @@ impl FrameState {
                 material_stride,
                 &mut cpu_reallocs,
             );
+            let class = f.materials.class_for_layout(class, layout_id, layout);
             let mut cull = layout.cull_source();
             if (g.len as u64) * layout.stride as u64 > f.max_storage_binding {
                 cull = CullSource::None;
@@ -697,8 +1307,23 @@ impl FrameState {
                 cull,
             });
         }
+        // The texture sets drawn this frame, against the uploaded textures (texture kinds, map
+        // flags), and the frame's default maps and extension stream.
+        let mut ext_used = false;
+        for s in &f.sources {
+            f.materials.resolve_set(
+                s.material,
+                assets,
+                frame_index,
+                &mut f.materials_buf,
+                material_stride,
+                &mut cpu_reallocs,
+            );
+            ext_used |= s.class & CLASS_EXT != 0;
+        }
+        f.materials.prepare_gpu(device, encoder, assets, ext_used, up);
         for s in &mut f.sources {
-            s.pipeline = pipeline_rank(&f.materials, assets, s.material);
+            s.pipeline = pipeline_rank(&f.materials, s.class, s.material);
         }
         f.sources.sort_unstable_by_key(source_sort_key);
         stats.batches = f.sources.len() as u32;
@@ -706,20 +1331,364 @@ impl FrameState {
     }
 }
 
+/// Whether a material casts shadows (`ShadowMode` with `Auto`: lit opaque and alpha-masked
+/// materials).
+fn material_casts(m: &Material) -> bool {
+    match m.shadows {
+        ShadowMode::CastAndReceive | ShadowMode::CastOnly => !m.effective_blend().is_transparent(),
+        ShadowMode::ReceiveOnly | ShadowMode::None => false,
+        _ => !m.unlit && !m.effective_blend().is_transparent(),
+    }
+}
+
+impl MaterialTable {
+    /// The texture kinds (`PipelineKey::kinds`) of `m`'s maps, as its texture set was last
+    /// resolved (0, single-layer maps, for a set no frame has drawn yet).
+    fn known_kinds(&self, m: &Material) -> u8 {
+        let maps: TextureSet = [
+            m.base_color_texture,
+            m.normal_texture,
+            m.metallic_roughness_texture,
+            m.occlusion_texture,
+            m.emissive_texture,
+        ];
+        self.set_map
+            .get(&maps)
+            .and_then(|&i| self.sets.get(i as usize))
+            .filter(|s| s.resolved)
+            .map_or(0, |s| s.kinds)
+    }
+}
+
+impl FrameState {
+    /// `Renderer::prewarm` for one requested material (graphics spec §3.5): its forward pipeline
+    /// for instance layout `layout` and a pass signature (`format`, `samples`, `output`), with
+    /// the class bits the batch would get on that layout (the extension stream only where it
+    /// fits), its maps' texture kinds and the last frame's frame-wide globals (shading model,
+    /// normal maps, the casting light's filter); and, when the last frame drew depth views,
+    /// its depth pipeline as a caster (per depth bias).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prewarm_material(
+        &self,
+        device: &wgpu::Device,
+        pipelines: &mut Pipelines,
+        m: &Material,
+        shader: Option<(ShaderHandle, u32)>,
+        layout: u16,
+        (format, samples, output): (wgpu::TextureFormat, u32, crate::output::OutputEncoding),
+    ) {
+        let mut class = material_class(m);
+        if !crate::pipeline::ext_fits(pipelines.layouts[layout as usize]) {
+            class &= !CLASS_EXT;
+        }
+        let kinds = self.materials.known_kinds(m);
+        let key = crate::pipeline::PipelineKey {
+            layout,
+            class,
+            format,
+            samples,
+            output,
+            kinds,
+            shader,
+            pass: crate::pipeline::PassKind::Forward,
+            globals: self.materials.globals,
+        };
+        pipelines.forward(device, key);
+        if material_casts(m) {
+            let pass = caster_pass(class);
+            for d in &self.depth_views {
+                pipelines.depth(
+                    device,
+                    crate::pipeline::PipelineKey {
+                        pass,
+                        shader: None,
+                        ..key
+                    },
+                    d.bias,
+                );
+            }
+        }
+    }
+}
+
 /// Whether the batches of `material` cast shadows (the depth views' draw filter; blended
 /// batches never reach it).
 pub(crate) fn source_casts(materials: &MaterialTable, material: u32) -> bool {
-    // STUB(P-MAT): `ShadowMode` / blend / unlit rules. Until then every opaque material casts
-    // (depth views exist only where the lighting requests them).
-    materials
-        .entries
-        .get(material as usize)
-        .is_some_and(|e| e.class & CLASS_BLEND == 0)
+    let Some(e) = materials.entries.get(material as usize) else {
+        return false;
+    };
+    match e.key.shadows {
+        ShadowMode::CastAndReceive | ShadowMode::CastOnly => true,
+        ShadowMode::ReceiveOnly | ShadowMode::None => false,
+        // Auto: lit opaque and alpha-masked materials (unlit ones, like sky quads, never cast).
+        _ => e.key.flags & 1 == 0 && !BlendMode::from_class(e.class).is_transparent(),
+    }
 }
 
 /// The depth pipeline a caster of pipeline class `class` draws with in depth views:
-/// `PassKind::Depth` (vertex only), or `PassKind::DepthMask` for alpha-masked materials.
+/// `PassKind::Depth` (vertex only), or `PassKind::DepthMask` for alpha-masked materials (the
+/// depth pass then binds the material's group 1 and discards masked texels).
 pub(crate) fn caster_pass(class: u8) -> crate::pipeline::PassKind {
-    let _ = class; // STUB(P-MAT): DepthMask for the AlphaMask class bits
-    crate::pipeline::PassKind::Depth
+    if BlendMode::from_class(class) == BlendMode::AlphaMask {
+        crate::pipeline::PassKind::DepthMask
+    } else {
+        crate::pipeline::PassKind::Depth
+    }
+}
+
+#[cfg(test)]
+mod material_tests {
+    use super::*;
+    use crate::material::TextureTransform;
+    use glam::{Vec2, Vec3, Vec4};
+
+    fn handle(i: u32) -> TextureHandle {
+        TextureHandle::from_raw(crate::handles::RawHandle {
+            index: i,
+            generation: 0,
+        })
+    }
+
+    /// A default material writes the legacy uniform prefix and class: nothing else is set.
+    #[test]
+    fn material_defaults_are_legacy() {
+        let m = Material::default();
+        let g = gpu_material(&m, wanted_flags(&m));
+        assert_eq!(g.base_color, [1.0; 4]);
+        assert_eq!(g.emissive, [0.0; 4]);
+        assert_eq!(g.params, [0.0, 0.5, 0.0, 0.0]);
+        assert_eq!(g.flags, [0; 4]);
+        assert_eq!((g.uv_row0, g.uv_row1), ([1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]));
+        assert_eq!(material_class(&m), 0);
+        let legacy = Material {
+            alpha_blend: true,
+            double_sided: true,
+            ..Material::default()
+        };
+        let class = material_class(&legacy);
+        assert_eq!(
+            class & (CLASS_BLEND | CLASS_DOUBLE_SIDED),
+            CLASS_BLEND | CLASS_DOUBLE_SIDED
+        );
+        assert_eq!(BlendMode::from_class(class), BlendMode::AlphaBlend);
+        let t = handle(1);
+        assert_ne!(
+            material_class(&Material::default().with_normal_map(t, 1.0)) & CLASS_EXT,
+            0
+        );
+        assert_ne!(
+            material_class(&Material::default().with_uv1_maps(MapMask::EMISSIVE)) & CLASS_EXT,
+            0
+        );
+        assert_eq!(material_class(&Material::default().with_orm_map(t)) & CLASS_EXT, 0);
+    }
+
+    /// Materials differing in any new field intern to different ids; equal ones to one.
+    #[test]
+    fn material_key_covers_new_fields() {
+        let t = handle(3);
+        let base = Material::default();
+        let variants = [
+            base.clone().with_normal_map(t, 1.0),
+            base.clone().with_normal_map(t, 0.5),
+            base.clone().with_metallic_roughness_map(t),
+            base.clone().with_occlusion_map(t, 1.0),
+            base.clone().with_occlusion_map(t, 0.3),
+            base.clone().with_emissive_map(t, Vec3::ZERO),
+            base.clone().with_blend(BlendMode::Additive),
+            base.clone().with_alpha_mask(0.5),
+            base.clone().with_alpha_mask(0.2),
+            base.clone().with_uv_transform(TextureTransform {
+                offset: Vec2::new(0.5, 0.0),
+                ..TextureTransform::IDENTITY
+            }),
+            base.clone().with_uv1_maps(MapMask::NORMAL),
+            base.clone().with_shadows(ShadowMode::None),
+            base.clone().with_render_order(2),
+        ];
+        let mut keys = vec![MaterialKey::new(&base)];
+        for v in &variants {
+            let k = MaterialKey::new(v);
+            assert!(!keys.contains(&k), "{v:?}");
+            keys.push(k);
+        }
+        // The per-entity fast path agrees with the keys.
+        let all: Vec<&Material> = std::iter::once(&base).chain(&variants).collect();
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(same_material(a, b), i == j, "{a:?} vs {b:?}");
+            }
+            assert!(same_material(a, &(*a).clone()));
+        }
+        let mut table = MaterialTable::default();
+        let mut buf = TrackedBuffer::new("test", wgpu::BufferUsages::UNIFORM);
+        let mut r = 0;
+        let ids: Vec<u32> = variants
+            .iter()
+            .map(|m| table.intern(m, 1, &mut buf, 256, &mut r).0)
+            .collect();
+        let again: Vec<u32> = variants
+            .iter()
+            .map(|m| table.intern(&m.clone(), 1, &mut buf, 256, &mut r).0)
+            .collect();
+        assert_eq!(ids, again);
+        // One texture set per distinct map combination: the normal-map variants share one.
+        assert_eq!(table.set_of(ids[0]), table.set_of(ids[1]));
+        assert_ne!(table.set_of(ids[0]), table.set_of(ids[2]));
+    }
+
+    /// The uniform's map flags are what the set can bind: unavailable maps are dropped, ORM
+    /// packing needs both slots, sRGB data maps get fixups.
+    #[test]
+    fn set_flags_follow_availability() {
+        let mut set = TextureSetEntry::new([None; 5]);
+        let wanted = FLAG_NORMAL | FLAG_METALLIC_ROUGHNESS | FLAG_OCCLUSION | FLAG_ORM_PACKED | FLAG_UV_TRANSFORM;
+        assert_eq!(set.flags(wanted), FLAG_UV_TRANSFORM, "nothing uploaded yet");
+        set.available = 0b0_1110;
+        assert_eq!(set.flags(wanted), wanted);
+        set.available = 0b0_0110;
+        assert_eq!(
+            set.flags(wanted),
+            FLAG_NORMAL | FLAG_METALLIC_ROUGHNESS | FLAG_UV_TRANSFORM,
+            "no occlusion: no ORM"
+        );
+        set.available = 0b1_1110;
+        set.srgb = 0b0_0010;
+        assert_eq!(
+            set.flags(FLAG_NORMAL | FLAG_EMISSIVE),
+            FLAG_NORMAL | FLAG_EMISSIVE | 1 << (FLAG_FIXUP_SHIFT + 1)
+        );
+    }
+
+    /// Draw order: opaque, then alpha-masked, then transparent by render order, alpha before
+    /// additive at equal order.
+    #[test]
+    fn class_bits_and_sort_key() {
+        let mut table = MaterialTable::default();
+        let mut buf = TrackedBuffer::new("test", wgpu::BufferUsages::UNIFORM);
+        let mut r = 0;
+        let materials = [
+            ("additive", Material::additive(Vec4::ONE)),
+            (
+                "late alpha",
+                Material::color(Vec4::splat(0.5))
+                    .with_blend(BlendMode::AlphaBlend)
+                    .with_render_order(1),
+            ),
+            (
+                "alpha",
+                Material::color(Vec4::splat(0.5)).with_blend(BlendMode::AlphaBlend),
+            ),
+            ("early additive", Material::additive(Vec4::ONE).with_render_order(-3)),
+            ("mask", Material::default().with_alpha_mask(0.5)),
+            ("opaque", Material::default()),
+        ];
+        let mut sources: Vec<(Source, &str)> = materials
+            .iter()
+            .map(|(name, m)| {
+                let (id, class) = table.intern(m, 1, &mut buf, 256, &mut r);
+                let s = Source {
+                    blend: class & CLASS_BLEND != 0,
+                    class,
+                    layout: 0,
+                    pipeline: pipeline_rank(&table, class, id),
+                    material: id,
+                    mesh: GpuMesh {
+                        alloc: crate::arena::ArenaAlloc {
+                            base_vertex: 0,
+                            vertex_count: 4,
+                            first_index: 0,
+                            index_count: 6,
+                        },
+                        sphere: crate::culling::Sphere {
+                            center: Vec3::ZERO,
+                            radius: 1.0,
+                        },
+                    },
+                    triangles: 2,
+                    buffer: SourceBuffer::Ecs,
+                    first: 0,
+                    count: 1,
+                    stride: 64,
+                    cull: CullSource::Matrix { offset: 0 },
+                };
+                (s, *name)
+            })
+            .collect();
+        sources.sort_by_key(|(s, _)| source_sort_key(s));
+        let order: Vec<&str> = sources.iter().map(|(_, n)| *n).collect();
+        assert_eq!(
+            order,
+            ["opaque", "mask", "early additive", "alpha", "additive", "late alpha"]
+        );
+    }
+
+    /// `Renderer::prewarm` builds the pipelines a requested material draws with after one
+    /// frame of the scene: the class bits on each layout, its maps' texture kinds (a texture
+    /// array here), the frame-wide globals (Standard shading, the shadow filter) and the caster
+    /// depth pipeline; spawning entities with the materials afterwards builds nothing.
+    #[test]
+    fn prewarm_builds_what_materials_draw_with() {
+        use crate::assets::{RenderAssets, TextureSource};
+        use crate::components::{Camera3d, DirectionalLight, Mesh3d};
+        use crate::lighting::api::{DirectionalShadow, ShadingModel};
+        use space3d_core::{App, ImageData, MeshData, Transform};
+        let mut app = App::new();
+        app.add_plugin(crate::RenderPlugin::default());
+        let Ok(r) = pollster::block_on(crate::Renderer::new_headless(32, 32)) else {
+            eprintln!("skipping GPU test: no adapter available");
+            return;
+        };
+        app.insert_resource(r);
+        app.resources.expect_mut::<LightingSettings>().shading = ShadingModel::Standard;
+        let a = app.resources.expect_mut::<RenderAssets>();
+        let cube = a.add_mesh(MeshData::cube(1.0));
+        let layers = [
+            ImageData::filled(4, 4, [255; 4]),
+            ImageData::filled(4, 4, [200, 90, 40, 255]),
+        ];
+        let skin = a.add_texture(TextureSource::from_layers(&layers).unwrap());
+        let normal = a.add_image_linear(ImageData::filled(4, 4, [128, 128, 255, 255]));
+        let orm = a.add_image_linear(ImageData::filled(4, 4, [255, 200, 30, 255]));
+        let hull = Material::srgb(0.8, 0.8, 0.8)
+            .with_texture(skin)
+            .with_normal_map(normal, 1.0)
+            .with_orm_map(orm);
+        app.world.spawn((Transform::IDENTITY, Mesh3d(cube), hull.clone()));
+        app.world.spawn((
+            Transform::from_xyz(0.0, 3.0, 6.0).looking_at(glam::Vec3::ZERO, glam::Vec3::Y),
+            Camera3d::default(),
+        ));
+        app.world.spawn((
+            Transform::IDENTITY.looking_at(glam::Vec3::new(-0.3, -1.0, -0.4), glam::Vec3::Y),
+            DirectionalLight::default(),
+            DirectionalShadow::new(),
+        ));
+        crate::render_to_image(&mut app).unwrap();
+        let variants = [
+            Material {
+                double_sided: true,
+                ..hull.clone().with_alpha_mask(0.5)
+            },
+            hull.clone().with_blend(BlendMode::AlphaBlend),
+            Material::additive(Vec4::new(1.0, 0.5, 0.1, 1.0)),
+        ];
+        let request = crate::renderer::PrewarmRequest {
+            materials: variants.to_vec(),
+            ..Default::default()
+        };
+        app.resources.expect_mut::<crate::Renderer>().prewarm(&request);
+        let counts = app.resources.expect::<crate::Renderer>().pipelines.pipeline_counts();
+        for (i, m) in variants.into_iter().enumerate() {
+            app.world
+                .spawn((Transform::from_xyz(i as f32 * 1.5 - 1.5, 0.0, 1.0), Mesh3d(cube), m));
+        }
+        crate::render_to_image(&mut app).unwrap();
+        let r = app.resources.expect::<crate::Renderer>();
+        assert_eq!(r.pipelines.pipeline_counts(), counts, "the frame built no pipeline");
+        // Within the pipeline budget of spec §3.5 (forward ≤ 30, depth/shadow ≤ 6) with four
+        // blend classes, maps, a texture array and a shadow.
+        assert!(counts.0 <= 30 && counts.1 <= 6, "{counts:?}");
+        assert_eq!(r.gpu_error_count(), 0);
+    }
 }

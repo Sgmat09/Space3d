@@ -31,6 +31,76 @@ pub(crate) struct Vertex {
 pub(crate) const VERTEX_SIZE: u64 = std::mem::size_of::<Vertex>() as u64;
 pub(crate) const INDEX_SIZE: u64 = 4;
 
+/// Extension vertex (vertex buffer slot 2, 16 bytes): the tangent and second UV set of the
+/// arena vertex with the same index. The stream is allocated in lockstep with the arena's
+/// vertex buffer (same element indices), so draws address it with the same `base_vertex`
+/// (indirect args apply it to every per-vertex buffer).
+///
+/// Markers: `tangent.w = ±1` (±32767) means the mesh has extension data; `0` (never written,
+/// or cleared) means none — the shader then samples the second UV set's maps with UV0 and
+/// derives the tangent frame per pixel. A mesh with a second UV set but no tangents stores the
+/// tangent `(0, 0, 0, 1)`; one with tangents but no second UV set stores UV0 as UV1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub(crate) struct ExtVertex {
+    /// `Snorm16x4`: unit tangent xyz, bitangent sign w (or the markers above).
+    pub tangent: [i16; 4],
+    /// `Float32x2`: second UV set.
+    pub uv1: [f32; 2],
+}
+
+pub(crate) const EXT_VERTEX_SIZE: u64 = std::mem::size_of::<ExtVertex>() as u64;
+
+/// Vertex attributes of the extension stream: tangent at `first`, UV1 at `first + 1`.
+pub(crate) fn ext_attributes(first: u32) -> [wgpu::VertexAttribute; 2] {
+    [
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Snorm16x4,
+            offset: 0,
+            shader_location: first,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: 8,
+            shader_location: first + 1,
+        },
+    ]
+}
+
+/// Encode a signed unit value as `Snorm16`.
+fn snorm16(v: f32) -> i16 {
+    (v.clamp(-1.0, 1.0) * 32767.0).round() as i16
+}
+
+/// The extension vertices of a mesh with `extras` (empty when it has neither tangents nor a
+/// second UV set matching its vertex count; see [`ExtVertex`] for the markers).
+pub(crate) fn build_ext_vertices(mesh: &MeshData, extras: &crate::material::MeshExtras) -> Vec<ExtVertex> {
+    let n = mesh.positions.len();
+    let tangents = (extras.tangents.len() == n).then_some(&extras.tangents);
+    let uvs1 = (extras.uvs1.len() == n).then_some(&extras.uvs1);
+    if n == 0 || (tangents.is_none() && uvs1.is_none()) {
+        return Vec::new();
+    }
+    (0..n)
+        .map(|i| {
+            let tangent = match tangents {
+                Some(t) => {
+                    let [x, y, z, w] = t[i];
+                    let v = glam::Vec3::new(x, y, z).normalize_or_zero();
+                    let sign = if w < 0.0 { -32767 } else { 32767 };
+                    [snorm16(v.x), snorm16(v.y), snorm16(v.z), sign]
+                }
+                None => [0, 0, 0, 32767],
+            };
+            let uv1 = match uvs1 {
+                Some(uv) => uv[i],
+                None => mesh.uvs.get(i).copied().unwrap_or([0.0; 2]),
+            };
+            ExtVertex { tangent, uv1 }
+        })
+        .collect()
+}
+
 pub(crate) const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
     0 => Float32x3,
     1 => Float32x3,
@@ -147,6 +217,9 @@ pub(crate) struct MeshArena {
     pub indices: RangeAllocator,
     /// Bumped when buffers are replaced.
     pub generation: u32,
+    /// The extension stream ([`ExtVertex`], slot 2) and its capacity in vertices: created with
+    /// the first mesh that has extension data, then kept at the vertex buffer's capacity.
+    pub ext: Option<(wgpu::Buffer, u32)>,
 }
 
 /// Which buffers of the arena lacked space for an allocation.
@@ -200,6 +273,30 @@ impl MeshArena {
     pub fn free(&mut self, a: ArenaAlloc) {
         self.vertices.free(a.base_vertex..a.base_vertex + a.vertex_count);
         self.indices.free(a.first_index..a.first_index + a.index_count);
+    }
+
+    /// Create the extension stream, or grow it to the vertex buffer's capacity (copying its
+    /// contents GPU→GPU; new space is zero: no extension data). Record it after the vertex
+    /// buffer's growth and before writes into the stream.
+    pub fn ensure_ext(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, up: &mut Uploader) {
+        let capacity = self.vertices.capacity();
+        if self.ext.as_ref().is_some_and(|(_, c)| *c == capacity) || capacity == 0 {
+            return;
+        }
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("space3d mesh arena extension vertices"),
+            size: capacity as u64 * EXT_VERTEX_SIZE,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        if let Some((old, old_capacity)) = &self.ext {
+            let n = (*old_capacity).min(capacity) as u64 * EXT_VERTEX_SIZE;
+            if n > 0 {
+                encoder.copy_buffer_to_buffer(old, 0, &buffer, 0, n);
+            }
+        }
+        self.ext = Some((buffer, capacity));
+        up.reallocations += 1;
     }
 
     /// Grow allocator capacities so `extra_*` more elements fit (2x amortized). Only a side
@@ -407,6 +504,30 @@ mod tests {
                 indices: false
             }
         );
+    }
+
+    /// Extension vertices carry the markers the shader reads: `w = ±1` with data (tangent sign
+    /// kept), `(0, 0, 0, 1)` for a second UV set without tangents, UV0 as UV1 for tangents
+    /// without a second set; nothing for meshes without (matching) extras.
+    #[test]
+    fn ext_stream_markers() {
+        use crate::material::MeshExtras;
+        let mesh = MeshData::plane(1.0);
+        let n = mesh.positions.len();
+        assert!(build_ext_vertices(&mesh, &MeshExtras::new()).is_empty(), "no extras");
+        let wrong = MeshExtras::new().with_tangents(vec![[1.0, 0.0, 0.0, 1.0]; n + 1]);
+        assert!(build_ext_vertices(&mesh, &wrong).is_empty(), "length mismatch ignored");
+        let t = build_ext_vertices(&mesh, &MeshExtras::new().with_tangents(vec![[2.0, 0.0, 0.0, -1.0]; n]));
+        assert_eq!(t[0].tangent, [32767, 0, 0, -32767], "normalized, sign kept");
+        assert_eq!(t[1].uv1, mesh.uvs[1], "UV0 stands in for UV1");
+        let uv = build_ext_vertices(&mesh, &MeshExtras::new().with_uvs1(vec![[0.25, 0.75]; n]));
+        assert_eq!(uv[2].tangent, [0, 0, 0, 32767], "UV1 only: valid marker, no tangent");
+        assert_eq!(uv[2].uv1, [0.25, 0.75]);
+        assert_eq!(std::mem::size_of::<ExtVertex>() as u64, EXT_VERTEX_SIZE);
+        assert_eq!(EXT_VERTEX_SIZE, 16);
+        let attrs = ext_attributes(8);
+        assert_eq!((attrs[0].shader_location, attrs[1].shader_location), (8, 9));
+        assert_eq!(attrs[1].offset, 8);
     }
 
     #[test]

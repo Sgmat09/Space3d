@@ -9,7 +9,7 @@ mod bounds;
 mod export;
 mod normals;
 mod paint;
-mod tangents;
+pub(crate) mod tangents;
 mod topology;
 mod transform;
 mod uv;

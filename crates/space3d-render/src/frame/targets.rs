@@ -2,12 +2,12 @@
 //! §1.3), copies of render targets that views sample while drawing into them, and the texture
 //! pool (§2.6).
 
+use super::FrameState;
 use super::plan::GroupTarget;
 use super::views::ViewTarget;
-use super::{FrameState, uniform_binding};
 use crate::assets::RenderAssets;
 use crate::node::FrameMode;
-use crate::pipeline::{DEPTH_FORMAT, GpuMaterial, Pipelines};
+use crate::pipeline::DEPTH_FORMAT;
 use crate::stats::RenderStats;
 
 /// What an intermediate group's textures are made for: equal keys reuse the textures.
@@ -257,24 +257,17 @@ pub(super) struct Feedback {
     pub(super) size: (u32, u32),
     pub(super) format: wgpu::TextureFormat,
     pub(super) texture: wgpu::Texture,
+    /// Sampled in place of the render target by the material bind groups of the views drawing
+    /// into it (`frame/draws.rs`).
     pub(super) view: wgpu::TextureView,
-    /// Material bind group sampling `view` (and the materials buffer generation it binds).
-    pub(super) bind_group: Option<(wgpu::BindGroup, u32)>,
     pub(super) last_used: u64,
 }
 
 impl FrameState {
     /// Copies of render targets sampled by the views drawing into them (see
-    /// `ViewData::feedback`), and their material bind groups.
-    pub(super) fn prepare_feedback(
-        &mut self,
-        device: &wgpu::Device,
-        assets: &RenderAssets,
-        pipelines: &Pipelines,
-        frame_index: u64,
-    ) {
+    /// `ViewData::feedback`).
+    pub(super) fn prepare_feedback(&mut self, device: &wgpu::Device, assets: &RenderAssets, frame_index: u64) {
         let f = self;
-        let mgen = f.materials_buf.gpu.generation;
         // Views sampling their own render target bind a copy of it (see `ViewData::feedback`).
         for v in 0..f.views.len() {
             let ViewTarget::Texture { handle, .. } = f.views[v].target else {
@@ -321,7 +314,6 @@ impl FrameState {
                         format: g.format,
                         texture,
                         view,
-                        bind_group: None,
                         last_used: frame_index,
                     };
                     match entry {
@@ -334,28 +326,6 @@ impl FrameState {
                 }
             };
             fb.last_used = frame_index;
-            if fb.bind_group.as_ref().is_none_or(|(_, gen_)| *gen_ != mgen) {
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("space3d material (render target feedback)"),
-                    // Render targets (and their copies) are single-layer.
-                    layout: pipelines.material_bgl(false),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: uniform_binding(f.materials_buf.buffer(), std::mem::size_of::<GpuMaterial>()),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&fb.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&g.sampler),
-                        },
-                    ],
-                });
-                fb.bind_group = Some((bg, mgen));
-            }
         }
         // Free copies of targets that stopped sampling themselves (or were removed).
         f.feedback.retain(|_, fb| fb.last_used + 60 > frame_index);

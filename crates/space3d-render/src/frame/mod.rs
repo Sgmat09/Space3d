@@ -124,9 +124,6 @@ pub(crate) struct FrameState {
     /// View bind groups (group 0; see `depth::ViewBindGroups`): one per set of lighting
     /// resources the frame's views bind.
     view_bgs: depth::ViewBindGroups,
-    /// Material bind group per texture: (bind group, materials buffer generation, texture
-    /// version, texture is an array — selects the pipeline variant).
-    material_bgs: FastMap<Option<TextureHandle>, (wgpu::BindGroup, u32, u32, bool)>,
     /// Culling bind group per (source buffer, window of frustums).
     cull_bgs: FastMap<(SourceBuffer, u32), (wgpu::BindGroup, [u32; 5])>,
     compact_bg: Option<(wgpu::BindGroup, [u32; 5])>,
@@ -297,7 +294,6 @@ impl FrameState {
             explicit: Vec::new(),
             materials: MaterialTable::default(),
             view_bgs: Default::default(),
-            material_bgs: FastMap::default(),
             cull_bgs: FastMap::default(),
             compact_bg: None,
             arena_buffers: None,
@@ -533,7 +529,7 @@ impl Renderer {
             .chain(request.layouts.iter().copied())
             .map(|l| pipelines.layout_id(l))
             .collect();
-        let forward = |pipelines: &mut Pipelines, format, samples, output| {
+        let forward = |f: &FrameState, pipelines: &mut Pipelines, format, samples, output| {
             for m in &request.materials {
                 let shader = match m.shader {
                     Some(h) => match pipelines.custom_version(h) {
@@ -544,20 +540,8 @@ impl Renderer {
                     None => None,
                 };
                 for &layout in &layouts {
-                    pipelines.forward(
-                        device,
-                        crate::pipeline::PipelineKey {
-                            layout,
-                            class: extract::material_class(m),
-                            format,
-                            samples,
-                            output,
-                            kinds: 0,
-                            shader,
-                            pass: crate::pipeline::PassKind::Forward,
-                            globals: 0,
-                        },
-                    );
+                    // The materials area's key (class, texture kinds, globals) and caster.
+                    f.prewarm_material(device, pipelines, m, shader, layout, (format, samples, output));
                 }
             }
         };
@@ -566,7 +550,7 @@ impl Renderer {
         } else {
             crate::output::OutputEncoding::Linear
         };
-        forward(pipelines, primary.format, primary.samples, primary_output);
+        forward(f, pipelines, primary.format, primary.samples, primary_output);
         for v in 0..f.views.len() {
             let is_primary = matches!(f.views[v].target, ViewTarget::Primary);
             let extra = request
@@ -576,7 +560,7 @@ impl Renderer {
                 .map(|&format| Some(format));
             for format in std::iter::once(None).chain(extra) {
                 let t = f.view_targets(v, frame_graphics, format);
-                forward(pipelines, t.scene.color, t.scene.samples, t.scene.output);
+                forward(f, pipelines, t.scene.color, t.scene.samples, t.scene.output);
                 for i in 0..nodes.len() {
                     let c = &nodes.nodes[i];
                     f.slot_targets.clear();
@@ -657,8 +641,10 @@ impl Renderer {
             device: &self.device,
             queue: &self.queue,
             encoder: &mut encoder,
+            world,
             assets: &mut assets,
             settings: &lighting_settings,
+            graphics: &self.frame_graphics,
             headless,
             stats: &mut self.stats,
             timing: &self.timer,
@@ -920,6 +906,7 @@ impl Renderer {
             encoder,
             up,
             pipelines,
+            lighting_settings,
             frame_index,
             stats,
             &mut cpu_reallocs,
@@ -1003,8 +990,8 @@ impl Renderer {
         // last frame fall back to the built-in shader before anything is drawn with them.
         pipelines.poll_pending(device);
         f.prepare_view_bind_groups(device, pipelines, lighting, frame_index);
+        f.prepare_feedback(device, assets, frame_index);
         f.prepare_material_bind_groups(device, assets, pipelines, white, white_sampler);
-        f.prepare_feedback(device, assets, pipelines, frame_index);
         f.prepare_cull_bind_groups(device, pipelines, frame_index);
 
         let caps_after = f.capacities();

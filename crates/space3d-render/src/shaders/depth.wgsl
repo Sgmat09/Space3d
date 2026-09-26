@@ -15,16 +15,13 @@ struct MaterialParams {
     base_color: vec4<f32>,
     emissive: vec4<f32>,
     params: vec4<f32>,      // x: metallic, y: roughness, z: has texture
+    maps: vec4<f32>,        // x: normal scale, y: occlusion strength, z: alpha cutoff
 }
 
 @group(0) @binding(0) var<uniform> view: View;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(2) var base_sampler: sampler;
 //#TEXTURE
-
-// Alpha below which a masked caster texel casts no shadow. (The materials area replaces this
-// with the material's own cutoff.)
-const S3D_DEPTH_MASK_CUTOFF: f32 = 0.5;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -93,7 +90,8 @@ fn fs_mask(in: MaskOut) {
     // Sampled unconditionally (uniform control flow); `params.z` blends it in.
     let tex = sample_base(in.uv, in.layer).a;
     let alpha = material.base_color.a * in.alpha * mix(1.0, tex, material.params.z);
-    if (alpha < S3D_DEPTH_MASK_CUTOFF) {
+    // The material's cutoff (`Material::alpha_cutoff`).
+    if (alpha < material.maps.z) {
         discard;
     }
 }

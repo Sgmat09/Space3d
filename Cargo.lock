@@ -513,6 +513,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bevy_mikktspace"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bff34eb29ff4b8a8688bc7299f14fb6b597461ca80fec03ed7d22939ab33e48f"
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3564,6 +3570,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pbr_showcase"
+version = "0.1.0"
+dependencies = [
+ "space3d",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4895,6 +4908,7 @@ name = "space3d-assets"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "bevy_mikktspace",
  "criterion",
  "futures",
  "glam 0.33.9",
@@ -5206,6 +5220,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "space3d-assets",
  "space3d-core",
  "space3d-particles",
  "space3d-physics",

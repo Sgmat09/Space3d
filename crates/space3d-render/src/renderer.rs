@@ -1032,6 +1032,8 @@ impl Renderer {
             });
             self.stats.meshes_uploaded += 1;
         }
+        // The extension stream (tangents, second UV set) of the meshes just placed.
+        assets.upload_extras(&self.device, encoder, &pending, &mut self.uploader);
     }
 
     /// Read back the primary target of the last rendered frame as sRGB RGBA8.
@@ -1373,16 +1375,22 @@ impl Renderer {
     /// scene first) and `request.formats` on primary views (the capture format when windowed),
     /// the forward pipelines of `request.materials` × instance layouts, every render node's
     /// `prewarm` for the targets its slots draw with, and the post pipelines of the post groups'
-    /// targets (the composite, FXAA and the bloom chain in both chain formats). STUB(P-MAT):
-    /// material variants join when they land.
+    /// targets (the composite, FXAA and the bloom chain in both chain formats). Each material's
+    /// forward pipeline gets the class bits it has on each layout, its maps' texture kinds (as
+    /// the last frame resolved them; single-layer for maps no frame has drawn yet) and the last
+    /// frame's frame-wide overrides (shading model, normal maps, the casting light's filter);
+    /// casters also get their depth pipeline when the last frame drew a shadow.
     pub fn prewarm(&mut self, request: &PrewarmRequest) {
         self.prewarm_pipelines(request);
     }
 
-    /// Where a cubemap is on its way to being usable as an environment.
+    /// Where a cubemap is on its way to being usable as an environment, as of the last rendered
+    /// frame: `Missing` for cubemaps that frame did not have (removed, or added since),
+    /// `Uploading` until it is on the GPU, then `Baking` (the passes left of its environment
+    /// bake, which starts in the first frame a camera's `EnvironmentLight` uses it) until
+    /// `Ready`; `Failed` if the upload failed (logged).
     pub fn environment_state(&self, cubemap: crate::handles::CubemapHandle) -> crate::lighting::api::EnvironmentState {
-        let _ = cubemap; // STUB(P-MAT)
-        crate::lighting::api::EnvironmentState::Missing
+        self.lighting.environment_state(cubemap)
     }
 }
 

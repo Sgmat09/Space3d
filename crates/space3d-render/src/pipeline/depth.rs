@@ -4,7 +4,10 @@
 
 use super::forward::texture_wgsl;
 use super::instance::{instance_attributes, instance_wgsl};
-use super::{CLASS_DOUBLE_SIDED, DEPTH_FORMAT, KIND_COLOR_LAYERED, PassKind, PipelineKey, Pipelines, VIEW_STRUCTS};
+use super::{
+    CLASS_DOUBLE_SIDED, DEPTH_FORMAT, KIND_COLOR_LAYERED, KIND_DATA_LAYERED, PassKind, PipelineKey, Pipelines,
+    VIEW_STRUCTS,
+};
 use crate::arena::{VERTEX_ATTRIBUTES, VERTEX_SIZE};
 use crate::instance::InstanceLayout;
 use std::borrow::Cow;
@@ -15,7 +18,10 @@ const DEPTH_TEMPLATE: &str = include_str!("../shaders/depth.wgsl");
 pub(crate) fn depth_shader(layout: &InstanceLayout, kinds: u8) -> String {
     DEPTH_TEMPLATE
         .replace("//#VIEW", VIEW_STRUCTS)
-        .replace("//#TEXTURE", texture_wgsl(kinds & KIND_COLOR_LAYERED != 0))
+        .replace(
+            "//#TEXTURE",
+            &texture_wgsl(kinds & KIND_COLOR_LAYERED != 0, kinds & KIND_DATA_LAYERED != 0),
+        )
         .replace("//#INSTANCE", &instance_wgsl(layout))
 }
 
@@ -44,8 +50,12 @@ impl Pipelines {
             shader: None,
             globals: 0,
             pass: if mask { PassKind::DepthMask } else { PassKind::Depth },
-            // Only the base color map's kind matters here.
-            kinds: if mask { key.kinds & KIND_COLOR_LAYERED } else { 0 },
+            // The material's bind group (group 1) fixes both texture kinds.
+            kinds: if mask {
+                key.kinds & (KIND_COLOR_LAYERED | KIND_DATA_LAYERED)
+            } else {
+                0
+            },
             ..key
         };
         let bias = wgpu::DepthBiasState {
@@ -67,7 +77,7 @@ impl Pipelines {
                 .clone();
             let inst_attrs = instance_attributes(layout);
             let pipeline_layout = if mask {
-                &self.layouts_by_texture[(key.kinds & KIND_COLOR_LAYERED) as usize]
+                &self.layouts_by_texture[key.kinds as usize]
             } else {
                 &self.depth_layout
             };

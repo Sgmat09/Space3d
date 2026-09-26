@@ -326,13 +326,16 @@ impl FrameState {
     /// buffers; on `CpuDirect` (and for sources the GPU culler cannot take) CPU culling and
     /// direct draws. `depth`: a depth view — only opaque sources whose material casts
     /// ([`super::extract::source_casts`]) are recorded. Returns the index of the view's first
-    /// blended draw (`draws.len()` without any).
+    /// blended draw (`draws.len()` without any). `camera_view`: the camera's view matrix, for
+    /// batches sorted back to front per instance (`TransparentSort::PerInstance`; `None` in
+    /// depth views, which draw no blended sources).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_sources(
         &mut self,
         frustum: &Frustum,
         culling: bool,
         depth: bool,
+        camera_view: Option<glam::Mat4>,
         buffers: &mut InstanceBuffers,
         out_cursor: &mut u64,
         visible_overflow: &mut bool,
@@ -387,7 +390,10 @@ impl FrameState {
                 *out_cursor
             };
             let fits = region_start + s.count as u64 * s.stride as u64 <= f.max_storage_binding;
-            if gpu && s.cull != CullSource::None && fits {
+            // Instances sorted back to front per view (`TransparentSort::PerInstance`) are
+            // culled and ordered on the CPU on every path.
+            let sort = camera_view.filter(|_| f.materials.sorts(&s));
+            if gpu && s.cull != CullSource::None && fits && sort.is_none() {
                 // GPU culling: reserve an output region, emit a job and an indirect draw.
                 if multi && !same_run {
                     *out_cursor = region_start;
@@ -500,7 +506,29 @@ impl FrameState {
                         *visible_overflow = true;
                         visible = s.count;
                     }
-                    if visible == s.count {
+                    let sorted_fits = f.cpu_visible.len() as u64 + visible as u64 * 64 <= f.max_buffer_size;
+                    if let Some(camera_view) = sort.filter(|_| visible > 0 && sorted_fits) {
+                        // Back to front: the visible instances in view-depth order, copied
+                        // (diffed) into `cpu_visible`.
+                        let mask = culling.then_some(&f.cull_mask[..]);
+                        let sorted =
+                            f.materials
+                                .sort_back_to_front(order, mask, &f.ecs_matrices, camera_view, cpu_reallocs);
+                        let at = f.cpu_visible.len();
+                        let matrices = &f.ecs_matrices;
+                        f.cpu_visible.write_all(
+                            at,
+                            sorted.len(),
+                            sorted.iter().map(|&i| &matrices[i as usize]),
+                            cpu_reallocs,
+                        );
+                        f.draws.push(DrawCmd {
+                            vb: VertexSource::CpuVisible,
+                            vb_offset: at as u64,
+                            kind: DrawKind::Direct { instances: visible },
+                            ..base_cmd
+                        });
+                    } else if visible == s.count {
                         f.draws.push(DrawCmd {
                             vb: VertexSource::Ecs,
                             vb_offset: s.first as u64 * 64,
@@ -762,6 +790,7 @@ impl FrameState {
                 &frustum,
                 culling,
                 false,
+                Some(camera_view),
                 buffers,
                 out_cursor,
                 visible_overflow,
