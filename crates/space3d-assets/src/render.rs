@@ -432,6 +432,38 @@ mod tests {
         assert_eq!(custom, Material::srgb(0.2, 0.3, 0.4));
     }
 
+    /// The migration guide's step 3 (reviewer round M2): `apply_material_maps` keeps the
+    /// caller's emissive factor (× `emissive_strength`), so a custom material with no emissive
+    /// — the game's painted hull and trim — gets no light from its emissive map (the ships' nav
+    /// lights stayed dark); seeding the glTF factor where there is a map, as the guide shows and
+    /// `material_from_data` does, lights it.
+    #[test]
+    fn emissive_maps_need_a_factor() {
+        let data = MaterialData {
+            emissive_texture: Some(0),
+            emissive: [1.0, 1.0, 1.0],
+            ..Default::default()
+        };
+        let mut assets = RenderAssets::default();
+        let map = assets.add_image(ImageData::new(1, 1));
+        let mut tex = |_: usize, _: TextureRole| Some(map);
+        let painted = Material::srgb(0.5, 0.5, 0.55);
+        let mut as_is = painted.clone();
+        apply_material_maps(&mut as_is, &data, &mut tex);
+        assert_eq!(
+            (as_is.emissive_texture, as_is.emissive),
+            (Some(map), Vec3::ZERO),
+            "the map alone is dark"
+        );
+        let mut seeded = painted;
+        if data.emissive_texture.is_some() && seeded.emissive == Vec3::ZERO {
+            seeded.emissive = Vec3::from_array(data.emissive);
+        }
+        apply_material_maps(&mut seeded, &data, &mut tex);
+        assert_eq!(seeded.emissive, Vec3::ONE);
+        assert_eq!(seeded.emissive, material_from_data(&data, &mut tex).emissive);
+    }
+
     /// `prepare_model` generates MikkTSpace tangents for normal-mapped primitives without
     /// `TANGENT` (carrying the second UV set through vertex splits) and leaves the others.
     #[test]
