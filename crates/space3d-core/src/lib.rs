@@ -18,7 +18,7 @@ pub mod schedule;
 pub mod time;
 pub mod transform;
 
-pub use app::{App, AppExit, Plugin};
+pub use app::{App, AppExit, ENV_HEADLESS_UNPACED, HeadlessPacing, Pacer, Plugin};
 pub use data::{HdrImageData, ImageData, MeshData};
 pub use events::{EventReader, Events};
 pub use resources::Resources;

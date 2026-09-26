@@ -122,6 +122,14 @@ Optional: `editor`, `github`, `stories`, `test` (generated projects enable `stor
 `space3d = { …, default-features = false, features = ["net"] }` (see
 `examples/multiplayer_chat`).
 
+## 7. Updating Space3d
+
+Space3d is consumed by git revision. After bumping the pinned `rev`, run `cargo update -p space3d`
+(or `cargo update`). Space3d always tracks the latest stable release of its dependencies, so a
+consumer lockfile pinned to an older version can fail to resolve, e.g. `space3d-net` needs
+`hyper-util ^0.1.21` ("failed to select a version for `hyper-util`"): update that crate too —
+`cargo update -p hyper-util` — or simply `cargo update`.
+
 ## Next
 
 * [Testing](testing.md) · [Storybook](storybook.md) · [Platforms](platforms.md) ·

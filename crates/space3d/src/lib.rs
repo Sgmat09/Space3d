@@ -57,6 +57,8 @@
 //! * `SPACE3D_EXIT_AFTER_FRAMES=N` / `SPACE3D_EXIT_AFTER_SECS=S` — [`AutoExitPlugin`]
 //! * `SPACE3D_HEADLESS=1` or `=WxH` — [`DefaultPlugins`] without a window (each axis clamped
 //!   to `1..=`[`MAX_HEADLESS_SIZE`])
+//! * `SPACE3D_HEADLESS_UNPACED=1` — the headless runner runs as fast as possible, one fixed
+//!   step per frame ([`space3d_core::HeadlessPacing::Unpaced`]; default: real-time deadline pacing)
 //! * `SPACE3D_AUDIO=off|mock` — audio backend override (`audio` crate)
 //! * `RUST_LOG` — log filter ([`LogPlugin`], native)
 

@@ -42,6 +42,9 @@ pub struct Time {
     pub alpha: f32,
     /// Fixed steps that were dropped because the frame was too slow.
     pub dropped_ticks: u64,
+    /// CPU time the previous [`crate::App::update`] took (all stages, excluding any runner
+    /// sleep or vsync wait). A frame's own cost is visible from the next frame on.
+    pub update_duration: Duration,
     pub(crate) accumulator: Duration,
 }
 
