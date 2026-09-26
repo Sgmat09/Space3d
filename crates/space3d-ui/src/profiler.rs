@@ -273,10 +273,13 @@ impl Profiler {
             return;
         }
         self.last_index = Some(tl.index);
-        self.ingest(tl);
+        self.record(tl);
     }
 
-    fn ingest(&mut self, tl: FrameTimeline) {
+    /// Aggregate one finished frame into the statistics and make it the shown timeline (what
+    /// [`Self::update`] does with the frames of [`ProfilerLayer`]). For other sources of
+    /// timings: recorded sessions, replays, tests. Works while [`Self::frozen`].
+    pub fn record(&mut self, tl: FrameTimeline) {
         self.frames += 1;
         let mut per_frame: HashMap<Arc<str>, (f64, u32)> = HashMap::new();
         for s in &tl.spans {
@@ -307,7 +310,9 @@ impl Profiler {
         self.timeline = tl;
     }
 
-    /// Draw the profiler contents into `ui`.
+    /// Draw the profiler contents into `ui`: a toolbar, then collapsible "Timeline" (the last
+    /// frame's systems, flame style) and "Systems" (a striped table sorted by average time,
+    /// numbers right-aligned) sections.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.frozen, "Freeze");
@@ -315,51 +320,65 @@ impl Profiler {
             if ui.checkbox(&mut on, "Timing").changed() {
                 Self::set_enabled(on);
             }
-            ui.label(format!(
-                "frame {:.2} ms · {} spans",
-                self.timeline.duration * 1000.0,
-                self.timeline.spans.len()
-            ));
         });
         if self.stats.is_empty() {
-            ui.label(match crate::tracing_install_state() {
-                crate::TracingInstall::None => {
-                    "No timings: install the tracing layers (UiPlugin::install_tracing or ProfilerLayer)."
-                }
-                _ => "Waiting for frames...",
-            });
+            ui.label(
+                egui::RichText::new(match crate::tracing_install_state() {
+                    crate::TracingInstall::None => {
+                        "No timings: install the tracing layers (UiPlugin::install_tracing or ProfilerLayer)."
+                    }
+                    _ => "Waiting for frames...",
+                })
+                .weak(),
+            );
             return;
         }
-        ui.separator();
-        self.flame_ui(ui);
-        ui.separator();
-        self.table_ui(ui);
+        egui::CollapsingHeader::new("Timeline")
+            .id_salt("space3d_profiler_timeline")
+            .default_open(true)
+            .show(ui, |ui| self.flame_ui(ui));
+        egui::CollapsingHeader::new(format!("Systems ({})", self.stats.len()))
+            .id_salt("space3d_profiler_systems")
+            .default_open(true)
+            .show(ui, |ui| self.table_ui(ui));
+    }
+
+    /// One-line summary of the shown frame (time, span count, frozen), as in the F4 window's
+    /// header; [`Self::ui`] leaves it out for hosts that show it elsewhere.
+    pub fn summary(&self) -> String {
+        format!(
+            "{:.2} ms · {} spans{}",
+            self.timeline.duration * 1000.0,
+            self.timeline.spans.len(),
+            if self.frozen { " · frozen" } else { "" }
+        )
     }
 
     fn flame_ui(&self, ui: &mut egui::Ui) {
         let tl = &self.timeline;
         let depth = tl.spans.iter().map(|s| s.depth).max().unwrap_or(0) + 1;
-        let row = 16.0;
+        let row = 14.0;
         let width = ui.available_width().max(100.0);
         let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(width, row * depth as f32 + 4.0), egui::Sense::hover());
+            ui.allocate_exact_size(egui::vec2(width, row * depth as f32 + 2.0), egui::Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
         let total = tl.duration.max(1e-9);
         let hover = response.hover_pos();
         let mut tooltip = None;
+        let font = egui::FontId::monospace(10.0);
         for s in &tl.spans {
             let x0 = rect.left() + (s.start / total) as f32 * rect.width();
             let w = ((s.duration / total) as f32 * rect.width()).max(1.0);
-            let y0 = rect.top() + 2.0 + s.depth as f32 * row;
+            let y0 = rect.top() + 1.0 + s.depth as f32 * row;
             let r = egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(w, row - 1.0));
             painter.rect_filled(r, 1.0, name_color(&s.name));
             if w > 40.0 {
-                painter.text(
-                    r.left_center() + egui::vec2(2.0, 0.0),
+                painter.with_clip_rect(r.intersect(rect)).text(
+                    r.left_center() + egui::vec2(3.0, 0.0),
                     egui::Align2::LEFT_CENTER,
                     short_name(&s.name),
-                    egui::FontId::monospace(10.0),
+                    font.clone(),
                     egui::Color32::BLACK,
                 );
             }
@@ -374,36 +393,46 @@ impl Profiler {
 
     fn table_ui(&self, ui: &mut egui::Ui) {
         let max = self.stats.first().map_or(1.0, |s| s.avg_ms.max(1e-6));
-        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-            egui::Grid::new("space3d_profiler_table")
-                .striped(true)
-                .num_columns(5)
-                .show(ui, |ui| {
-                    ui.strong("system");
-                    ui.strong("avg ms");
-                    ui.strong("last ms");
-                    ui.strong("max ms");
-                    ui.strong("calls");
-                    ui.end_row();
-                    for s in &self.stats {
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(egui::vec2(60.0, 10.0), egui::Sense::hover());
-                            let frac = (s.avg_ms / max) as f32;
-                            ui.painter().rect_filled(
-                                egui::Rect::from_min_size(r.min, egui::vec2(r.width() * frac, r.height())),
-                                1.0,
-                                name_color(&s.name),
-                            );
-                            ui.label(short_name(&s.name)).on_hover_text(&*s.name);
-                        });
-                        ui.monospace(format!("{:.3}", s.avg_ms));
-                        ui.monospace(format!("{:.3}", s.last_ms));
-                        ui.monospace(format!("{:.3}", s.max_ms));
-                        ui.monospace(format!("{}", s.calls));
+        let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 2.0;
+        let number = |ui: &mut egui::Ui, text: String| {
+            ui.label(egui::RichText::new(text).monospace());
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("space3d_profiler_scroll")
+            .max_height(ui.available_height().max(120.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                egui::Grid::new("space3d_profiler_table")
+                    .striped(true)
+                    .num_columns(5)
+                    .min_row_height(row_height)
+                    .spacing([10.0, 0.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("system").weak());
+                        for h in ["    avg", "   last", "    max", "calls"] {
+                            ui.label(egui::RichText::new(h).monospace().weak());
+                        }
                         ui.end_row();
-                    }
-                });
-        });
+                        for s in &self.stats {
+                            ui.horizontal(|ui| {
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(36.0, 6.0), egui::Sense::hover());
+                                let frac = (s.avg_ms / max) as f32;
+                                ui.painter().rect_filled(r, 1.0, egui::Color32::from_white_alpha(12));
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(r.min, egui::vec2(r.width() * frac, r.height())),
+                                    1.0,
+                                    name_color(&s.name),
+                                );
+                                ui.label(short_name(&s.name)).on_hover_text(&*s.name);
+                            });
+                            number(ui, format!("{:>7.3}", s.avg_ms));
+                            number(ui, format!("{:>7.3}", s.last_ms));
+                            number(ui, format!("{:>7.3}", s.max_ms));
+                            number(ui, format!("{:>5}", s.calls));
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 }
 
@@ -437,13 +466,21 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
     if !p.visible {
         return;
     }
+    let screen = ctx.content_rect();
+    let size = egui::vec2(screen.width().min(440.0) - 12.0, 300.0f32.min(screen.height() - 12.0));
+    let pos = egui::pos2((screen.right() - size.x - 6.0).max(6.0), 6.0);
+    let summary = p.summary();
     let mut open = true;
-    egui::Window::new("Profiler")
-        .id(egui::Id::new("space3d_profiler"))
-        .open(&mut open)
-        .default_pos([360.0, 40.0])
-        .default_width(520.0)
-        .show(&ctx, |ui| p.ui(ui));
+    crate::tool::window(
+        &ctx,
+        ("space3d_profiler", "Profiler"),
+        egui::Rect::from_min_size(pos, size),
+        &mut open,
+        |ui| {
+            ui.label(egui::RichText::new(summary).weak());
+        },
+        |ui| p.ui(ui),
+    );
     if !open {
         p.visible = false;
     }
@@ -465,7 +502,7 @@ mod tests {
             duration: d,
             depth: 0,
         };
-        p.ingest(FrameTimeline {
+        p.record(FrameTimeline {
             index: 1,
             duration: 0.01,
             spans: vec![span("a", 0.002), span("b", 0.004), span("a", 0.001)],
@@ -474,7 +511,7 @@ mod tests {
         let a = p.get("a").unwrap();
         assert_eq!(a.calls, 2);
         assert!((a.last_ms - 3.0).abs() < 1e-9);
-        p.ingest(FrameTimeline {
+        p.record(FrameTimeline {
             index: 2,
             duration: 0.01,
             spans: vec![span("a", 0.0)],

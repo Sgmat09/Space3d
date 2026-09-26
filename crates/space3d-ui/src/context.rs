@@ -8,9 +8,9 @@
 //! before it ends, both with the same top-level [`egui::Ui`] over the screen (id
 //! `(viewport_id, "__top_ui")`, like `run_ui`'s). See [`EguiContext::add_plugin`].
 
-use crate::UiPlugin;
 use crate::input::InputTranslator;
 use crate::overlay::EguiOverlay;
+use crate::{UiPlugin, UiTheme, UiThemeSync};
 use space3d_core::glam::Vec2;
 use space3d_core::{SystemCtx, Time};
 use space3d_platform::{Input, WindowState};
@@ -323,8 +323,14 @@ fn screen_info(sys: &SystemCtx, settings: &UiPlugin) -> ([u32; 2], f32, bool, us
 }
 
 /// `Stage::PreUpdate`: translate input and begin the egui pass.
-pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator, settings: &UiPlugin) {
+pub(crate) fn begin_frame(
+    sys: &mut SystemCtx,
+    translator: &mut InputTranslator,
+    theme: &mut UiThemeSync,
+    settings: &UiPlugin,
+) {
     let (size, native_ppp, focused, max_texture_side) = screen_info(sys, settings);
+    let ui_theme = sys.resources.get::<UiTheme>().copied();
     let (time, dt) = sys
         .resources
         .get::<Time>()
@@ -388,6 +394,9 @@ pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator,
         // dragged is dropped nowhere.
         egui::DragAndDrop::clear_payload(&e.ctx);
     }
+    // An inserted or changed `UiTheme` restyles egui once, between passes (no resource: the
+    // style is never touched).
+    theme.sync(&e.ctx, ui_theme.as_ref());
     e.ctx.begin_pass(raw);
     e.in_pass = true;
     // `run_ui`'s top-level ui, handed to the plugins' begin hooks now and end hooks in

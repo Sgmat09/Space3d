@@ -8,6 +8,7 @@
 
 use crate::files::{IoJobs, sanitize_file_name, write_file_with};
 use crate::sub_app::{LiveView, panic_message, panics_are_isolated};
+use crate::widgets::{fill_drag, fill_slider, panel_frame, panel_title, property, section};
 use space3d_core::{App, Plugin, Stage, SystemCtx, Time};
 use space3d_platform::InputPlugin;
 use space3d_render::RenderPlugin;
@@ -318,13 +319,12 @@ impl StorybookViewer {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Stories");
+        panel_title(ui, "Stories", &self.book.len().to_string());
         ui.add(
             egui::TextEdit::singleline(&mut self.search)
                 .hint_text("search id or tag")
                 .desired_width(f32::INFINITY),
         );
-        ui.separator();
         let mut clicked: Option<String> = None;
         egui::ScrollArea::vertical()
             .id_salt("space3d_story_list")
@@ -373,35 +373,30 @@ impl StorybookViewer {
 
     fn knob_widget(ui: &mut egui::Ui, knob: &Knob, value: &mut KnobValue) -> bool {
         let before = value.clone();
-        match (&knob.kind, &mut *value) {
+        property(ui, &knob.name, |ui| match (&knob.kind, &mut *value) {
             (KnobKind::Bool, KnobValue::Bool(b)) => {
-                ui.checkbox(b, &knob.name);
+                ui.checkbox(b, "");
             }
             (KnobKind::Float { min, max }, KnobValue::Float(v)) => {
-                ui.add(egui::Slider::new(v, *min..=*max).text(&knob.name));
+                fill_slider(ui, egui::Slider::new(v, *min..=*max));
             }
             (KnobKind::Int { min, max }, KnobValue::Int(v)) => {
-                ui.add(egui::Slider::new(v, *min..=*max).text(&knob.name));
+                fill_slider(ui, egui::Slider::new(v, *min..=*max));
             }
             (KnobKind::Color, KnobValue::Color(c)) => {
-                ui.horizontal(|ui| {
-                    let mut rgba = egui::Rgba::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
-                    if egui::color_picker::color_edit_button_rgba(ui, &mut rgba, egui::color_picker::Alpha::OnlyBlend)
-                        .changed()
-                    {
-                        *c = rgba.to_rgba_unmultiplied();
-                    }
-                    ui.label(&knob.name);
-                });
+                let mut rgba = egui::Rgba::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                if egui::color_picker::color_edit_button_rgba(ui, &mut rgba, egui::color_picker::Alpha::OnlyBlend)
+                    .changed()
+                {
+                    *c = rgba.to_rgba_unmultiplied();
+                }
             }
             (KnobKind::Text, KnobValue::Text(t)) => {
-                ui.horizontal(|ui| {
-                    ui.label(&knob.name);
-                    ui.text_edit_singleline(t);
-                });
+                ui.add(egui::TextEdit::singleline(t).desired_width(f32::INFINITY));
             }
             (KnobKind::Choice { options }, KnobValue::Choice(i)) => {
-                egui::ComboBox::from_label(&knob.name)
+                egui::ComboBox::from_id_salt(("space3d_knob", &knob.name))
+                    .width(ui.available_width() - ui.spacing().icon_width)
                     .selected_text(options.get(*i).cloned().unwrap_or_default())
                     .show_ui(ui, |ui| {
                         for (k, o) in options.iter().enumerate() {
@@ -409,97 +404,114 @@ impl StorybookViewer {
                         }
                     });
             }
-            _ => {
-                ui.label(format!("{}: {}", knob.name, knob.format_value(value)));
+            (_, v) => {
                 if ui.small_button("reset").clicked() {
-                    *value = knob.default.clone();
+                    *v = knob.default.clone();
+                } else {
+                    ui.label(knob.format_value(v));
                 }
             }
-        }
+        });
         *value != before
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let Some(story) = self.selected().cloned() else {
-            ui.label("No story selected.");
+            ui.label(egui::RichText::new("No story selected.").weak());
             return;
         };
-        ui.heading(&story.name);
-        ui.label(egui::RichText::new(&story.id).weak());
+        panel_title(ui, &story.name, &format!("{}×{}", story.size.0, story.size.1));
+        ui.label(egui::RichText::new(&story.id).weak().small());
         if !story.description.is_empty() {
             ui.label(&story.description);
         }
-        ui.label(format!(
-            "{}x{} · {} warm-up ticks{}",
-            story.size.0,
-            story.size.1,
-            story.ticks,
-            if story.tags.is_empty() {
-                String::new()
-            } else {
-                format!(" · tags: {}", story.tags.join(", "))
-            }
-        ));
-        ui.separator();
-        ui.strong("Knobs");
-        if story.knobs.is_empty() {
-            ui.label(egui::RichText::new("(none)").weak());
+        let mut info = format!("{} warm-up ticks", story.ticks);
+        if !story.tags.is_empty() {
+            info.push_str(" · ");
+            info.push_str(&story.tags.join(", "));
         }
-        for knob in &story.knobs {
-            let mut value = self
-                .knobs
-                .get(&knob.name)
-                .cloned()
-                .unwrap_or_else(|| knob.default.clone());
-            if Self::knob_widget(ui, knob, &mut value) {
-                self.set_knob(&knob.name, value);
-            }
-        }
-        if !story.knobs.is_empty() && ui.button("Reset knobs").clicked() {
+        ui.label(egui::RichText::new(info).weak().small());
+        ui.add_space(2.0);
+        let mut reset = false;
+        let knobs = story.knobs.len();
+        section(
+            ui,
+            "space3d_story_knobs_section",
+            &format!("Knobs ({knobs})"),
+            true,
+            |ui| {
+                reset = knobs > 0 && ui.small_button("Reset").clicked();
+            },
+            |ui| {
+                if knobs == 0 {
+                    ui.label(egui::RichText::new("(none)").weak());
+                }
+                for knob in &story.knobs {
+                    let mut value = self
+                        .knobs
+                        .get(&knob.name)
+                        .cloned()
+                        .unwrap_or_else(|| knob.default.clone());
+                    if Self::knob_widget(ui, knob, &mut value) {
+                        self.set_knob(&knob.name, value);
+                    }
+                }
+            },
+        );
+        if reset {
             self.knobs = story.default_knobs();
             self.dirty = true;
         }
-        ui.separator();
-        ui.strong("Simulation");
-        ui.horizontal(|ui| {
-            if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
-                self.set_playing(!self.playing);
-            }
-            if ui.button("Step").clicked() {
-                self.step(1);
-            }
-            ui.add(egui::DragValue::new(&mut self.step_count).range(1..=100_000));
-            if ui.button("Step N").clicked() {
-                self.step(self.step_count);
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Restart").clicked() {
-                self.rebuild();
-            }
-            if let Some(t) = self.story_tick() {
-                ui.label(format!("tick {t}"));
-            }
-            if let Some(v) = &self.view {
-                ui.label(format!("{} frames", v.frames()));
-            }
-        });
-        if self.pending_steps > 0 {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("stepping: {} ticks left", self.pending_steps));
-                if ui.small_button("Cancel").clicked() {
-                    self.pending_steps = 0;
+        section(
+            ui,
+            "space3d_story_sim_section",
+            "Simulation",
+            true,
+            |_| {},
+            |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
+                        self.set_playing(!self.playing);
+                    }
+                    if ui.button("Step").clicked() {
+                        self.step(1);
+                    }
+                    if ui.button("Restart").clicked() {
+                        self.rebuild();
+                    }
+                });
+                property(ui, "Step N", |ui| {
+                    if ui.small_button("Run").clicked() {
+                        self.step(self.step_count);
+                    }
+                    fill_drag(
+                        ui,
+                        egui::DragValue::new(&mut self.step_count)
+                            .range(1..=100_000)
+                            .suffix(" ticks"),
+                    );
+                });
+                let tick = self.story_tick().map_or_else(|| "–".to_owned(), |t| t.to_string());
+                let frames = self.view.as_ref().map_or(0, LiveView::frames);
+                property(ui, "Tick", |ui| ui.label(format!("{tick} · {frames} frames")));
+                if self.pending_steps > 0 {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("stepping: {} ticks left", self.pending_steps));
+                        if ui.small_button("Cancel").clicked() {
+                            self.pending_steps = 0;
+                        }
+                    });
                 }
-            });
-        }
-        ui.separator();
+            },
+        );
+        ui.add_space(2.0);
         if ui.button("Capture screenshot").clicked()
             && let Err(e) = self.capture_screenshot()
         {
             self.status = e;
         }
-        ui.label(egui::RichText::new(&self.status).weak());
+        ui.label(egui::RichText::new(&self.status).weak().small());
         if !panics_are_isolated() {
             ui.label(
                 egui::RichText::new("panic = abort build: a panicking story closes the viewer")
@@ -512,16 +524,20 @@ impl StorybookViewer {
     /// Draw the viewer into the root ui (sidebar, knobs panel, live viewport).
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("space3d_story_sidebar")
-            .default_size(240.0)
+            .default_size(200.0)
+            .frame(panel_frame(ui.style()))
             .show(ui, |ui| self.sidebar(ui));
         egui::Panel::right("space3d_story_knobs")
-            .default_size(300.0)
+            .default_size(260.0)
+            .frame(panel_frame(ui.style()))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("space3d_story_knobs_scroll")
                     .show(ui, |ui| self.side_panel(ui));
             });
-        egui::CentralPanel::default().show(ui, |ui| {
+        let m = ui.style().spacing.window_margin;
+        let central = egui::Frame::central_panel(ui.style()).inner_margin(m);
+        egui::CentralPanel::default().frame(central).show(ui, |ui| {
             let avail = ui.available_size();
             ui.centered_and_justified(|ui| match &mut self.view {
                 Some(v) => {

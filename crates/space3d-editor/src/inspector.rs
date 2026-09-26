@@ -6,6 +6,7 @@ use crate::components::{
     MeshSource, can_remove, component_values, ensure_stable_id, names, remove_component, set_component_value,
 };
 use crate::history::{EditCommand, EditorHistory};
+use crate::widgets::{fill_drag, fill_slider, icon_button, property, section, vec3_fields};
 use space3d_core::glam::{EulerRot, Quat, Vec3, Vec4};
 use space3d_core::hecs::{Component, Entity, World};
 use space3d_core::{Name, Parent, Transform};
@@ -50,16 +51,6 @@ fn gesture_ended(r: &egui::Response) -> bool {
     r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus())
 }
 
-fn vec3_edit(ui: &mut egui::Ui, v: &mut Vec3, speed: f64) -> egui::Response {
-    ui.horizontal(|ui| {
-        let x = ui.add(egui::DragValue::new(&mut v.x).speed(speed).prefix("x ").max_decimals(4));
-        let y = ui.add(egui::DragValue::new(&mut v.y).speed(speed).prefix("y ").max_decimals(4));
-        let z = ui.add(egui::DragValue::new(&mut v.z).speed(speed).prefix("z ").max_decimals(4));
-        x | y | z
-    })
-    .inner
-}
-
 // egui's color buttons round-trip the value through HSVA every frame; writing that back
 // unconditionally would nudge colors (and record bogus undo steps) just by showing them.
 fn color3_edit(ui: &mut egui::Ui, c: &mut Vec3) -> egui::Response {
@@ -96,19 +87,19 @@ fn typed_section<T: Component + Clone + PartialEq>(
         return false;
     };
     let mut value = before.clone();
-    let mut remove = false;
     let mut ended = false;
-    egui::CollapsingHeader::new(title)
-        .id_salt(("space3d_inspector", title))
-        .default_open(true)
-        .show(ui, |ui| {
+    let (remove, _) = section(
+        ui,
+        ("space3d_inspector", title),
+        title,
+        true,
+        |ui| icon_button(ui, "×", &format!("Remove {title}")).clicked(),
+        |ui| {
             if let Some(r) = body(ui, &mut value) {
                 ended = gesture_ended(&r);
             }
-            if ui.small_button("Remove component").clicked() {
-                remove = true;
-            }
-        });
+        },
+    );
     if remove {
         history.execute(
             EditCommand::set::<T>(format!("Remove {title}"), id, Some(before), None),
@@ -150,20 +141,12 @@ pub fn inspector_ui(
         ui.label("entity no longer exists");
         return false;
     };
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(format!("Entity #{}", e.id())).strong());
-        ui.label(egui::RichText::new(id.to_string()).weak().small());
-    });
-
-    // Name.
+    // Name, id and parent.
     let before = world.get::<&Name>(e).ok().map(|n| n.0.clone());
     let mut text = before.clone().unwrap_or_default();
-    let r = ui
-        .horizontal(|ui| {
-            ui.label("Name");
-            ui.text_edit_singleline(&mut text)
-        })
-        .inner;
+    let r = property(ui, "Name", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY))
+    });
     if r.changed() {
         let after = (!text.is_empty()).then(|| Name(text.clone()));
         match &after {
@@ -179,25 +162,27 @@ pub fn inspector_ui(
     if r.lost_focus() {
         history.end_merge();
     }
-
-    // Parent.
+    property(ui, "Entity", |ui| {
+        ui.label(format!("#{}", e.id()));
+        ui.add(egui::Label::new(egui::RichText::new(id.to_string()).weak().small()).truncate())
+            .on_hover_text(id.to_string());
+    });
     if let Ok(p) = world.get::<&Parent>(e).map(|p| p.0) {
         let pname = crate::components::display_name(world, p);
-        let mut unparent = false;
-        ui.horizontal(|ui| {
-            ui.label(format!("Parent: {pname}"));
-            unparent = ui.small_button("Unparent").clicked();
+        let unparent = property(ui, "Parent", |ui| {
+            let clicked = ui.small_button("Unparent").clicked();
+            ui.add(egui::Label::new(pname).truncate());
+            clicked
         });
         if unparent {
             let pid = ensure_stable_id(world, p);
             history.execute(EditCommand::reparent(id, pid, None), world, registry);
         }
     }
-    ui.separator();
+    ui.add_space(2.0);
 
     typed_section::<Transform>(ui, world, registry, history, e, id, "Transform", |ui, t| {
-        let mut r = ui.label("translation");
-        r |= vec3_edit(ui, &mut t.translation, 0.01);
+        let mut r = property(ui, "Position", |ui| vec3_fields(ui, &mut t.translation, 0.01));
         let euler = match state.euler {
             Some((ent, q, eu)) if ent == e && q == t.rotation => eu,
             _ => {
@@ -206,39 +191,33 @@ pub fn inspector_ui(
             }
         };
         let mut eu = euler;
-        ui.label("rotation (deg)");
-        let rr = vec3_edit(ui, &mut eu, 0.5);
+        let rr = property(ui, "Rotation °", |ui| vec3_fields(ui, &mut eu, 0.5));
         if eu != euler {
             t.rotation = Quat::from_euler(EulerRot::XYZ, eu.x.to_radians(), eu.y.to_radians(), eu.z.to_radians());
         }
         state.euler = Some((e, t.rotation, eu));
         r |= rr;
-        ui.label("scale");
-        r |= vec3_edit(ui, &mut t.scale, 0.01);
+        r |= property(ui, "Scale", |ui| vec3_fields(ui, &mut t.scale, 0.01));
         Some(r)
     });
 
     typed_section::<Material>(ui, world, registry, history, e, id, "Material", |ui, m| {
-        let mut r = ui
-            .horizontal(|ui| {
-                ui.label("base color");
-                color4_edit(ui, &mut m.base_color)
-            })
-            .inner;
-        r |= ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0).text("metallic"));
-        r |= ui.add(egui::Slider::new(&mut m.roughness, 0.0..=1.0).text("roughness"));
-        r |= ui
-            .horizontal(|ui| {
-                ui.label("emissive");
-                color3_edit(ui, &mut m.emissive)
-            })
-            .inner;
-        r |= ui.checkbox(&mut m.unlit, "unlit");
-        r |= ui.checkbox(&mut m.double_sided, "double sided");
-        r |= ui.checkbox(&mut m.alpha_blend, "alpha blend");
+        let mut r = property(ui, "Base color", |ui| color4_edit(ui, &mut m.base_color));
+        r |= property(ui, "Metallic", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut m.metallic, 0.0..=1.0))
+        });
+        r |= property(ui, "Roughness", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut m.roughness, 0.0..=1.0))
+        });
+        r |= property(ui, "Emissive", |ui| color3_edit(ui, &mut m.emissive));
+        r |= property(ui, "Flags", |ui| {
+            ui.checkbox(&mut m.unlit, "Unlit")
+                | ui.checkbox(&mut m.double_sided, "2-sided")
+                | ui.checkbox(&mut m.alpha_blend, "Blend")
+        });
         if let Some(t) = m.base_color_texture {
-            ui.horizontal(|ui| {
-                ui.label(format!("texture #{}", t.index()));
+            property(ui, "Texture", |ui| {
+                ui.label(format!("#{}", t.index()));
                 if ui.small_button("Clear").clicked() {
                     m.base_color_texture = None;
                 }
@@ -248,46 +227,35 @@ pub fn inspector_ui(
     });
 
     typed_section::<DirectionalLight>(ui, world, registry, history, e, id, "Directional light", |ui, l| {
-        let mut r = ui
-            .horizontal(|ui| {
-                ui.label("color");
-                color3_edit(ui, &mut l.color)
-            })
-            .inner;
-        r |= ui.add(
-            egui::DragValue::new(&mut l.intensity)
-                .speed(0.05)
-                .range(0.0..=1000.0)
-                .prefix("intensity "),
-        );
+        let mut r = property(ui, "Color", |ui| color3_edit(ui, &mut l.color));
+        r |= property(ui, "Intensity", |ui| {
+            fill_drag(
+                ui,
+                egui::DragValue::new(&mut l.intensity).speed(0.05).range(0.0..=1000.0),
+            )
+        });
         Some(r)
     });
 
     typed_section::<PointLight>(ui, world, registry, history, e, id, "Point light", |ui, l| {
-        let mut r = ui
-            .horizontal(|ui| {
-                ui.label("color");
-                color3_edit(ui, &mut l.color)
-            })
-            .inner;
-        r |= ui.add(
-            egui::DragValue::new(&mut l.intensity)
-                .speed(0.05)
-                .range(0.0..=1000.0)
-                .prefix("intensity "),
-        );
-        r |= ui.add(
-            egui::DragValue::new(&mut l.range)
-                .speed(0.1)
-                .range(0.01..=10_000.0)
-                .prefix("range "),
-        );
+        let mut r = property(ui, "Color", |ui| color3_edit(ui, &mut l.color));
+        r |= property(ui, "Intensity", |ui| {
+            fill_drag(
+                ui,
+                egui::DragValue::new(&mut l.intensity).speed(0.05).range(0.0..=1000.0),
+            )
+        });
+        r |= property(ui, "Range", |ui| {
+            fill_drag(ui, egui::DragValue::new(&mut l.range).speed(0.1).range(0.01..=10_000.0))
+        });
         Some(r)
     });
 
     typed_section::<Camera3d>(ui, world, registry, history, e, id, "Camera", |ui, c| {
         let mut ortho = matches!(c.projection, Projection::Orthographic { .. });
-        let mut r = ui.checkbox(&mut ortho, "orthographic");
+        let mut r = property(ui, "Projection", |ui| {
+            ui.selectable_value(&mut ortho, false, "Perspective") | ui.selectable_value(&mut ortho, true, "Ortho")
+        });
         c.projection = match (ortho, c.projection) {
             (true, Projection::Perspective { near, far, .. }) => Projection::Orthographic {
                 height: 10.0,
@@ -304,45 +272,55 @@ pub fn inspector_ui(
         match &mut c.projection {
             Projection::Perspective { fov_y, near, far } => {
                 let mut deg = fov_y.to_degrees();
-                r |= ui.add(egui::Slider::new(&mut deg, 5.0..=170.0).text("fov°"));
+                r |= property(ui, "FOV °", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut deg, 5.0..=170.0))
+                });
                 *fov_y = deg.to_radians();
-                r |= ui.add(
-                    egui::DragValue::new(near)
-                        .speed(0.01)
-                        .range(0.0001..=100.0)
-                        .prefix("near "),
-                );
-                r |= ui.add(egui::DragValue::new(far).speed(1.0).range(0.01..=1e6).prefix("far "));
+                r |= property(ui, "Near / far", |ui| {
+                    let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                    let h = ui.spacing().interact_size.y;
+                    ui.add_sized([w, h], egui::DragValue::new(near).speed(0.01).range(0.0001..=100.0))
+                        | ui.add_sized([w, h], egui::DragValue::new(far).speed(1.0).range(0.01..=1e6))
+                });
             }
             Projection::Orthographic { height, near, far } => {
-                r |= ui.add(
-                    egui::DragValue::new(height)
-                        .speed(0.1)
-                        .range(0.01..=1e5)
-                        .prefix("height "),
-                );
-                r |= ui.add(egui::DragValue::new(near).speed(0.01).prefix("near "));
-                r |= ui.add(egui::DragValue::new(far).speed(1.0).prefix("far "));
+                r |= property(ui, "Height", |ui| {
+                    fill_drag(ui, egui::DragValue::new(height).speed(0.1).range(0.01..=1e5))
+                });
+                r |= property(ui, "Near / far", |ui| {
+                    let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                    let h = ui.spacing().interact_size.y;
+                    ui.add_sized([w, h], egui::DragValue::new(near).speed(0.01))
+                        | ui.add_sized([w, h], egui::DragValue::new(far).speed(1.0))
+                });
             }
         }
         let mut clear = c.clear_color.is_some();
-        r |= ui.checkbox(&mut clear, "clear");
+        r |= property(ui, "Clear", |ui| {
+            let mut r = ui.checkbox(&mut clear, "");
+            if let Some(col) = &mut c.clear_color
+                && clear
+            {
+                r |= color4_edit(ui, col);
+            }
+            r
+        });
         match (clear, &mut c.clear_color) {
-            (true, Some(col)) => r |= color4_edit(ui, col),
             (true, None) => c.clear_color = Some(Vec4::new(0.02, 0.02, 0.03, 1.0)),
             (false, _) => c.clear_color = None,
+            _ => {}
         }
-        r |= ui.add(egui::DragValue::new(&mut c.order).prefix("order "));
-        r |= ui.checkbox(&mut c.active, "active");
+        r |= property(ui, "Order", |ui| fill_drag(ui, egui::DragValue::new(&mut c.order)));
+        r |= property(ui, "Active", |ui| ui.checkbox(&mut c.active, ""));
         if let RenderTarget::Texture(t) = c.target {
-            ui.label(format!("renders to texture #{}", t.index()));
+            property(ui, "Target", |ui| ui.label(format!("texture #{}", t.index())));
         }
         Some(r)
     });
 
     typed_section::<Visibility>(ui, world, registry, history, e, id, "Visibility", |ui, v| {
         let mut visible = *v == Visibility::Visible;
-        let r = ui.checkbox(&mut visible, "visible");
+        let r = property(ui, "Visible", |ui| ui.checkbox(&mut visible, ""));
         *v = if visible {
             Visibility::Visible
         } else {
@@ -352,53 +330,53 @@ pub fn inspector_ui(
     });
 
     let mesh_changed = typed_section::<MeshSource>(ui, world, registry, history, e, id, "Mesh source", |ui, s| {
-        ui.label(format!("kind: {}", s.label()));
+        let kind = s.label();
         let r = match s {
-            MeshSource::Cube { size } | MeshSource::Plane { size } => ui.add(
-                egui::DragValue::new(size)
-                    .speed(0.01)
-                    .range(0.001..=1e4)
-                    .prefix("size "),
-            ),
+            MeshSource::Cube { size } | MeshSource::Plane { size } => property(ui, "Size", |ui| {
+                fill_drag(ui, egui::DragValue::new(size).speed(0.01).range(0.001..=1e4))
+            }),
             MeshSource::Sphere {
                 radius,
                 sectors,
                 stacks,
             } => {
-                let mut r = ui.add(
-                    egui::DragValue::new(radius)
-                        .speed(0.01)
-                        .range(0.001..=1e4)
-                        .prefix("radius "),
-                );
-                r |= ui.add(egui::DragValue::new(sectors).range(3..=256).prefix("sectors "));
-                r |= ui.add(egui::DragValue::new(stacks).range(2..=256).prefix("stacks "));
-                r
+                let r = property(ui, "Radius", |ui| {
+                    fill_drag(ui, egui::DragValue::new(radius).speed(0.01).range(0.001..=1e4))
+                });
+                r | property(ui, "Segments", |ui| {
+                    let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                    let h = ui.spacing().interact_size.y;
+                    ui.add_sized([w, h], egui::DragValue::new(sectors).range(3..=256).suffix(" sec"))
+                        | ui.add_sized([w, h], egui::DragValue::new(stacks).range(2..=256).suffix(" stk"))
+                })
             }
-            MeshSource::Data(m) => ui.label(format!(
-                "{} vertices, {} triangles",
-                m.vertex_count(),
-                m.triangle_count()
-            )),
+            MeshSource::Data(m) => property(ui, "Data", |ui| {
+                ui.label(format!("{} verts · {} tris", m.vertex_count(), m.triangle_count()))
+            }),
         };
+        property(ui, "Kind", |ui| ui.label(egui::RichText::new(kind).weak()));
         Some(r)
     });
 
     if let Ok(mesh) = world.get::<&Mesh3d>(e).map(|m| *m) {
-        egui::CollapsingHeader::new("Mesh")
-            .id_salt(("space3d_inspector", "Mesh3d"))
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(format!("handle #{}", mesh.0.index()));
+        section(
+            ui,
+            ("space3d_inspector", "Mesh3d"),
+            "Mesh",
+            false,
+            |_| {},
+            |ui| {
+                property(ui, "Handle", |ui| ui.label(format!("#{}", mesh.0.index())));
                 if let Some(a) = assets {
                     if let Some(t) = a.mesh_triangles(mesh.0) {
-                        ui.label(format!("{t} triangles"));
+                        property(ui, "Triangles", |ui| ui.label(t.to_string()));
                     }
                     if let Some(b) = a.mesh_aabb(mesh.0) {
-                        ui.label(format!("bounds {:.2} .. {:.2}", b.min, b.max));
+                        property(ui, "Bounds", |ui| ui.label(format!("{:.2} .. {:.2}", b.min, b.max)));
                     }
                 }
-            });
+            },
+        );
     }
 
     json_sections(ui, world, registry, history, state, e, id);
@@ -429,10 +407,19 @@ fn json_sections(
     }
     for name in names_shown {
         let current = values.get(&name).cloned();
-        egui::CollapsingHeader::new(&name)
-            .id_salt(("space3d_inspector_json", &name))
-            .default_open(true)
-            .show(ui, |ui| {
+        let editing = state.json_edits.contains_key(&name);
+        let (actions, _) = section(
+            ui,
+            ("space3d_inspector_json", &name),
+            &name,
+            true,
+            |ui| {
+                let remove =
+                    can_remove(&name) && current.is_some() && icon_button(ui, "×", &format!("Remove {name}")).clicked();
+                let edit = !editing && current.is_some() && ui.small_button("Edit JSON").clicked();
+                (remove, edit)
+            },
+            |ui| {
                 if let Some(text) = state.json_edits.get_mut(&name) {
                     ui.add(
                         egui::TextEdit::multiline(text)
@@ -474,25 +461,26 @@ fn json_sections(
                         ui.colored_label(ui.visuals().error_fg_color, err);
                     }
                 } else if let Some(v) = &current {
-                    let pretty = serde_json::to_string_pretty(v).unwrap_or_default();
-                    ui.label(egui::RichText::new(&pretty).monospace());
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Edit JSON").clicked() {
-                            state.json_edits.insert(name.clone(), pretty.clone());
-                        }
-                        if can_remove(&name) && ui.small_button("Remove").clicked() {
-                            remove_component(world, e, &name);
-                            history.push(EditCommand::set_json(
-                                format!("Remove {name}"),
-                                id,
-                                name.clone(),
-                                current.clone(),
-                                None,
-                            ));
-                        }
-                    });
+                    let compact = serde_json::to_string(v).unwrap_or_default();
+                    ui.add(egui::Label::new(egui::RichText::new(&compact).monospace()).wrap());
                 }
-            });
+            },
+        );
+        let (remove, edit) = actions;
+        if edit && let Some(v) = &current {
+            let pretty = serde_json::to_string_pretty(v).unwrap_or_default();
+            state.json_edits.insert(name.clone(), pretty);
+        }
+        if remove {
+            remove_component(world, e, &name);
+            history.push(EditCommand::set_json(
+                format!("Remove {name}"),
+                id,
+                name.clone(),
+                current.clone(),
+                None,
+            ));
+        }
     }
 }
 
@@ -530,9 +518,11 @@ fn add_component_ui(
     if options.is_empty() {
         return;
     }
-    ui.separator();
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
+        let add_width = 36.0;
         egui::ComboBox::from_id_salt("space3d_add_component")
+            .width(ui.available_width() - add_width - ui.spacing().item_spacing.x - ui.spacing().icon_width)
             .selected_text(if state.add_pick.is_empty() {
                 "Add component..."
             } else {

@@ -55,6 +55,14 @@ fn build_tree(world: &World) -> Tree {
     Tree { names, children, roots }
 }
 
+/// Entities the hierarchy lists (editor-internal ones are hidden).
+pub(crate) fn entity_count(world: &World) -> usize {
+    world
+        .iter()
+        .filter(|e| !world.satisfies::<&EditorInternal>(e.entity()))
+        .count()
+}
+
 /// Whether moving `child` under `parent` keeps the hierarchy acyclic.
 pub fn can_reparent(world: &World, child: Entity, parent: Option<Entity>) -> bool {
     match parent {
@@ -72,10 +80,11 @@ pub fn hierarchy_ui(
 ) -> Vec<HierarchyAction> {
     let mut actions = Vec::new();
     ui.horizontal(|ui| {
+        let button = ui.spacing().interact_size.y + ui.spacing().item_spacing.x;
         ui.add(
             egui::TextEdit::singleline(filter)
                 .hint_text("search")
-                .desired_width(ui.available_width() - 30.0),
+                .desired_width(ui.available_width() - button),
         );
         ui.menu_button("+", |ui| {
             for kind in AddKind::ALL {
@@ -86,12 +95,12 @@ pub fn hierarchy_ui(
             }
         });
     });
-    ui.separator();
     let tree = build_tree(world);
+    let drop_height = ui.spacing().interact_size.y;
     egui::ScrollArea::vertical()
         .id_salt("space3d_hierarchy")
         .auto_shrink([false, false])
-        .max_height(ui.available_height() - 36.0)
+        .max_height(ui.available_height() - drop_height - ui.spacing().item_spacing.y)
         .show(ui, |ui| {
             let filter = filter.to_lowercase();
             if filter.is_empty() {
@@ -111,11 +120,11 @@ pub fn hierarchy_ui(
             }
         });
     // Drop zone: make root.
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), drop_height), egui::Sense::hover());
     let hovering = response.dnd_hover_payload::<Entity>().is_some();
     ui.painter().rect_stroke(
         rect,
-        4.0,
+        2.0,
         egui::Stroke::new(
             1.0,
             if hovering {
@@ -130,8 +139,8 @@ pub fn hierarchy_ui(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         "drop here to unparent",
-        egui::FontId::proportional(11.0),
-        egui::Color32::GRAY,
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
     );
     if let Some(child) = response.dnd_release_payload::<Entity>() {
         actions.push(HierarchyAction::Reparent {

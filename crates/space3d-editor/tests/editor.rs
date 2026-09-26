@@ -5,7 +5,7 @@ use space3d_editor::*;
 use space3d_platform::{Input, KeyCode, MouseButton};
 use space3d_render::*;
 use space3d_stories::{KnobValue, Story, Storybook};
-use space3d_ui::EguiContext;
+use space3d_ui::{EguiContext, UiDensity, UiTheme, egui};
 use std::time::Duration;
 
 /// The platform's "command" modifier key (Cmd on macOS, Ctrl elsewhere).
@@ -484,4 +484,134 @@ fn storybook_viewer_streams_the_story_into_its_viewport() {
         app.resources.expect::<StorybookViewer>().story_tick(),
         Some(start + 500)
     );
+}
+
+/// A book whose story has one knob of every kind (the viewer's side panel shows all widgets).
+fn knob_book() -> Storybook {
+    let mut b = Storybook::new();
+    b.add(
+        Story::new("Demo/Scene/Knobs", |app, k| {
+            let c = k.color("clear");
+            app.world.spawn((
+                Transform::from_xyz(0.0, 0.0, 3.0),
+                Camera3d::default().with_clear_color(Vec4::from(c)),
+            ));
+        })
+        .description("One knob of every kind.")
+        .knob_color("clear", [0.1, 0.3, 0.6, 1.0])
+        .knob_f32("roughness", 0.5, 0.0..=1.0)
+        .knob_i64("count", 12, 1..=100)
+        .knob_bool("wireframe", false)
+        .knob_choice("projection", &["perspective", "orthographic"], 0)
+        .knob_text("label", "hello")
+        .tag("demo")
+        .size(320, 180)
+        .ticks(2),
+    );
+    b.add(Story::new("Demo/Scene/Other", |_, _| {}).size(64, 64));
+    b.add(Story::new("Demo/UI/Panel", |_, _| {}).size(64, 64));
+    b
+}
+
+/// The standalone tools opt into the compact density; `EditorPlugin` added to a game leaves the
+/// game's egui style alone.
+#[test]
+fn standalone_tools_are_compact_and_the_plugin_keeps_a_games_style() {
+    let config = EditorConfig {
+        headless: Some((320, 200)),
+        ..EditorConfig::new("test")
+    };
+    let mut editor = editor_app(&config);
+    assert_eq!(editor.resources.get::<UiTheme>(), Some(&UiTheme::compact()));
+    editor.step_ticks(2);
+    let ctx = editor.resources.expect::<EguiContext>().ctx().clone();
+    assert_eq!(UiDensity::of(&ctx), Some(UiDensity::compact()));
+    assert_eq!(
+        ctx.global_style().spacing.item_spacing,
+        UiDensity::compact().item_spacing
+    );
+    let viewer = storybook_app(
+        demo_book(),
+        StorybookConfig {
+            headless: Some((320, 200)),
+            ..Default::default()
+        },
+    );
+    assert_eq!(viewer.resources.get::<UiTheme>(), Some(&UiTheme::compact()));
+
+    // A game with its own style adds the in-game editor: nothing restyles egui.
+    let mut game = App::new();
+    game.add_plugin(space3d_ui::UiPlugin::deterministic());
+    let ctx = game.resources.expect::<EguiContext>().ctx().clone();
+    ctx.global_style_mut(|s| s.spacing.item_spacing = egui::vec2(12.0, 8.0));
+    let style = ctx.global_style();
+    game.add_plugin(EditorPlugin::default());
+    game.step_ticks(3);
+    assert!(game.resources.get::<UiTheme>().is_none());
+    assert!(
+        std::sync::Arc::ptr_eq(&style, &ctx.global_style()),
+        "the game's style is untouched"
+    );
+}
+
+/// Editor, texture editor, model editor and storybook viewer captures, written to
+/// `$SPACE3D_EDITOR_SNAPSHOT_DIR` (for reviewing the tools' layout by eye).
+#[test]
+fn tool_layouts_for_review() {
+    let Some(mut app) = headless_editor(1280, 720) else {
+        return;
+    };
+    let cube = entity_named(&app, "Cube").unwrap();
+    let child = app.world.spawn((
+        Name("Cube child".into()),
+        Transform::from_xyz(1.0, 0.0, 0.0),
+        space3d_core::Parent(cube),
+    ));
+    let _ = child;
+    app.world.spawn((
+        Name("Sun".into()),
+        Transform::IDENTITY,
+        DirectionalLight {
+            color: Vec3::ONE,
+            intensity: 2.0,
+        },
+    ));
+    app.resources.expect_mut::<EditorState>().selected = Some(cube);
+    app.step_ticks(4);
+    let img = render_to_image(&mut app).expect("capture");
+    maybe_save("review_editor", &img);
+
+    {
+        let tex = app.resources.expect_mut::<TextureEditor>();
+        tex.open = true;
+        tex.open_image(ImageData::filled(64, 64, [0, 200, 90, 255]));
+    }
+    app.step_ticks(12);
+    let img = render_to_image(&mut app).expect("capture");
+    maybe_save("review_texture_editor", &img);
+    app.resources.expect_mut::<TextureEditor>().open = false;
+    app.resources.expect_mut::<ModelEditor>().open = true;
+    app.step_ticks(12);
+    let img = render_to_image(&mut app).expect("capture");
+    maybe_save("review_model_editor", &img);
+
+    let config = StorybookConfig {
+        headless: Some((1280, 720)),
+        ..Default::default()
+    };
+    let mut app = storybook_app(knob_book(), config);
+    for _ in 0..400 {
+        app.update(Duration::from_millis(16));
+        let frames = app
+            .resources
+            .expect::<StorybookViewer>()
+            .view()
+            .map_or(0, LiveView::frames);
+        if frames >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let img = render_to_image(&mut app).expect("capture");
+    maybe_save("review_storybook", &img);
 }

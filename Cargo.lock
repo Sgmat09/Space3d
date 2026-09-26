@@ -5206,6 +5206,7 @@ dependencies = [
  "space3d-physics",
  "space3d-render",
  "space3d-test",
+ "space3d-ui",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

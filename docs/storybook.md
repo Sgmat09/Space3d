@@ -45,8 +45,9 @@ pub fn storybook() -> Storybook {
 * `.tolerance(0.02)` loosens the screenshot comparison for one story.
 
 The engine ships its own book (`space3d::stories::engine_storybook()`: lighting, materials,
-instancing, textures, cameras, hierarchies, physics) — `book.extend(engine_storybook())` to
-browse both.
+instancing, textures, cameras, hierarchies, physics, and the UI stories `Engine/UI/Theme/*` and
+`Engine/UI/Tools/*` — see [ui.md](ui.md)) — `book.extend(engine_storybook())` to browse both. The
+viewer itself uses the compact UI density.
 
 ## The storybook binary
 

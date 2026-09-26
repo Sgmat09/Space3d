@@ -8,6 +8,7 @@
 //! resolution; only the on-screen copy is downscaled.
 
 use crate::files::{IoJobs, read_file_with, write_file_with};
+use crate::widgets::{fill_drag, fill_slider, property, section};
 use space3d_assets::edit::texture::{self as tex, Blur, Brush, Filter, ImageEditHistory, Rect as PxRect};
 use space3d_core::ImageData;
 use space3d_tasks::Task;
@@ -538,7 +539,7 @@ impl TextureEditor {
         egui::Window::new("Texture editor")
             .id(egui::Id::new("space3d_texture_editor"))
             .open(&mut open)
-            .default_size([820.0, 560.0])
+            .default_size([760.0, 500.0])
             .show(ctx, |ui| self.contents(ui));
         self.open = open;
     }
@@ -557,7 +558,7 @@ impl TextureEditor {
         ui.separator();
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.set_width(210.0);
+                ui.set_width(200.0);
                 egui::ScrollArea::vertical().id_salt("tex_tools").show(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| self.side_panel(ui));
                 });
@@ -569,14 +570,13 @@ impl TextureEditor {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("New");
-            ui.add(egui::DragValue::new(&mut self.new_size[0]).range(1..=4096).suffix(" w"));
-            ui.add(egui::DragValue::new(&mut self.new_size[1]).range(1..=4096).suffix(" h"));
-            if ui.button("Create").clicked() {
+            ui.add(egui::DragValue::new(&mut self.new_size[0]).range(1..=4096).prefix("w "));
+            ui.add(egui::DragValue::new(&mut self.new_size[1]).range(1..=4096).prefix("h "));
+            if ui.button("New").clicked() {
                 self.new_image(self.new_size[0], self.new_size[1]);
             }
             ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(180.0));
+            ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(140.0));
             if ui.button("Open").clicked() {
                 self.load();
             }
@@ -603,128 +603,175 @@ impl TextureEditor {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
             for t in TextureTool::ALL {
                 ui.selectable_value(&mut self.tool, t, t.label());
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Color");
-            ui.color_edit_button_srgba_unmultiplied(&mut self.color);
+        property(ui, "Color", |ui| {
+            ui.color_edit_button_srgba_unmultiplied(&mut self.color)
         });
-        ui.add(egui::Slider::new(&mut self.brush.radius, 0.5..=64.0).text("radius"));
-        ui.add(egui::Slider::new(&mut self.brush.opacity, 0.0..=1.0).text("opacity"));
-        ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("hardness"));
-        ui.add(egui::Slider::new(&mut self.fill_tolerance, 0..=255).text("fill tol."));
-        ui.checkbox(&mut self.rect_filled, "filled rect");
-        ui.horizontal(|ui| {
-            ui.label("Zoom");
-            ui.add(egui::Slider::new(&mut self.zoom, 0.05..=32.0).logarithmic(true));
+        property(ui, "Radius", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut self.brush.radius, 0.5..=64.0))
         });
-        if ui.button("Fit").clicked() {
-            self.fit_pending = true;
-            self.pan = egui::Vec2::ZERO;
-        }
-        ui.separator();
+        property(ui, "Opacity", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut self.brush.opacity, 0.0..=1.0))
+        });
+        property(ui, "Hardness", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0))
+        });
+        property(ui, "Fill tol.", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut self.fill_tolerance, 0..=255))
+        });
+        property(ui, "Rect", |ui| ui.checkbox(&mut self.rect_filled, "filled"));
+        property(ui, "Zoom", |ui| {
+            let fit = ui.small_button("Fit").clicked();
+            fill_slider(ui, egui::Slider::new(&mut self.zoom, 0.05..=32.0).logarithmic(true));
+            if fit {
+                self.fit_pending = true;
+                self.pan = egui::Vec2::ZERO;
+            }
+        });
         let a = &mut self.adjust;
         let mut op: Option<EditorOp> = None;
-        egui::CollapsingHeader::new("Color").default_open(true).show(ui, |ui| {
-            ui.add(egui::Slider::new(&mut a.brightness, -1.0..=1.0).text("brightness"));
-            ui.add(egui::Slider::new(&mut a.contrast, 0.0..=3.0).text("contrast"));
-            if ui.button("Apply brightness/contrast").clicked() {
-                let (b, c) = (a.brightness, a.contrast);
-                op = Some(Box::new(move |e| {
-                    e.apply_async("Brightness/contrast", move |i| tex::brightness_contrast(i, b, c))
-                }));
-            }
-            ui.add(egui::Slider::new(&mut a.hue, -180.0..=180.0).text("hue"));
-            ui.add(egui::Slider::new(&mut a.saturation, 0.0..=3.0).text("saturation"));
-            ui.add(egui::Slider::new(&mut a.lightness, -1.0..=1.0).text("lightness"));
-            if ui.button("Apply hue/saturation").clicked() {
-                let (h, s, l) = (a.hue, a.saturation, a.lightness);
-                op = Some(Box::new(move |e| {
-                    e.apply_async("Hue/saturation", move |i| tex::hue_saturation(i, h, s, l))
-                }));
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Grayscale").clicked() {
-                    op = Some(Box::new(|e| e.apply_async("Grayscale", tex::grayscale)));
-                }
-                if ui.button("Invert").clicked() {
-                    op = Some(Box::new(|e| e.apply_async("Invert", tex::invert)));
-                }
-            });
-        });
-        egui::CollapsingHeader::new("Filter / transform")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.add(egui::Slider::new(&mut a.blur_sigma, 0.3..=16.0).text("sigma"));
-                if ui.button("Blur").clicked() {
-                    let s = a.blur_sigma;
+        section(
+            ui,
+            "tex_color",
+            "Color",
+            true,
+            |_| {},
+            |ui| {
+                property(ui, "Brightness", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut a.brightness, -1.0..=1.0))
+                });
+                property(ui, "Contrast", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut a.contrast, 0.0..=3.0))
+                });
+                if ui.button("Apply brightness/contrast").clicked() {
+                    let (b, c) = (a.brightness, a.contrast);
                     op = Some(Box::new(move |e| {
-                        e.replace_async("Blur", move |i| tex::blur(i, Blur::Gaussian { sigma: s }))
+                        e.apply_async("Brightness/contrast", move |i| tex::brightness_contrast(i, b, c))
                     }));
                 }
-                ui.horizontal(|ui| {
+                property(ui, "Hue", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut a.hue, -180.0..=180.0))
+                });
+                property(ui, "Saturation", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut a.saturation, 0.0..=3.0))
+                });
+                property(ui, "Lightness", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut a.lightness, -1.0..=1.0))
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Apply hue/sat.").clicked() {
+                        let (h, s, l) = (a.hue, a.saturation, a.lightness);
+                        op = Some(Box::new(move |e| {
+                            e.apply_async("Hue/saturation", move |i| tex::hue_saturation(i, h, s, l))
+                        }));
+                    }
+                    if ui.button("Grayscale").clicked() {
+                        op = Some(Box::new(|e| e.apply_async("Grayscale", tex::grayscale)));
+                    }
+                    if ui.button("Invert").clicked() {
+                        op = Some(Box::new(|e| e.apply_async("Invert", tex::invert)));
+                    }
+                });
+            },
+        );
+        section(
+            ui,
+            "tex_filter",
+            "Filter / transform",
+            true,
+            |_| {},
+            |ui| {
+                property(ui, "Blur σ", |ui| {
+                    let blur = ui.small_button("Blur").clicked();
+                    fill_slider(ui, egui::Slider::new(&mut a.blur_sigma, 0.3..=16.0));
+                    if blur {
+                        let s = a.blur_sigma;
+                        op = Some(Box::new(move |e| {
+                            e.replace_async("Blur", move |i| tex::blur(i, Blur::Gaussian { sigma: s }))
+                        }));
+                    }
+                });
+                property(ui, "Resize", |ui| {
                     ui.add(egui::DragValue::new(&mut a.resize[0]).range(1..=8192));
                     ui.add(egui::DragValue::new(&mut a.resize[1]).range(1..=8192));
-                    if ui.button("Resize").clicked() {
+                    if ui.small_button("Apply").clicked() {
                         let [w, h] = a.resize;
                         op = Some(Box::new(move |e| {
                             e.replace_async("Resize", move |i| tex::resize(i, w, h, Filter::Bilinear))
                         }));
                     }
                 });
-                ui.horizontal(|ui| {
-                    if ui.button("Flip H").clicked() {
+                property(ui, "Flip", |ui| {
+                    if ui.small_button("H").clicked() {
                         op = Some(Box::new(|e| e.apply_async("Flip horizontal", tex::flip_horizontal)));
                     }
-                    if ui.button("Flip V").clicked() {
+                    if ui.small_button("V").clicked() {
                         op = Some(Box::new(|e| e.apply_async("Flip vertical", tex::flip_vertical)));
                     }
                 });
-                ui.horizontal(|ui| {
-                    if ui.button("Rot ⟳").clicked() {
+                property(ui, "Rotate", |ui| {
+                    if ui.small_button("90° ⟳").clicked() {
                         op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate90_cw)));
                     }
-                    if ui.button("Rot ⟲").clicked() {
+                    if ui.small_button("90° ⟲").clicked() {
                         op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate90_ccw)));
                     }
-                    if ui.button("180°").clicked() {
+                    if ui.small_button("180°").clicked() {
                         op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate180)));
                     }
                 });
-            });
-        egui::CollapsingHeader::new("Generate").show(ui, |ui| {
-            ui.add(egui::DragValue::new(&mut a.noise_seed).prefix("seed "));
-            ui.add(egui::Slider::new(&mut a.noise_scale, 1.0..=256.0).text("scale"));
-            ui.add(egui::Slider::new(&mut a.noise_octaves, 1..=8).text("octaves"));
-            if ui.button("Value noise").clicked() {
-                let (seed, scale, oct) = (a.noise_seed, a.noise_scale, a.noise_octaves);
-                op = Some(Box::new(move |e| {
-                    e.replace_async("Noise", move |i| tex::value_noise(i.width, i.height, seed, scale, oct));
-                }));
-            }
-            if ui.button("Checker").clicked() {
-                op = Some(Box::new(|e| {
-                    e.replace_async("Checker", |i| {
-                        tex::checker(
-                            i.width,
-                            i.height,
-                            (i.width / 8).max(1),
-                            [230, 230, 230, 255],
-                            [60, 60, 60, 255],
-                        )
-                    });
-                }));
-            }
-            ui.add(egui::Slider::new(&mut a.normal_strength, 0.1..=10.0).text("strength"));
-            if ui.button("Normal map from height").clicked() {
-                let s = a.normal_strength;
-                op = Some(Box::new(move |e| {
-                    e.replace_async("Normal map", move |i| tex::normal_map_from_height(i, s))
-                }));
-            }
-        });
+            },
+        );
+        section(
+            ui,
+            "tex_generate",
+            "Generate",
+            false,
+            |_| {},
+            |ui| {
+                property(ui, "Seed", |ui| fill_drag(ui, egui::DragValue::new(&mut a.noise_seed)));
+                property(ui, "Scale", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut a.noise_scale, 1.0..=256.0))
+                });
+                property(ui, "Octaves", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut a.noise_octaves, 1..=8))
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Value noise").clicked() {
+                        let (seed, scale, oct) = (a.noise_seed, a.noise_scale, a.noise_octaves);
+                        op = Some(Box::new(move |e| {
+                            e.replace_async("Noise", move |i| tex::value_noise(i.width, i.height, seed, scale, oct));
+                        }));
+                    }
+                    if ui.button("Checker").clicked() {
+                        op = Some(Box::new(|e| {
+                            e.replace_async("Checker", |i| {
+                                tex::checker(
+                                    i.width,
+                                    i.height,
+                                    (i.width / 8).max(1),
+                                    [230, 230, 230, 255],
+                                    [60, 60, 60, 255],
+                                )
+                            });
+                        }));
+                    }
+                });
+                property(ui, "Strength", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut a.normal_strength, 0.1..=10.0))
+                });
+                if ui.button("Normal map from height").clicked() {
+                    let s = a.normal_strength;
+                    op = Some(Box::new(move |e| {
+                        e.replace_async("Normal map", move |i| tex::normal_map_from_height(i, s))
+                    }));
+                }
+            },
+        );
         if let Some(op) = op {
             op(self);
         }

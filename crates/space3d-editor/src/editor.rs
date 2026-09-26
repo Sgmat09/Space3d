@@ -437,7 +437,8 @@ impl Tools<'_> {
 }
 
 fn menu_bar(ui: &mut egui::Ui, sys: &mut SystemCtx, t: &mut Tools) {
-    egui::Panel::top("space3d_editor_menu").show(ui, |ui| {
+    let frame = crate::widgets::panel_frame(ui.style());
+    egui::Panel::top("space3d_editor_menu").frame(frame).show(ui, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("New scene").clicked() {
@@ -616,10 +617,13 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                 menu_bar(ui, sys, &mut t);
                 if t.state.show_hierarchy {
                     let mut actions = Vec::new();
+                    let frame = crate::widgets::panel_frame(ui.style());
                     egui::Panel::left("space3d_editor_hierarchy")
-                        .default_size(230.0)
+                        .default_size(210.0)
+                        .frame(frame)
                         .show(ui, |ui| {
-                            ui.heading("Hierarchy");
+                            let count = crate::hierarchy::entity_count(sys.world);
+                            crate::widgets::panel_title(ui, "Hierarchy", &format!("{count} entities"));
                             actions = hierarchy_ui(ui, sys.world, t.state.selected, &mut t.state.hierarchy_filter);
                         });
                     for a in actions {
@@ -627,10 +631,12 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                     }
                 }
                 if t.state.show_inspector {
+                    let frame = crate::widgets::panel_frame(ui.style());
                     egui::Panel::right("space3d_editor_inspector")
-                        .default_size(300.0)
+                        .default_size(280.0)
+                        .frame(frame)
                         .show(ui, |ui| {
-                            ui.heading("Inspector");
+                            crate::widgets::panel_title(ui, "Inspector", "");
                             egui::ScrollArea::vertical()
                                 .id_salt("space3d_inspector_scroll")
                                 .show(ui, |ui| {
@@ -648,7 +654,12 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                                             );
                                         }
                                         _ => {
-                                            ui.label("Select an entity (hierarchy or click in the viewport).");
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Select an entity (hierarchy or click in the viewport).",
+                                                )
+                                                .weak(),
+                                            );
                                         }
                                     }
                                 });

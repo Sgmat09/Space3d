@@ -198,6 +198,9 @@ pub struct Console {
     pub min_level: LogLevel,
     /// Case-insensitive text filter.
     pub filter: String,
+    /// Copy lines from the global log buffer ([`ConsoleLayer`]) every frame (default `true`).
+    /// Off, the console holds only its own lines: command output and [`Console::print`].
+    pub capture_logs: bool,
     lines: VecDeque<LogLine>,
     last_seq: Option<u64>,
     local_seq: u64,
@@ -226,6 +229,7 @@ impl Default for Console {
             visible: false,
             min_level: LogLevel::Info,
             filter: String::new(),
+            capture_logs: true,
             lines: VecDeque::new(),
             last_seq: None,
             local_seq: u64::MAX / 2,
@@ -276,14 +280,29 @@ impl Console {
                 t.dropped_ticks
             ))
         });
-        c.register("debug", "debug: toggle the debug overlay (F3)", |_, sys| {
-            let d = sys
-                .resources
-                .get_mut::<crate::DebugOverlay>()
-                .ok_or("no debug overlay")?;
-            d.visible = !d.visible;
-            Ok(format!("debug overlay {}", if d.visible { "on" } else { "off" }))
-        });
+        c.register(
+            "debug",
+            "debug [details]: toggle the debug overlay (F3), or its renderer details",
+            |args, sys| {
+                let d = sys
+                    .resources
+                    .get_mut::<crate::DebugOverlay>()
+                    .ok_or("no debug overlay")?;
+                let on_off = |b: bool| if b { "on" } else { "off" };
+                match args.first().copied() {
+                    None => {
+                        d.visible = !d.visible;
+                        Ok(format!("debug overlay {}", on_off(d.visible)))
+                    }
+                    Some("details") => {
+                        d.details = !d.details;
+                        d.visible = true;
+                        Ok(format!("debug overlay details {}", on_off(d.details)))
+                    }
+                    Some(other) => Err(format!("unknown argument `{other}` (usage: debug [details])")),
+                }
+            },
+        );
         c.register("profiler", "profiler: toggle the profiler (F4)", |_, sys| {
             let p = sys.resources.get_mut::<crate::Profiler>().ok_or("no profiler")?;
             p.visible = !p.visible;
@@ -444,11 +463,25 @@ impl Console {
         self.input_focused
     }
 
-    /// Draw the console into `ui` (log view + input line).
+    /// Lines shown with the current level and text filter.
+    fn shown(&self) -> impl Iterator<Item = &LogLine> {
+        let filter = self.filter.to_lowercase();
+        self.lines.iter().filter(move |l| {
+            let level = match l.level {
+                LogLevel::Command | LogLevel::Output => true,
+                lvl => lvl >= self.min_level,
+            };
+            level && (filter.is_empty() || l.message.to_lowercase().contains(&filter))
+        })
+    }
+
+    /// Draw the console into `ui`: a toolbar (level, filter, clear), the log (one dense
+    /// monospace line per entry) and the input line.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("space3d_console_level")
                 .selected_text(format!("{:?}", self.min_level))
+                .width(64.0)
                 .show_ui(ui, |ui| {
                     for l in [
                         LogLevel::Trace,
@@ -463,34 +496,45 @@ impl Console {
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .hint_text("filter")
-                    .desired_width(160.0),
+                    .desired_width(140.0),
             );
             if ui.button("Clear").clicked() {
                 self.clear();
             }
         });
-        let filter = self.filter.to_lowercase();
         let visuals = ui.visuals().clone();
-        let input_height = 28.0;
-        egui::ScrollArea::vertical()
-            .max_height((ui.available_height() - input_height).max(60.0))
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let input_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 2.0;
+        egui::Frame::new()
+            .fill(visuals.extreme_bg_color)
+            .corner_radius(2)
+            .inner_margin(egui::Margin::symmetric(4, 2))
             .show(ui, |ui| {
-                for l in &self.lines {
-                    let shown = match l.level {
-                        LogLevel::Command | LogLevel::Output => true,
-                        lvl => lvl >= self.min_level,
-                    };
-                    if !shown || (!filter.is_empty() && !l.message.to_lowercase().contains(&filter)) {
-                        continue;
-                    }
-                    let text = match l.level {
-                        LogLevel::Command | LogLevel::Output => format!("{}{}", l.level.tag(), l.message),
-                        _ => format!("{} {}: {}", l.level.tag(), l.target, l.message),
-                    };
-                    ui.label(egui::RichText::new(text).monospace().color(l.level.color(&visuals)));
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("space3d_console_log")
+                    .max_height((ui.available_height() - input_height - 4.0).max(48.0))
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for l in self.shown() {
+                            let color = l.level.color(&visuals);
+                            let mut job = egui::text::LayoutJob::default();
+                            let format = |c| egui::TextFormat::simple(font.clone(), c);
+                            match l.level {
+                                LogLevel::Command | LogLevel::Output => {
+                                    job.append(l.level.tag(), 0.0, format(color));
+                                    job.append(&l.message, 0.0, format(color));
+                                }
+                                _ => {
+                                    job.append(l.level.tag(), 0.0, format(color));
+                                    job.append(&format!(" {}: ", l.target), 0.0, format(visuals.weak_text_color()));
+                                    job.append(&l.message, 0.0, format(color));
+                                }
+                            }
+                            ui.label(job);
+                        }
+                    });
             });
         let edit = egui::TextEdit::singleline(&mut self.input)
             .hint_text("command (try `help`)")
@@ -531,7 +575,9 @@ impl Console {
 /// `Stage::Update`: pull logs, run queued commands and draw the console window.
 pub(crate) fn console_system(sys: &mut SystemCtx) {
     let ctx = crate::EguiContext::active_context(sys);
-    if let Some(c) = sys.resources.get_mut::<Console>() {
+    if let Some(c) = sys.resources.get_mut::<Console>()
+        && c.capture_logs
+    {
         c.pull_logs();
     }
     if let Some(ctx) = ctx
@@ -540,12 +586,22 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
     {
         let mut open = true;
         let screen = ctx.content_rect();
-        egui::Window::new("Console")
-            .id(egui::Id::new("space3d_console"))
-            .open(&mut open)
-            .default_pos([8.0, (screen.height() * 0.55).max(40.0)])
-            .default_size([screen.width().min(720.0) - 16.0, screen.height() * 0.4])
-            .show(&ctx, |ui| c.ui(ui));
+        let size = egui::vec2(
+            (screen.width() - 12.0).min(640.0),
+            (screen.height() * 0.4).clamp(140.0, 360.0).min(screen.height() - 12.0),
+        );
+        let pos = egui::pos2(6.0, (screen.bottom() - size.y - 6.0).max(6.0));
+        let (shown, total) = (c.shown().count(), c.lines.len());
+        crate::tool::window(
+            &ctx,
+            ("space3d_console", "Console"),
+            egui::Rect::from_min_size(pos, size),
+            &mut open,
+            |ui| {
+                ui.label(egui::RichText::new(format!("{shown}/{total} lines")).weak());
+            },
+            |ui| c.ui(ui),
+        );
         if !open {
             c.visible = false;
         }
@@ -572,7 +628,9 @@ mod tests {
         c.submit("fail");
         c.submit("nope");
         c.submit("echo hello world");
+        c.submit("debug details");
         app.insert_resource(c);
+        app.insert_resource(crate::DebugOverlay::new(false));
         app.add_system(space3d_core::Stage::Update, Console::run_pending);
         app.step_ticks(1);
         assert_eq!(app.resources.expect::<TickRate>().hz, 30.0);
@@ -584,7 +642,9 @@ mod tests {
             msgs.iter()
                 .any(|(l, m)| *l == LogLevel::Error && m.contains("unknown command"))
         );
-        assert_eq!(c.history.len(), 4);
+        assert_eq!(c.history.len(), 5);
+        let overlay = app.resources.expect::<crate::DebugOverlay>();
+        assert!(overlay.visible && overlay.details, "`debug details` shows the details");
     }
 
     #[test]

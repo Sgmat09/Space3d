@@ -1,9 +1,10 @@
-//! `physical_key_for_egui_key` does not allocate in the steady state: a counting global
-//! allocator (per thread, since libtest runs tests and its own bookkeeping on several threads)
-//! sees no allocation while the keyboard layout's labels do not change.
+//! `physical_key_for_egui_key` and the theme sync do not allocate in the steady state: a
+//! counting global allocator (per thread, since libtest runs tests and its own bookkeeping on
+//! several threads) sees no allocation while the keyboard layout's labels do not change, and
+//! none while the `UiTheme` resource is unchanged or absent.
 
 use space3d_platform::{Input, KeyCode, LogicalKey};
-use space3d_ui::physical_key_for_egui_key;
+use space3d_ui::{UiTheme, UiThemeSync, physical_key_for_egui_key};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -98,4 +99,22 @@ fn physical_key_for_egui_key_does_not_allocate_in_the_steady_state() {
         }
     });
     assert_eq!(again, 0);
+}
+
+#[test]
+fn theme_sync_does_not_allocate_in_the_steady_state() {
+    let ctx = egui::Context::default();
+    let theme = UiTheme::compact();
+    let mut sync = UiThemeSync::default();
+    let first = allocations(|| assert!(sync.sync(&ctx, Some(&theme))));
+    assert!(first > 0, "applying a theme restyles egui once");
+    let mut absent = UiThemeSync::default();
+    let steady = allocations(|| {
+        for _ in 0..1000 {
+            assert!(!sync.sync(&ctx, Some(&theme)), "unchanged theme");
+            assert!(!absent.sync(&ctx, None), "no theme");
+        }
+    });
+    assert_eq!(steady, 0, "no allocation while the theme is unchanged or absent");
+    assert_eq!(sync.applications(), 1);
 }
