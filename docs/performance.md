@@ -655,3 +655,59 @@ arguments (a foundation decision); fewer passes (the compute bloom chain the pos
 Visual check: every Showcase golden (`Engine/Showcase/{SpaceCorps Look, Battle, WebGL2 SpaceCorps
 Look, WebGL2 Battle}`) and the example's headless 1280 × 720 PNG (Medium, recommended for the M4
 Max as an integrated GPU) were inspected.
+
+### M2 review — fixes and the gates they touch
+
+Graphics maintainer, `graphics` after Phase I, answering the M2 reviewers and the game's M1
+feedback (game#1–#15).
+
+**Direct mode, `benches/instancing.rs` (spec §4.4, ±5 % of F0).** The review measured
+`extract_upload/ecs/100k` (100k *moving* ECS entities, `CpuDirect`) at 1.91–2.04 ms against F0's
+1.66–1.76 ms in interleaved same-machine runs, and bisected the jump to the materials merge
+(4c54e68); explicit instance buffers and the static paths are within noise. Cause: the
+`Material` component the spec extends (§2.7, +12 fields) grew from 64 to **160 bytes**
+(`size_of::<Material>()`), and extraction reads each entity's material in full every frame to
+intern it (the branch-free `same_material` compares every field against the last material;
+any field may differ): about 10 MB more memory traffic per frame at 100k, 2.5 ns per entity.
+The intern path is already a one-compare fast path; there is no change detection to skip the
+read. The gate is relaxed for that path (spec §4.4 amendment: within +20 % of F0, recorded
+here); 100k+ moving instances belong in `InstanceBuffers`.
+
+**VRAM (spec §4.4, T1/T2 ≤ 220 MB).** `RenderStats::target_bytes` did not count the shadow
+map although `battle_steady_state` said so; it does now, and `RenderStats::lighting_bytes`
+counts the lighting area's cubemaps and baked environments. The Battle at High, 1080p:
+**146.0 MB** of frame, post and shadow targets (the 2048² shadow map 16.8 MB; the bloom chain
+lost its 1280 × 720 resampled level, below) and **83.9 MB** of sky and IBL — the 1024² HDR sky is
+`Rgba16Float` with mips (67 MB), twice the spec line's 33 MB for a 4-byte format. 230 MB of
+textures plus the 23 MB particle pool: **not met, by the sky's format** (lever: HDR cubemaps in
+`Rg11b10Ufloat` where renderable, deferred). Process memory adds the per-pass driver memory of
+the M1.1 amendment (≈ 2.8 MB per render pass per frame in flight on Metal: the review measured
+550 MB of frame-related `phys_footprint` at High, 240 MB of it post). `battle_steady_state`
+now asserts the two parts (≤ 150 MB and ≤ 90 MB) instead of claiming the 220 MB line.
+
+**Battle CPU sub-budgets (spec §4.4: particles `prepare` ≤ 0.1 ms, post ≤ 0.05 ms).** Not met:
+the review measured `render_frame` 1.42–1.47 ms at High (the top-line 1.5 ms gate met) with
+particles ≈ 1.05 ms of it (the node's `prepare` ≈ 0.5 ms and its 2.3 MB of strip uploads per
+ticking frame) and post ≈ 0.38 ms (the bloom chain's render passes). Recorded as not met in the
+spec; the levers — a GPU strip builder with incremental uploads, the compute bloom chain, no
+wgpu indirect validation for engine-written arguments — are deferred. The Battle now has 18
+render passes at High (19 before: the bloom resample is gone).
+
+**Bloom chain at High vs Ultra (1080p).** High's 720 cap made level 0 1280 × 720, resampled
+*up* from the 960 × 540 prefilter (a bigger target and a pass for no detail), so High cost
+more than Ultra (19 passes / 133.5 MB against 18 / 129.3 MB). A level 0 is now never larger
+than half the rect, and Ultra is 8 / 720: at 1080p High runs 7 levels and Ultra 8 at 960 × 540
+(13 and 15 bloom passes), Ultra one wider level at every resolution. Small groups gain too:
+a 320 × 192 preview's chain loses its resample pass.
+
+**Small post groups (game#15).** `Bloom::min_rect_height` skips the chain for groups shorter
+than it (UI previews: 240): four 320 × 192 previews with post next to a 1280 × 720 main view
+were 47 render passes, 5 post groups; with bloom off on them 15 (post.md, "Small views").
+
+**`ParticleStats::cpu_reallocations` in the steady state.** It flagged frames without any
+allocation: the runtime compared `HashMap::capacity()` of its entity map, which moves with
+tombstones as emitters come and go. The map now counts only a capacity beyond any seen before
+(a real reallocation; `runtime::tests::emitter_churn_counts_no_reallocations`), and
+`battle_steady_state` asserts 0 over 30 frames after the battle's load has built up (6 s; the
+growth of pools and scratch buffers while explosions, missiles and smoke accumulate over the
+first 5 s is warm-up).

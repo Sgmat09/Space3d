@@ -113,8 +113,11 @@ Details: [`frame.md`](graphics/frame.md); normative order: spec §1.4.
 
 **Turn on HDR, exposure and tonemapping.** Insert `PostProcess` next to a `Camera3d`. Pick the
 look explicitly: `Tonemapper::AgXPunchy` with `.with_exposure(0.5)` keeps faction colors, lasers
-and fire saturated in a dark space scene; `AgX` (the default) is gentler, `KhronosPbrNeutral`
-keeps base colors, `AcesFitted` and `Reinhard` are there too. Clear colors pass through exposure
+and fire saturated in a dark space scene but skews dim saturated skies toward their strongest
+channel; `AgX` (the default) is gentler, with `ColorGrading::vivid()` it keeps those skies' hues;
+`KhronosPbrNeutral` keeps base colors but its toe crushes dim saturated ones, which
+`KhronosPbrNeutralNoToe` passes unchanged; `AcesFitted` and `Reinhard` are there too (numbers
+in frame.md, "Choose the look explicitly"). Clear colors pass through exposure
 and the tonemapper like everything else. `FrameSettings::post = false` turns post off globally.
 ([frame.md](graphics/frame.md))
 
@@ -123,8 +126,10 @@ soft knee): anything brighter than 1 after exposure glows — emissive above 1, 
 particles, stars in an HDR sky. `Bloom::natural()` is a photographic veil. Emissive maps ×
 `emissive` factors above 1 make windows and engines glow. ([post.md](graphics/post.md#bloom))
 
-**Expose automatically.** `.with_auto_exposure(AutoExposure::on())`; black space is not metered,
-so the ships and effects set the exposure; `exposure` becomes the compensation.
+**Expose automatically.** `.with_auto_exposure(AutoExposure::on())`; `exposure` becomes the
+compensation. Black space is not metered, but an HDR skybox is: where a nebula fills most of the
+frame it sets the exposure (the Battle brightens by about +0.9 EV and washes out), so give sky
+scenes a negative compensation and a low `max_ev`, or keep a manual exposure.
 ([post.md](graphics/post.md#auto-exposure))
 
 **Anti-alias.** MSAA on the primary target (`Renderer::set_msaa_samples(4)`, or the quality
@@ -269,7 +274,7 @@ look otherwise (tonemapper, exposure, grading, bloom intensity, materials stay a
 |---|---|---|---|---|
 | render scale (primary) | 0.75 | 1 | 1 | 1 |
 | MSAA / AA | 1 + FXAA Low | 4 on tile-based GPUs, else 1 + FXAA Medium | 4 | 4 |
-| bloom mips / max mip height | 4 / 270 | 6 / 540 | 7 / 720 | 8 / 1080 |
+| bloom mips / max mip height | 4 / 270 | 6 / 540 | 7 / 720 | 8 / 720 |
 | auto exposure, chromatic aberration, film grain | off | as authored | as authored | as authored |
 | shadow map / filter | 1024 / Pcf4 | 2048 / Pcf9 | 2048 / Pcf16 | 4096 / Pcf16 |
 | IBL specular / irradiance / samples / passes per frame | 128 / 16 / 32 / 6 | 256 / 32 / 64 / all | 512 / 32 / 128 / all | 512 / 32 / 256 / all |
@@ -295,8 +300,11 @@ renderer.prewarm(&q.prewarm_request(&materials));
   again).
 * The adapters (`frame_settings`, `msaa_samples`, `post`, `post_for`, `lighting`, `shadow`,
   `sky_face_size`) are there for games that store their own settings.
-* **Ultra** is never recommended: a menu choice for big GPUs (the Battle costs the same as High
-  on the Dev machine at 1080p; its 4096² shadow map and half-resolution 4K bloom pay off at 4K).
+* **Ultra** is never recommended: a menu choice for big GPUs. It is High plus a 4096² PCF16
+  shadow, one more (wider) bloom level (8 / 720) and a 256-sample environment bake. A level 0 is
+  never larger than half the rect, so at 1080p High and Ultra both run their chains at 960 × 540
+  (High 13 bloom passes, Ultra 15); before M2's fix High's 720 cap resampled level 0 up to
+  1280 × 720 and cost more than Ultra.
 * Map a game's own setting names to tiers (SpaceCorps2027: `low`/`medium`/`high` →
   `Low`/`Medium`/`High`): [migration.md](graphics/migration.md#2-quality-presets).
 

@@ -134,9 +134,13 @@ impl Plugin for AssetsPlugin {
             ctx.resources
                 .scope::<AssetServer, _>(|resources, server| server.process(resources));
         });
+        // Every type a built-in loader produces (the `.hdr` and `.skybox` loaders too: loading
+        // a `CubemapData` or `HdrImageData` needs no extra setup).
         app.init_asset::<ImageData>()
             .init_asset::<MeshData>()
-            .init_asset::<ModelData>();
+            .init_asset::<ModelData>()
+            .init_asset::<space3d_core::HdrImageData>()
+            .init_asset::<CubemapData>();
     }
 }
 

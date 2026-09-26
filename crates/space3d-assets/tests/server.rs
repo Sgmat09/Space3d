@@ -264,3 +264,39 @@ fn loading_unregistered_type_panics() {
     let (mut app, _mem) = mem_app();
     let _: Handle<u64> = app.resources.expect_mut::<AssetServer>().load("mem://x.bin");
 }
+
+/// The migration guide's step 4: a `.skybox` manifest (and an `.hdr` panorama) load with
+/// `AssetsPlugin` alone — its build registers every type a built-in loader produces, so
+/// `load::<CubemapData>` / `load::<HdrImageData>` no longer panic with "asset type … is not
+/// registered" (reviewer round M2, game migration).
+#[test]
+fn skybox_and_hdr_load_with_the_plugin_alone() {
+    let (mut app, mem) = mem_app();
+    for (i, name) in ["px", "nx", "py", "ny", "pz", "nz"].iter().enumerate() {
+        mem.insert(&format!("sky/{name}.png"), png([i as u8 * 40, 0, 0, 255]));
+    }
+    mem.insert(
+        "sky/sky.skybox",
+        br#"{"faces": ["px.png", "nx.png", "py.png", "ny.png", "pz.png", "nz.png"], "convention": "threejs"}"#.to_vec(),
+    );
+    let mut hdr = Vec::new();
+    let img = image::Rgb32FImage::from_pixel(4, 2, image::Rgb([8.0, 0.5, 0.25]));
+    image::DynamicImage::ImageRgb32F(img)
+        .write_to(&mut std::io::Cursor::new(&mut hdr), image::ImageFormat::Hdr)
+        .unwrap();
+    mem.insert("sky/nebula.hdr", hdr);
+    let (cube, pano): (Handle<CubemapData>, Handle<space3d_core::HdrImageData>) = {
+        let server = app.resources.expect_mut::<AssetServer>();
+        (server.load("mem://sky/sky.skybox"), server.load("mem://sky/nebula.hdr"))
+    };
+    run_until(&mut app, T, |app| {
+        let s = app.resources.expect::<AssetServer>();
+        s.is_loaded(&cube) && s.is_loaded(&pano)
+    });
+    let cubes = app.resources.expect::<Assets<CubemapData>>();
+    let c = cubes.get(&cube).expect("cubemap");
+    assert_eq!((c.faces.len(), c.convention), (6, CubeConvention::ThreeJs));
+    assert_eq!(c.faces[5].get(0, 0), [200, 0, 0, 255]);
+    let p = app.resources.expect::<Assets<space3d_core::HdrImageData>>();
+    assert_eq!(p.get(&pano).map(|h| (h.width, h.height)), Some((4, 2)));
+}

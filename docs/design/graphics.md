@@ -1396,7 +1396,10 @@ This is design-particles §4 verbatim, except for these normative deltas:
 3. **Output:** particle shaders call `s3d_output()` (`OUTPUT_WGSL`) with the view's encoding, exposure and
    tonemapper, so they match meshes in every mode.
    * `ParticleSettings::ldr_soft_clip` becomes **`direct_soft_clip: bool`** (default true). It applies `1 − e^−x`
-     only in `FrameMode::Direct` (no tonemapper exists there).
+     only in `FrameMode::Direct` (no tonemapper exists there). *(Amended at the M2 review, game#3: also in the
+     Ldr passthrough of a render scale below 1 without post — `FrameMode::Ldr` with no tonemapper — which has no
+     tonemapper either; the look no longer changes with the render scale. Never in Hdr mode or a post camera's Ldr
+     fallback, whose tonemapper runs per fragment.)*
 4. **Distortion:** `SpriteRender::target: SpriteTarget { Color, Distortion { strength: f32 } }` (default
    `Color`). Distortion layers draw in the Distortion slot with `DISTORTION_WGSL` into `DB`. The `Rg16Float`
    target is dropped.
@@ -1748,7 +1751,7 @@ crates/space3d-render/
   tests/{frame_modes,nodes,overlay_stages,depth_views,capture_hdr,alloc_frame}.rs  F
   tests/{common/mod.rs (declares area modules), gl.rs, alloc.rs, headless.rs, custom_shader.rs}  F
   tests/common/{materials,post}.rs                                                 P-MAT / P-POST
-  tests/{materials,environment,shadows,gltf_render,gl_materials,alloc_materials}.rs P-MAT
+  tests/{materials,environment,shadows,gl_materials,alloc_materials}.rs           P-MAT (glTF renders: space3d-assets/tests/gltf_materials.rs)
   tests/{post,post_distortion,gl_post,alloc_post}.rs                               P-POST
   benches/{instancing.rs, frame.rs}  F;  benches/materials.rs P-MAT;  benches/post.rs P-POST;  benches/graphics.rs I
   examples/frame_nodes.rs                                                          F
@@ -1905,6 +1908,19 @@ more. Record those figures for reference; they are not the gate.
 | forward full-screen lit pixels, all maps + IBL + PCF9, vs today's shader | ≤ +0.20 ms |
 | Battle scene total GPU | ≤ 3.0 ms; CPU `render_frame` ≤ 1.5 ms |
 
+*(Amended at the M2 review, measured on Dev, `docs/performance.md` "M2 review".)*
+* **Direct mode, `benches/instancing.rs`**: met for explicit instance buffers; the ECS path of *moving*
+  entities (`extract_upload/ecs/100k`) is 14–16 % above F0 (≈ 0.25 ms per 100k entities), bisected to the
+  materials merge. The cause is the `Material` component this spec extends (§2.7: +12 fields): 64 → 160 bytes
+  per entity, read in full every frame to intern it (`same_material` must compare every field), about 10 MB
+  more memory traffic per frame at 100k. Relaxed for that path to "within +20 % of F0" with this measurement;
+  static and explicit-buffer paths keep ±5 %. Games with 100k+ moving instances use `InstanceBuffers`.
+* **CPU sub-budgets of the Battle** (below): the top-line `render_frame` ≤ 1.5 ms is met, but particles
+  `prepare` (≈ 0.5 ms of the node, ≈ 1 ms with its uploads: CPU-built ribbon and beam strips, 2.3 MB a ticking
+  frame) and post (≈ 0.38 ms: 11+ render passes of bloom) are over their 0.1 / 0.05 ms lines. Recorded as not
+  met; the levers are a GPU strip builder with incremental uploads (particles) and the compute bloom chain
+  (post), both deferred (§6.2).
+
 **CPU budgets.**
 * Native render stage for Battle ≤ 1.5 ms on Dev:
   * frame plan and passes ≤ 0.15 ms;
@@ -1929,6 +1945,12 @@ more. Record those figures for reference; they are not the gate.
 * T3 ≤ 48 MB: `S` 9.3, depth 4.7, `L` 4.7, bloom 0.7, DB 0.6, shadow 4.2, IBL 128 ≈ 1, sky 512² ≈ 8.4, CPU
   particles < 1.
 * `RenderStats::target_bytes` reports frame and post targets. `benches/graphics.rs` asserts the T1 figure on Dev.
+  *(Amended at the M2 review.)* `target_bytes` now also counts the directional shadow map, and
+  `RenderStats::lighting_bytes` the lighting area's cubemaps (sky, IBL source) and baked environments, every
+  mip. The Battle at High, 1080p: 146 MB of targets and shadow + 84 MB of sky and IBL = 230 MB of textures
+  (+ the 23 MB particle pool): **over the T1/T2 line by the sky's format** — the 1024² HDR sky is stored as
+  `Rgba16Float` with mips (67 MB), where the line above budgets 33 MB (a 4-byte format). Lever: HDR cubemaps
+  in `Rg11b10Ufloat` where renderable (deferred, §6.2). `battle_steady_state` pins both parts.
 * *(Amended at M1.1, measured on Dev: `docs/performance.md` "F7 / F8 and M1.1".)* The figures above are textures.
   With the half-rect prefilter the bloom chain's textures are 2.8 MB at 1080p (`Rg11b10Ufloat`), 11.1 MB at 4K
   and, for T3's Low chain at 1440 × 810, 1.9 MB (`Rg11b10Ufloat`) or 3.7 MB (`Rgba16Float`, the format ANGLE and
@@ -1968,6 +1990,11 @@ more. Record those figures for reference; they are not the gate.
 | shading model | Classic | Standard | Standard |
 | particles (`ParticleSettings::for_quality`) | CPU 8k (wasm) / 16k | GPU 65k (mobile) / 262k | GPU 262k |
 | recommended sky face size (docs) | 512 | 1024 | 2048 |
+
+*(Amended at the M2 review.)* Ultra (added in Phase I, opt-in) is High plus a 4096² Pcf16 shadow, a 256-sample
+environment bake and bloom **8 / 720** (was 8 / 1080): a bloom level 0 is never larger than half the post
+group's rect (`chain_size`; a bigger one was resampled up from the half-resolution prefilter for no detail),
+so at 1080p High's 7 / 720 and Ultra run at 960 × 540 and Ultra is High plus one wider level everywhere.
 
 ---
 
@@ -2529,6 +2556,20 @@ lands during PM3/PM4 → PM5; PA4 after PO5 → I.
   KTX2/Basis.
 * **Post:** local exposure, depth of field, motion blur, SSAO/SSR.
 * **Upstream:** a wgpu-hal patch recognising the unprefixed `EXT_color_buffer_half_float`.
+* *(Added at the M2 review.)*
+  * **Auto exposure sky weight:** metering ignores only black; a skybox is metered like the scene (a nebula
+    filling the frame sets the exposure). Down-weighting it needs scene depth in the post group's metering pass.
+    Documented workaround: negative compensation and a low `max_ev` (post.md).
+  * **HDR cubemaps in a 4-byte format** (`Rg11b10Ufloat` where renderable; the compute bake paths need a storage
+    format, so the fragment path would build those mips): halves the sky and IBL memory (VRAM line above).
+  * **GPU strip builder / incremental strip uploads** (particles) and the **compute bloom chain** (post): the
+    Battle's CPU sub-budgets.
+  * **`SpriteTexture::Path`** (a texture by asset path in a `.pfx.ron`): needs the particles' asset loader to
+    resolve dependencies; until then `SpriteTexture::Handle` (and built-ins) only — a path draws untextured and
+    is warned once (particles.md).
+  * **wasm budgets** (§4.4, "measured manually … in Phase I"): the web build compiles and links for wasm32 and
+    the Low look is covered by the `WebGL2 *` stories and the ANGLE runs, but no browser measurement was taken
+    (no wasm-bindgen toolchain on the build machine).
 
 ---
 

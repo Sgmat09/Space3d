@@ -218,7 +218,7 @@ A builder edits only the files it owns; everything else goes through the foundat
 | `src/shaders/post/{composite, distortion}.wgsl` | F→P-POST |
 | `src/shaders/post/{bloom, exposure, exposure_dl, fxaa, distortion_mesh}.wgsl` | P-POST |
 | `tests/{frame_modes, nodes, overlay_stages, depth_views, gpu_timings, footprint, capture_hdr, alloc_frame, gl, alloc, headless, custom_shader}.rs`, `tests/common/mod.rs` | F |
-| `tests/{materials, environment, shadows, gltf_render, gl_materials, alloc_materials}.rs`, `tests/common/materials.rs` | P-MAT |
+| `tests/{materials, environment, shadows, gl_materials, alloc_materials}.rs`, `tests/common/materials.rs` (glTF import renders: `space3d-assets/tests/gltf_materials.rs`) | P-MAT |
 | `tests/{post, post_distortion, gl_post, alloc_post}.rs`, `tests/common/post.rs` | P-POST |
 | `benches/{instancing, frame}.rs` / `materials.rs` / `post.rs`; `crates/space3d-stories/{benches/graphics.rs, tests/perf_graphics.rs}` (the Battle scene needs particles and the showcase content) | F / P-MAT / P-POST; I |
 | `examples/frame_nodes.rs` | F |

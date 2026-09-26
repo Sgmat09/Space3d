@@ -7,23 +7,39 @@ shadow, the particle library (engines, lasers, explosions, shields, warps), dist
 post chain. Each step is independent and shippable on its own; the order below gives the biggest
 visual win first. The overview of every feature is [`../graphics.md`](../graphics.md).
 
-**Step 0 changes nothing.** The game's code (pinned at the pre-upgrade API) compiles unchanged
-against the upgrade and renders the same pixels (checked: the game's workspace type-checks against
-this tree with 0 warnings; `crates/space3d/tests/api_compat_249c874.rs` compiles its forms of every
-touched type). One behavior differs by design: with **more than 16 point lights**, each view is
-lit by the 16 nearest to its camera instead of the first 16 in query order (spec D19).
+**Where the game is.** At its HEAD (199cd9a) the game pins Space3d `0463134` (graphics M1 and the
+keyboard-layout work on main) and has already done parts of this guide: the flight, backdrop,
+viewer and preview cameras have a `PostProcess` (`game/look.rs`: `KhronosPbrNeutral` over a
+full-frame lift, `TONE_LIFT`, bloom, FXAA), the graphics-quality setting drives
+`FrameSettings::render_scale` (`ui/render_scale.rs` is gone), `game/additive.rs` draws in
+`OverlayStage::HdrScene`, the effects are particles (`game/fx.rs` with its own `.pfx.ron`
+exhaust, explosion, warp, hit and muzzle effects), and previews below 120 pt skip bloom. What
+M2 adds for it: material maps from glTF (step 3), the cubemap sky and image-based lighting
+(step 4), the sun's shadow (step 5), quality presets (step 2), and the M2 fixes to the game's
+M1 feedback (game#1–#15, marked below).
+
+**Step 0 changes nothing.** The game's code compiles unchanged against M2 and renders the same
+pixels, except where a fix changes behavior it asked for: particle emitters moved in
+`Stage::Update` no longer bead at 30 and 45 fps (game#2), sprites soft-clip at render scales
+below 1 without post (game#3), a lowered `ParticleSettings::max_particles` applies at once
+(game#14), and the built-in effects are retuned for the top-down view (game#11; the game
+mostly plays its own effects). Checked: a scratch copy of the game's workspace pointed at this
+tree type-checks with 0 warnings; `crates/space3d/tests/api_compat_249c874.rs` compiles its forms
+of every touched type. One behavior differs by design since M1: with **more than 16 point
+lights**, each view is lit by the 16 nearest to its camera instead of the first 16 in query
+order (spec D19).
 
 | step | game files | engine feature |
 |---|---|---|
 | [0](#0-update-the-engine) | `Cargo.toml` | the upgrade, the `particles` feature |
-| [1](#1-hdr-and-the-battle-look) | `game/camera.rs` | `PostProcess`: HDR, AgX punchy, exposure, bloom, vignette |
-| [2](#2-quality-presets) | `session.rs`, `ui/render_scale.rs`, `ui/pages/settings.rs` | `GraphicsQuality`, render scale, `ParticleSettings::for_quality_on` |
+| [1](#1-hdr-and-the-battle-look) | `game/look.rs` (done at M1) | `PostProcess`: the look; M2: `KhronosPbrNeutralNoToe` replaces Neutral + `TONE_LIFT` |
+| [2](#2-quality-presets) | `session.rs`, `game/look.rs`, `ui/pages/settings.rs` | `GraphicsQuality`, `ParticleSettings::for_quality_on` (render scale done at M1) |
 | [3](#3-ship-materials-from-gltf) | `game/models.rs` | normal, ORM, emissive maps; tangents |
 | [4](#4-the-sky-as-a-cubemap-and-image-based-lighting) | `game/env.rs`, `game/camera.rs` | `Skybox`, `EnvironmentLight`, `ShadingModel::Standard` |
 | [5](#5-the-suns-shadow) | `game/camera.rs` | `DirectionalShadow` |
 | [6](#6-effects-particles-and-the-additive-overlay) | `game/fx.rs`, `game/additive.rs`, `game/fx/*`, lasers in `ui/hud` | particles; `OverlayStage::HdrScene` |
 | [7](#7-distortion) | — | built into the particle effects; `DistortionMaterial` |
-| [8](#8-ui-previews) | `ui/preview.rs` | MSAA render targets, post on previews |
+| [8](#8-ui-previews) | `ui/preview.rs`, `game/look.rs` | MSAA render targets, post on previews, `Bloom::min_rect_height` |
 | [9](#9-loading-screens-prewarm) | map loading | `GraphicsQuality::prewarm_request` |
 | [10](#10-web) | `web/`, settings | Low on WebGL2 |
 | [11](#11-tests-and-performance) | `client/tests` | goldens per backend, `DownlevelOverride::webgl2()`, `GpuTimings` |
@@ -31,19 +47,37 @@ lit by the 16 nearest to its camera instead of the first 16 in query order (spec
 ## 0. Update the engine
 
 ```toml
-# Cargo.toml (workspace)
-space3d = { git = "https://github.com/SpaceCorps/Space3d", rev = "<graphics merge>", default-features = false,
+# Cargo.toml (workspace): from rev 0463134 (M1) to the M2 merge
+space3d = { git = "https://github.com/SpaceCorps/Space3d", rev = "<graphics M2 merge>", default-features = false,
             features = ["render", "platform", "assets", "audio", "net", "ui", "github", "particles"] }
 ```
 
-`particles` adds `space3d::particles` (its own prelude; it is not in `space3d::prelude`). Build,
-run, compare: nothing looks different yet.
+`particles` (already on) adds `space3d::particles` (its own prelude; it is not in
+`space3d::prelude`). Build, run, compare. A lockfile pinned before `hyper-util` 0.1.21 needs
+`cargo update -p hyper-util` (game#7, noted on main).
 
 ## 1. HDR and the battle look
 
-`game/camera.rs` spawns the game camera. Give it a `PostProcess`: the scene now renders in linear
-HDR, bloom makes everything above 1 glow, and a tonemapper maps it to the display. egui still draws
-after tonemapping, unchanged.
+**Done at M1** (`game/look.rs`: the flight camera renders HDR with `KhronosPbrNeutral`, bloom and
+FXAA). What M2 changes for it:
+
+* **Drop the lift.** Neutral's toe subtracts `x − 6.25·x²` from every channel of a color whose
+  weakest channel `x` is under 0.08, nearly all of a dim sky's weakest channel (sRGB (21, 47, 65)
+  → (1, 40, 60)); the game lifts the whole scene by `TONE_LIFT` 0.018 to compensate, at the cost
+  of blacks at sRGB ~7 (game#9). `Tonemapper::KhronosPbrNeutralNoToe` passes colors unchanged
+  below 0.8 and rolls the highlights off like Neutral: use it for `FLIGHT_TONEMAPPER`,
+  `showcase`, `viewer` and `preview`, and remove `lift()` and the overlay's `Kind::Fill` (the
+  exposures tuned against the lift, `FLIGHT_EXPOSURE` 0.15, want a second look: without the lift
+  and the toe the image is brighter by the toe's 0.04 above it).
+* **If you want AgX.** `AgXPunchy` + 0.5 EV (below, the reference Battle's look) skews dim
+  saturated nebulae toward their strongest channel — the reason the game rejected it (game#6;
+  M-1's magenta: (54, 0, 21), green crushed). Plain `AgX` with `ColorGrading::vivid()` keeps the
+  hue and adds saturation (the same magenta (78, 8, 47); frame.md, "Choose the look
+  explicitly", has the numbers).
+
+For a new camera: give it a `PostProcess`: the scene then renders in linear HDR, bloom makes
+everything above 1 glow, and a tonemapper maps it to the display. egui still draws after
+tonemapping, unchanged.
 
 ```rust
 use space3d::render::Vignette; // PostProcess and Tonemapper are in space3d::prelude
@@ -53,9 +87,10 @@ let entity = ctx.world.spawn((
     Camera3d::default()
         .with_clear_color(Vec4::new(0.004, 0.006, 0.012, 1.0))
         .with_projection(Projection::Perspective { fov_y: FOV_Y_DEG.to_radians(), near: 2.0, far: FAR }),
-    // The recommended battle look: AgX punchy half a stop up keeps faction colors, lasers and
-    // fire saturated (plain AgX turns them pastel), bloom on everything above 1, a light
-    // vignette. Distortion is on by default (free until something writes it).
+    // The reference Battle's look: AgX punchy half a stop up keeps faction colors, lasers and
+    // fire saturated (plain AgX turns them pastel) but skews dim saturated skies (above), bloom
+    // on everything above 1, a light vignette. Distortion is on by default (free until
+    // something writes it).
     PostProcess::default()
         .with_tonemapper(Tonemapper::AgXPunchy)
         .with_exposure(0.5)
@@ -71,8 +106,7 @@ What to retune afterwards:
   shifts slightly. `PostProcess::passthrough()` reproduces the old look exactly (to A/B).
 * **Emissive above 1 glows.** Engines, canopies and running lights (`Surface::glows()` roles with
   their glTF emissive factor) bloom; scale the factors (2–5 glows clearly, 5–16 reads white-hot).
-* The `additive.rs` overlay still draws after tonemapping, exactly as before (step 6 moves it
-  into the HDR scene so it blooms too).
+* The `additive.rs` overlay draws in the HDR scene (step 6a, done at M1), so it blooms too.
 
 ## 2. Quality presets
 
@@ -112,14 +146,17 @@ fn apply_graphics_quality(ctx: &mut SystemCtx) {
 }
 ```
 
-**Replace `ui/render_scale.rs`'s render-target path with the engine's render scale.** Today the
-game camera renders into an offscreen `RenderTarget::Texture` at 50 % / 75 % and egui paints it
-behind the UI. With `FrameSettings::render_scale` (or `CameraFrame::render_scale` on the game
-camera) the camera stays on `RenderTarget::Primary`, the scene renders smaller into the primary
-scene texture, the composite upscales it (bloom and post at scene resolution), and egui stays
-sharp. It also keeps HdrScene overlays working (step 6: with the render-target path the window
-has no scene view, so they would draw nothing). Delete `RenderScalePlugin` and its egui image;
-keep `GameSettings::render_scale()` as the value.
+**Render scale: done at M1.** The game sets `FrameSettings::render_scale` from
+`GameSettings::render_scale()` (`ui/render_scale.rs`'s render-target path is gone): the scene
+renders smaller into the primary scene texture, the composite upscales it, and egui stays sharp.
+Since M2 sprites also soft-clip at render scales below 1 when post is off, as they do at 1
+(game#3: the "low" quality with post off no longer flattens HDR sparks).
+
+**The particle budget.** `game/look.rs` works around M1's grow-only pool
+(`session_particle_budget`: "Space3d M1's pool only grows"). Since M2 a lowered
+`ParticleSettings::max_particles` applies at once (new rings stop at it; the free tail is given
+back), and `ParticleStats` reports `pool_capacity` (the budget in force), `pool_allocated` and
+`pool_high_water` (game#14): the workaround can go.
 
 `apply` is lossless: switching Low → High restores what Low turned off (chromatic aberration,
 grain, auto exposure) from the camera's authored `PostProcess`. Cameras spawned later (previews)
@@ -185,11 +222,23 @@ fn to_parts(ctx: &mut SystemCtx, model: &ModelData, tangents: &[Vec<Vec<[f32; 4]
   + `extend` reorders primitives, so `ModelMesh::extras` must be kept in step or cleared
   ([`api.md`](api.md)). Without tangents the shader builds per-pixel frames (correct, a little
   softer).
-* **Emissive.** The painted hulls carry `emissiveFactor` 1.0 with the emissive map as the mask:
-  keep both (`apply_material_maps` does). Setting `emissive` from the factor *without* the map
-  washes every hull out white (measured on Protos.glb and Wraith.glb). `painted_material`'s
-  "emissive factor only on glowing roles" stays right; with the map, glowing roles can drop their
-  separate uniform emissive materials.
+* **Emissive.** The painted hulls carry `emissiveFactor` 1.0 with the emissive map as the mask,
+  and bake their nav lights into it (187–304 texels on `SC_Hull` of Protos, Wraith, Echelon and
+  Ostirion, 275 on Paragon's `SC_Trim`). `apply_material_maps` multiplies the material's
+  `emissive` by the map; it does not set the factor. `painted_material` gives Hull and Trim no
+  emissive, so their map would contribute nothing: **seed the factor wherever there is a map**
+  before `apply_material_maps` (the engine's own `upload_model` does this):
+
+  ```rust
+  if data.emissive_texture.is_some() && material.emissive == Vec3::ZERO {
+      material.emissive = Vec3::from_array(data.emissive); // the map is the mask
+  }
+  apply_material_maps(&mut material, &data, &mut |i, role| texture(assets, i, role));
+  ```
+
+  Setting `emissive` from the factor *without* the map washes every hull out white (measured on
+  Protos.glb and Wraith.glb). With the map, glowing roles can drop their separate uniform
+  emissive materials.
 * **Stop discarding the maps.** `models.rs` removes the model from `Assets<ModelData>` "because
   ORM, normal and emissive maps the engine can't use yet would stay in memory": they are used now.
 * **Whole models without custom code**: `space3d::assets::render::prepare_model_async(model,
@@ -212,7 +261,9 @@ next to them, `assets/skyboxes/G-1/sky.skybox`:
 { "faces": ["right.jpg", "left.jpg", "top.jpg", "bottom.jpg", "front.jpg", "back.jpg"], "convention": "threejs" }
 ```
 
-and load it like any asset (`SkyboxLoader` is registered by `AssetsPlugin`):
+and load it like any asset (`AssetsPlugin` registers the `.skybox` and `.hdr` loaders and their
+asset types, `CubemapData` and `HdrImageData`; before M2's fix the asset types were missing and
+`load::<CubemapData>` panicked):
 
 ```rust
 use space3d::assets::{AssetServer, Assets, CubemapData, Handle};
@@ -275,11 +326,12 @@ ctx.world.insert_one(
 
 Two ways, both supported; move effect by effect.
 
-**a) Keep `additive.rs`, draw it into the HDR scene** so the sprites bloom and tonemap with the
-scene: four steps in [`frame.md`](frame.md#migrating-an-additive-overlay-the-games-additivers) —
-stage per instance (`HdrScene` for the world copy, `AfterTonemap` for the `UiParticles` copy over
-egui), encoding from `prepare_scene`, no `1 − e^−x` soft clip outside Direct mode, `Rgba16Float`
-pipelines — plus the engine render scale of step 2.
+**a) Keep `additive.rs`, draw it into the HDR scene** (done at M1: the world copy draws in
+`OverlayStage::HdrScene`) so the sprites bloom and tonemap with the scene: four steps in
+[`frame.md`](frame.md#migrating-an-additive-overlay-the-games-additivers) — stage per instance
+(`HdrScene` for the world copy, `AfterTonemap` for the `UiParticles` copy over egui), encoding
+from `prepare_scene`, no `1 − e^−x` soft clip outside Direct mode, `Rgba16Float` pipelines —
+plus the engine render scale of step 2.
 
 **b) Replace the sprites with the particle library** (GPU simulated, 100k+, depth-tested, soft
 against hulls, lit flashes, distortion, deterministic on the fixed tick):
@@ -297,8 +349,14 @@ fn play(ctx: &mut SystemCtx, effect: fx::Effect) {
         Effect::Impact { at, dir, color } => {
             ctx.spawn_effect(builtin::HIT_SPARK, EffectSpawn::at(at).facing(-dir).tint(color.extend(1.0)));
         }
-        Effect::ShieldHit { center, radius, dir } => {
-            ctx.spawn_effect(builtin::SHIELD_RIPPLE, EffectSpawn::at(center).facing(-dir).scale(radius / 20.0));
+        Effect::ShieldHit { center, radius, dir, ship } => {
+            // World `center` and `dir` on a moving ship: `follow_world` converts them into the
+            // ship's space (plain `follow` takes the transform as local: at(center).follow(ship)
+            // would play at twice the ship's position, game#1).
+            ctx.spawn_effect(
+                builtin::SHIELD_RIPPLE,
+                EffectSpawn::at(center).facing(-dir).scale(radius / 20.0).follow_world(ship, &ctx.world),
+            );
         }
         Effect::Warp { at, scale, arriving } => {
             let fx = if arriving { builtin::WARP_IN } else { builtin::WARP_OUT };
@@ -324,6 +382,24 @@ if let Ok(mut em) = ctx.world.get::<&mut ParticleEmitter>(e) {
 // Held lasers / repairs: LASER_BEAM / REPAIR_BEAM with `beam_to(BeamEnd::Entity(target))`.
 // Missiles: MISSILE_TRAIL; heavy hits: DEBRIS_SPARKS; EMP: EMP.
 ```
+
+M2 changes for the game's effects (it plays its own `.pfx.ron` effects, so most of this is for
+its authoring):
+
+* **Moving ships in `Stage::Update`** (`fx::animate`, the exhaust emitters): emission no longer
+  beads at 30 and 45 fps — each fixed tick extrapolates the steady motion measured over the
+  previous frame to its own time (game#2; particles.md, "Moving emitters").
+* **Ships easing toward 20 Hz server updates**: set `ParticleEmitter::velocity_smoothing` (0.1–
+  0.2 s) on exhaust emitters: the time rate then follows each tick's distance against the
+  smoothed speed, and the plume keeps an even density (game#8). The game's own exhaust recipe —
+  mostly per distance flown, cores wider than their spacing, a small time rate — is what the
+  built-in `ENGINE_EXHAUST` does now too, and what particles.md recommends (game#12).
+* **Fast emitters**: `rate_per_distance` rings are sized for `Spawn::max_speed` (100 units/s by
+  default); looping effects now grow them with the emitter's speed, so the exhaust's
+  `capacity: Some(192)` override can go; one-shots on fast bolts set `max_speed` (game#10).
+* **The built-ins' reference view** is the game's: 1.4 px per unit with 40-unit hulls at
+  `scale` 1 (particles.md, "Built-in effects"): warps about 4 hulls across, explosions whose
+  fireball burns out within a second, 3-px sparks, no thin crisp rings (game#11).
 
 The full mapping of the game's sprite kinds, fades and effects (smoke = `ParticleBlend::Premultiplied`,
 `Fade` → `Curve::Preset`, …) is in [`particles.md`](particles.md#migrating-the-games-effects). Space
@@ -354,10 +430,17 @@ sys.world.spawn((
     Camera3d::default()
         .with_target(RenderTarget::Texture(target))
         .with_clear_color(Vec4::new(0.0, 0.0, 0.0, 0.0)), // transparent: the composite keeps alpha
-    PostProcess::default().with_tonemapper(Tonemapper::AgXPunchy),
+    PostProcess::default().with_tonemapper(Tonemapper::KhronosPbrNeutralNoToe),
     EnvironmentLight::new(studio_cube),                     // studio reflections instead of the rig swap
 ));
 ```
+
+**Bloom on small previews costs passes, not pixels** (game#15): every render-target camera with
+post is its own post group, and its bloom chain is about 9 render passes whatever its size —
+four 320 × 192 shop cards made the frame 47 passes against 11 without them. Keep the game's rule
+(no bloom under 120 pt) or move it into the engine with `Bloom::min_rect_height` (post.md,
+"Small views": 240 px is a good threshold); level 0 is never resampled up any more, which saves
+a pass on every small group.
 
 Render at display size instead of 2× (a quarter of the pixels). Previews live far from the maps,
 so the particles and their light flashes stay out of them (particle draws are culled per view).
@@ -402,13 +485,13 @@ signatures, every node's pipelines (particles, sky) and the post pipelines.
 
 | | done when |
 |---|---|
-| 0 | the game builds against the upgrade and looks the same |
-| 1 | the game camera has `PostProcess` (AgX punchy, +0.5 EV); lights and emissive retuned |
-| 2 | Settings › Graphics drives `GraphicsQuality::apply` + `ParticleSettings::for_quality_on`; `ui/render_scale.rs` uses `FrameSettings::render_scale` |
-| 3 | ship materials get their maps (`apply_material_maps`) and tangents; the maps are no longer discarded |
+| 0 | the game builds against M2 (from rev 0463134) and looks the same |
+| 1 | done at M1 (`PostProcess` on every camera); M2: `KhronosPbrNeutralNoToe` replaces Neutral + `TONE_LIFT` (or AgX + `ColorGrading::vivid()`) |
+| 2 | Settings › Graphics drives `GraphicsQuality::apply` + `ParticleSettings::for_quality_on` (render scale done at M1); the grow-only budget workaround removed |
+| 3 | ship materials get their maps (`apply_material_maps`, emissive factor seeded where there is a map) and tangents; the maps are no longer discarded |
 | 4 | the sky is a `Skybox` cubemap and an `EnvironmentLight`; `ShadingModel::Standard` |
 | 5 | the key light has a `DirectionalShadow` (`ShadowFit::top_down`); grid and walls opt out |
-| 6 | effects are particles (or the overlay is `HdrScene`); lasers are `LASER_SHOT` / `LASER_BEAM` |
-| 8 | previews use MSAA render targets and post |
+| 6 | done at M1 (particles, the overlay in `HdrScene`); M2: `follow_world` for hits on moving ships, `velocity_smoothing` on exhausts |
+| 8 | previews use MSAA render targets and post; bloom only above ~240 px (`Bloom::min_rect_height`) |
 | 9 | map loads prewarm |
 | 11 | goldens re-blessed; GL variants where needed |
