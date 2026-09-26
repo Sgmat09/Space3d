@@ -2,22 +2,25 @@
 //!
 //! Owner: P-MAT (graphics spec §3.6). The environments are generated in code: a nebula (an HDR
 //! panorama of warped value noise over a dark sky, a bright core and stars up to 8× white) and a
-//! photo studio (a sky gradient, a big softbox and a warm strip light).
+//! photo studio (a sky gradient, a big softbox and a warm strip light). So are the asteroid
+//! field's rocks (noise-displaced spheres) and the rocky ground under them.
 
 use super::{ambient, camera, mesh, sun};
 use crate::{KnobValues, Story};
 use space3d_assets::render::{ModelUploadOptions, spawn_model, upload_model};
 use space3d_core::HdrImageData;
+use space3d_core::glam::EulerRot;
 use space3d_core::prelude::*;
 use space3d_render::{
-    CubemapHandle, CubemapSource, EnvironmentLight, LightingSettings, Material, Mesh3d, PointLight, PostProcess,
-    Projection, RenderAssets, SamplerSettings, ShadingModel, Skybox, TextureSource, Tonemapper, f32_to_f16,
+    Aabb, CubemapHandle, CubemapSource, DirectionalLight, DirectionalShadow, EnvironmentLight, LightingSettings,
+    Material, Mesh3d, PointLight, PostProcess, Projection, RenderAssets, SamplerSettings, ShadingModel, ShadowFilter,
+    ShadowFit, Skybox, TextureSource, Tonemapper, f32_to_f16,
 };
 use std::sync::OnceLock;
 
 /// This area's stories, in registry order.
 pub(crate) fn stories() -> Vec<Story> {
-    vec![skybox(), ibl_spheres(), nebula_ship()]
+    vec![skybox(), ibl_spheres(), nebula_ship(), directional_shadow()]
 }
 
 /// The test ship: a hull with baked base color, normal, ORM and emissive maps.
@@ -389,6 +392,179 @@ fn nebula_ship() -> Story {
     .size(320, 240)
 }
 
+/// An asteroid: a sphere displaced by value noise (seeded), with smooth normals.
+fn asteroid(seed: u32) -> MeshData {
+    let mut m = MeshData::sphere(1.0, 28, 18);
+    for p in &mut m.positions {
+        let d = Vec3::from_array(*p);
+        let bumps = fbm(d * 1.6 + Vec3::splat(seed as f32 * 3.7), seed) - 0.5;
+        let craters = (fbm(d * 3.1, seed + 40) - 0.5).abs();
+        *p = (d * (1.0 + 0.55 * bumps - 0.25 * craters)).to_array();
+    }
+    space3d_assets::edit::mesh::recalculate_smooth_normals(&mut m);
+    m
+}
+
+/// Height of the rocky ground at (x, z).
+fn ground_height(x: f32, z: f32) -> f32 {
+    let p = Vec3::new(x * 0.09, 0.0, z * 0.09);
+    (fbm(p, 5) - 0.5) * 2.2 + (fbm(p * 3.0, 6) - 0.5) * 0.5
+}
+
+/// The rocky ground: a `size`-wide grid of `n` × `n` cells displaced by [`ground_height`],
+/// colored by height (vertex colors), normals from central differences.
+fn ground(size: f32, n: u32) -> MeshData {
+    let mut m = MeshData {
+        positions: Vec::new(),
+        normals: Vec::new(),
+        uvs: Vec::new(),
+        colors: Vec::new(),
+        indices: Vec::new(),
+    };
+    let step = size / n as f32;
+    for j in 0..=n {
+        for i in 0..=n {
+            let (x, z) = (i as f32 * step - size * 0.5, j as f32 * step - size * 0.5);
+            let y = ground_height(x, z);
+            let e = step * 0.5;
+            let nx = ground_height(x - e, z) - ground_height(x + e, z);
+            let nz = ground_height(x, z - e) - ground_height(x, z + e);
+            m.positions.push([x, y, z]);
+            m.normals.push(Vec3::new(nx, 2.0 * e, nz).normalize().to_array());
+            m.uvs.push([i as f32 / n as f32, j as f32 / n as f32]);
+            let t = ((y + 1.2) / 2.4).clamp(0.0, 1.0);
+            let c = Vec3::new(0.05, 0.05, 0.055).lerp(Vec3::new(0.2, 0.18, 0.17), t * t);
+            m.colors.push(c.extend(1.0).to_array());
+        }
+    }
+    let row = n + 1;
+    for j in 0..n {
+        for i in 0..n {
+            let a = j * row + i;
+            m.indices
+                .extend_from_slice(&[a, a + row, a + 1, a + 1, a + row, a + row + 1]);
+        }
+    }
+    m
+}
+
+/// A top-down asteroid field under one shadow-casting sun: three test ships over drifting rocks
+/// over a rocky ground, in the game's camera angle.
+fn directional_shadow() -> Story {
+    Story::new("Engine/Lights/Directional Shadow", |app, k| {
+        app.insert_resource(LightingSettings {
+            shading: ShadingModel::Standard,
+            ..LightingSettings::default()
+        });
+        ambient(app, 0.03);
+        let floor = mesh(app, ground(90.0, 120));
+        app.world.spawn((
+            Name("ground".into()),
+            Transform::from_xyz(0.0, -4.0, 0.0),
+            Mesh3d(floor),
+            Material::color(Vec4::ONE).with_metallic_roughness(0.0, 0.95),
+        ));
+        // Rocks of three shapes at scattered heights and sizes (deterministic).
+        let rocks = [0, 1, 2].map(|seed| mesh(app, asteroid(seed)));
+        for i in 0..46u32 {
+            let r = |c: i32| unit(hash(i as i32, c, 0, 17));
+            let (x, z) = (r(1) * 44.0 - 22.0, r(2) * 30.0 - 15.0);
+            let size = 0.35 + 1.4 * r(3).powi(2);
+            let y = -1.5 + r(4) * 4.5;
+            let tint = 0.25 + 0.2 * r(5);
+            app.world.spawn((
+                Transform::from_xyz(x, y, z)
+                    .with_rotation(Quat::from_euler(EulerRot::YXZ, r(6) * 6.3, r(7) * 6.3, 0.0))
+                    .with_scale(Vec3::new(size, size * (0.7 + 0.3 * r(8)), size)),
+                Mesh3d(rocks[i as usize % 3]),
+                Material::srgb(tint * 1.1, tint, tint * 0.92).with_metallic_roughness(0.0, 0.85),
+            ));
+        }
+        // Three ships flying over the field.
+        let model = space3d_assets::loaders::load_gltf(SHIP_GLB, &space3d_assets::LoadContext::new("ship.glb"), true)
+            .expect("ship.glb decodes");
+        let uploaded = upload_model(
+            &model,
+            app.resources.init::<RenderAssets>(),
+            &ModelUploadOptions::default(),
+        );
+        for (x, y, z, yaw, scale) in [
+            (-4.0, 5.0, 1.5, 200.0f32, 2.2f32),
+            (5.5, 3.5, -4.0, 235.0, 1.6),
+            (9.0, 6.5, 5.0, 170.0, 1.9),
+        ] {
+            spawn_model(
+                &mut app.world,
+                &uploaded,
+                Transform::from_xyz(x, y, z)
+                    .with_rotation(Quat::from_rotation_y(yaw.to_radians()))
+                    .with_scale(Vec3::splat(scale)),
+            );
+        }
+        // The sun: `elevation` degrees above the horizon, from the upper right of the view.
+        let elevation = k.f32("elevation").to_radians();
+        let direction = Vec3::new(-0.8 * elevation.cos(), -elevation.sin(), -0.6 * elevation.cos());
+        let fit = match k.choice("fit") {
+            0 => ShadowFit::top_down(0.0, 8.0, 200.0),
+            1 => ShadowFit::Camera {
+                camera: None,
+                max_distance: 80.0,
+                receivers: None,
+            },
+            _ => ShadowFit::Bounds(Aabb::new(Vec3::new(-30.0, -6.0, -24.0), Vec3::new(30.0, 9.0, 24.0))),
+        };
+        let filter = [
+            ShadowFilter::Pcf9,
+            ShadowFilter::Pcf16,
+            ShadowFilter::Pcf4,
+            ShadowFilter::Hard,
+        ][k.choice("filter").min(3)];
+        app.world.spawn((
+            Name("sun".into()),
+            Transform::IDENTITY.looking_at(direction, Vec3::Y),
+            DirectionalLight {
+                color: Vec3::new(1.0, 0.95, 0.88),
+                intensity: 2.6,
+            },
+            DirectionalShadow::new()
+                .with_map_size([2048, 1024, 512][k.choice("map size").min(2)])
+                .with_fit(fit)
+                .with_filter(filter)
+                .with_bias(k.f32("depth bias"), k.f32("normal bias"), k.f32("slope bias"))
+                .with_strength(k.f32("strength")),
+        ));
+        let cam = camera(
+            app,
+            Vec3::new(0.0, 30.0, 13.0),
+            Vec3::new(0.0, 0.0, 0.5),
+            Projection::Perspective {
+                fov_y: 42f32.to_radians(),
+                near: 0.5,
+                far: 200.0,
+            },
+        );
+        app.world.insert_one(cam, PostProcess::default()).unwrap();
+    })
+    .description(
+        "A top-down asteroid field (the game's camera angle) under one shadow-casting sun: three \
+         copies of the test ship over noise-displaced rocks over a rocky ground. The sun's \
+         `DirectionalShadow` is one 2048² depth map fitted to the camera frustum within the slab \
+         |y| ≤ 8 (`ShadowFit::top_down`), texel-snapped so it never shimmers while the camera \
+         pans; the casters are drawn instanced in a depth-only pass culled like a camera view; \
+         receivers filter it with 9-tap PCF. Knobs: map size, filter, fit (top-down / camera / \
+         fixed bounds), depth / normal / slope bias, strength, sun elevation.",
+    )
+    .knob_choice("map size", &["2048", "1024", "512"], 0)
+    .knob_choice("filter", &["PCF 9", "PCF 16", "PCF 4", "hard"], 0)
+    .knob_choice("fit", &["top-down", "camera", "bounds"], 0)
+    .knob_f32("depth bias", 0.02, 0.0..=0.5)
+    .knob_f32("normal bias", 1.0, 0.0..=4.0)
+    .knob_f32("slope bias", 1.5, 0.0..=6.0)
+    .knob_f32("strength", 1.0, 0.0..=1.0)
+    .knob_f32("elevation", 48.0, 10.0..=90.0)
+    .size(320, 200)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +613,33 @@ mod tests {
         let unlit = KnobValues::default().with("environment", KnobValue::Bool(false));
         let unlit = run_story_headless(&ship, &unlit, None).unwrap();
         assert!(!compare_images(&lit, &unlit, &CompareOptions::default()).passed);
+    }
+
+    /// The shadow story's shadow is there (strength 0 is another picture) and every fit and
+    /// filter renders it.
+    #[test]
+    fn shadow_story_knobs() {
+        require_gpu!();
+        let story = directional_shadow();
+        let shadowed = run_story_headless(&story, &KnobValues::default(), None).unwrap();
+        let off = KnobValues::default().with("strength", KnobValue::Float(0.0));
+        let off = run_story_headless(&story, &off, None).unwrap();
+        assert!(!compare_images(&shadowed, &off, &CompareOptions::default()).passed);
+        // The shadowed picture is darker overall.
+        let mean = |img: &ImageData| img.pixels.iter().map(|&p| p as f64).sum::<f64>() / img.pixels.len() as f64;
+        assert!(
+            mean(&shadowed) < mean(&off) - 1.0,
+            "{} vs {}",
+            mean(&shadowed),
+            mean(&off)
+        );
+        for (knob, choices) in [("fit", 3), ("filter", 4)] {
+            for c in 1..choices {
+                let k = KnobValues::default().with(knob, KnobValue::Choice(c));
+                let img = run_story_headless(&story, &k, None).unwrap();
+                assert!(mean(&img) < mean(&off) - 1.0, "{knob} {c}");
+            }
+        }
     }
 
     /// The generators are pure and the nebula is HDR: stars and the core exceed white, the sky
