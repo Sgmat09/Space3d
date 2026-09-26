@@ -1,6 +1,7 @@
 //! Post-processing on wgpu's GL backend — the WebGL2 / GLES 3.0 path (graphics spec §4.1 class
 //! B: float color buffers through `EXT_color_buffer_float`): the `tests/post.rs` cases on a GL
-//! adapter, plus bloom parity with the default backend.
+//! adapter (auto exposure meters with the render-pass chain there: GLES 3.0 has no compute),
+//! plus bloom parity with the default backend.
 //!
 //! Skips when there is no GL adapter. On macOS, ANGLE (GLES 3.0, WebGL2's feature level) provides
 //! one; ANGLE crashes when several GL contexts render from different threads, so run it with one
@@ -178,4 +179,54 @@ fn gl_bloom_matches_default_backend() {
     let cmp = compare_images(&default, &gl, &CompareOptions::perceptual());
     eprintln!("bloom GL vs default: {}", cmp.summary());
     assert!(cmp.passed, "{}", cmp.summary());
+}
+
+#[test]
+fn gl_auto_exposure_converges_and_matches_reference() {
+    cases::auto_exposure_converges_and_matches_reference(gl_app, false);
+}
+
+#[test]
+fn gl_instant_converges_frame_1() {
+    cases::instant_converges_frame_1(gl_app);
+}
+
+#[test]
+fn gl_render_to_image_is_idempotent_with_ae_and_grain() {
+    cases::render_to_image_is_idempotent_with_ae_and_grain(gl_app);
+}
+
+#[test]
+fn gl_auto_exposure_feeds_bloom() {
+    cases::auto_exposure_feeds_bloom(gl_app);
+}
+
+#[test]
+fn gl_auto_exposure_per_post_group() {
+    cases::auto_exposure_per_post_group(gl_app);
+}
+
+#[test]
+fn gl_auto_exposure_history_and_steady_state() {
+    cases::auto_exposure_history_and_steady_state(gl_app, false);
+}
+
+#[test]
+fn gl_grading_matches_formulas() {
+    cases::grading_matches_formulas(gl_app);
+}
+
+#[test]
+fn gl_lut_identity_is_neutral() {
+    cases::lut_identity_is_neutral(gl_app);
+}
+
+#[test]
+fn gl_lut_changes_colors() {
+    cases::lut_changes_colors(gl_app);
+}
+
+#[test]
+fn gl_invalid_grading_hook_falls_back() {
+    cases::invalid_grading_hook_falls_back(gl_app);
 }

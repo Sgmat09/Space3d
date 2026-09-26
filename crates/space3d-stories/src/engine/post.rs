@@ -6,13 +6,13 @@ use super::{ambient, mesh, sun};
 use crate::{KnobValues, Story};
 use space3d_core::prelude::*;
 use space3d_render::{
-    Bloom, BloomComposite, Camera3d, ChromaticAberration, FilmGrain, FxaaQuality, Material, Mesh3d, PostProcess,
-    Vignette,
+    AutoExposure, Bloom, BloomComposite, Camera3d, ChromaticAberration, ColorGrading, ColorLut, CustomShader,
+    FilmGrain, FxaaQuality, Material, Mesh3d, Metering, PointLight, PostProcess, RenderAssets, Vignette,
 };
 
 /// This area's stories, in registry order.
 pub(crate) fn stories() -> Vec<Story> {
-    vec![bloom(), bloom_veil(), fxaa(), lens()]
+    vec![bloom(), bloom_veil(), auto_exposure(), fxaa(), lens(), color_grading()]
 }
 
 /// Dark-space backdrop (linear).
@@ -380,6 +380,282 @@ fn lens() -> Story {
     .knob_f32("chromatic_aberration", 0.35, 0.0..=1.0)
     .knob_f32("grain", 0.06, 0.0..=0.5)
     .knob_bool("fxaa", true)
+    .tag("graphics")
+    .tag("post")
+    .size(320, 180)
+}
+
+/// One auto-exposure panel at `origin`: a lit planet and fighter hull, engine glows, a small
+/// nebula and stars on black (not metered), every light and radiance × `k`.
+fn exposure_panel(app: &mut App, origin: Vec3, k: f32) {
+    let sphere = mesh(app, MeshData::sphere(1.0, 48, 24));
+    let cube = mesh(app, MeshData::cube(1.0));
+    app.world.spawn((
+        at(origin + Vec3::new(-0.9, -0.2, -1.5)),
+        Mesh3d(sphere),
+        Material::srgb(0.45, 0.55, 0.8).with_metallic_roughness(0.0, 0.55),
+    ));
+    app.world.spawn((
+        at(origin + Vec3::new(0.9, 0.2, -0.4))
+            .with_rotation(Quat::from_rotation_y(0.6) * Quat::from_rotation_x(0.3))
+            .with_scale(Vec3::new(0.35, 0.18, 1.1)),
+        Mesh3d(cube),
+        Material::color(Vec4::new(0.6, 0.6, 0.65, 1.0)).with_metallic_roughness(0.7, 0.35),
+    ));
+    for side in [-0.1f32, 0.1] {
+        app.world.spawn((
+            at(origin + Vec3::new(0.62 + side, 0.1, -0.85)).with_scale(Vec3::splat(0.1)),
+            Mesh3d(sphere),
+            Material::unlit((Vec3::new(1.0, 2.6, 6.0) * k).extend(1.0)),
+        ));
+    }
+    app.world.spawn((
+        at(origin + Vec3::new(1.6, 1.4, -6.0))
+            .with_rotation(Quat::from_rotation_z(0.5))
+            .with_scale(Vec3::new(3.0, 1.2, 0.1)),
+        Mesh3d(cube),
+        Material::unlit((Vec3::new(0.012, 0.005, 0.02) * k).extend(1.0)),
+    ));
+    let mut rng = Lcg(3);
+    for _ in 0..40 {
+        let p = Vec3::new(rng.next() * 6.0 - 3.0, rng.next() * 4.0 - 2.0, -5.5);
+        app.world.spawn((
+            at(origin + p).with_scale(Vec3::splat(0.03)),
+            Mesh3d(cube),
+            Material::unlit((Vec3::new(0.9, 0.95, 1.0) * (0.5 + 2.0 * rng.next()) * k).extend(1.0)),
+        ));
+    }
+    app.world.spawn((
+        at(origin + Vec3::new(3.0, 1.5, 0.5)),
+        PointLight {
+            color: Vec3::new(1.0, 0.95, 0.85),
+            intensity: 12.0 * k,
+            range: 20.0,
+        },
+    ));
+}
+
+fn auto_exposure() -> Story {
+    Story::new("Engine/Post/Auto Exposure", |app, k| {
+        // The same scene lit 16× dimmer (left), as authored (middle) and 16× brighter (right),
+        // each in its own post group: with auto exposure all three are exposed alike. No ambient
+        // light (it would not scale with the panels).
+        ambient(app, 0.0);
+        let ae = AutoExposure {
+            enabled: k.bool("auto_exposure"),
+            min_ev: k.f32("min_ev"),
+            max_ev: k.f32("max_ev"),
+            metering: match k.choice("metering") {
+                0 => Metering::Average,
+                _ => Metering::CenterWeighted,
+            },
+            ..AutoExposure::default()
+        };
+        for (i, scale) in [1.0 / 16.0, 1.0, 16.0].into_iter().enumerate() {
+            let origin = Vec3::new(100.0 * i as f32, 0.0, 0.0);
+            exposure_panel(app, origin, scale);
+            app.world.spawn((
+                Name(format!("camera {i}")),
+                at(origin + Vec3::new(0.0, 0.3, 3.2)).looking_at(origin + Vec3::new(0.0, 0.0, -1.0), Vec3::Y),
+                Camera3d {
+                    order: i as i32,
+                    viewport: Some([i as f32 / 3.0, 0.0, 1.0 / 3.0, 1.0]),
+                    clear_color: Some(Vec4::new(0.0, 0.0, 0.0, 1.0)),
+                    ..Default::default()
+                },
+                PostProcess {
+                    exposure: k.f32("compensation"),
+                    auto_exposure: ae,
+                    ..PostProcess::default()
+                },
+            ));
+        }
+    })
+    .description(
+        "`AutoExposure` meters each post group's rect: a 255-bin log2 luminance histogram (compute; \
+         black is not metered, the darkest 10 % and the brightest 10 % are cut), exposed to middle \
+         grey within `min_ev..=max_ev`, plus `PostProcess::exposure` as compensation. The same \
+         scene lit 16× dimmer, as authored and 16× brighter: with auto exposure all three read \
+         alike; without it the left panel is black and the right one blown out. The story uses a \
+         compensation of −1 EV (a darker key suits space: the lit hull and planet, not the \
+         shadows, should read as middle grey). Cameras snap on their first frame, then adapt at \
+         `adapt_to_bright` / `adapt_to_dark` per second. On WebGL2 a chain of render passes \
+         meters without the percentile cut.",
+    )
+    .knob_bool("auto_exposure", true)
+    .knob_f32("compensation", -1.0, -4.0..=4.0)
+    .knob_choice("metering", &["Average", "Center weighted"], 1)
+    .knob_f32("min_ev", -8.0, -16.0..=0.0)
+    .knob_f32("max_ev", 8.0, 0.0..=16.0)
+    .ticks(180)
+    .tag("graphics")
+    .tag("post")
+    .size(320, 180)
+}
+
+/// A `.cube` 3D LUT of size `n` computed from `f` (sRGB-encoded in and out).
+fn cube_lut(n: u32, f: impl Fn(Vec3) -> Vec3) -> String {
+    let mut s = format!("TITLE \"generated\"\nLUT_3D_SIZE {n}\n");
+    let last = (n - 1) as f32;
+    for b in 0..n {
+        for g in 0..n {
+            for r in 0..n {
+                let v = f(Vec3::new(r as f32, g as f32, b as f32) / last).clamp(Vec3::ZERO, Vec3::ONE);
+                s += &format!("{:.5} {:.5} {:.5}\n", v.x, v.y, v.z);
+            }
+        }
+    }
+    s
+}
+
+/// "Teal and orange": shadows pushed toward teal, highlights toward orange, skin-like mids kept.
+fn teal_orange(c: Vec3) -> Vec3 {
+    let luma = c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    let t = (luma * 1.4 - 0.2).clamp(0.0, 1.0);
+    let t = t * t * (3.0 - 2.0 * t);
+    let tint = Vec3::new(0.86, 1.0, 1.1).lerp(Vec3::new(1.12, 0.98, 0.84), t);
+    let graded = c * tint;
+    let g = graded.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    Vec3::splat(g).lerp(graded, 1.15)
+}
+
+/// "Bleach bypass": half desaturated with a contrasty luminance overlay.
+fn bleach_bypass(c: Vec3) -> Vec3 {
+    let luma = c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    let overlay = |base: f32, blend: f32| {
+        if base < 0.5 {
+            2.0 * base * blend
+        } else {
+            1.0 - 2.0 * (1.0 - base) * (1.0 - blend)
+        }
+    };
+    let o = Vec3::new(overlay(c.x, luma), overlay(c.y, luma), overlay(c.z, luma));
+    Vec3::splat(luma).lerp(o, 0.55)
+}
+
+/// A post-display "night vision" hook: green monochrome, scanlines and a round mask (`uv`).
+const NIGHT_VISION: &str = "fn post_ldr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let l = s3d_luma(c);
+    let lines = 0.85 + 0.15 * step(0.5, fract(uv.y * 90.0));
+    let d = length((uv - 0.5) * vec2<f32>(1.6, 1.0));
+    let mask = 1.0 - smoothstep(0.62, 0.72, d);
+    return vec3<f32>(0.15, 1.0, 0.25) * pow(l, 0.8) * 1.4 * lines * mask;
+}";
+
+/// A colorful space scene for grading: a planet, a nebula backdrop, ships with engine glows, a
+/// row of saturated tiles and a grey ramp from black to white.
+fn grading_scene(app: &mut App) {
+    let sphere = mesh(app, MeshData::sphere(1.0, 48, 24));
+    let cube = mesh(app, MeshData::cube(1.0));
+    app.world.spawn((
+        at(Vec3::new(-1.5, 0.6, -3.0)).with_scale(Vec3::splat(1.4)),
+        Mesh3d(sphere),
+        Material::srgb(0.3, 0.55, 0.85).with_metallic_roughness(0.0, 0.6),
+    ));
+    for (i, color) in [Vec3::new(0.5, 0.05, 0.4), Vec3::new(0.05, 0.3, 0.45)]
+        .into_iter()
+        .enumerate()
+    {
+        app.world.spawn((
+            at(Vec3::new(-2.0 + 4.0 * i as f32, 0.8, -7.0))
+                .with_rotation(Quat::from_rotation_z(0.4 - 0.8 * i as f32))
+                .with_scale(Vec3::new(5.0, 3.0, 0.1)),
+            Mesh3d(cube),
+            Material::unlit((color * 0.35).extend(1.0)),
+        ));
+    }
+    fighter(
+        app,
+        Vec3::new(1.1, 0.55, -1.2),
+        Vec3::new(-1.0, 0.1, 0.3),
+        Vec3::new(0.7, 0.66, 0.6),
+        Vec3::new(14.0, 6.0, 1.6),
+    );
+    for i in 0..8 {
+        let x = -1.4 + i as f32 * 0.4;
+        app.world.spawn((
+            at(Vec3::new(x, -0.35, 0.0)).with_scale(Vec3::new(0.3, 0.25, 0.05)),
+            Mesh3d(cube),
+            Material::unlit((super::palette(i) * 0.8).extend(1.0)),
+        ));
+        let v = i as f32 / 7.0;
+        app.world.spawn((
+            at(Vec3::new(x, -0.72, 0.0)).with_scale(Vec3::new(0.38, 0.3, 0.05)),
+            Mesh3d(cube),
+            Material::unlit(Vec4::new(v * v, v * v, v * v, 1.0)),
+        ));
+    }
+    sun(app, Vec3::new(0.6, -0.4, -0.7), 2.2);
+    ambient(app, 0.05);
+}
+
+fn color_grading() -> Story {
+    Story::new("Engine/Post/Color Grading", |app, k| {
+        grading_scene(app);
+        let lut = match k.choice("lut") {
+            1 => Some(cube_lut(17, teal_orange)),
+            2 => Some(cube_lut(17, bleach_bypass)),
+            _ => None,
+        }
+        .map(|text| {
+            let strip = ColorLut::from_cube(&text).expect("a generated LUT parses");
+            let texture = app.resources.init::<RenderAssets>().add_texture(strip);
+            ColorLut {
+                contribution: k.f32("lut_contribution"),
+                ..ColorLut::new(texture, 17)
+            }
+        });
+        let shader = k.bool("night_vision").then(|| {
+            app.resources
+                .init::<RenderAssets>()
+                .add_shader(CustomShader::new("night vision", NIGHT_VISION))
+        });
+        let grading = ColorGrading {
+            temperature: k.f32("temperature"),
+            tint: k.f32("tint"),
+            saturation: k.f32("saturation"),
+            contrast: k.f32("contrast"),
+            lift: Vec3::new(0.0, 0.01, 0.03) * k.f32("lift"),
+            gamma: Vec3::splat(k.f32("gamma")),
+            gain: Vec3::new(1.0, 0.98, 0.94) * k.f32("gain"),
+            lut,
+            shader,
+        };
+        // The same view ungraded (left) and graded (right).
+        let eye = Transform::from_xyz(0.0, 0.2, 3.0).looking_at(Vec3::new(0.0, 0.0, -1.0), Vec3::Y);
+        let base = PostProcess::default();
+        for (i, post) in [base, base.with_color_grading(grading)].into_iter().enumerate() {
+            app.world.spawn((
+                Name(if i == 0 { "camera" } else { "graded camera" }.into()),
+                eye,
+                Camera3d {
+                    order: i as i32,
+                    viewport: Some([0.5 * i as f32, 0.0, 0.5, 1.0]),
+                    clear_color: Some(SPACE),
+                    ..Default::default()
+                },
+                post,
+            ));
+        }
+    })
+    .description(
+        "`ColorGrading`, fused into the composite: white balance (`temperature`, `tint`), \
+         `saturation` and `contrast` (log2, around middle grey) in linear HDR before the \
+         tonemapper; lift/gamma/gain (ASC CDL on the sRGB-encoded color) and a 3D LUT after it, \
+         then the `post_ldr_hook` of an optional WGSL hook shader (`night_vision`). Left: \
+         ungraded; right: graded. The LUTs are generated `.cube` files (`ColorLut::from_cube`): \
+         teal & orange and bleach bypass.",
+    )
+    .knob_f32("temperature", 0.2, -1.0..=1.0)
+    .knob_f32("tint", 0.0, -1.0..=1.0)
+    .knob_f32("saturation", 1.15, 0.0..=2.0)
+    .knob_f32("contrast", 1.1, 0.5..=2.0)
+    .knob_f32("lift", 1.0, 0.0..=4.0)
+    .knob_f32("gamma", 1.0, 0.5..=2.0)
+    .knob_f32("gain", 1.0, 0.5..=1.5)
+    .knob_choice("lut", &["None", "Teal & orange", "Bleach bypass"], 1)
+    .knob_f32("lut_contribution", 0.8, 0.0..=1.0)
+    .knob_bool("night_vision", false)
     .tag("graphics")
     .tag("post")
     .size(320, 180)

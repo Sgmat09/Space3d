@@ -386,8 +386,9 @@ pub(super) struct BloomState {
     pipelines: FastMap<wgpu::TextureFormat, BloomPipelines>,
     params_bg: Option<(wgpu::BindGroup, u32)>,
     /// Source bind groups by (0 = scene texture / 1 = pooled chain / 2 = the prefilter's
-    /// half-resolution target, its generation, level), with the frame they were last used.
-    pub sources: FastMap<(u8, u64, u32), (wgpu::BindGroup, u64)>,
+    /// half-resolution target, its generation, the exposure texture's generation for the scene
+    /// and the level for the chain), with the frame they were last used.
+    pub sources: FastMap<(u8, u64, u64), (wgpu::BindGroup, u64)>,
 }
 
 impl BloomState {
@@ -491,7 +492,8 @@ impl BloomState {
 
     /// Record a post group's chain (prefilter, resample, downsamples, upsamples) from `scene`
     /// (the scene texture, bind groups cached by `scene_generation`) into a pooled texture.
-    /// Returns level 0's view and the texture's generation for the composite.
+    /// Returns level 0's view and the texture's generation for the composite. `exposure`: the
+    /// camera's exposure texture E (auto exposure; any 1×1 texture otherwise) and its generation.
     /// `timestamps`: GPU timestamps written at the start of the first pass and the end of the
     /// last one.
     pub fn encode(
@@ -499,7 +501,7 @@ impl BloomState {
         cx: &mut PostEncode<'_>,
         (scene, scene_generation): (&wgpu::TextureView, u64),
         plan: &BloomPlan,
-        exposure: &wgpu::TextureView,
+        (exposure, exposure_generation): (&wgpu::TextureView, u64),
         frame: u64,
         timestamps: Option<ChainTimestamps<'_>>,
     ) -> Option<(wgpu::TextureView, u64)> {
@@ -545,9 +547,9 @@ impl BloomState {
                 Target::Level(l) => &chain.mips[l as usize],
             };
             let key = match source {
-                Target::Scene => (0, scene_generation, 0),
+                Target::Scene => (0, scene_generation, exposure_generation),
                 Target::Half => (2, half.map_or(0, |h| h.generation), 0),
-                Target::Level(level) => (1, chain.generation, level),
+                Target::Level(level) => (1, chain.generation, level as u64),
             };
             let view = view_of(source);
             let bg = sources.entry(key).or_insert_with(|| {
@@ -1040,7 +1042,7 @@ mod tests {
                     end: (i + 1 == chains).then_some(2 * round + 1),
                 });
                 state
-                    .encode(&mut cx, (&scene, 1), &plan, &exposure, 0, timestamps)
+                    .encode(&mut cx, (&scene, 1), &plan, (&exposure, 0), 0, timestamps)
                     .expect("params");
                 pool.release_all();
             }

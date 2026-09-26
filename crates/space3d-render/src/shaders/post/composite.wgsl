@@ -6,9 +6,11 @@
 // (WebGL2-safe).
 //
 // Order (normative): S at the rect [+ chromatic aberration taps] → un-premultiply (transparent
-// groups) → exposure → bloom → vignette → [white balance, saturation, contrast, HDR hook] →
-// tonemap → [lift/gamma/gain, LUT, LDR hook] → in the last pass: grain → dither → encode →
-// re-premultiply. Bracketed steps belong to later post milestones; this file keeps their slots.
+// groups) → exposure (manual, or 2^(E + compensation) with auto exposure) → bloom → vignette →
+// white balance × saturation, contrast → `post_hdr_hook` → tonemap → lift/gamma/gain, LUT (in
+// the sRGB-encoded display space) → `post_ldr_hook` → in the last pass: grain → dither → encode
+// → re-premultiply. The grading hooks (`ColorGrading::shader`, spliced at the HOOKS marker at
+// the end) are identity functions unless a hook shader defines them.
 
 // 0: D has an sRGB format (hardware encodes), 1: 8-bit D without one (encode here),
 // 2: float D (linear, no dither).
@@ -26,22 +28,23 @@ const S3D_POST_DISTORTION: u32 = 256u;
 const S3D_POST_TRANSPARENT: u32 = 512u;
 const S3D_POST_SCENE_ALPHA: u32 = 1024u;
 const S3D_POST_EXACT: u32 = 2048u;
+const S3D_POST_GRADE_LDR: u32 = 4096u;
 
 // Matches `GpuPost` (post/chain.rs): one 256-byte slot per post group.
 struct PostParams {
     out_rect: vec4<f32>,        // the group's rect in D pixels (x, y, w, h), unclipped
     src_rect: vec4<f32>,        // its rect in S pixels, unclipped
     src_texel: vec4<f32>,       // 1/S.w, 1/S.h, rect aspect (w/h), D height
-    exposure: vec4<f32>,        // linear multiplier, -, bloom intensity, bloom mode (0 add, 1 mix)
+    exposure: vec4<f32>,        // linear multiplier (the compensation with auto exposure), -, bloom intensity, bloom mode (0 add, 1 mix)
     vignette: vec4<f32>,        // intensity, smoothness, roundness, center.x
     vignette_color: vec4<f32>,  // linear multiplier at full vignette (rgb), center.y
     lens: vec4<f32>,            // chromatic aberration scale (S px⁻²), -, distortion scale, distortion chromatic
     grain: vec4<f32>,           // intensity, cell size (D px), luminance response, -
-    grade_matrix: mat3x3<f32>,
-    lift_contrast: vec4<f32>,
-    gamma_lut: vec4<f32>,
-    gain_lut: vec4<f32>,
-    flags: vec4<u32>,           // x effect bits, y tonemapper id, z 1 = last pass (0: FXAA follows), w -
+    grade_matrix: mat3x3<f32>,  // white balance × saturation (linear HDR)
+    lift_contrast: vec4<f32>,   // lift (offset), contrast (log2, around middle grey)
+    gamma_lut: vec4<f32>,       // 1 / gamma (power), LUT contribution
+    gain_lut: vec4<f32>,        // gain (slope), LUT size N
+    flags: vec4<u32>,           // x effect bits, y tonemapper id, z 1 = last pass (0: FXAA follows), w 1 = the LUT texture is sRGB
     frame: vec4<u32>,           // reserved (0): the seeds are `post_seeds`
 }
 
@@ -98,6 +101,58 @@ fn post_scene(s: vec2<f32>) -> vec4<f32> {
         return textureLoad(scene_tex, vec2<i32>(floor(s)), 0);
     }
     return post_scene_bilinear(s);
+}
+
+// The exposure multiplier: manual 2^stops, or with auto exposure 2^(E + compensation).
+fn post_exposure() -> f32 {
+    var e = post.exposure.x;
+    if (post_has(S3D_POST_AUTO_EXPOSURE)) {
+        e = e * exp2(textureLoad(exposure_tex, vec2<i32>(0), 0).r);
+    }
+    return e;
+}
+
+// White balance × saturation, then contrast in log2 space around middle grey (linear HDR).
+fn post_grade_hdr(c: vec3<f32>) -> vec3<f32> {
+    var g = max(post.grade_matrix * c, vec3<f32>(0.0));
+    let k = post.lift_contrast.w;
+    if (k != 1.0) {
+        g = pow(max(g, vec3<f32>(1e-10)) * (1.0 / 0.18), vec3<f32>(k)) * 0.18;
+    }
+    return g;
+}
+
+// 3D LUT lookup of the sRGB-encoded color `e` (0..1) in the N²×N strip: bilinear inside the
+// red/green slice, blended between the two nearest blue slices.
+fn post_lut(e: vec3<f32>) -> vec3<f32> {
+    let n = post.gain_lut.w;
+    let b = e.b * (n - 1.0);
+    let b0 = floor(b);
+    let b1 = min(b0 + 1.0, n - 1.0);
+    let x = (e.r * (n - 1.0) + 0.5) / n;
+    let y = (e.g * (n - 1.0) + 0.5) / n;
+    let s0 = textureSampleLevel(lut_tex, post_sampler, vec2<f32>((x + b0) / n, y), 0.0).rgb;
+    let s1 = textureSampleLevel(lut_tex, post_sampler, vec2<f32>((x + b1) / n, y), 0.0).rgb;
+    var g = mix(s0, s1, b - b0);
+    if ((post.flags.w & 1u) != 0u) {
+        // An sRGB-format strip is decoded when sampled: back to its encoded values.
+        g = s3d_linear_to_srgb(clamp(g, vec3<f32>(0.0), vec3<f32>(1.0)));
+    }
+    return g;
+}
+
+// Lift/gamma/gain (ASC CDL: (e · gain + lift)^(1 / gamma)) and the LUT, on the sRGB-encoded
+// display color (as grading tools and `.cube` files expect). Display-linear in and out.
+fn post_grade_ldr(c: vec3<f32>) -> vec3<f32> {
+    var e = s3d_linear_to_srgb(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
+    if (post_has(S3D_POST_GRADE_LDR)) {
+        e = pow(max(e * post.gain_lut.xyz + post.lift_contrast.xyz, vec3<f32>(0.0)), post.gamma_lut.xyz);
+    }
+    if (post_has(S3D_POST_LUT)) {
+        e = clamp(e, vec3<f32>(0.0), vec3<f32>(1.0));
+        e = mix(e, post_lut(e), post.gamma_lut.w);
+    }
+    return s3d_srgb_to_linear(clamp(e, vec3<f32>(0.0), vec3<f32>(1.0)));
 }
 
 // Bloom level 0 at S position `s` (already exposed and thresholded). The chain covers the
@@ -189,7 +244,7 @@ fn fs_composite(in: FullscreenOut) -> @location(0) vec4<f32> {
     if (transparent && a > 1.0 / 255.0) {
         rgb = rgb / a;
     }
-    rgb = rgb * post.exposure.x;
+    rgb = rgb * post_exposure();
     // Bloom is in exposed units (the prefilter exposed it): added after exposure, never exposed
     // twice. Transparent groups weight it by alpha below (no haze where nothing was drawn).
     if (post_has(S3D_POST_BLOOM)) {
@@ -203,7 +258,16 @@ fn fs_composite(in: FullscreenOut) -> @location(0) vec4<f32> {
     if (post_has(S3D_POST_VIGNETTE)) {
         rgb = rgb * post_vignette((in.pos.xy - post.out_rect.xy) / post.out_rect.zw);
     }
+    let uv = (in.pos.xy - post.out_rect.xy) / post.out_rect.zw;
+    if (post_has(S3D_POST_GRADE)) {
+        rgb = post_grade_hdr(rgb);
+    }
+    rgb = post_hdr_hook(rgb, uv);
     rgb = s3d_tonemap(post.flags.y, rgb);
+    if (post_has(S3D_POST_GRADE_LDR | S3D_POST_LUT)) {
+        rgb = post_grade_ldr(rgb);
+    }
+    rgb = post_ldr_hook(rgb, uv);
     if (post.flags.z != 0u) {
         rgb = post_finish(rgb, in.pos.xy);
     }
@@ -212,3 +276,8 @@ fn fs_composite(in: FullscreenOut) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(rgb, a);
 }
+
+// Grading hooks (`ColorGrading::shader`): `post_hdr_hook` (linear HDR, before the tonemapper) and
+// `post_ldr_hook` (display-linear, after the LUT), `fn(c: vec3<f32>, uv: vec2<f32>) ->
+// vec3<f32>` with `uv` 0..1 over the post group's rect. Identity unless a hook shader defines them.
+//#HOOKS

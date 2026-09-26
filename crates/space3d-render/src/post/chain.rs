@@ -5,11 +5,13 @@
 
 use super::PostGroupPlan;
 use super::api::{BloomComposite, FilmGrain};
+use super::grading;
 use crate::node::FrameMode;
 use crate::output::{Tonemapper, pcg};
 use bytemuck::{Pod, Zeroable};
 
-/// Effect bits of `PostParams::flags.x` (composite.wgsl `S3D_POST_*`).
+/// Effect bits of `PostParams::flags.x` (composite.wgsl `S3D_POST_*`). `GRADE`: white balance
+/// × saturation and contrast (HDR); `GRADE_LDR`: lift/gamma/gain (display); `LUT`: the 3D LUT.
 #[allow(dead_code, reason = "the post area (PO1–PO5) sets the effect bits")]
 pub(crate) mod bits {
     pub const BLOOM: u32 = 1;
@@ -24,6 +26,7 @@ pub(crate) mod bits {
     pub const TRANSPARENT: u32 = 512;
     pub const SCENE_ALPHA: u32 = 1024;
     pub const EXACT: u32 = 2048;
+    pub const GRADE_LDR: u32 = 4096;
 }
 
 /// Matches `PostParams` in composite.wgsl: one 256-byte uniform slot per post group. Nothing in
@@ -39,7 +42,8 @@ pub(crate) struct GpuPost {
     pub src_rect: [f32; 4],
     /// 1/S.w, 1/S.h, rect aspect (w/h), D height in pixels.
     pub src_texel: [f32; 4],
-    /// Linear exposure multiplier, -, bloom intensity, bloom mode (0 additive, 1 energy).
+    /// Linear exposure multiplier (the compensation with auto exposure), -, bloom intensity,
+    /// bloom mode (0 additive, 1 energy).
     pub exposure: [f32; 4],
     pub vignette: [f32; 4],
     pub vignette_color: [f32; 4],
@@ -47,10 +51,13 @@ pub(crate) struct GpuPost {
     pub grain: [f32; 4],
     /// White balance × saturation (three std140 columns).
     pub grade_matrix: [[f32; 4]; 3],
+    /// Lift (rgb), contrast.
     pub lift_contrast: [f32; 4],
+    /// 1 / gamma (rgb), LUT contribution.
     pub gamma_lut: [f32; 4],
+    /// Gain (rgb), LUT size N.
     pub gain_lut: [f32; 4],
-    /// Effect bits ([`bits`]), tonemapper id, -, -.
+    /// Effect bits ([`bits`]), tonemapper id, 1 = last pass, 1 = the LUT texture is sRGB.
     pub flags: [u32; 4],
     /// Reserved (zero): the seeds moved to the seed window (`post_seeds` in composite.wgsl).
     pub frame: [u32; 4],
@@ -70,11 +77,29 @@ pub(crate) fn grain_seed(seed: u32, animated: bool, frame: u64) -> u32 {
     if animated { pcg(seed ^ frame as u32) } else { seed }
 }
 
+/// What a post group's composite does besides the settings' own switches this frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct CompositePlan {
+    /// Its bloom chain is recorded.
+    pub bloom: bool,
+    /// The composite writes the LDR intermediate and the FXAA pass finishes (grain, dither,
+    /// encoding).
+    pub fxaa: bool,
+    /// The exposure is metered (the composite multiplies by 2^E).
+    pub auto_exposure: bool,
+    /// A usable LUT: size N, the texture is sRGB.
+    pub lut: Option<(u32, bool)>,
+}
+
 impl GpuPost {
-    /// Parameters of one post group; `bloom`: its bloom chain is recorded this frame; `fxaa`:
-    /// the composite writes the LDR intermediate and the FXAA pass finishes (grain, dither,
-    /// encoding). Its seeds: [`SeedKey::of`].
-    pub(crate) fn new(plan: &PostGroupPlan, bloom: bool, fxaa: bool) -> Self {
+    /// Parameters of one post group (see [`CompositePlan`]). Its seeds: [`SeedKey::of`].
+    pub(crate) fn new(plan: &PostGroupPlan, c: CompositePlan) -> Self {
+        let CompositePlan {
+            bloom,
+            fxaa,
+            auto_exposure,
+            lut,
+        } = c;
         let s = &plan.settings;
         // The passthrough group is a plain copy and upscale: no effect.
         let effects = !plan.passthrough;
@@ -153,8 +178,39 @@ impl GpuPost {
                 0.0,
             ];
         }
-        p.grade_matrix = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
-        p.flags = [flags, tonemapper.id(), u32::from(!fxaa), 0];
+        if hdr && auto_exposure {
+            flags |= bits::AUTO_EXPOSURE;
+        }
+        let g = &s.color_grading;
+        let m = if effects && grading::hdr_active(g) {
+            flags |= bits::GRADE;
+            p.lift_contrast[3] = grading::contrast(g);
+            grading::hdr_matrix(g)
+        } else {
+            p.lift_contrast[3] = 1.0;
+            glam::Mat3::IDENTITY
+        };
+        p.grade_matrix = [m.x_axis, m.y_axis, m.z_axis].map(|c| [c.x, c.y, c.z, 0.0]);
+        let inverse_gamma = grading::inverse_gamma(g);
+        if effects && grading::ldr_active(g) {
+            flags |= bits::GRADE_LDR;
+            let lift = if g.lift.is_finite() { g.lift } else { glam::Vec3::ZERO };
+            let gain = if g.gain.is_finite() { g.gain } else { glam::Vec3::ONE };
+            p.lift_contrast[..3].copy_from_slice(&lift.to_array());
+            p.gain_lut[..3].copy_from_slice(&gain.to_array());
+            p.gamma_lut[..3].copy_from_slice(&inverse_gamma.to_array());
+        } else {
+            p.gain_lut[..3].copy_from_slice(&[1.0; 3]);
+            p.gamma_lut[..3].copy_from_slice(&[1.0; 3]);
+        }
+        let mut lut_srgb = 0;
+        if let (true, Some((n, srgb)), Some(l)) = (effects, lut, g.lut) {
+            flags |= bits::LUT;
+            p.gamma_lut[3] = l.contribution.clamp(0.0, 1.0);
+            p.gain_lut[3] = n as f32;
+            lut_srgb = u32::from(srgb);
+        }
+        p.flags = [flags, tonemapper.id(), u32::from(!fxaa), lut_srgb];
         p
     }
 }
@@ -217,6 +273,10 @@ mod tests {
         assert_eq!(offset("frame"), std::mem::offset_of!(GpuPost, frame));
         for (name, bit) in [
             ("S3D_POST_BLOOM", bits::BLOOM),
+            ("S3D_POST_AUTO_EXPOSURE", bits::AUTO_EXPOSURE),
+            ("S3D_POST_GRADE", bits::GRADE),
+            ("S3D_POST_GRADE_LDR", bits::GRADE_LDR),
+            ("S3D_POST_LUT", bits::LUT),
             ("S3D_POST_DITHER", bits::DITHER),
             ("S3D_POST_TRANSPARENT", bits::TRANSPARENT),
             ("S3D_POST_SCENE_ALPHA", bits::SCENE_ALPHA),

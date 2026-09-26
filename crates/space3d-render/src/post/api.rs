@@ -5,8 +5,9 @@
 //! works); enums are `#[non_exhaustive]`. A camera with an enabled `PostProcess` renders through
 //! its target group's scene texture (HDR, or the Ldr fallback) and the composite: exposure
 //! (manual), the tonemapper and dither work since the frame milestone F4, bloom since PO1, FXAA,
-//! vignette, chromatic aberration and film grain since PO3; auto exposure, grading and
-//! distortion arrive with the post milestones PO2, PO4 and PO5 (docs/graphics/post.md).
+//! vignette, chromatic aberration and film grain since PO3, auto exposure since PO2, color
+//! grading (white balance, saturation, contrast, lift/gamma/gain, 3D LUTs, WGSL hooks) since
+//! PO4; the distortion apply arrives with PO5 (docs/graphics/post.md).
 
 use crate::assets::{AddressMode, FilterMode, SamplerSettings, TextureSource};
 use crate::handles::{ShaderHandle, TextureHandle};
@@ -196,23 +197,33 @@ impl PostProcess {
 }
 
 /// Histogram-based automatic exposure: the metered exposure maps the (percentile-filtered)
-/// average scene luminance to middle grey (0.18), is clamped to `min_ev..=max_ev`, then
-/// [`PostProcess::exposure`] is added as compensation.
+/// log-average luminance of the post group's rect to middle grey (0.18), is clamped to
+/// `min_ev..=max_ev`, then [`PostProcess::exposure`] is added as compensation. Black pixels
+/// (below 2⁻¹⁶) are not metered, so a starfield on black is exposed for its stars and ships, not
+/// for the void; a frame with nothing metered holds the exposure.
+///
+/// Works in Hdr mode (off in the Ldr fallback, warned once). Uses a compute histogram where the
+/// device has compute (`GraphicsCaps::compute_histogram`), else a chain of render passes
+/// (WebGL2) without the percentile filter. The first frame of a camera snaps to the metered
+/// value (a one-shot capture is exposed correctly), then it adapts with `FrameInfo::delta`:
+/// deterministic under `App::step_ticks`, frozen when `Time::frame` does not advance.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AutoExposure {
     /// Default false.
     pub enabled: bool,
-    /// Lowest metered exposure in stops. Default −8.
+    /// Lowest metered exposure in stops (how far a bright scene is darkened). Default −8.
     pub min_ev: f32,
-    /// Highest metered exposure in stops. Default 8.
+    /// Highest metered exposure in stops (how far a dark scene is brightened). Default 8.
     pub max_ev: f32,
-    /// Adaptation rate (1/s, exponential) when the scene gets brighter. Default 3.
+    /// Adaptation rate (1/s) when the scene gets brighter: each frame closes
+    /// `1 − 2^(−dt · rate)` of the gap (at 3, 7/8 of it in a second). Default 3.
     pub adapt_to_bright: f32,
     /// Adaptation rate (1/s) when the scene gets darker. Default 1.
     pub adapt_to_dark: f32,
-    /// Fraction of the darkest samples ignored (compute path). Default 0.10.
+    /// Fraction of the darkest metered samples ignored (compute path). Default 0.10.
     pub low_percentile: f32,
-    /// Fraction below which samples count (compute path). Default 0.90.
+    /// Metered samples above this fraction (the brightest: light sources, sparks) are ignored
+    /// (compute path). Default 0.90.
     pub high_percentile: f32,
     /// Sample weighting. Default `CenterWeighted`.
     pub metering: Metering,
@@ -547,28 +558,39 @@ pub const DISTORTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uno
 /// `distortion_depth_fade(frag_position, db_size, softness)`. Blend One/One.
 pub const DISTORTION_WGSL: &str = include_str!("../shaders/post/distortion.wgsl");
 
-/// Grading in the composite: white balance → saturation → contrast (linear HDR) → tonemap →
-/// lift/gamma/gain → LUT → hook (display space).
+/// Grading in the composite (no extra pass): white balance → saturation → contrast (linear HDR,
+/// before the tonemapper) → `post_hdr_hook` → tonemap → lift/gamma/gain → LUT (sRGB-encoded
+/// display space) → `post_ldr_hook`. Neutral values cost nothing; in the Ldr fallback everything
+/// runs on the already tonemapped display colors.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorGrading {
-    /// −1 (cool) ..1 (warm). Default 0.
+    /// White balance, −1 (cooler) .. 1 (warmer): a von Kries adaptation in LMS along the daylight
+    /// locus. Default 0.
     pub temperature: f32,
     /// Green (−1) .. magenta (1). Default 0.
     pub tint: f32,
-    /// 0 = grey, 1 = unchanged. Default 1.
+    /// 0 = grey, 1 = unchanged, > 1 more saturated (around Rec. 709 luma). Default 1.
     pub saturation: f32,
-    /// Around middle grey in log2 space. Default 1.
+    /// Contrast around middle grey (0.18) in log2 space: `0.18 · (c / 0.18)^contrast` per
+    /// channel. Default 1.
     pub contrast: f32,
-    /// ASC-CDL offset (display space). Default 0.
+    /// ASC-CDL offset, added after `gain` on the sRGB-encoded display color (0.05 lifts the
+    /// blacks by about 5 %). Default 0.
     pub lift: Vec3,
-    /// ASC-CDL power. Default 1.
+    /// Midtone gamma: the encoded color is raised to `1 / gamma` after lift and gain (> 1
+    /// brightens the midtones, black and white stay). Default 1.
     pub gamma: Vec3,
-    /// ASC-CDL slope. Default 1.
+    /// ASC-CDL slope: multiplies the sRGB-encoded display color. Default 1.
     pub gain: Vec3,
-    /// Optional 3D LUT (strip texture), applied in sRGB-encoded display space.
+    /// Optional 3D LUT (strip texture), applied to the sRGB-encoded display color.
     pub lut: Option<ColorLut>,
-    /// Optional WGSL hook (a `CustomShader` defining `post_hdr_hook` and/or `post_ldr_hook`,
-    /// `fn(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32>`). Invalid hooks fall back to identity.
+    /// Optional WGSL hooks: a [`crate::CustomShader`] (registered with
+    /// `RenderAssets::add_shader`) defining `post_hdr_hook` (linear HDR, before the tonemapper)
+    /// and/or `post_ldr_hook` (display-linear 0..1, after the LUT), both
+    /// `fn(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32>` with `uv` 0..1 over the camera's rect. It
+    /// may use the composite's helpers (`s3d_luma`, `s3d_linear_to_srgb`, …) but not declare
+    /// resources. A hook that fails to build is replaced by identity, reported by
+    /// `Renderer::shader_error`.
     pub shader: Option<ShaderHandle>,
 }
 
@@ -595,13 +617,16 @@ impl ColorGrading {
     }
 }
 
-/// A 3D LUT stored as an N²×N strip texture (slice b at x ∈ [b·N, (b+1)·N)), indexed by
-/// sRGB-encoded color.
+/// A 3D LUT stored as an N²×N strip texture (blue slice b at x ∈ [b·N, (b + 1)·N), red along x
+/// inside it, green along y), indexed by the sRGB-encoded display color and returning one. An
+/// sRGB-format strip (a PNG loaded with `RenderAssets::add_image`) is re-encoded after sampling,
+/// so it behaves like a linear upload ([`ColorLut::identity`], [`ColorLut::from_cube`]). A strip
+/// whose size is not N²×N (or an array texture) is ignored, warned once.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorLut {
     /// The strip texture.
     pub texture: TextureHandle,
-    /// N (16, 32 or 64).
+    /// N (2..=64; 16, 32 or 64 typically).
     pub size: u32,
     /// 0..1 blend between ungraded and graded. Default 1.
     pub contribution: f32,
@@ -643,10 +668,13 @@ impl ColorLut {
         }
     }
 
-    /// Parse an Adobe/Resolve `.cube` 3D LUT (`LUT_3D_SIZE` ≤ 64) into an `Rgba16Float` strip.
+    /// Parse an Adobe/Resolve `.cube` 3D LUT (`LUT_3D_SIZE` 2..=64; a `DOMAIN_MIN`/`DOMAIN_MAX`
+    /// or `LUT_3D_INPUT_RANGE` other than 0..1 is resampled onto 0..1) into an `Rgba16Float`
+    /// strip (no mips, clamped linear sampler). Register it with `RenderAssets::add_texture` and
+    /// pass the handle to [`ColorLut::new`] with the file's size. `.cube` LUTs map
+    /// display-encoded colors to display-encoded colors, which is how the composite applies them.
     pub fn from_cube(text: &str) -> Result<TextureSource, LutError> {
-        let _ = text; // STUB(P-POST): the parser lands with PO4
-        Err(LutError::MissingSize)
+        super::lut::parse_cube(text)
     }
 }
 
