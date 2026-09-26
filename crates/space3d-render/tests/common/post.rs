@@ -2206,3 +2206,228 @@ pub mod distortion {
         assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
     }
 }
+
+/// Post hardening (PO6) test bodies: GPU timing labels, pass and memory counts, resizes and
+/// device loss with every effect on.
+pub mod hardening {
+    use super::distortion::{quad_at, writer};
+    use super::*;
+
+    const BLACK: Vec4 = Vec4::new(0.0, 0.0, 0.0, 1.0);
+
+    fn stats(app: &App) -> RenderStats {
+        app.resources.expect::<RenderStats>().clone()
+    }
+
+    /// Every post effect at once: auto exposure (instant), bloom, FXAA, vignette, chromatic
+    /// aberration, grain, grading with a LUT and a distortion writer, over a small lit and
+    /// emissive scene. Returns the camera.
+    pub fn all_post(app: &mut App) -> Entity {
+        quad_at(app, 0.4, Vec3::new(-0.5, 0.2, -1.0), Vec2::new(1.2, 0.8));
+        quad_at(app, 6.0, Vec3::new(0.6, -0.3, -1.0), Vec2::splat(0.2));
+        quad_at(app, 0.1, Vec3::new(0.0, 0.0, -2.0), Vec2::new(6.0, 3.0));
+        let lut = app
+            .resources
+            .expect_mut::<RenderAssets>()
+            .add_texture(ColorLut::identity(16));
+        let mut p = PostProcess::cinematic()
+            .with_auto_exposure(AutoExposure::on().instant())
+            .with_color_grading(ColorGrading {
+                temperature: 0.2,
+                saturation: 1.1,
+                lut: Some(ColorLut::new(lut, 16)),
+                ..ColorGrading::default()
+            });
+        p.distortion.chromatic = 0.3;
+        let cam = camera(app, 0.0, BLACK, Some(p));
+        writer(
+            app,
+            Vec3::ZERO,
+            Vec2::ONE,
+            DistortionMaterial {
+                strength: 0.03,
+                mode: DistortionMode::Radial { inner: 0.2, outer: 0.5 },
+                ..DistortionMaterial::default()
+            },
+        );
+        cam
+    }
+
+    /// Every post pass writes GPU timestamps under its spec §4.4 label, for its camera:
+    /// `post.exposure` (the compute pass, or one span over the render-pass chain),
+    /// `post.bloom` (one span over the chain), `post.composite`, `post.fxaa`, and the frame's
+    /// `distortion`. Skipped without `TIMESTAMP_QUERY`.
+    pub fn post_gpu_timings_are_labelled(make: MakeApp) {
+        let Some(mut app) = make(320, 180) else { return };
+        if !app.resources.expect::<Renderer>().graphics_caps().timestamps {
+            eprintln!("skipping: no TIMESTAMP_QUERY");
+            return;
+        }
+        let cam = all_post(&mut app);
+        app.resources.expect_mut::<FrameSettings>().gpu_timing = true;
+        for no_compute in [false, true] {
+            app.resources.expect_mut::<FrameSettings>().downlevel.no_compute = no_compute;
+            for _ in 0..6 {
+                render(&mut app);
+            }
+            let t = app.resources.expect::<GpuTimings>().clone();
+            eprintln!("no_compute {no_compute}: {:?}", t.scopes);
+            for label in [
+                "post.exposure",
+                "post.bloom",
+                "post.composite",
+                "post.fxaa",
+                "distortion",
+            ] {
+                let scope = t.scopes.iter().find(|s| s.label == label);
+                let scope = scope.unwrap_or_else(|| panic!("no `{label}` scope in {:?}", t.scopes));
+                assert_eq!(scope.camera, Some(cam), "{label}");
+                assert!(scope.ms >= 0.0 && scope.ms < 100.0, "{label}: {} ms", scope.ms);
+            }
+            let exposure = t.scopes.iter().filter(|s| s.label == "post.exposure").count();
+            assert_eq!(exposure, 1, "one exposure scope per group (a span over the chain)");
+        }
+    }
+
+    /// Pass and memory counts at 1920 × 1080 (spec §4.4, design-post §5.6): the composite alone
+    /// is one post pass; bloom adds the 6-level chain (11 passes, 2.76 MB of `Rg11b10Ufloat` or
+    /// twice that in `Rgba16Float`); auto exposure one compute pass (4 render passes, 1.1 MB of
+    /// levels on the render-pass path); FXAA one pass and the 8.3 MB LDR intermediate; distortion
+    /// one Distortion pass and its 2.1 MB half-resolution buffer (8.3 MB at full resolution).
+    pub fn post_pass_and_memory_counts(make: MakeApp) {
+        let Some(mut app) = make(1920, 1080) else { return };
+        quad_at(&mut app, 6.0, Vec3::new(0.3, 0.2, -1.0), Vec2::splat(0.3));
+        let minimal = PostProcess {
+            dither: true,
+            ..PostProcess::default().without_bloom()
+        };
+        let cam = camera(&mut app, 0.0, BLACK, Some(minimal));
+        let caps = app.resources.expect::<Renderer>().graphics_caps().clone();
+        let measure = |app: &mut App, p: PostProcess| {
+            set_post(app, cam, p);
+            render(app);
+            render(app);
+            let s = stats(app);
+            assert_eq!((s.textures_created, s.cpu_reallocations), (0, 0), "{s:?}");
+            s
+        };
+        let base = measure(&mut app, minimal);
+        assert_eq!(
+            (base.post_passes, base.distortion_passes, base.compute_passes),
+            (1, 0, 0)
+        );
+        let bloom = measure(&mut app, minimal.with_bloom(Bloom::glow()));
+        assert_eq!(bloom.post_passes, 12, "prefilter, 5 down, 5 up, composite");
+        let chain_px: u64 = [(960, 540), (480, 270), (240, 135), (120, 67), (60, 33), (30, 16)]
+            .iter()
+            .map(|&(w, h)| w * h)
+            .sum();
+        let texel = match caps.bloom_format {
+            Some(wgpu::TextureFormat::Rg11b10Ufloat) => 4,
+            _ => 8,
+        };
+        assert_eq!(
+            bloom.target_bytes - base.target_bytes,
+            chain_px * texel,
+            "the bloom chain"
+        );
+        let compute = caps.compute_histogram && caps.exposure_format == Some(wgpu::TextureFormat::R32Float);
+        let ae = measure(
+            &mut app,
+            minimal.with_bloom(Bloom::glow()).with_auto_exposure(AutoExposure::on()),
+        );
+        if compute {
+            assert_eq!((ae.post_passes, ae.compute_passes), (12, 1));
+            assert_eq!(ae.target_bytes, bloom.target_bytes, "no pooled levels");
+        } else {
+            // 480 × 270 → 60 × 34 → 8 × 5, then the adapt pass.
+            assert_eq!(ae.post_passes, 16);
+            let levels: u64 = 480 * 270 + 60 * 34 + 8 * 5;
+            assert_eq!(ae.target_bytes - bloom.target_bytes, levels * 8);
+        }
+        let fxaa = measure(&mut app, minimal.with_fxaa(FxaaQuality::Medium));
+        assert_eq!(fxaa.post_passes, 2);
+        assert_eq!(
+            fxaa.target_bytes - base.target_bytes,
+            1920 * 1080 * 4,
+            "the LDR intermediate"
+        );
+        writer(&mut app, Vec3::ZERO, Vec2::ONE, DistortionMaterial::default());
+        let half = measure(&mut app, minimal);
+        assert_eq!((half.post_passes, half.distortion_passes), (1, 1));
+        assert_eq!(
+            half.target_bytes - base.target_bytes,
+            960 * 540 * 4,
+            "half-resolution buffer"
+        );
+        let mut full = minimal;
+        full.distortion.resolution = DistortionResolution::Full;
+        set_post(&mut app, cam, full);
+        render(&mut app);
+        assert_eq!(stats(&app).textures_created, 1, "the buffer is resized once");
+        let full = measure(&mut app, full);
+        assert_eq!(full.target_bytes - base.target_bytes, 1920 * 1080 * 4);
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// `resize_reallocates_once_and_stays_bounded`: 30 resizes with every effect on. Each new
+    /// size reallocates on its first frame only (the next frame creates no texture and
+    /// reallocates nothing), the targets in use stay within a fixed budget per pixel (scene,
+    /// depth, output, bloom chain, LDR intermediate, distortion buffer), and back at the first
+    /// size the frame uses exactly the memory it used before: nothing leaks.
+    pub fn resize_reallocates_once_and_stays_bounded(make: MakeApp) {
+        let Some(mut app) = make(320, 180) else { return };
+        all_post(&mut app);
+        render(&mut app);
+        render(&mut app);
+        let first = stats(&app).target_bytes;
+        for i in 0..30u32 {
+            let (w, h) = (160 + (i * 37) % 320, 90 + (i * 23) % 200);
+            app.resources.expect_mut::<Renderer>().resize(w, h);
+            let img = render(&mut app);
+            assert_eq!((img.width, img.height), (w, h));
+            assert!(stats(&app).textures_created > 0, "{w} × {h}: reallocated");
+            render(&mut app);
+            let s = stats(&app);
+            assert_eq!((s.textures_created, s.cpu_reallocations), (0, 0), "{w} × {h}: once");
+            // Rgba16Float scene 8 + depth 4 + output 4 + LDR 4 + distortion 1 + bloom ≤ 2 bytes
+            // per pixel, and 64 KiB for the small targets.
+            let budget = 24 * w as u64 * h as u64 + (64 << 10);
+            assert!(s.target_bytes <= budget, "{w} × {h}: {} bytes", s.target_bytes);
+        }
+        app.resources.expect_mut::<Renderer>().resize(320, 180);
+        render(&mut app);
+        render(&mut app);
+        assert_eq!(stats(&app).target_bytes, first, "back at 320 × 180");
+        assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+    }
+
+    /// A lost device with every effect on (auto exposure read back, bloom, FXAA, grading, LUT,
+    /// distortion meshes) degrades like the rest of the renderer: frames are dropped and
+    /// captures fail, without a panic or a hang.
+    pub fn a_lost_device_degrades_with_every_effect(make: MakeApp) {
+        let Some(mut app) = make(160, 90) else { return };
+        app.resources.expect_mut::<FrameSettings>().read_exposure = true;
+        let cam = all_post(&mut app);
+        render(&mut app);
+        app.resources.expect::<Renderer>().device().destroy();
+        for _ in 0..3 {
+            app.run_stage(Stage::Render);
+        }
+        assert!(render_to_image(&mut app).is_none());
+        // New writers, textures and settings after the loss.
+        writer(
+            &mut app,
+            Vec3::new(0.5, 0.0, 0.0),
+            Vec2::ONE,
+            DistortionMaterial::default(),
+        );
+        set_post(&mut app, cam, PostProcess::default().with_fxaa(FxaaQuality::High));
+        app.resources.expect_mut::<Renderer>().resize(200, 100);
+        for _ in 0..3 {
+            app.run_stage(Stage::Render);
+        }
+        let _ = app.resources.expect::<Renderer>().camera_exposure(cam);
+        assert!(render_to_image(&mut app).is_none());
+    }
+}

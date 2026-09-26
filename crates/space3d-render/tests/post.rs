@@ -1,6 +1,7 @@
 //! Post-processing effects (graphics spec §5.2 P-POST) on the default backend: bloom (PO1), auto
 //! exposure (PO2), FXAA, vignette, chromatic aberration and film grain (PO3), color grading, 3D
-//! LUTs and grading hooks (PO4).
+//! LUTs and grading hooks (PO4), hardening (PO6: GPU timings, pass and memory counts, resizes,
+//! device loss). Distortion (PO5) is in `tests/post_distortion.rs`.
 //! The bodies live in `common/post.rs` (`cases`), shared with the GL run (`tests/gl_post.rs`);
 //! `WGPU_BACKEND=gl` runs this file on GL too.
 
@@ -9,7 +10,7 @@ mod common;
 mod post_common;
 
 use common::headless_app;
-use post_common::cases;
+use post_common::{cases, hardening};
 
 #[test]
 fn bloom_only_above_threshold() {
@@ -165,4 +166,24 @@ fn lut_changes_colors() {
 #[test]
 fn invalid_grading_hook_falls_back() {
     cases::invalid_grading_hook_falls_back(headless_app);
+}
+
+#[test]
+fn post_gpu_timings_are_labelled() {
+    hardening::post_gpu_timings_are_labelled(headless_app);
+}
+
+#[test]
+fn post_pass_and_memory_counts() {
+    hardening::post_pass_and_memory_counts(headless_app);
+}
+
+#[test]
+fn resize_reallocates_once_and_stays_bounded() {
+    hardening::resize_reallocates_once_and_stays_bounded(headless_app);
+}
+
+#[test]
+fn a_lost_device_degrades_with_every_effect() {
+    hardening::a_lost_device_degrades_with_every_effect(headless_app);
 }

@@ -712,11 +712,14 @@ impl Meters {
                         (&cx.pool.get(levels[pass_index]).view, &meter.reduce)
                     };
                     // One `post.exposure` scope spans the chain's passes.
-                    let timestamp_writes = span.map(|(query_set, begin, end)| wgpu::RenderPassTimestampWrites {
-                        query_set,
-                        beginning_of_pass_write_index: (pass_index == 0).then_some(begin),
-                        end_of_pass_write_index: (pass_index == n).then_some(end),
-                    });
+                    // (Passes in between write none: wgpu rejects writes with neither index.)
+                    let timestamp_writes =
+                        span.filter(|_| pass_index == 0 || pass_index == n)
+                            .map(|(query_set, begin, end)| wgpu::RenderPassTimestampWrites {
+                                query_set,
+                                beginning_of_pass_write_index: (pass_index == 0).then_some(begin),
+                                end_of_pass_write_index: (pass_index == n).then_some(end),
+                            });
                     let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("space3d exposure"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {

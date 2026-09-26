@@ -1,8 +1,9 @@
 //! Steady-state heap allocations of the render stage with post effects (graphics spec §4.4
 //! "Passes and wgpu allocations"): bloom on one post camera, on two split-screen post cameras
 //! sharing one pooled chain, every PO1/PO3 effect (`PostProcess::cinematic()`), auto exposure
-//! on both metering paths with the exposure readback (PO2), and color grading with a LUT and a
-//! hook shader (PO4). The renderer's own work allocates nothing (`cpu_reallocations == 0`,
+//! on both metering paths with the exposure readback (PO2), color grading with a LUT and a
+//! hook shader (PO4), distortion meshes (a moving heat haze and shockwave, PO5) and every
+//! effect at once (PO6). The renderer's own work allocates nothing (`cpu_reallocations == 0`,
 //! `textures_created == 0`); what remains is wgpu's bookkeeping, about 20 allocations per render
 //! pass on Metal. Each mode is pinned to its measured bound (+10 %) and must not grow over time,
 //! at 320 × 180 (a 3-level bloom chain) and at 1920 × 1080 (the 6-level chain of 1080p and
@@ -65,6 +66,8 @@ fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
         "auto exposure" => MEASURED_AE * 11 / 10,
         "auto exposure (render passes)" => MEASURED_AE_PASSES * 11 / 10,
         "graded" => MEASURED_GRADED * 11 / 10,
+        "distortion" => MEASURED_DISTORTION * 11 / 10,
+        "all post" => MEASURED_ALL * 11 / 10,
         _ => MEASURED_SPLIT * 11 / 10,
     };
     if backend == wgpu::Backend::Metal {
@@ -98,6 +101,12 @@ const MEASURED_AE_PASSES: u64 = 308;
 /// Bloom with white balance, saturation, contrast, lift/gamma/gain, an identity LUT and a
 /// grading hook: the same passes and allocations as bloom.
 const MEASURED_GRADED: u64 = 234;
+/// Bloom with two `DistortionMaterial` meshes moving every frame (their instances re-uploaded
+/// through the staging ring): 33 over bloom for the Distortion pass and its two draws.
+const MEASURED_DISTORTION: u64 = 267;
+/// Everything: auto exposure (compute, read back), bloom, FXAA, vignette, chromatic aberration,
+/// grain, grading with a LUT, and the distortion meshes (9 render passes, 1 compute pass).
+const MEASURED_ALL: u64 = 351;
 
 #[test]
 fn bloom_allocates_a_small_constant_amount() {
@@ -125,6 +134,10 @@ fn bloom_allocates_a_small_constant_amount() {
         for &e in &movers {
             app.world.get::<&mut Transform>(e).unwrap().translation.y += dy;
         }
+        // Distortion meshes move too: their instances are uploaded every frame.
+        for (_, t) in app.world.query_mut::<(&DistortionMaterial, &mut Transform)>() {
+            t.translation.x += dy;
+        }
         space3d_core::transform::propagate_transforms(&mut app.world);
         let a0 = ALLOCS.load(Relaxed);
         app.run_stage(Stage::Render);
@@ -137,7 +150,7 @@ fn bloom_allocates_a_small_constant_amount() {
         counted
     };
     type Setup = fn(&mut App, Entity, Entity);
-    let modes: [(&str, Setup); 7] = [
+    let modes: [(&str, Setup); 9] = [
         ("bloom", |app, cam, _| {
             app.world.insert_one(cam, PostProcess::default()).unwrap();
         }),
@@ -189,7 +202,62 @@ fn bloom_allocates_a_small_constant_amount() {
                 .insert_one(cam, PostProcess::default().with_color_grading(grading))
                 .unwrap();
         }),
+        ("distortion", |app, cam, _| {
+            app.world.insert_one(cam, PostProcess::default()).unwrap();
+            let plane = app
+                .resources
+                .expect_mut::<RenderAssets>()
+                .add_mesh(MeshData::plane(1.0));
+            let facing = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+            for (x, material) in [
+                (-1.0, DistortionMaterial::default()),
+                (
+                    1.0,
+                    DistortionMaterial {
+                        strength: 0.04,
+                        mode: DistortionMode::Radial { inner: 0.2, outer: 0.5 },
+                        ..DistortionMaterial::default()
+                    },
+                ),
+            ] {
+                app.world.spawn((
+                    Transform::from_xyz(x, 0.0, 1.0)
+                        .with_rotation(facing)
+                        .with_scale(Vec3::splat(2.0)),
+                    Mesh3d(plane),
+                    material,
+                ));
+            }
+        }),
+        ("all post", |app, cam, _| {
+            app.resources.expect_mut::<FrameSettings>().read_exposure = true;
+            let lut = app
+                .resources
+                .expect_mut::<RenderAssets>()
+                .add_texture(ColorLut::identity(16));
+            let grading = ColorGrading {
+                temperature: 0.2,
+                saturation: 1.2,
+                lut: Some(ColorLut::new(lut, 16)),
+                ..ColorGrading::default()
+            };
+            let mut p = PostProcess::cinematic()
+                .with_auto_exposure(AutoExposure::on())
+                .with_color_grading(grading);
+            p.distortion.chromatic = 0.3;
+            app.world.insert_one(cam, p).unwrap();
+        }),
         ("bloom 1080p", |app, cam, _| {
+            app.resources.expect_mut::<FrameSettings>().read_exposure = false;
+            let writers: Vec<Entity> = app
+                .world
+                .query::<(Entity, &DistortionMaterial)>()
+                .iter()
+                .map(|(e, _)| e)
+                .collect();
+            for e in writers {
+                app.world.despawn(e).unwrap();
+            }
             app.world.insert_one(cam, PostProcess::default()).unwrap();
             app.resources.expect_mut::<Renderer>().resize(1920, 1080);
         }),
@@ -220,6 +288,8 @@ fn bloom_allocates_a_small_constant_amount() {
         let compute = caps.compute_histogram && caps.exposure_format == Some(wgpu::TextureFormat::R32Float);
         let passes = match name {
             "cinematic" => 8,
+            "all post" if !compute => 11,
+            "all post" => 8,
             "bloom 1080p" => 12,
             // Metering by render passes (no compute, e.g. GL): an 80 × 45 level reduced to
             // 10 × 6, then the adapt pass.
@@ -229,6 +299,8 @@ fn bloom_allocates_a_small_constant_amount() {
         };
         assert_eq!(s.post_groups, groups, "{name}");
         assert_eq!(s.post_passes, groups * passes, "{name}");
+        let distortion = u32::from(matches!(name, "distortion" | "all post"));
+        assert_eq!(s.distortion_passes, distortion, "{name}");
 
         let max = *per_frame.iter().max().unwrap();
         let (first, second) = per_frame.split_at(FRAMES / 2);

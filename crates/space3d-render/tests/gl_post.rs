@@ -17,7 +17,7 @@ mod common;
 #[path = "common/post.rs"]
 mod post_common;
 
-use post_common::{cases, distortion};
+use post_common::{cases, distortion, hardening};
 use space3d_core::prelude::*;
 use space3d_render::*;
 use space3d_test::{CompareOptions, compare_images};
@@ -297,4 +297,19 @@ fn gl_distortion_does_not_bleed_across_viewports() {
 #[test]
 fn gl_distortion_steady_state() {
     distortion::distortion_steady_state(gl_app);
+}
+
+#[test]
+fn gl_post_pass_and_memory_counts() {
+    hardening::post_pass_and_memory_counts(gl_app);
+}
+
+#[test]
+fn gl_resize_reallocates_once_and_stays_bounded() {
+    hardening::resize_reallocates_once_and_stays_bounded(gl_app);
+}
+
+#[test]
+fn gl_a_lost_device_degrades_with_every_effect() {
+    hardening::a_lost_device_degrades_with_every_effect(gl_app);
 }
