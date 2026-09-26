@@ -883,8 +883,8 @@ fn builtin_slots() {
         (builtin::EXPLOSION, "explosion", 81),
         (builtin::HIT_SPARK, "hit_spark", 16),
         (builtin::SHIELD_RIPPLE, "shield_ripple", 8),
-        (builtin::WARP_IN, "warp_in", 26),
-        (builtin::WARP_OUT, "warp_out", 26),
+        (builtin::WARP_IN, "warp_in", 27),
+        (builtin::WARP_OUT, "warp_out", 27),
         (builtin::ENGINE_EXHAUST, "engine_exhaust", 237),
         (builtin::LASER_TRAIL, "laser_trail", 581),
     ];
