@@ -299,6 +299,28 @@ pub fn apply_density(style: &mut Style, d: &UiDensity) {
     style.interaction.tooltip_delay = d.tooltip_delay;
 }
 
+/// Scroll bars `bar_width` wide that stay visible while the content overflows, for tool panels:
+/// egui's default floating bars only show on hover, so a clipped list gives no cue that it
+/// continues. The bar keeps a column of its own (it never covers content) and its handle takes
+/// the text color at reduced opacity, so it shows under any palette (a game's translucent widget
+/// fills included). Set it on a `Ui` with `ui.spacing_mut().scroll = visible_scroll_bars(w)`.
+pub fn visible_scroll_bars(bar_width: f32) -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        floating: true,
+        bar_width,
+        floating_width: bar_width,
+        floating_allocated_width: bar_width + 2.0,
+        foreground_color: true,
+        dormant_background_opacity: 0.4,
+        active_background_opacity: 0.5,
+        interact_background_opacity: 0.7,
+        dormant_handle_opacity: 0.45,
+        active_handle_opacity: 0.6,
+        interact_handle_opacity: 0.9,
+        ..egui::style::ScrollStyle::floating()
+    }
+}
+
 /// `base` with the tokens of `d`: spacing, margins, control and icon sizes, default widths,
 /// scroll bar width, text sizes (families kept), corner radii and tooltip delay. Everything
 /// else — colors, fonts, shadows, animation time, text options — is `base`'s, and applying
@@ -418,7 +440,7 @@ impl ThemePreview {
         &self.rects
     }
 
-    /// Width of the panel under `ui`'s style: its "Space [combo] Name [field]" row at the
+    /// Width of the panel under `ui`'s style: its `Space [combo] Name [field]` row at the
     /// style's default combo and text field widths. Every other row fills this width.
     pub fn panel_width(ui: &egui::Ui) -> f32 {
         let s = ui.spacing();
@@ -592,7 +614,7 @@ fn table(ui: &mut egui::Ui, width: f32, row_height: f32, add: &mut impl FnMut(eg
         for (i, (name, kind, kib, time)) in TABLE.into_iter().enumerate() {
             let cells: [egui::WidgetText; 4] = [
                 name.into(),
-                egui::RichText::new(kind).weak().into(),
+                kind.into(),
                 egui::RichText::new(kib.to_string()).monospace().into(),
                 egui::RichText::new(time).monospace().into(),
             ];

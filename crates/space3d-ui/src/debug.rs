@@ -180,6 +180,9 @@ pub(crate) fn hotkeys(sys: &mut SystemCtx, keys: (Option<KeyCode>, Option<KeyCod
     }
 }
 
+/// Egui id of the overlay's area.
+pub(crate) const OVERLAY_ID: &str = "space3d_debug_overlay";
+
 /// Overlay text size (points); its own, so a game's text styles never enlarge it.
 const FONT_SIZE: f32 = 11.0;
 const LABEL: egui::Color32 = egui::Color32::from_gray(150);
@@ -245,19 +248,23 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx, hint: &str) {
     let ui_stats = sys.resources.get::<EguiContext>().map(EguiContext::stats);
     let entities = sys.world.len() as u64;
 
-    egui::Area::new(egui::Id::new("space3d_debug_overlay"))
+    egui::Area::new(egui::Id::new(OVERLAY_ID))
         .anchor(egui::Align2::LEFT_TOP, [6.0, 6.0])
         .order(egui::Order::Foreground)
         .interactable(false)
         .show(&ctx, |ui| {
+            // Nearly opaque: the renderer blends in linear space, where a lighter fill lets
+            // bright scene content wash out the grey labels.
             egui::Frame::new()
-                .fill(egui::Color32::from_black_alpha(200))
+                .fill(egui::Color32::from_black_alpha(235))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(22)))
                 .corner_radius(3)
                 .inner_margin(egui::Margin::symmetric(6, 4))
                 .show(ui, |ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 1.0);
+                    crate::tool::derived_style(ui, "overlay", |style| {
+                        style.wrap_mode = Some(egui::TextWrapMode::Extend);
+                        style.spacing.item_spacing = egui::vec2(4.0, 1.0);
+                    });
                     let width = grid_width(ui);
                     let fps = overlay.fps();
                     // 30 characters, like a grid row.

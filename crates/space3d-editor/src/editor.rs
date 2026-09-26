@@ -437,7 +437,7 @@ impl Tools<'_> {
 }
 
 fn menu_bar(ui: &mut egui::Ui, sys: &mut SystemCtx, t: &mut Tools) {
-    let frame = crate::widgets::panel_frame(ui.style());
+    let frame = crate::widgets::menu_bar_frame(ui.style());
     egui::Panel::top("space3d_editor_menu").frame(frame).show(ui, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
@@ -660,12 +660,7 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                                             );
                                         }
                                         _ => {
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    "Select an entity (hierarchy or click in the viewport).",
-                                                )
-                                                .weak(),
-                                            );
+                                            ui.label("Select an entity (hierarchy or click in the viewport).");
                                         }
                                     }
                                 });
@@ -673,8 +668,9 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                 }
                 viewport = ui.available_rect_before_wrap();
             });
-            t.tex.show(&ctx);
-            t.model.show(&ctx);
+            // Over the viewport: never over the menu bar or the side panels.
+            t.tex.show_in(&ctx, viewport);
+            t.model.show_in(&ctx, viewport);
         } else {
             t.tex.poll_io();
             t.model.poll_io();

@@ -14,16 +14,30 @@ pub(crate) fn panel_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::side_top_panel(style).inner_margin(egui::Margin::symmetric(m.left, m.top))
 }
 
-/// Panel title row: the title in strong body text and optional weak `info` on the right.
+/// Panel title row: the title in strong body text and optional `info` (a count) on the right.
 pub(crate) fn panel_title(ui: &mut egui::Ui, title: &str, info: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).strong());
         if !info.is_empty() {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(info).weak());
+                ui.label(info);
             });
         }
     });
+}
+
+/// Frame for the editor's menu bar: the style's window margin at the sides and 2 pt above and
+/// below, like egui's own top panel frame (one control tall plus 4 pt and the separator line).
+pub(crate) fn menu_bar_frame(style: &egui::Style) -> egui::Frame {
+    let m = style.spacing.window_margin;
+    egui::Frame::side_top_panel(style).inner_margin(egui::Margin::symmetric(m.left, 2))
+}
+
+/// Width of a fixed tool column (texture / model editor) laid out for `base` points at 12.5 pt
+/// text: it grows with the body text size, so bigger fonts keep the same proportions.
+pub(crate) fn tool_column_width(ui: &egui::Ui, base: f32) -> f32 {
+    let body = egui::TextStyle::Body.resolve(ui.style()).size;
+    (base * (body / 12.5).max(1.0)).round()
 }
 
 /// A collapsible section: a full-width header band (toggle icon, clickable `title`, `actions`
@@ -105,16 +119,11 @@ fn property_row<R>(ui: &mut egui::Ui, label: &str, wrap: bool, add: impl FnOnce(
 }
 
 /// Scroll bars that stay visible while the content overflows (egui's floating bars only show
-/// on hover, so a clipped tool panel gives no cue that it continues). Scoped to `ui`.
+/// on hover, so a clipped tool panel gives no cue that it continues), in the style's bar width
+/// ([`space3d_ui::visible_scroll_bars`]). Scoped to `ui`.
 pub(crate) fn visible_scroll_bars(ui: &mut egui::Ui) {
     let width = ui.spacing().scroll.bar_width;
-    ui.spacing_mut().scroll = egui::style::ScrollStyle {
-        bar_width: width,
-        bar_inner_margin: 2.0,
-        dormant_background_opacity: 0.4,
-        dormant_handle_opacity: 0.6,
-        ..egui::style::ScrollStyle::solid()
-    };
+    ui.spacing_mut().scroll = space3d_ui::visible_scroll_bars(width);
 }
 
 /// `value` with the most decimals in `decimals` that fit `room` characters (at least none).
@@ -188,12 +197,19 @@ fn value_box_width(ui: &egui::Ui) -> f32 {
 }
 
 /// A slider filling the rest of the line: the rail takes what the fixed-width value box (the
-/// same in every row, so the boxes line up) leaves. At most 3 decimals, fewer when the value
-/// would not fit the box (integer sliders stay integers).
+/// same in every row, so the boxes line up) leaves. When that would leave the rail shorter than
+/// two control heights (big fonts in a narrow column), the box gives up room first, down to
+/// three digits. At most 3 decimals, fewer when the value would not fit the box (integer
+/// sliders stay integers).
 pub(crate) fn fill_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egui::Response {
-    let value_width = value_box_width(ui);
     let gap = ui.spacing().item_spacing.x;
-    ui.spacing_mut().slider_width = (ui.available_width() - value_width - gap).floor().max(24.0);
+    let available = ui.available_width();
+    let min_rail = 2.0 * ui.spacing().interact_size.y;
+    let value_width = value_box_width(ui)
+        .min(available - gap - min_rail)
+        .max(min_value_box_width(ui))
+        .floor();
+    ui.spacing_mut().slider_width = (available - value_width - gap).floor().max(24.0);
     // The slider's value box is a drag value at least `interact_size.x` wide.
     ui.spacing_mut().interact_size.x = value_width;
     let room = chars_in(ui, value_width);
@@ -201,6 +217,13 @@ pub(crate) fn fill_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egui::
         let (lo, hi) = (*decimals.start(), (*decimals.end()).min(3));
         fit_number(v, lo.min(hi)..=hi, room)
     }))
+}
+
+/// Narrowest slider value box in `ui`: three digits and the button padding.
+fn min_value_box_width(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let digit = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
+    (3.0 * digit + 2.0 * ui.spacing().button_padding.x).ceil()
 }
 
 /// How many digits fit a `width` drag value box in `ui` (inside the button padding).

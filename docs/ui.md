@@ -83,7 +83,10 @@ egui::Grid::new("assets")
 ```
 
 The pure functions are public too: `compact_style(&base, &density) -> egui::Style`,
-`apply_density(&mut style, &density)` and `apply_theme(&ctx, &theme)`.
+`apply_density(&mut style, &density)` and `apply_theme(&ctx, &theme)`. For tool panels,
+`visible_scroll_bars(width)` is a `ScrollStyle` whose bars stay visible while content is hidden,
+keep a column of their own and draw the handle in the text color (so it shows on any palette):
+`ui.spacing_mut().scroll = visible_scroll_bars(8.0)`.
 
 ### How much denser
 
@@ -111,6 +114,17 @@ Size game windows explicitly:
   of the edges);
 * or `.default_width(w)` (with `.resizable(false)` for a fixed width).
 
+```rust
+// A small HUD window as wide as "Salvage: 12 t [Jettison]", not 340 pt.
+egui::Window::new("Cargo hold")
+    .fixed_pos([520.0, 300.0])
+    .auto_sized()
+    .show(ctx, |ui| {
+        ui.label("Salvage: 12 t");
+        let _ = ui.button("Jettison");
+    });
+```
+
 ### Games that style egui themselves
 
 A game that sets egui's `Style` itself (say, once at startup) needs to do nothing: without a
@@ -127,20 +141,26 @@ its own colors and fonts, it has two options:
 The debug overlay (**F3**), profiler (**F4**) and console (**`**) show up inside games, so they
 never read their sizes from the global style and never change it. They are the engine's tools,
 not the app's UI: they are compact **in every app**, with or without a `UiTheme`. Each applies
-the compact density to its own `Ui` only (one cached copy of the style, not one per frame), keeps
-the context's colors, and draws its own compact header (egui's title bar height follows the
-global heading size). Their size and layout are the same under egui's default, the compact theme
-or a game's roomy style; only the window fill and stroke follow the game's colors (story
-`Engine/UI/Tools/Game Style`, `crates/space3d-ui/tests/tools.rs`).
+the compact density to its own `Ui` only (cached copies of the style, none per frame), keeps the
+context's colors, and draws its own compact header (egui's title bar height follows the global
+heading size). Their size and layout are the same under egui's default, the compact theme or a
+game's roomy style; only the colors follow the game's (story `Engine/UI/Tools/Game Style`,
+`crates/space3d-ui/tests/tools.rs`). Text people read — the header summaries, counts, log
+targets — is in the normal text color; weak text (trace / debug log lines, placeholders) is drawn
+at 80 % instead of egui's 60 %, so it stays above 3:1 on the window fill. Scroll bars stay visible
+while content is hidden, with the handle in the text color (`visible_scroll_bars`).
 
 The profiler docks to the top-right corner and the console to the bottom-left, 6 pt in from the
 screen edges (and from each other), and never grow with their contents. The profiler is exactly as
 tall as its contents, up to 45 % of the screen height (at least 300 pt) and never down into the
-open console; its table scrolls by whole rows (no row is ever cut) with a scroll bar that stays
-visible while rows are hidden. The console is 640 × 40 % of the screen (140–360 pt) and wraps long
-lines (paths, backtraces) instead of widening.
+open console; with the debug overlay open beside it (small screens, e.g. 640 × 360 pt at 2x) it
+ends 6 pt right of the overlay, down to 300 pt wide. Its table scrolls by whole rows (no row is
+ever cut). The console is 640 × 40 % of the screen (140–360 pt), a whole number of log lines tall
+(stuck to the newest line, the oldest shown is never a sliver), and wraps long lines (paths,
+backtraces) under their message instead of widening.
 
-* **Debug overlay** (`DebugOverlay`): a small panel at the top-left that never takes the pointer —
+* **Debug overlay** (`DebugOverlay`): a small, nearly opaque panel at the top-left (readable over
+  bright scene content) that never takes the pointer —
   FPS, average and worst frame time, a sparkline of the last 240 frames (60 / 30 Hz guides), and a
   monospace grid of label/value pairs with right-aligned numbers: frame, tick, rate, dropped
   ticks, entities, alpha, draws, triangles, drawn instances, uploaded bytes, egui primitives and
@@ -148,13 +168,16 @@ lines (paths, backtraces) instead of widening.
   `debug details`) adds the draw path, indirect / multi draws, batches, views, culled instances
   and instance bytes.
 * **Profiler** (`Profiler`): header with the last frame's time, span count and a close button;
-  Freeze / Timing toggles; collapsible *Timeline* (flame view) and *Systems* (striped table sorted
-  by average time: a bar of the average, the name — truncated, full name on hover — and
-  right-aligned avg / last / max / calls columns under a fixed header) sections.
+  Freeze / Timing toggles; collapsible, full-width *Timeline* (flame view; names truncated with
+  "…", full name and time on hover) and *Systems* (striped table sorted by average time: a bar of
+  the average, the name — truncated, full name on hover — and right-aligned avg / last / max /
+  calls columns under a fixed header) sections. Names are shortened to their last two path
+  segments, generic arguments to their last (`events::Events<AppExit>`).
   `Profiler::record(FrameTimeline)` aggregates frames from other sources (recordings, replays,
   tests).
-* **Console** (`Console`): level / filter / clear toolbar, one dense monospace line per entry and
-  the command line. `Console::capture_logs = false` keeps only the console's own lines (command
+* **Console** (`Console`): level / filter / clear toolbar (the filter fills the row), one dense
+  monospace line per entry — the level tag in a column of its own, then target and message; a
+  wrapped entry continues under its message — and the command line. `Console::capture_logs = false` keeps only the console's own lines (command
   output and `Console::print`).
 
 ## Engine tools
@@ -169,7 +192,13 @@ into equal cells (axis color bars instead of "x " prefixes) and drop decimals be
 widen it; groups of checkboxes or buttons wrap within the value column. The side panels keep
 their width frame after frame and whatever is selected (hierarchy 160–400 pt, inspector 220–480
 pt), their scroll bars stay visible while content is hidden, and buttons (the section "×"
-included) are at least 18 pt tall. `EditorPlugin` added to a game does **not** insert the theme:
+included) are at least 18 pt tall. A slider's rail stays at least two control heights long: in a
+narrow column with big fonts the value box gives up room first (down to three digits), and the
+texture and model editors' tool columns grow with the body text size. The menu bar is as tall as
+egui's own top panel (one control plus 2 pt above and below), and the texture and model editors
+open over the viewport, never over the menu bar or the side panels (`TextureEditor::show_in`,
+`ModelEditor::show_in` with the viewport rect; `show` keeps egui's placement). `EditorPlugin`
+added to a game does **not** insert the theme:
 the game's style stays as it is (insert the theme yourself to get the same density), and its
 panels still keep their width.
 
@@ -183,7 +212,8 @@ goldens in `crates/space3d-stories/tests/__screenshots__/Engine/UI/`. The tool s
 
 Tests: `crates/space3d-ui/tests/theme.rs` (density, default path untouched, applied once, never
 fights a game's style), `crates/space3d-ui/tests/tools.rs` (docked tools stay inside the screen and
-apart at several sizes and scale factors, never grow, same geometry under a game's style),
+apart at several sizes and scale factors, never grow, same geometry under a game's style; the
+profiler keeps clear of the debug overlay and above the console on 640 × 330–400 pt screens),
 `crates/space3d-ui/tests/alloc_free.rs` (no allocation while the theme is unchanged or absent) and
-the editor's `standalone_tools_are_compact_and_the_plugin_keeps_a_games_style` and
-`editor_panels_keep_their_width_under_any_style`.
+the editor's `standalone_tools_are_compact_and_the_plugin_keeps_a_games_style`,
+`editor_panels_keep_their_width_under_any_style` and `tool_windows_stay_over_the_viewport`.

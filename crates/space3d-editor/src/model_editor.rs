@@ -754,16 +754,29 @@ impl ModelEditor {
 
     /// Show the editor window.
     pub fn show(&mut self, ctx: &egui::Context) {
+        self.show_window(ctx, None);
+    }
+
+    /// Show the editor window within `area` (screen points; e.g. the viewport left between an
+    /// editor's panels): it opens at its top-left corner and never leaves it.
+    pub fn show_in(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        self.show_window(ctx, Some(area));
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context, area: Option<egui::Rect>) {
         self.poll_io();
         if !self.open {
             return;
         }
         let mut open = self.open;
-        egui::Window::new("Model editor")
+        let mut window = egui::Window::new("Model editor")
             .id(egui::Id::new("space3d_model_editor"))
             .open(&mut open)
-            .default_size([820.0, 480.0])
-            .show(ctx, |ui| self.contents(ui));
+            .default_size([820.0, 480.0]);
+        if let Some(area) = area {
+            window = window.default_pos(area.min + egui::vec2(8.0, 8.0)).constrain_to(area);
+        }
+        window.show(ctx, |ui| self.contents(ui));
         self.open = open;
     }
 
@@ -787,7 +800,7 @@ impl ModelEditor {
             self.selected_faces.len(),
         );
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(info).weak());
+            ui.label(info);
             if !self.status.is_empty() {
                 ui.separator();
                 ui.label(egui::RichText::new(&self.status).weak());
@@ -796,7 +809,7 @@ impl ModelEditor {
         ui.separator();
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.set_width(230.0);
+                ui.set_width(crate::widgets::tool_column_width(ui, 230.0));
                 crate::widgets::visible_scroll_bars(ui);
                 egui::ScrollArea::vertical().id_salt("model_ops").show(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| self.ops_panel(ui));

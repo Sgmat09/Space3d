@@ -1,6 +1,6 @@
-//! Layout of the docked engine tools (profiler, console): they stay 6 pt inside the screen,
-//! never grow with their contents, never overlap each other and look the same under a game's
-//! roomy style.
+//! Layout of the docked engine tools (debug overlay, profiler, console): they stay 6 pt inside
+//! the screen, never grow with their contents, never overlap each other and look the same under
+//! a game's roomy style.
 
 use space3d_core::prelude::*;
 use space3d_ui::*;
@@ -57,6 +57,12 @@ fn tools_app(size: (u32, u32), ppp: f32, roomy: bool) -> App {
          textures/hull_plating_damaged_normal.ktx2 (unsupported format) after 3 retries",
     );
     app
+}
+
+fn area(app: &App, id: &str) -> egui::Rect {
+    let ctx = app.resources.expect::<EguiContext>().ctx().clone();
+    ctx.memory(|m| m.area_rect(egui::Id::new(id)))
+        .unwrap_or_else(|| panic!("{id} shown"))
 }
 
 fn rects(app: &App) -> (egui::Rect, egui::Rect, egui::Rect) {
@@ -117,5 +123,48 @@ fn a_games_roomy_style_changes_no_tool_geometry() {
         let (_, p1, c1) = rects(&plain);
         let (_, p2, c2) = rects(&roomy);
         assert_eq!((p1, c1), (p2, c2), "{size:?}");
+    }
+}
+
+#[test]
+fn the_profiler_keeps_clear_of_the_debug_overlay_on_small_screens() {
+    // 640 × 330 to 640 × 400 pt (1280 × 720 at 2x...): the profiler's default 440 pt would
+    // reach under the overlay, and the height left above the console fits only a few rows.
+    for (size, details) in [
+        ((1280, 720), false),
+        ((1280, 720), true),
+        ((1280, 800), true),
+        ((1280, 660), true),
+        ((1280, 680), false),
+    ] {
+        let mut app = tools_app(size, 2.0, false);
+        app.insert_resource(space3d_render::RenderStats::default());
+        {
+            let overlay = app.resources.expect_mut::<DebugOverlay>();
+            overlay.visible = true;
+            overlay.details = details;
+        }
+        app.step_ticks(4);
+        let (screen, profiler, console) = rects(&app);
+        let overlay = area(&app, "space3d_debug_overlay");
+        let label = format!(
+            "{size:?} at 2x, details {details}: overlay {overlay:?}, profiler {profiler:?}, console {console:?}"
+        );
+        assert!(screen.shrink(EDGE - 0.5).contains_rect(profiler), "{label}");
+        assert!(
+            profiler.left() >= overlay.right() + EDGE - 0.5,
+            "the profiler ends right of the overlay: {label}"
+        );
+        assert!(profiler.width() >= 300.0, "{label}");
+        assert!(
+            (profiler.right() - (screen.right() - EDGE)).abs() < 1.0,
+            "still docked right: {label}"
+        );
+        assert!(
+            profiler.bottom() <= console.top() - EDGE + 0.5,
+            "the profiler (whole rows only) stays above the console: {label}"
+        );
+        app.step_ticks(30);
+        assert_eq!(rects(&app), (screen, profiler, console), "stable: {label}");
     }
 }

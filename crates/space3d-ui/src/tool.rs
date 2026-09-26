@@ -5,7 +5,7 @@
 //! `Ui` (a scoped copy of the style), keeps the context's colors, and draws its own compact
 //! header instead of egui's title bar (whose height follows the global heading size).
 
-use crate::theme::{UiDensity, apply_density};
+use crate::theme::{UiDensity, apply_density, visible_scroll_bars};
 use std::sync::Arc;
 
 /// Density of the engine tools: the compact preset with slightly smaller text.
@@ -21,59 +21,62 @@ pub(crate) const TOOL_DENSITY: UiDensity = UiDensity {
 /// Gap between a docked tool window and the screen edges (and between two tools).
 pub(crate) const EDGE: f32 = 6.0;
 
-/// Inner margin of a tool window (a little more at the bottom than at the top, so the last row
-/// never touches the border or the resize grip).
+/// Inner margin of a tool window (more at the bottom than at the top, so the last row never
+/// touches the border and stays clear of the resize grip).
 const MARGIN: egui::Margin = egui::Margin {
     left: 6,
     right: 6,
     top: 4,
-    bottom: 6,
+    bottom: 8,
 };
 
-/// Scroll bars that stay visible while the content overflows (egui's default floating bars
-/// only show on hover, so a clipped list gives no cue that it continues).
-pub(crate) fn visible_scroll_bars() -> egui::style::ScrollStyle {
-    egui::style::ScrollStyle {
-        bar_inner_margin: 2.0,
-        dormant_background_opacity: 0.4,
-        dormant_handle_opacity: 0.6,
-        ..egui::style::ScrollStyle::solid()
-    }
-}
+/// Opacity of weak text in the tools (egui's default 0.6 is under 3:1 against the window fill):
+/// trace / debug log lines and placeholders stay dimmer than normal text but readable.
+const WEAK_TEXT_ALPHA: f32 = 0.8;
 
-/// The tool style derived from `base` (and the `base` it was derived from), cached so a tool
-/// costs no style clone per frame while the context's style is unchanged.
+/// A style derived from the `base` style by a tool, cached with the `base` it came from.
 #[derive(Clone)]
-struct ScopedStyle {
+struct DerivedStyle {
     base: Arc<egui::Style>,
-    scoped: Arc<egui::Style>,
+    derived: Arc<egui::Style>,
 }
 
-/// Apply the tool density and visible scroll bars to `ui` only (the global style is
-/// untouched). Text keeps egui's per-layout wrapping; rows that must stay on one line say so.
-pub(crate) fn scope_style(ui: &mut egui::Ui) {
-    let id = egui::Id::new("space3d_ui::tool_style");
+/// Give `ui` its current style changed by `derive`, from a cache keyed by `key`: no style clone
+/// per frame while `ui`'s style is unchanged (`ui.spacing_mut()` / `ui.style_mut()` would copy
+/// the whole style every frame).
+pub(crate) fn derived_style(ui: &mut egui::Ui, key: &'static str, derive: fn(&mut egui::Style)) {
+    let id = egui::Id::new(("space3d_ui::tool_style", key));
     let base = ui.style().clone();
     let cached = ui
         .ctx()
-        .data(|d| d.get_temp::<ScopedStyle>(id))
+        .data(|d| d.get_temp::<DerivedStyle>(id))
         .filter(|c| Arc::ptr_eq(&c.base, &base));
-    let scoped = match cached {
-        Some(c) => c.scoped,
+    let derived = match cached {
+        Some(c) => c.derived,
         None => {
             let mut style = (*base).clone();
-            style.spacing.scroll = visible_scroll_bars();
-            apply_density(&mut style, &TOOL_DENSITY);
-            let scoped = Arc::new(style);
-            let entry = ScopedStyle {
+            derive(&mut style);
+            let derived = Arc::new(style);
+            let entry = DerivedStyle {
                 base,
-                scoped: scoped.clone(),
+                derived: derived.clone(),
             };
             ui.ctx().data_mut(|d| d.insert_temp(id, entry));
-            scoped
+            derived
         }
     };
-    ui.set_style(scoped);
+    ui.set_style(derived);
+}
+
+/// Apply the tool density, visible scroll bars and readable weak text to `ui` only (the global
+/// style is untouched; colors stay the context's). Text keeps egui's per-layout wrapping; rows
+/// that must stay on one line say so.
+pub(crate) fn scope_style(ui: &mut egui::Ui) {
+    derived_style(ui, "tool", |style| {
+        apply_density(style, &TOOL_DENSITY);
+        style.spacing.scroll = visible_scroll_bars(TOOL_DENSITY.scroll_bar_width);
+        style.visuals.weak_text_alpha = style.visuals.weak_text_alpha.max(WEAK_TEXT_ALPHA);
+    });
 }
 
 /// How a tool window is placed and sized.
@@ -90,6 +93,9 @@ pub(crate) struct ToolWindow<'a> {
     /// The window is exactly as tall as its contents (up to `size.y`) instead of user-resizable
     /// in height. The contents get the bottom they must stay above.
     pub fit_height: bool,
+    /// Outer width the window must stay within this frame (another tool is in the way), or
+    /// `f32::INFINITY`. Unlike `size.x`, applied every frame.
+    pub max_width: f32,
 }
 
 /// A tool window docked to a screen corner: compact frame and header row (title, `summary`,
@@ -108,7 +114,11 @@ pub(crate) fn window<R>(
     let chrome = frame.total_margin().sum();
     let screen = ctx.content_rect();
     let bounds = screen.shrink(EDGE);
-    let size = spec.size.min(bounds.size()).max(egui::vec2(160.0, 60.0));
+    let size = spec
+        .size
+        .min(bounds.size())
+        .min(egui::vec2(spec.max_width, f32::INFINITY))
+        .max(egui::vec2(160.0, 60.0));
     let id = egui::Id::new(spec.id);
     let fit_id = id.with("fit_height");
     let first_show = ctx.memory(|m| m.area_rect(id)).is_none();
@@ -121,6 +131,9 @@ pub(crate) fn window<R>(
         .default_size(size)
         .constrain_to(bounds)
         .min_size([160.0, 60.0]);
+    if spec.max_width.is_finite() {
+        window = window.max_width(size.x);
+    }
     if first_show {
         // egui caps a new window's size by the *global* window margin; asking for the size as
         // the minimum on the first frame keeps the tool's size independent of the game's style.

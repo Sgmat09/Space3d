@@ -526,6 +526,16 @@ impl TextureEditor {
 
     /// Show the editor window.
     pub fn show(&mut self, ctx: &egui::Context) {
+        self.show_window(ctx, None);
+    }
+
+    /// Show the editor window within `area` (screen points; e.g. the viewport left between an
+    /// editor's panels): it opens at its top-left corner and never leaves it.
+    pub fn show_in(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        self.show_window(ctx, Some(area));
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context, area: Option<egui::Rect>) {
         self.poll_io();
         if !self.open {
             return;
@@ -536,11 +546,14 @@ impl TextureEditor {
         self.set_max_texture_side(ctx.input(|i| i.max_texture_side));
         self.sync_texture(ctx);
         let mut open = self.open;
-        egui::Window::new("Texture editor")
+        let mut window = egui::Window::new("Texture editor")
             .id(egui::Id::new("space3d_texture_editor"))
             .open(&mut open)
-            .default_size([760.0, 560.0])
-            .show(ctx, |ui| self.contents(ui));
+            .default_size([760.0, 560.0]);
+        if let Some(area) = area {
+            window = window.default_pos(area.min + egui::vec2(8.0, 8.0)).constrain_to(area);
+        }
+        window.show(ctx, |ui| self.contents(ui));
         self.open = open;
     }
 
@@ -558,7 +571,7 @@ impl TextureEditor {
         ui.separator();
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.set_width(200.0);
+                ui.set_width(crate::widgets::tool_column_width(ui, 200.0));
                 crate::widgets::visible_scroll_bars(ui);
                 egui::ScrollArea::vertical().id_salt("tex_tools").show(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| self.side_panel(ui));

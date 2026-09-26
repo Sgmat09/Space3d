@@ -8,6 +8,7 @@
 //! table sorted by average time.
 
 use space3d_core::SystemCtx;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -312,7 +313,8 @@ impl Profiler {
 
     /// Draw the profiler contents into `ui`: a toolbar, then collapsible "Timeline" (the last
     /// frame's systems, flame style) and "Systems" (a striped table sorted by average time,
-    /// numbers right-aligned, scrolling by whole rows within the space left in `ui`) sections.
+    /// numbers right-aligned, scrolling by whole rows within the space left in `ui`) sections,
+    /// both the full width of `ui` (not indented).
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let bottom = ui.available_rect_before_wrap().bottom();
         self.ui_until(ui, bottom);
@@ -342,11 +344,11 @@ impl Profiler {
         egui::CollapsingHeader::new("Timeline")
             .id_salt("space3d_profiler_timeline")
             .default_open(true)
-            .show(ui, |ui| self.flame_ui(ui));
+            .show_unindented(ui, |ui| self.flame_ui(ui));
         egui::CollapsingHeader::new(format!("Systems ({})", self.stats.len()))
             .id_salt("space3d_profiler_systems")
             .default_open(true)
-            .show(ui, |ui| self.table_ui(ui, max_bottom));
+            .show_unindented(ui, |ui| self.table_ui(ui, max_bottom));
     }
 
     /// One-line summary of the shown frame (time, span count, frozen), as in the F4 window's
@@ -372,7 +374,7 @@ impl Profiler {
         let total = tl.duration.max(1e-9);
         let hover = response.hover_pos();
         let mut tooltip = None;
-        let font = egui::FontId::monospace(10.0);
+        let font = egui::FontId::proportional(10.5);
         for s in &tl.spans {
             let x0 = rect.left() + (s.start / total) as f32 * rect.width();
             let w = ((s.duration / total) as f32 * rect.width()).max(1.0);
@@ -380,13 +382,17 @@ impl Profiler {
             let r = egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(w, row - 1.0));
             painter.rect_filled(r, 1.0, name_color(&s.name));
             if w > 40.0 {
-                painter.with_clip_rect(r.intersect(rect)).text(
-                    r.left_center() + egui::vec2(3.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    short_name(&s.name),
-                    font.clone(),
-                    egui::Color32::BLACK,
+                // Truncated with "…" to the span (the full name is in the tooltip).
+                let mut job = egui::text::LayoutJob::single_section(
+                    short_name(&s.name).into_owned(),
+                    egui::TextFormat::simple(font.clone(), egui::Color32::BLACK),
                 );
+                job.wrap = egui::text::TextWrapping::truncate_at_width(w - 6.0);
+                let galley = painter.layout_job(job);
+                let pos = egui::pos2(r.left() + 3.0, r.center().y - galley.size().y / 2.0);
+                painter
+                    .with_clip_rect(r.intersect(rect))
+                    .galley(pos, galley, egui::Color32::BLACK);
             }
             if hover.is_some_and(|p| r.contains(p)) {
                 tooltip = Some(format!("{}\n{:.3} ms", s.name, s.duration * 1000.0));
@@ -434,14 +440,20 @@ impl Profiler {
             egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         );
 
+        // Stripes a little stronger than egui's barely visible `faint_bg_color`.
+        let stripe = visuals.faint_bg_color.gamma_multiply(3.0);
         ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
+            crate::tool::derived_style(ui, "profiler_rows", |s| s.spacing.item_spacing.y = 0.0);
             let rows = self.stats.len();
             let room = (max_bottom - ui.cursor().top()).max(pitch);
             let shown = ((room / pitch).floor() as usize).clamp(1, rows.max(1));
+            // Exactly `shown` rows tall (egui makes a scrolling area at least 64 pt tall, which
+            // would cut the last row).
+            let height = shown as f32 * pitch;
             egui::ScrollArea::vertical()
                 .id_salt("space3d_profiler_scroll")
-                .max_height(shown as f32 * pitch)
+                .max_height(height)
+                .min_scrolled_height(height)
                 .auto_shrink([false, true])
                 .show_rows(ui, pitch, rows, |ui, range| {
                     for i in range {
@@ -450,7 +462,7 @@ impl Profiler {
                             ui.allocate_exact_size(egui::vec2(ui.available_width(), pitch), egui::Sense::hover());
                         let painter = ui.painter();
                         if i % 2 == 1 {
-                            painter.rect_filled(rect, 0.0, visuals.faint_bg_color);
+                            painter.rect_filled(rect, 0.0, stripe);
                         }
                         let x = columns.xs(rect);
                         let y = rect.center().y;
@@ -466,7 +478,7 @@ impl Profiler {
                             name_color(&s.name),
                         );
                         let mut job = egui::text::LayoutJob::single_section(
-                            short_name(&s.name).to_owned(),
+                            short_name(&s.name).into_owned(),
                             egui::TextFormat::simple(body.clone(), text),
                         );
                         job.wrap = egui::text::TextWrapping::truncate_at_width((x.name_end - x.name).max(8.0));
@@ -550,19 +562,55 @@ fn name_color(name: &str) -> egui::Color32 {
     egui::ecolor::Hsva::new(hue, 0.45, 0.9, 1.0).into()
 }
 
-/// Strip module paths from closure-style type names (`a::b::{{closure}}` → `b::{{closure}}`).
-fn short_name(name: &str) -> &str {
-    let trimmed = name.trim_end_matches("::{{closure}}");
-    match trimmed.rmatch_indices("::").nth(1) {
-        Some((i, _)) => &name[i + 2..],
-        None => name,
+/// Shorten a system name: the path keeps its last two segments, generic arguments their last
+/// segment and closure suffixes stay (`a::b::c::{{closure}}` → `b::c::{{closure}}`,
+/// `space3d_core::events::Events<space3d_core::app::AppExit>` → `events::Events<AppExit>`).
+fn short_name(name: &str) -> Cow<'_, str> {
+    const CLOSURE: &str = "::{{closure}}";
+    let core = name.trim_end_matches(CLOSURE);
+    let suffix = &name[core.len()..];
+    let Some(open) = core.find('<') else {
+        return Cow::Borrowed(&name[last_segments(core, 2)..]);
+    };
+    let head = core[..open].trim_end_matches("::");
+    let mut out = String::with_capacity(core.len());
+    out.push_str(&head[last_segments(head, 2)..]);
+    // Every path inside the generic arguments keeps its last segment.
+    let args = &core[open..];
+    let mut path_start = None;
+    for (i, c) in args.char_indices() {
+        let in_path = c.is_alphanumeric() || c == '_' || c == ':';
+        match (in_path, path_start) {
+            (true, None) => path_start = Some(i),
+            (false, Some(start)) => {
+                let path: &str = &args[start..i];
+                out.push_str(&path[last_segments(path, 1)..]);
+                path_start = None;
+            }
+            _ => {}
+        }
+        if !in_path {
+            out.push(c);
+        }
     }
+    if let Some(start) = path_start {
+        let path = &args[start..];
+        out.push_str(&path[last_segments(path, 1)..]);
+    }
+    out.push_str(suffix);
+    Cow::Owned(out)
+}
+
+/// Byte offset in `path` where its last `n` `::`-separated segments start.
+fn last_segments(path: &str, n: usize) -> usize {
+    path.rmatch_indices("::").nth(n - 1).map_or(0, |(i, _)| i + 2)
 }
 
 /// `Stage::Update`: pull timings and draw the window.
 pub(crate) fn profiler_system(sys: &mut SystemCtx) {
     let ctx = crate::EguiContext::active_context(sys);
     let console_open = sys.resources.get::<crate::Console>().is_some_and(|c| c.visible);
+    let overlay_open = sys.resources.get::<crate::DebugOverlay>().is_some_and(|d| d.visible);
     let Some(p) = sys.resources.get_mut::<Profiler>() else {
         return;
     };
@@ -571,7 +619,7 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
     if !p.visible {
         return;
     }
-    let size = window_size(&ctx, console_open);
+    let (size, max_width) = window_size(&ctx, console_open, overlay_open);
     let summary = p.summary();
     let mut open = true;
     crate::tool::window(
@@ -582,10 +630,11 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
             anchor: egui::Align2::RIGHT_TOP,
             size,
             fit_height: true,
+            max_width,
         },
         &mut open,
         |ui| {
-            ui.label(egui::RichText::new(summary).weak());
+            ui.label(summary);
         },
         |ui, max_bottom| p.ui_until(ui, max_bottom),
     );
@@ -596,17 +645,23 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
 
 const PROFILER_ID: &str = "space3d_profiler";
 
+/// Narrowest the profiler gets to stay clear of the debug overlay.
+const MIN_WIDTH: f32 = 300.0;
+
 /// Largest size of the profiler window (docked top-right): 440 pt wide and 45 % of the screen
 /// height (at least 300 pt), but never down into the console when the console is open below it
-/// (at its default place, or wherever the user moved it).
-fn window_size(ctx: &egui::Context, console_open: bool) -> egui::Vec2 {
+/// (at its default place, or wherever the user moved it). Also the width it must stay within
+/// this frame: with the debug overlay (top-left) open beside it, the profiler ends left of it
+/// (unless that would leave it under [`MIN_WIDTH`]), `f32::INFINITY` otherwise.
+fn window_size(ctx: &egui::Context, console_open: bool, overlay_open: bool) -> (egui::Vec2, f32) {
     let edge = crate::tool::EDGE;
     let screen = ctx.content_rect();
     let width = 440.0f32.min(screen.width() - 2.0 * edge);
-    let (profiler, console) = ctx.memory(|m| {
+    let (profiler, console, overlay) = ctx.memory(|m| {
         (
             m.area_rect(egui::Id::new(PROFILER_ID)),
             m.area_rect(egui::Id::new(crate::console::CONSOLE_ID)),
+            m.area_rect(egui::Id::new(crate::debug::OVERLAY_ID)),
         )
     });
     let profiler = profiler.unwrap_or_else(|| {
@@ -615,6 +670,18 @@ fn window_size(ctx: &egui::Context, console_open: bool) -> egui::Vec2 {
             egui::vec2(width, 0.0),
         )
     });
+    // The overlay starts at the top of the screen, so a profiler whose top is beside it
+    // (above its bottom) must end left of it.
+    let mut max_width = f32::INFINITY;
+    if overlay_open
+        && let Some(overlay) = overlay
+        && profiler.top() < overlay.bottom() + edge
+    {
+        let room = profiler.right() - overlay.right() - edge;
+        if room >= MIN_WIDTH {
+            max_width = room;
+        }
+    }
     let mut height = (screen.height() * 0.45).max(300.0).min(screen.height() - 2.0 * edge);
     if console_open {
         let console = console.unwrap_or_else(|| crate::console::window_rect(screen));
@@ -622,7 +689,7 @@ fn window_size(ctx: &egui::Context, console_open: bool) -> egui::Vec2 {
             height = height.min(console.top() - edge - profiler.top());
         }
     }
-    egui::vec2(width, height.max(90.0))
+    (egui::vec2(width.min(max_width), height.max(90.0)), max_width)
 }
 
 #[cfg(test)]
@@ -634,6 +701,16 @@ mod tests {
         assert_eq!(short_name("render::render_frame"), "render::render_frame");
         assert_eq!(short_name("a::b::c::d"), "c::d");
         assert_eq!(short_name("app::sys::{{closure}}"), "app::sys::{{closure}}");
+        assert_eq!(short_name("x::app::sys::{{closure}}"), "app::sys::{{closure}}");
+        assert_eq!(short_name("tick"), "tick");
+        assert_eq!(
+            short_name("space3d_core::events::Events<space3d_core::app::AppExit>"),
+            "events::Events<AppExit>"
+        );
+        assert_eq!(
+            short_name("a::b::c::run::<x::y::Foo, Vec<z::Bar>>::{{closure}}"),
+            "c::run<Foo, Vec<Bar>>::{{closure}}"
+        );
         let mut p = Profiler::default();
         let span = |n: &str, d: f64| TimelineSpan {
             name: intern(n),

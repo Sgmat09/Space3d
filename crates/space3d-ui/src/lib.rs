@@ -79,7 +79,9 @@ pub use egui_wgpu;
 pub use input::{REPEAT_DELAY, REPEAT_INTERVAL, REPEAT_KEYS, egui_key, egui_logical_key, physical_key_for_egui_key};
 pub use profiler::{FrameTimeline, Profiler, ProfilerLayer, SystemStats, TimelineSpan};
 pub use textures::UiTextures;
-pub use theme::{ThemePreview, UiDensity, UiTheme, UiThemeSync, apply_density, apply_theme, compact_style};
+pub use theme::{
+    ThemePreview, UiDensity, UiTheme, UiThemeSync, apply_density, apply_theme, compact_style, visible_scroll_bars,
+};
 pub use tracing_setup::{TracingInstall, install_tracing, tracing_install_state};
 
 use overlay::EguiOverlay;

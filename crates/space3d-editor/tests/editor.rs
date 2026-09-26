@@ -628,6 +628,52 @@ fn editor_panels_keep_their_width_under_any_style() {
     }
 }
 
+/// The menu bar is as tall as egui's own top panel (one control plus 2 pt above and below), and
+/// the texture and model editors open over the viewport: never over the menu bar or the side
+/// panels.
+#[test]
+fn tool_windows_stay_over_the_viewport() {
+    let mut app = App::new();
+    app.add_plugin(space3d_ui::UiPlugin {
+        install_tracing: false,
+        fallback_size: (1280, 720),
+        ..space3d_ui::UiPlugin::deterministic()
+    });
+    app.insert_resource(UiTheme::compact());
+    app.add_plugin(EditorPlugin::default());
+    scene(&mut app);
+    app.resources.expect_mut::<TextureEditor>().open = true;
+    app.resources.expect_mut::<ModelEditor>().open = true;
+    app.step_ticks(6);
+    let ctx = app.resources.expect::<EguiContext>().ctx().clone();
+    let panel = |id: &str| {
+        egui::containers::panel::PanelState::load(&ctx, egui::Id::new(id))
+            .unwrap_or_else(|| panic!("panel {id} shown"))
+            .outer_rect
+    };
+    let (menu, hierarchy, inspector) = (
+        panel("space3d_editor_menu"),
+        panel("space3d_editor_hierarchy"),
+        panel("space3d_editor_inspector"),
+    );
+    // One control, 2 pt above and below, and the panel's 1 pt separator line.
+    let control = UiDensity::compact().control_height;
+    assert!((menu.height() - (control + 5.0)).abs() < 0.5, "menu bar {menu:?}");
+    let viewport = egui::Rect::from_min_max(
+        egui::pos2(hierarchy.right(), menu.bottom()),
+        egui::pos2(inspector.left(), ctx.content_rect().bottom()),
+    );
+    for id in ["space3d_texture_editor", "space3d_model_editor"] {
+        let window = ctx
+            .memory(|m| m.area_rect(egui::Id::new(id)))
+            .unwrap_or_else(|| panic!("{id} shown"));
+        assert!(
+            viewport.expand(0.5).contains_rect(window),
+            "{id} {window:?} within the viewport {viewport:?}"
+        );
+    }
+}
+
 /// Editor, texture editor, model editor and storybook viewer captures, written to
 /// `$SPACE3D_EDITOR_SNAPSHOT_DIR` (for reviewing the tools' layout by eye).
 #[test]

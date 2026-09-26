@@ -76,7 +76,7 @@ impl LogLevel {
             Self::Info => " INFO",
             Self::Warn => " WARN",
             Self::Error => "ERROR",
-            Self::Command => "   > ",
+            Self::Command => "    >",
             Self::Output => "     ",
         }
     }
@@ -474,8 +474,11 @@ impl Console {
         })
     }
 
-    /// Draw the console into `ui`: a toolbar (level, filter, clear), the log (one dense
-    /// monospace line per entry, long entries wrapped to the width) and the input line.
+    /// Draw the console into `ui`: a toolbar (level, a filter filling the row, clear), the log
+    /// and the input line. The log shows one dense monospace line per entry — the level tag in
+    /// a column of its own, then target and message; a long entry wraps under its message, the
+    /// tag column kept clear — and is a whole number of lines tall, so while it sticks to the
+    /// newest line the oldest shown is never cut.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("space3d_console_level")
@@ -492,17 +495,25 @@ impl Console {
                         ui.selectable_value(&mut self.min_level, l, format!("{l:?}"));
                     }
                 });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("filter")
-                    .desired_width(140.0),
-            );
-            if ui.button("Clear").clicked() {
-                self.clear();
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Clear").clicked() {
+                    self.clear();
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("filter")
+                        .desired_width(ui.available_width()),
+                );
+            });
         });
         let visuals = ui.visuals().clone();
         let font = egui::TextStyle::Monospace.resolve(ui.style());
+        // The height of a one-line entry as laid out (galley rows are rounded to pixels).
+        let line = ui.fonts_mut(|f| {
+            f.layout_no_wrap("0".to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .y
+        });
         let input_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 2.0;
         let filter = self.filter.to_lowercase();
         egui::Frame::new()
@@ -510,33 +521,38 @@ impl Console {
             .corner_radius(2)
             .inner_margin(egui::Margin::symmetric(4, 2))
             .show(ui, |ui| {
+                // A whole number of lines (the window, as tall as its contents, gives up the
+                // rest).
+                let room = (ui.available_height() - input_height - 4.0).max(3.0 * line);
+                let height = (room / line).floor() * line;
                 egui::ScrollArea::vertical()
                     .id_salt("space3d_console_log")
-                    .max_height((ui.available_height() - input_height - 4.0).max(48.0))
+                    .max_height(height)
+                    .min_scrolled_height(height)
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        // Long lines (paths, backtraces) wrap: the log never widens the window.
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        crate::tool::derived_style(ui, "console_log", |style| {
+                            style.spacing.item_spacing.y = 0.0;
+                            // Long lines (paths, backtraces) wrap: the log never widens the window.
+                            style.wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        });
+                        let format = |c| egui::TextFormat::simple(font.clone(), c);
                         for l in self.shown(&filter) {
                             let color = l.level.color(&visuals);
-                            let mut job = egui::text::LayoutJob::default();
-                            let format = |c| egui::TextFormat::simple(font.clone(), c);
-                            match l.level {
-                                LogLevel::Command | LogLevel::Output => {
-                                    job.append(l.level.tag(), 0.0, format(color));
-                                    job.append(&l.message, 0.0, format(color));
+                            ui.horizontal_top(|ui| {
+                                ui.label(egui::text::LayoutJob::single_section(
+                                    l.level.tag().to_owned(),
+                                    format(color),
+                                ));
+                                let mut job = egui::text::LayoutJob::default();
+                                if !matches!(l.level, LogLevel::Command | LogLevel::Output) {
+                                    job.append(&l.target, 0.0, format(visuals.text_color()));
+                                    job.append(": ", 0.0, format(visuals.text_color()));
                                 }
-                                _ => {
-                                    job.append(l.level.tag(), 0.0, format(color));
-                                    job.append(" ", 0.0, format(color));
-                                    job.append(&l.target, 0.0, format(visuals.weak_text_color()));
-                                    job.append(": ", 0.0, format(visuals.weak_text_color()));
-                                    job.append(&l.message, 0.0, format(color));
-                                }
-                            }
-                            ui.label(job);
+                                job.append(&l.message, 0.0, format(color));
+                                ui.label(job);
+                            });
                         }
                     });
             });
@@ -616,10 +632,11 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
                 anchor: egui::Align2::LEFT_BOTTOM,
                 size: window_rect(screen).size(),
                 fit_height: false,
+                max_width: f32::INFINITY,
             },
             &mut open,
             |ui| {
-                ui.label(egui::RichText::new(format!("{shown}/{total} lines")).weak());
+                ui.label(format!("{shown}/{total} lines"));
             },
             |ui, _| c.ui(ui),
         );

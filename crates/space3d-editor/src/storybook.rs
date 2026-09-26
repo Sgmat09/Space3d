@@ -326,8 +326,10 @@ impl StorybookViewer {
                 .desired_width(f32::INFINITY),
         );
         let mut clicked: Option<String> = None;
+        // Full width: the scroll bar sits at the panel's edge, not after the longest name.
         egui::ScrollArea::vertical()
             .id_salt("space3d_story_list")
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 if self.search.trim().is_empty() {
                     let mut root = GroupNode::default();
