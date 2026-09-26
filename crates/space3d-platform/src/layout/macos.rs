@@ -8,15 +8,23 @@
 //! thread on macOS.
 //!
 //! ISO keyboards: macOS gives the key left of `1` (`§` on US, `@` on French, `^` on German
-//! Macs) virtual key `0x0A` and the key right of left Shift (`<`) `0x32`; winit reports both
-//! as `KeyCode::Backquote` (and never `IntlBackslash`). The label of `Backquote` is then read
-//! from `0x0A` — the W3C `Backquote` position — and not learned from presses, which would
-//! flip it between the two keys. ANSI and JIS keyboards have no `0x0A` key: `0x32` is left of
-//! `1`.
+//! Macs) virtual key `0x0A` (`kVK_ISO_Section`) and the key right of left Shift (`<`) `0x32`
+//! (`kVK_ANSI_Grave`); winit 0.30 reports both as `KeyCode::Backquote`. [`physical_key`] reads
+//! the virtual key of the event AppKit is dispatching (`NSApp.currentEvent`) and reports the
+//! key right of left Shift as `IntlBackslash` (its W3C position), the key left of `1` as
+//! `Backquote`. Their labels are read from those virtual keys. ANSI and JIS keyboards send
+//! `0x32` for the key left of `1`. The JIS Ro key (`0x5E`, `kVK_JIS_Underscore`), which winit
+//! leaves unidentified, is `IntlRo`. See `super::MACOS_KEYS`.
+//!
+//! When winit delivers a key event late (it queues events that arrive while another one is
+//! handled), `currentEvent` is another event and the ISO key right of left Shift stays
+//! `Backquote`: the label of `Backquote` on ISO keyboards therefore comes from the OS table
+//! only and is not learned from presses, which could flip it between the two keys.
 
-use super::{OsLayout, normalize_label, writing_system_keys};
+use super::{OsLayout, macos_key_of_virtual_key, macos_virtual_key_of_key, normalize_label, writing_system_keys};
 use crate::input::KeyCode;
 use std::ffi::{c_char, c_int, c_ulong, c_void};
+use winit::keyboard::{NativeKeyCode, PhysicalKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
 
 type CFStringRef = *const c_void;
@@ -74,6 +82,23 @@ unsafe extern "C" {
     fn pthread_main_np() -> c_int;
 }
 
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    /// The shared `NSApplication` (nil until created; winit creates it).
+    static mut NSApp: *mut c_void;
+}
+
+#[link(name = "objc")]
+unsafe extern "C" {
+    fn sel_registerName(name: *const c_char) -> *const c_void;
+    /// Called through a pointer cast to each message's signature.
+    fn objc_msgSend();
+}
+
+/// `NSEventTypeKeyDown`, `NSEventTypeKeyUp`.
+const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
+const NS_EVENT_TYPE_KEY_UP: usize = 11;
+
 const K_UC_KEY_ACTION_DISPLAY: u16 = 3;
 const K_UC_KEY_TRANSLATE_NO_DEAD_KEYS: u32 = 1;
 /// `shiftKey` (0x0200) in `UCKeyTranslate`'s `(EventModifiers >> 8) & 0xFF` form.
@@ -83,6 +108,8 @@ const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const K_KEYBOARD_ISO: u32 = u32::from_be_bytes(*b"ISO ");
 /// `kVK_ISO_Section`: on ISO keyboards, the key left of `1` (W3C `Backquote` position).
 const VK_ISO_SECTION: u16 = 0x0A;
+/// `kVK_ANSI_Grave`: on ISO keyboards, the key right of left Shift (W3C `IntlBackslash`).
+const VK_ANSI_GRAVE: u16 = 0x32;
 
 /// Whether the caller may use Text Input Sources.
 fn on_main_thread() -> bool {
@@ -99,6 +126,60 @@ fn keyboard_type() -> u8 {
 fn is_iso(keyboard_type: u8) -> bool {
     // SAFETY: plain HIToolbox lookup.
     unsafe { KBGetLayoutType(i16::from(keyboard_type)) == K_KEYBOARD_ISO }
+}
+
+/// The virtual key code of the key event AppKit is dispatching (`NSApp.currentEvent`), if it
+/// is one. `None` off the main thread, before `NSApplication` exists, and for other events.
+fn current_key_event_code() -> Option<u16> {
+    type SendId = unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void;
+    type SendUInt = unsafe extern "C" fn(*mut c_void, *const c_void) -> usize;
+    type SendU16 = unsafe extern "C" fn(*mut c_void, *const c_void) -> u16;
+    if !on_main_thread() {
+        return None;
+    }
+    // SAFETY: main thread (AppKit's requirement). `objc_msgSend` is called with the exact
+    // signature of each message: `-[NSApplication currentEvent]` returns an object,
+    // `-[NSEvent type]` an `NSUInteger`, `-[NSEvent keyCode]` an `unsigned short` (only sent to
+    // key events: it raises for other event types).
+    unsafe {
+        let app = (&raw const NSApp).read();
+        if app.is_null() {
+            return None;
+        }
+        let send_id = std::mem::transmute::<unsafe extern "C" fn(), SendId>(objc_msgSend);
+        let send_uint = std::mem::transmute::<unsafe extern "C" fn(), SendUInt>(objc_msgSend);
+        let send_u16 = std::mem::transmute::<unsafe extern "C" fn(), SendU16>(objc_msgSend);
+        let event = send_id(app, sel_registerName(c"currentEvent".as_ptr()));
+        if event.is_null() {
+            return None;
+        }
+        let kind = send_uint(event, sel_registerName(c"type".as_ptr()));
+        if kind != NS_EVENT_TYPE_KEY_DOWN && kind != NS_EVENT_TYPE_KEY_UP {
+            return None;
+        }
+        Some(send_u16(event, sel_registerName(c"keyCode".as_ptr())))
+    }
+}
+
+/// winit's physical key of the key event AppKit is dispatching, corrected (module docs):
+/// `Backquote` from the event's virtual key (ISO: `0x32` is `IntlBackslash`), unidentified
+/// keys of `super::MACOS_KEYS` (JIS Ro) by their code. Unchanged off the main thread and
+/// when the virtual key is unknown.
+pub(super) fn physical_key(key: PhysicalKey) -> PhysicalKey {
+    let vk = match key {
+        PhysicalKey::Code(KeyCode::Backquote) => match current_key_event_code() {
+            Some(vk @ (VK_ISO_SECTION | VK_ANSI_GRAVE)) => vk,
+            _ => return key,
+        },
+        PhysicalKey::Unidentified(NativeKeyCode::MacOS(vk)) if on_main_thread() => vk,
+        _ => return key,
+    };
+    macos_key_of_virtual_key(vk, is_iso(keyboard_type())).map_or(key, PhysicalKey::Code)
+}
+
+/// The virtual key whose output labels `code` on a keyboard of type ISO (`iso`) or other.
+fn virtual_key(code: KeyCode, iso: bool) -> Option<u16> {
+    macos_virtual_key_of_key(code, iso).or_else(|| code.to_scancode().and_then(|s| u16::try_from(s).ok()))
 }
 
 /// An owned (copied) input source, released on drop.
@@ -238,11 +319,7 @@ fn read_keys(id: Option<String>, layout: *const c_void, keyboard_type: u8) -> Os
     let kt = u32::from(keyboard_type);
     let mut keys = Vec::new();
     for code in writing_system_keys() {
-        let vk = match code {
-            KeyCode::Backquote if iso => Some(VK_ISO_SECTION),
-            _ => code.to_scancode().and_then(|s| u16::try_from(s).ok()),
-        };
-        let Some(vk) = vk else { continue };
+        let Some(vk) = virtual_key(code, iso) else { continue };
         let Some(unshifted) = translate(layout, vk, 0, kt) else {
             continue;
         };
@@ -301,14 +378,34 @@ mod tests {
     #[test]
     fn nothing_is_read_off_the_main_thread() {
         let read = std::thread::spawn(|| {
+            let ro = PhysicalKey::Unidentified(NativeKeyCode::MacOS(0x5E));
             (
                 layout_check().is_none(),
                 read_layout().is_none(),
                 read_installed("com.apple.keylayout.US", None).is_none(),
+                current_key_event_code().is_none(),
+                physical_key(ro) == ro,
             )
         })
         .join()
         .unwrap();
-        assert_eq!(read, (true, true, true));
+        assert_eq!(read, (true, true, true, true, true));
+    }
+
+    #[test]
+    fn labels_are_read_from_the_keys_virtual_keys() {
+        assert_eq!(virtual_key(KeyCode::Backquote, true), Some(VK_ISO_SECTION));
+        assert_eq!(virtual_key(KeyCode::Backquote, false), Some(VK_ANSI_GRAVE));
+        assert_eq!(virtual_key(KeyCode::IntlBackslash, true), Some(VK_ANSI_GRAVE));
+        assert_eq!(virtual_key(KeyCode::IntlBackslash, false), Some(VK_ISO_SECTION));
+        assert_eq!(virtual_key(KeyCode::IntlRo, true), Some(0x5E));
+        assert_eq!(virtual_key(KeyCode::IntlYen, false), Some(0x5D));
+        assert_eq!(virtual_key(KeyCode::KeyA, true), Some(0x00));
+        // Every writing-system key has a virtual key on every keyboard type.
+        for iso in [true, false] {
+            for key in writing_system_keys() {
+                assert!(virtual_key(key, iso).is_some(), "{key:?} (ISO: {iso})");
+            }
+        }
     }
 }

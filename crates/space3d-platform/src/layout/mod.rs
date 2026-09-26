@@ -52,9 +52,16 @@
 //! 3. nothing (`None`) for character keys that are still unknown; `key_cap` then shows the US
 //!    QWERTY character of that position.
 //!
+//! The reverse lookup — which physical key types a given text — is
+//! [`KeyboardLayout::key_for_label`] (`"m"` → `KeyCode::Semicolon` on AZERTY) and
+//! [`KeyboardLayout::key_for_label_matching`]; both read a map cached per
+//! [`KeyboardLayout::generation`], so they do not allocate while the labels stay the same
+//! (`space3d_ui::physical_key_for_egui_key` is built on them). [`KeyboardLayout::label_text`]
+//! borrows a label without allocating.
+//!
 //! | platform | OS table | layout changes |
 //! |---|---|---|
-//! | macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate` (main thread) | polled once per second and on focus (input source id, keyboard type) |
+//! | macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate` (main thread), by virtual key (ISO and JIS keys: see below) | polled once per second and on focus (input source id, keyboard type) |
 //! | Windows | `MapVirtualKeyExW` + `ToUnicodeEx` for the thread's `HKL` | polled once per second and on focus (`HKL`) |
 //! | Web | `navigator.keyboard.getLayoutMap()` (Chromium-based browsers; async) | re-read on focus |
 //! | Linux (X11/Wayland) | none: learned only (winit reports `key_without_modifiers`) | learned labels update on the next press |
@@ -72,14 +79,30 @@
 //! * macOS reads Text Input Sources on the main thread only (macOS 14+ aborts the process on
 //!   other threads): [`KeyboardLayout::refresh_from_os`] reads nothing elsewhere. The first
 //!   query initializes the Text Input Services (tens of ms, once, at start-up);
-//! * macOS ISO keyboards (most European Macs): winit reports both the key left of `1` (`§`,
-//!   `@`, `^`) and the key right of left Shift (`<`) as [`KeyCode::Backquote`] (never
-//!   `IntlBackslash`), so a `Backquote` binding fires on either. Its label is the key left of
-//!   `1` (the W3C `Backquote` position), from the OS table, and is not learned from presses;
+//! * macOS ISO keyboards (most European Macs): winit 0.30 reports both the key left of `1`
+//!   (`§`, `@`, `^`; virtual key `0x0A`) and the key right of left Shift (`<`, `` ` ``; `0x32`)
+//!   as [`KeyCode::Backquote`]. The window runner reads the virtual key of the event AppKit is
+//!   dispatching and reports the key right of left Shift as [`KeyCode::IntlBackslash`] (its
+//!   W3C position, as on Windows); each has its own OS label. When winit delivers
+//!   an event late (queued behind another one) its virtual key is unknown and the key reads
+//!   `Backquote`, so on ISO keyboards `Backquote`'s label comes from the OS table only (not
+//!   learned from presses, which could flip it between the two keys);
+//! * macOS JIS keyboards: winit 0.30 has no code for the Ro key (virtual key `0x5E`, left of
+//!   right Shift); the runner reports it as [`KeyCode::IntlRo`], with its OS label (`"_"`);
 //! * input methods (IME) report the layout they type through (e.g. romaji for Japanese).
+//!
+//! # Pinned layouts
+//!
+//! On macOS, Windows and the web the window runner keeps the OS table current, so a table set
+//! with [`KeyboardLayout::set_os_layout`] (a fake or sample layout for screenshots, windowed
+//! test runs, a "my keyboard is…" setting) is replaced within a second. Pin it with
+//! [`KeyboardLayout::set_pinned`]: while pinned the OS table is not re-read and key events
+//! teach nothing; unpinning lets the runner re-read the OS table on its next frame.
 
 use crate::input::KeyCode;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+use winit::keyboard::PhysicalKey;
 
 pub use winit::keyboard::{Key as LogicalKey, KeyLocation, NamedKey};
 
@@ -378,9 +401,117 @@ pub struct KeyboardLayout {
     ambiguous: HashSet<KeyCode>,
     learned: HashMap<KeyCode, Learned>,
     generation: u64,
+    /// Automatic updates suspended ([`Self::set_pinned`]).
+    pinned: bool,
+    /// Reverse lookup of the labels ([`Self::key_for_label`]): built on first use and dropped
+    /// by every change, so it always belongs to the current [`Self::generation`].
+    by_label: OnceLock<LabelIndex>,
+}
+
+/// The labels of one [`KeyboardLayout::generation`], by text.
+#[derive(Clone, Debug, Default)]
+struct LabelIndex {
+    /// Each distinct label text with the first writing-system key (keyboard order) that
+    /// prints it, in keyboard order.
+    first: Vec<(String, KeyCode)>,
+    /// The same, by text.
+    by_text: HashMap<String, KeyCode>,
+}
+
+impl LabelIndex {
+    fn build(layout: &KeyboardLayout) -> Self {
+        let mut index = Self::default();
+        for key in writing_system_keys() {
+            if let Some(text) = layout.label_text(key)
+                && !index.by_text.contains_key(text)
+            {
+                index.first.push((text.to_owned(), key));
+                index.by_text.insert(text.to_owned(), key);
+            }
+        }
+        index
+    }
 }
 
 impl KeyboardLayout {
+    /// The text of [`Self::label`] (`label(key).text`) without allocating: what `key` types
+    /// without modifiers, learned first, then from the OS table. `None` for keys that are not
+    /// [`writing_system_keys`] and unknown ones.
+    pub fn label_text(&self, key: KeyCode) -> Option<&str> {
+        self.learned
+            .get(&key)
+            .and_then(|l| l.unshifted.as_deref())
+            .or_else(|| self.os.get(&key).map(|o| o.0.as_str()))
+    }
+
+    /// The physical key that types `text` without modifiers on this layout (the inverse of
+    /// [`Self::label_text`]): `Some(KeyCode::Semicolon)` for `"m"` on AZERTY. When several
+    /// keys print the same text, the first in keyboard order ([`writing_system_keys`]) wins.
+    /// `None` when no key is known to type `text`.
+    ///
+    /// Looks up a reverse map that is built on the first lookup after the labels change
+    /// ([`Self::generation`]) and cached until the next change: lookups in between do not
+    /// allocate. Safe to call from several threads.
+    pub fn key_for_label(&self, text: &str) -> Option<KeyCode> {
+        self.label_index().by_text.get(text).copied()
+    }
+
+    /// The first physical key in keyboard order ([`writing_system_keys`]) whose label text
+    /// satisfies `matches`, e.g. the key egui reads as a given `egui::Key`. Calls `matches`
+    /// once per distinct label, in keyboard order, and stops at the first match; uses the
+    /// same cached reverse map as [`Self::key_for_label`] (no allocations while the labels do
+    /// not change).
+    pub fn key_for_label_matching(&self, mut matches: impl FnMut(&str) -> bool) -> Option<KeyCode> {
+        let index = self.label_index();
+        index.first.iter().find(|(text, _)| matches(text)).map(|&(_, key)| key)
+    }
+
+    fn label_index(&self) -> &LabelIndex {
+        self.by_label.get_or_init(|| LabelIndex::build(self))
+    }
+
+    /// Pin the labels (`true`) or let them follow the OS and key events again (`false`).
+    ///
+    /// While pinned nothing automatic changes the labels: the OS table is not re-read (the
+    /// window runner's polls and focus checks, [`Self::refresh_from_os`], results of the
+    /// web's asynchronous read) and key events teach nothing
+    /// ([`Input::inject_key_event`](crate::Input::inject_key_event), the runner). Explicit
+    /// calls still apply: [`Self::set_os_layout`], [`Self::learn`], [`Self::clear_os_layout`],
+    /// [`Self::clear_learned`]. Use it to show a fake or sample layout in windowed runs,
+    /// screenshots and tests on a machine with another layout:
+    ///
+    /// ```
+    /// use space3d_platform::*;
+    /// let mut input = Input::default();
+    /// let layout = input.keyboard_layout_mut();
+    /// layout.set_os_layout(
+    ///     Some("sample-azerty".into()),
+    ///     [(KeyCode::KeyA, "q".into(), Some("Q".into())), (KeyCode::KeyQ, "a".into(), Some("A".into()))],
+    /// );
+    /// layout.set_pinned(true); // the runner keeps this table until unpinned
+    /// assert!(!input.refresh_keyboard_layout());
+    /// input.inject_key_tap_logical(KeyCode::KeyA, LogicalKey::Character("a".into()));
+    /// assert_eq!(input.key_cap(KeyCode::KeyA), "Q", "key events teach nothing while pinned");
+    /// ```
+    ///
+    /// Unpinning does not change the labels by itself; the window runner re-reads the OS
+    /// table on its next frame (macOS, Windows: replacing a table set with `set_os_layout`;
+    /// web: a new asynchronous read), as [`Self::refresh_from_os`] does.
+    pub fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
+    }
+
+    /// Whether the labels are pinned ([`Self::set_pinned`]).
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// A label changed: new generation, and the reverse map is rebuilt on its next use.
+    fn changed(&mut self) {
+        self.generation += 1;
+        self.by_label.take();
+    }
+
     /// Label of a [writing-system key](writing_system_keys) (learned first, then the OS
     /// table). `None` for other keys and unknown ones; see
     /// [`Input::key_label_info`](crate::Input::key_label_info) for the full lookup.
@@ -440,7 +571,7 @@ impl KeyboardLayout {
         }
         let changed = *entry != before;
         if changed {
-            self.generation += 1;
+            self.changed();
         }
         changed
     }
@@ -449,7 +580,9 @@ impl KeyboardLayout {
     /// `"com.apple.keylayout.French"`, a Windows `HKL`) and `(key, unshifted, shifted)`
     /// labels. A different layout (id or labels) also forgets the learned labels, which
     /// belonged to the previous layout. Returns whether anything changed. Custom platforms
-    /// and tests can call this directly.
+    /// and tests can call this directly; on macOS, Windows and the web the window runner
+    /// replaces such a table with the OS's on its next check unless the labels are pinned
+    /// ([`Self::set_pinned`]).
     pub fn set_os_layout(
         &mut self,
         id: Option<String>,
@@ -483,7 +616,7 @@ impl KeyboardLayout {
         self.os = table;
         self.ambiguous = ambiguous;
         self.learned.clear();
-        self.generation += 1;
+        self.changed();
         true
     }
 
@@ -494,7 +627,7 @@ impl KeyboardLayout {
             self.os_id = None;
             self.os.clear();
             self.ambiguous.clear();
-            self.generation += 1;
+            self.changed();
         }
     }
 
@@ -502,7 +635,7 @@ impl KeyboardLayout {
     pub fn clear_learned(&mut self) {
         if !self.learned.is_empty() {
             self.learned.clear();
-            self.generation += 1;
+            self.changed();
         }
     }
 
@@ -527,8 +660,12 @@ impl KeyboardLayout {
     /// as the window runner does; on macOS it reads nothing off the main thread (Text Input
     /// Sources are main-thread only: macOS 14+ aborts the process otherwise). On the web it
     /// applies the result of the previous request and starts a new asynchronous one;
-    /// elsewhere it does nothing. Returns whether the labels changed.
+    /// elsewhere, and while the labels are pinned ([`Self::set_pinned`]), it does nothing.
+    /// Returns whether the labels changed.
     pub fn refresh_from_os(&mut self) -> bool {
+        if self.pinned {
+            return false;
+        }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let check = os::layout_check();
@@ -562,9 +699,10 @@ impl KeyboardLayout {
         changed
     }
 
+    /// Apply the web's finished read, unless pinned (then it waits for the unpinning).
     #[cfg(target_arch = "wasm32")]
     fn apply_web_result(&mut self) -> bool {
-        web::take().is_some_and(|layout| self.apply_os_layout(layout))
+        !self.pinned && web::take().is_some_and(|layout| self.apply_os_layout(layout))
     }
 }
 
@@ -580,6 +718,76 @@ pub(crate) struct OsLayout {
     pub keys: Vec<(KeyCode, String, Option<String>)>,
     /// Keys that stand for several physical keys on this keyboard.
     pub ambiguous: Vec<KeyCode>,
+}
+
+/// macOS virtual keys whose physical key winit 0.30 leaves unidentified or conflates:
+/// `(virtual key, key on ISO keyboards, key on ANSI and JIS keyboards)`. ISO keyboards send
+/// `kVK_ISO_Section` (0x0A) for the key left of `1` and `kVK_ANSI_Grave` (0x32) for the extra
+/// key right of left Shift, which winit both reports as `Backquote`; other keyboard types send
+/// `kVK_ANSI_Grave` for the key left of `1` (and `kVK_ISO_Section` for the extra key, when the
+/// OS types an ISO keyboard as ANSI). winit has no code for the JIS Ro key
+/// (`kVK_JIS_Underscore`, 0x5E, left of right Shift).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MACOS_KEYS: [(u16, KeyCode, KeyCode); 3] = [
+    (0x0A, KeyCode::Backquote, KeyCode::IntlBackslash),
+    (0x32, KeyCode::IntlBackslash, KeyCode::Backquote),
+    (0x5E, KeyCode::IntlRo, KeyCode::IntlRo),
+];
+
+/// The physical key of macOS virtual key `vk` on an ISO (`iso`) or ANSI/JIS keyboard, for the
+/// virtual keys winit 0.30 gets wrong ([`MACOS_KEYS`]); `None` for the others.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn macos_key_of_virtual_key(vk: u16, iso: bool) -> Option<KeyCode> {
+    MACOS_KEYS
+        .iter()
+        .find(|k| k.0 == vk)
+        .map(|k| if iso { k.1 } else { k.2 })
+}
+
+/// The macOS virtual key of physical `key` on an ISO (`iso`) or ANSI/JIS keyboard, for the
+/// keys winit 0.30 gets wrong ([`MACOS_KEYS`]); `None` for the others.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn macos_virtual_key_of_key(key: KeyCode, iso: bool) -> Option<u16> {
+    MACOS_KEYS
+        .iter()
+        .find(|k| (if iso { k.1 } else { k.2 }) == key)
+        .map(|k| k.0)
+}
+
+/// The window runner's physical key of a winit key event: winit's, corrected where winit 0.30
+/// leaves a key unidentified or reports two keys as one (macOS ISO and JIS keys, see
+/// [`MACOS_KEYS`]). Call on the event-loop thread while the event is dispatched.
+pub(crate) fn physical_key(key: PhysicalKey) -> PhysicalKey {
+    #[cfg(target_os = "macos")]
+    {
+        macos::physical_key(key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        key
+    }
+}
+
+/// The key a release of `code` releases on macOS. The ISO key right of left Shift is
+/// `IntlBackslash`, but [`physical_key`] reports it as `Backquote` when the event's virtual
+/// key is unknown, so a press and its release may disagree: a release of one of the two keys
+/// that is not held releases the other one when that is held.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn macos_released_key(code: KeyCode, pressed: impl Fn(KeyCode) -> bool) -> KeyCode {
+    let other = match code {
+        KeyCode::Backquote => KeyCode::IntlBackslash,
+        KeyCode::IntlBackslash => KeyCode::Backquote,
+        _ => return code,
+    };
+    if !pressed(code) && pressed(other) { other } else { code }
+}
+
+/// Test support (macOS; call on the main thread while AppKit dispatches a key event): the
+/// window runner's physical key for winit's `key` (see `MACOS_KEYS`). Not a stable API.
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+pub fn __macos_physical_key(key: PhysicalKey) -> PhysicalKey {
+    physical_key(key)
 }
 
 /// Test support (macOS; call on the main thread): the OS table of the installed layout `id`
@@ -694,6 +902,8 @@ pub(crate) fn shifted_case(s: &str) -> String {
 pub(crate) struct LayoutWatch {
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     last_check: Option<web_time::Instant>,
+    /// The labels were pinned at the last poll: unpinning checks the OS at once.
+    was_pinned: bool,
 }
 
 impl LayoutWatch {
@@ -702,8 +912,14 @@ impl LayoutWatch {
     const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// Called by the runner on the event-loop thread: every frame (`force = false`) and on
-    /// start-up / focus gain (`force = true`).
+    /// start-up / focus gain (`force = true`). Does nothing while the labels are pinned, and
+    /// forces a check on the first poll after they are unpinned.
     pub(crate) fn poll(&mut self, now: web_time::Instant, force: bool, layout: &mut KeyboardLayout) {
+        let unpinned = std::mem::replace(&mut self.was_pinned, layout.is_pinned()) && !layout.is_pinned();
+        if layout.is_pinned() {
+            return;
+        }
+        let force = force || unpinned;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             if !force
@@ -872,6 +1088,170 @@ mod tests {
         );
         l.clear_os_layout();
         assert!(l.learn(KeyCode::Backquote, Some("<"), None), "no OS table: learned");
+    }
+
+    #[test]
+    fn pinned_labels_ignore_the_os_until_unpinned() {
+        let mut l = KeyboardLayout::default();
+        assert!(!l.is_pinned());
+        l.set_os_layout(Some("fake".into()), [(KeyCode::KeyA, "q".into(), Some("Q".into()))]);
+        l.set_pinned(true);
+        assert!(l.is_pinned());
+        let g = l.generation();
+        assert!(!l.refresh_from_os(), "pinned: the OS table is not read");
+        let mut watch = LayoutWatch::default();
+        let now = web_time::Instant::now();
+        watch.poll(now, true, &mut l);
+        assert_eq!(l.os_layout_id(), Some("fake"));
+        assert_eq!(l.generation(), g);
+        // Explicit calls still apply.
+        assert!(l.learn(KeyCode::KeyZ, Some("w"), None));
+        assert!(l.set_os_layout(Some("fake2".into()), [(KeyCode::KeyA, "a".into(), None)]));
+        assert!(l.is_pinned(), "set_os_layout keeps the pin");
+        // Unpinned: the first poll checks the OS at once, however recent the last check.
+        l.set_pinned(false);
+        watch.poll(now, false, &mut l);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(watch.last_check, Some(now), "forced check");
+        assert!(!watch.was_pinned);
+    }
+
+    #[test]
+    fn macos_virtual_keys_map_to_their_w3c_positions() {
+        use KeyCode as K;
+        // ISO: 0x0A left of 1, 0x32 right of left Shift. ANSI/JIS: 0x32 left of 1.
+        assert_eq!(macos_key_of_virtual_key(0x0A, true), Some(K::Backquote));
+        assert_eq!(macos_key_of_virtual_key(0x32, true), Some(K::IntlBackslash));
+        assert_eq!(macos_key_of_virtual_key(0x0A, false), Some(K::IntlBackslash));
+        assert_eq!(macos_key_of_virtual_key(0x32, false), Some(K::Backquote));
+        assert_eq!(macos_key_of_virtual_key(0x5E, true), Some(K::IntlRo), "JIS Ro");
+        assert_eq!(macos_key_of_virtual_key(0x5E, false), Some(K::IntlRo));
+        assert_eq!(macos_key_of_virtual_key(0x00, true), None, "winit's KeyA: unchanged");
+        assert_eq!(
+            macos_key_of_virtual_key(0x5D, false),
+            None,
+            "winit's IntlYen: unchanged"
+        );
+        for iso in [true, false] {
+            for (vk, ..) in MACOS_KEYS {
+                let key = macos_key_of_virtual_key(vk, iso).unwrap();
+                assert!(is_writing_system_key(key));
+                assert_eq!(macos_virtual_key_of_key(key, iso), Some(vk), "{key:?} (ISO: {iso})");
+            }
+        }
+        assert_eq!(macos_virtual_key_of_key(K::KeyA, true), None);
+        // Off macOS (and for other keys) the runner keeps winit's key.
+        #[cfg(not(target_os = "macos"))]
+        {
+            use winit::keyboard::NativeKeyCode;
+            let ro = PhysicalKey::Unidentified(NativeKeyCode::MacOS(0x5E));
+            assert_eq!(physical_key(ro), ro);
+        }
+        assert_eq!(physical_key(PhysicalKey::Code(K::KeyA)), PhysicalKey::Code(K::KeyA));
+    }
+
+    #[test]
+    fn a_release_finds_the_iso_key_its_press_named() {
+        use KeyCode as K;
+        let held = |keys: &'static [KeyCode]| move |k: KeyCode| keys.contains(&k);
+        // Pressed as IntlBackslash (virtual key known), released as Backquote (unknown).
+        assert_eq!(
+            macos_released_key(K::Backquote, held(&[K::IntlBackslash])),
+            K::IntlBackslash
+        );
+        assert_eq!(
+            macos_released_key(K::IntlBackslash, held(&[K::Backquote])),
+            K::Backquote
+        );
+        assert_eq!(
+            macos_released_key(K::Backquote, held(&[K::Backquote, K::IntlBackslash])),
+            K::Backquote
+        );
+        assert_eq!(macos_released_key(K::Backquote, held(&[])), K::Backquote);
+        assert_eq!(macos_released_key(K::KeyA, held(&[K::KeyB])), K::KeyA);
+    }
+
+    #[test]
+    fn reverse_lookup_finds_the_first_key_and_follows_changes() {
+        let mut l = KeyboardLayout::default();
+        assert_eq!(l.key_for_label("a"), None);
+        l.set_os_layout(
+            Some("fr".into()),
+            [
+                (KeyCode::KeyA, "q".into(), Some("Q".into())),
+                (KeyCode::KeyQ, "a".into(), Some("A".into())),
+                (KeyCode::Semicolon, "m".into(), Some("M".into())),
+                (KeyCode::Backquote, "<".into(), None),
+                (KeyCode::IntlBackslash, "<".into(), None),
+            ],
+        );
+        assert_eq!(l.key_for_label("m"), Some(KeyCode::Semicolon));
+        assert_eq!(l.key_for_label("a"), Some(KeyCode::KeyQ));
+        assert_eq!(
+            l.key_for_label("<"),
+            Some(KeyCode::Backquote),
+            "first in keyboard order"
+        );
+        assert_eq!(l.key_for_label("M"), None, "unshifted labels only");
+        assert!(l.by_label.get().is_some(), "cached");
+        let upper = |t: &str| t.chars().all(char::is_alphabetic) && t != "q";
+        assert_eq!(
+            l.key_for_label_matching(upper),
+            Some(KeyCode::KeyQ),
+            "keyboard order: Q row first"
+        );
+        let mut seen = Vec::new();
+        assert_eq!(
+            l.key_for_label_matching(|t| {
+                seen.push(t.to_owned());
+                false
+            }),
+            None
+        );
+        assert_eq!(
+            seen,
+            ["<", "a", "q", "m"],
+            "each distinct label once, in keyboard order"
+        );
+        // Learned labels win, and every change rebuilds the map.
+        assert!(l.learn(KeyCode::Semicolon, Some("ñ"), None));
+        assert!(l.by_label.get().is_none(), "dropped by the change");
+        assert_eq!(l.key_for_label("m"), None);
+        assert_eq!(l.key_for_label("ñ"), Some(KeyCode::Semicolon));
+        for key in writing_system_keys() {
+            assert_eq!(l.label_text(key), l.label(key).map(|x| x.text).as_deref(), "{key:?}");
+        }
+        assert_eq!(l.label_text(KeyCode::F1), None);
+        l.clear_learned();
+        assert_eq!(l.key_for_label("m"), Some(KeyCode::Semicolon));
+        l.clear_os_layout();
+        assert_eq!(l.key_for_label("m"), None);
+        // A clone carries its own map.
+        l.learn(KeyCode::KeyA, Some("x"), None);
+        let copy = l.clone();
+        l.learn(KeyCode::KeyA, Some("y"), None);
+        assert_eq!(copy.key_for_label("x"), Some(KeyCode::KeyA));
+        assert_eq!(l.key_for_label("x"), None);
+    }
+
+    #[test]
+    fn reverse_lookup_is_shared_across_threads() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<KeyboardLayout>();
+        let mut l = KeyboardLayout::default();
+        for (key, us) in WRITING_KEYS.iter().map(|w| (w.0, w.2)) {
+            l.learn(key, Some(us), None);
+        }
+        let l = &l;
+        std::thread::scope(|s| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| s.spawn(move || (l.key_for_label("m"), l.key_for_label("\\"))))
+                .collect();
+            for t in threads {
+                // US labels: `\` is printed by Backslash, IntlBackslash and IntlRo; Backslash first.
+                assert_eq!(t.join().unwrap(), (Some(KeyCode::KeyM), Some(KeyCode::Backslash)));
+            }
+        });
     }
 
     #[test]

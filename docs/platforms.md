@@ -179,7 +179,36 @@ let m_free = m_key.is_none_or(|k| !bound_to_an_action(k));
 ```
 
 Alternatively read position-based hotkeys from `Input::just_pressed(KeyCode::KeyM)` and show
-`Input::key_cap(KeyCode::KeyM)`.
+`Input::key_cap(KeyCode::KeyM)`. `physical_key_for_egui_key` is cheap enough for every frame:
+it walks a reverse map (label → physical key) that the layout caches per `generation()` and
+does not allocate while the labels stay the same. Use the map directly for "which key types
+this character":
+
+```rust
+let layout = ctx.resources.expect::<Input>().keyboard_layout();
+let m = layout.key_for_label("m");                     // Some(KeyCode::Semicolon) on AZERTY
+let digit = layout.key_for_label_matching(|t| t.chars().all(|c| c.is_ascii_digit()));
+let text: Option<&str> = layout.label_text(KeyCode::KeyA); // borrowed, no allocation
+```
+
+When several keys print the same text, the first in keyboard order (`writing_system_keys()`)
+wins.
+
+**Fake and sample layouts.** `KeyboardLayout::set_os_layout(id, labels)` sets a layout table
+directly (custom platforms, tests, screenshots of another layout's key caps). On macOS,
+Windows and the web the window runner re-reads the OS table (once per second, on focus), which
+replaces such a table; pin it to keep it:
+
+```rust
+let layout = ctx.resources.expect_mut::<Input>().keyboard_layout_mut();
+layout.set_os_layout(Some("sample-azerty".into()), azerty_labels);
+layout.set_pinned(true);  // no OS re-reads, key events teach nothing, until unpinned
+// ...
+layout.set_pinned(false); // the runner re-reads the OS table on its next frame
+```
+
+While pinned, explicit calls (`set_os_layout`, `learn`, `clear_learned`, `clear_os_layout`)
+still apply; `refresh_from_os` / `Input::refresh_keyboard_layout` do nothing.
 
 **Where labels come from.** Learned labels (from key events on the current layout) win over the
 OS table; the OS table is read by the window runner on the event-loop thread at start-up, on
@@ -187,7 +216,7 @@ focus gain and when the layout id changes (checked at most once per second) — 
 
 | platform | OS table | layout switch detected | notes |
 |---|---|---|---|
-| macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate`, main thread only | yes (input source id, keyboard type) | first query at start-up initializes Text Input Services (~35 ms, once); IMEs report the layout they type through; ISO keyboards: see below |
+| macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate`, main thread only | yes (input source id, keyboard type) | first query at start-up initializes Text Input Services (~35 ms, once); IMEs report the layout they type through; ISO and JIS keys: see below |
 | Windows | `MapVirtualKeyExW` + `ToUnicodeEx` for the thread's `HKL` | yes (`HKL`) | |
 | Web | `navigator.keyboard.getLayoutMap()` (Chromium-based browsers), async | on focus | Firefox/Safari, or iframes without the `keyboard-map` permission: learned only; no shifted characters |
 | Linux X11/Wayland | none (no hard `libxkbcommon` dependency) | no | learned from winit's `key_without_modifiers` |
@@ -205,11 +234,21 @@ Limitations:
 * macOS Text Input Sources are main-thread only (macOS 14+ aborts the process otherwise): the
   runner reads them on the event-loop thread, and `Input::refresh_keyboard_layout` reads nothing
   on other threads (headless tests on libtest threads use learned labels only).
-* macOS ISO keyboards (most European Macs): winit reports both the key left of `1` (`§` on US,
-  `@` on French, `^` on German Macs) and the key right of left Shift (`<`) as
-  `KeyCode::Backquote`, so a `Backquote` binding fires on either and `IntlBackslash` never
-  fires. `key_label(Backquote)` names the key left of `1` (the W3C `Backquote` position) and is
-  not learned from presses, which would flip it between the two keys.
+* macOS ISO keyboards (most European Macs): winit 0.30 reports both the key left of `1` (`§`
+  on US/British, `@` on French, `^` on German Macs; virtual key `0x0A`) and the key right of
+  left Shift (`` ` `` on US/British, `<` on French/German; `0x32`) as `KeyCode::Backquote`. The
+  runner reads the virtual key of the event AppKit is dispatching (`NSApp.currentEvent`) and
+  reports the key right of left Shift as `KeyCode::IntlBackslash` (its W3C position, as on
+  Windows); each key has its own OS label (egui gets its character's key, else
+  `egui::Key::IntlBackslash`, like egui-winit). A `Backquote` binding (such as the UI
+  console's default key) now fires on the key left of `1` only. If winit delivers a key event
+  late (it queues events that arrive while it is handling another), the virtual key is unknown
+  and either key reads `Backquote` (a release still releases the key its press named), so on
+  ISO keyboards `key_label(Backquote)` comes from the OS table only and is not learned from
+  presses.
+* macOS JIS keyboards: winit 0.30 has no code for the Ro key (`_`, left of right Shift; virtual
+  key `0x5E`); the runner reports it as `KeyCode::IntlRo` with its OS label.
+* A table set with `set_os_layout` lasts until the next OS check unless pinned (see above).
 
 ## CI and releases
 

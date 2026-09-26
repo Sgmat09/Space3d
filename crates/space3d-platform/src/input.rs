@@ -540,7 +540,8 @@ impl Input {
     }
     /// A keyboard event with its logical key (what the runner feeds): presses/releases the
     /// physical key, appends the text of presses to [`Self::text`], records the event in
-    /// [`Self::key_events`] and learns the key's label (see [`crate::layout`]).
+    /// [`Self::key_events`] and learns the key's label (see [`crate::layout`]; not while the
+    /// labels are pinned: [`KeyboardLayout::set_pinned`]).
     pub fn inject_key_event(&mut self, event: KeyEvent) {
         if event.pressed {
             self.keys.press(event.physical);
@@ -574,10 +575,14 @@ impl Input {
     /// Learn what a pressed key types: the modifier-free key where the platform reports it,
     /// else the logical key when neither Shift nor Alt/AltGr/Option is held; plus the
     /// shifted character when only Shift is held. Caps Lock is undone for letters (the
-    /// logical key of the fallback is lowered, the shifted character raised).
+    /// logical key of the fallback is lowered, the shifted character raised). Nothing is
+    /// learned while the labels are pinned ([`KeyboardLayout::set_pinned`]).
     fn learn_label(&mut self, event: &KeyEvent) {
         use crate::layout::{logical_key_label, shifted_case, unshifted_case};
         use KeyCode as K;
+        if self.layout.is_pinned() {
+            return;
+        }
         let shift = self.any_pressed([K::ShiftLeft, K::ShiftRight]);
         let alt = self.any_pressed([K::AltLeft, K::AltRight]);
         let other = self.any_pressed([K::ControlLeft, K::ControlRight, K::SuperLeft, K::SuperRight]);
