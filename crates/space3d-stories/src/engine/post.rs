@@ -661,3 +661,51 @@ fn color_grading() -> Story {
     .tag("post")
     .size(320, 180)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{KnobValue, KnobValues, StoryRunOptions, render_story};
+
+    /// Measurement for docs/graphics/post.md ("Resolution independence"): the mean luma bloom
+    /// adds to `Engine/Post/Bloom` at each rect size (8-bit sRGB luma, with minus without bloom).
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture"]
+    fn bloom_added_luma_by_size() {
+        let story = super::bloom();
+        let luma = |img: &space3d_core::ImageData| {
+            let mut sum = 0.0f64;
+            for p in img.pixels.chunks(4) {
+                sum += 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64;
+            }
+            sum / (img.width * img.height) as f64
+        };
+        for size in [
+            (3840, 2160),
+            (2560, 1440),
+            (1920, 1080),
+            (1600, 900),
+            (1280, 720),
+            (640, 360),
+            (320, 180),
+        ] {
+            let options = StoryRunOptions {
+                size: Some(size),
+                ticks: None,
+            };
+            let with = render_story(&story, &KnobValues::default(), &options);
+            let without = render_story(
+                &story,
+                &KnobValues::default().with("enabled", KnobValue::Bool(false)),
+                &options,
+            );
+            let (Ok(with), Ok(without)) = (with, without) else {
+                eprintln!("skipping: no renderer");
+                return;
+            };
+            eprintln!(
+                "{size:?}: bloom adds {:+.1} mean luma",
+                luma(&with.image) - luma(&without.image)
+            );
+        }
+    }
+}

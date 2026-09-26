@@ -1,6 +1,8 @@
 //! Steady-state heap allocations of the render stage with post effects (graphics spec §4.4
 //! "Passes and wgpu allocations"): bloom on one post camera, on two split-screen post cameras
-//! sharing one pooled chain, and every PO1/PO3 effect (`PostProcess::cinematic()`). The renderer's own work allocates nothing (`cpu_reallocations == 0`,
+//! sharing one pooled chain, every PO1/PO3 effect (`PostProcess::cinematic()`), auto exposure
+//! on both metering paths with the exposure readback (PO2), and color grading with a LUT and a
+//! hook shader (PO4). The renderer's own work allocates nothing (`cpu_reallocations == 0`,
 //! `textures_created == 0`); what remains is wgpu's bookkeeping, about 20 allocations per render
 //! pass on Metal. Each mode is pinned to its measured bound (+10 %) and must not grow over time,
 //! at 320 × 180 (a 3-level bloom chain) and at 1920 × 1080 (the 6-level chain of 1080p and
@@ -60,6 +62,9 @@ fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
         "bloom" => MEASURED_BLOOM * 11 / 10,
         "cinematic" => MEASURED_CINEMATIC * 11 / 10,
         "bloom 1080p" => MEASURED_BLOOM_1080P * 11 / 10,
+        "auto exposure" => MEASURED_AE * 11 / 10,
+        "auto exposure (render passes)" => MEASURED_AE_PASSES * 11 / 10,
+        "graded" => MEASURED_GRADED * 11 / 10,
         _ => MEASURED_SPLIT * 11 / 10,
     };
     if backend == wgpu::Backend::Metal {
@@ -83,6 +88,16 @@ const MEASURED_CINEMATIC: u64 = 261;
 /// Bloom on one camera at 1920 × 1080: the reference chain, 6 levels, level 0 exactly half the
 /// rect (no resample; 11 render passes).
 const MEASURED_BLOOM_1080P: u64 = 332;
+/// Bloom with auto exposure metered by the compute histogram, read back every frame
+/// (`FrameSettings::read_exposure`): 55 over bloom for the compute pass, the copy into E, the
+/// readback copy and its mapping (wgpu's).
+const MEASURED_AE: u64 = 289;
+/// The same metered by render passes (`DownlevelOverride::no_compute`): 3 render passes instead
+/// of the compute pass.
+const MEASURED_AE_PASSES: u64 = 308;
+/// Bloom with white balance, saturation, contrast, lift/gamma/gain, an identity LUT and a
+/// grading hook: the same passes and allocations as bloom.
+const MEASURED_GRADED: u64 = 234;
 
 #[test]
 fn bloom_allocates_a_small_constant_amount() {
@@ -122,7 +137,7 @@ fn bloom_allocates_a_small_constant_amount() {
         counted
     };
     type Setup = fn(&mut App, Entity, Entity);
-    let modes: [(&str, Setup); 4] = [
+    let modes: [(&str, Setup); 7] = [
         ("bloom", |app, cam, _| {
             app.world.insert_one(cam, PostProcess::default()).unwrap();
         }),
@@ -141,6 +156,38 @@ fn bloom_allocates_a_small_constant_amount() {
             c.viewport = None;
             drop(c);
             app.world.insert_one(cam, PostProcess::cinematic()).unwrap();
+        }),
+        ("auto exposure", |app, cam, _| {
+            app.resources.expect_mut::<FrameSettings>().read_exposure = true;
+            app.world
+                .insert_one(cam, PostProcess::default().with_auto_exposure(AutoExposure::on()))
+                .unwrap();
+        }),
+        ("auto exposure (render passes)", |app, _, _| {
+            app.resources.expect_mut::<FrameSettings>().downlevel.no_compute = true;
+        }),
+        ("graded", |app, cam, _| {
+            app.resources.expect_mut::<FrameSettings>().read_exposure = false;
+            app.resources.expect_mut::<FrameSettings>().downlevel.no_compute = false;
+            let assets = app.resources.expect_mut::<RenderAssets>();
+            let lut = assets.add_texture(ColorLut::identity(16));
+            let hook = assets.add_shader(CustomShader::new(
+                "tint",
+                "fn post_ldr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> { return c * vec3<f32>(1.0, 0.95, 0.9); }",
+            ));
+            let grading = ColorGrading {
+                temperature: 0.2,
+                saturation: 1.2,
+                contrast: 1.1,
+                lift: Vec3::splat(0.02),
+                gamma: Vec3::splat(1.1),
+                lut: Some(ColorLut::new(lut, 16)),
+                shader: Some(hook),
+                ..ColorGrading::default()
+            };
+            app.world
+                .insert_one(cam, PostProcess::default().with_color_grading(grading))
+                .unwrap();
         }),
         ("bloom 1080p", |app, cam, _| {
             app.world.insert_one(cam, PostProcess::default()).unwrap();
@@ -172,6 +219,8 @@ fn bloom_allocates_a_small_constant_amount() {
         let passes = match name {
             "cinematic" => 8,
             "bloom 1080p" => 12,
+            // Metering: an 80 × 45 level reduced to 10 × 6, then the adapt pass.
+            "auto exposure (render passes)" => 10,
             _ => 7,
         };
         assert_eq!(s.post_groups, groups, "{name}");

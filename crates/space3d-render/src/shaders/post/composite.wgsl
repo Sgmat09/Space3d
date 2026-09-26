@@ -156,11 +156,34 @@ fn post_grade_ldr(c: vec3<f32>) -> vec3<f32> {
 }
 
 // Bloom level 0 at S position `s` (already exposed and thresholded). The chain covers the
-// rect's part inside S.
+// rect's part inside S; its prefilter centers each texel half a scene pixel before the 2 × 2
+// block it stands for (bloom.wgsl `fs_prefilter`), so the lookup moves half a pixel on. Level 0
+// is magnified by a cubic B-spline (4 bilinear taps, Sigg & Hadwiger 2005) rather than bilinear:
+// smoother, and every texel adds the same light to the frame at any magnification (bilinear at
+// 2.67×, 720p and 1440p, weighed texels 3 % apart, so a small glow pulsed as it moved).
 fn post_bloom(s: vec2<f32>) -> vec3<f32> {
     let clip = post_scene_clip();
-    let uv = (s - clip.xy) / max(clip.zw - clip.xy, vec2<f32>(1.0));
-    return textureSampleLevel(bloom_tex, post_sampler, uv, 0.0).rgb;
+    let uv = (s + 0.5 - clip.xy) / max(clip.zw - clip.xy, vec2<f32>(1.0));
+    let size = vec2<f32>(textureDimensions(bloom_tex));
+    let t = uv * size - 0.5;
+    let i = floor(t);
+    let f = t - i;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    let w3 = f3 / 6.0;
+    let g0 = w0 + w1;
+    let g1 = w2 + w3;
+    // Tap positions (texel centers at +0.5) and normalized coordinates.
+    let p0 = (i - 0.5 + w1 / g0) / size;
+    let p1 = (i + 1.5 + w3 / g1) / size;
+    let a = textureSampleLevel(bloom_tex, post_sampler, vec2<f32>(p0.x, p0.y), 0.0).rgb;
+    let b = textureSampleLevel(bloom_tex, post_sampler, vec2<f32>(p1.x, p0.y), 0.0).rgb;
+    let c = textureSampleLevel(bloom_tex, post_sampler, vec2<f32>(p0.x, p1.y), 0.0).rgb;
+    let d = textureSampleLevel(bloom_tex, post_sampler, vec2<f32>(p1.x, p1.y), 0.0).rgb;
+    return g0.y * (g0.x * a + g1.x * b) + g1.y * (g0.x * c + g1.x * d);
 }
 
 // Chromatic aberration: red and blue sampled `off` apart around `s`, radially from the rect's

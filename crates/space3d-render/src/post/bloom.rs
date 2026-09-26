@@ -7,7 +7,7 @@
 //! `GraphicsCaps::bloom_format`: level 0 has the reference chain's heights (half the rect at
 //! 1080p, capped at `Bloom::max_mip_height`; [`chain_size`]); every further level halves it.
 //! Passes: one prefilter (S → exactly half the rect: exposure, soft threshold and the firefly
-//! limit per pixel, then a 4 × 4 tent),
+//! limit per pixel, then a 3 × 3 tent),
 //! an area resample of its output into level 0 when level 0 has another size (720p, 900p,
 //! 1440p, 4K, …), `mips − 1` downsamples and `mips − 1` upsamples blended by `scatter` — 11
 //! render passes for the default 6 levels at 1080p, 10 (with the resample) for the 5 of 720p.
@@ -85,7 +85,7 @@ pub(crate) struct ChainSize {
 /// while the smallest one has fewer than 2 pixels on its short side. Level `k` is
 /// `max(1, level0 >> k)` (the texture's mip chain).
 ///
-/// The prefilter's tent (4 × 4 pixels per destination pixel) weighs every source pixel alike
+/// The prefilter's tent (3 × 3 pixels per destination pixel) weighs every source pixel alike
 /// only at exactly 2× reduction: at 2.67× (720p, 1440p, 360p) or 4× (4K) a fixed footprint
 /// leaves gaps, and a 1–2 px bright source gets a full, a double or no halo depending on its
 /// position (moving, it blinks). So the prefilter always halves the rect exactly (`half`,
@@ -1081,6 +1081,40 @@ mod tests {
         Some(best)
     }
 
+    /// Measurement for docs/graphics/post.md ("Cost"): the chain's GPU time (loaded, best of 3
+    /// runs of 40 rounds) by rect size, with the default glow and the Low-quality chain. Run
+    /// alone: `cargo test -p space3d-render --lib bloom_gpu_time_by_size -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf measurement: run alone with --ignored"]
+    fn bloom_gpu_time_by_size() {
+        let glow = Bloom::glow();
+        let low = Bloom {
+            mip_count: 4,
+            max_mip_height: 270,
+            ..glow
+        };
+        let cases = [
+            ("720p", (1280, 720), glow),
+            ("1080p", (1920, 1080), glow),
+            ("1440p", (2560, 1440), glow),
+            ("4K", (3840, 2160), glow),
+            ("Low 1440x810", (1440, 810), low),
+        ];
+        for (name, size, bloom) in cases {
+            let Some(format) = pollster::block_on(crate::Renderer::new_headless(4, 4))
+                .ok()
+                .and_then(|r| r.graphics_caps().bloom_format)
+            else {
+                eprintln!("skipping: no adapter or no float targets");
+                return;
+            };
+            let best = (0..3)
+                .filter_map(|_| gpu_ms_per_chain_at(size, &bloom, format, 5, 40))
+                .fold(f64::MAX, f64::min);
+            eprintln!("{name}: {best:.3} ms GPU per chain ({format:?}, loaded)");
+        }
+    }
+
     /// Gate (graphics spec §4.4): bloom with 6 levels at 1080p ≤ 0.20 ms of GPU time on the dev
     /// machine (Apple M4 Max), loaded (measured 0.14–0.17 ms). Skips without `TIMESTAMP_QUERY`;
     /// `SPACE3D_PERF_BUDGET_SCALE` relaxes it on slower machines. Each run is the best of 40
@@ -1276,8 +1310,9 @@ mod tests {
         Some((chain.size, out))
     }
 
-    /// The light bloom adds to a `size` frame (the composite's bilinear sampling of level 0 at
-    /// every pixel center, summed): the red channel.
+    /// The light bloom adds to a `size` frame: the composite's lookup of level 0 at every pixel
+    /// center (composite.wgsl `post_bloom`: half a scene pixel on, cubic B-spline), summed, red
+    /// channel.
     fn added_light(size: (u32, u32), level: (u32, u32), texels: &[f32]) -> f64 {
         let (lw, lh) = (level.0 as f32, level.1 as f32);
         let at = |x: i64, y: i64| {
@@ -1285,18 +1320,27 @@ mod tests {
             let y = y.clamp(0, level.1 as i64 - 1) as usize;
             texels[y * level.0 as usize + x] as f64
         };
+        let bspline = |t: f64| {
+            let (t2, t3) = (t * t, t * t * t);
+            [
+                (1.0 - t).powi(3) / 6.0,
+                (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0,
+                (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0,
+                t3 / 6.0,
+            ]
+        };
         let mut sum = 0.0;
         for py in 0..size.1 {
             for px in 0..size.0 {
-                let u = (px as f32 + 0.5) / size.0 as f32 * lw - 0.5;
-                let v = (py as f32 + 0.5) / size.1 as f32 * lh - 0.5;
+                let u = (px as f32 + 1.0) / size.0 as f32 * lw - 0.5;
+                let v = (py as f32 + 1.0) / size.1 as f32 * lh - 0.5;
                 let (x0, y0) = (u.floor(), v.floor());
-                let (fx, fy) = ((u - x0) as f64, (v - y0) as f64);
-                let (x0, y0) = (x0 as i64, y0 as i64);
-                sum += at(x0, y0) * (1.0 - fx) * (1.0 - fy)
-                    + at(x0 + 1, y0) * fx * (1.0 - fy)
-                    + at(x0, y0 + 1) * (1.0 - fx) * fy
-                    + at(x0 + 1, y0 + 1) * fx * fy;
+                let (wx, wy) = (bspline((u - x0) as f64), bspline((v - y0) as f64));
+                for (j, wy) in wy.iter().enumerate() {
+                    for (i, wx) in wx.iter().enumerate() {
+                        sum += at(x0 as i64 - 1 + i as i64, y0 as i64 - 1 + j as i64) * wx * wy;
+                    }
+                }
             }
         }
         sum
@@ -1325,9 +1369,9 @@ mod tests {
 
     /// The M1 review's shimmer finding: a small bright source moving over the pixel grid (every
     /// phase of the prefilter's 2 × 2 blocks and of level 0's texels) gets the same added light
-    /// (M1: 2 px sources varied by 11 %, 4 px ones by 4 %, at 720p, 1080p and 1440p). The
-    /// prefilter is exact at 1080p; at 720p and 1440p the resample into level 0 and the
-    /// composite's magnification by 2.67 leave about 1 %.
+    /// within 0.3 % (0.02–0.1 % measured; M1: 2 px sources varied by 11 %, 4 px ones by 4 %, at
+    /// 720p, 1080p and 1440p). The per-pixel prefilter makes level 0's energy exact; the
+    /// composite's B-spline magnification keeps it exact at 2.67× (bilinear left 3 %).
     #[test]
     fn bloom_is_stable_under_motion() {
         let Ok(r) = pollster::block_on(crate::Renderer::new_headless(8, 8)) else {
@@ -1336,7 +1380,7 @@ mod tests {
         };
         let glow = Bloom::glow();
         for size in [(1280, 720), (1920, 1080), (2560, 1440)] {
-            let limit = if size.1 == 1080 { 0.002 } else { 0.02 };
+            let limit = 0.003;
             for (px, radiance) in [(1, 30.0), (2, 10.0), (3, 6.0), (4, 4.0)] {
                 let spread = motion_spread(&r, size, px, radiance, &glow).expect("chain");
                 eprintln!("{size:?}: {px} px of {radiance}: spread {:.2} %", spread * 100.0);

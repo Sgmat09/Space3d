@@ -6,7 +6,7 @@
 // * `fs_prefilter`: S (the post group's rect) → exactly half its size (level 0 at 1080p). Every
 //   scene pixel is exposed (bloom works in exposed units: the composite adds it after
 //   exposure), soft-thresholded and softly limited on its own (the firefly guard), then a
-//   separable [1 3 3 1] / 8 tent over 4 × 4 pixels filters them: linear after the per-pixel
+//   separable [1 2 1] / 4 tent over 3 × 3 pixels filters them: linear after the per-pixel
 //   steps, so each pixel's weight over level 0 is exactly 1/4 wherever it sits and a small
 //   bright source adds the same light at every sub-pixel position (no shimmer while it moves).
 //   (M1 thresholded and Karis-weighted 2 × 2 box averages of bilinear taps: position-dependent
@@ -149,26 +149,30 @@ fn bloom_pixel(p: vec2<i32>, lo: vec2<i32>, hi: vec2<i32>, e: f32) -> vec3<f32> 
     return bloom_limit(bloom_threshold(c * e));
 }
 
-// Tent weight [1 3 3 1] / 8 of tap `k` (0..3).
+// Tent weight [1 2 1] / 4 of tap `k` (0..2).
 fn bloom_tent(k: i32) -> f32 {
-    return select(0.375, 0.125, k == 0 || k == 3);
+    return select(0.25, 0.5, k == 1);
 }
 
 @fragment
 fn fs_prefilter(in: FullscreenOut) -> @location(0) vec4<f32> {
-    // The destination pixel covers the rect's pixels 2i, 2i + 1 per axis; a separable
-    // [1 3 3 1] / 8 tent over 2i − 1 … 2i + 2. Every scene pixel is exposed, thresholded and
-    // limited on its own, then filtered linearly: its total weight over the destination is
-    // exactly 1/4 wherever it sits, so a small bright source adds the same light at every
-    // position (no shimmer while it moves), in proportion to its energy above the threshold.
+    // Destination pixel i, per axis: a [1 2 1] / 4 tent over the rect's pixels 2i − 1, 2i,
+    // 2i + 1. Every scene pixel is exposed, thresholded and limited on its own, then filtered
+    // linearly: an even pixel weighs 1/2 in one destination pixel, an odd one 1/4 in two, so
+    // every pixel's total weight is exactly 1/4 wherever it sits and a small bright source adds
+    // the same light at every position (no shimmer while it moves), in proportion to its energy
+    // above the threshold. (9 loads: a [1 3 3 1] tent over 4 × 4 is as stable but costs twice
+    // as much at 4K, a 2 × 2 box half but leaves blocky glows along thin lines.) Destination
+    // pixel i is centered on scene pixel 2i, half a scene pixel before the 2 × 2 block it
+    // stands for: the composite samples bloom half a scene pixel further (composite.wgsl).
     let lo = vec2<i32>(bloom.src_rect.xy);
     let hi = lo + vec2<i32>(bloom.src_rect.zw);
     let base = lo + vec2<i32>(in.pos.xy) * 2 - 1;
     let e = bloom_exposure_multiplier();
     var sum = vec3<f32>(0.0);
-    for (var y = 0; y < 4; y += 1) {
+    for (var y = 0; y < 3; y += 1) {
         var row = vec3<f32>(0.0);
-        for (var x = 0; x < 4; x += 1) {
+        for (var x = 0; x < 3; x += 1) {
             row += bloom_pixel(base + vec2<i32>(x, y), lo, hi, e) * bloom_tent(x);
         }
         sum += row * bloom_tent(y);
