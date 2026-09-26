@@ -595,17 +595,30 @@ impl Console {
 /// Egui id of the console window.
 pub(crate) const CONSOLE_ID: &str = "space3d_console";
 
-/// Default place of the docked console window: bottom-left, 640 pt wide and 40 % of the screen
-/// height (140 to 360 pt), [`crate::tool::EDGE`] in from the edges.
-pub(crate) fn window_rect(screen: egui::Rect) -> egui::Rect {
+/// Default place of the docked console window in the dock area `dock`: bottom-left, 640 pt wide
+/// and 40 % of the area's height (140 to 360 pt), [`crate::tool::EDGE`] in from its edges.
+pub(crate) fn window_rect(dock: egui::Rect) -> egui::Rect {
     let edge = crate::tool::EDGE;
     let size = egui::vec2(
-        (screen.width() - 2.0 * edge).min(640.0),
-        (screen.height() * 0.4)
+        (dock.width() - 2.0 * edge).min(640.0),
+        (dock.height() * 0.4)
             .clamp(140.0, 360.0)
-            .min(screen.height() - 2.0 * edge),
+            .min(dock.height() - 2.0 * edge),
     );
-    egui::Rect::from_min_size(egui::pos2(screen.left() + edge, screen.bottom() - edge - size.y), size)
+    egui::Rect::from_min_size(egui::pos2(dock.left() + edge, dock.bottom() - edge - size.y), size)
+}
+
+/// Where the console window is this frame (docked in `dock` or where the user moved it).
+pub(crate) fn placed_rect(ctx: &egui::Context, dock: egui::Rect) -> egui::Rect {
+    let bounds = dock.shrink(crate::tool::EDGE);
+    crate::tool::placed_rect(
+        ctx,
+        CONSOLE_ID,
+        egui::Align2::LEFT_BOTTOM,
+        bounds.left_bottom(),
+        window_rect(dock).size(),
+        bounds,
+    )
 }
 
 /// `Stage::Update`: pull logs, run queued commands and draw the console window.
@@ -616,12 +629,13 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
     {
         c.pull_logs();
     }
-    if let Some(ctx) = ctx
+    let dock = ctx.as_ref().map(|ctx| crate::tool::dock_rect(sys.resources, ctx));
+    if let (Some(ctx), Some(dock)) = (ctx, dock)
         && let Some(c) = sys.resources.get_mut::<Console>()
         && c.visible
     {
         let mut open = true;
-        let screen = ctx.content_rect();
+        let bounds = dock.shrink(crate::tool::EDGE);
         let filter = c.filter.to_lowercase();
         let (shown, total) = (c.shown(&filter).count(), c.lines.len());
         crate::tool::window(
@@ -630,7 +644,9 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
                 id: CONSOLE_ID,
                 title: "Console",
                 anchor: egui::Align2::LEFT_BOTTOM,
-                size: window_rect(screen).size(),
+                dock_pos: bounds.left_bottom(),
+                bounds,
+                size: window_rect(dock).size(),
                 fit_height: false,
                 max_width: f32::INFINITY,
             },

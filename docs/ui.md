@@ -18,8 +18,12 @@ app.insert_resource(space3d_ui::UiTheme::compact()); // space3d::ui::UiTheme wit
 
 * **Without the resource the app's UI does not change.** The engine never writes egui's `Style`
   unless a `UiTheme` resource exists: the UI of an app that does not opt in renders exactly as
-  before, pixel for pixel. (The engine's own F3 / F4 / console tools are not the app's UI: they
-  have their own compact look in every app, see [In-game tools](#in-game-tools).)
+  before, pixel for pixel.
+* **The engine's dev tools are compact in every app.** The F3 overlay, F4 profiler and console
+  are the engine's tools, not the app's UI: with or without a `UiTheme` they have their own
+  compact look, and they get it by restyling only their own windows (a scoped copy of the style
+  on their own `Ui`s) — never the global style, never the app's windows. See
+  [In-game tools](#in-game-tools).
 * **Applied once, between passes.** `UiPlugin` applies the theme when the resource is inserted or
   changed, right before the next egui pass begins, to both the dark and the light style. In every
   other frame it costs one comparison and no allocation (`UiThemeSync`; tokens compare bit for
@@ -73,7 +77,10 @@ app.insert_resource(UiTheme::Custom(UiDensity {
 
 `UiDensity::egui_default()` holds the right-hand column. egui's `Style` has no table row height:
 tables read it with `UiDensity::row_height(ui)` (the applied theme's `table_row_height`, or the
-style's control height without a theme) or `UiDensity::of(ctx)`:
+style's control height without a theme) or `UiDensity::of(ctx)`. Both only report a theme that
+still holds: after the `UiTheme` resource is removed, or once the game changed the style's sizes
+after the theme was applied (colors do not count), `of` is `None` and `row_height` follows the
+style again:
 
 ```rust
 egui::Grid::new("assets")
@@ -104,8 +111,9 @@ an `egui::Window`.
 
 The theme holds sizes of egui's `Style`; the width of a window is not one of them. An
 `egui::Window` is **340 pt wide by default whatever it holds** (its contents fill that width), so
-a small game window ("Cargo hold: 12 t [Jettison]") keeps a lot of empty space under any theme.
-Size game windows explicitly:
+a small game window ("Cargo hold: 12 t [Jettison]") keeps a lot of empty space under any theme,
+`UiTheme::compact()` included. That width is the game's choice, not the theme's: the engine does
+not resize an app's windows (its own tools size themselves). To size game windows compactly:
 
 * `.auto_sized()`: the window takes the width of its contents. Give the contents a width
   (`ui.set_width(..)`, fixed-width widgets): widgets that fill the available width — separators,
@@ -146,21 +154,57 @@ context's colors, and draws its own compact header (egui's title bar height foll
 heading size). Their size and layout are the same under egui's default, the compact theme or a
 game's roomy style; only the colors follow the game's (story `Engine/UI/Tools/Game Style`,
 `crates/space3d-ui/tests/tools.rs`). Text people read — the header summaries, counts, log
-targets — is in the normal text color; weak text (trace / debug log lines, placeholders) is drawn
-at 80 % instead of egui's 60 %, so it stays above 3:1 on the window fill. Scroll bars stay visible
-while content is hidden, with the handle in the text color (`visible_scroll_bars`).
+targets — is in the normal text color. Weak text (trace / debug log lines, placeholders) takes an
+opacity derived from the palette: the least, from the palette's own `weak_text_alpha` up to 0.85,
+at which it reaches 65 % of the normal text's contrast on the window fill (at least 3:1, at most
+4.5:1) — about 0.78 on egui's greys (3.4:1 where egui's 0.6 gives 2.4:1), and egui's 0.6 under a
+bright game palette, where that already reads at 5.9:1 and stays clearly dimmer than the 16:1 of
+normal text. Scroll bars stay visible while content is hidden, with the handle in the text color
+(`visible_scroll_bars`).
 
-The profiler docks to the top-right corner and the console to the bottom-left, 6 pt in from the
-screen edges (and from each other), and never grow with their contents. The profiler is exactly as
-tall as its contents, up to 45 % of the screen height (at least 300 pt) and never down into the
-open console; with the debug overlay open beside it (small screens, e.g. 640 × 360 pt at 2x) it
-ends 6 pt right of the overlay, down to 300 pt wide. Its table scrolls by whole rows (no row is
-ever cut). The console is 640 × 40 % of the screen (140–360 pt), a whole number of log lines tall
-(stuck to the newest line, the oldest shown is never a sliver), and wraps long lines (paths,
-backtraces) under their message instead of widening.
+### Docking
 
-* **Debug overlay** (`DebugOverlay`): a small, nearly opaque panel at the top-left (readable over
-  bright scene content) that never takes the pointer —
+The tools dock to the corners of the **dock area**, 6 pt in from its edges (and from each other):
+the overlay top-left, the profiler top-right, the console bottom-left. The dock area is the whole
+screen, or the `ToolDockArea` resource when a host sets it: hosts that cover part of the screen
+with their own panels set it every frame to what is left, and the tools then never cover their
+menu bars or side panels — the editor sets it to its viewport (between the menu bar, hierarchy
+and inspector; the whole screen while F1 hides the editor), the storybook viewer to the story
+viewport. An area partly off screen is clipped to the screen; one too small to hold a tool window
+is ignored. A game with panels of its own can do the same:
+
+```rust
+app.add_root_ui_system(|ui: &mut egui::Ui, sys: &mut SystemCtx| {
+    egui::Panel::right("inventory").show(ui, |ui| { /* ... */ });
+    // The tools draw early in the frame: they use the area set in the previous one.
+    space3d_ui::set_tool_dock_area(sys.resources, ui.available_rect_before_wrap());
+});
+```
+
+* **Docked tools follow the dock area.** When the window or a panel is resized — larger or
+  smaller — the docked corner goes to the new corner (the size the user gave a tool stays, capped
+  to the area).
+* **Dragging a tool undocks it**: it stays where it was put (inside the screen) until its title is
+  double-clicked, which docks it again. Clicks inside a docked tool, or resizing it by a free edge,
+  leave it docked.
+* **Above the game's windows**: the tool windows sit on egui's foreground layer (with menus and
+  popups, under tooltips), so a game window never draws over them.
+
+The profiler is exactly as tall as its contents, up to 45 % of the dock area's height (at least
+300 pt) and never down into the open console. With the debug overlay open beside it (small
+screens, e.g. 640 × 360 pt at 2x) it ends 6 pt right of the overlay, down to 240 pt wide (where
+names would get narrower than 12 digits, under about 370 pt, its table keeps the avg and calls
+columns only); when not even that fits (a tall, narrow screen such as a phone held upright) it
+docks under the overlay if 160 pt fit there. Only on screens too small for all three (about
+430 × 240 pt) do they overlap. Its table scrolls by whole rows (no row is ever cut), under a
+header whose titles sit right above their right-aligned columns whether or not the scroll bar
+takes a column of its own. The console is 640 × 40 % of the dock area (140–360 pt), a whole
+number of log lines tall (stuck to the newest line, the oldest shown is never a sliver), and
+wraps long lines (paths, backtraces) under their message instead of widening.
+
+* **Debug overlay** (`DebugOverlay`): a small panel at the top-left that never takes the pointer,
+  98 % opaque (the renderer blends in linear space, where even 92 % black over a white scene is a
+  mid grey: its labels keep 6:1 over any scene) —
   FPS, average and worst frame time, a sparkline of the last 240 frames (60 / 30 Hz guides), and a
   monospace grid of label/value pairs with right-aligned numbers: frame, tick, rate, dropped
   ticks, entities, alpha, draws, triangles, drawn instances, uploaded bytes, egui primitives and
@@ -189,31 +233,45 @@ actions (remove, edit JSON), and panel margins from the style. Rows never ask fo
 panel's width, under any style or density: sliders get a fixed-width value box (the same in every
 row, so the boxes line up) and the rail takes the rest; x / y / z and paired fields split the row
 into equal cells (axis color bars instead of "x " prefixes) and drop decimals before they would
-widen it; groups of checkboxes or buttons wrap within the value column. The side panels keep
+widen it; groups of checkboxes or buttons wrap within the value column; actions sit in rows of
+equal cells as wide as the property rows (the texture editor's "Apply …", flip and rotate rows),
+so every slider's value box stays in one column. Rows reuse the styles they derive (slider
+widths, header spacing, scroll bars) frame after frame instead of copying the `Style` per row.
+The side panels keep
 their width frame after frame and whatever is selected (hierarchy 160–400 pt, inspector 220–480
 pt), their scroll bars stay visible while content is hidden, and buttons (the section "×"
 included) are at least 18 pt tall. A slider's rail stays at least two control heights long: in a
 narrow column with big fonts the value box gives up room first (down to three digits), and the
 texture and model editors' tool columns grow with the body text size. The menu bar is as tall as
 egui's own top panel (one control plus 2 pt above and below), and the texture and model editors
-open over the viewport, never over the menu bar or the side panels (`TextureEditor::show_in`,
-`ModelEditor::show_in` with the viewport rect; `show` keeps egui's placement). `EditorPlugin`
-added to a game does **not** insert the theme:
+open over the viewport, 6 pt clear of the menu bar and the side panels (`TextureEditor::show_in`,
+`ModelEditor::show_in` with the viewport rect; `show` keeps egui's placement). The editor and the
+storybook viewer set the `ToolDockArea` to their viewport, so F3 / F4 / the console dock there
+too (see [Docking](#docking)). `EditorPlugin` added to a game does **not** insert the theme:
 the game's style stays as it is (insert the theme yourself to get the same density), and its
 panels still keep their width.
 
 ## Stories and tests
 
-The engine storybook (`space3d_stories::engine_storybook`, feature `ui`, part of `engine`) holds
+The engine storybook (`space3d_stories::engine_storybook`, feature `ui`: not a default feature, since
+it pulls in egui; the editor turns it on, and so does the facade's `ui` feature together with
+`stories`) holds
 `Engine/UI/Theme/Default`, `Engine/UI/Theme/Compact`, `Engine/UI/Tools/Debug Overlay`,
 `Engine/UI/Tools/Profiler`, `Engine/UI/Tools/Console` and `Engine/UI/Tools/Game Style`, with
 goldens in `crates/space3d-stories/tests/__screenshots__/Engine/UI/`. The tool stories have a
 `style` knob (egui default, compact theme, roomy game style).
 
 Tests: `crates/space3d-ui/tests/theme.rs` (density, default path untouched, applied once, never
-fights a game's style), `crates/space3d-ui/tests/tools.rs` (docked tools stay inside the screen and
-apart at several sizes and scale factors, never grow, same geometry under a game's style; the
-profiler keeps clear of the debug overlay and above the console on 640 × 330–400 pt screens),
+fights a game's style; unit tests: `UiDensity::of` forgets a removed or overridden theme),
+`crates/space3d-ui/tests/tools.rs` (docked tools stay inside the screen and apart at several sizes
+and scale factors, never grow, same geometry under a game's style; the profiler keeps clear of the
+debug overlay and above the console on 640 × 330–400 pt screens and shares 480 × 320 and
+390 × 844 pt screens without overlaps; docked tools follow the screen as it grows and shrinks; a
+dragged tool floats until its title is double-clicked; tools dock inside a `ToolDockArea`; a game
+window never covers them), the profiler's `table_headers_line_up_with_their_columns` (header
+titles over their columns with and without a scroll bar, and in a narrow table),
 `crates/space3d-ui/tests/alloc_free.rs` (no allocation while the theme is unchanged or absent) and
 the editor's `standalone_tools_are_compact_and_the_plugin_keeps_a_games_style`,
-`editor_panels_keep_their_width_under_any_style` and `tool_windows_stay_over_the_viewport`.
+`editor_panels_keep_their_width_under_any_style`, `tool_windows_stay_over_the_viewport`,
+`engine_tools_dock_inside_the_viewport` (at 1280 × 720 and 1920 × 1080, after resizes, and the
+whole screen with the editor hidden) and `rows_reuse_their_styles_frame_after_frame`.

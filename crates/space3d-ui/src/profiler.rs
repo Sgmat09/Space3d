@@ -405,7 +405,9 @@ impl Profiler {
 
     /// The systems table: a header row, then one row per system (scrolling by whole rows so no
     /// row is ever cut) ending above screen y `max_bottom`. Columns fill the width: a bar of the
-    /// average time, the name (truncated, full name on hover) and right-aligned numbers.
+    /// average time, the name (truncated, full name on hover) and right-aligned numbers, their
+    /// headers right above them whether or not a scroll bar takes a column of its own. In a
+    /// narrow table the name keeps the room of the `last` and `max` columns.
     fn table_ui(&self, ui: &mut egui::Ui, max_bottom: f32) {
         let max = self.stats.first().map_or(1.0, |s| s.avg_ms.max(1e-6));
         let mono = egui::TextStyle::Monospace.resolve(ui.style());
@@ -420,25 +422,9 @@ impl Profiler {
         let visuals = ui.visuals().clone();
         let text = visuals.text_color();
 
+        // The header's texts are drawn once the rows' width is known (a scroll bar narrows them).
         let (header, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), pitch), egui::Sense::hover());
-        let painter = ui.painter();
-        let x = columns.xs(header);
-        let y = header.center().y;
-        painter.text(
-            egui::pos2(x.name, y),
-            egui::Align2::LEFT_CENTER,
-            "system",
-            body.clone(),
-            text,
-        );
-        for (right, h) in [(x.avg, "avg"), (x.last, "last"), (x.max, "max"), (x.calls, "calls")] {
-            painter.text(egui::pos2(right, y), egui::Align2::RIGHT_CENTER, h, mono.clone(), text);
-        }
-        painter.hline(
-            header.x_range(),
-            header.bottom() - 0.5,
-            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
-        );
+        let mut rows_x = None;
 
         // Stripes a little stronger than egui's barely visible `faint_bg_color`.
         let stripe = visuals.faint_bg_color.gamma_multiply(3.0);
@@ -460,6 +446,7 @@ impl Profiler {
                         let s = &self.stats[i];
                         let (rect, response) =
                             ui.allocate_exact_size(egui::vec2(ui.available_width(), pitch), egui::Sense::hover());
+                        rows_x.get_or_insert(rect.x_range());
                         let painter = ui.painter();
                         if i % 2 == 1 {
                             painter.rect_filled(rect, 0.0, stripe);
@@ -484,26 +471,59 @@ impl Profiler {
                         job.wrap = egui::text::TextWrapping::truncate_at_width((x.name_end - x.name).max(8.0));
                         let galley = ui.fonts_mut(|f| f.layout_job(job));
                         painter.galley(egui::pos2(x.name, y - galley.size().y / 2.0), galley, text);
-                        for (right, value) in [
-                            (x.avg, format!("{:.3}", s.avg_ms)),
-                            (x.last, format!("{:.3}", s.last_ms)),
-                            (x.max, format!("{:.3}", s.max_ms)),
-                            (x.calls, s.calls.to_string()),
-                        ] {
-                            painter.text(
-                                egui::pos2(right, y),
-                                egui::Align2::RIGHT_CENTER,
-                                value,
-                                mono.clone(),
-                                text,
-                            );
+                        let numbers = [(Some(x.avg), s.avg_ms), (x.last, s.last_ms), (x.max, s.max_ms)];
+                        for (right, ms) in numbers {
+                            if let Some(right) = right {
+                                painter.text(
+                                    egui::pos2(right, y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    format!("{ms:.3}"),
+                                    mono.clone(),
+                                    text,
+                                );
+                            }
                         }
+                        painter.text(
+                            egui::pos2(x.calls, y),
+                            egui::Align2::RIGHT_CENTER,
+                            s.calls.to_string(),
+                            mono.clone(),
+                            text,
+                        );
                         response.on_hover_ui(|ui| {
                             ui.label(&*s.name);
                         });
                     }
                 });
         });
+
+        let header = egui::Rect::from_x_y_ranges(rows_x.unwrap_or(header.x_range()), header.y_range());
+        let painter = ui.painter();
+        let x = columns.xs(header);
+        let y = header.center().y;
+        painter.text(
+            egui::pos2(x.name, y),
+            egui::Align2::LEFT_CENTER,
+            "system",
+            body.clone(),
+            text,
+        );
+        let titles = [
+            (Some(x.avg), "avg"),
+            (x.last, "last"),
+            (x.max, "max"),
+            (Some(x.calls), "calls"),
+        ];
+        for (right, h) in titles {
+            if let Some(right) = right {
+                painter.text(egui::pos2(right, y), egui::Align2::RIGHT_CENTER, h, mono.clone(), text);
+            }
+        }
+        painter.hline(
+            header.x_range(),
+            header.bottom() - 0.5,
+            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        );
     }
 }
 
@@ -513,16 +533,18 @@ struct TableColumns {
     number: f32,
     calls: f32,
     gap: f32,
+    /// Narrowest name column before `last` and `max` give up their room.
+    min_name: f32,
 }
 
 /// Screen x of the table's columns in a row: where the name starts and must end, and the right
-/// edges of the right-aligned number columns.
+/// edges of the right-aligned number columns (`last` and `max` are left out of a narrow table).
 struct ColumnXs {
     name: f32,
     name_end: f32,
     avg: f32,
-    last: f32,
-    max: f32,
+    last: Option<f32>,
+    max: Option<f32>,
     calls: f32,
 }
 
@@ -533,21 +555,36 @@ impl TableColumns {
             number: (digit * 8.0).ceil(),
             calls: (digit * 5.0).ceil(),
             gap: 8.0,
+            min_name: (digit * 12.0).ceil(),
         }
     }
 
     fn xs(&self, row: egui::Rect) -> ColumnXs {
+        let name = row.left() + 2.0 + self.bar + 6.0;
         let calls = row.right() - 2.0;
         let max = calls - self.calls - self.gap;
         let last = max - self.number - self.gap;
         let avg = last - self.number - self.gap;
-        ColumnXs {
-            name: row.left() + 2.0 + self.bar + 6.0,
-            name_end: avg - self.number - self.gap,
-            avg,
-            last,
-            max,
-            calls,
+        let name_end = avg - self.number - self.gap;
+        if name_end - name >= self.min_name {
+            ColumnXs {
+                name,
+                name_end,
+                avg,
+                last: Some(last),
+                max: Some(max),
+                calls,
+            }
+        } else {
+            let avg = max;
+            ColumnXs {
+                name,
+                name_end: avg - self.number - self.gap,
+                avg,
+                last: None,
+                max: None,
+                calls,
+            }
         }
     }
 }
@@ -611,15 +648,16 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
     let ctx = crate::EguiContext::active_context(sys);
     let console_open = sys.resources.get::<crate::Console>().is_some_and(|c| c.visible);
     let overlay_open = sys.resources.get::<crate::DebugOverlay>().is_some_and(|d| d.visible);
+    let dock = ctx.as_ref().map(|ctx| crate::tool::dock_rect(sys.resources, ctx));
     let Some(p) = sys.resources.get_mut::<Profiler>() else {
         return;
     };
     p.update();
-    let Some(ctx) = ctx else { return };
+    let (Some(ctx), Some(dock)) = (ctx, dock) else { return };
     if !p.visible {
         return;
     }
-    let (size, max_width) = window_size(&ctx, console_open, overlay_open);
+    let place = placement(&ctx, dock, console_open, overlay_open);
     let summary = p.summary();
     let mut open = true;
     crate::tool::window(
@@ -628,9 +666,11 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
             id: PROFILER_ID,
             title: "Profiler",
             anchor: egui::Align2::RIGHT_TOP,
-            size,
+            dock_pos: place.dock_pos,
+            bounds: place.bounds,
+            size: place.size,
             fit_height: true,
-            max_width,
+            max_width: place.max_width,
         },
         &mut open,
         |ui| {
@@ -645,51 +685,93 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
 
 const PROFILER_ID: &str = "space3d_profiler";
 
-/// Narrowest the profiler gets to stay clear of the debug overlay.
-const MIN_WIDTH: f32 = 300.0;
+/// Narrowest the profiler gets to stay clear of the debug overlay (its table then shows the
+/// average and calls columns only).
+const MIN_WIDTH: f32 = 240.0;
 
-/// Largest size of the profiler window (docked top-right): 440 pt wide and 45 % of the screen
-/// height (at least 300 pt), but never down into the console when the console is open below it
-/// (at its default place, or wherever the user moved it). Also the width it must stay within
-/// this frame: with the debug overlay (top-left) open beside it, the profiler ends left of it
-/// (unless that would leave it under [`MIN_WIDTH`]), `f32::INFINITY` otherwise.
-fn window_size(ctx: &egui::Context, console_open: bool, overlay_open: bool) -> (egui::Vec2, f32) {
+/// Height below the debug overlay the profiler needs to dock there instead (header, sections and
+/// a few rows).
+const MIN_STACKED_HEIGHT: f32 = 160.0;
+
+/// Where and how big the profiler window is this frame.
+struct Placement {
+    /// Where its top-right corner docks.
+    dock_pos: egui::Pos2,
+    /// The dock area, [`crate::tool::EDGE`] in.
+    bounds: egui::Rect,
+    /// Largest size.
+    size: egui::Vec2,
+    /// Width it must stay within this frame (the debug overlay is beside it), or infinity.
+    max_width: f32,
+}
+
+/// The profiler docks top-right in `dock` (the dock area), 440 pt wide and up to 45 % of the
+/// area's height (at least 300 pt), but never down into the console when the console is open
+/// below it (docked, or wherever the user moved it). With the debug overlay (top-left) open
+/// beside it, the profiler ends left of it; when that would leave it under [`MIN_WIDTH`], it
+/// docks below the overlay instead if [`MIN_STACKED_HEIGHT`] fits there (tall, narrow screens),
+/// and only overlaps the overlay when neither fits.
+fn placement(ctx: &egui::Context, dock: egui::Rect, console_open: bool, overlay_open: bool) -> Placement {
     let edge = crate::tool::EDGE;
-    let screen = ctx.content_rect();
-    let width = 440.0f32.min(screen.width() - 2.0 * edge);
-    let (profiler, console, overlay) = ctx.memory(|m| {
-        (
-            m.area_rect(egui::Id::new(PROFILER_ID)),
-            m.area_rect(egui::Id::new(crate::console::CONSOLE_ID)),
-            m.area_rect(egui::Id::new(crate::debug::OVERLAY_ID)),
-        )
-    });
-    let profiler = profiler.unwrap_or_else(|| {
-        egui::Rect::from_min_size(
-            egui::pos2(screen.right() - edge - width, screen.top() + edge),
+    let bounds = dock.shrink(edge);
+    let width = 440.0f32.min(bounds.width());
+    let floating = crate::tool::is_floating(ctx, PROFILER_ID);
+    let limit = if floating {
+        ctx.content_rect().shrink(edge)
+    } else {
+        bounds
+    };
+    let placed = |pos| {
+        crate::tool::placed_rect(
+            ctx,
+            PROFILER_ID,
+            egui::Align2::RIGHT_TOP,
+            pos,
             egui::vec2(width, 0.0),
+            bounds,
         )
-    });
-    // The overlay starts at the top of the screen, so a profiler whose top is beside it
-    // (above its bottom) must end left of it.
+    };
+    let mut dock_pos = bounds.right_top();
+    let mut profiler = placed(dock_pos);
+    // The overlay is docked at the top-left corner (its size from the last frame).
+    let overlay = ctx
+        .memory(|m| m.area_rect(egui::Id::new(crate::debug::OVERLAY_ID)))
+        .filter(|_| overlay_open)
+        .map(|r| egui::Rect::from_min_size(bounds.left_top(), r.size()));
+    let console = console_open.then(|| crate::console::placed_rect(ctx, dock));
+    let below = |profiler: egui::Rect, console: egui::Rect| {
+        console.x_range().intersects(profiler.x_range()) && console.top() > profiler.top()
+    };
     let mut max_width = f32::INFINITY;
-    if overlay_open
-        && let Some(overlay) = overlay
+    if let Some(overlay) = overlay
         && profiler.top() < overlay.bottom() + edge
     {
         let room = profiler.right() - overlay.right() - edge;
         if room >= MIN_WIDTH {
             max_width = room;
+        } else if !floating {
+            let stacked = placed(egui::pos2(bounds.right(), overlay.bottom() + edge));
+            let floor = console
+                .filter(|&c| below(stacked, c))
+                .map_or(bounds.bottom(), |c| c.top() - edge);
+            if floor - stacked.top() >= MIN_STACKED_HEIGHT {
+                dock_pos = stacked.right_top();
+                profiler = stacked;
+            }
         }
     }
-    let mut height = (screen.height() * 0.45).max(300.0).min(screen.height() - 2.0 * edge);
-    if console_open {
-        let console = console.unwrap_or_else(|| crate::console::window_rect(screen));
-        if console.x_range().intersects(profiler.x_range()) && console.top() > profiler.top() {
-            height = height.min(console.top() - edge - profiler.top());
-        }
+    let mut height = (dock.height() * 0.45).max(300.0).min(limit.bottom() - profiler.top());
+    if let Some(console) = console
+        && below(profiler, console)
+    {
+        height = height.min(console.top() - edge - profiler.top());
     }
-    (egui::vec2(width.min(max_width), height.max(90.0)), max_width)
+    Placement {
+        dock_pos,
+        bounds,
+        size: egui::vec2(width.min(max_width), height.max(90.0)),
+        max_width,
+    }
 }
 
 #[cfg(test)]
@@ -734,5 +816,114 @@ mod tests {
         });
         assert_eq!(p.get("b").unwrap().calls, 0);
         assert_eq!(p.get("a").unwrap().total_calls, 3);
+    }
+
+    /// A profiler with `n` systems of distinct timings.
+    fn profiler_with(n: u32) -> Profiler {
+        let mut p = Profiler::default();
+        for frame in 0..8u64 {
+            let spans = (0..n)
+                .map(|i| TimelineSpan {
+                    name: intern(&format!("game::system_{i}")),
+                    start: f64::from(i) * 0.0001,
+                    duration: 0.0001 * f64::from(n - i) * (1.0 + 0.1 * frame as f64),
+                    depth: 0,
+                })
+                .collect();
+            p.record(FrameTimeline {
+                index: frame + 1,
+                duration: 0.004,
+                spans,
+            });
+        }
+        p
+    }
+
+    fn texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+            _ => {}
+        }
+    }
+
+    /// Right edges of the table's header titles and of the numbers painted in its rows (one
+    /// entry per distinct column), and how many rows were painted, for the profiler shown in a
+    /// docked tool window `size` big.
+    fn table_columns(p: &mut Profiler, size: egui::Vec2) -> (Vec<(String, f32)>, Vec<f32>, usize) {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let ctx = ui.ctx().clone();
+                let mut open = true;
+                crate::tool::window(
+                    &ctx,
+                    crate::tool::ToolWindow {
+                        id: PROFILER_ID,
+                        title: "Profiler",
+                        anchor: egui::Align2::RIGHT_TOP,
+                        dock_pos: screen.shrink(6.0).right_top(),
+                        bounds: screen.shrink(6.0),
+                        size,
+                        fit_height: true,
+                        max_width: f32::INFINITY,
+                    },
+                    &mut open,
+                    |_| {},
+                    |ui, max_bottom| p.ui_until(ui, max_bottom),
+                );
+            });
+            shapes = out.shapes;
+            out.textures_delta.clear();
+        }
+        let mut all = Vec::new();
+        for s in &shapes {
+            texts(&s.shape, &mut all);
+        }
+        let headers = all
+            .iter()
+            .filter(|(t, _)| ["avg", "last", "max", "calls"].contains(&t.as_str()))
+            .map(|(t, r)| (t.clone(), r.right()))
+            .collect();
+        let numbers: Vec<&(String, egui::Rect)> = all.iter().filter(|(t, _)| t.parse::<f64>().is_ok()).collect();
+        let rows = numbers.iter().filter(|(t, _)| t.contains('.')).count();
+        let mut columns: Vec<f32> = Vec::new();
+        for (_, r) in numbers {
+            if !columns.iter().any(|&x| (x - r.right()).abs() < 0.5) {
+                columns.push(r.right());
+            }
+        }
+        (headers, columns, rows)
+    }
+
+    /// The header titles sit right above their right-aligned numbers, whether the table
+    /// scrolls (its scroll bar takes a column of its own) or not; a narrow table keeps avg and
+    /// calls only.
+    #[test]
+    fn table_headers_line_up_with_their_columns() {
+        for (systems, size, scrolls, titles) in [
+            (40, egui::vec2(440.0, 320.0), true, 4),
+            (6, egui::vec2(440.0, 600.0), false, 4),
+            (40, egui::vec2(250.0, 320.0), true, 2),
+        ] {
+            let mut p = profiler_with(systems);
+            let (headers, mut columns, rows) = table_columns(&mut p, size);
+            let label = format!("{systems} systems in {size:?}: headers {headers:?}, columns {columns:?}");
+            assert_eq!(rows / (titles - 1) < systems as usize, scrolls, "scrolling: {label}");
+            assert_eq!(headers.len(), titles, "{label}");
+            columns.sort_by(f32::total_cmp);
+            assert_eq!(columns.len(), titles, "{label}");
+            let mut edges: Vec<f32> = headers.iter().map(|(_, x)| *x).collect();
+            edges.sort_by(f32::total_cmp);
+            for (h, c) in edges.iter().zip(&columns) {
+                assert!((h - c).abs() < 0.5, "header {h} over column {c}: {label}");
+            }
+        }
     }
 }

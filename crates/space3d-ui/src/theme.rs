@@ -148,14 +148,38 @@ impl UiDensity {
         }
     }
 
-    /// The density the last [`apply_theme`] gave `ctx` (`None` while no theme was applied).
+    /// The density of the theme applied to `ctx` by [`apply_theme`] (what [`crate::UiPlugin`]
+    /// does with the [`UiTheme`] resource), while the context's style still has its sizes. `None`
+    /// before a theme is applied, once the [`UiTheme`] resource is removed, and once the style's
+    /// sizes changed after the theme was applied (a game restyled egui; colors do not count).
     /// For UI code that only has the egui context, e.g. to size table rows.
     pub fn of(ctx: &egui::Context) -> Option<Self> {
-        ctx.data(|d| d.get_temp::<Self>(density_id()))
+        let applied = ctx.data(|d| d.get_temp::<AppliedDensity>(density_id()))?;
+        let style = ctx.global_style();
+        if let Some((checked, valid)) = &applied.checked
+            && std::sync::Arc::ptr_eq(checked, &style)
+        {
+            return valid.then_some(applied.density);
+        }
+        // The style changed since the last check (rare): compare its sizes with the tokens once.
+        let mut resized = (*style).clone();
+        apply_density(&mut resized, &applied.density);
+        let valid = resized == *style;
+        let density = applied.density;
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                density_id(),
+                AppliedDensity {
+                    density,
+                    checked: Some((style, valid)),
+                },
+            );
+        });
+        valid.then_some(density)
     }
 
-    /// Row height for tables in `ui`: [`Self::table_row_height`] of the applied theme, or the
-    /// style's control height without a theme.
+    /// Row height for tables in `ui`: [`Self::table_row_height`] of the applied theme ([`Self::of`]),
+    /// or the style's control height without one.
     pub fn row_height(ui: &egui::Ui) -> f32 {
         Self::of(ui.ctx()).map_or(ui.spacing().interact_size.y, |d| d.table_row_height)
     }
@@ -195,6 +219,14 @@ impl UiDensity {
 
 fn density_id() -> egui::Id {
     egui::Id::new("space3d_ui::UiDensity")
+}
+
+/// The density [`apply_theme`] gave a context, with the last style [`UiDensity::of`] checked it
+/// against (and whether that style still had its sizes).
+#[derive(Clone)]
+struct AppliedDensity {
+    density: UiDensity,
+    checked: Option<(std::sync::Arc<Style>, bool)>,
 }
 
 /// Opt-in UI theme (resource). Insert it to apply its density to egui's style; see the
@@ -336,9 +368,15 @@ pub fn compact_style(base: &Style, d: &UiDensity) -> Style {
 /// for [`UiDensity::of`]. [`crate::UiPlugin`] calls this whenever the [`UiTheme`] resource is
 /// inserted or changed; call it yourself to apply a theme again after changing the style.
 pub fn apply_theme(ctx: &egui::Context, theme: &UiTheme) {
-    let d = *theme.density();
-    ctx.all_styles_mut(|style| apply_density(style, &d));
-    ctx.data_mut(|data| data.insert_temp(density_id(), d));
+    let density = *theme.density();
+    ctx.all_styles_mut(|style| apply_density(style, &density));
+    ctx.data_mut(|data| data.insert_temp(density_id(), AppliedDensity { density, checked: None }));
+}
+
+/// Forget the density [`apply_theme`] gave `ctx` ([`UiDensity::of`] returns `None`); the style
+/// keeps its sizes.
+fn forget_theme(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<AppliedDensity>(density_id()));
 }
 
 /// Applies [`UiTheme`] changes to an egui context: what [`crate::UiPlugin`] runs before every
@@ -352,8 +390,8 @@ pub struct UiThemeSync {
 
 impl UiThemeSync {
     /// Apply `theme` if it differs from the last theme seen. `None` (the resource is absent)
-    /// touches nothing; a theme inserted again after that is applied again. Returns whether
-    /// the style changed.
+    /// leaves the style alone (after a theme: [`UiDensity::of`] returns `None` from now on); a
+    /// theme inserted again after that is applied again. Returns whether the style changed.
     pub fn sync(&mut self, ctx: &egui::Context, theme: Option<&UiTheme>) -> bool {
         let unchanged = match (theme, &self.applied) {
             (Some(t), Some(applied)) => t.same_as(applied),
@@ -370,7 +408,12 @@ impl UiThemeSync {
                 self.applications += 1;
                 true
             }
-            None => false,
+            None => {
+                // The resource was removed: the style keeps its sizes, but no theme is applied
+                // any more.
+                forget_theme(ctx);
+                false
+            }
         }
     }
 
@@ -726,6 +769,38 @@ mod tests {
         assert!(sync.sync(&ctx, Some(&custom)), "inserted again: applied again");
         assert_eq!(sync.applications(), 3);
         assert_eq!(sync.applied(), Some(&custom));
+    }
+
+    /// `UiDensity::of` (and `row_height`) report the theme only while it is applied: not after
+    /// the resource is removed, nor after a game changes the style's sizes (colors do not count).
+    #[test]
+    fn the_applied_density_is_forgotten_when_it_no_longer_holds() {
+        let ctx = egui::Context::default();
+        let mut sync = UiThemeSync::default();
+        let theme = UiTheme::compact();
+        sync.sync(&ctx, Some(&theme));
+        assert_eq!(UiDensity::of(&ctx), Some(UiDensity::compact()));
+        ctx.global_style_mut(|s| s.visuals.window_fill = egui::Color32::from_rgb(20, 19, 18));
+        assert_eq!(
+            UiDensity::of(&ctx),
+            Some(UiDensity::compact()),
+            "a color change keeps it"
+        );
+        ctx.global_style_mut(|s| s.spacing.item_spacing = vec2(14.0, 10.0));
+        assert_eq!(UiDensity::of(&ctx), None, "the game restyled the sizes");
+        // Applied again (the resource changed): back.
+        let custom = UiTheme::Custom(UiDensity {
+            table_row_height: 20.0,
+            ..UiDensity::compact()
+        });
+        sync.sync(&ctx, Some(&custom));
+        assert_eq!(UiDensity::of(&ctx).map(|d| d.table_row_height), Some(20.0));
+        assert!(!sync.sync(&ctx, None));
+        assert_eq!(UiDensity::of(&ctx), None, "the resource was removed");
+        assert_eq!(
+            ctx.global_style().spacing.item_spacing,
+            UiDensity::compact().item_spacing
+        );
     }
 
     #[test]

@@ -6,6 +6,62 @@
 
 use space3d_core::glam::Vec3;
 use std::hash::Hash;
+use std::sync::Arc;
+
+/// Gap between the editor's tool windows (texture / model editor) and the edges of the viewport
+/// they open over (the side panels), as for the engine tools.
+pub(crate) const WINDOW_GAP: f32 = 6.0;
+
+/// What a [`cached_style`] entry changes in its base style.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StyleChange {
+    /// Section header rows: 2 pt between the toggle and the title.
+    HeaderSpacing,
+    /// [`visible_scroll_bars`].
+    ScrollBars,
+    /// [`fill_slider`]: rail and value box widths (bits).
+    Slider(u32, u32),
+    /// [`number_field`] narrower than a control: the drag value's minimum width (bits).
+    FieldWidth(u32),
+}
+
+/// Derived styles by base style and change (a handful: one per panel width and style).
+#[derive(Clone, Default)]
+struct StyleCache(Vec<(Arc<egui::Style>, StyleChange, Arc<egui::Style>)>);
+
+/// Most entries kept (the oldest go first).
+const STYLE_CACHE_SIZE: usize = 32;
+
+/// Give `ui` its style changed by `derive`, reusing the style derived for the same base style and
+/// `change` in earlier frames: `ui.spacing_mut()` would copy the whole `Style` (text styles,
+/// visuals...) for every row in every frame.
+fn cached_style(ui: &mut egui::Ui, change: StyleChange, derive: impl FnOnce(&mut egui::Style)) {
+    let id = egui::Id::new("space3d_editor::style_cache");
+    let base = ui.style().clone();
+    let hit = ui.ctx().data_mut(|d| {
+        d.get_temp_mut_or_default::<StyleCache>(id)
+            .0
+            .iter()
+            .find(|(b, c, _)| *c == change && Arc::ptr_eq(b, &base))
+            .map(|(_, _, derived)| derived.clone())
+    });
+    let derived = hit.unwrap_or_else(|| {
+        let mut style = (*base).clone();
+        derive(&mut style);
+        let derived = Arc::new(style);
+        ui.ctx().data_mut(|d| {
+            let cache = &mut d.get_temp_mut_or_default::<StyleCache>(id).0;
+            // Styles nothing else holds any more (a restyled context) go first.
+            cache.retain(|(b, _, _)| Arc::strong_count(b) > 1);
+            if cache.len() >= STYLE_CACHE_SIZE {
+                cache.remove(0);
+            }
+            cache.push((base, change, derived.clone()));
+        });
+        derived
+    });
+    ui.set_style(derived);
+}
 
 /// Frame for the editor's side / top panels: the style's window margin on every side (4 pt with
 /// the compact theme) instead of egui's 8 pt sides.
@@ -54,7 +110,7 @@ pub(crate) fn section<A, B>(
     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
     let background = ui.painter().add(egui::Shape::Noop);
     let header = ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
+        cached_style(ui, StyleChange::HeaderSpacing, |s| s.spacing.item_spacing.x = 2.0);
         state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
         let title = ui.add(
             egui::Label::new(egui::RichText::new(title).strong())
@@ -122,8 +178,9 @@ fn property_row<R>(ui: &mut egui::Ui, label: &str, wrap: bool, add: impl FnOnce(
 /// on hover, so a clipped tool panel gives no cue that it continues), in the style's bar width
 /// ([`space3d_ui::visible_scroll_bars`]). Scoped to `ui`.
 pub(crate) fn visible_scroll_bars(ui: &mut egui::Ui) {
-    let width = ui.spacing().scroll.bar_width;
-    ui.spacing_mut().scroll = space3d_ui::visible_scroll_bars(width);
+    cached_style(ui, StyleChange::ScrollBars, |s| {
+        s.spacing.scroll = space3d_ui::visible_scroll_bars(s.spacing.scroll.bar_width);
+    });
 }
 
 /// `value` with the most decimals in `decimals` that fit `room` characters (at least none).
@@ -157,7 +214,12 @@ pub(crate) fn number_field(
             .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
     );
     cell.set_clip_rect(rect.intersect(ui.clip_rect()));
-    cell.spacing_mut().interact_size.x = width;
+    if width < cell.spacing().interact_size.x {
+        // A drag value is at least a control wide: let it shrink to the cell.
+        cached_style(&mut cell, StyleChange::FieldWidth(width.to_bits()), |s| {
+            s.spacing.interact_size.x = width;
+        });
+    }
     let response = cell.add(drag.custom_formatter(move |v, decimals| fit_number(v, decimals, room.max(1))));
     if let Some(color) = axis {
         let bar =
@@ -209,9 +271,12 @@ pub(crate) fn fill_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egui::
         .min(available - gap - min_rail)
         .max(min_value_box_width(ui))
         .floor();
-    ui.spacing_mut().slider_width = (available - value_width - gap).floor().max(24.0);
+    let rail = (available - value_width - gap).floor().max(24.0);
     // The slider's value box is a drag value at least `interact_size.x` wide.
-    ui.spacing_mut().interact_size.x = value_width;
+    cached_style(ui, StyleChange::Slider(rail.to_bits(), value_width.to_bits()), |s| {
+        s.spacing.slider_width = rail;
+        s.spacing.interact_size.x = value_width;
+    });
     let room = chars_in(ui, value_width);
     ui.add(slider.custom_formatter(move |v, decimals| {
         let (lo, hi) = (*decimals.start(), (*decimals.end()).min(3));
@@ -233,6 +298,39 @@ fn chars_in(ui: &egui::Ui, width: f32) -> usize {
     (((width - 2.0 * ui.spacing().button_padding.x) / digit).floor() as usize).max(1)
 }
 
+/// Gap between the cells of a [`button_row`].
+const CELL_GAP: f32 = 2.0;
+
+/// Buttons in equal cells filling the rest of the line, [`CELL_GAP`] apart (labels truncated to
+/// their cell); returns the index of the clicked one. On its own line: a row of actions as wide as
+/// the property rows; in a [`property`] row: fills the value column.
+pub(crate) fn button_row<const N: usize>(ui: &mut egui::Ui, buttons: [egui::Button<'_>; N]) -> Option<usize> {
+    let height = ui.spacing().interact_size.y;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    let width = ((rect.width() - CELL_GAP * (N as f32 - 1.0)) / N as f32).floor();
+    let mut clicked = None;
+    for (i, button) in buttons.into_iter().enumerate() {
+        let x = if i + 1 == N {
+            // The last cell ends exactly at the row's right edge.
+            rect.right() - width
+        } else {
+            rect.left() + i as f32 * (width + CELL_GAP)
+        };
+        let cell = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(width, height));
+        if ui.place(cell, button.truncate()).clicked() {
+            clicked = Some(i);
+        }
+    }
+    clicked
+}
+
+/// Width of a button showing `text` in `ui` (text and the button padding).
+pub(crate) fn text_button_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text = ui.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE).size().x);
+    (text + 2.0 * ui.spacing().button_padding.x).ceil()
+}
+
 /// A drag value filling the rest of the line.
 pub(crate) fn fill_drag(ui: &mut egui::Ui, drag: egui::DragValue<'_>) -> egui::Response {
     let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
@@ -245,4 +343,54 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui:
     let side = ui.spacing().interact_size.y;
     ui.add(egui::Button::new(icon).frame(false).min_size(egui::vec2(side, side)))
         .on_hover_text(tooltip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slider rows, section headers and scroll bars reuse the styles they
+    /// derived in earlier frames (no `Style` copy per row per frame); a restyled context gets
+    /// fresh ones.
+    #[test]
+    fn rows_reuse_their_styles_frame_after_frame() {
+        let ctx = egui::Context::default();
+        let mut frames: Vec<[*const egui::Style; 3]> = Vec::new();
+        let run = |ctx: &egui::Context, frames: &mut Vec<[*const egui::Style; 3]>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let mut value = 0.5f32;
+                let slider = ui.horizontal(|ui| {
+                    fill_slider(ui, egui::Slider::new(&mut value, 0.0..=1.0));
+                    Arc::as_ptr(ui.style())
+                });
+                let (header, _) = section(ui, "s", "Section", true, |ui| Arc::as_ptr(ui.style()), |_| {});
+                let bars = ui.scope(|ui| {
+                    visible_scroll_bars(ui);
+                    Arc::as_ptr(ui.style())
+                });
+                frames.push([slider.inner, header, bars.inner]);
+            });
+            out.textures_delta.clear();
+        };
+        for _ in 0..3 {
+            run(&ctx, &mut frames);
+        }
+        let last = *frames.last().unwrap();
+        assert!(frames.iter().all(|f| *f == last), "the same styles every frame");
+        assert!(
+            last.iter().all(|&p| p != Arc::as_ptr(&ctx.global_style())),
+            "derived styles"
+        );
+        ctx.global_style_mut(|s| s.spacing.item_spacing.y = 5.0);
+        run(&ctx, &mut frames);
+        let restyled = *frames.last().unwrap();
+        assert!(
+            restyled.iter().zip(&last).all(|(a, b)| a != b),
+            "a restyled context gets fresh ones"
+        );
+    }
 }

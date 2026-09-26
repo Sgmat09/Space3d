@@ -758,7 +758,8 @@ impl ModelEditor {
     }
 
     /// Show the editor window within `area` (screen points; e.g. the viewport left between an
-    /// editor's panels): it opens at its top-left corner and never leaves it.
+    /// editor's panels): it opens at its top-left corner and stays inside it, 6 pt clear of its
+    /// edges.
     pub fn show_in(&mut self, ctx: &egui::Context, area: egui::Rect) {
         self.show_window(ctx, Some(area));
     }
@@ -774,7 +775,9 @@ impl ModelEditor {
             .open(&mut open)
             .default_size([820.0, 480.0]);
         if let Some(area) = area {
-            window = window.default_pos(area.min + egui::vec2(8.0, 8.0)).constrain_to(area);
+            // 6 pt clear of the area's edges (the editor's panels), like the engine tools.
+            let area = area.shrink(crate::widgets::WINDOW_GAP);
+            window = window.default_pos(area.min + egui::vec2(2.0, 2.0)).constrain_to(area);
         }
         window.show(ctx, |ui| self.contents(ui));
         self.open = open;

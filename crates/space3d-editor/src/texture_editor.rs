@@ -8,7 +8,7 @@
 //! resolution; only the on-screen copy is downscaled.
 
 use crate::files::{IoJobs, read_file_with, write_file_with};
-use crate::widgets::{fill_drag, fill_slider, property, property_group, section};
+use crate::widgets::{button_row, fill_drag, fill_slider, number_field, property, section, text_button_width};
 use space3d_assets::edit::texture::{self as tex, Blur, Brush, Filter, ImageEditHistory, Rect as PxRect};
 use space3d_core::ImageData;
 use space3d_tasks::Task;
@@ -530,7 +530,8 @@ impl TextureEditor {
     }
 
     /// Show the editor window within `area` (screen points; e.g. the viewport left between an
-    /// editor's panels): it opens at its top-left corner and never leaves it.
+    /// editor's panels): it opens at its top-left corner and stays inside it, 6 pt clear of its
+    /// edges.
     pub fn show_in(&mut self, ctx: &egui::Context, area: egui::Rect) {
         self.show_window(ctx, Some(area));
     }
@@ -549,9 +550,11 @@ impl TextureEditor {
         let mut window = egui::Window::new("Texture editor")
             .id(egui::Id::new("space3d_texture_editor"))
             .open(&mut open)
-            .default_size([760.0, 560.0]);
+            .default_size([760.0, 620.0]);
         if let Some(area) = area {
-            window = window.default_pos(area.min + egui::vec2(8.0, 8.0)).constrain_to(area);
+            // 6 pt clear of the area's edges (the editor's panels), like the engine tools.
+            let area = area.shrink(crate::widgets::WINDOW_GAP);
+            window = window.default_pos(area.min + egui::vec2(2.0, 2.0)).constrain_to(area);
         }
         window.show(ctx, |ui| self.contents(ui));
         self.open = open;
@@ -616,22 +619,13 @@ impl TextureEditor {
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
-        // Tool toggles in equal cells, three per row.
-        let gap = 2.0;
-        let cell = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
-        for row in TextureTool::ALL.chunks(3) {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                for &t in row {
-                    let size = egui::vec2(cell, ui.spacing().interact_size.y);
-                    if ui
-                        .add_sized(size, egui::Button::selectable(self.tool == t, t.label()))
-                        .clicked()
-                    {
-                        self.tool = t;
-                    }
-                }
-            });
+        // Tool toggles in equal cells, three per row; every other row lines up with the
+        // property rows (value boxes in one column, actions in full-width rows of equal cells).
+        for row in TextureTool::ALL.as_chunks::<3>().0 {
+            let buttons = row.map(|t| egui::Button::selectable(self.tool == t, t.label()));
+            if let Some(i) = button_row(ui, buttons) {
+                self.tool = row[i];
+            }
         }
         property(ui, "Color", |ui| {
             ui.color_edit_button_srgba_unmultiplied(&mut self.color)
@@ -650,13 +644,19 @@ impl TextureEditor {
         });
         property(ui, "Rect", |ui| ui.checkbox(&mut self.rect_filled, "filled"));
         property(ui, "Zoom", |ui| {
-            let fit = ui.button("Fit").clicked();
-            fill_slider(ui, egui::Slider::new(&mut self.zoom, 0.05..=32.0).logarithmic(true));
-            if fit {
+            fill_slider(ui, egui::Slider::new(&mut self.zoom, 0.05..=32.0).logarithmic(true))
+        });
+        match button_row(ui, [egui::Button::new("Fit"), egui::Button::new("100 %")]) {
+            Some(0) => {
                 self.fit_pending = true;
                 self.pan = egui::Vec2::ZERO;
             }
-        });
+            Some(_) => {
+                self.zoom = 1.0;
+                self.pan = egui::Vec2::ZERO;
+            }
+            None => {}
+        }
         let a = &mut self.adjust;
         let mut op: Option<EditorOp> = None;
         section(
@@ -672,7 +672,7 @@ impl TextureEditor {
                 property(ui, "Contrast", |ui| {
                     fill_slider(ui, egui::Slider::new(&mut a.contrast, 0.0..=3.0))
                 });
-                if ui.button("Apply brightness/contrast").clicked() {
+                if button_row(ui, [egui::Button::new("Apply brightness/contrast")]).is_some() {
                     let (b, c) = (a.brightness, a.contrast);
                     op = Some(Box::new(move |e| {
                         e.apply_async("Brightness/contrast", move |i| tex::brightness_contrast(i, b, c))
@@ -687,20 +687,17 @@ impl TextureEditor {
                 property(ui, "Lightness", |ui| {
                     fill_slider(ui, egui::Slider::new(&mut a.lightness, -1.0..=1.0))
                 });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Apply hue/sat.").clicked() {
-                        let (h, s, l) = (a.hue, a.saturation, a.lightness);
-                        op = Some(Box::new(move |e| {
-                            e.apply_async("Hue/saturation", move |i| tex::hue_saturation(i, h, s, l))
-                        }));
-                    }
-                    if ui.button("Grayscale").clicked() {
-                        op = Some(Box::new(|e| e.apply_async("Grayscale", tex::grayscale)));
-                    }
-                    if ui.button("Invert").clicked() {
-                        op = Some(Box::new(|e| e.apply_async("Invert", tex::invert)));
-                    }
-                });
+                if button_row(ui, [egui::Button::new("Apply hue/saturation")]).is_some() {
+                    let (h, s, l) = (a.hue, a.saturation, a.lightness);
+                    op = Some(Box::new(move |e| {
+                        e.apply_async("Hue/saturation", move |i| tex::hue_saturation(i, h, s, l))
+                    }));
+                }
+                match button_row(ui, [egui::Button::new("Grayscale"), egui::Button::new("Invert")]) {
+                    Some(0) => op = Some(Box::new(|e| e.apply_async("Grayscale", tex::grayscale))),
+                    Some(_) => op = Some(Box::new(|e| e.apply_async("Invert", tex::invert))),
+                    None => {}
+                }
             },
         );
         section(
@@ -711,44 +708,51 @@ impl TextureEditor {
             |_| {},
             |ui| {
                 property(ui, "Blur σ", |ui| {
-                    let blur = ui.button("Blur").clicked();
-                    fill_slider(ui, egui::Slider::new(&mut a.blur_sigma, 0.3..=16.0));
-                    if blur {
-                        let s = a.blur_sigma;
-                        op = Some(Box::new(move |e| {
-                            e.replace_async("Blur", move |i| tex::blur(i, Blur::Gaussian { sigma: s }))
-                        }));
-                    }
+                    fill_slider(ui, egui::Slider::new(&mut a.blur_sigma, 0.3..=16.0))
                 });
-                property_group(ui, "Resize", |ui| {
-                    ui.add(egui::DragValue::new(&mut a.resize[0]).range(1..=8192));
-                    ui.add(egui::DragValue::new(&mut a.resize[1]).range(1..=8192));
-                    if ui.button("Apply").clicked() {
+                if button_row(ui, [egui::Button::new("Apply blur")]).is_some() {
+                    let s = a.blur_sigma;
+                    op = Some(Box::new(move |e| {
+                        e.replace_async("Blur", move |i| tex::blur(i, Blur::Gaussian { sigma: s }))
+                    }));
+                }
+                property(ui, "Resize", |ui| {
+                    // Width and height fields share the line left of the button.
+                    let apply = egui::Button::new("Apply");
+                    let gap = ui.spacing().item_spacing.x;
+                    let button = text_button_width(ui, "Apply");
+                    let cell = ((ui.available_width() - button - 2.0 * gap) / 2.0).floor().max(24.0);
+                    for v in &mut a.resize {
+                        number_field(ui, cell, egui::DragValue::new(v).range(1..=8192), 0, None);
+                    }
+                    if ui
+                        .add_sized([ui.available_width(), ui.spacing().interact_size.y], apply)
+                        .clicked()
+                    {
                         let [w, h] = a.resize;
                         op = Some(Box::new(move |e| {
                             e.replace_async("Resize", move |i| tex::resize(i, w, h, Filter::Bilinear))
                         }));
                     }
                 });
-                property_group(ui, "Flip", |ui| {
-                    if ui.button("H").clicked() {
-                        op = Some(Box::new(|e| e.apply_async("Flip horizontal", tex::flip_horizontal)));
-                    }
-                    if ui.button("V").clicked() {
-                        op = Some(Box::new(|e| e.apply_async("Flip vertical", tex::flip_vertical)));
-                    }
-                });
-                property_group(ui, "Rotate", |ui| {
-                    if ui.button("90° ⟳").clicked() {
-                        op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate90_cw)));
-                    }
-                    if ui.button("90° ⟲").clicked() {
-                        op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate90_ccw)));
-                    }
-                    if ui.button("180°").clicked() {
-                        op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate180)));
-                    }
-                });
+                // Flips and rotations: full-width rows of equal cells (in the value column their
+                // labels would not fit).
+                match button_row(ui, [egui::Button::new("Flip H"), egui::Button::new("Flip V")]) {
+                    Some(0) => op = Some(Box::new(|e| e.apply_async("Flip horizontal", tex::flip_horizontal))),
+                    Some(_) => op = Some(Box::new(|e| e.apply_async("Flip vertical", tex::flip_vertical))),
+                    None => {}
+                }
+                let rotate = [
+                    egui::Button::new("90° ⟳"),
+                    egui::Button::new("90° ⟲"),
+                    egui::Button::new("180°"),
+                ];
+                match button_row(ui, rotate) {
+                    Some(0) => op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate90_cw))),
+                    Some(1) => op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate90_ccw))),
+                    Some(_) => op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate180))),
+                    None => {}
+                }
             },
         );
         section(
@@ -765,14 +769,14 @@ impl TextureEditor {
                 property(ui, "Octaves", |ui| {
                     fill_slider(ui, egui::Slider::new(&mut a.noise_octaves, 1..=8))
                 });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Value noise").clicked() {
+                match button_row(ui, [egui::Button::new("Value noise"), egui::Button::new("Checker")]) {
+                    Some(0) => {
                         let (seed, scale, oct) = (a.noise_seed, a.noise_scale, a.noise_octaves);
                         op = Some(Box::new(move |e| {
                             e.replace_async("Noise", move |i| tex::value_noise(i.width, i.height, seed, scale, oct));
                         }));
                     }
-                    if ui.button("Checker").clicked() {
+                    Some(_) => {
                         op = Some(Box::new(|e| {
                             e.replace_async("Checker", |i| {
                                 tex::checker(
@@ -785,11 +789,12 @@ impl TextureEditor {
                             });
                         }));
                     }
-                });
+                    None => {}
+                }
                 property(ui, "Strength", |ui| {
                     fill_slider(ui, egui::Slider::new(&mut a.normal_strength, 0.1..=10.0))
                 });
-                if ui.button("Normal map from height").clicked() {
+                if button_row(ui, [egui::Button::new("Normal map from height")]).is_some() {
                     let s = a.normal_strength;
                     op = Some(Box::new(move |e| {
                         e.replace_async("Normal map", move |i| tex::normal_map_from_height(i, s))

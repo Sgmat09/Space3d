@@ -667,11 +667,106 @@ fn tool_windows_stay_over_the_viewport() {
         let window = ctx
             .memory(|m| m.area_rect(egui::Id::new(id)))
             .unwrap_or_else(|| panic!("{id} shown"));
+        // 6 pt clear of the panels (the model editor's 820 pt used to touch both at 1280 x 720).
         assert!(
-            viewport.expand(0.5).contains_rect(window),
-            "{id} {window:?} within the viewport {viewport:?}"
+            viewport.shrink(5.5).contains_rect(window),
+            "{id} {window:?} within the viewport {viewport:?}, 6 pt in"
         );
     }
+}
+
+/// The engine tools (F3 overlay, F4 profiler, console) dock inside the editor's viewport: never
+/// over the menu bar, the hierarchy or the inspector, at any window size, and they follow the
+/// viewport when the window is resized. With the editor UI hidden (F1) they use the whole screen.
+#[test]
+fn engine_tools_dock_inside_the_viewport() {
+    let mut app = App::new();
+    app.add_plugin(space3d_ui::UiPlugin {
+        install_tracing: false,
+        ..space3d_ui::UiPlugin::deterministic()
+    });
+    app.insert_resource(space3d_platform::WindowState {
+        physical_size: space3d_core::glam::UVec2::new(1280, 720),
+        scale_factor: 1.0,
+        focused: true,
+        suspended: false,
+        title: String::new(),
+        cursor_visible: true,
+        cursor_grab: false,
+    });
+    app.insert_resource(UiTheme::compact());
+    app.add_plugin(EditorPlugin::default());
+    scene(&mut app);
+    app.resources.expect_mut::<space3d_ui::DebugOverlay>().visible = true;
+    app.resources.expect_mut::<space3d_ui::Profiler>().visible = true;
+    app.resources.expect_mut::<space3d_ui::Console>().visible = true;
+    let tools = |app: &App| {
+        let ctx = app.resources.expect::<EguiContext>().ctx().clone();
+        ["space3d_debug_overlay", "space3d_profiler", "space3d_console"].map(|id| {
+            ctx.memory(|m| m.area_rect(egui::Id::new(id)))
+                .unwrap_or_else(|| panic!("{id} shown"))
+        })
+    };
+    for size in [(1280, 720), (1920, 1080), (1280, 720)] {
+        app.resources
+            .expect_mut::<space3d_platform::WindowState>()
+            .physical_size = space3d_core::glam::UVec2::new(size.0, size.1);
+        app.step_ticks(6);
+        let ctx = app.resources.expect::<EguiContext>().ctx().clone();
+        let panel = |id: &str| {
+            egui::containers::panel::PanelState::load(&ctx, egui::Id::new(id))
+                .unwrap_or_else(|| panic!("panel {id} shown"))
+                .outer_rect
+        };
+        let (menu, hierarchy, inspector) = (
+            panel("space3d_editor_menu"),
+            panel("space3d_editor_hierarchy"),
+            panel("space3d_editor_inspector"),
+        );
+        let screen = ctx.content_rect();
+        assert_eq!(screen.size(), egui::vec2(size.0 as f32, size.1 as f32));
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(hierarchy.right(), menu.bottom()),
+            egui::pos2(inspector.left(), screen.bottom()),
+        );
+        let [overlay, profiler, console] = tools(&app);
+        let label =
+            format!("{size:?}: viewport {viewport:?}, overlay {overlay:?}, profiler {profiler:?}, console {console:?}");
+        for tool in [overlay, profiler, console] {
+            assert!(viewport.shrink(5.5).contains_rect(tool), "inside the viewport: {label}");
+        }
+        assert!(
+            overlay.left_top().distance(viewport.left_top() + egui::vec2(6.0, 6.0)) < 1.0,
+            "{label}"
+        );
+        assert!(
+            profiler
+                .right_top()
+                .distance(viewport.right_top() + egui::vec2(-6.0, 6.0))
+                < 1.0,
+            "{label}"
+        );
+        assert!(
+            console
+                .left_bottom()
+                .distance(viewport.left_bottom() + egui::vec2(6.0, -6.0))
+                < 1.0,
+            "{label}"
+        );
+    }
+    // F1 hides the editor UI: the tools take the screen's corners.
+    app.resources.expect_mut::<EditorState>().visible = false;
+    app.step_ticks(3);
+    let screen = app.resources.expect::<EguiContext>().ctx().content_rect();
+    let [overlay, profiler, _] = tools(&app);
+    assert!(overlay.left_top().distance(egui::pos2(6.0, 6.0)) < 1.0, "{overlay:?}");
+    assert!(
+        profiler
+            .right_top()
+            .distance(screen.right_top() + egui::vec2(-6.0, 6.0))
+            < 1.0,
+        "{profiler:?}"
+    );
 }
 
 /// Editor, texture editor, model editor and storybook viewer captures, written to

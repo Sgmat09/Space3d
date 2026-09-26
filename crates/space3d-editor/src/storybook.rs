@@ -13,7 +13,7 @@ use space3d_core::{App, Plugin, Stage, SystemCtx, Time};
 use space3d_platform::InputPlugin;
 use space3d_render::RenderPlugin;
 use space3d_stories::{Knob, KnobKind, KnobValue, KnobValues, Story, Storybook};
-use space3d_ui::{EguiContext, UiPlugin};
+use space3d_ui::{EguiContext, UiPlugin, set_tool_dock_area};
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
@@ -128,6 +128,8 @@ pub struct StorybookViewer {
     status: String,
     screenshot_dir: String,
     writes: IoJobs<String>,
+    /// Screen rect of the story viewport as of the last [`Self::ui`] (between the panels).
+    viewport: egui::Rect,
 }
 
 impl std::fmt::Debug for StorybookViewer {
@@ -157,6 +159,7 @@ impl StorybookViewer {
             status: String::new(),
             screenshot_dir: config.screenshot_dir.clone(),
             writes: IoJobs::default(),
+            viewport: egui::Rect::NOTHING,
         };
         let first = config
             .initial_story
@@ -541,6 +544,7 @@ impl StorybookViewer {
                     .auto_shrink([false, true])
                     .show(ui, |ui| self.side_panel(ui));
             });
+        self.viewport = ui.available_rect_before_wrap();
         let m = ui.style().spacing.window_margin;
         let central = egui::Frame::central_panel(ui.style()).inner_margin(m);
         egui::CentralPanel::default().frame(central).show(ui, |ui| {
@@ -587,7 +591,11 @@ fn storybook_system(sys: &mut SystemCtx) {
     let Some(mut viewer) = sys.resources.remove::<StorybookViewer>() else {
         return;
     };
-    EguiContext::with_root_ui(sys, |ui, _| viewer.ui(ui));
+    if EguiContext::with_root_ui(sys, |ui, _| viewer.ui(ui)).is_some() {
+        // The engine tools (F3 / F4 / console) dock inside the story viewport, clear of the
+        // sidebar and the knobs panel.
+        set_tool_dock_area(sys.resources, viewer.viewport);
+    }
     let pointer_down = ctx.input(|i| i.pointer.any_down());
     viewer.frame(&ctx, dt, pointer_down);
     sys.resources.insert(viewer);

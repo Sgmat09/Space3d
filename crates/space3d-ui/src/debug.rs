@@ -1,9 +1,10 @@
 //! Debug overlay (F3): FPS, frame-time sparkline, ticks, renderer statistics, entity count.
 //!
-//! A small panel anchored at the top-left that never takes the pointer and looks the same under
-//! any egui style (its own frame, fonts and spacing): a header with FPS, average and worst
-//! frame time, a sparkline of the last 240 frames, and a monospace grid of label/value pairs
-//! with right-aligned numbers. [`DebugOverlay::details`] adds the rarer renderer counters.
+//! A small panel docked at the top-left of the screen (or of the [`crate::ToolDockArea`]) that
+//! never takes the pointer and looks the same under any egui style (its own frame, fonts and
+//! spacing): a header with FPS, average and worst frame time, a sparkline of the last 240
+//! frames, and a monospace grid of label/value pairs with right-aligned numbers.
+//! [`DebugOverlay::details`] adds the rarer renderer counters.
 
 use crate::{Console, EguiContext, Profiler};
 use space3d_core::{SystemCtx, TickRate, Time};
@@ -185,7 +186,8 @@ pub(crate) const OVERLAY_ID: &str = "space3d_debug_overlay";
 
 /// Overlay text size (points); its own, so a game's text styles never enlarge it.
 const FONT_SIZE: f32 = 11.0;
-const LABEL: egui::Color32 = egui::Color32::from_gray(150);
+/// Label grey: 6:1 on the overlay's fill even over a white scene.
+const LABEL: egui::Color32 = egui::Color32::from_gray(165);
 const VALUE: egui::Color32 = egui::Color32::from_gray(235);
 /// Characters per label and value column.
 const LABEL_CHARS: usize = 6;
@@ -247,16 +249,19 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx, hint: &str) {
     let stats = sys.resources.get::<RenderStats>().cloned();
     let ui_stats = sys.resources.get::<EguiContext>().map(EguiContext::stats);
     let entities = sys.world.len() as u64;
+    let edge = crate::tool::EDGE;
+    let dock = crate::tool::dock_rect(sys.resources, &ctx);
 
     egui::Area::new(egui::Id::new(OVERLAY_ID))
-        .anchor(egui::Align2::LEFT_TOP, [6.0, 6.0])
+        .fixed_pos(dock.left_top() + egui::vec2(edge, edge))
         .order(egui::Order::Foreground)
         .interactable(false)
         .show(&ctx, |ui| {
-            // Nearly opaque: the renderer blends in linear space, where a lighter fill lets
-            // bright scene content wash out the grey labels.
+            // Practically opaque: the renderer blends in linear space, where even 92 % black
+            // over a white scene is a mid grey that washes the labels out (2.5:1); at 98 %
+            // the labels keep 6:1 over any scene.
             egui::Frame::new()
-                .fill(egui::Color32::from_black_alpha(235))
+                .fill(egui::Color32::from_black_alpha(250))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(22)))
                 .corner_radius(3)
                 .inner_margin(egui::Margin::symmetric(6, 4))

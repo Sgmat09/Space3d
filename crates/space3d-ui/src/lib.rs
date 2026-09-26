@@ -30,7 +30,9 @@
 //! * Console (**`**, [`Console`]): log lines captured from `tracing` ([`ConsoleLayer`]) and a
 //!   command registry.
 //! * The three tools are compact under any egui style: they size themselves (their own `Ui`
-//!   only) and never change the global style (see `docs/ui.md`).
+//!   only) and never change the global style (see `docs/ui.md`). They dock to the corners of the
+//!   screen, or of the [`ToolDockArea`] a host with its own panels sets (the editor's viewport),
+//!   follow it when it is resized, and stay above the game's windows.
 //! * [`UiTextures`] shows renderer render targets (e.g. a `Camera3d` rendering to a texture) as
 //!   egui images.
 //! * Opt-in density ([`theme`]): `app.insert_resource(UiTheme::compact())` applies the compact
@@ -82,6 +84,7 @@ pub use textures::UiTextures;
 pub use theme::{
     ThemePreview, UiDensity, UiTheme, UiThemeSync, apply_density, apply_theme, compact_style, visible_scroll_bars,
 };
+pub use tool::{ToolDockArea, set_tool_dock_area};
 pub use tracing_setup::{TracingInstall, install_tracing, tracing_install_state};
 
 use overlay::EguiOverlay;
@@ -246,6 +249,7 @@ impl UiAppExt for App {
 /// Common imports.
 pub mod prelude {
     pub use crate::{
-        Console, DebugOverlay, EguiContext, Profiler, UiAppExt, UiDensity, UiPlugin, UiTextures, UiTheme, egui,
+        Console, DebugOverlay, EguiContext, Profiler, ToolDockArea, UiAppExt, UiDensity, UiPlugin, UiTextures, UiTheme,
+        egui,
     };
 }

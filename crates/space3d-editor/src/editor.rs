@@ -15,7 +15,7 @@ use space3d_core::hecs::{Entity, World};
 use space3d_core::{App, Name, Plugin, Stage, SystemCtx, TickRate, Time, Transform};
 use space3d_render::{Material, Mesh3d, RenderAssets, Renderer, TextureHandle};
 use space3d_scene::{ComponentRegistry, Scene, SceneFormat, ScenePlugin};
-use space3d_ui::{Console, DebugOverlay, EguiContext, Profiler, UiPlugin};
+use space3d_ui::{Console, DebugOverlay, EguiContext, Profiler, UiPlugin, set_tool_dock_area};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -687,6 +687,10 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
             // Free the preview target and entities while the window is closed.
             t.model.destroy_preview(sys.world, sys.resources, &ctx);
         }
+
+        // The engine tools (F3 / F4 / console) dock inside the viewport, clear of the menu bar
+        // and the side panels (the whole screen while the editor UI is hidden).
+        set_tool_dock_area(sys.resources, viewport);
 
         // Viewport: gizmo + picking.
         if t.state.visible {

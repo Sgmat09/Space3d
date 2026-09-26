@@ -29,8 +29,9 @@ scene = ["dep:space3d-scene"]
 net = ["dep:space3d-net"]
 ## SQLite (native) / localStorage (web): KV, save slots, leaderboards.
 db = ["dep:space3d-db"]
-## egui integration, debug overlay, profiler. Implies `platform`.
-ui = ["platform", "dep:space3d-ui"]
+## egui integration, debug overlay, profiler. Implies `platform`. With `stories`, the engine
+## storybook also holds the UI stories.
+ui = ["platform", "dep:space3d-ui", "space3d-stories?/ui"]
 ## Scene inspector, texture editor, model editor. Implies `ui`.
 editor = ["ui", "dep:space3d-editor"]
 ## GitHub releases / update checker / crash reporter.
