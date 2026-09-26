@@ -36,6 +36,9 @@ pub(crate) struct LightingPrepare<'a> {
     /// Headless renderers finish every pending bake in the frame it is requested.
     pub headless: bool,
     pub stats: &'a mut RenderStats,
+    /// GPU timings: `timing.render("ibl.bake", None)` as a bake pass's `timestamp_writes`
+    /// (`None` unless `FrameSettings::gpu_timing`).
+    pub timing: &'a crate::timing::GpuTimer,
 }
 
 /// One depth-only view the frame renders before the camera views (a shadow map).
