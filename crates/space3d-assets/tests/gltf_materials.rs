@@ -449,7 +449,7 @@ fn ship_maps() -> [ImageData; 4] {
                     );
                     let occlusion = (150.0 + h.min(1.0) * 105.0) as u8;
                     let roughness = if h < 0.9 { 220 } else { 90 + panel * 25 };
-                    orm.set(x, y, [occlusion, roughness, if stripe { 40 } else { 230 }, 255]);
+                    orm.set(x, y, [occlusion, roughness, if stripe { 30 } else { 150 }, 255]);
                     emissive.set(x, y, [0, 0, 0, 255]);
                 }
                 1 => {
