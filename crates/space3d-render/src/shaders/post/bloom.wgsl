@@ -1,12 +1,16 @@
 // Space3d bloom (graphics spec §5.2 PO1, design-post §5.3; Jimenez, "Next-Generation Post
 // Processing in Call of Duty: Advanced Warfare", 2014). The renderer prepends OUTPUT_WGSL and
-// FULLSCREEN_WGSL. Three entry points share one layout, each drawn as a full-screen triangle
+// FULLSCREEN_WGSL. Four entry points share one layout, each drawn as a full-screen triangle
 // over one level of the post group's bloom chain:
 //
-// * `fs_prefilter`: S (the post group's rect) → level 0. 13 taps in 5 boxes; each box is exposed
-//   (bloom works in exposed units: the composite adds it after exposure), soft-thresholded and
-//   weighted by its Karis factor 1 / (1 + luma) (normalized: a hot pixel cannot dominate its
-//   neighbourhood, so single-pixel fireflies do not flicker into large blobs).
+// * `fs_prefilter`: S (the post group's rect) → exactly half its size (level 0 at 1080p). 13
+//   taps in 5 boxes; each box is exposed (bloom works in exposed units: the composite adds it
+//   after exposure), soft-thresholded and weighted by its Karis factor 1 / (1 + luma)
+//   (normalized: a hot pixel cannot dominate its neighbourhood, so single-pixel fireflies do
+//   not flicker into large blobs). The taps weigh every source pixel alike only at exactly 2×.
+// * `fs_resample`: the prefilter's half-resolution output → level 0 when level 0 has another
+//   size (the reference heights, post/bloom.rs `chain_size`): an area average, every pixel
+//   weighted by its overlap with the destination pixel's box (energy kept wherever it sits).
 // * `fs_down`: level i → level i + 1, the same 13 taps with the plain weights.
 // * `fs_up`: level i + 1 → level i, a 3×3 tent, blended with src × scatter + dst × (1 − scatter)
 //   (the pipeline's blend constant), so level 0 ends up holding Σ (1 − s)·s^k · level_k.
@@ -22,9 +26,10 @@ struct BloomPass {
     src_rect: vec4<f32>,
     // 1 / source width, 1 / source height, tap step in source pixels, exposure multiplier.
     src_texel: vec4<f32>,
-    // Soft threshold: t, t − k, 2k, 0.25 / k (k = t × soft_knee; 0 for a hard cut).
+    // Prefilter: the soft threshold t, t − k, 2k, 0.25 / k (k = t × soft_knee; 0 for a hard
+    // cut). Resample: the destination pixel's box in source pixels (w, h, 0, 0).
     threshold: vec4<f32>,
-    // x: multiply by 2^E (auto exposure), y..w: 0.
+    // x: multiply by 2^E (auto exposure). Resample: y, z = bilinear taps per axis.
     flags: vec4<u32>,
 }
 
@@ -137,6 +142,39 @@ fn fs_prefilter(in: FullscreenOut) -> @location(0) vec4<f32> {
         + bloom_threshold(b3) * w3 + bloom_threshold(b4) * w4;
     let c = sum / (w0 + w1 + w2 + w3 + w4);
     return vec4<f32>(min(c, vec3<f32>(S3D_BLOOM_MAX)), 1.0);
+}
+
+// The overlaps of source pixels `i` and `i + 1` (pixel `i` spans [i, i + 1]) with the box
+// [lo, hi], as one bilinear tap: its position (texel centers at +0.5) and its weight.
+fn bloom_area_pair(i: f32, lo: f32, hi: f32) -> vec2<f32> {
+    let w0 = max(min(i + 1.0, hi) - max(i, lo), 0.0);
+    let w1 = max(min(i + 2.0, hi) - max(i + 1.0, lo), 0.0);
+    let w = w0 + w1;
+    return vec2<f32>(i + 0.5 + w1 / max(w, 1e-6), w);
+}
+
+@fragment
+fn fs_resample(in: FullscreenOut) -> @location(0) vec4<f32> {
+    // The destination pixel's box in source pixels (its pixel center `in.pos` is exact),
+    // clamped to the source, and `flags.yz` bilinear taps per axis (post/bloom.rs
+    // `resample_taps`): uniform loop bounds. Taps outside the box weigh 0.
+    let b = bloom.threshold.xy;
+    let c = in.pos.xy * b;
+    let lo = max(c - 0.5 * b, vec2<f32>(0.0));
+    let hi = min(c + 0.5 * b, bloom.src_rect.zw);
+    let first = floor(lo);
+    var sum = vec3<f32>(0.0);
+    var total = 0.0;
+    for (var y = 0u; y < bloom.flags.z; y += 1u) {
+        let ty = bloom_area_pair(first.y + 2.0 * f32(y), lo.y, hi.y);
+        for (var x = 0u; x < bloom.flags.y; x += 1u) {
+            let tx = bloom_area_pair(first.x + 2.0 * f32(x), lo.x, hi.x);
+            let w = tx.y * ty.y;
+            sum += bloom_tap(vec2<f32>(tx.x, ty.x)) * w;
+            total += w;
+        }
+    }
+    return vec4<f32>(sum / max(total, 1e-6), 1.0);
 }
 
 @fragment

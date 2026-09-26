@@ -247,9 +247,13 @@ pub mod cases {
         let dim = quad(&mut app, Vec3::splat(0.8), Vec2::new(0.0, 0.0), size);
         let cam = camera(&mut app, 0.0, BLACK, Some(post(hard())));
         let bloomed = render(&mut app);
-        // A 128 × 64 rect: the reference chain's 34-px level (standing for the four finer ones)
-        // and its 17-px level.
-        assert_eq!(stats(&app).post_passes, 4, "prefilter, 1 down, 1 up, composite");
+        // A 128 × 64 rect: the reference chain's 34-px level (standing for the four finer ones,
+        // resampled from the prefilter's 32-px half of the rect) and its 17-px level.
+        assert_eq!(
+            stats(&app).post_passes,
+            5,
+            "prefilter, resample, 1 down, 1 up, composite"
+        );
         set_post(&mut app, cam, post(hard()).without_bloom());
         let plain = render(&mut app);
         assert_eq!(stats(&app).post_passes, 1);
@@ -445,7 +449,7 @@ pub mod cases {
         quad(&mut app, Vec3::splat(8.0), Vec2::ZERO, Vec2::splat(0.25));
         let cam = camera(&mut app, 0.0, BLACK, Some(post(Bloom::glow())));
         let hdr = render(&mut app);
-        assert_eq!(stats(&app).post_passes, 4);
+        assert_eq!(stats(&app).post_passes, 5);
         assert!(max_outside(&hdr, [60, 28, 8, 8], 0) > 0.05, "Hdr: bloom");
         frame_settings(&mut app).downlevel.no_float_targets = true;
         let ldr = render(&mut app);
@@ -528,8 +532,8 @@ pub mod cases {
         let first = render(&mut app);
         let s = stats(&app);
         // 64 × 64 rects: the reference chain's 540 / 2^4 = 34-px level stands for the four
-        // finer ones, then its 17-px level: two levels.
-        assert_eq!(s.post_passes, 2 * (2 * 2 - 1 + 1), "{s:?}");
+        // finer ones (resampled from the prefilter's 32 × 32), then its 17-px level: two levels.
+        assert_eq!(s.post_passes, 2 * (2 * 2 - 1 + 1 + 1), "{s:?}");
         let with_bloom = s.target_bytes;
         set_post(&mut app, left, post(Bloom::glow()).without_bloom());
         set_post(&mut app, right, PostProcess::default().without_bloom());
@@ -537,10 +541,10 @@ pub mod cases {
         let no_bloom = stats(&app).target_bytes;
         set_post(&mut app, left, post(Bloom::glow()));
         set_post(&mut app, right, PostProcess::default());
-        // One shared chain: 34² + 17² = 1445 pixels of 4 (Rg11b10Ufloat) or 8 (Rgba16Float)
-        // bytes.
+        // One shared chain and half-resolution texture: 34² + 17² + 32² = 2469 pixels of 4
+        // (Rg11b10Ufloat) or 8 (Rgba16Float) bytes.
         let chain = with_bloom - no_bloom;
-        assert!(chain == 1445 * 4 || chain == 1445 * 8, "{chain} bytes of bloom chain");
+        assert!(chain == 2469 * 4 || chain == 2469 * 8, "{chain} bytes of bloom chain");
         for _ in 0..4 {
             render(&mut app);
         }
@@ -557,6 +561,63 @@ pub mod cases {
             "{s:?}"
         );
         assert_eq!(render(&mut app), first, "deterministic");
+    }
+
+    /// A 1 px source of radiance 30 gets the same halo wherever it sits (the reviewed failure:
+    /// at 720p, 1440p and 4K the prefilter's taps left gaps, and the halo of a moving spark
+    /// blinked between none, full and double). Moved over 12 pixel positions (every phase of
+    /// the chain's texels), the energy bloom adds stays within 5 % of its mean for each ratio of
+    /// rect to level 0 (`chain_size`, emulated on a 320 × 180 rect with a lower
+    /// `max_mip_height`): 2× (1080p), 2.65× capped (1440p), 4× (4K), 2.65× below the reference
+    /// height (720p, 360p) and 1.67× (900p).
+    pub fn bloom_halo_is_independent_of_position(make: MakeApp) {
+        let (w, h) = (320u32, 180u32);
+        let Some(mut app) = make(w, h) else { return };
+        let px = 2.0 / h as f32;
+        // Pixel (x, y)'s center in world units (ortho camera 2 units high at x = 0).
+        let at = |x: u32, y: u32| {
+            Vec2::new(
+                (x as f32 + 0.5 - w as f32 / 2.0) * px,
+                (h as f32 / 2.0 - y as f32 - 0.5) * px,
+            )
+        };
+        let dot = quad(&mut app, Vec3::new(30.0, 15.0, 6.0), at(150, 80), Vec2::splat(px));
+        let cam = camera(&mut app, 0.0, BLACK, None);
+        let total = |img: &ImageData| mean_all(img).dot(Vec3::ONE) as f64 * (w * h) as f64;
+        for (label, max_mip_height, passes) in [
+            ("2× (1080p)", 90, 11),
+            ("2.65×, capped (1440p)", 68, 12),
+            ("4×, capped (4K)", 45, 10),
+            ("2.65×, merged levels (720p)", 540, 6),
+            ("1.67× (900p)", 108, 12),
+        ] {
+            let bloom = Bloom {
+                max_mip_height,
+                ..Bloom::glow()
+            };
+            let mut added = Vec::new();
+            for k in 0..12u32 {
+                let p = at(150 + k, 80 + (5 * k) % 7);
+                app.world.get::<&mut Transform>(dot).unwrap().translation = p.extend(0.0);
+                set_post(&mut app, cam, post(bloom));
+                let bloomed = render(&mut app);
+                assert_eq!(stats(&app).post_passes, passes + 1, "{label}");
+                set_post(&mut app, cam, post(bloom).without_bloom());
+                let plain = render(&mut app);
+                added.push(total(&bloomed) - total(&plain));
+            }
+            let mean = added.iter().sum::<f64>() / added.len() as f64;
+            let (lo, hi) = added
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), &a| (lo.min(a), hi.max(a)));
+            let spread = (hi - lo) / mean;
+            eprintln!(
+                "{label}: bloom adds {lo:.2} … {hi:.2} (mean {mean:.2}, spread {:.1} %)",
+                100.0 * spread
+            );
+            assert!(mean > 1.0, "{label}: a halo ({mean:.2})");
+            assert!(spread < 0.05, "{label}: halo energy {lo:.2} … {hi:.2} over positions");
+        }
     }
 
     /// The downlevel switches bloom does not depend on (no compute, no read-only depth, the
@@ -590,7 +651,7 @@ pub mod cases {
         };
         set_path(&mut app, DrawPath::CpuDirect);
         assert_eq!(render(&mut app), full);
-        assert_eq!(stats(&app).post_passes, 4);
+        assert_eq!(stats(&app).post_passes, 5);
         frame_settings(&mut app).downlevel = DownlevelOverride::webgl2();
         render(&mut app);
         assert_eq!(stats(&app).post_passes, 1, "Ldr fallback: no bloom");
@@ -952,7 +1013,11 @@ pub mod cases {
         ));
         camera(&mut app, 0.0, BLACK, None);
         render(&mut app);
-        assert_eq!(stats(&app).post_passes, 3 + 2, "bloom (2 levels), composite, FXAA");
+        assert_eq!(
+            stats(&app).post_passes,
+            4 + 2,
+            "bloom (2 levels, resampled), composite, FXAA"
+        );
         let texture = {
             let assets = app.resources.expect::<RenderAssets>();
             assets.render_target_view(rt).unwrap().texture().clone()

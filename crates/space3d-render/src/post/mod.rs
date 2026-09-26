@@ -510,22 +510,23 @@ impl PostState {
             _ => self.frame_caps.bloom_format,
         }?;
         let rect = clip_rect(group.scene_rect, group.scene_size);
-        let bloom::ChainSize { size, mips, merged } = bloom::chain_size((rect[2], rect[3]), b);
+        let chain = bloom::chain_size((rect[2], rect[3]), b);
         let first_slot = self.bloom.slots;
         let (params, slot) = (&mut self.bloom.params, self.bloom.slot);
         let mut n = first_slot as usize;
         // STUB(P-POST) PO2: with auto exposure the prefilter also multiplies by 2^E.
         let exposure = (s.exposure.exp2(), false);
-        bloom::passes(group.scene_size, rect, (size, mips), b, exposure, |p| {
+        bloom::passes(group.scene_size, rect, &chain, b, exposure, |p| {
             params.write_at(n * slot, bytemuck::bytes_of(&p), reallocs);
             n += 1;
         });
         self.bloom.slots = n as u32;
         Some(BloomPlan {
             format,
-            size,
-            mips,
-            merged,
+            size: chain.size,
+            mips: chain.mips,
+            merged: chain.merged,
+            half: chain.half,
             first_slot,
             scatter: b.scatter.clamp(0.0, 1.0),
         })

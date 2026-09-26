@@ -51,6 +51,11 @@ fn bloom_steady_state() {
 }
 
 #[test]
+fn bloom_halo_is_independent_of_position() {
+    cases::bloom_halo_is_independent_of_position(headless_app);
+}
+
+#[test]
 fn bloom_downlevel_parity() {
     cases::bloom_downlevel_parity(headless_app);
 }

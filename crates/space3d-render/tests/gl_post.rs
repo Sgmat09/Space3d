@@ -93,6 +93,11 @@ fn gl_bloom_steady_state() {
 }
 
 #[test]
+fn gl_bloom_halo_is_independent_of_position() {
+    cases::bloom_halo_is_independent_of_position(gl_app);
+}
+
+#[test]
 fn gl_bloom_downlevel_parity() {
     cases::bloom_downlevel_parity(gl_app);
 }

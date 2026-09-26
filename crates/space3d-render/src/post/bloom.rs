@@ -4,10 +4,12 @@
 //! composite, which adds level 0 after exposure (graphics spec §1.9).
 //!
 //! A post group's chain is one pooled texture (`TexturePool`, per-level views) of
-//! `GraphicsCaps::bloom_format`: level 0 is the group's rect in the scene texture at half
-//! resolution, capped at `Bloom::max_mip_height`; every further level halves it. Passes: one
-//! prefilter (S → level 0: exposure, soft threshold, Karis average), `mips − 1` downsamples and
-//! `mips − 1` upsamples blended by `scatter` — 11 render passes for the default 6 levels.
+//! `GraphicsCaps::bloom_format`: level 0 has the reference chain's heights (half the rect at
+//! 1080p, capped at `Bloom::max_mip_height`; [`chain_size`]); every further level halves it.
+//! Passes: one prefilter (S → exactly half the rect: exposure, soft threshold, Karis average),
+//! an area resample of its output into level 0 when level 0 has another size (720p, 900p,
+//! 1440p, 4K, …), `mips − 1` downsamples and `mips − 1` upsamples blended by `scatter` — 11
+//! render passes for the default 6 levels at 1080p, 10 (with the resample) for the 5 of 720p.
 
 use super::PostEncode;
 use super::api::Bloom;
@@ -32,10 +34,10 @@ pub(crate) fn bloom_source() -> String {
 /// Most levels a chain has (`Bloom::mip_count` is clamped to 1..=8).
 pub(crate) const MAX_MIPS: u32 = 8;
 
-/// Render passes of a chain with `mips` levels: the prefilter, the downsamples and the
-/// upsamples.
-pub(crate) const fn pass_count(mips: u32) -> u32 {
-    2 * mips - 1
+/// Render passes of a chain with `mips` levels: the prefilter, the resample (when `resample`),
+/// the downsamples and the upsamples.
+pub(crate) const fn pass_count(mips: u32, resample: bool) -> u32 {
+    2 * mips - 1 + resample as u32
 }
 
 /// Matches `BloomPass` in bloom.wgsl: one aligned uniform slot per pass.
@@ -47,20 +49,24 @@ pub(crate) struct GpuBloomPass {
     pub src_rect: [f32; 4],
     /// 1 / source width, 1 / source height, tap step in source pixels, exposure multiplier.
     pub src_texel: [f32; 4],
-    /// Soft threshold: t, t − k, 2k, 0.25 / k (k = t × soft_knee; all 0 but t for a hard cut).
+    /// Prefilter: the soft threshold t, t − k, 2k, 0.25 / k (k = t × soft_knee; all 0 but t
+    /// for a hard cut). Resample: the destination pixel's box in source pixels (w, h, 0, 0).
     pub threshold: [f32; 4],
-    /// x: multiply by 2^E (auto exposure).
+    /// x: multiply by 2^E (auto exposure). Resample: y, z = bilinear taps per axis.
     pub flags: [u32; 4],
 }
 
-/// A post group's bloom chain: level 0's size, the number of levels and how many of the
-/// reference chain's finest levels level 0 stands for ([`chain_size`]).
+/// A post group's bloom chain: level 0's size, the number of levels, how many of the reference
+/// chain's finest levels level 0 stands for and the prefilter's own target ([`chain_size`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChainSize {
     pub size: (u32, u32),
     pub mips: u32,
     /// Finest levels of the reference chain merged into level 0 (their weights too).
     pub merged: u32,
+    /// The prefilter's target, exactly half the rect (rounded up), when level 0 has another
+    /// size: an area resample turns it into level 0.
+    pub half: Option<(u32, u32)>,
 }
 
 /// The chain of a post group whose rect in the scene texture is `rect` (pixels).
@@ -77,6 +83,18 @@ pub(crate) struct ChainSize {
 /// levels widens), and smaller rects cost less. Levels are then dropped from the coarse end
 /// while the smallest one has fewer than 2 pixels on its short side. Level `k` is
 /// `max(1, level0 >> k)` (the texture's mip chain).
+///
+/// The prefilter's 13 taps (bilinear taps half a destination texel apart, Karis-weighted and
+/// thresholded per box) weigh every source pixel alike only at exactly 2× reduction: at 2.67×
+/// (720p, 1440p, 360p) or 4× (4K) they leave gaps, and a 1–2 px bright source gets a full, a
+/// double or no halo depending on its position (moving, it blinks); at 1.67× (900p) the halo
+/// still varies by a quarter. So the prefilter always halves the rect exactly (`half`, rounded
+/// up), and when level 0 has another size an area resample makes level 0 from it: each level-0
+/// pixel averages the pixels under its box, fractional ones by their overlap, so every pixel
+/// keeps its energy wherever it sits. (Resampling S to twice level 0 before the prefilter
+/// instead would keep its threshold boxes at 1080p's fraction of the frame at 1440p and 4K,
+/// but a small source split across resampled pixels then thresholds differently at every
+/// position: its halo varied by half.)
 pub(crate) fn chain_size(rect: (u32, u32), bloom: &Bloom) -> ChainSize {
     let (rw, rh) = (rect.0.max(1), rect.1.max(1));
     let cap = bloom.max_mip_height.max(1);
@@ -98,7 +116,20 @@ pub(crate) fn chain_size(rect: (u32, u32), bloom: &Bloom) -> ChainSize {
     while mips > 1 && (size.0 >> (mips - 1)).min(size.1 >> (mips - 1)) < 2 {
         mips -= 1;
     }
-    ChainSize { size, mips, merged }
+    let half_rect = (rw.div_ceil(2), rh.div_ceil(2));
+    ChainSize {
+        size,
+        mips,
+        merged,
+        half: (half_rect != size).then_some(half_rect),
+    }
+}
+
+/// Bilinear taps per axis that average a box of `b` source pixels: it touches at most
+/// `ceil(b) + 1` pixels (an aligned box `ceil(b)`, but rounding can shift it by a hair), two
+/// per tap.
+pub(crate) fn resample_taps(b: f32) -> u32 {
+    ((b.ceil() + 1.0) / 2.0).ceil() as u32
 }
 
 /// Blend constant of the upsample into `target` (`dst = src × c + dst × (1 − c)`): `scatter`,
@@ -139,30 +170,44 @@ pub(crate) fn soft_threshold(c: Vec3, threshold: f32, soft_knee: f32) -> Vec3 {
     c * (rq.max(br - t) / br.max(1e-4))
 }
 
-/// Uniforms of every pass of a chain, in recording order: the prefilter, the downsamples
-/// (into level 1, 2, …) and the upsamples (into level `mips − 2`, …, 0).
+/// Uniforms of every pass of a chain, in recording order: the prefilter, the resample into
+/// level 0 (with `chain.half`), the downsamples (into level 1, 2, …) and the upsamples (into
+/// level `mips − 2`, …, 0).
 ///
-/// `rect` is the post group's rect in the scene texture of `scene_size`; `(size, mips)` the
-/// chain ([`chain_size`]); `(exposure, auto)` the linear manual exposure multiplier (the
-/// compensation with auto exposure) and whether the prefilter also multiplies by 2^E.
+/// `rect` is the post group's rect in the scene texture of `scene_size`; `chain` the chain
+/// ([`chain_size`]); `(exposure, auto)` the linear manual exposure multiplier (the compensation
+/// with auto exposure) and whether the prefilter also multiplies by 2^E.
 pub(crate) fn passes(
     scene_size: (u32, u32),
     rect: [u32; 4],
-    (size, mips): ((u32, u32), u32),
+    chain: &ChainSize,
     bloom: &Bloom,
     (exposure, auto_exposure): (f32, bool),
     mut emit: impl FnMut(GpuBloomPass),
 ) {
+    let (size, mips) = (chain.size, chain.mips);
     let texel = |(w, h): (u32, u32)| [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32];
     let [sx, sy] = texel(scene_size);
     // Half a destination texel, in source pixels: the 13 taps sit ±1 and ±2 steps away.
     let step = |src_h: f32, dst_h: u32| 0.5 * src_h / dst_h.max(1) as f32;
+    let prefiltered = chain.half.unwrap_or(size);
     emit(GpuBloomPass {
         src_rect: [rect[0] as f32, rect[1] as f32, rect[2] as f32, rect[3] as f32],
-        src_texel: [sx, sy, step(rect[3] as f32, size.1), exposure],
+        src_texel: [sx, sy, step(rect[3] as f32, prefiltered.1), exposure],
         threshold: threshold_constants(bloom.threshold, bloom.soft_knee),
         flags: [u32::from(auto_exposure), 0, 0, 0],
     });
+    if let Some((w, h)) = chain.half {
+        // Each level-0 pixel's box in half-resolution pixels.
+        let (bx, by) = (w as f32 / size.0.max(1) as f32, h as f32 / size.1.max(1) as f32);
+        let [tx, ty] = texel((w, h));
+        emit(GpuBloomPass {
+            src_rect: [0.0, 0.0, w as f32, h as f32],
+            src_texel: [tx, ty, 0.0, 1.0],
+            threshold: [bx, by, 0.0, 0.0],
+            flags: [0, resample_taps(bx), resample_taps(by), 0],
+        });
+    }
     let level = |l: u32| {
         let (w, h) = level_size(size, l);
         let [tx, ty] = texel((w, h));
@@ -190,13 +235,15 @@ pub(crate) fn passes(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BloomPassKind {
     Prefilter,
+    Resample,
     Down,
     Up,
 }
 
-/// The three bloom pipelines of one chain format.
+/// The four bloom pipelines of one chain format.
 pub(crate) struct BloomPipelines {
     pub prefilter: wgpu::RenderPipeline,
+    pub resample: wgpu::RenderPipeline,
     pub down: wgpu::RenderPipeline,
     pub up: wgpu::RenderPipeline,
 }
@@ -211,6 +258,7 @@ impl BloomPipelines {
         let pipeline = |kind: BloomPassKind| {
             let (entry, blend) = match kind {
                 BloomPassKind::Prefilter => ("fs_prefilter", None),
+                BloomPassKind::Resample => ("fs_resample", None),
                 BloomPassKind::Down => ("fs_down", None),
                 // dst = src × scatter + dst × (1 − scatter) (scatter = the blend constant).
                 BloomPassKind::Up => (
@@ -253,6 +301,7 @@ impl BloomPipelines {
         };
         Self {
             prefilter: pipeline(BloomPassKind::Prefilter),
+            resample: pipeline(BloomPassKind::Resample),
             down: pipeline(BloomPassKind::Down),
             up: pipeline(BloomPassKind::Up),
         }
@@ -261,6 +310,7 @@ impl BloomPipelines {
     pub(crate) fn get(&self, kind: BloomPassKind) -> &wgpu::RenderPipeline {
         match kind {
             BloomPassKind::Prefilter => &self.prefilter,
+            BloomPassKind::Resample => &self.resample,
             BloomPassKind::Down => &self.down,
             BloomPassKind::Up => &self.up,
         }
@@ -284,21 +334,31 @@ pub(super) struct BloomPlan {
     pub mips: u32,
     /// Reference levels merged into level 0 ([`ChainSize::merged`]).
     pub merged: u32,
+    /// The prefilter's half-resolution target when level 0 is resampled from it
+    /// ([`ChainSize::half`]).
+    pub half: Option<(u32, u32)>,
     /// Uniform slot of the first pass (the others follow in recording order).
     pub first_slot: u32,
     pub scatter: f32,
 }
 
 impl BloomPlan {
-    /// Bytes of the chain (every level).
+    /// Bytes of the chain (every level) and of the prefilter's half-resolution target.
     pub fn bytes(&self) -> u64 {
         let texel = self.format.block_copy_size(None).unwrap_or(8) as u64;
-        (0..self.mips)
-            .map(|l| {
-                let (w, h) = level_size(self.size, l);
-                texel * w as u64 * h as u64
-            })
-            .sum()
+        let (w, h) = self.half.unwrap_or((0, 0));
+        texel * w as u64 * h as u64
+            + (0..self.mips)
+                .map(|l| {
+                    let (w, h) = level_size(self.size, l);
+                    texel * w as u64 * h as u64
+                })
+                .sum::<u64>()
+    }
+
+    /// Render passes of the chain ([`pass_count`]).
+    pub fn passes(&self) -> u32 {
+        pass_count(self.mips, self.half.is_some())
     }
 }
 
@@ -325,8 +385,8 @@ pub(super) struct BloomState {
     module: wgpu::ShaderModule,
     pipelines: FastMap<wgpu::TextureFormat, BloomPipelines>,
     params_bg: Option<(wgpu::BindGroup, u32)>,
-    /// Source bind groups by (0 = scene texture / 1 = pooled chain, its generation, level),
-    /// with the frame they were last used.
+    /// Source bind groups by (0 = scene texture / 1 = pooled chain / 2 = the prefilter's
+    /// half-resolution target, its generation, level), with the frame they were last used.
     pub sources: FastMap<(u8, u64, u32), (wgpu::BindGroup, u64)>,
 }
 
@@ -429,9 +489,9 @@ impl BloomState {
         }
     }
 
-    /// Record a post group's chain (prefilter, downsamples, upsamples) from `scene` (the scene
-    /// texture, bind groups cached by `scene_generation`) into a pooled texture. Returns level
-    /// 0's view and the texture's generation for the composite.
+    /// Record a post group's chain (prefilter, resample, downsamples, upsamples) from `scene`
+    /// (the scene texture, bind groups cached by `scene_generation`) into a pooled texture.
+    /// Returns level 0's view and the texture's generation for the composite.
     /// `timestamps`: GPU timestamps written at the start of the first pass and the end of the
     /// last one.
     pub fn encode(
@@ -451,33 +511,45 @@ impl BloomState {
                 .entry(plan.format)
                 .or_insert_with(|| BloomPipelines::new(cx.device, module, layout, plan.format))
         };
-        let index = cx.pool.acquire(
-            cx.device,
-            PoolDesc {
-                size: plan.size,
-                format: plan.format,
-                mips: plan.mips,
-                usage: U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
-            },
-        );
+        let desc = |size, mips| PoolDesc {
+            size,
+            format: plan.format,
+            mips,
+            usage: U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+        };
+        let index = cx.pool.acquire(cx.device, desc(plan.size, plan.mips));
+        let half = plan.half.map(|size| cx.pool.acquire(cx.device, desc(size, 1)));
         let chain = cx.pool.get(index);
+        let half = half.map(|i| cx.pool.get(i));
         let (sources, source_bgl) = (&mut self.sources, &self.source_bgl);
-        let last = pass_count(plan.mips) - 1;
+        let last = plan.passes() - 1;
+        let resample = u32::from(half.is_some());
         for j in 0..=last {
-            // Prefilter into level 0, downsample into 1..mips, upsample into mips-2..=0.
+            // Prefilter into level 0 (or the half-resolution texture, then resample that into
+            // level 0), downsample into 1..mips, upsample into mips-2..=0.
             let (kind, source, target) = if j == 0 {
-                (BloomPassKind::Prefilter, None, 0)
-            } else if j < plan.mips {
-                (BloomPassKind::Down, Some(j - 1), j)
+                let target = half.map_or(Target::Level(0), |_| Target::Half);
+                (BloomPassKind::Prefilter, Target::Scene, target)
+            } else if j <= resample {
+                (BloomPassKind::Resample, Target::Half, Target::Level(0))
+            } else if j - resample < plan.mips {
+                let l = j - resample;
+                (BloomPassKind::Down, Target::Level(l - 1), Target::Level(l))
             } else {
-                let target = 2 * plan.mips - 2 - j;
-                (BloomPassKind::Up, Some(target + 1), target)
+                let target = 2 * plan.mips - 2 - (j - resample);
+                (BloomPassKind::Up, Target::Level(target + 1), Target::Level(target))
+            };
+            let view_of = |t: Target| match t {
+                Target::Scene => scene,
+                Target::Half => half.map_or(&chain.mips[0], |h| &h.mips[0]),
+                Target::Level(l) => &chain.mips[l as usize],
             };
             let key = match source {
-                None => (0, scene_generation, 0),
-                Some(level) => (1, chain.generation, level),
+                Target::Scene => (0, scene_generation, 0),
+                Target::Half => (2, half.map_or(0, |h| h.generation), 0),
+                Target::Level(level) => (1, chain.generation, level),
             };
-            let view = source.map_or(scene, |level| &chain.mips[level as usize]);
+            let view = view_of(source);
             let bg = sources.entry(key).or_insert_with(|| {
                 let bg = cx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("space3d bloom source"),
@@ -503,7 +575,7 @@ impl BloomState {
             let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("space3d bloom"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &chain.mips[target as usize],
+                    view: view_of(target),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -525,7 +597,7 @@ impl BloomState {
             pass.set_pipeline(pipelines.get(kind));
             pass.set_bind_group(0, params_bg, &[((plan.first_slot + j) as usize * self.slot) as u32]);
             pass.set_bind_group(1, &bg.0, &[]);
-            if kind == BloomPassKind::Up {
+            if let (BloomPassKind::Up, Target::Level(target)) = (kind, target) {
                 let s = upsample_blend(plan.scatter, plan.merged, target) as f64;
                 pass.set_blend_constant(wgpu::Color { r: s, g: s, b: s, a: s });
             }
@@ -539,6 +611,17 @@ impl BloomState {
     }
 }
 
+/// A texture a bloom pass reads or writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// The scene texture (the prefilter's source).
+    Scene,
+    /// The prefilter's half-resolution target ([`ChainSize::half`]).
+    Half,
+    /// A level of the chain.
+    Level(u32),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,17 +630,22 @@ mod tests {
     fn chain_sizes() {
         let glow = Bloom::glow();
         let c = |rect| {
-            let ChainSize { size, mips, merged } = chain_size(rect, &glow);
+            let ChainSize { size, mips, merged, .. } = chain_size(rect, &glow);
             (size, mips, merged)
         };
-        let ChainSize { size, mips, merged } = chain_size((1920, 1080), &glow);
-        assert_eq!((size, mips, merged), ((960, 540), 6, 0));
+        let ChainSize {
+            size,
+            mips,
+            merged,
+            half,
+        } = chain_size((1920, 1080), &glow);
+        assert_eq!((size, mips, merged, half), ((960, 540), 6, 0, None));
         let levels: Vec<_> = (0..mips).map(|l| level_size(size, l)).collect();
         assert_eq!(
             levels,
             [(960, 540), (480, 270), (240, 135), (120, 67), (60, 33), (30, 16)]
         );
-        // 4K is capped: the same cost as 1080p.
+        // 4K is capped: the same chain as 1080p.
         assert_eq!(c((3840, 2160)), ((960, 540), 6, 0));
         // 1440p: capped to 540 high.
         assert_eq!(c((2560, 1440)), ((960, 540), 6, 0));
@@ -573,16 +661,40 @@ mod tests {
             let last = level_size(size, mips - 1).1;
             assert!((16..=17).contains(&last), "{rect:?}: smallest level {last} px high");
         }
+        // The prefilter halves the rect exactly (rounded up); level 0 is resampled from that
+        // unless it is that size (1080p; 2160p with a 1080 cap).
+        let half = |rect, bloom: &Bloom| chain_size(rect, bloom).half;
+        assert_eq!(half((1920, 1080), &glow), None);
+        assert_eq!(half((960, 1080), &glow), None);
+        assert_eq!(half((1280, 720), &glow), Some((640, 360)));
+        assert_eq!(half((1600, 900), &glow), Some((800, 450)));
+        assert_eq!(half((2560, 1440), &glow), Some((1280, 720)));
+        assert_eq!(half((3840, 2160), &glow), Some((1920, 1080)));
+        assert_eq!(half((320, 180), &glow), Some((160, 90)));
+        assert_eq!(half((321, 181), &glow), Some((161, 91)));
+        assert_eq!(half((1920, 1079), &glow), Some((960, 540)));
+        let tall = Bloom {
+            max_mip_height: 1080,
+            ..glow
+        };
+        assert_eq!(half((3840, 2160), &tall), None);
         // Tiny and odd rects never produce 0-sized levels, and the last level keeps ≥ 2 px.
         for rect in [(1, 1), (3, 5), (17, 9), (64, 32), (101, 7), (4000, 3), (3, 4000)] {
-            let ChainSize { size, mips, merged } = chain_size(rect, &glow);
+            let ChainSize {
+                size,
+                mips,
+                merged,
+                half,
+            } = chain_size(rect, &glow);
             assert!(size.0 >= 1 && size.1 >= 1 && (1..=6).contains(&mips), "{rect:?}");
             assert!(merged + mips <= 6, "{rect:?}");
             let last = level_size(size, mips - 1);
             assert!(mips == 1 || last.0.min(last.1) >= 2, "{rect:?}: {size:?} × {mips}");
+            assert!(half.is_none_or(|(w, h)| w >= 1 && h >= 1), "{rect:?}");
         }
         assert_eq!(c((64, 32)), ((34, 17), 1, 5));
         assert_eq!(c((1, 1)), ((1, 1), 1, 5));
+        assert_eq!(half((1, 1), &glow), None);
         // mip_count 0 and 20 clamp to 1 and 8.
         let b = |mip_count| Bloom { mip_count, ..glow };
         assert_eq!(chain_size((4096, 4096), &b(0)).mips, 1);
@@ -593,8 +705,82 @@ mod tests {
             max_mip_height: 270,
             ..glow
         };
-        let ChainSize { size, mips, merged } = chain_size((1440, 810), &low);
+        let ChainSize { size, mips, merged, .. } = chain_size((1440, 810), &low);
         assert_eq!((size, mips, merged), ((480, 270), 4, 0));
+    }
+
+    /// CPU mirror of `fs_resample` in bloom.wgsl along one axis: the bilinear taps (position,
+    /// weight) of the destination pixel `j` of `dst` pixels over `src` source pixels.
+    fn area_taps(j: u32, src: u32, dst: u32) -> Vec<(f32, f32)> {
+        let b = src as f32 / dst as f32;
+        let c = (j as f32 + 0.5) * b;
+        let (lo, hi) = ((c - 0.5 * b).max(0.0), (c + 0.5 * b).min(src as f32));
+        let first = lo.floor();
+        (0..resample_taps(b))
+            .map(|k| {
+                let i = first + 2.0 * k as f32;
+                let w0 = ((i + 1.0).min(hi) - i.max(lo)).max(0.0);
+                let w1 = ((i + 2.0).min(hi) - (i + 1.0).max(lo)).max(0.0);
+                let w = w0 + w1;
+                (i + 0.5 + w1 / w.max(1e-6), w)
+            })
+            .collect()
+    }
+
+    /// The resample is an area average: summed over the destination pixels, every source
+    /// pixel's weight (its share of each pixel it lands in) is exactly the destination/source
+    /// area ratio, wherever it sits: no gaps, no double counting (a lone bright pixel keeps its
+    /// energy at every position). Bilinear taps land between the two pixels they average.
+    #[test]
+    fn resample_keeps_every_pixel_energy() {
+        for (src, dst) in [
+            (720u32, 540u32),
+            (1440, 1080),
+            (2160, 1080),
+            (360, 270),
+            (180, 136),
+            (1081, 1080),
+            (4320, 1080),
+            (3, 2),
+            (450, 540),
+        ] {
+            let mut received = vec![0.0f64; src as usize];
+            for j in 0..dst {
+                let taps = area_taps(j, src, dst);
+                let total: f32 = taps.iter().map(|t| t.1).sum();
+                assert!(
+                    (total - src as f32 / dst as f32).abs() < 1e-3,
+                    "{src}->{dst} px {j}: {total}"
+                );
+                for (p, w) in taps {
+                    if w == 0.0 {
+                        continue;
+                    }
+                    // Bilinear: texel centers at +0.5.
+                    let i = (p - 0.5).floor();
+                    let f = p - 0.5 - i;
+                    assert!((0.0..=1.0).contains(&f));
+                    for (k, share) in [(i, 1.0 - f), (i + 1.0, f)] {
+                        if share > 1e-6 {
+                            assert!((0.0..src as f32).contains(&k), "{src}->{dst} px {j} reads {k}");
+                            received[k as usize] += (w * share) as f64 / total as f64;
+                        }
+                    }
+                }
+            }
+            let want = dst as f64 / src as f64;
+            for (i, r) in received.iter().enumerate() {
+                assert!(
+                    (r - want).abs() < 2e-3,
+                    "{src}->{dst}: pixel {i} weighs {r}, want {want}"
+                );
+            }
+        }
+        // Taps per axis: 1 up to a box of 1 pixel, 2 up to 3 pixels.
+        assert_eq!(
+            [0.833, 1.0, 1.333, 2.0, 2.5, 3.0, 4.0].map(resample_taps),
+            [1, 1, 2, 2, 2, 2, 3]
+        );
     }
 
     /// Level 0 of a chain that merged `n` reference levels carries their weights: the final
@@ -664,22 +850,19 @@ mod tests {
     #[test]
     fn pass_uniforms() {
         let glow = Bloom::glow();
-        let ChainSize { size, mips, .. } = chain_size((1920, 1080), &glow);
+        let chain = chain_size((1920, 1080), &glow);
+        let mips = chain.mips;
         let mut all = Vec::new();
-        passes(
-            (1920, 1080),
-            [0, 0, 1920, 1080],
-            (size, mips),
-            &glow,
-            (2.0, false),
-            |p| all.push(p),
-        );
-        assert_eq!(all.len() as u32, pass_count(mips));
+        passes((1920, 1080), [0, 0, 1920, 1080], &chain, &glow, (2.0, false), |p| {
+            all.push(p)
+        });
+        assert_eq!(all.len() as u32, pass_count(mips, false));
         assert_eq!(all.len(), 11);
         let pre = all[0];
         assert_eq!(pre.src_rect, [0.0, 0.0, 1920.0, 1080.0]);
         assert_eq!(pre.src_texel, [1.0 / 1920.0, 1.0 / 1080.0, 1.0, 2.0]);
         assert_eq!(pre.threshold, [1.0, 0.5, 1.0, 0.5]);
+        assert_eq!(pre.flags, [0; 4]);
         // Downsample into level 1 reads level 0.
         assert_eq!(all[1].src_rect, [0.0, 0.0, 960.0, 540.0]);
         assert_eq!(all[1].src_texel[2], 1.0);
@@ -687,6 +870,38 @@ mod tests {
         assert_eq!(all[mips as usize].src_rect, [0.0, 0.0, 30.0, 16.0]);
         // The last upsample reads level 1.
         assert_eq!(all[10].src_rect, [0.0, 0.0, 480.0, 270.0]);
+
+        // 720p (a viewport at y = 360 of a 1280 × 1080 scene texture): the prefilter halves
+        // the rect exactly (step 1), the resample boxes 4/3 of its pixels into each level-0 one.
+        let run = |scene, rect: [u32; 4]| {
+            let chain = chain_size((rect[2], rect[3]), &glow);
+            let mut all = Vec::new();
+            passes(scene, rect, &chain, &glow, (2.0, false), |p| all.push(p));
+            assert_eq!(all.len() as u32, pass_count(chain.mips, true));
+            all
+        };
+        let all = run((1280, 1080), [0, 360, 1280, 720]);
+        assert_eq!(all.len(), 10);
+        let (pre, resample) = (all[0], all[1]);
+        assert_eq!(pre.src_rect, [0.0, 360.0, 1280.0, 720.0]);
+        assert_eq!(pre.src_texel, [1.0 / 1280.0, 1.0 / 1080.0, 1.0, 2.0]);
+        assert_eq!(pre.threshold, [1.0, 0.5, 1.0, 0.5]);
+        assert_eq!(resample.src_rect, [0.0, 0.0, 640.0, 360.0]);
+        assert_eq!(resample.src_texel, [1.0 / 640.0, 1.0 / 360.0, 0.0, 1.0]);
+        assert_eq!(resample.threshold, [4.0 / 3.0, 4.0 / 3.0, 0.0, 0.0]);
+        assert_eq!(resample.flags, [0, 2, 2, 0]);
+        // Then the chain as before: the first downsample reads level 0.
+        assert_eq!(all[2].src_rect, [0.0, 0.0, 480.0, 270.0]);
+        // 4K: 2 × 2 half-resolution pixels per level-0 pixel (2 taps per axis: robust to
+        // rounding; 900p: 1 tap, level 0 is larger than half the rect).
+        let all = run((3840, 2160), [0, 0, 3840, 2160]);
+        assert_eq!(all.len(), 12);
+        assert_eq!(all[1].threshold, [2.0, 2.0, 0.0, 0.0]);
+        assert_eq!(all[1].flags, [0, 2, 2, 0]);
+        let all = run((1600, 900), [0, 0, 1600, 900]);
+        assert_eq!(all[0].src_texel[2], 1.0);
+        assert_eq!(all[1].threshold, [800.0 / 960.0, 450.0 / 540.0, 0.0, 0.0]);
+        assert_eq!(all[1].flags, [0, 1, 1, 0]);
     }
 
     /// GPU milliseconds of one bloom chain over a 1920 × 1080 scene texture in `format` with the
@@ -742,13 +957,19 @@ mod tests {
         });
         let align = device.limits().min_uniform_buffer_offset_alignment as usize;
         let mut state = BloomState::new(device, align);
-        let ChainSize { size, mips, merged } = chain_size(scene_size, bloom);
+        let chain = chain_size(scene_size, bloom);
+        let ChainSize {
+            size,
+            mips,
+            merged,
+            half,
+        } = chain;
         let mut reallocs = 0;
         let mut n = 0;
         let slot = state.slot;
         let params = &mut state.params;
         let rect = [0, 0, scene_size.0, scene_size.1];
-        passes(scene_size, rect, (size, mips), bloom, (1.0, false), |p| {
+        passes(scene_size, rect, &chain, bloom, (1.0, false), |p| {
             params.write_at(n * slot, bytemuck::bytes_of(&p), &mut reallocs);
             n += 1;
         });
@@ -758,6 +979,7 @@ mod tests {
             size,
             mips,
             merged,
+            half,
             first_slot: 0,
             scatter: bloom.scatter,
         };
