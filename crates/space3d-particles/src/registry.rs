@@ -244,7 +244,7 @@ impl ParticleEffects {
 
 /// The built-in effect library: handles reserved at indices `0..COUNT` whenever
 /// `ParticlesPlugin::builtins` is set. The effects are RON data (`assets/particles/*.pfx.ron`,
-/// embedded; [`SOURCES`]) authored for HDR + bloom, scale 1 ≈ a 40-unit hull.
+/// embedded; [`SOURCES`](builtin::SOURCES)) authored for HDR + bloom, scale 1 ≈ a 40-unit hull.
 pub mod builtin {
     use super::EffectHandle;
     use crate::effect::ParticleEffect;
