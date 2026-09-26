@@ -36,6 +36,8 @@
 //!   random attributes come from a PCG hash of (layer instance seed, `k`): deterministic, and
 //!   shared bit for bit with the shaders.
 
+#[cfg(feature = "assets")]
+mod asset;
 mod components;
 mod cpu;
 mod curve;
@@ -50,6 +52,8 @@ mod stats;
 #[doc(hidden)]
 pub mod testing;
 
+#[cfg(feature = "assets")]
+pub use asset::ParticleEffectLoader;
 pub use components::{
     BeamEnd, EffectSpawn, FinishAction, OnRemove, ParticleAttractor, ParticleBeam, ParticleEffectFinished,
     ParticleEmitter, SpawnEffect,
@@ -133,6 +137,14 @@ impl Plugin for ParticlesPlugin {
         }
         if self.tick_system {
             app.add_system_ordered(Stage::FixedUpdate, Self::TICK_ORDER, "particles::tick", tick_system);
+        }
+        // `.pfx.ron` effects, when the app has an asset server (add `AssetsPlugin` first).
+        #[cfg(feature = "assets")]
+        if app.resources.contains::<space3d_assets::AssetServer>() {
+            use space3d_assets::AssetApp;
+            app.init_asset::<ParticleEffect>()
+                .register_asset_loader(asset::ParticleEffectLoader);
+            app.add_system_named(Stage::Update, "particles::effect_assets", asset::sync_effect_assets);
         }
         // The render node (the frame's `RenderNodes` exists with or without a renderer; a
         // `RenderPlugin` added later keeps it).

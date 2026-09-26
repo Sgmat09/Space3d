@@ -730,6 +730,8 @@ impl Runtime {
             }
             let i = match found {
                 Some(i) => i,
+                // An effect asset still loading: the emitter starts once it has loaded.
+                None if effects.is_pending(em.effect) => continue,
                 None => {
                     let effect = match effects.get(em.effect) {
                         Some(effect) => effect,

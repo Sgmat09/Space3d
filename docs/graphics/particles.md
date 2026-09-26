@@ -10,8 +10,8 @@ mode. The normative design is
 Status: milestones PA0 (runtime, CPU simulation, effect library), PA1 (CPU backend rendering,
 prefabs), PA2 (the GPU compute backend: 100k+ particles, budgets, parity with the CPU backend),
 the M1.1 polish (sub-pixel sprites, exact sub-tick emission, throttle response) and PA3
-(ribbons, beams, textures and flipbooks, light flashes, 14 built-ins) are in. Distortion layers,
-per-particle sorting, LOD calibration (PA4) and the `.pfx.ron` asset loader follow; the API
+(ribbons, beams, textures and flipbooks, light flashes, 14 built-ins, the `.pfx.ron` asset
+loader) are in. Distortion layers, per-particle sorting and LOD calibration (PA4) follow; the API
 below does not change for them.
 
 ## Quick start
@@ -113,7 +113,22 @@ let fx = ParticleEffect::new("sparks").layer(
 ```
 
 `ParticleEffects::set` replaces an effect (hot reload): layers that keep their capacity update in
-place; a changed structure restarts running instances (their old particles drain).
+place; a changed structure restarts running instances (their old particles drain;
+`runtime::tests::hot_reload_structure_change_drains`).
+
+**Effect files.** With the crate's `assets` feature (the facade's `assets` + `particles` enable
+it) and an `AssetServer` (`AssetsPlugin` before `ParticlesPlugin`), `.pfx.ron` files load like any
+asset and follow its hot reload:
+
+```rust
+let asset: Handle<ParticleEffect> = server.load("effects/plasma.pfx.ron");
+let plasma = effects.add_asset(asset); // an EffectHandle at once
+ctx.spawn_effect(plasma, EffectSpawn::at(p)); // waits until the file has loaded
+```
+
+Editing the file reloads it (`ParticleEffects::set` semantics); a file that fails to load plays
+nothing (its emitters finish, warned) — `tests/assets.rs`. Referencing a `SpriteTexture::Path` from
+such a file is not resolved yet (use built-ins or handles).
 
 ### Layer reference
 

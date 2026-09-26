@@ -5075,6 +5075,7 @@ dependencies = [
  "proptest",
  "ron",
  "serde",
+ "space3d-assets",
  "space3d-core",
  "space3d-render",
  "space3d-test",

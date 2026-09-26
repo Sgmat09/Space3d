@@ -50,6 +50,8 @@ pub enum EffectError {
 struct Slot {
     generation: u32,
     effect: Option<ParticleEffect>,
+    /// Reserved for an effect asset still loading: emitters wait for it.
+    pending: bool,
 }
 
 /// Registered effects (resource, inserted by [`crate::ParticlesPlugin`]).
@@ -59,6 +61,9 @@ pub struct ParticleEffects {
     free: Vec<u32>,
     /// Bumped by every change (the runtime and the render node rebuild what depends on it).
     version: u64,
+    /// Effects that follow an asset (`add_asset`).
+    #[cfg(feature = "assets")]
+    pub(crate) asset_links: Vec<(space3d_assets::Handle<ParticleEffect>, EffectHandle)>,
 }
 
 impl std::fmt::Debug for ParticleEffects {
@@ -80,6 +85,7 @@ impl ParticleEffects {
             self.slots.push(Slot {
                 generation: 0,
                 effect: None,
+                pending: false,
             });
         }
         let index = match self.free.pop() {
@@ -88,17 +94,55 @@ impl ParticleEffects {
                 self.slots.push(Slot {
                     generation: 0,
                     effect: None,
+                    pending: false,
                 });
                 self.slots.len() as u32 - 1
             }
         };
         let slot = &mut self.slots[index as usize];
         slot.effect = Some(effect);
+        slot.pending = false;
         self.version += 1;
         Ok(EffectHandle {
             index,
             generation: slot.generation,
         })
+    }
+
+    /// Register the `.pfx.ron` effect asset `asset` (`AssetServer::load`): its handle is valid at
+    /// once, emitters playing it wait until it has loaded, and it follows the asset's hot reloads
+    /// like [`Self::set`]. An asset that fails to load plays nothing (emitters finish, warned).
+    #[cfg(feature = "assets")]
+    pub fn add_asset(&mut self, asset: space3d_assets::Handle<ParticleEffect>) -> EffectHandle {
+        if let Some(&(_, h)) = self.asset_links.iter().find(|(a, _)| a.id() == asset.id()) {
+            return h;
+        }
+        let h = self
+            .add(ParticleEffect::default())
+            .expect("the default effect is valid");
+        let slot = &mut self.slots[h.index as usize];
+        slot.effect = None;
+        slot.pending = true;
+        self.asset_links.push((asset, h));
+        h
+    }
+
+    /// Whether `handle` is an effect asset still loading (emitters wait for it).
+    pub fn is_pending(&self, handle: EffectHandle) -> bool {
+        self.slots
+            .get(handle.index as usize)
+            .is_some_and(|s| s.generation == handle.generation && s.pending)
+    }
+
+    /// An effect asset could not be loaded: its emitters play nothing.
+    #[cfg(feature = "assets")]
+    pub(crate) fn fail_pending(&mut self, handle: EffectHandle) {
+        if let Some(slot) = self.slots.get_mut(handle.index as usize)
+            && slot.generation == handle.generation
+        {
+            slot.pending = false;
+            self.version += 1;
+        }
     }
 
     /// Register `effect` at a built-in handle.
@@ -108,6 +152,7 @@ impl ParticleEffects {
             self.slots.push(Slot {
                 generation: 0,
                 effect: None,
+                pending: false,
             });
         }
         self.slots[handle.index as usize].effect = Some(effect);
@@ -119,16 +164,27 @@ impl ParticleEffects {
     pub fn set(&mut self, handle: EffectHandle, effect: ParticleEffect) -> Result<(), EffectError> {
         effect.validate()?;
         crate::render::textures::prepare_effect(&effect);
-        let slot = self.slot_mut(handle).ok_or(EffectError::UnknownHandle)?;
+        let slot = self
+            .slots
+            .get_mut(handle.index as usize)
+            .filter(|s| s.generation == handle.generation && (s.effect.is_some() || s.pending))
+            .ok_or(EffectError::UnknownHandle)?;
         slot.effect = Some(effect);
+        slot.pending = false;
         self.version += 1;
         Ok(())
     }
 
     /// Unregister an effect (running instances drain).
     pub fn remove(&mut self, handle: EffectHandle) -> Option<ParticleEffect> {
-        let slot = self.slot_mut(handle)?;
-        let effect = slot.effect.take()?;
+        #[cfg(feature = "assets")]
+        self.asset_links.retain(|&(_, h)| h != handle);
+        let slot = self
+            .slots
+            .get_mut(handle.index as usize)
+            .filter(|s| s.generation == handle.generation && (s.effect.is_some() || s.pending))?;
+        slot.pending = false;
+        let effect = slot.effect.take().unwrap_or_default();
         slot.generation = slot.generation.wrapping_add(1);
         self.version += 1;
         if handle.index >= builtin::COUNT {
@@ -183,12 +239,6 @@ impl ParticleEffects {
     /// Number of slots (the highest handle index + 1).
     pub(crate) fn slot_count(&self) -> usize {
         self.slots.len()
-    }
-
-    fn slot_mut(&mut self, handle: EffectHandle) -> Option<&mut Slot> {
-        self.slots
-            .get_mut(handle.index as usize)
-            .filter(|s| s.generation == handle.generation && s.effect.is_some())
     }
 }
 
