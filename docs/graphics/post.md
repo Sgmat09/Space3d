@@ -538,10 +538,11 @@ darker.
 are sampled apart, radially from the rect's center and growing with r²; at the corners the split
 is `intensity × 2 %` of the rect's width (resolution-independent). The taps are bilinear and
 clamped to the rect. Up to 1.5 px from green, red and blue are one tap each; a wider split is a
-spectrum of taps at most two pixels apart (so a star smears into a small rainbow instead of
-three dots), at most 13, so the cost is bounded whatever the intensity (the composite at 1080p
-on Dev: 0.091 ms without CA, 0.116 ms at 0.15, 0.128 at 0.25, 0.155 at 0.5, 0.180 at 1.0; with
-taps a pixel apart and up to 25 of them it was 0.126 / 0.150 / 0.199 / 0.248). The distortion's
+spectrum of taps at most 1.5 pixels apart (so a star smears into a small rainbow instead of
+three dots: `wide_split_is_a_spectrum`), at most 17, so the cost is bounded whatever the
+intensity (the composite at 1080p on Dev: 0.091 ms without CA, 0.119 ms at 0.15, 0.137 at 0.25,
+0.172 at 0.5, 0.202 at 1.0; with taps a pixel apart and up to 25 of them it was 0.126 / 0.150 /
+0.199 / 0.248). The distortion's
 spectral split (`Distortion::chromatic`) uses the same taps. Off in `GraphicsQuality::Low`.
 
 ## Film grain

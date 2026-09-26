@@ -202,10 +202,10 @@ fn post_distortion(s: vec2<f32>) -> vec2<f32> {
 // from the rect's center, growing with r²: `lens.x` puts intensity × 2 % of the rect width at
 // the corners) and the distortion's spectral split (R and B at (1 ∓ lens.w) × the offset `ds`).
 // Up to 1.5 px from green, red and blue are single taps; further apart a spectrum of taps at
-// most two pixels apart (each bilinear tap covers ±1 px, so a star's copies still touch) spans
-// the split, red fading into green into blue, so a star under a strong shockwave or at a corner
+// most 1.5 pixels apart (each bilinear tap covers ±1 px, so a star's copies overlap) spans the
+// split, red fading into green into blue, so a star under a strong shockwave or at a corner
 // smears into a small rainbow instead of splitting into separate red, green and blue dots. At
-// most 13 taps: beyond a 12-px half split (CA far above 0.5 at 1080p) they spread further
+// most 17 taps: beyond a 12-px half split (CA far above 0.5 at 1080p) they spread further
 // apart, so the cost stays bounded whatever the intensity.
 fn post_chromatic(s0: vec2<f32>, ds: vec2<f32>, c: vec4<f32>) -> vec4<f32> {
     var off = vec2<f32>(0.0);
@@ -221,8 +221,8 @@ fn post_chromatic(s0: vec2<f32>, ds: vec2<f32>, c: vec4<f32>) -> vec4<f32> {
         let b = post_scene_bilinear(s0 + ds + v).b;
         return vec4<f32>(r, c.g, b, c.a);
     }
-    // Taps at t = k / m, k = −m … m: at most two pixels apart, at most 13.
-    let m = i32(clamp(ceil(length(v) * 0.5), 1.0, 6.0));
+    // Taps at t = k / m, k = −m … m: at most 1.5 pixels apart, at most 17.
+    let m = i32(clamp(ceil(length(v) / 1.5), 1.0, 8.0));
     var sum = vec3<f32>(0.0);
     var weight = vec3<f32>(0.0);
     for (var k = -m; k <= m; k++) {
