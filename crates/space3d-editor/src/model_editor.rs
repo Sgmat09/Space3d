@@ -10,7 +10,7 @@
 
 use crate::components::EditorInternal;
 use crate::files::{IoJobs, read_file_with, write_file_with};
-use crate::widgets::{fill_slider, property, section, vec3_fields};
+use crate::widgets::{fill_slider, property, property_group, section, vec3_fields};
 use space3d_assets::edit::mesh::{self as ops, MeshEditHistory, WeldOptions};
 use space3d_core::glam::{EulerRot, Mat4, Quat, Vec3, Vec4};
 use space3d_core::hecs::{Entity, World};
@@ -797,6 +797,7 @@ impl ModelEditor {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(230.0);
+                crate::widgets::visible_scroll_bars(ui);
                 egui::ScrollArea::vertical().id_salt("model_ops").show(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| self.ops_panel(ui));
                 });
@@ -879,25 +880,25 @@ impl ModelEditor {
             true,
             |_| {},
             |ui| {
-                property(ui, "Normals", |ui| {
-                    if ui.small_button("Smooth").clicked() {
+                property_group(ui, "Normals", |ui| {
+                    if ui.button("Smooth").clicked() {
                         run = Some("smooth_normals");
                     }
-                    if ui.small_button("Flat").clicked() {
+                    if ui.button("Flat").clicked() {
                         run = Some("flat_normals");
                     }
-                    if ui.small_button("Flip").clicked() {
+                    if ui.button("Flip").clicked() {
                         run = Some("flip_normals");
                     }
                 });
-                property(ui, "Weld ε", |ui| {
+                property_group(ui, "Weld ε", |ui| {
                     ui.add(egui::DragValue::new(&mut p.weld_epsilon).speed(0.0001).range(0.0..=1.0));
-                    if ui.small_button("Weld").clicked() {
+                    if ui.button("Weld").clicked() {
                         run = Some("weld");
                     }
                 });
                 property(ui, "Subdivide", |ui| {
-                    if ui.small_button("Subdivide").clicked() {
+                    if ui.button("Subdivide").clicked() {
                         run = Some("subdivide");
                     }
                 });
@@ -908,7 +909,7 @@ impl ModelEditor {
                 {
                     self.paint_mode = false;
                 }
-                property(ui, "Facing", |ui| {
+                property_group(ui, "Facing", |ui| {
                     egui::ComboBox::from_id_salt("extrude_axis")
                         .selected_text(p.select_axis.label())
                         .width(44.0)
@@ -917,30 +918,27 @@ impl ModelEditor {
                                 ui.selectable_value(&mut p.select_axis, a, a.label());
                             }
                         });
-                    if ui.small_button("Select").clicked() {
+                    if ui.button("Select").clicked() {
                         select = Some(Some(p.select_axis));
                     }
-                    if ui
-                        .add_enabled(selected > 0, egui::Button::new("Clear").small())
-                        .clicked()
-                    {
+                    if ui.add_enabled(selected > 0, egui::Button::new("Clear")).clicked() {
                         select = Some(None);
                     }
                 });
-                property(ui, "Extrude", |ui| {
+                property_group(ui, "Extrude", |ui| {
                     ui.add(egui::DragValue::new(&mut p.extrude_distance).speed(0.01));
                     let hint = if selected == 0 {
                         "No faces selected: extrudes the faces facing the axis".to_owned()
                     } else {
                         format!("Extrudes the {selected} selected faces")
                     };
-                    if ui.small_button("Extrude").on_hover_text(hint).clicked() {
+                    if ui.button("Extrude").on_hover_text(hint).clicked() {
                         run = Some("extrude");
                     }
                 });
-                property(ui, "Decimate", |ui| {
+                property_group(ui, "Decimate", |ui| {
                     ui.add(egui::DragValue::new(&mut p.decimate_resolution).range(1..=256));
-                    if ui.small_button("Decimate").clicked() {
+                    if ui.button("Decimate").clicked() {
                         run = Some("decimate");
                     }
                 });
@@ -957,11 +955,11 @@ impl ModelEditor {
                     fill_slider(ui, egui::Slider::new(&mut p.uv_scale, 0.01..=10.0).logarithmic(true))
                 });
                 property(ui, "Box", |ui| {
-                    if ui.small_button("Project").clicked() {
+                    if ui.button("Project").clicked() {
                         run = Some("uv_box");
                     }
                 });
-                property(ui, "Planar", |ui| {
+                property_group(ui, "Planar", |ui| {
                     egui::ComboBox::from_id_salt("uv_axis")
                         .selected_text(p.uv_axis.label())
                         .width(44.0)
@@ -970,7 +968,7 @@ impl ModelEditor {
                                 ui.selectable_value(&mut p.uv_axis, a, a.label());
                             }
                         });
-                    if ui.small_button("Project").clicked() {
+                    if ui.button("Project").clicked() {
                         run = Some("uv_planar");
                     }
                 });
@@ -986,7 +984,7 @@ impl ModelEditor {
                 if ui.checkbox(&mut self.paint_mode, "paint on drag").changed() && self.paint_mode {
                     self.select_mode = false;
                 }
-                property(ui, "Color", |ui| {
+                property_group(ui, "Color", |ui| {
                     let mut c = egui::Rgba::from_rgba_unmultiplied(
                         p.paint_color[0],
                         p.paint_color[1],
@@ -998,7 +996,7 @@ impl ModelEditor {
                     {
                         p.paint_color = c.to_rgba_unmultiplied();
                     }
-                    if ui.small_button("Fill all").clicked() {
+                    if ui.button("Fill all").clicked() {
                         run = Some("fill_colors");
                     }
                 });
@@ -1050,6 +1048,8 @@ impl ModelEditor {
         } else {
             egui::vec2(avail.x, avail.x / aspect)
         };
+        // Centered in the space left of the window (no gutter on one side only).
+        ui.add_space(((ui.available_width() - size.x) / 2.0).floor().max(0.0));
         let response = match self.preview_texture() {
             Some(id) => {
                 ui.add(egui::Image::new(egui::load::SizedTexture::new(id, size)).sense(egui::Sense::click_and_drag()))

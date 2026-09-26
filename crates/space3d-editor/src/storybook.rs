@@ -8,7 +8,7 @@
 
 use crate::files::{IoJobs, sanitize_file_name, write_file_with};
 use crate::sub_app::{LiveView, panic_message, panics_are_isolated};
-use crate::widgets::{fill_drag, fill_slider, panel_frame, panel_title, property, section};
+use crate::widgets::{fill_drag, fill_slider, panel_frame, panel_title, property, section, visible_scroll_bars};
 use space3d_core::{App, Plugin, Stage, SystemCtx, Time};
 use space3d_platform::InputPlugin;
 use space3d_render::RenderPlugin;
@@ -396,7 +396,7 @@ impl StorybookViewer {
             }
             (KnobKind::Choice { options }, KnobValue::Choice(i)) => {
                 egui::ComboBox::from_id_salt(("space3d_knob", &knob.name))
-                    .width(ui.available_width() - ui.spacing().icon_width)
+                    .width(ui.available_width())
                     .selected_text(options.get(*i).cloned().unwrap_or_default())
                     .show_ui(ui, |ui| {
                         for (k, o) in options.iter().enumerate() {
@@ -405,7 +405,7 @@ impl StorybookViewer {
                     });
             }
             (_, v) => {
-                if ui.small_button("reset").clicked() {
+                if ui.button("reset").clicked() {
                     *v = knob.default.clone();
                 } else {
                     ui.label(knob.format_value(v));
@@ -421,7 +421,7 @@ impl StorybookViewer {
             return;
         };
         panel_title(ui, &story.name, &format!("{}×{}", story.size.0, story.size.1));
-        ui.label(egui::RichText::new(&story.id).weak().small());
+        ui.label(egui::RichText::new(&story.id).small());
         if !story.description.is_empty() {
             ui.label(&story.description);
         }
@@ -430,7 +430,7 @@ impl StorybookViewer {
             info.push_str(" · ");
             info.push_str(&story.tags.join(", "));
         }
-        ui.label(egui::RichText::new(info).weak().small());
+        ui.label(egui::RichText::new(info).small());
         ui.add_space(2.0);
         let mut reset = false;
         let knobs = story.knobs.len();
@@ -440,7 +440,7 @@ impl StorybookViewer {
             &format!("Knobs ({knobs})"),
             true,
             |ui| {
-                reset = knobs > 0 && ui.small_button("Reset").clicked();
+                reset = knobs > 0 && ui.button("Reset").clicked();
             },
             |ui| {
                 if knobs == 0 {
@@ -481,7 +481,7 @@ impl StorybookViewer {
                     }
                 });
                 property(ui, "Step N", |ui| {
-                    if ui.small_button("Run").clicked() {
+                    if ui.button("Run").clicked() {
                         self.step(self.step_count);
                     }
                     fill_drag(
@@ -498,7 +498,7 @@ impl StorybookViewer {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(format!("stepping: {} ticks left", self.pending_steps));
-                        if ui.small_button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() {
                             self.pending_steps = 0;
                         }
                     });
@@ -511,13 +511,9 @@ impl StorybookViewer {
         {
             self.status = e;
         }
-        ui.label(egui::RichText::new(&self.status).weak().small());
+        ui.label(egui::RichText::new(&self.status).small());
         if !panics_are_isolated() {
-            ui.label(
-                egui::RichText::new("panic = abort build: a panicking story closes the viewer")
-                    .weak()
-                    .small(),
-            );
+            ui.label(egui::RichText::new("panic = abort build: a panicking story closes the viewer").small());
         }
     }
 
@@ -525,14 +521,22 @@ impl StorybookViewer {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("space3d_story_sidebar")
             .default_size(200.0)
-            .frame(panel_frame(ui.style()))
-            .show(ui, |ui| self.sidebar(ui));
-        egui::Panel::right("space3d_story_knobs")
-            .default_size(260.0)
+            .size_range(160.0..=400.0)
             .frame(panel_frame(ui.style()))
             .show(ui, |ui| {
+                visible_scroll_bars(ui);
+                self.sidebar(ui);
+            });
+        egui::Panel::right("space3d_story_knobs")
+            .default_size(260.0)
+            .size_range(220.0..=480.0)
+            .frame(panel_frame(ui.style()))
+            .show(ui, |ui| {
+                visible_scroll_bars(ui);
+                // Full width whatever the story shows: the panel keeps its width.
                 egui::ScrollArea::vertical()
                     .id_salt("space3d_story_knobs_scroll")
+                    .auto_shrink([false, true])
                     .show(ui, |ui| self.side_panel(ui));
             });
         let m = ui.style().spacing.window_margin;

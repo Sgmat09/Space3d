@@ -122,16 +122,18 @@ fn theme_story(id: &str, theme: Option<UiTheme>) -> Story {
         }
         plain_backdrop(app);
         let mut preview = ThemePreview::default();
-        // A window-looking panel that takes the size of its contents (an auto-sized
-        // `egui::Window` would stretch to the screen edge around the separators).
+        // A real game window around the panel. `auto_sized`: the window takes the panel's width
+        // (egui's default window is 340 pt wide whatever it holds). `fixed_pos`: an auto-sized
+        // window's first frame spans the screen (its title bar grows), which would push a
+        // `default_pos` window against the edge of this small capture.
         app.add_ui_system(move |ctx, _| {
-            egui::Area::new(egui::Id::new("space3d_theme_story"))
+            egui::Window::new("Asset browser")
+                .id(egui::Id::new("space3d_theme_story"))
                 .fixed_pos([12.0, 12.0])
+                .auto_sized()
+                .collapsible(false)
                 .show(ctx, |ui| {
-                    egui::Frame::window(ui.style()).show(ui, |ui| {
-                        ui.heading("Asset browser");
-                        preview.ui(ui);
-                    });
+                    preview.ui(ui);
                 });
         });
     })
@@ -199,7 +201,7 @@ fn debug_overlay() -> Story {
     )
     .knob_choice("style", &STYLES, 0)
     .knob_bool("details", true)
-    .size(320, 200)
+    .size(320, 210)
     .ticks(3)
     .tag("ui")
 }

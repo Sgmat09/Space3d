@@ -208,8 +208,22 @@ fn grid_width(ui: &egui::Ui) -> f32 {
     ui.fonts_mut(|f| f.glyph_width(&font, '0')) * chars as f32
 }
 
-/// `Stage::Update`: record the frame time and draw the overlay.
-pub(crate) fn debug_overlay_system(sys: &mut SystemCtx) {
+/// The overlay's last line: the keys of the other tools (`"F4 profiler · ` console"`), empty
+/// without keys.
+pub(crate) fn tool_keys_hint(profiler: Option<KeyCode>, console: Option<KeyCode>) -> String {
+    let name = |k: KeyCode| match k {
+        KeyCode::Backquote => "`".to_owned(),
+        k => format!("{k:?}"),
+    };
+    let parts: Vec<String> = [(profiler, "profiler"), (console, "console")]
+        .into_iter()
+        .filter_map(|(k, what)| k.map(|k| format!("{} {what}", name(k))))
+        .collect();
+    parts.join(" · ")
+}
+
+/// `Stage::Update`: record the frame time and draw the overlay (`hint`: [`tool_keys_hint`]).
+pub(crate) fn debug_overlay_system(sys: &mut SystemCtx, hint: &str) {
     let ctx = EguiContext::active_context(sys);
     let (delta_ms, time) = match sys.resources.get::<Time>() {
         Some(t) => (t.delta.as_secs_f32() * 1000.0, t.clone()),
@@ -305,6 +319,13 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx) {
                             ],
                         );
                     }
+                    if !hint.is_empty() {
+                        ui.label(
+                            egui::RichText::new(hint)
+                                .font(egui::FontId::monospace(FONT_SIZE))
+                                .color(LABEL),
+                        );
+                    }
                 });
         });
 }
@@ -312,6 +333,16 @@ pub(crate) fn debug_overlay_system(sys: &mut SystemCtx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_hint() {
+        assert_eq!(
+            tool_keys_hint(Some(KeyCode::F4), Some(KeyCode::Backquote)),
+            "F4 profiler · ` console"
+        );
+        assert_eq!(tool_keys_hint(None, Some(KeyCode::F9)), "F9 console");
+        assert_eq!(tool_keys_hint(None, None), "");
+    }
 
     #[test]
     fn frame_history_and_fps() {

@@ -159,6 +159,38 @@ impl UiDensity {
     pub fn row_height(ui: &egui::Ui) -> f32 {
         Self::of(ui.ctx()).map_or(ui.spacing().interact_size.y, |d| d.table_row_height)
     }
+
+    /// The tokens' bit patterns: equal for the same tokens, NaNs included (unlike `==`).
+    fn to_bits(self) -> [u32; 25] {
+        [
+            self.item_spacing.x,
+            self.item_spacing.y,
+            self.button_padding.x,
+            self.button_padding.y,
+            self.window_margin,
+            self.menu_margin,
+            self.control_height,
+            self.control_min_width,
+            self.indent,
+            self.icon_size,
+            self.icon_spacing,
+            self.slider_width,
+            self.combo_width,
+            self.text_edit_width,
+            self.scroll_bar_width,
+            self.heading_size,
+            self.body_size,
+            self.button_size,
+            self.small_size,
+            self.monospace_size,
+            self.widget_radius,
+            self.window_radius,
+            self.menu_radius,
+            self.table_row_height,
+            self.tooltip_delay,
+        ]
+        .map(f32::to_bits)
+    }
 }
 
 fn density_id() -> egui::Id {
@@ -196,6 +228,13 @@ impl UiTheme {
         match self {
             Self::Compact(d) | Self::Custom(d) => d,
         }
+    }
+
+    /// Same variant and bit-identical tokens (a NaN token still equals itself, so a malformed
+    /// custom density is applied once, not every frame).
+    fn same_as(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+            && self.density().to_bits() == other.density().to_bits()
     }
 }
 
@@ -294,7 +333,12 @@ impl UiThemeSync {
     /// touches nothing; a theme inserted again after that is applied again. Returns whether
     /// the style changed.
     pub fn sync(&mut self, ctx: &egui::Context, theme: Option<&UiTheme>) -> bool {
-        if theme == self.applied.as_ref() {
+        let unchanged = match (theme, &self.applied) {
+            (Some(t), Some(applied)) => t.same_as(applied),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
             return false;
         }
         self.applied = theme.copied();
@@ -374,10 +418,19 @@ impl ThemePreview {
         &self.rects
     }
 
-    /// Draw the panel into `ui` (text never wraps: every label keeps its full width).
+    /// Width of the panel under `ui`'s style: its "Space [combo] Name [field]" row at the
+    /// style's default combo and text field widths. Every other row fills this width.
+    pub fn panel_width(ui: &egui::Ui) -> f32 {
+        let s = ui.spacing();
+        let text = |t: &str| text_width(ui, t, TextStyle::Body);
+        (text("Space") + s.combo_width + text("Name") + s.text_edit_width + 3.0 * s.item_spacing.x).ceil()
+    }
+
+    /// Draw the panel into `ui`, [`Self::panel_width`] wide (or narrower when `ui` is): rows
+    /// fill the width, text never wraps.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         self.rects.clear();
+        let width = Self::panel_width(ui).min(ui.available_width());
         let rects = &mut self.rects;
         // `hit`: a control (a hit target), not text.
         let mut add = |r: egui::Response, hit: bool| {
@@ -387,8 +440,9 @@ impl ThemePreview {
         let row_height = UiDensity::row_height(ui);
 
         ui.scope(|ui| {
-            // A menu bar row (egui's `MenuBar` look without its fill-the-width sizing, so the
-            // panel keeps the width of its content).
+            ui.set_width(width);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            // A menu bar row (egui's `MenuBar` look without its fill-the-width sizing).
             ui.horizontal(|ui| {
                 egui::containers::menu::menu_style(ui.style_mut());
                 ui.set_min_height(ui.spacing().interact_size.y);
@@ -407,7 +461,20 @@ impl ThemePreview {
             });
             ui.horizontal(|ui| {
                 add(ui.checkbox(&mut self.snap, "Snap"), true);
-                add(ui.add(egui::Slider::new(&mut self.grid, 0.0..=10.0).text("Grid")), true);
+                // Label and value box at the right end, the rail fills what is left.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    add(ui.label("Grid"), false);
+                    let size = egui::vec2(ui.spacing().interact_size.x, ui.spacing().interact_size.y);
+                    add(
+                        ui.add_sized(size, egui::DragValue::new(&mut self.grid).speed(0.05).range(0.0..=10.0)),
+                        true,
+                    );
+                    ui.spacing_mut().slider_width = ui.available_width();
+                    add(
+                        ui.add(egui::Slider::new(&mut self.grid, 0.0..=10.0).show_value(false)),
+                        true,
+                    );
+                });
             });
             ui.horizontal(|ui| {
                 add(ui.label("Space"), false);
@@ -422,48 +489,116 @@ impl ThemePreview {
                     true,
                 );
                 add(ui.label("Name"), false);
-                add(ui.text_edit_singleline(&mut self.name), true);
+                add(
+                    ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(ui.available_width())),
+                    true,
+                );
             });
             let header = egui::CollapsingHeader::new("Transform")
                 .id_salt("space3d_theme_preview_transform")
                 .default_open(true)
                 .show(ui, |ui| {
-                    egui::Grid::new("space3d_theme_preview_grid")
-                        .num_columns(2)
-                        .show(ui, |ui| {
-                            for (label, v) in ["Position", "Rotation", "Scale"].into_iter().zip(&mut self.transform) {
-                                add(ui.label(label), false);
-                                ui.horizontal(|ui| {
-                                    for c in v.iter_mut() {
-                                        add(ui.add(egui::DragValue::new(c).speed(0.1).max_decimals(2)), true);
-                                    }
-                                });
-                                ui.end_row();
+                    let labels = ["Position", "Rotation", "Scale"];
+                    let label_w = labels
+                        .iter()
+                        .map(|l| text_width(ui, l, TextStyle::Body))
+                        .fold(0.0, f32::max)
+                        .ceil();
+                    for (label, v) in labels.into_iter().zip(&mut self.transform) {
+                        ui.horizontal(|ui| {
+                            let h = ui.spacing().interact_size.y;
+                            add(cell(ui, egui::vec2(label_w, h), egui::Align::Min, label), false);
+                            let gap = ui.spacing().item_spacing.x;
+                            let w = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+                            for c in v.iter_mut() {
+                                add(
+                                    ui.add_sized([w, h], egui::DragValue::new(c).speed(0.1).max_decimals(2)),
+                                    true,
+                                );
                             }
                         });
+                    }
                 });
             add(header.header_response, true);
             ui.separator();
-            egui::Grid::new("space3d_theme_preview_table")
-                .striped(true)
-                .num_columns(4)
-                .min_row_height(row_height)
-                .show(ui, |ui| {
-                    for h in ["Asset", "Kind", "KiB", "Modified"] {
-                        add(ui.strong(h), false);
-                    }
-                    ui.end_row();
-                    for (name, kind, kib, time) in TABLE {
-                        add(ui.label(name), false);
-                        add(ui.label(egui::RichText::new(kind).weak()), false);
-                        add(ui.monospace(format!("{kib:>5}")), false);
-                        add(ui.monospace(time), false);
-                        ui.end_row();
-                    }
-                });
+            self::table(ui, width, row_height, &mut add);
         })
         .response
     }
+}
+
+/// Width of `text` in `style` (one line).
+fn text_width(ui: &egui::Ui, text: &str, style: TextStyle) -> f32 {
+    let font = style.resolve(ui.style());
+    ui.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE).size().x)
+}
+
+/// A label in a `size` cell, left- (`Align::Min`) or right-aligned (`Align::Max`), truncated
+/// to the cell. The cell always takes its full width.
+fn cell(ui: &mut egui::Ui, size: egui::Vec2, align: egui::Align, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let layout = match align {
+        egui::Align::Max => egui::Layout::right_to_left(egui::Align::Center),
+        _ => egui::Layout::left_to_right(egui::Align::Center),
+    };
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    child.add(egui::Label::new(text).truncate().selectable(false))
+}
+
+/// The preview's striped table: columns fill `width`, numbers (and their headers) right-aligned.
+fn table(ui: &mut egui::Ui, width: f32, row_height: f32, add: &mut impl FnMut(egui::Response, bool) -> egui::Response) {
+    let gap = ui.spacing().item_spacing.x * 2.0;
+    let kind = TABLE
+        .iter()
+        .map(|r| text_width(ui, r.1, TextStyle::Body))
+        .fold(text_width(ui, "Kind", TextStyle::Body), f32::max)
+        .ceil();
+    let kib = text_width(ui, "00000", TextStyle::Monospace)
+        .max(text_width(ui, "KiB", TextStyle::Body))
+        .ceil();
+    let modified = text_width(ui, "00:00", TextStyle::Monospace)
+        .max(text_width(ui, "Modified", TextStyle::Body))
+        .ceil();
+    let asset = (width - kind - kib - modified - 3.0 * gap).max(0.0);
+    // (space before, width, alignment)
+    let columns = [
+        (0.0, asset, egui::Align::Min),
+        (gap, kind, egui::Align::Min),
+        (gap, kib, egui::Align::Max),
+        (gap, modified, egui::Align::Max),
+    ];
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        ui.spacing_mut().interact_size.y = row_height;
+        let stripe = ui.visuals().faint_bg_color;
+        let row = |ui: &mut egui::Ui,
+                   cells: [egui::WidgetText; 4],
+                   add: &mut dyn FnMut(egui::Response, bool) -> egui::Response,
+                   striped: bool| {
+            let background = ui.painter().add(egui::Shape::Noop);
+            let r = ui.horizontal(|ui| {
+                for (text, (space, w, align)) in cells.into_iter().zip(columns) {
+                    ui.add_space(space);
+                    add(cell(ui, egui::vec2(w, row_height), align, text), false);
+                }
+            });
+            if striped {
+                ui.painter()
+                    .set(background, egui::Shape::rect_filled(r.response.rect, 0.0, stripe));
+            }
+        };
+        let header = ["Asset", "Kind", "KiB", "Modified"].map(|h| egui::RichText::new(h).strong().into());
+        row(ui, header, add, false);
+        for (i, (name, kind, kib, time)) in TABLE.into_iter().enumerate() {
+            let cells: [egui::WidgetText; 4] = [
+                name.into(),
+                egui::RichText::new(kind).weak().into(),
+                egui::RichText::new(kib.to_string()).monospace().into(),
+                egui::RichText::new(time).monospace().into(),
+            ];
+            row(ui, cells, add, i % 2 == 0);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -569,5 +704,24 @@ mod tests {
         assert!(sync.sync(&ctx, Some(&custom)), "inserted again: applied again");
         assert_eq!(sync.applications(), 3);
         assert_eq!(sync.applied(), Some(&custom));
+    }
+
+    #[test]
+    fn a_nan_token_is_applied_once() {
+        let ctx = egui::Context::default();
+        let mut sync = UiThemeSync::default();
+        let broken = UiTheme::Custom(UiDensity {
+            slider_width: f32::NAN,
+            ..UiDensity::compact()
+        });
+        assert!(sync.sync(&ctx, Some(&broken)));
+        let applied = ctx.global_style();
+        for _ in 0..5 {
+            assert!(!sync.sync(&ctx, Some(&broken)), "unchanged theme with a NaN token");
+        }
+        assert!(std::sync::Arc::ptr_eq(&applied, &ctx.global_style()));
+        assert_eq!(sync.applications(), 1);
+        let compact = UiTheme::Compact(*broken.density());
+        assert!(sync.sync(&ctx, Some(&compact)), "another variant is a change");
     }
 }

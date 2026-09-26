@@ -80,19 +80,21 @@ pub fn hierarchy_ui(
 ) -> Vec<HierarchyAction> {
     let mut actions = Vec::new();
     ui.horizontal(|ui| {
-        let button = ui.spacing().interact_size.y + ui.spacing().item_spacing.x;
-        ui.add(
-            egui::TextEdit::singleline(filter)
-                .hint_text("search")
-                .desired_width(ui.available_width() - button),
-        );
-        ui.menu_button("+", |ui| {
-            for kind in AddKind::ALL {
-                if ui.button(kind.label()).clicked() {
-                    actions.push(HierarchyAction::Add(kind, None));
-                    ui.close();
+        // "+" at the right end, the search field fills the rest of the row.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button("+", |ui| {
+                for kind in AddKind::ALL {
+                    if ui.button(kind.label()).clicked() {
+                        actions.push(HierarchyAction::Add(kind, None));
+                        ui.close();
+                    }
                 }
-            }
+            });
+            ui.add(
+                egui::TextEdit::singleline(filter)
+                    .hint_text("search")
+                    .desired_width(ui.available_width()),
+            );
         });
     });
     let tree = build_tree(world);
@@ -140,7 +142,7 @@ pub fn hierarchy_ui(
         egui::Align2::CENTER_CENTER,
         "drop here to unparent",
         egui::TextStyle::Small.resolve(ui.style()),
-        ui.visuals().weak_text_color(),
+        ui.visuals().text_color(),
     );
     if let Some(child) = response.dnd_release_payload::<Entity>() {
         actions.push(HierarchyAction::Reparent {
@@ -186,7 +188,11 @@ fn entity_label(
     selected: Option<Entity>,
     actions: &mut Vec<HierarchyAction>,
 ) {
-    let response = ui.add(egui::Button::selectable(selected == Some(e), name).sense(egui::Sense::click_and_drag()));
+    let response = ui.add(
+        egui::Button::selectable(selected == Some(e), name)
+            .wrap_mode(egui::TextWrapMode::Truncate)
+            .sense(egui::Sense::click_and_drag()),
+    );
     if response.clicked() || response.drag_started() {
         actions.push(HierarchyAction::Select(e));
     }

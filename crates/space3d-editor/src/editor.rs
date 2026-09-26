@@ -620,10 +620,12 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                     let frame = crate::widgets::panel_frame(ui.style());
                     egui::Panel::left("space3d_editor_hierarchy")
                         .default_size(210.0)
+                        .size_range(160.0..=400.0)
                         .frame(frame)
                         .show(ui, |ui| {
                             let count = crate::hierarchy::entity_count(sys.world);
                             crate::widgets::panel_title(ui, "Hierarchy", &format!("{count} entities"));
+                            crate::widgets::visible_scroll_bars(ui);
                             actions = hierarchy_ui(ui, sys.world, t.state.selected, &mut t.state.hierarchy_filter);
                         });
                     for a in actions {
@@ -634,11 +636,15 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                     let frame = crate::widgets::panel_frame(ui.style());
                     egui::Panel::right("space3d_editor_inspector")
                         .default_size(280.0)
+                        .size_range(220.0..=480.0)
                         .frame(frame)
                         .show(ui, |ui| {
                             crate::widgets::panel_title(ui, "Inspector", "");
+                            crate::widgets::visible_scroll_bars(ui);
+                            // Full width whatever is selected: the panel keeps its width.
                             egui::ScrollArea::vertical()
                                 .id_salt("space3d_inspector_scroll")
+                                .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     match (t.state.selected, sys.resources.get::<ComponentRegistry>()) {
                                         (Some(e), Some(registry)) => {

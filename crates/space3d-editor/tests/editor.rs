@@ -554,6 +554,80 @@ fn standalone_tools_are_compact_and_the_plugin_keeps_a_games_style() {
     );
 }
 
+/// Width of an egui side panel after the last frame.
+fn panel_width(app: &App, id: &str) -> f32 {
+    let ctx = app.resources.expect::<EguiContext>().ctx().clone();
+    egui::containers::panel::PanelState::load(&ctx, egui::Id::new(id))
+        .unwrap_or_else(|| panic!("panel {id} shown"))
+        .outer_rect
+        .width()
+}
+
+/// The inspector's rows (sliders with their value boxes, vec3 fields, checkboxes) never ask for
+/// more than the panel's width, whatever the style: the panels keep their width frame after
+/// frame (they used to grow every frame until the viewport was gone) and it does not depend on
+/// the selection.
+#[test]
+fn editor_panels_keep_their_width_under_any_style() {
+    let styles: [(&str, Option<UiTheme>, bool); 4] = [
+        ("egui default", None, false),
+        ("compact", Some(UiTheme::compact()), false),
+        (
+            "custom 14 pt",
+            Some(UiTheme::Custom(UiDensity {
+                body_size: 14.0,
+                button_size: 14.0,
+                ..UiDensity::compact()
+            })),
+            false,
+        ),
+        ("roomy game style", None, true),
+    ];
+    for (name, theme, roomy) in styles {
+        let mut app = App::new();
+        app.add_plugin(space3d_ui::UiPlugin {
+            install_tracing: false,
+            ..space3d_ui::UiPlugin::deterministic()
+        });
+        if let Some(t) = theme {
+            app.insert_resource(t);
+        }
+        if roomy {
+            let ctx = app.resources.expect::<EguiContext>().ctx().clone();
+            ctx.all_styles_mut(|s| {
+                s.spacing.item_spacing = egui::vec2(14.0, 10.0);
+                s.spacing.button_padding = egui::vec2(12.0, 6.0);
+                s.spacing.interact_size = egui::vec2(48.0, 32.0);
+                for font in s.text_styles.values_mut() {
+                    font.size += 4.0;
+                }
+            });
+        }
+        app.add_plugin(EditorPlugin::default());
+        scene(&mut app);
+        let cube = entity_named(&app, "Cube").unwrap();
+        let camera = entity_named(&app, "Main camera").unwrap();
+        let _ = app.world.insert_one(cube, Transform::from_xyz(-12.345, 0.5, 1234.5));
+        app.resources.expect_mut::<EditorState>().selected = Some(cube);
+        app.step_ticks(6);
+        let widths = |app: &App| {
+            (
+                panel_width(app, "space3d_editor_hierarchy"),
+                panel_width(app, "space3d_editor_inspector"),
+            )
+        };
+        let first = widths(&app);
+        app.step_ticks(60);
+        assert_eq!(widths(&app), first, "{name}: panels keep their width");
+        assert!(first.1 <= 480.0 && first.0 <= 400.0, "{name}: {first:?}");
+        for selection in [Some(camera), None, Some(cube)] {
+            app.resources.expect_mut::<EditorState>().selected = selection;
+            app.step_ticks(6);
+            assert_eq!(widths(&app), first, "{name}: same width with {selection:?} selected");
+        }
+    }
+}
+
 /// Editor, texture editor, model editor and storybook viewer captures, written to
 /// `$SPACE3D_EDITOR_SNAPSHOT_DIR` (for reviewing the tools' layout by eye).
 #[test]

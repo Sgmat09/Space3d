@@ -463,20 +463,19 @@ impl Console {
         self.input_focused
     }
 
-    /// Lines shown with the current level and text filter.
-    fn shown(&self) -> impl Iterator<Item = &LogLine> {
-        let filter = self.filter.to_lowercase();
+    /// Lines shown with the current level and text filter (`filter` lowercased by the caller).
+    fn shown<'a>(&'a self, filter: &'a str) -> impl Iterator<Item = &'a LogLine> {
         self.lines.iter().filter(move |l| {
             let level = match l.level {
                 LogLevel::Command | LogLevel::Output => true,
                 lvl => lvl >= self.min_level,
             };
-            level && (filter.is_empty() || l.message.to_lowercase().contains(&filter))
+            level && crate::tool::contains_ignore_case(&l.message, filter)
         })
     }
 
     /// Draw the console into `ui`: a toolbar (level, filter, clear), the log (one dense
-    /// monospace line per entry) and the input line.
+    /// monospace line per entry, long entries wrapped to the width) and the input line.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("space3d_console_level")
@@ -505,6 +504,7 @@ impl Console {
         let visuals = ui.visuals().clone();
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let input_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 2.0;
+        let filter = self.filter.to_lowercase();
         egui::Frame::new()
             .fill(visuals.extreme_bg_color)
             .corner_radius(2)
@@ -517,7 +517,9 @@ impl Console {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        for l in self.shown() {
+                        // Long lines (paths, backtraces) wrap: the log never widens the window.
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        for l in self.shown(&filter) {
                             let color = l.level.color(&visuals);
                             let mut job = egui::text::LayoutJob::default();
                             let format = |c| egui::TextFormat::simple(font.clone(), c);
@@ -528,7 +530,9 @@ impl Console {
                                 }
                                 _ => {
                                     job.append(l.level.tag(), 0.0, format(color));
-                                    job.append(&format!(" {}: ", l.target), 0.0, format(visuals.weak_text_color()));
+                                    job.append(" ", 0.0, format(color));
+                                    job.append(&l.target, 0.0, format(visuals.weak_text_color()));
+                                    job.append(": ", 0.0, format(visuals.weak_text_color()));
                                     job.append(&l.message, 0.0, format(color));
                                 }
                             }
@@ -572,6 +576,22 @@ impl Console {
     }
 }
 
+/// Egui id of the console window.
+pub(crate) const CONSOLE_ID: &str = "space3d_console";
+
+/// Default place of the docked console window: bottom-left, 640 pt wide and 40 % of the screen
+/// height (140 to 360 pt), [`crate::tool::EDGE`] in from the edges.
+pub(crate) fn window_rect(screen: egui::Rect) -> egui::Rect {
+    let edge = crate::tool::EDGE;
+    let size = egui::vec2(
+        (screen.width() - 2.0 * edge).min(640.0),
+        (screen.height() * 0.4)
+            .clamp(140.0, 360.0)
+            .min(screen.height() - 2.0 * edge),
+    );
+    egui::Rect::from_min_size(egui::pos2(screen.left() + edge, screen.bottom() - edge - size.y), size)
+}
+
 /// `Stage::Update`: pull logs, run queued commands and draw the console window.
 pub(crate) fn console_system(sys: &mut SystemCtx) {
     let ctx = crate::EguiContext::active_context(sys);
@@ -586,21 +606,22 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
     {
         let mut open = true;
         let screen = ctx.content_rect();
-        let size = egui::vec2(
-            (screen.width() - 12.0).min(640.0),
-            (screen.height() * 0.4).clamp(140.0, 360.0).min(screen.height() - 12.0),
-        );
-        let pos = egui::pos2(6.0, (screen.bottom() - size.y - 6.0).max(6.0));
-        let (shown, total) = (c.shown().count(), c.lines.len());
+        let filter = c.filter.to_lowercase();
+        let (shown, total) = (c.shown(&filter).count(), c.lines.len());
         crate::tool::window(
             &ctx,
-            ("space3d_console", "Console"),
-            egui::Rect::from_min_size(pos, size),
+            crate::tool::ToolWindow {
+                id: CONSOLE_ID,
+                title: "Console",
+                anchor: egui::Align2::LEFT_BOTTOM,
+                size: window_rect(screen).size(),
+                fit_height: false,
+            },
             &mut open,
             |ui| {
                 ui.label(egui::RichText::new(format!("{shown}/{total} lines")).weak());
             },
-            |ui| c.ui(ui),
+            |ui, _| c.ui(ui),
         );
         if !open {
             c.visible = false;

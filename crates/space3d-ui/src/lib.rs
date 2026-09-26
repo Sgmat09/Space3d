@@ -195,7 +195,10 @@ impl Plugin for UiPlugin {
         });
         let keys = (self.debug_overlay_key, self.profiler_key, self.console_key);
         app.add_system_named(Stage::PreUpdate, "ui::hotkeys", move |sys| debug::hotkeys(sys, keys));
-        app.add_system_named(Stage::Update, "ui::debug_overlay", debug::debug_overlay_system);
+        let hint = debug::tool_keys_hint(self.profiler_key, self.console_key);
+        app.add_system_named(Stage::Update, "ui::debug_overlay", move |sys| {
+            debug::debug_overlay_system(sys, &hint);
+        });
         app.add_system_named(Stage::Update, "ui::profiler", profiler::profiler_system);
         app.add_system_named(Stage::Update, "ui::console", console::console_system);
         app.add_system_named(Stage::PostUpdate, "ui::end_frame", move |sys| {

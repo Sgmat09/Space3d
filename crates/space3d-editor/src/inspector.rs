@@ -6,7 +6,9 @@ use crate::components::{
     MeshSource, can_remove, component_values, ensure_stable_id, names, remove_component, set_component_value,
 };
 use crate::history::{EditCommand, EditorHistory};
-use crate::widgets::{fill_drag, fill_slider, icon_button, property, section, vec3_fields};
+use crate::widgets::{
+    fill_drag, fill_slider, icon_button, number_field, property, property_group, section, vec3_fields,
+};
 use space3d_core::glam::{EulerRot, Quat, Vec3, Vec4};
 use space3d_core::hecs::{Component, Entity, World};
 use space3d_core::{Name, Parent, Transform};
@@ -164,13 +166,13 @@ pub fn inspector_ui(
     }
     property(ui, "Entity", |ui| {
         ui.label(format!("#{}", e.id()));
-        ui.add(egui::Label::new(egui::RichText::new(id.to_string()).weak().small()).truncate())
+        ui.add(egui::Label::new(egui::RichText::new(id.to_string()).small()).truncate())
             .on_hover_text(id.to_string());
     });
     if let Ok(p) = world.get::<&Parent>(e).map(|p| p.0) {
         let pname = crate::components::display_name(world, p);
         let unparent = property(ui, "Parent", |ui| {
-            let clicked = ui.small_button("Unparent").clicked();
+            let clicked = ui.button("Unparent").clicked();
             ui.add(egui::Label::new(pname).truncate());
             clicked
         });
@@ -210,7 +212,7 @@ pub fn inspector_ui(
             fill_slider(ui, egui::Slider::new(&mut m.roughness, 0.0..=1.0))
         });
         r |= property(ui, "Emissive", |ui| color3_edit(ui, &mut m.emissive));
-        r |= property(ui, "Flags", |ui| {
+        r |= property_group(ui, "Flags", |ui| {
             ui.checkbox(&mut m.unlit, "Unlit")
                 | ui.checkbox(&mut m.double_sided, "2-sided")
                 | ui.checkbox(&mut m.alpha_blend, "Blend")
@@ -218,7 +220,7 @@ pub fn inspector_ui(
         if let Some(t) = m.base_color_texture {
             property(ui, "Texture", |ui| {
                 ui.label(format!("#{}", t.index()));
-                if ui.small_button("Clear").clicked() {
+                if ui.button("Clear").clicked() {
                     m.base_color_texture = None;
                 }
             });
@@ -253,7 +255,7 @@ pub fn inspector_ui(
 
     typed_section::<Camera3d>(ui, world, registry, history, e, id, "Camera", |ui, c| {
         let mut ortho = matches!(c.projection, Projection::Orthographic { .. });
-        let mut r = property(ui, "Projection", |ui| {
+        let mut r = property_group(ui, "Projection", |ui| {
             ui.selectable_value(&mut ortho, false, "Perspective") | ui.selectable_value(&mut ortho, true, "Ortho")
         });
         c.projection = match (ortho, c.projection) {
@@ -277,10 +279,12 @@ pub fn inspector_ui(
                 });
                 *fov_y = deg.to_radians();
                 r |= property(ui, "Near / far", |ui| {
-                    let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                    let h = ui.spacing().interact_size.y;
-                    ui.add_sized([w, h], egui::DragValue::new(near).speed(0.01).range(0.0001..=100.0))
-                        | ui.add_sized([w, h], egui::DragValue::new(far).speed(1.0).range(0.01..=1e6))
+                    pair(
+                        ui,
+                        egui::DragValue::new(near).speed(0.01).range(0.0001..=100.0),
+                        egui::DragValue::new(far).speed(1.0).range(0.01..=1e6),
+                        0,
+                    )
                 });
             }
             Projection::Orthographic { height, near, far } => {
@@ -288,10 +292,12 @@ pub fn inspector_ui(
                     fill_drag(ui, egui::DragValue::new(height).speed(0.1).range(0.01..=1e5))
                 });
                 r |= property(ui, "Near / far", |ui| {
-                    let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                    let h = ui.spacing().interact_size.y;
-                    ui.add_sized([w, h], egui::DragValue::new(near).speed(0.01))
-                        | ui.add_sized([w, h], egui::DragValue::new(far).speed(1.0))
+                    pair(
+                        ui,
+                        egui::DragValue::new(near).speed(0.01),
+                        egui::DragValue::new(far).speed(1.0),
+                        0,
+                    )
                 });
             }
         }
@@ -344,17 +350,19 @@ pub fn inspector_ui(
                     fill_drag(ui, egui::DragValue::new(radius).speed(0.01).range(0.001..=1e4))
                 });
                 r | property(ui, "Segments", |ui| {
-                    let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                    let h = ui.spacing().interact_size.y;
-                    ui.add_sized([w, h], egui::DragValue::new(sectors).range(3..=256).suffix(" sec"))
-                        | ui.add_sized([w, h], egui::DragValue::new(stacks).range(2..=256).suffix(" stk"))
+                    pair(
+                        ui,
+                        egui::DragValue::new(sectors).range(3..=256).suffix(" sec"),
+                        egui::DragValue::new(stacks).range(2..=256).suffix(" stk"),
+                        4,
+                    )
                 })
             }
             MeshSource::Data(m) => property(ui, "Data", |ui| {
                 ui.label(format!("{} verts · {} tris", m.vertex_count(), m.triangle_count()))
             }),
         };
-        property(ui, "Kind", |ui| ui.label(egui::RichText::new(kind).weak()));
+        property(ui, "Kind", |ui| ui.label(kind));
         Some(r)
     });
 
@@ -416,7 +424,7 @@ fn json_sections(
             |ui| {
                 let remove =
                     can_remove(&name) && current.is_some() && icon_button(ui, "×", &format!("Remove {name}")).clicked();
-                let edit = !editing && current.is_some() && ui.small_button("Edit JSON").clicked();
+                let edit = !editing && current.is_some() && ui.button("Edit JSON").clicked();
                 (remove, edit)
             },
             |ui| {
@@ -520,33 +528,40 @@ fn add_component_ui(
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let add_width = 36.0;
-        egui::ComboBox::from_id_salt("space3d_add_component")
-            .width(ui.available_width() - add_width - ui.spacing().item_spacing.x - ui.spacing().icon_width)
-            .selected_text(if state.add_pick.is_empty() {
-                "Add component..."
-            } else {
-                &state.add_pick
-            })
-            .show_ui(ui, |ui| {
-                for o in &options {
-                    ui.selectable_value(&mut state.add_pick, o.clone(), o);
+        // "Add" at the right end, the combo box fills the rest of the row.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let add = ui.add_enabled(!state.add_pick.is_empty(), egui::Button::new("Add"));
+            egui::ComboBox::from_id_salt("space3d_add_component")
+                .width(ui.available_width())
+                .selected_text(if state.add_pick.is_empty() {
+                    "Add component..."
+                } else {
+                    &state.add_pick
+                })
+                .show_ui(ui, |ui| {
+                    for o in &options {
+                        ui.selectable_value(&mut state.add_pick, o.clone(), o);
+                    }
+                });
+            if add.clicked() {
+                let name = std::mem::take(&mut state.add_pick);
+                if insert_default(world, e, &name) {
+                    let after = component_values(world, registry, e).and_then(|v| v.get(&name).cloned());
+                    history.push(EditCommand::set_json(format!("Add {name}"), id, name, None, after));
+                } else {
+                    // Unknown type: let the user write its JSON value.
+                    state.json_edits.insert(name, "{}".into());
                 }
-            });
-        if ui
-            .add_enabled(!state.add_pick.is_empty(), egui::Button::new("Add"))
-            .clicked()
-        {
-            let name = std::mem::take(&mut state.add_pick);
-            if insert_default(world, e, &name) {
-                let after = component_values(world, registry, e).and_then(|v| v.get(&name).cloned());
-                history.push(EditCommand::set_json(format!("Add {name}"), id, name, None, after));
-            } else {
-                // Unknown type: let the user write its JSON value.
-                state.json_edits.insert(name, "{}".into());
             }
-        }
+        });
     });
+}
+
+/// Two drag values sharing the rest of the line in equal cells (`affix`: characters of the
+/// longer prefix / suffix).
+fn pair(ui: &mut egui::Ui, a: egui::DragValue<'_>, b: egui::DragValue<'_>, affix: usize) -> egui::Response {
+    let width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).floor();
+    number_field(ui, width, a, affix, None) | number_field(ui, width, b, affix, None)
 }
 
 #[cfg(test)]

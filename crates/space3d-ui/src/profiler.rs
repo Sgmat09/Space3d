@@ -312,8 +312,14 @@ impl Profiler {
 
     /// Draw the profiler contents into `ui`: a toolbar, then collapsible "Timeline" (the last
     /// frame's systems, flame style) and "Systems" (a striped table sorted by average time,
-    /// numbers right-aligned) sections.
+    /// numbers right-aligned, scrolling by whole rows within the space left in `ui`) sections.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let bottom = ui.available_rect_before_wrap().bottom();
+        self.ui_until(ui, bottom);
+    }
+
+    /// [`Self::ui`] with the table ending above screen y `max_bottom`.
+    fn ui_until(&mut self, ui: &mut egui::Ui, max_bottom: f32) {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.frozen, "Freeze");
             let mut on = is_enabled();
@@ -340,7 +346,7 @@ impl Profiler {
         egui::CollapsingHeader::new(format!("Systems ({})", self.stats.len()))
             .id_salt("space3d_profiler_systems")
             .default_open(true)
-            .show(ui, |ui| self.table_ui(ui));
+            .show(ui, |ui| self.table_ui(ui, max_bottom));
     }
 
     /// One-line summary of the shown frame (time, span count, frozen), as in the F4 window's
@@ -391,48 +397,146 @@ impl Profiler {
         }
     }
 
-    fn table_ui(&self, ui: &mut egui::Ui) {
+    /// The systems table: a header row, then one row per system (scrolling by whole rows so no
+    /// row is ever cut) ending above screen y `max_bottom`. Columns fill the width: a bar of the
+    /// average time, the name (truncated, full name on hover) and right-aligned numbers.
+    fn table_ui(&self, ui: &mut egui::Ui, max_bottom: f32) {
         let max = self.stats.first().map_or(1.0, |s| s.avg_ms.max(1e-6));
-        let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 2.0;
-        let number = |ui: &mut egui::Ui, text: String| {
-            ui.label(egui::RichText::new(text).monospace());
-        };
-        egui::ScrollArea::vertical()
-            .id_salt("space3d_profiler_scroll")
-            .max_height(ui.available_height().max(120.0))
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                egui::Grid::new("space3d_profiler_table")
-                    .striped(true)
-                    .num_columns(5)
-                    .min_row_height(row_height)
-                    .spacing([10.0, 0.0])
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("system").weak());
-                        for h in ["    avg", "   last", "    max", "calls"] {
-                            ui.label(egui::RichText::new(h).monospace().weak());
+        let mono = egui::TextStyle::Monospace.resolve(ui.style());
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        let (pitch, digit) = ui.fonts_mut(|f| {
+            (
+                (f.row_height(&mono).max(f.row_height(&body)) + 3.0).round(),
+                f.glyph_width(&mono, '0'),
+            )
+        });
+        let columns = TableColumns::new(digit);
+        let visuals = ui.visuals().clone();
+        let text = visuals.text_color();
+
+        let (header, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), pitch), egui::Sense::hover());
+        let painter = ui.painter();
+        let x = columns.xs(header);
+        let y = header.center().y;
+        painter.text(
+            egui::pos2(x.name, y),
+            egui::Align2::LEFT_CENTER,
+            "system",
+            body.clone(),
+            text,
+        );
+        for (right, h) in [(x.avg, "avg"), (x.last, "last"), (x.max, "max"), (x.calls, "calls")] {
+            painter.text(egui::pos2(right, y), egui::Align2::RIGHT_CENTER, h, mono.clone(), text);
+        }
+        painter.hline(
+            header.x_range(),
+            header.bottom() - 0.5,
+            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        );
+
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let rows = self.stats.len();
+            let room = (max_bottom - ui.cursor().top()).max(pitch);
+            let shown = ((room / pitch).floor() as usize).clamp(1, rows.max(1));
+            egui::ScrollArea::vertical()
+                .id_salt("space3d_profiler_scroll")
+                .max_height(shown as f32 * pitch)
+                .auto_shrink([false, true])
+                .show_rows(ui, pitch, rows, |ui, range| {
+                    for i in range {
+                        let s = &self.stats[i];
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(ui.available_width(), pitch), egui::Sense::hover());
+                        let painter = ui.painter();
+                        if i % 2 == 1 {
+                            painter.rect_filled(rect, 0.0, visuals.faint_bg_color);
                         }
-                        ui.end_row();
-                        for s in &self.stats {
-                            ui.horizontal(|ui| {
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(36.0, 6.0), egui::Sense::hover());
-                                let frac = (s.avg_ms / max) as f32;
-                                ui.painter().rect_filled(r, 1.0, egui::Color32::from_white_alpha(12));
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_size(r.min, egui::vec2(r.width() * frac, r.height())),
-                                    1.0,
-                                    name_color(&s.name),
-                                );
-                                ui.label(short_name(&s.name)).on_hover_text(&*s.name);
-                            });
-                            number(ui, format!("{:>7.3}", s.avg_ms));
-                            number(ui, format!("{:>7.3}", s.last_ms));
-                            number(ui, format!("{:>7.3}", s.max_ms));
-                            number(ui, format!("{:>5}", s.calls));
-                            ui.end_row();
+                        let x = columns.xs(rect);
+                        let y = rect.center().y;
+                        let bar = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + 2.0, y - 3.0),
+                            egui::vec2(columns.bar, 6.0),
+                        );
+                        let frac = (s.avg_ms / max).clamp(0.0, 1.0) as f32;
+                        painter.rect_filled(bar, 1.0, egui::Color32::from_white_alpha(12));
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * frac, bar.height())),
+                            1.0,
+                            name_color(&s.name),
+                        );
+                        let mut job = egui::text::LayoutJob::single_section(
+                            short_name(&s.name).to_owned(),
+                            egui::TextFormat::simple(body.clone(), text),
+                        );
+                        job.wrap = egui::text::TextWrapping::truncate_at_width((x.name_end - x.name).max(8.0));
+                        let galley = ui.fonts_mut(|f| f.layout_job(job));
+                        painter.galley(egui::pos2(x.name, y - galley.size().y / 2.0), galley, text);
+                        for (right, value) in [
+                            (x.avg, format!("{:.3}", s.avg_ms)),
+                            (x.last, format!("{:.3}", s.last_ms)),
+                            (x.max, format!("{:.3}", s.max_ms)),
+                            (x.calls, s.calls.to_string()),
+                        ] {
+                            painter.text(
+                                egui::pos2(right, y),
+                                egui::Align2::RIGHT_CENTER,
+                                value,
+                                mono.clone(),
+                                text,
+                            );
                         }
-                    });
-            });
+                        response.on_hover_ui(|ui| {
+                            ui.label(&*s.name);
+                        });
+                    }
+                });
+        });
+    }
+}
+
+/// Column layout of the profiler table (widths from the monospace digit width).
+struct TableColumns {
+    bar: f32,
+    number: f32,
+    calls: f32,
+    gap: f32,
+}
+
+/// Screen x of the table's columns in a row: where the name starts and must end, and the right
+/// edges of the right-aligned number columns.
+struct ColumnXs {
+    name: f32,
+    name_end: f32,
+    avg: f32,
+    last: f32,
+    max: f32,
+    calls: f32,
+}
+
+impl TableColumns {
+    fn new(digit: f32) -> Self {
+        Self {
+            bar: 28.0,
+            number: (digit * 8.0).ceil(),
+            calls: (digit * 5.0).ceil(),
+            gap: 8.0,
+        }
+    }
+
+    fn xs(&self, row: egui::Rect) -> ColumnXs {
+        let calls = row.right() - 2.0;
+        let max = calls - self.calls - self.gap;
+        let last = max - self.number - self.gap;
+        let avg = last - self.number - self.gap;
+        ColumnXs {
+            name: row.left() + 2.0 + self.bar + 6.0,
+            name_end: avg - self.number - self.gap,
+            avg,
+            last,
+            max,
+            calls,
+        }
     }
 }
 
@@ -458,6 +562,7 @@ fn short_name(name: &str) -> &str {
 /// `Stage::Update`: pull timings and draw the window.
 pub(crate) fn profiler_system(sys: &mut SystemCtx) {
     let ctx = crate::EguiContext::active_context(sys);
+    let console_open = sys.resources.get::<crate::Console>().is_some_and(|c| c.visible);
     let Some(p) = sys.resources.get_mut::<Profiler>() else {
         return;
     };
@@ -466,24 +571,58 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
     if !p.visible {
         return;
     }
-    let screen = ctx.content_rect();
-    let size = egui::vec2(screen.width().min(440.0) - 12.0, 300.0f32.min(screen.height() - 12.0));
-    let pos = egui::pos2((screen.right() - size.x - 6.0).max(6.0), 6.0);
+    let size = window_size(&ctx, console_open);
     let summary = p.summary();
     let mut open = true;
     crate::tool::window(
         &ctx,
-        ("space3d_profiler", "Profiler"),
-        egui::Rect::from_min_size(pos, size),
+        crate::tool::ToolWindow {
+            id: PROFILER_ID,
+            title: "Profiler",
+            anchor: egui::Align2::RIGHT_TOP,
+            size,
+            fit_height: true,
+        },
         &mut open,
         |ui| {
             ui.label(egui::RichText::new(summary).weak());
         },
-        |ui| p.ui(ui),
+        |ui, max_bottom| p.ui_until(ui, max_bottom),
     );
     if !open {
         p.visible = false;
     }
+}
+
+const PROFILER_ID: &str = "space3d_profiler";
+
+/// Largest size of the profiler window (docked top-right): 440 pt wide and 45 % of the screen
+/// height (at least 300 pt), but never down into the console when the console is open below it
+/// (at its default place, or wherever the user moved it).
+fn window_size(ctx: &egui::Context, console_open: bool) -> egui::Vec2 {
+    let edge = crate::tool::EDGE;
+    let screen = ctx.content_rect();
+    let width = 440.0f32.min(screen.width() - 2.0 * edge);
+    let (profiler, console) = ctx.memory(|m| {
+        (
+            m.area_rect(egui::Id::new(PROFILER_ID)),
+            m.area_rect(egui::Id::new(crate::console::CONSOLE_ID)),
+        )
+    });
+    let profiler = profiler.unwrap_or_else(|| {
+        egui::Rect::from_min_size(
+            egui::pos2(screen.right() - edge - width, screen.top() + edge),
+            egui::vec2(width, 0.0),
+        )
+    });
+    let mut height = (screen.height() * 0.45).max(300.0).min(screen.height() - 2.0 * edge);
+    if console_open {
+        let console = console.unwrap_or_else(|| crate::console::window_rect(screen));
+        if console.x_range().intersects(profiler.x_range()) && console.top() > profiler.top() {
+            height = height.min(console.top() - edge - profiler.top());
+        }
+    }
+    egui::vec2(width, height.max(90.0))
 }
 
 #[cfg(test)]

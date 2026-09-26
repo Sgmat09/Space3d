@@ -16,13 +16,14 @@ per point — and it is strictly **opt-in**:
 app.insert_resource(space3d_ui::UiTheme::compact()); // space3d::ui::UiTheme with the facade
 ```
 
-* **Without the resource nothing changes.** The engine never writes egui's `Style` unless a
-  `UiTheme` resource exists: an app that does not opt in renders exactly as before, pixel for
-  pixel.
+* **Without the resource the app's UI does not change.** The engine never writes egui's `Style`
+  unless a `UiTheme` resource exists: the UI of an app that does not opt in renders exactly as
+  before, pixel for pixel. (The engine's own F3 / F4 / console tools are not the app's UI: they
+  have their own compact look in every app, see [In-game tools](#in-game-tools).)
 * **Applied once, between passes.** `UiPlugin` applies the theme when the resource is inserted or
   changed, right before the next egui pass begins, to both the dark and the light style. In every
-  other frame it costs one comparison and no allocation (`UiThemeSync`); there is no per-frame
-  style churn.
+  other frame it costs one comparison and no allocation (`UiThemeSync`; tokens compare bit for
+  bit, so even a NaN token counts as unchanged); there is no per-frame style churn.
 * **Sizes only.** The theme writes the tokens below. Colors, fonts (families), shadows, animation
   time and every other `Style` field keep the values the context has, so the preset also works
   on top of a game's own look.
@@ -87,11 +88,28 @@ The pure functions are public too: `compact_style(&base, &density) -> egui::Styl
 ### How much denser
 
 `ThemePreview` is a representative tool panel (menu bar, toolbar, buttons, checkbox, slider,
-combo box, text field, a collapsing section and a 10-row striped table). With the compact
-preset it takes **338 × 374 pt instead of 486 × 420 pt — 61.9 % of the area** — with every
-widget whole, no text wrapped or clipped and every control at least 18 pt tall
-(`crates/space3d-ui/tests/theme.rs`). The stories `Engine/UI/Theme/Default` and
-`Engine/UI/Theme/Compact` show the same panel side by side.
+combo box, text field, a collapsing section and a 10-row striped table). Its width is that of its
+"Space [combo] Name [text field]" row at the style's default widths (`ThemePreview::panel_width`),
+and every other row fills it: the slider rail, the transform fields and the table's columns
+(numbers and their headers right-aligned). With the compact preset it takes **338 × 354 pt
+instead of 487 × 390 pt — 63.1 % of the area** — with every widget whole, no text wrapped or
+clipped and every control at least 18 pt tall (`crates/space3d-ui/tests/theme.rs`). The stories
+`Engine/UI/Theme/Default` and `Engine/UI/Theme/Compact` show the same panel side by side, each in
+an `egui::Window`.
+
+### Window width
+
+The theme holds sizes of egui's `Style`; the width of a window is not one of them. An
+`egui::Window` is **340 pt wide by default whatever it holds** (its contents fill that width), so
+a small game window ("Cargo hold: 12 t [Jettison]") keeps a lot of empty space under any theme.
+Size game windows explicitly:
+
+* `.auto_sized()`: the window takes the width of its contents. Give the contents a width
+  (`ui.set_width(..)`, fixed-width widgets): widgets that fill the available width — separators,
+  right-to-left rows, `TextEdit::desired_width(f32::INFINITY)` — stretch an auto-sized window to
+  the screen edge (its first frame spans the screen, so pin it with `fixed_pos` or keep it clear
+  of the edges);
+* or `.default_width(w)` (with `.resizable(false)` for a fixed width).
 
 ### Games that style egui themselves
 
@@ -107,21 +125,34 @@ its own colors and fonts, it has two options:
 ## In-game tools
 
 The debug overlay (**F3**), profiler (**F4**) and console (**`**) show up inside games, so they
-never read their sizes from the global style and never change it. Each applies the compact
-density to its own `Ui` only, keeps the context's colors, and draws its own compact header (egui's
-title bar height follows the global heading size). They look the same under egui's default, the
-compact theme or a game's roomy style (story `Engine/UI/Tools/Game Style`).
+never read their sizes from the global style and never change it. They are the engine's tools,
+not the app's UI: they are compact **in every app**, with or without a `UiTheme`. Each applies
+the compact density to its own `Ui` only (one cached copy of the style, not one per frame), keeps
+the context's colors, and draws its own compact header (egui's title bar height follows the
+global heading size). Their size and layout are the same under egui's default, the compact theme
+or a game's roomy style; only the window fill and stroke follow the game's colors (story
+`Engine/UI/Tools/Game Style`, `crates/space3d-ui/tests/tools.rs`).
+
+The profiler docks to the top-right corner and the console to the bottom-left, 6 pt in from the
+screen edges (and from each other), and never grow with their contents. The profiler is exactly as
+tall as its contents, up to 45 % of the screen height (at least 300 pt) and never down into the
+open console; its table scrolls by whole rows (no row is ever cut) with a scroll bar that stays
+visible while rows are hidden. The console is 640 × 40 % of the screen (140–360 pt) and wraps long
+lines (paths, backtraces) instead of widening.
 
 * **Debug overlay** (`DebugOverlay`): a small panel at the top-left that never takes the pointer —
   FPS, average and worst frame time, a sparkline of the last 240 frames (60 / 30 Hz guides), and a
   monospace grid of label/value pairs with right-aligned numbers: frame, tick, rate, dropped
   ticks, entities, alpha, draws, triangles, drawn instances, uploaded bytes, egui primitives and
-  vertices. `DebugOverlay::details` (console: `debug details`) adds the draw path, indirect / multi
-  draws, batches, views, culled instances and instance bytes.
+  vertices; the last line names the other tools' keys. `DebugOverlay::details` (console:
+  `debug details`) adds the draw path, indirect / multi draws, batches, views, culled instances
+  and instance bytes.
 * **Profiler** (`Profiler`): header with the last frame's time, span count and a close button;
   Freeze / Timing toggles; collapsible *Timeline* (flame view) and *Systems* (striped table sorted
-  by average time, numbers right-aligned) sections. `Profiler::record(FrameTimeline)` aggregates
-  frames from other sources (recordings, replays, tests).
+  by average time: a bar of the average, the name — truncated, full name on hover — and
+  right-aligned avg / last / max / calls columns under a fixed header) sections.
+  `Profiler::record(FrameTimeline)` aggregates frames from other sources (recordings, replays,
+  tests).
 * **Console** (`Console`): level / filter / clear toolbar, one dense monospace line per entry and
   the command line. `Console::capture_logs = false` keeps only the console's own lines (command
   output and `Console::print`).
@@ -129,11 +160,18 @@ compact theme or a game's roomy style (story `Engine/UI/Tools/Game Style`).
 ## Engine tools
 
 `run_editor` / `editor_app` and `run_storybook` / `storybook_app` insert `UiTheme::compact()`
-themselves. Their panels use property rows (a label column and the value on one line, shared by
-every section so values align), collapsible component sections with header actions (remove,
-edit JSON), fields that fill the row, and panel margins from the style. `EditorPlugin` added to a
-game does **not** insert the theme: the game's style stays as it is (insert the theme yourself to
-get the same density).
+themselves. Their panels use property rows (a label column in the normal text color and the value
+on one line, shared by every section so values align), collapsible component sections with header
+actions (remove, edit JSON), and panel margins from the style. Rows never ask for more than the
+panel's width, under any style or density: sliders get a fixed-width value box (the same in every
+row, so the boxes line up) and the rail takes the rest; x / y / z and paired fields split the row
+into equal cells (axis color bars instead of "x " prefixes) and drop decimals before they would
+widen it; groups of checkboxes or buttons wrap within the value column. The side panels keep
+their width frame after frame and whatever is selected (hierarchy 160–400 pt, inspector 220–480
+pt), their scroll bars stay visible while content is hidden, and buttons (the section "×"
+included) are at least 18 pt tall. `EditorPlugin` added to a game does **not** insert the theme:
+the game's style stays as it is (insert the theme yourself to get the same density), and its
+panels still keep their width.
 
 ## Stories and tests
 
@@ -144,6 +182,8 @@ goldens in `crates/space3d-stories/tests/__screenshots__/Engine/UI/`. The tool s
 `style` knob (egui default, compact theme, roomy game style).
 
 Tests: `crates/space3d-ui/tests/theme.rs` (density, default path untouched, applied once, never
-fights a game's style), `crates/space3d-ui/tests/alloc_free.rs` (no allocation while the theme is
-unchanged or absent) and the editor's
-`standalone_tools_are_compact_and_the_plugin_keeps_a_games_style`.
+fights a game's style), `crates/space3d-ui/tests/tools.rs` (docked tools stay inside the screen and
+apart at several sizes and scale factors, never grow, same geometry under a game's style),
+`crates/space3d-ui/tests/alloc_free.rs` (no allocation while the theme is unchanged or absent) and
+the editor's `standalone_tools_are_compact_and_the_plugin_keeps_a_games_style` and
+`editor_panels_keep_their_width_under_any_style`.

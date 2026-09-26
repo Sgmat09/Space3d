@@ -8,7 +8,7 @@
 //! resolution; only the on-screen copy is downscaled.
 
 use crate::files::{IoJobs, read_file_with, write_file_with};
-use crate::widgets::{fill_drag, fill_slider, property, section};
+use crate::widgets::{fill_drag, fill_slider, property, property_group, section};
 use space3d_assets::edit::texture::{self as tex, Blur, Brush, Filter, ImageEditHistory, Rect as PxRect};
 use space3d_core::ImageData;
 use space3d_tasks::Task;
@@ -539,7 +539,7 @@ impl TextureEditor {
         egui::Window::new("Texture editor")
             .id(egui::Id::new("space3d_texture_editor"))
             .open(&mut open)
-            .default_size([760.0, 500.0])
+            .default_size([760.0, 560.0])
             .show(ctx, |ui| self.contents(ui));
         self.open = open;
     }
@@ -559,6 +559,7 @@ impl TextureEditor {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(200.0);
+                crate::widgets::visible_scroll_bars(ui);
                 egui::ScrollArea::vertical().id_salt("tex_tools").show(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| self.side_panel(ui));
                 });
@@ -602,12 +603,23 @@ impl TextureEditor {
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for t in TextureTool::ALL {
-                ui.selectable_value(&mut self.tool, t, t.label());
-            }
-        });
+        // Tool toggles in equal cells, three per row.
+        let gap = 2.0;
+        let cell = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+        for row in TextureTool::ALL.chunks(3) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for &t in row {
+                    let size = egui::vec2(cell, ui.spacing().interact_size.y);
+                    if ui
+                        .add_sized(size, egui::Button::selectable(self.tool == t, t.label()))
+                        .clicked()
+                    {
+                        self.tool = t;
+                    }
+                }
+            });
+        }
         property(ui, "Color", |ui| {
             ui.color_edit_button_srgba_unmultiplied(&mut self.color)
         });
@@ -625,7 +637,7 @@ impl TextureEditor {
         });
         property(ui, "Rect", |ui| ui.checkbox(&mut self.rect_filled, "filled"));
         property(ui, "Zoom", |ui| {
-            let fit = ui.small_button("Fit").clicked();
+            let fit = ui.button("Fit").clicked();
             fill_slider(ui, egui::Slider::new(&mut self.zoom, 0.05..=32.0).logarithmic(true));
             if fit {
                 self.fit_pending = true;
@@ -686,7 +698,7 @@ impl TextureEditor {
             |_| {},
             |ui| {
                 property(ui, "Blur σ", |ui| {
-                    let blur = ui.small_button("Blur").clicked();
+                    let blur = ui.button("Blur").clicked();
                     fill_slider(ui, egui::Slider::new(&mut a.blur_sigma, 0.3..=16.0));
                     if blur {
                         let s = a.blur_sigma;
@@ -695,32 +707,32 @@ impl TextureEditor {
                         }));
                     }
                 });
-                property(ui, "Resize", |ui| {
+                property_group(ui, "Resize", |ui| {
                     ui.add(egui::DragValue::new(&mut a.resize[0]).range(1..=8192));
                     ui.add(egui::DragValue::new(&mut a.resize[1]).range(1..=8192));
-                    if ui.small_button("Apply").clicked() {
+                    if ui.button("Apply").clicked() {
                         let [w, h] = a.resize;
                         op = Some(Box::new(move |e| {
                             e.replace_async("Resize", move |i| tex::resize(i, w, h, Filter::Bilinear))
                         }));
                     }
                 });
-                property(ui, "Flip", |ui| {
-                    if ui.small_button("H").clicked() {
+                property_group(ui, "Flip", |ui| {
+                    if ui.button("H").clicked() {
                         op = Some(Box::new(|e| e.apply_async("Flip horizontal", tex::flip_horizontal)));
                     }
-                    if ui.small_button("V").clicked() {
+                    if ui.button("V").clicked() {
                         op = Some(Box::new(|e| e.apply_async("Flip vertical", tex::flip_vertical)));
                     }
                 });
-                property(ui, "Rotate", |ui| {
-                    if ui.small_button("90° ⟳").clicked() {
+                property_group(ui, "Rotate", |ui| {
+                    if ui.button("90° ⟳").clicked() {
                         op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate90_cw)));
                     }
-                    if ui.small_button("90° ⟲").clicked() {
+                    if ui.button("90° ⟲").clicked() {
                         op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate90_ccw)));
                     }
-                    if ui.small_button("180°").clicked() {
+                    if ui.button("180°").clicked() {
                         op = Some(Box::new(|e| e.replace_async("Rotate", tex::rotate180)));
                     }
                 });
