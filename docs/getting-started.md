@@ -25,7 +25,7 @@ Options: `--space3d-path <checkout>` (use a local engine checkout instead of git
 
 ```text
 my_game/
-├── Cargo.toml            space3d dependency, profiles, workspace with mobile/
+├── Cargo.toml            space3d dependency, epaint patch, profiles, workspace with mobile/
 ├── src/lib.rs            the game: `build(app)` + `GamePlugin`
 ├── src/main.rs           space3d::main!(my_game::build)
 ├── src/stories.rs        storybook
@@ -130,7 +130,11 @@ list their own unbuilt optional dependencies: with `physics`, nalgebra and parry
 ## 7. Updating Space3d
 
 Space3d is consumed by git revision. After bumping the pinned `rev`, run `cargo update -p space3d`
-(or `cargo update`). Space3d always tracks the latest stable release of its dependencies, so a
+(or `cargo update`). Bump the `rev` of the `[patch.crates-io] epaint` entry with it: it gives
+egui Space3d's Chinese and Japanese line breaking, and only applies while it comes from the same
+Space3d revision (a game created before it existed adds it by hand, see
+[UI: Chinese and Japanese line breaking](ui.md#chinese-and-japanese-line-breaking-kinsoku);
+`space3d doctor` warns when it is missing or unused). Space3d always tracks the latest stable release of its dependencies, so a
 consumer lockfile pinned to an older version can fail to resolve, e.g. `space3d-net` needs
 `hyper-util ^0.1.21` ("failed to select a version for `hyper-util`"): update that crate too —
 `cargo update -p hyper-util` — or simply `cargo update`.
@@ -138,4 +142,4 @@ consumer lockfile pinned to an older version can fail to resolve, e.g. `space3d-
 ## Next
 
 * [Testing](testing.md) · [Storybook](storybook.md) · [Platforms](platforms.md) ·
-  [Networking](networking.md) · [Performance](performance.md)
+  [UI](ui.md) · [Networking](networking.md) · [Performance](performance.md)

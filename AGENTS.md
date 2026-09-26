@@ -26,6 +26,10 @@ Rust cross-platform game engine (desktop, web/wasm, Android, iOS). Cargo workspa
    (`SPACE3D_HEADLESS=1`, `RenderPlugin::headless`) whenever a window isn't needed.
 8. `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
    must pass.
+9. **Patched crates live in `third_party/`** (`[patch.crates-io]`, not workspace members):
+   `epaint` carries kinsoku line breaking for Chinese and Japanese. After an egui bump run
+   `python3 scripts/update-epaint.py`; after editing `third_party/epaint`, `--refresh` the patch
+   (`third_party/README.md`).
 
 ## Crate map
 | crate | role |

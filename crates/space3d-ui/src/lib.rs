@@ -40,6 +40,10 @@
 //!   preset's [`UiDensity`] tokens (spacing, control and text sizes, corner radii) to egui's
 //!   style once, before the next pass; without a [`UiTheme`] resource the engine never touches
 //!   egui's `Style`.
+//! * Chinese and Japanese text wraps by the kinsoku rules (no line starts with 、。，」）？ or a
+//!   small kana, none ends with 「（): Space3d builds egui with a patched `epaint`
+//!   (`third_party/epaint`); a game gets it with the same `[patch.crates-io]` line — see
+//!   `docs/ui.md`, "Chinese and Japanese line breaking".
 //!
 //! Headless determinism: with [`UiPlugin::deterministic`] (fixed `pixels_per_point`, no
 //! animations, no dithering) and egui time taken from [`space3d_core::Time`], the same inputs
