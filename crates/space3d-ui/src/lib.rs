@@ -11,6 +11,10 @@
 //!   headless target — so UI shows up in `render_to_image` screenshots.
 //! * [`UiAppExt::add_ui_system`] registers `|ctx: &egui::Context, sys: &mut SystemCtx|` UI code;
 //!   [`UiAppExt::add_root_ui_system`] gets the frame's root [`egui::Ui`] for panels.
+//! * egui plugins get their pass hooks (`on_begin_pass` before the UI systems, `on_end_pass`
+//!   after them), which egui itself only runs from `Context::run_ui`: the built-in ones (label
+//!   text selection, drag-and-drop, `egui::debug_text`) and those added with
+//!   [`EguiContext::add_plugin`].
 //! * Debug overlay (**F3**, [`DebugOverlay`]): FPS, frame-time graph, tick / tick rate /
 //!   dropped ticks, [`space3d_render::RenderStats`] and entity count.
 //! * Profiler (**F4**, [`Profiler`]): per-system timings aggregated from the core's `system`
