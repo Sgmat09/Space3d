@@ -518,3 +518,26 @@ and `... forward_full_screen_gate`.
 Memory (not a gate): a radiance cube is `faces² × 6 × 4/3` texels at 4 B (sRGB) or 8 B
 (`Rgba16Float`): a 1024² LDR sky 33.6 MB, the stories' 512² HDR nebula 16.8 MB; an environment at
 the defaults 4.2 MB (256² × 6 faces × 6 mips + 32² irradiance, `Rgba16Float`); the BRDF LUT 16 KiB.
+
+### P-MAT PM5 / PM6 — directional shadow, hardening
+
+Dev machine (M4 Max, Metal), release, frames back to back; load averages 4–9. Commands:
+`cargo test -p space3d-render --release --test shadows -- --ignored --nocapture shadow_map_gate`,
+`cargo test -p space3d-render --release --test environment -- --ignored --nocapture forward_full_screen_gate`,
+`cargo bench -p space3d-render --bench materials`.
+
+| gate / measurement | measured | status |
+|---|---|---|
+| shadow 2048², 100k instanced casters ≤ 0.30 ms (`shadow` GPU scope; 100k cube entities — one instanced batch — on a 400 × 400 field, all inside the map, `ShadowFit::top_down`, PCF9; median of 120 frames) | **0.276 ms** (min 0.27, 3 runs) on `GpuMultiDraw` | met |
+| the same cubes from one explicit `InstanceBuffer<InstanceCompact>` (recorded) | 0.66 ms; its camera `scene` pass is slower by the same factor (0.94 vs 0.63 ms), with a matrix layout too (0.63 ms), on `CpuDirect` more so (1.46 ms) | recorded: explicit buffers draw about 2.4× slower than the ECS buffer in every pass, shadow or not — a finding for the instancing code, not the shadow |
+| forward full-screen lit pixels, all maps + IBL + PCF9 vs today's shader ≤ +0.20 ms (as in PM4, plus the sun's 2048² shadow with the 9-tap filter on every pixel) | `scene` 0.169 → 0.288 ms; median paired difference **+0.119 ms** (2 runs identical) | met (the first PCF version, a loop over dynamically indexed vectors, cost +0.24 ms; the unrolled kernels +0.03 ms over PM4) |
+| ECS 100k static PBR entities ≤ 2.5 ms (`materials/ecs_pbr/100k`) | 2.27 ms | met |
+| shadow view CPU at 100k ECS (`materials/shadow_view/ecs{,_off}/100k`: the render stage with and without the shadow, camera seeing 4.7k of 100k cubes) | `CpuDirect` 1.59 → 2.00 ms (**+0.40 ms**: the depth view culls every caster on the CPU like a camera); best path (`GpuMultiDraw`) 1.64 → 1.74 ms (**+0.10 ms**, no extra dispatch) | design budget +0.4 ms: met |
+| the same with one explicit 100k-instance buffer (`…/explicit{,_off}/100k`, `CpuDirect`) | 0.31 → 0.48 ms (+0.17 ms) | recorded |
+| steady-state allocations with PM1–PM5 in use (`tests/alloc_materials.rs`: + the sun's shadow, refitted every frame to the moving camera, alpha-masked casters) | 151 per frame on `CpuDirect`, 266 on the GPU culling paths, constant; live bytes +0 over 90 frames. With the shadow's `strength` at 0 (light picked, pipelines specialized, no depth view) exactly PM4's 114 / 208: the lighting's per-frame work allocates nothing, the depth pass and its draws are wgpu's 37 / 58 | bound 165 / 290 |
+| still scene with a shadow (`static_scene_uploads_nothing_with_shadows`, MSAA 4) | 0 bytes uploaded, 0 textures created, 0 reallocations, identical frames; a new `map_size` creates one texture | met |
+| engine goldens (`engine_goldens_are_exact`) | exact (without a casting light `S3D_SHADOW_TAPS` is 0 and the shadow code is compiled out) | met |
+
+Memory: a shadow map is `map_size²` × 4 B (`Depth32Float`): 16.8 MB at 2048², 4.2 MB at 1024²,
+plus one render pass per frame (≈ 2.8 MB of Metal driver memory per frame in flight, see "F7 /
+F8 and M1.1").

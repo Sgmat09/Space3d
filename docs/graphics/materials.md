@@ -1,4 +1,4 @@
-# Materials and lighting: maps, blend modes, glTF import, skybox, image-based lighting
+# Materials and lighting: maps, blend modes, glTF import, skybox, image-based lighting, shadows
 
 `Material` renders lit or unlit surfaces with a base color, metallic/roughness, emissive and — since
 the graphics upgrade — normal, metallic-roughness, occlusion and emissive maps, five blend modes,
@@ -6,7 +6,8 @@ per-material UV transforms and a second UV set. glTF models "just light up": eve
 material slot is read and converted. The normative design is
 [`docs/design/graphics.md`](../design/graphics.md) §2.2.8, §2.2.9, §2.4 and §5.2 (P-MAT); this page
 covers milestones PM1 (blend modes and maps), PM2 (glTF import and tangents), PM3 (cubemaps and the
-skybox) and PM4 (image-based lighting). Shadows (PM5) come next.
+skybox), PM4 (image-based lighting), PM5 (the directional shadow) and PM6 (prewarm, budgets, the
+example). `examples/pbr_showcase` puts everything together in the game's top-down view.
 
 A material without maps, with `BlendMode::Opaque` (or the legacy `alpha_blend`), renders exactly —
 bit for bit — as before the upgrade: every map sits behind a uniform flag, and new settings default
@@ -212,6 +213,75 @@ Stories: `Engine/Environment/IBL Spheres` (gold and red rows, roughness 0 → 1,
 photo studio or the nebula) and `Engine/Environment/Nebula Ship` (the test ship lit by the nebula it
 flies in: metal panels reflect the nebula's core, bloom on the engines).
 
+## Directional shadow
+
+```rust
+use space3d::prelude::*;
+use space3d::render::{ShadowFilter, ShadowFit};
+
+world.spawn((
+    Transform::IDENTITY.looking_at(Vec3::new(-0.5, -0.8, -0.3), Vec3::Y),
+    DirectionalLight { color: Vec3::ONE, intensity: 2.5 },
+    // Top-down games: fit the map to what the camera sees within |y − 0| ≤ 60.
+    DirectionalShadow::new().with_fit(ShadowFit::top_down(0.0, 60.0, 2000.0)),
+));
+```
+
+One directional light casts: the one carrying a `DirectionalShadow` (a component next to the
+unchanged `DirectionalLight`). With several, the lowest entity casts and a warning is logged once.
+
+* **The map** is a `map_size`² `Depth32Float` texture (rounded up to a power of two, clamped to the
+  device; default 2048 — use 1024 on the web), drawn as a *depth view* before the camera views: it
+  culls its casters like a camera (on GPU draw paths as one more frustum of the same culling
+  dispatches; on `CpuDirect` on the CPU) and draws them instanced, depth only. `RenderStats`
+  counts `depth_views`, `shadow_casters` and `shadow_draw_calls`; its GPU time is the `shadow`
+  scope of `GpuTimings`.
+* **Fit** (`DirectionalShadow::fit`), recomputed every frame on the CPU:
+  * `ShadowFit::Camera { camera, max_distance, receivers }` (default: the first primary camera,
+    200 units, no box) covers that camera's frustum from its near plane to `max_distance`,
+    intersected with `receivers` when given. `ShadowFit::top_down(plane_y, half_thickness,
+    max_distance)` is that with the slab `|y − plane_y| ≤ half_thickness` as the box: a camera
+    looking down at a playfield gets a map just over its footprint, whatever its far plane.
+  * `ShadowFit::Bounds(aabb)` covers a fixed box (arenas, previews).
+  * The map is square around the covered points in a light basis anchored at the world origin;
+    its size changes only in steps of 1/8 of a power of two while zooming, and its center snaps to
+    whole texels, so panning never makes shadow edges shimmer. It extends `caster_depth` (500)
+    toward the light, so casters outside the view (above the camera, off screen toward the sun)
+    still cast.
+  * Receivers outside the map are lit; shadows fade out over its outer 10 %.
+* **Filter** (`ShadowFilter`, a pipeline constant, so it costs only what it uses): `Hard` (one
+  bilinear comparison, 2×2 texels), `Pcf4` (3×3), `Pcf9` (default, 5×5), `Pcf16` (7×7), smooth
+  kernels built from bilinear comparisons (Castaño 2013). A wider kernel is a softer edge; the
+  texel size sets the scale, so a 1024² map with `Pcf9` looks like a 2048² one with `Pcf16`.
+* **Biases** (`with_bias(depth, normal, slope)`): `depth_bias` (0.02, world units along the light)
+  is subtracted from the receiver's light depth; `normal_bias` (1.0, in texels) moves the receiver
+  along its geometric normal, more at grazing angles; `slope_bias` (1.5) is the raster slope bias
+  of the depth pass, scaled with the filter's reach (a wider kernel compares texels farther along
+  a sloped receiver). The defaults leave no acne on flat ground lit at 45° and at 80° with every
+  filter and both a fine and a coarse map (`no_acne_at_grazing_angle`). Raise `slope_bias` for
+  acne on steep surfaces; lower `depth_bias`/`normal_bias` when thin casters detach from their
+  shadows ("peter-panning").
+* **`strength`** (1.0) scales the shadow: 0.5 lets half of the light through; 0 skips the depth
+  pass entirely.
+* **Who casts and receives** (`Material::shadows`, `ShadowMode::Auto` by default): lit opaque and
+  alpha-masked materials cast (masked ones their cut-out shape) and receive; lit transparent ones
+  receive but do not cast; unlit ones neither (sky quads, glows, particles). `CastAndReceive`,
+  `CastOnly`, `ReceiveOnly` and `None` override that (an unlit material with `CastOnly` casts).
+  Explicit `InstanceBuffer`s cast like entities. Only the casting light is shadowed; the others,
+  ambient and image-based light are not.
+* The camera views get the light matrix and filter parameters in `GpuView` (`shadow_view_proj`,
+  `shadow_params`, `shadow_info`), the casting light moves to `dir_lights[0]`, and group 0 binds
+  the map (binding 5, `texture_depth_2d`) with a comparison sampler (binding 6). Custom shaders may
+  call `s3d_shadow_factor(world_pos, geometric_normal, light_dir)` (1 = lit).
+* **Parity and determinism.** The shadow is the same, pixel for pixel, on every draw path and
+  under `DownlevelOverride::webgl2()` (`shadow_same_on_every_path`); captures replay the frame's
+  map and never render it again. Without a `DirectionalShadow`, pipelines and pixels are exactly
+  those of a renderer without shadows.
+
+Story: `Engine/Lights/Directional Shadow` — three test ships over an asteroid field and a rocky
+ground in the game's camera angle, with knobs for the map size, filter, fit, biases, strength and
+sun elevation.
+
 ## glTF import
 
 The glTF loader (`space3d::assets::GltfLoader`, `load_gltf`) reads every material slot into
@@ -260,10 +330,13 @@ emissive maps and no `TANGENT` (generated by `space3d-assets/tests/gltf_material
 
 ## WebGL2 and GLES
 
-Everything above works on WebGL2 / GLES 3.0: a material binds 5 textures and the view 3 more
-(environment specular and irradiance cubes, BRDF LUT: 8 of the fragment stage's 16 texture
-units), no storage buffers, and the extension stream is rebound with the mesh arena where
-`BASE_VERTEX` is missing. Alpha to coverage needs MSAA (usually off on the web).
+Everything above works on WebGL2 / GLES 3.0: a material binds 5 textures and the view 4 more
+(environment specular and irradiance cubes, BRDF LUT, shadow map: 9 of the fragment stage's 16
+texture units), no storage buffers, and the extension stream is rebound with the mesh arena where
+`BASE_VERTEX` is missing. Alpha to coverage needs MSAA (usually off on the web). The shadow map is
+a depth texture sampled as a `sampler2DShadow` with `textureLod` (bilinear comparisons are core
+GLES 3.0), culled on the CPU (`tests/gl_materials.rs`: `shadow_on_gl_matches_default_backend`,
+every filter, within 1 % of Metal's pixels).
 
 Cubemaps are square 6-layer textures, which wgpu's GL backend creates as `TEXTURE_CUBE_MAP`s. The
 cubemap conversion, mip chain and bake have two paths computing the same texels (same functions,
@@ -283,6 +356,26 @@ lossless, `ibl_ldr_fallback_close_to_hdr`). Verified on ANGLE (GLES 3.0): `tests
 and `tests/environment.rs` with `WGPU_BACKEND=gl`, `tests/gl_materials.rs` (GL vs Metal, including
 `cube_on_gl_is_texture_cube_map`), and the storybook.
 
+## Prewarm
+
+Pipelines are built on first use; on WebGL2 each program link takes 50–150 ms. Call
+`Renderer::prewarm` on a loading screen, after one frame of the scene (so the frame's pass
+signatures, texture kinds and frame-wide settings are known), with the materials the game will
+spawn:
+
+```rust
+let request = space3d::render::PrewarmRequest { materials: vec![hull.clone(), shield.clone()], ..Default::default() };
+app.resources.expect_mut::<Renderer>().prewarm(&request);
+```
+
+Each material's forward pipeline is built with the class bits a batch of it gets on each
+instance layout (blend mode, double-sided, the extension stream where the layout has room), its
+maps' texture kinds as the last frame resolved them (single-layer for maps no frame has drawn)
+and the last frame's frame-wide settings (shading model, normal maps, the casting light's
+filter); casters also get their depth pipeline when the last frame drew a shadow. A frame after
+the prewarm builds no pipeline for them (`prewarm_builds_what_materials_draw_with`). Changing
+`ShadingModel`, `normal_maps` or the shadow filter re-specializes every lit pipeline once.
+
 ## Performance
 
 * Materials are interned per entity per frame; a material equal to the previous entity's is
@@ -294,13 +387,19 @@ and `tests/environment.rs` with `WGPU_BACKEND=gl`, `tests/gl_materials.rs` (GL v
 * `benches/materials.rs`: `materials/ecs_pbr/100k` (100k static entities, 8 PBR materials with
   maps; gate ≤ 2.5 ms per frame on the dev machine), `materials/ecs_plain/100k`,
   `materials/transparent_sort/4096`. Measured values are in `docs/performance.md`.
-* Image-based lighting costs 3 texture samples per lit pixel, the skybox one per uncovered pixel.
-  A 1080p screen of mapped, IBL-lit Standard pixels costs +0.09 ms of GPU over the legacy shader
-  on the dev machine (`forward_full_screen_gate`, gate +0.20 ms with PM5's shadow taps). A bake is one-time: 1024² LDR faces → 256² specular + 32² irradiance
+* Image-based lighting costs 3 texture samples per lit pixel, the skybox one per uncovered pixel,
+  the shadow 1/4/9/16 comparisons per lit pixel. A 1080p screen of mapped, IBL-lit, shadowed
+  (PCF9) Standard pixels costs +0.12 ms of GPU over the legacy shader on the dev machine
+  (`forward_full_screen_gate`, gate +0.20 ms). The shadow map of 100k cube entities costs
+  0.28 ms at 2048² (`shadow_map_gate`, gate 0.30 ms; explicit instance buffers draw slower, in
+  the camera pass too); the depth view adds 0.1 ms of CPU at 100k entities on GPU draw paths and
+  0.4 ms on `CpuDirect` (`materials/shadow_view/*`). A bake is one-time: 1024² LDR faces → 256² specular + 32² irradiance
   in about 1 ms of GPU on the dev machine with compute (`ibl_bake_gate`, gate ≤ 3 ms), a few ms
   with render passes (each pass has a fixed cost of tens of µs on Metal: 102 of them for this
   cubemap, 17 dispatches in one compute pass instead).
 * Memory: a radiance cube is `faces² × 6 × 4/3` texels (4 bytes in sRGB, 8 in `Rgba16Float`:
   a 1024² LDR sky ≈ 34 MB, 512² ≈ 8 MB — use 512² faces on the web), an environment ≈ 4.2 MB at
-  the default sizes; a still camera with a skybox and an environment uploads nothing and
-  allocates nothing per frame.
+  the default sizes, a shadow map 16.8 MB at 2048² (4.2 MB at 1024²; kept 600 frames after its
+  light stops casting); a still camera with a skybox, an environment and a shadow uploads nothing
+  and allocates nothing per frame (the depth pass adds wgpu's per-pass bookkeeping, 37
+  allocations per frame on Metal).
