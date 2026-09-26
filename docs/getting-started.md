@@ -90,7 +90,9 @@ impl Plugin for GamePlugin {
   ```
 * **Input** via named actions: `ActionMap::bind("jump", Binding::Key(KeyCode::Space))`, then
   `ctx.resources.expect::<ActionState>().just_pressed("jump")`. Touch regions work as virtual
-  buttons on phones.
+  buttons on phones. `KeyCode`s are physical key positions (WASD stays WASD-shaped on AZERTY);
+  show players the key's label on their layout with `Input::key_cap` — see
+  [Keyboard layouts](platforms.md#keyboard-layouts).
 
 ## 5. `DefaultPlugins` and `MinimalPlugins`
 

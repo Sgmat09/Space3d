@@ -57,6 +57,19 @@ app.play(&script);
 Because simulation runs on fixed ticks, the same script always gives the same result —
 `assert_deterministic` runs two apps in lockstep and compares world fingerprints every tick.
 
+Keyboard layouts: `tap_key`/`inject_key_*` press physical keys only. To test what a player on
+another layout sees (UI shortcuts, typed text, key labels), inject the logical key too — the
+same `KeyEvent` the window runner records ([Keyboard layouts](platforms.md#keyboard-layouts)):
+
+```rust
+let input = app.input();                           // &mut space3d_platform::Input
+// AZERTY: the key labelled Z sits in QWERTY's W position.
+input.inject_key_tap_logical(KeyCode::KeyW, LogicalKey::Character("z".into()));
+input.inject_key_event(KeyEvent::press(KeyCode::Digit2, LogicalKey::Character("é".into()))
+    .with_logical_key(LogicalKey::Character("2".into())));   // with Shift held
+assert_eq!(input.key_cap(KeyCode::KeyW), "Z");     // learned from the event
+```
+
 ## Golden screenshots
 
 ```rust

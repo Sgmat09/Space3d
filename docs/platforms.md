@@ -126,6 +126,61 @@ xcrun simctl install booted target/xcode/Build/Products/Debug-iphonesimulator/<g
 xcrun simctl launch booted <bundle id>
 ```
 
+## Keyboard layouts
+
+Players use AZERTY, QWERTZ, Dvorak, JIS and many other layouts. Every keyboard event carries
+two identities, and the engine keeps both:
+
+* **Physical key** (`KeyCode`) — the key's *position*, named after the US QWERTY key in that
+  place. `Input::pressed`, `just_pressed` and `Binding::Key` use it. `KeyCode::KeyW` is the key
+  right of Tab on every keyboard, labelled W on QWERTY and Z on AZERTY.
+* **Logical key** (`LogicalKey`, winit's `Key`) — what the key *means* on the player's layout.
+  The window runner records it on a `KeyEvent` per OS event: `physical`, `logical_key` (with
+  Shift/AltGr/Option applied), `key_without_modifiers` (desktop only), `text`, `location`,
+  `pressed`, `repeat`. Read this frame's events with `Input::key_events()`, or the last logical
+  key of a physical key with `Input::logical_key(KeyCode)`.
+
+**Bindings.** Bind physical keys for movement and anything position-based: WASD bound as
+`KeyW/KeyA/KeyS/KeyD` is `Z/Q/S/D` on AZERTY — still an inverted T under the left hand. What
+the player must see is the label on *their* keyboard, not the code name:
+
+```rust
+let input = ctx.resources.expect::<Input>();
+let cap = input.key_cap(KeyCode::KeyW);           // "W" on QWERTY, "Z" on AZERTY — never empty
+let label = input.key_label(KeyCode::KeyW);       // Some("z") / None while unknown
+let space = input.key_label(KeyCode::Space);      // Some("Space") — English: localize it
+let gen = input.keyboard_layout().generation();   // changes when labels may have changed
+```
+
+`key_label` returns what the key types **without modifiers** (dead keys: their base character,
+`^`), or an English name for non-character keys (`Space`, `Enter`, `Shift`, `F1`, `Numpad 1`;
+`Command`/`Option` on Apple platforms, `Windows` on Windows). `key_label_info` adds the shifted
+character and the source (`Os`, `Learned`, `Named`); `key_cap` upper-cases letters as keyboards
+print them (`Q`, but AZERTY's `é`/`2` key stays `é`) and falls back to the US QWERTY character
+of the position while the layout's is unknown.
+
+**UI.** egui receives the logical key (`Event::Key::key`) and the physical one
+(`physical_key`), like egui-winit, so text fields and shortcuts follow the layout as in native
+apps: `Ctrl/Cmd+Z/A/C/V/X` act on the keys labelled Z/A/C/V/X (on AZERTY, undo is the key in
+QWERTY's W position). Layouts without Latin letters (Cyrillic, Greek, …) fall back to the
+physical key, so shortcuts still work in the QWERTY positions.
+
+**Where labels come from.** Learned labels (from key events on the current layout) win over the
+OS table; the OS table is read by the window runner on the event-loop thread at start-up, on
+focus gain and when the layout id changes (checked at most once per second) — never per frame.
+
+| platform | OS table | layout switch detected | notes |
+|---|---|---|---|
+| macOS | `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate` | yes (input source id) | first query at start-up initializes Text Input Services (~35 ms, once); IMEs report the layout they type through |
+| Windows | `MapVirtualKeyExW` + `ToUnicodeEx` for the thread's `HKL` | yes (`HKL`) | |
+| Web | `navigator.keyboard.getLayoutMap()` (Chromium-based browsers), async | on focus | Firefox/Safari, or iframes without the `keyboard-map` permission: learned only; no shifted characters |
+| Linux X11/Wayland | none (no hard `libxkbcommon` dependency) | no | learned from winit's `key_without_modifiers` |
+| Android, iOS | none | no | learned from unmodified presses (Shift/Alt presses only teach the shifted character) |
+
+Limitations: without an OS table a character key has no label until the player presses it once;
+after an undetected layout switch the old learned labels stay until each key is pressed again;
+key-cap capitalization without a known shifted character is a heuristic (letter rows only).
+
 ## CI and releases
 
 `space3d ci init --targets desktop,web,android,ios` (also run by `space3d new`) writes
