@@ -176,6 +176,22 @@ Additions made by the foundation since F2 (additive):
     blue, which a warm or green tint multiplied to grey); `builtin::LASER_TRAIL` reserves 576
     slots (was 1024) and has a smaller head.
 
+* Phase I (integration), all additive:
+  * `GraphicsQuality` implements the §4.4 presets and gains `Ultra` (the enum is
+    `#[non_exhaustive]`), `ALL`, `name()`, `Display`, `recommended_for(&Renderer)`,
+    `post_for(PostProcess, msaa_samples)`, `sky_face_size()`, `prewarm_request(&[Material]) ->
+    PrewarmRequest` and `apply(&mut World, &mut Resources)`; `recommended` also returns Low
+    without compute. `PostProcess::with_quality` maps `Ultra` to 8 bloom levels / 1080 and FXAA
+    Ultra.
+  * `space3d_particles::ParticleSettings::for_quality_on(GraphicsQuality, &GraphicsCaps)`: Low's
+    settings where the GPU backend is unavailable.
+  * `space3d_stories::showcase` (feature `engine`): the showcase content and scenes
+    (`ShowcaseContent`, `ShowcaseAssets`, `spawn_look`, `spawn_battle`, `dress_battle`,
+    `battle_look`, `headless_battle`, `measure_battle`, …).
+  * `space3d-editor`: scene reprs and inspector sections for `CameraFrame`, `PostProcess`,
+    `DirectionalShadow` (saved), `Skybox`, `EnvironmentLight` (snapshot-only: session-local
+    cubemap handles); the `Material` repr gains the scalar map and blend fields.
+
 ## Ownership map (spec §3.6)
 
 A builder edits only the files it owns; everything else goes through the foundation maintainer
@@ -204,7 +220,7 @@ A builder edits only the files it owns; everything else goes through the foundat
 | `tests/{frame_modes, nodes, overlay_stages, depth_views, gpu_timings, footprint, capture_hdr, alloc_frame, gl, alloc, headless, custom_shader}.rs`, `tests/common/mod.rs` | F |
 | `tests/{materials, environment, shadows, gltf_render, gl_materials, alloc_materials}.rs`, `tests/common/materials.rs` | P-MAT |
 | `tests/{post, post_distortion, gl_post, alloc_post}.rs`, `tests/common/post.rs` | P-POST |
-| `benches/{instancing, frame}.rs` / `materials.rs` / `post.rs` / `graphics.rs` | F / P-MAT / P-POST / I |
+| `benches/{instancing, frame}.rs` / `materials.rs` / `post.rs`; `crates/space3d-stories/{benches/graphics.rs, tests/perf_graphics.rs}` (the Battle scene needs particles and the showcase content) | F / P-MAT / P-POST; I |
 | `examples/frame_nodes.rs` | F |
 | `crates/space3d-assets/**` (incl. the `render` feature) | F (skeleton) → P-MAT |
 | `crates/space3d-particles/**` | F (skeleton) → P-PART |
@@ -214,7 +230,7 @@ A builder edits only the files it owns; everything else goes through the foundat
 | `crates/space3d/{Cargo.toml, src/lib.rs, tests/api_compat_249c874.rs, tests/prelude_policy.rs}` | F |
 | `crates/space3d-editor/src/components.rs` | F → I (reprs) |
 | `examples/{pbr_showcase}` / `{post_processing}` / `{particles, particles_stress}` / `{graphics_showcase}` | P-MAT / P-POST / P-PART / I |
-| `docs/graphics/{api, frame}.md` / `materials.md` / `post.md` / `particles.md` / `migration.md` | F / P-MAT / P-POST / P-PART / I |
+| `docs/graphics/{api, frame}.md` / `materials.md` / `post.md` / `particles.md` / `migration.md`, `docs/graphics.md` | F / P-MAT / P-POST / P-PART / I |
 
 Change requests to F files: `scratchpad/graphics/change-requests.md` (file, change, reason), or
 through the orchestrator.

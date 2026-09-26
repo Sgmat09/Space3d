@@ -484,6 +484,50 @@ the `DepthMask` pipeline, several maps, a still scene uploading nothing; also on
 `pipeline::depth::tests`, `tests/gpu_timings.rs`, `tests/alloc_frame.rs` ("depth_views",
 "timings"), `tests/footprint.rs` (ignored: process memory per mode, macOS).
 
+## Graphics areas (summary)
+
+The frame above hosts four areas built on its contracts (spec §2.6); each has its own page in
+`docs/graphics/` and an overview in [`docs/graphics.md`](../../docs/graphics.md).
+
+* **Materials and lighting** (`material.rs`, `lighting/`, `frame/{extract,draws}.rs`,
+  `pipeline/forward.rs`, `shaders/forward.wgsl`): `Material` carries base color, normal,
+  metallic-roughness, occlusion (ORM packing: one sample) and emissive maps, a `BlendMode`
+  (opaque, alpha mask with alpha-to-coverage under MSAA, alpha, premultiplied, additive),
+  `ShadowMode`, a UV transform and per-map UV sets; the pipeline class bits and texture kinds
+  select forward-shader variants through overrides (one module per layout × kinds × ext stream).
+  Tangents come from the mesh's ext stream (slot 2) or per-pixel frames. `LightingSettings`
+  chooses `Classic` (the legacy model, pixel-identical) or `Standard` (GGX / Smith / Schlick with
+  multiple-scattering IBL). `Lighting::prepare` uploads cubemaps (panoramas converted on the
+  GPU), bakes environments (irradiance + GGX-prefiltered specular: compute, or render passes on
+  GL, budgeted per frame there), picks the shadow light and fits its map (texel-snapped, a
+  camera-frustum or a fixed-box fit); the frame draws its depth view and binds the results in the
+  view bind group (bindings 1–6). The skybox is a built-in render node (`space3d/skybox`) in the
+  Skybox phase.
+* **Post** (`post/`): per post group, auto exposure (a compute histogram or, on WebGL2, a render
+  pass chain; 1×1 exposure texture, read back without blocking), the bloom chain (position-stable
+  prefilter at half the rect, a reference chain of `mip_count` levels, B-spline upsampling;
+  `Rg11b10Ufloat` or `Rgba16Float` from the texture pool), then one composite pass — distortion
+  apply, exposure, bloom, vignette, grading, tonemapper, LUT, grain, dither, output encoding —
+  and FXAA when on. `DistortionMaterial` meshes are the built-in node `space3d/distortion-meshes`;
+  writers draw into the post group's `DB` in the Distortion phase through `DISTORTION_WGSL`.
+* **Particles** (`crates/space3d-particles`): one render node (`space3d/particles`). Its
+  `prepare` replays the fixed ticks logged since the last frame (render-on-demand equals
+  render-every-tick): on the GPU backend `simulate`, `emit`, `mark` and `scatter` dispatches and a
+  per-view bitonic sort for `ByDistance` layers, drawn with indirect draws; on the CPU backend
+  (WebGL2) the same tick log, ring slots and RNG in Rust. Ribbons and beams are CPU-built strips
+  on every backend. Draws land in the Transparent (or SceneRead, for soft particles) and
+  Distortion slots, culled per view by each item's bounds; light flashes are `PointLight` child
+  entities.
+* **Quality** (`quality.rs`): `GraphicsQuality::{Low, Medium, High, Ultra}` sets every area's
+  performance knobs coherently (render scale, MSAA / FXAA, bloom chain, shadow map and filter,
+  IBL bake, shading model; particles through `ParticleSettings::for_quality_on`), picks a tier
+  per device (`recommended`: Low on GL, without float targets or without compute) and builds a
+  prewarm request per tier. `apply` remembers each camera's authored post settings, so switching
+  tiers is lossless.
+
+The Battle reference scene of spec §4.4 (`space3d_stories::showcase`) exercises all of it: 1.5 ms
+GPU, 1.45 ms CPU per 1080p frame on the Dev machine (`docs/performance.md`, "Phase I").
+
 ## Custom shaders
 A `CustomShader` is WGSL spliced into the built-in forward shader, registered with
 `RenderAssets::add_shader` and selected per material with `Material::with_shader`. It defines
@@ -857,17 +901,19 @@ the pre-`render-fixes` renderer, with one unordered dispatch per view and buffer
 instances, 2 views) are unchanged within noise (25 → 9 dispatches).
 
 ## Known limitations
-* Lighting is metallic/roughness Blinn-Phong with Schlick Fresnel, 4 directional + 16 point
-  lights per view (with more, the 16 nearest to the view's camera, in query order; with at most
-  16, every light in query order). Shadow maps are drawn (depth views) but shading with them,
-  IBL and the skybox are the materials area's (`docs/graphics/materials.md`); post-processing
-  is in `docs/graphics/post.md`.
+* 4 directional + 16 point lights per view (with more, the 16 nearest to the view's camera, in
+  query order; with at most 16, every light in query order); one directional light casts
+  shadows (no cascades, no point or spot shadows); lights are global (every view sees them).
+* Transparent meshes and particles are two order spaces: blended meshes by `render_order`, then
+  the particle node's draws (no order-independent transparency).
 * After a `Lost` surface the platform runner attaches a new one on a later redraw (throttled
   to once per second), so the window can stay blank briefly.
 * Layer indices past a texture array's last layer sample the unused padding layer on GL for
   square arrays of 6k layers (other backends clamp to the last layer).
 * GPU-culled visible counts in `RenderStats` lag by 1–3 frames (read back without blocking).
-* Transparent instances are not depth-sorted within a batch.
+* Transparent instances are sorted back to front only with
+  `LightingSettings::transparent_sort` (`PerInstance`, up to a cap per view); by default they draw
+  in batch order.
 * ECS extraction interns materials and checks meshes serially (the matrix gather and diff are
   parallel); instance layouts whose position is not f32/f16 are not culled per instance.
 * ECS entities past `max_buffer_size / 64` are not all drawn (the largest batches are cut).

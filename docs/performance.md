@@ -586,3 +586,72 @@ Allocations per frame: every allocation test (`space3d-render` `alloc`, `alloc_f
 `alloc_materials`, `alloc_post`; `space3d-particles` `alloc`; `space3d-core` `alloc_transforms`)
 passes its lane's bound on the merged tree, on Metal and on ANGLE (GL).
 
+
+### Phase I — the Battle reference scene and the quality presets
+
+Integration builder, `graphics` after the M2 merges. The reference scene of spec §4.4 is
+`space3d_stories::showcase` (`spawn_battle` + `dress_battle`): 300 ships of three procedural
+hulls with base color, packed ORM, normal and emissive maps (one material per faction: 9
+instanced batches), 60 asteroids, the nebula sky as `Skybox` and `EnvironmentLight`, one sun with
+a `DirectionalShadow` (`ShadowFit::top_down`), the particle load of
+`space3d_particles::testing::battle` (900 engine exhausts, 64 ribbons, 16 beams, 30 explosions a
+second with their light flashes — 41 point lights —, hits, shield ripples, warps' shockwaves),
+`battle_look()` (AgX punchy, +0.5 EV, bloom, vignette) and two 256² render-target ship previews
+(4× MSAA, no post). The egui HUD of windowed runs is not part of the reference (the stories and
+the example show the previews through a HUD camera; the perf harness leaves it out: it costs
+0.08 ms of CPU).
+
+Measured with `cargo test --release -p space3d-stories --test perf_graphics -- --ignored
+--nocapture` (`battle_dev_gates`; `cargo bench -p space3d-stories --bench graphics --
+graphics/report` prints the same), 1920 × 1080 headless, Apple M4 Max, Metal, content of
+1024² hull maps and 1024² sky faces, 240 warm-up frames, medians of 60 frames. The machine was
+shared: another session ran the game (≈ 120 % CPU) and an iOS simulator app (≈ 100 % CPU and its
+Metal host), load average 6.8–7.4. Three runs, every tier, High passing both gates each time:
+
+| tier | GPU frame (frozen-frame throughput + particle sim) | CPU `render_frame` (back to back / after an idle GPU) | render passes | targets | particles alive |
+|---|---|---|---|---|---|
+| **High** (gates) | **1.49 ms** (1.27 + 0.22) | **1.45 ms** / 1.39–1.43 ms | 19 | 133.5 MB | 101 800 |
+| Medium | 1.39 ms (1.21 + 0.18) | 1.38–1.41 ms | 16 | 129.3 MB | 61 000 |
+| Low | 0.71–0.75 ms (CPU particles) | 0.77–0.78 ms | 13 | 25.3 MB | 5 300 |
+| Ultra | 1.48–1.50 ms (1.26 + 0.22) | 1.43–1.47 ms | 18 | 129.3 MB | 101 800 |
+
+Gates (spec §4.4, Dev): **Battle total GPU ≤ 3.0 ms — met (1.49 ms)**; **CPU `render_frame` ≤
+1.5 ms — met at 1.45 ms, a 3 % margin** on the shared machine (the first measurements, with the
+previews post-processed and the HUD camera, read 1.85 ms: see below); **frame and post targets
+≤ 220 MB (T1/T2) — 133.5 MB** (`RenderStats::target_bytes`; asserted by `battle_steady_state`, which
+also checks no CPU reallocations and no textures created over 30 steady frames, 0 GPU errors).
+Draws: 12 built-in (hulls, rocks, sky; 4 of them shadow) + 114 particle draws; 1 post group.
+
+How the GPU frame is measured: the frozen frame (no ticks) rendered back to back is the
+frame's throughput — the GPU's time when the GPU is the slower side, else the CPU's — and the
+particle simulation passes that only ticking frames record (`particles.sim`, `.compact`,
+`.sort` timestamps, 0.22 ms) are added. Pass scopes of a ticking frame (they overlap on Apple
+GPUs, so their sum, 4.0 ms, overstates the frame): cull 0.023, shadow 0.046, scene 0.227, depth
+resolve 0.231, scene_read 0.693, distortion 0.584, post.bloom 0.748, post.composite 0.756,
+particles.sort 0.127 ms.
+
+Where the CPU goes (High, `sample` of the release build, `render_frame` = 100 %):
+* **58 % wgpu's command encoding** (`CommandEncoder::finish`: wgpu 30 records passes and encodes
+  them to Metal at `finish`): beginning the 19 render passes (27 % of it), **wgpu's indirect-draw
+  validation** (`VALIDATION_INDIRECT_CALL`, on in release by default; 25 % of it — the particles
+  draw with 100+ indirect draws), draws and binds. Every render pass costs about 15–25 µs of CPU:
+  the first version of the scene post-processed the two previews (two more bloom chains and
+  composites: 41 passes) and measured 1.85 ms; the reference scene's previews are one pass each
+  (spec §4.4: "RT 2"), 19 passes in all. With `WGPU_VALIDATION_INDIRECT_CALL=0` the same frame
+  takes 1.33–1.35 ms (not a default: it guards GPU-written indirect arguments).
+* **35 % the particle node's `prepare`** (≈ 0.5 ms; spec budget 0.1 ms for the GPU backend):
+  the tick replay's uploads (a ticking frame uploads **2.3 MB**, 2.3 MB of it particles: mostly the
+  CPU-built ribbon and beam strips, 40 B a point, rebuilt every frame), emitter transforms of
+  the 900 moving engines, the entry tables, and bounds. The particles lane's own gates (100k
+  sim + compaction ≤ 0.06 ms GPU, draws ≤ 0.40 ms) are GPU gates and are met.
+* The rest (extraction, planning, lighting, post planning, the scene passes' own recording):
+  under 0.1 ms.
+
+Levers, if the CPU gate needs margin on slower machines: incremental strip uploads (only the
+points that moved) and a GPU strip builder in the particles lane; batching the particles' indirect
+draws (one multi-draw per pipeline); turning off wgpu's indirect validation for engine-written
+arguments (a foundation decision); fewer passes (the compute bloom chain the post lane lists).
+
+Visual check: every Showcase golden (`Engine/Showcase/{SpaceCorps Look, Battle, WebGL2 SpaceCorps
+Look, WebGL2 Battle}`) and the example's headless 1280 × 720 PNG (Medium, recommended for the M4
+Max as an integrated GPU) were inspected.

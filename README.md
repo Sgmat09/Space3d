@@ -47,6 +47,12 @@ space3d::main!(build);
   render-to-texture, MSAA; automatic instancing of ECS entities and explicit
   `InstanceBuffer<T>`s for 1M+ instances; GPU frustum culling + (multi-)indirect draws with a CPU
   fallback (WebGL2); dirty-range uploads through a staging belt; headless rendering and capture.
+* **Graphics.** HDR with AgX/ACES/Khronos tonemapping, bloom, auto exposure, color grading and
+  LUTs, FXAA, lens effects, screen-space distortion; normal, ORM and emissive maps lit straight
+  from glTF, every blend mode; cubemap skyboxes with image-based lighting; a shadow-casting sun;
+  100k GPU particles with ribbons, beams, flipbooks and a built-in effect library; render nodes
+  and HDR overlay stages for custom effects; `GraphicsQuality` presets from WebGL2 to Ultra
+  ([below](#graphics)).
 * **Never block the frame.** I/O runs on `space3d_tasks` (tokio natively,
   `wasm-bindgen-futures` on the web); CPU work on a compute pool; systems only poll
   `Task`s or register `AsyncQueue` callbacks.
@@ -79,7 +85,8 @@ space3d::main!(build);
 │                                                                                               │
 │  platform ── winit runner (desktop · web canvas · Android NativeActivity · iOS UIKit), Input  │
 │     │                                                                                         │
-│  render ──── wgpu: mesh arena · materials · lights · instancing · GPU culling · capture       │
+│  render ──── wgpu: mesh arena · PBR maps · lights · IBL · shadows · HDR · post · nodes        │
+│  particles ─ GPU/CPU effects: sprites · ribbons · beams · built-in library                    │
 │  ui ──────── egui overlay · debug overlay · profiler · console        editor ── inspectors    │
 │  assets ──── asset server · loaders · hot reload · texture/mesh editing                       │
 │  physics (rapier) · audio (kira) · scene (RON) · net (HTTP/WS) · db (SQLite/localStorage)     │
@@ -99,7 +106,8 @@ Frame:  Startup (once) → PreUpdate (task completions, input, network inbox)
 | [`space3d`](crates/space3d) | facade: feature-gated re-exports, plugin groups, prelude, `main!` |
 | [`space3d-core`](crates/space3d-core) | App, Plugin, ECS, resources, events, stages, fixed tick, Transform |
 | [`space3d-tasks`](crates/space3d-tasks) | async runtime bridge, `Task`, `AsyncQueue` |
-| [`space3d-render`](crates/space3d-render) | wgpu renderer ([architecture](crates/space3d-render/ARCHITECTURE.md)) |
+| [`space3d-render`](crates/space3d-render) | wgpu renderer ([architecture](crates/space3d-render/ARCHITECTURE.md), [graphics](docs/graphics.md)) |
+| [`space3d-particles`](crates/space3d-particles) | particle effects drawn as a render node ([docs](docs/graphics/particles.md)) |
 | [`space3d-platform`](crates/space3d-platform) | winit runner for all platforms, input, action maps |
 | [`space3d-assets`](crates/space3d-assets) | asset server, loaders, hot reload, editing ops |
 | [`space3d-net`](crates/space3d-net) | HTTP/WebSocket clients and servers |
@@ -113,6 +121,51 @@ Frame:  Startup (once) → PreUpdate (task completions, input, network inbox)
 | [`space3d-test`](crates/space3d-test) | test harness |
 | [`space3d-github`](crates/space3d-github) | GitHub REST, update checker, crash reporter, CI templates |
 | [`space3d-cli`](crates/space3d-cli) | the `space3d` command |
+
+## Graphics
+
+![SpaceCorps look](crates/space3d-stories/tests/__screenshots__/Engine/Showcase/SpaceCorps_Look.png)
+
+The renderer draws a top-down space battle with every effect a space game needs — and nothing
+changes until a game asks: a camera without `PostProcess` renders exactly as before.
+
+```rust
+use space3d::particles::prelude::*;
+use space3d::prelude::*;
+
+ctx.world.spawn((
+    Transform::from_xyz(0.0, 400.0, 150.0).looking_at(Vec3::ZERO, Vec3::Y),
+    Camera3d::default(),
+    PostProcess::default().with_tonemapper(Tonemapper::AgXPunchy).with_exposure(0.5), // HDR + bloom
+    Skybox::new(nebula),                                   // a cubemap behind everything …
+    EnvironmentLight::new(nebula),                         // … that also lights the hulls
+));
+ctx.world.spawn((sun_transform, DirectionalLight::default(), DirectionalShadow::default()));
+let ship = space3d::assets::render::spawn_model(ctx.world, &hull, transform); // glTF maps as authored
+ctx.spawn_effect(builtin::EXPLOSION, EffectSpawn::at(p));   // one call: fireball, debris, flash, shockwave
+GraphicsQuality::recommended_for(renderer).apply(ctx.world, ctx.resources);  // Low on WebGL2
+```
+
+| feature | what you get |
+|---|---|
+| HDR, tonemapping, exposure | `PostProcess` on a camera: linear HDR scene, AgX / AgX punchy / ACES / Khronos PBR Neutral / Reinhard, manual or histogram auto exposure |
+| bloom | position-stable, energy-proportional, resolution-independent; emissive, particles and HDR skies glow |
+| post chain | color grading (white balance, lift/gamma/gain, 3D LUTs, WGSL hooks), FXAA, vignette, chromatic aberration, film grain |
+| distortion | heat haze and shockwaves from particles, `DistortionMaterial` meshes and render nodes |
+| materials | normal, ORM, metallic-roughness, occlusion and emissive maps; opaque, alpha-mask, alpha, premultiplied and additive blending; GGX shading |
+| glTF | every material slot straight from the file, sRGB/linear by slot, `texCoord` sets, texture transforms, MikkTSpace tangents |
+| sky and IBL | cubemaps from faces, three.js faces or panoramas (LDR/HDR); `Skybox`; diffuse + GGX-prefiltered specular baked on the GPU |
+| shadows | one directional shadow, fitted to a top-down camera, PCF 1–16 taps |
+| particles | GPU simulation (CPU on WebGL2), 100k+, sprites, ribbons, beams, flipbooks, soft particles, light flashes, sorting, LOD; 14 built-in space effects |
+| extension | render nodes (compute + draws in the frame's passes), HDR overlay stages, custom WGSL |
+| quality | `GraphicsQuality::{Low, Medium, High, Ultra}` for every knob; `recommended` per device; prewarm plans |
+| WebGL2 | every feature has a path (Ldr fallback, CPU particles, CPU culling) |
+
+The Battle reference scene (300 ships with PBR maps, 100k particles, IBL, shadows, bloom, MSAA)
+costs about **1.5 ms of GPU and 1.45 ms of CPU** per 1080p frame on an Apple M4 Max.
+Overview and how-tos: [docs/graphics.md](docs/graphics.md) · adopting it in a game:
+[docs/graphics/migration.md](docs/graphics/migration.md) · try it:
+`cargo run -p graphics_showcase --release`.
 
 ## Quickstart
 
@@ -242,12 +295,17 @@ the debug overlay (F3) shows it live. More: [docs/performance.md](docs/performan
 | [`save_game`](examples/save_game) | SQLite save slots + key/value settings |
 | [`async_loading`](examples/async_loading) | assets over HTTP + compute-pool meshes while the frame keeps ticking |
 | [`web_demo`](examples/web_demo) | a browser-first scene built with `space3d::main!` |
+| [`graphics_showcase`](examples/graphics_showcase) | the Battle reference scene with every graphics feature, quality tiers, egui HUD, headless PNG, web |
+| [`pbr_showcase`](examples/pbr_showcase) | a glTF ship with PBR maps, skybox + IBL, a shadow-casting sun, every blend mode |
+| [`post_processing`](examples/post_processing) | every post effect toggled with keys |
+| [`particles`](examples/particles), [`particles_stress`](examples/particles_stress) | the particle library in a small battle; 100k+ particles |
 
 ```sh
 cargo run -p hello_cube
 cargo run -p instancing_million --release
 SPACE3D_EXIT_AFTER_FRAMES=120 cargo run -p physics_playground   # smoke test: quit after 120 frames
 SPACE3D_HEADLESS=1 SPACE3D_EXIT_AFTER_FRAMES=60 cargo run -p hello_cube   # no window at all
+SPACE3D_HEADLESS=1 cargo run -p graphics_showcase --release   # writes graphics_showcase.png
 ```
 
 ## Dependency policy: latest stable only

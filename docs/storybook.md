@@ -45,8 +45,19 @@ pub fn storybook() -> Storybook {
 * `.tolerance(0.02)` loosens the screenshot comparison for one story.
 
 The engine ships its own book (`space3d::stories::engine_storybook()`: lighting, materials,
-instancing, textures, cameras, hierarchies, physics) — `book.extend(engine_storybook())` to
-browse both.
+instancing, textures, cameras, hierarchies, physics, and the graphics areas: `Engine/Frame/*`,
+`Engine/Materials/*`, `Engine/Environment/*`, `Engine/Lights/*`, `Engine/Post/*`,
+`Engine/Particles/*` and `Engine/Showcase/*`) — `book.extend(engine_storybook())` to browse both.
+
+The **showcase** stories put every graphics feature together: `Engine/Showcase/SpaceCorps Look`
+(a close-up skirmish in the SpaceCorps top-down view: PBR hulls with all maps, the nebula skybox
+and its image-based lighting, shadows on asteroids, engines, beams, bolts, a missile's ribbon, an
+explosion with its shockwave, a warp; a `quality` knob over the `GraphicsQuality` tiers and
+toggles for shadows, IBL, bloom and distortion), `Engine/Showcase/Battle` (the graphics spec's
+reference scene: 300 ships, 100k particles, two render-target previews in the corner), and both
+again under `DownlevelOverride::webgl2()` at Low (`Engine/Showcase/WebGL2 *`). Their content and
+scenes are public (`space3d::stories::showcase`) and shared with `examples/graphics_showcase`
+and the graphics benchmarks. See [graphics.md](graphics.md).
 
 ## The storybook binary
 

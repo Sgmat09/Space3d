@@ -62,6 +62,19 @@ WebGL2 uses the CPU draw path); assets are fetched over HTTP relative to the pag
 uses `localStorage` (KV, save slots, leaderboards; raw SQL returns `Unsupported`); WebSocket and
 HTTP clients use the browser APIs; servers are native-only; audio starts after a user gesture.
 
+Graphics on the web ([graphics.md](graphics.md#webgl2-and-other-downlevel-devices)): WebGPU
+browsers get every feature as natively (`GraphicsQuality::recommended` picks Medium or High);
+WebGL2 gets `GraphicsQuality::Low` — render scale 0.75, FXAA instead of MSAA, a 4-level bloom
+(where `EXT_color_buffer_float` exists; without it the Ldr fallback tonemaps per fragment and has
+no bloom), a 1024² PCF4 shadow, the Classic shading model with a small environment bake spread
+over frames, and the CPU particle backend (8 192 particles, thinner spawns). Every feature has a
+WebGL2 path (no compute, no storage buffers in vertex shaders). WebGL2 links each shader
+program when a pipeline is first built (50–150 ms): prewarm on loading screens
+(`GraphicsQuality::prewarm_request`). `examples/graphics_showcase` builds for the web
+(`cargo run -p space3d-cli -- serve` from its directory; `web/index.html`), and
+`DownlevelOverride::webgl2()` shows the WebGL2 look on a desktop GPU (the
+`Engine/Showcase/WebGL2 *` stories).
+
 ## Android
 
 One-time setup:
