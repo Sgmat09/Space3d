@@ -21,13 +21,23 @@ pollster.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
-web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlCanvasElement", "Navigator"] }
 console_error_panic_hook.workspace = true
 tracing-wasm.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [dev-dependencies]
 image.workspace = true
 space3d-tasks.workspace = true
+
+# OS keyboard-layout tables, read on the main thread (macOS Text Input Sources are
+# main-thread only; libtest runs tests on worker threads).
+[[test]]
+name = "os_layout"
+harness = false
 
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-native-activity"] }

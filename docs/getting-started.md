@@ -90,7 +90,9 @@ impl Plugin for GamePlugin {
   ```
 * **Input** via named actions: `ActionMap::bind("jump", Binding::Key(KeyCode::Space))`, then
   `ctx.resources.expect::<ActionState>().just_pressed("jump")`. Touch regions work as virtual
-  buttons on phones.
+  buttons on phones. `KeyCode`s are physical key positions (WASD stays WASD-shaped on AZERTY);
+  show players the key's label on their layout with `Input::key_cap` — see
+  [Keyboard layouts](platforms.md#keyboard-layouts).
 
 ## 5. `DefaultPlugins` and `MinimalPlugins`
 
@@ -119,6 +121,14 @@ Optional: `editor`, `github`, `stories`, `test` (generated projects enable `stor
 `editor`, plus `test` for their tests). A dedicated server can use
 `space3d = { …, default-features = false, features = ["net"] }` (see
 `examples/multiplayer_chat`).
+
+## 7. Updating Space3d
+
+Space3d is consumed by git revision. After bumping the pinned `rev`, run `cargo update -p space3d`
+(or `cargo update`). Space3d always tracks the latest stable release of its dependencies, so a
+consumer lockfile pinned to an older version can fail to resolve, e.g. `space3d-net` needs
+`hyper-util ^0.1.21` ("failed to select a version for `hyper-util`"): update that crate too —
+`cargo update -p hyper-util` — or simply `cargo update`.
 
 ## Next
 

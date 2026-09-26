@@ -5,6 +5,16 @@
 //! frame become a click), wheel, keys, typed text and touches. Because tests drive the same
 //! `Input` resource through `inject_*`, UI interaction is fully scriptable.
 //!
+//! Keys follow the player's keyboard layout like egui-winit: `Event::Key::key` is the
+//! **logical** key of the press ([`egui_logical_key`] of winit's logical key, then of the
+//! modifier-free key) and `physical_key` the physical one ([`egui_key`]). When the layout's key
+//! has no egui equivalent (non-Latin layouts, AZERTY's digit row) or no logical key was
+//! recorded (legacy `inject_key_*` events), the physical key is used for both — so `Ctrl/Cmd+Z`
+//! undoes with the key labelled Z (physical `KeyW` on AZERTY), and on a Cyrillic layout with the
+//! key in Z's position. A key's release reuses the egui key of its press. Hotkeys read from
+//! egui (`key_pressed(egui::Key::M)`) therefore fire on the key labelled M; to compare them
+//! with physical-key bindings, translate with [`physical_key_for_egui_key`].
+//!
 //! `Input` drops the OS's key repeats (a held key is simply "pressed"), but egui text fields
 //! only act on key *presses*, so held editing/navigation keys ([`REPEAT_KEYS`]: Backspace,
 //! Delete, arrows, Home/End, ...) get synthesized repeat presses: after [`REPEAT_DELAY`]
@@ -12,7 +22,119 @@
 //! deterministic under `App::step_ticks`.
 
 use space3d_core::glam::Vec2;
-use space3d_platform::{Input, KeyCode, MouseButton};
+use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton, NamedKey, is_writing_system_key, writing_system_keys};
+
+/// Map a logical (layout) key to an egui key — the mapping egui-winit uses: characters by
+/// [`egui::Key::from_name`] (`"z"` → `Z`, `"?"` → `Questionmark`), named keys (Enter, arrows,
+/// F-keys, ...) directly; `None` for dead keys, modifiers and characters egui has no key for
+/// (`"é"`, `"я"`).
+pub fn egui_logical_key(key: &LogicalKey) -> Option<egui::Key> {
+    match key {
+        LogicalKey::Named(named) => egui_named_key(*named),
+        LogicalKey::Character(s) => egui::Key::from_name(s.as_str()),
+        LogicalKey::Unidentified(_) | LogicalKey::Dead(_) => None,
+    }
+}
+
+fn egui_named_key(key: NamedKey) -> Option<egui::Key> {
+    use NamedKey as N;
+    use egui::Key as E;
+    Some(match key {
+        N::Enter => E::Enter,
+        N::Tab => E::Tab,
+        N::ArrowDown => E::ArrowDown,
+        N::ArrowLeft => E::ArrowLeft,
+        N::ArrowRight => E::ArrowRight,
+        N::ArrowUp => E::ArrowUp,
+        N::End => E::End,
+        N::Home => E::Home,
+        N::PageDown => E::PageDown,
+        N::PageUp => E::PageUp,
+        N::Backspace => E::Backspace,
+        N::Delete => E::Delete,
+        N::Insert => E::Insert,
+        N::Escape => E::Escape,
+        N::Cut => E::Cut,
+        N::Copy => E::Copy,
+        N::Paste => E::Paste,
+        N::Space => E::Space,
+        N::F1 => E::F1,
+        N::F2 => E::F2,
+        N::F3 => E::F3,
+        N::F4 => E::F4,
+        N::F5 => E::F5,
+        N::F6 => E::F6,
+        N::F7 => E::F7,
+        N::F8 => E::F8,
+        N::F9 => E::F9,
+        N::F10 => E::F10,
+        N::F11 => E::F11,
+        N::F12 => E::F12,
+        N::F13 => E::F13,
+        N::F14 => E::F14,
+        N::F15 => E::F15,
+        N::F16 => E::F16,
+        N::F17 => E::F17,
+        N::F18 => E::F18,
+        N::F19 => E::F19,
+        N::F20 => E::F20,
+        N::F21 => E::F21,
+        N::F22 => E::F22,
+        N::F23 => E::F23,
+        N::F24 => E::F24,
+        N::F25 => E::F25,
+        N::F26 => E::F26,
+        N::F27 => E::F27,
+        N::F28 => E::F28,
+        N::F29 => E::F29,
+        N::F30 => E::F30,
+        N::F31 => E::F31,
+        N::F32 => E::F32,
+        N::F33 => E::F33,
+        N::F34 => E::F34,
+        N::F35 => E::F35,
+        N::BrowserBack => E::BrowserBack,
+        _ => return None,
+    })
+}
+
+/// The egui key for a press of physical `code`: the logical key of the frame's last press
+/// event of `code` (winit's logical key first, like egui-winit, then the modifier-free key —
+/// which still names the layout's letter when Option/AltGr changed the character), else the
+/// physical key.
+fn press_key(input: &Input, code: KeyCode) -> Option<egui::Key> {
+    let event = input
+        .key_events()
+        .iter()
+        .rev()
+        .find(|e| e.physical == code && e.pressed);
+    event
+        .and_then(|e| {
+            egui_logical_key(&e.logical_key).or_else(|| e.key_without_modifiers.as_ref().and_then(egui_logical_key))
+        })
+        .or_else(|| egui_key(code))
+}
+
+/// The physical key that sends `key` to egui on the player's current layout when pressed
+/// without modifiers — the inverse of the translation above. Relates egui key reads
+/// (`i.key_pressed(egui::Key::M)`) to physical-key bindings ([`space3d_platform::Binding::Key`],
+/// [`Input::pressed`]): on AZERTY egui's `M` is `KeyCode::Semicolon`, on Dvorak `G` is
+/// `KeyCode::KeyU`, on QWERTY and QWERTZ it is `KeyCode::KeyM`.
+///
+/// It is the writing-system key whose layout label ([`Input::key_label`]) egui reads as
+/// `key`; else the physical key [`egui_key`] maps to `key`, unless the layout makes that key
+/// send another egui key (a label egui has no key for, such as Cyrillic `я` in Z's position,
+/// still sends the physical key's). `None` when the layout moved `key` to a position whose
+/// label is still unknown (no OS table, key not pressed yet), or no key sends it.
+pub fn physical_key_for_egui_key(input: &Input, key: egui::Key) -> Option<KeyCode> {
+    let sends = |label: String| egui_logical_key(&LogicalKey::Character(label.into()));
+    if let Some(code) = writing_system_keys().find(|&k| input.key_label(k).and_then(sends) == Some(key)) {
+        return Some(code);
+    }
+    KEYS.iter().copied().find(|&code| {
+        egui_key(code) == Some(key) && (!is_writing_system_key(code) || input.key_label(code).and_then(sends).is_none())
+    })
+}
 
 /// Map a physical key to the egui key it produces (US layout for punctuation).
 pub fn egui_key(code: KeyCode) -> Option<egui::Key> {
@@ -293,6 +415,8 @@ pub(crate) struct InputTranslator {
     pointer_touch: Option<u64>,
     /// Held [`REPEAT_KEYS`] and the time of their next synthesized repeat.
     repeats: Vec<(KeyCode, f64)>,
+    /// Held keys and the egui key their press was sent as (the release and repeats reuse it).
+    held: Vec<(KeyCode, egui::Key)>,
 }
 
 impl InputTranslator {
@@ -362,13 +486,36 @@ impl InputTranslator {
             });
         }
 
-        // Keys (+ clipboard shortcuts).
-        for &code in KEYS {
+        // Keys (+ clipboard shortcuts): the physical keys egui knows, then any other key that
+        // produced an event this frame (its logical key may still be one egui knows).
+        let mut extra: Vec<KeyCode> = Vec::new();
+        for e in input.key_events() {
+            if !KEYS.contains(&e.physical) && !extra.contains(&e.physical) {
+                extra.push(e.physical);
+            }
+        }
+        for code in KEYS.iter().copied().chain(extra) {
             let (down, up) = (input.just_pressed(code), input.just_released(code));
             if !down && !up {
                 continue;
             }
-            let Some(key) = egui_key(code) else { continue };
+            let physical_key = egui_key(code);
+            let held = self.held.iter().position(|(k, _)| *k == code);
+            let key = if down {
+                let key = press_key(input, code);
+                if let Some(i) = held {
+                    self.held.remove(i);
+                }
+                if let Some(key) = key
+                    && !up
+                {
+                    self.held.push((code, key));
+                }
+                key
+            } else {
+                held.map(|i| self.held.remove(i).1).or_else(|| press_key(input, code))
+            };
+            let Some(key) = key else { continue };
             if down && mods.command {
                 match key {
                     egui::Key::C => {
@@ -392,7 +539,7 @@ impl InputTranslator {
                 if (pressed && down) || (!pressed && up) {
                     out.push(egui::Event::Key {
                         key,
-                        physical_key: Some(key),
+                        physical_key,
                         pressed,
                         repeat: false,
                         modifiers: mods,
@@ -483,7 +630,9 @@ impl InputTranslator {
             if !input.pressed(code) {
                 continue;
             }
-            let Some(key) = egui_key(code) else { continue };
+            let physical_key = egui_key(code);
+            let held = self.held.iter().find(|(k, _)| *k == code).map(|h| h.1);
+            let Some(key) = held.or(physical_key) else { continue };
             let Some(i) = self.repeats.iter().position(|(k, _)| *k == code) else {
                 // Newly held (or held before the UI started): repeat after the delay.
                 self.repeats.push((code, time + REPEAT_DELAY));
@@ -494,7 +643,7 @@ impl InputTranslator {
             while time >= *next && n < MAX_REPEATS_PER_FRAME {
                 out.push(egui::Event::Key {
                     key,
-                    physical_key: Some(key),
+                    physical_key,
                     pressed: true,
                     repeat: true,
                     modifiers: mods,
@@ -513,6 +662,7 @@ impl InputTranslator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use space3d_platform::NamedKey;
 
     fn repeats(ev: &[egui::Event], key: egui::Key) -> usize {
         ev.iter()
@@ -572,6 +722,224 @@ mod tests {
         ev.clear();
         t.translate(&input, 1.0, frame_time + 7.1, "", &mut ev);
         assert_eq!(repeats(&ev, egui::Key::Backspace), 0);
+    }
+
+    fn ch(s: &str) -> LogicalKey {
+        LogicalKey::Character(s.into())
+    }
+
+    /// `(key, physical_key, pressed)` of every `Event::Key` in `ev`.
+    fn keys(ev: &[egui::Event]) -> Vec<(egui::Key, Option<egui::Key>, bool)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    ..
+                } => Some((*key, *physical_key, *pressed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn translate_frame(t: &mut InputTranslator, input: &mut Input, clipboard: &str) -> Vec<egui::Event> {
+        let mut ev = Vec::new();
+        t.translate(input, 1.0, 0.0, clipboard, &mut ev);
+        input.end_frame();
+        ev
+    }
+
+    #[test]
+    fn logical_key_mapping_matches_egui_winit() {
+        use egui::Key as E;
+        assert_eq!(egui_logical_key(&ch("z")), Some(E::Z));
+        assert_eq!(egui_logical_key(&ch("Z")), Some(E::Z));
+        assert_eq!(egui_logical_key(&ch("?")), Some(E::Questionmark));
+        assert_eq!(egui_logical_key(&ch(":")), Some(E::Colon));
+        assert_eq!(egui_logical_key(&ch("+")), Some(E::Plus));
+        assert_eq!(egui_logical_key(&ch("é")), None);
+        assert_eq!(egui_logical_key(&ch("я")), None);
+        assert_eq!(egui_logical_key(&LogicalKey::Named(NamedKey::Enter)), Some(E::Enter));
+        assert_eq!(egui_logical_key(&LogicalKey::Named(NamedKey::F5)), Some(E::F5));
+        assert_eq!(egui_logical_key(&LogicalKey::Named(NamedKey::Shift)), None);
+        assert_eq!(egui_logical_key(&LogicalKey::Dead(Some('^'))), None);
+    }
+
+    #[test]
+    fn egui_gets_the_logical_key_and_the_physical_key() {
+        use egui::Key as E;
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        // (physical key, modifier-free key, logical key if different, egui key, egui physical key)
+        type Case = (KeyCode, LogicalKey, Option<LogicalKey>, E, Option<E>);
+        let cases: [Case; 9] = [
+            // AZERTY: QWERTY's W position is labelled Z.
+            (KeyCode::KeyW, ch("z"), None, E::Z, Some(E::W)),
+            // QWERTZ: QWERTY's Y position is labelled Z.
+            (KeyCode::KeyY, ch("z"), None, E::Z, Some(E::Y)),
+            // Dvorak: QWERTY's period position types "v".
+            (KeyCode::Period, ch("v"), None, E::V, Some(E::Period)),
+            // JIS: QWERTY's quote position types ":".
+            (KeyCode::Quote, ch(":"), None, E::Colon, Some(E::Quote)),
+            // AZERTY digit row types "&": egui has no such key, the physical key is used.
+            (KeyCode::Digit1, ch("&"), None, E::Num1, Some(E::Num1)),
+            // Cyrillic: non-Latin letters fall back to the physical key (Ctrl+Z still works).
+            (KeyCode::KeyZ, ch("я"), None, E::Z, Some(E::Z)),
+            // US Shift+/: the shifted logical key, like egui-winit.
+            (KeyCode::Slash, ch("/"), Some(ch("?")), E::Questionmark, Some(E::Slash)),
+            // macOS AZERTY Option+(labelled W): logical "Ω", the modifier-free key names W.
+            (KeyCode::KeyZ, ch("w"), Some(ch("Ω")), E::W, Some(E::Z)),
+            // A key egui has no physical key for, whose character it knows (JIS ろ).
+            (KeyCode::IntlRo, ch("\\"), None, E::Backslash, None),
+        ];
+        for (code, key, logical, want, want_physical) in cases {
+            let mut press = space3d_platform::KeyEvent::press(code, key.clone());
+            if let Some(l) = logical {
+                press = press.with_logical_key(l);
+            }
+            input.inject_key_event(press);
+            input.inject_key_up_logical(code, key);
+            let ev = translate_frame(&mut t, &mut input, "");
+            assert_eq!(
+                keys(&ev),
+                vec![(want, want_physical, true), (want, want_physical, false)],
+                "{code:?}"
+            );
+        }
+        // Legacy injection (no logical key): physical for both.
+        input.inject_key_tap(KeyCode::KeyW);
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(keys(&ev), vec![(E::W, Some(E::W), true), (E::W, Some(E::W), false)]);
+    }
+
+    #[test]
+    fn release_matches_its_press() {
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        // US: Shift, then "/" pressed as "?"; Shift released before the key.
+        input.inject_key_down(KeyCode::ShiftLeft);
+        input.inject_key_event(space3d_platform::KeyEvent::press(KeyCode::Slash, ch("/")).with_logical_key(ch("?")));
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(
+            keys(&ev),
+            vec![
+                (egui::Key::Questionmark, Some(egui::Key::Slash), true),
+                (egui::Key::ShiftLeft, Some(egui::Key::ShiftLeft), true)
+            ]
+        );
+        input.inject_key_up(KeyCode::ShiftLeft);
+        translate_frame(&mut t, &mut input, "");
+        input.inject_key_up_logical(KeyCode::Slash, ch("/"));
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(
+            keys(&ev),
+            vec![(egui::Key::Questionmark, Some(egui::Key::Slash), false)],
+            "egui sees the key it saw pressed go up"
+        );
+    }
+
+    #[test]
+    fn clipboard_shortcuts_follow_the_layout() {
+        let cmd = if cfg!(any(target_os = "macos", target_os = "ios")) {
+            KeyCode::SuperLeft
+        } else {
+            KeyCode::ControlLeft
+        };
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_key_down(cmd);
+        // Dvorak: "v" is on QWERTY's period position; QWERTY's V position types "k".
+        input.inject_key_tap_logical(KeyCode::Period, ch("v"));
+        let ev = translate_frame(&mut t, &mut input, "clip");
+        assert!(ev.contains(&egui::Event::Paste("clip".into())), "{ev:?}");
+        assert!(
+            !ev.iter().any(|e| matches!(e, egui::Event::Text(_))),
+            "no text under Cmd"
+        );
+        input.inject_key_tap_logical(KeyCode::KeyV, ch("k"));
+        let ev = translate_frame(&mut t, &mut input, "clip");
+        assert!(!ev.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+        assert_eq!(keys(&ev)[0].0, egui::Key::K);
+        // AZERTY: "c" and "x" keep their QWERTY positions.
+        input.inject_key_tap_logical(KeyCode::KeyC, ch("c"));
+        input.inject_key_tap_logical(KeyCode::KeyX, ch("x"));
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert!(ev.contains(&egui::Event::Copy) && ev.contains(&egui::Event::Cut));
+    }
+
+    #[test]
+    fn physical_key_for_egui_key_inverts_the_translation() {
+        use egui::Key as E;
+        type Layout = &'static [(KeyCode, &'static str)];
+        type Expected = &'static [(E, Option<KeyCode>)];
+        // (layout, keys taught, egui key → expected physical key)
+        let cases: [(&str, Layout, Expected); 6] = [
+            (
+                "unknown (US assumed)",
+                &[],
+                &[(E::M, Some(KeyCode::KeyM)), (E::G, Some(KeyCode::KeyG))],
+            ),
+            (
+                "AZERTY",
+                &[(KeyCode::Semicolon, "m"), (KeyCode::KeyM, ","), (KeyCode::KeyW, "z")],
+                &[
+                    (E::M, Some(KeyCode::Semicolon)),
+                    (E::Comma, Some(KeyCode::KeyM)),
+                    (E::Z, Some(KeyCode::KeyW)),
+                    (E::L, Some(KeyCode::KeyL)),
+                ],
+            ),
+            (
+                "AZERTY, M's position not seen yet",
+                &[(KeyCode::KeyM, ",")],
+                &[(E::M, None)],
+            ),
+            (
+                "Dvorak",
+                &[
+                    (KeyCode::KeyU, "g"),
+                    (KeyCode::KeyP, "l"),
+                    (KeyCode::KeyG, "i"),
+                    (KeyCode::KeyL, "n"),
+                ],
+                &[(E::G, Some(KeyCode::KeyU)), (E::L, Some(KeyCode::KeyP))],
+            ),
+            (
+                "Cyrillic",
+                &[(KeyCode::KeyM, "ь"), (KeyCode::KeyZ, "я")],
+                &[(E::M, Some(KeyCode::KeyM)), (E::Z, Some(KeyCode::KeyZ))],
+            ),
+            (
+                "named keys",
+                &[],
+                &[
+                    (E::Enter, Some(KeyCode::Enter)),
+                    (E::Escape, Some(KeyCode::Escape)),
+                    (E::F1, Some(KeyCode::F1)),
+                ],
+            ),
+        ];
+        for (name, taught, expected) in cases {
+            let mut input = Input::default();
+            for &(code, c) in taught {
+                input.inject_key_tap_logical(code, ch(c));
+            }
+            input.end_frame();
+            for &(key, want) in expected {
+                assert_eq!(physical_key_for_egui_key(&input, key), want, "{name}: {key:?}");
+                // Pressing that key sends `key` to egui.
+                let Some(code) = want else { continue };
+                let label = input.key_label(code).filter(|_| is_writing_system_key(code));
+                let mut t = InputTranslator::default();
+                match label {
+                    Some(l) => input.inject_key_tap_logical(code, ch(&l)),
+                    None => input.inject_key_tap(code),
+                }
+                let ev = translate_frame(&mut t, &mut input, "");
+                assert_eq!(keys(&ev)[0].0, key, "{name}: {code:?} sends {key:?}");
+            }
+        }
     }
 
     #[test]

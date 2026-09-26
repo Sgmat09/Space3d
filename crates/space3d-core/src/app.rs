@@ -175,6 +175,7 @@ impl App {
     /// Advance one frame by real `dt`, running as many fixed ticks as fit.
     pub fn update(&mut self, dt: Duration) {
         let _span = tracing::trace_span!("frame").entered();
+        let work_start = Instant::now();
         if !self.started {
             self.started = true;
             self.run_stage(Stage::Startup);
@@ -215,6 +216,7 @@ impl App {
         self.run_stage(Stage::PostUpdate);
         self.run_stage(Stage::Render);
         self.run_stage(Stage::Last);
+        self.resources.expect_mut::<Time>().update_duration = work_start.elapsed();
     }
 
     /// Deterministically run exactly `n` fixed ticks (one frame each). For tests/replays.
@@ -226,20 +228,90 @@ impl App {
     }
 }
 
-/// Default runner: real-time loop without a window, until [`AppExit`].
+/// Environment variable selecting [`HeadlessPacing::Unpaced`] for [`headless_runner`]
+/// (`1`/`true`/`yes`/`on`).
+pub const ENV_HEADLESS_UNPACED: &str = "SPACE3D_HEADLESS_UNPACED";
+
+/// How [`headless_runner`] paces frames. Insert as a resource before [`App::run`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeadlessPacing {
+    /// Real time: one frame per fixed step, paced against deadlines so OS sleep overshoot
+    /// (4–5 ms on macOS) does not accumulate. Frame-to-frame `Time::delta` reflects wall
+    /// time; use `Time::update_duration` for the actual CPU work of a frame.
+    #[default]
+    Realtime,
+    /// As fast as possible: no sleeping, and every frame advances time by exactly one fixed
+    /// step (deterministic; for soak tests, profiling and headless benchmarks). Also selected
+    /// by [`ENV_HEADLESS_UNPACED`].
+    Unpaced,
+}
+
+impl HeadlessPacing {
+    /// The pacing for `app`: the resource if present, else [`ENV_HEADLESS_UNPACED`].
+    pub fn for_app(app: &App) -> Self {
+        if let Some(p) = app.resources.get::<HeadlessPacing>() {
+            return *p;
+        }
+        let unpaced = std::env::var(ENV_HEADLESS_UNPACED)
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if unpaced { Self::Unpaced } else { Self::Realtime }
+    }
+}
+
+/// Deadline pacing for real-time loops: frame `n` is due at `start + n × step`, so a late
+/// wake-up shortens the next sleep instead of delaying every later frame.
+#[derive(Clone, Copy, Debug)]
+pub struct Pacer {
+    deadline: Instant,
+}
+
+impl Pacer {
+    /// Frames beyond this many steps behind are dropped (the loop resynchronises instead of
+    /// running a burst of catch-up frames).
+    pub const MAX_LAG_STEPS: u32 = 4;
+
+    pub fn new(start: Instant) -> Self {
+        Self { deadline: start }
+    }
+
+    /// Call after a frame finished at `now`: how long to sleep before the next one.
+    pub fn next_sleep(&mut self, now: Instant, step: Duration) -> Option<Duration> {
+        self.deadline += step;
+        if self.deadline > now {
+            Some(self.deadline - now)
+        } else {
+            if now - self.deadline > step * Self::MAX_LAG_STEPS {
+                self.deadline = now;
+            }
+            None
+        }
+    }
+}
+
+/// Default runner: loop without a window until [`AppExit`], paced per [`HeadlessPacing`]
+/// (real time by default).
 pub fn headless_runner(mut app: App) {
+    let pacing = HeadlessPacing::for_app(&app);
     let mut last = Instant::now();
+    let mut pacer = Pacer::new(last);
     loop {
+        let step = app.resources.expect::<TickRate>().step();
+        if pacing == HeadlessPacing::Unpaced {
+            app.update(step);
+            if app.should_exit() {
+                break;
+            }
+            continue;
+        }
         let now = Instant::now();
         app.update(now - last);
         last = now;
         if app.should_exit() {
             break;
         }
-        let step = app.resources.expect::<TickRate>().step();
-        let spent = Instant::now() - now;
-        if spent < step {
-            std::thread::sleep(step - spent);
+        if let Some(sleep) = pacer.next_sleep(Instant::now(), step) {
+            std::thread::sleep(sleep);
         }
     }
 }
@@ -342,6 +414,66 @@ mod tests {
         app.step_ticks(1);
         let g = app.world.get::<&GlobalTransform>(child).unwrap().0;
         assert_eq!(g.w_axis.truncate(), glam::Vec3::new(1.0, 2.0, 0.0));
+    }
+
+    #[test]
+    fn update_duration_measures_the_frame_work() {
+        let mut app = App::new();
+        app.add_system(Stage::Update, |_| std::thread::sleep(Duration::from_millis(3)));
+        app.step_ticks(2);
+        assert!(app.resources.expect::<Time>().update_duration >= Duration::from_millis(3));
+    }
+
+    #[test]
+    fn pacer_absorbs_oversleep_and_resyncs_when_far_behind() {
+        let step = Duration::from_millis(10);
+        let t0 = Instant::now();
+        let mut p = Pacer::new(t0);
+        // Frame took 2 ms: sleep the remaining 8.
+        assert_eq!(
+            p.next_sleep(t0 + Duration::from_millis(2), step),
+            Some(Duration::from_millis(8))
+        );
+        // Woke 5 ms late (overslept) and worked 2 ms: the next sleep is shortened to 3 ms,
+        // so frames stay on the 10 ms grid instead of drifting to 15 ms.
+        assert_eq!(
+            p.next_sleep(t0 + Duration::from_millis(17), step),
+            Some(Duration::from_millis(3))
+        );
+        // Way behind (a 200 ms hitch): no sleep, and the grid restarts from now.
+        assert_eq!(p.next_sleep(t0 + Duration::from_millis(230), step), None);
+        assert_eq!(
+            p.next_sleep(t0 + Duration::from_millis(231), step),
+            Some(Duration::from_millis(9))
+        );
+    }
+
+    #[test]
+    fn unpaced_runner_is_fast_and_steps_exactly() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Option<(u64, Duration)>>> = Arc::default();
+        let out = seen.clone();
+        let mut app = App::new().with_tickrate(60.0);
+        app.insert_resource(HeadlessPacing::Unpaced);
+        app.init_resource::<Counter>();
+        app.add_system(Stage::Update, move |c| {
+            let k = c.resources.expect_mut::<Counter>();
+            k.frames += 1;
+            if k.frames == 600 {
+                let t = c.resources.expect::<Time>();
+                *out.lock().unwrap() = Some((t.tick, t.elapsed));
+                c.send(AppExit);
+            }
+        });
+        let started = Instant::now();
+        headless_runner(app); // the real runner
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "unpaced run must not sleep 10 s of game time"
+        );
+        let (tick, elapsed) = seen.lock().unwrap().expect("ran 600 frames");
+        assert_eq!(tick, 600);
+        assert_eq!(elapsed, TickRate::new(60.0).step() * 600);
     }
 
     struct P;

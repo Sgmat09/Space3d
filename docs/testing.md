@@ -57,6 +57,24 @@ app.play(&script);
 Because simulation runs on fixed ticks, the same script always gives the same result —
 `assert_deterministic` runs two apps in lockstep and compares world fingerprints every tick.
 
+Keyboard layouts: `tap_key`/`inject_key_*` press physical keys only. To test what a player on
+another layout sees (UI shortcuts, typed text, key labels), inject the logical key too — the
+same `KeyEvent` the window runner records ([Keyboard layouts](platforms.md#keyboard-layouts)):
+
+```rust
+let input = app.input();                           // &mut space3d_platform::Input
+// AZERTY: the key labelled Z sits in QWERTY's W position.
+input.inject_key_tap_logical(KeyCode::KeyW, LogicalKey::Character("z".into()));
+input.inject_key_event(KeyEvent::press(KeyCode::Digit2, LogicalKey::Character("é".into()))
+    .with_logical_key(LogicalKey::Character("2".into())));   // with Shift held
+assert_eq!(input.key_cap(KeyCode::KeyW), "Z");     // learned from the event
+```
+
+Tests on libtest threads never read the developer's own layout on macOS (Text Input Sources
+are main-thread only), so learned labels keep them deterministic. The OS tables themselves are
+tested on the main thread by `crates/space3d-platform/tests/os_layout.rs`, a custom harness
+(`harness = false`); it skips on macOS without a GUI login session.
+
 ## Golden screenshots
 
 ```rust
@@ -123,6 +141,20 @@ RenderBudget::new()
 
 `space3d_test::install_counting_allocator!();` (once per test binary) +
 `assert_max_allocations(n, || app.step())` catch per-frame allocations.
+
+### Headless frame timing
+
+The headless runner (no window) paces frames in real time against deadlines: frame *n* is
+due at `start + n × step`, so an OS sleep that overshoots (4–5 ms is common on macOS) shortens
+the next sleep instead of adding to every frame. Frame-to-frame `Time::delta` is therefore
+*pacing* (≈ the fixed step), not cost. To measure what a frame costs:
+
+* read `Time::update_duration` — the CPU time of the previous `App::update` (all stages,
+  excluding any sleep or vsync wait);
+* or run unpaced: `SPACE3D_HEADLESS_UNPACED=1` (or insert `HeadlessPacing::Unpaced` before
+  `App::run`). Frames then run back to back and each advances time by exactly one fixed step,
+  which is deterministic and shows throughput directly (e.g. 600 frames of a 60 Hz game in
+  well under a second).
 
 ## CI
 

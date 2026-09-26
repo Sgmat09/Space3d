@@ -121,6 +121,8 @@ wasm-bindgen = "0.2.128"
 wasm-bindgen-futures = "0.4.78"
 web-sys = "0.3.105"
 js-sys = "0.3.105"
+# Windows keyboard layout labels (space3d-platform); latest stable, already locked via other deps.
+windows-sys = "0.61.2"
 console_error_panic_hook = "0.1.7"
 tracing-wasm = "0.2.1"
 
