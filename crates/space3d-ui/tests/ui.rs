@@ -3,7 +3,7 @@
 //! GPU tests skip (return early) when no adapter is available.
 
 use space3d_core::prelude::*;
-use space3d_platform::{Input, KeyCode, MouseButton};
+use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton};
 use space3d_render::*;
 use space3d_ui::*;
 
@@ -323,4 +323,90 @@ fn console_key_types_into_focused_text_fields() {
     tap_backquote(&mut app);
     assert!(!app.resources.expect::<Console>().visible);
     assert_eq!(app.resources.expect::<String>(), "`", "field untouched meanwhile");
+}
+
+/// The platform's command modifier (Cmd on Apple platforms, Ctrl elsewhere).
+const COMMAND: KeyCode = if cfg!(any(target_os = "macos", target_os = "ios")) {
+    KeyCode::SuperLeft
+} else {
+    KeyCode::ControlLeft
+};
+
+fn ch(s: &str) -> LogicalKey {
+    LogicalKey::Character(s.into())
+}
+
+/// Tap physical `key` typing `c` on the player's layout, one frame.
+fn tap(app: &mut App, key: KeyCode, c: &str) {
+    app.resources.expect_mut::<Input>().inject_key_tap_logical(key, ch(c));
+    app.step_ticks(1);
+}
+
+/// Command + physical `key` (typing `c` on the layout), one frame each for down/tap/up.
+fn command(app: &mut App, key: KeyCode, c: &str) {
+    app.resources.expect_mut::<Input>().inject_key_down(COMMAND);
+    app.step_ticks(1);
+    tap(app, key, c);
+    app.resources.expect_mut::<Input>().inject_key_up(COMMAND);
+    app.step_ticks(1);
+}
+
+/// AZERTY: "azerty" is typed with QWERTY's Q W E R T Y positions.
+const AZERTY_WORD: [(KeyCode, &str); 6] = [
+    (KeyCode::KeyQ, "a"),
+    (KeyCode::KeyW, "z"),
+    (KeyCode::KeyE, "e"),
+    (KeyCode::KeyR, "r"),
+    (KeyCode::KeyT, "t"),
+    (KeyCode::KeyY, "y"),
+];
+
+#[test]
+fn azerty_typing_and_undo_follow_the_layout() {
+    let mut app = text_field_app("");
+    for (key, c) in AZERTY_WORD {
+        tap(&mut app, key, c);
+    }
+    assert_eq!(app.resources.expect::<String>(), "azerty");
+    // Let egui's undoer settle (new undo point after 1 s without changes).
+    app.step_ticks(90);
+    // Command + QWERTY's Z position types "w" on AZERTY: not undo.
+    command(&mut app, KeyCode::KeyZ, "w");
+    assert_eq!(app.resources.expect::<String>(), "azerty", "Cmd+W is not undo");
+    // Command + the key labelled Z (QWERTY's W position): undo, as in native apps.
+    command(&mut app, KeyCode::KeyW, "z");
+    assert_eq!(app.resources.expect::<String>(), "", "Cmd+Z undid the typing");
+    assert_eq!(
+        app.resources.expect::<Input>().key_cap(KeyCode::KeyW),
+        "Z",
+        "key label learned from the events"
+    );
+}
+
+#[test]
+fn azerty_select_all_and_copy_follow_the_layout() {
+    let mut app = text_field_app("");
+    for (key, c) in AZERTY_WORD {
+        tap(&mut app, key, c);
+    }
+    // Command + QWERTY's A position ("q" on AZERTY) does not select all...
+    command(&mut app, KeyCode::KeyA, "q");
+    command(&mut app, KeyCode::KeyC, "c");
+    assert_eq!(app.resources.expect::<EguiContext>().clipboard(), "");
+    // ...Command + the key labelled A (QWERTY's Q position) does.
+    command(&mut app, KeyCode::KeyQ, "a");
+    command(&mut app, KeyCode::KeyC, "c");
+    assert_eq!(app.resources.expect::<EguiContext>().clipboard(), "azerty");
+    assert_eq!(app.resources.expect::<String>(), "azerty", "shortcuts typed nothing");
+}
+
+#[test]
+fn dvorak_paste_follows_the_layout() {
+    let mut app = text_field_app("");
+    app.resources.expect_mut::<EguiContext>().set_clipboard("pasted");
+    // Dvorak: QWERTY's V position types "k"; "v" is on QWERTY's period position.
+    command(&mut app, KeyCode::KeyV, "k");
+    assert_eq!(app.resources.expect::<String>(), "");
+    command(&mut app, KeyCode::Period, "v");
+    assert_eq!(app.resources.expect::<String>(), "pasted");
 }
