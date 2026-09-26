@@ -543,6 +543,65 @@ fn static_scene_uploads_nothing_with_shadows() {
     assert_eq!(stats(&app).textures_created, 0);
 }
 
+/// Every material feature at once — maps (normal, ORM, emissive), a skybox, image-based
+/// lighting with Standard shading, the shadow, alpha-masked, blended and additive materials,
+/// post-processing — renders the same image twice in one app and in a second app built the
+/// same way (graphics spec §4.3).
+#[test]
+fn render_to_image_is_deterministic_with_all_features() {
+    let build = || -> Option<App> {
+        let mut app = app_with(4)?;
+        app.resources.expect_mut::<LightingSettings>().shading = ShadingModel::Standard;
+        let cube = ground_scene(&mut app, grey());
+        let a = app.resources.expect_mut::<RenderAssets>();
+        let faces = std::array::from_fn(|i| ImageData::filled(16, 16, [30 + 30 * i as u8, 60, 120, 255]));
+        let sky = a.add_cubemap(CubemapSource::from_faces(faces).unwrap());
+        let normal = a.add_image_linear(ImageData::checker(8, 2, [150, 110, 240, 255], [110, 150, 240, 255]));
+        let orm = a.add_image_linear(ImageData::filled(4, 4, [230, 120, 200, 255]));
+        let glow = a.add_image(ImageData::checker(8, 2, [255, 140, 20, 255], [0, 0, 0, 255]));
+        let mask = a.add_image(ImageData::checker(8, 2, [255, 255, 255, 255], [255, 255, 255, 0]));
+        let hull = Material::srgb(0.7, 0.72, 0.75)
+            .with_normal_map(normal, 1.0)
+            .with_orm_map(orm)
+            .with_emissive_map(glow, Vec3::splat(2.0));
+        for (i, m) in [
+            hull.clone(),
+            Material::srgb(0.8, 0.8, 0.8).with_texture(mask).with_alpha_mask(0.5),
+            Material::color(Vec4::new(0.2, 0.6, 1.0, 0.4)).with_blend(BlendMode::AlphaBlend),
+            Material::additive(Vec4::new(1.0, 0.4, 0.1, 1.0)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.world
+                .spawn((Transform::from_xyz(i as f32 * 1.6 - 2.4, 1.0, 0.5), Mesh3d(cube), m));
+        }
+        sun(&mut app, SUN, Some(shadow()));
+        let camera = app
+            .world
+            .query::<(Entity, &Camera3d)>()
+            .iter()
+            .map(|(e, _)| e)
+            .next()
+            .unwrap();
+        app.world
+            .insert(
+                camera,
+                (Skybox::new(sky), EnvironmentLight::new(sky), PostProcess::default()),
+            )
+            .unwrap();
+        Some(app)
+    };
+    let Some(mut a) = build() else { return };
+    let first = render(&mut a);
+    let again = render(&mut a);
+    assert_eq!(diff_fraction(&first, &again, 0), 0.0, "twice in one app");
+    let mut b = build().unwrap();
+    let other = render(&mut b);
+    assert_eq!(diff_fraction(&first, &other, 0), 0.0, "a second app");
+    assert_eq!(stats(&b).depth_views, 1);
+}
+
 /// Perf gate "shadow 2048², 100k instanced casters ≤ 0.30 ms" (graphics spec §4.4): the
 /// `shadow` pass (GPU timestamps) of 100 000 cube entities (one instanced batch) all inside the
 /// map (a 400 × 400 field under a top-down camera), with the default filter; median of 120

@@ -1686,6 +1686,9 @@ mod material_tests {
         crate::render_to_image(&mut app).unwrap();
         let r = app.resources.expect::<crate::Renderer>();
         assert_eq!(r.pipelines.pipeline_counts(), counts, "the frame built no pipeline");
+        // Within the pipeline budget of spec §3.5 (forward ≤ 30, depth/shadow ≤ 6) with four
+        // blend classes, maps, a texture array and a shadow.
+        assert!(counts.0 <= 30 && counts.1 <= 6, "{counts:?}");
         assert_eq!(r.gpu_error_count(), 0);
     }
 }
