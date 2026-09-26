@@ -8,47 +8,70 @@
 //! (exposure, tonemapping, dither, alpha, rect mapping, upscale; `chain.rs`,
 //! `shaders/post/composite.wgsl`); the post milestones add the effects: bloom (PO1,
 //! `bloom.rs`), FXAA (`fxaa.rs`) and the vignette, chromatic aberration and film grain in the
-//! composite (PO3); auto exposure, grading and the distortion apply are `STUB(P-POST)` until
-//! PO2, PO4 and PO5. Distortion buffers are real (the frame's Distortion phase plumbing, F5,
-//! clears and writes them).
+//! composite (PO3), auto exposure (PO2, `exposure.rs`, read back by `readback.rs`) and color
+//! grading with 3D LUTs and WGSL hooks in the composite (PO4, `grading.rs`, `lut.rs`), and
+//! distortion (PO5): the frame's Distortion phase (F5) clears each post group's persistent
+//! distortion buffer and draws the writers into it — `DistortionMaterial` meshes through the
+//! built-in node (`distortion_mesh.rs`), particles and user nodes through `DISTORTION_WGSL` —
+//! and the composite samples the scene, its chromatic split and the bloom where the buffer
+//! points.
 
 pub(crate) mod api;
 mod bloom;
 mod chain;
 mod distortion_mesh;
+mod exposure;
 mod fxaa;
+mod grading;
+mod lut;
+mod readback;
 
+use crate::assets::RenderAssets;
 use crate::caps::GraphicsCaps;
 use crate::frame::PoolDesc;
 use crate::gpu::{TrackedBuffer, Uploader};
-use crate::handles::FastMap;
+use crate::handles::{FastMap, ShaderHandle, TextureHandle};
 use crate::node::{FULLSCREEN_WGSL, FrameInfo, FrameMode, RenderNodes};
 use crate::output::{HASH_WGSL, OUTPUT_WGSL, OutputEncoding};
 use crate::settings::FrameSettings;
+use crate::shader::CustomShader;
 use crate::stats::RenderStats;
-use api::{AntiAliasing, BloomComposite, DISTORTION_FORMAT, DistortionResolution, FxaaQuality, PostProcess};
+use api::{AntiAliasing, BloomComposite, ColorLut, DISTORTION_FORMAT, DistortionResolution, FxaaQuality, PostProcess};
 use bloom::{BloomPlan, BloomState};
-use chain::{GpuPost, SeedKey};
+use chain::{CompositePlan, GpuPost, SeedKey};
+use exposure::{MeterPath, MeterPlan, Meters};
 use fxaa::{FxaaModules, LDR_FORMAT};
+use readback::ExposureReadback;
 use space3d_core::{Entity, World};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Source of the composite pass (`shaders/post/composite.wgsl` after the output tail, the hash
-/// functions and the full-screen triangle).
+/// functions and the full-screen triangle; its `//#HOOKS` marker takes the grading hooks).
 pub(crate) const COMPOSITE_WGSL: &str = include_str!("../shaders/post/composite.wgsl");
 
+/// The composite source with identity grading hooks.
 pub(crate) fn composite_source() -> String {
-    format!("{OUTPUT_WGSL}\n{HASH_WGSL}\n{FULLSCREEN_WGSL}\n{COMPOSITE_WGSL}")
+    composite_source_with(None)
 }
+
+/// The composite source with the grading hooks of `hook` (identity for the ones it lacks).
+pub(crate) fn composite_source_with(hook: Option<&CustomShader>) -> String {
+    let composite = COMPOSITE_WGSL.replace("//#HOOKS", &grading::hooks_wgsl(hook));
+    format!("{OUTPUT_WGSL}\n{HASH_WGSL}\n{FULLSCREEN_WGSL}\n{composite}")
+}
+
+/// A grading hook's (shader, version).
+type HookKey = (ShaderHandle, u32);
+
+/// Generations of a composite input bind group's textures: scene, distortion buffer, bloom
+/// chain, exposure, LUT (0: the dummy).
+type InputsKey = (u64, u64, u64, u64, u64);
 
 /// One post group of the frame plan (graphics spec §1.3): the settings camera, its rect and the
 /// storage of its target group.
 pub(crate) struct PostGroupPlan {
     /// The settings camera (highest-order post camera of the rect).
-    #[allow(
-        dead_code,
-        reason = "graphics contract (spec §2.6): per-camera history of the post area"
-    )]
     pub camera: Entity,
     pub settings: PostProcess,
     pub mode: FrameMode,
@@ -99,6 +122,9 @@ pub(crate) struct PostEncode<'a> {
     /// acquired here are released after the group.
     #[allow(dead_code, reason = "the post area's effects (PO1–PO3) acquire pooled textures")]
     pub pool: &'a mut crate::frame::TexturePool,
+    /// GPU timings (`FrameSettings::gpu_timing`): labels `post.exposure`, `post.bloom`,
+    /// `post.composite`, `post.fxaa` (graphics spec §4.4).
+    pub timing: &'a crate::timing::GpuTimer,
 }
 
 /// Inputs of one post group's passes.
@@ -209,12 +235,41 @@ pub(crate) struct PostState {
     /// The post groups' per-frame seeds, a window of frames at a time.
     seeds: SeedWindow,
     /// Input bind groups by (scene-texture generation, distortion-buffer generation or 0,
-    /// bloom-chain generation or 0), with the frame they were last used.
-    inputs_bgs: FastMap<(u64, u64, u64), (wgpu::BindGroup, u64)>,
+    /// bloom-chain generation or 0, exposure-texture generation or 0, LUT generation or 0), with
+    /// the frame they were last used.
+    inputs_bgs: FastMap<InputsKey, (wgpu::BindGroup, u64)>,
     /// Distortion buffers created (generation counter) and created since `end_frame`.
     distortion_generation: u64,
     created: u32,
-    composite: FastMap<(wgpu::TextureFormat, OutputKind), wgpu::RenderPipeline>,
+    /// Composite pipelines by output format, kind and grading hook.
+    composite: FastMap<(wgpu::TextureFormat, OutputKind, Option<HookKey>), wgpu::RenderPipeline>,
+    /// Grading hooks: the current source of each hook shader used, their composite modules, the
+    /// first build error of a version, and pipelines whose validation is still pending
+    /// (browser WebGPU answers error scopes asynchronously).
+    hooks: FastMap<ShaderHandle, (u32, Arc<CustomShader>)>,
+    hook_modules: FastMap<HookKey, wgpu::ShaderModule>,
+    hook_errors: FastMap<ShaderHandle, (u32, String)>,
+    hook_pending: Vec<(HookKey, space3d_tasks::Task<Option<String>>)>,
+    /// LUT strips in use: texture version, view, generation (bind groups), sRGB, and the renderer
+    /// frame last used; LUTs warned about (bad size).
+    luts: FastMap<TextureHandle, LutEntry>,
+    lut_generation: u64,
+    warned_luts: Vec<TextureHandle>,
+    /// Auto exposure: metering state, and the exposure readback.
+    meters: Meters,
+    readback: ExposureReadback,
+    /// `FrameSettings::read_exposure` of this frame.
+    read_exposure: bool,
+    /// Auto-exposure groups metered this frame.
+    metered: usize,
+    /// `FrameInfo::delta` of this frame (auto-exposure adaptation).
+    delta: f32,
+    /// Renderer frames (`begin_frame` calls): eviction clock, never feeds pixels.
+    tick: u64,
+    /// Warned (once) that auto exposure is off in the Ldr fallback / without a float exposure
+    /// format.
+    warned_ldr_exposure: bool,
+    warned_exposure_format: bool,
     fxaa_modules: FxaaModules,
     fxaa: FastMap<(FxaaQuality, wgpu::TextureFormat, OutputKind), wgpu::RenderPipeline>,
     /// FXAA input bind groups by LDR-intermediate generation, with the frame last used.
@@ -237,6 +292,26 @@ struct GroupPost {
     bloom: Option<BloomPlan>,
     /// FXAA after the composite (which then writes the LDR intermediate).
     fxaa: Option<FxaaQuality>,
+    /// Auto-exposure metering before the bloom chain.
+    meter: Option<MeterPlan>,
+    /// The group's rect in `S`, clipped.
+    scene_rect: [u32; 4],
+    /// The LUT strip bound (its handle).
+    lut: Option<TextureHandle>,
+    /// The grading hook compiled into the composite.
+    hook: Option<HookKey>,
+    /// Exposure compensation (stops; readback).
+    compensation: f32,
+}
+
+/// A LUT strip in use (see `PostState::luts`).
+struct LutEntry {
+    version: u32,
+    view: wgpu::TextureView,
+    generation: u64,
+    srgb: bool,
+    size: u32,
+    last_used: u64,
 }
 
 /// The part of `rect` (pixels, unclipped) inside a `size` texture, at least 1×1: `[x, y, w, h]`
@@ -427,6 +502,21 @@ impl PostState {
             seeds: SeedWindow::new(align as u64),
             inputs_bgs: FastMap::default(),
             composite: FastMap::default(),
+            hooks: FastMap::default(),
+            hook_modules: FastMap::default(),
+            hook_errors: FastMap::default(),
+            hook_pending: Vec::new(),
+            luts: FastMap::default(),
+            lut_generation: 0,
+            warned_luts: Vec::new(),
+            meters: Meters::new(align),
+            readback: ExposureReadback::default(),
+            read_exposure: false,
+            metered: 0,
+            delta: 0.0,
+            tick: 0,
+            warned_ldr_exposure: false,
+            warned_exposure_format: false,
             fxaa_modules: FxaaModules::default(),
             fxaa: FastMap::default(),
             fxaa_bgs: FastMap::default(),
@@ -442,9 +532,15 @@ impl PostState {
     }
 
     pub fn begin_frame(&mut self, frame: &FrameInfo, settings: &FrameSettings) {
-        // STUB(P-POST): read_exposure, gpu_timing (PO2, PO6).
         self.frame_caps = self.caps.masked(settings.downlevel);
         self.frame = frame.frame;
+        self.delta = frame.delta;
+        self.tick += 1;
+        self.read_exposure = settings.read_exposure;
+        self.metered = 0;
+        self.meters.begin_frame();
+        self.readback.begin_frame(self.tick);
+        self.poll_hooks();
         self.planned = 0;
         self.params.begin();
         self.seeds.current.clear();
@@ -455,19 +551,56 @@ impl PostState {
     }
 
     /// Step 6: what a post group needs (bloom, auto exposure, FXAA, distortion, depth). Writes
-    /// the group's composite parameters (slot = call order this frame).
-    pub fn plan_group(&mut self, world: &World, group: &PostGroupPlan, reallocs: &mut u32) -> PostGroupNeeds {
-        let _ = world; // STUB(P-POST): distortion writers, auto exposure history
-        let bloom = self.plan_bloom(group, reallocs);
+    /// the group's composite parameters (slot = call order this frame); `assets`: the LUT
+    /// textures and grading hook shaders.
+    pub fn plan_group(
+        &mut self,
+        world: &World,
+        assets: &RenderAssets,
+        group: &PostGroupPlan,
+        reallocs: &mut u32,
+    ) -> PostGroupNeeds {
+        // The Distortion phase's writers are nodes: the frame finds them (`group.distortion`).
+        let _ = world;
+        let s = &group.settings;
+        let effects = !group.passthrough && s.enabled;
+        let scene_rect = clip_rect(group.scene_rect, group.scene_size);
+        let meter = self.plan_exposure(group, scene_rect, reallocs);
+        let bloom = self.plan_bloom(group, meter.is_some(), reallocs);
         // FXAA runs in every mode (display space), never in the passthrough group.
-        let fxaa = match group.settings.anti_aliasing {
-            AntiAliasing::Fxaa(q) if !group.passthrough && group.settings.enabled => Some(q),
+        let fxaa = match s.anti_aliasing {
+            AntiAliasing::Fxaa(q) if effects => Some(q),
             _ => None,
         };
+        let g = &s.color_grading;
+        let lut = g
+            .lut
+            .filter(|_| effects)
+            .and_then(|l| self.plan_lut(assets, &l, reallocs));
+        let hook = g
+            .shader
+            .filter(|_| effects)
+            .and_then(|h| self.plan_hook(assets, h, reallocs));
         let capacity = self.groups.capacity();
-        self.groups.push(GroupPost { bloom, fxaa });
+        self.groups.push(GroupPost {
+            bloom,
+            fxaa,
+            meter,
+            scene_rect,
+            lut: lut.map(|(handle, _, _)| handle),
+            hook,
+            compensation: s.exposure,
+        });
         *reallocs += u32::from(self.groups.capacity() != capacity);
-        let params = GpuPost::new(group, bloom.is_some(), fxaa.is_some());
+        let params = GpuPost::new(
+            group,
+            CompositePlan {
+                bloom: bloom.is_some(),
+                fxaa: fxaa.is_some(),
+                auto_exposure: meter.is_some(),
+                lut: lut.map(|(_, n, srgb)| (n, srgb)),
+            },
+        );
         // Nothing in it changes per frame: a still scene uploads nothing.
         self.params
             .write_at(self.planned * self.slot, bytemuck::bytes_of(&params), reallocs);
@@ -479,16 +612,170 @@ impl PostState {
         self.planned += 1;
         PostGroupNeeds {
             bloom: bloom.is_some(),
+            auto_exposure: meter.is_some(),
             fxaa: fxaa.is_some(),
             distortion: !group.passthrough && group.settings.enabled && group.settings.distortion.enabled,
             ..Default::default()
         }
     }
 
+    /// The auto-exposure metering of a post group this frame (`rect`: its rect in `S`,
+    /// clipped): auto exposure enabled, in Hdr mode (off in the Ldr fallback, warned once; never
+    /// in the passthrough group) where `GraphicsCaps::exposure_format` exists. Cameras without
+    /// it report their manual exposure to `camera_exposure` (with `read_exposure`).
+    fn plan_exposure(&mut self, group: &PostGroupPlan, rect: [u32; 4], reallocs: &mut u32) -> Option<MeterPlan> {
+        let s = &group.settings;
+        let wanted = !group.passthrough && s.enabled && s.auto_exposure.enabled;
+        let path = if !wanted {
+            None
+        } else if group.mode != FrameMode::Hdr {
+            if !self.warned_ldr_exposure {
+                self.warned_ldr_exposure = true;
+                tracing::warn!("auto exposure is off in the Ldr fallback (no float render targets or HdrMode::Ldr)");
+            }
+            None
+        } else {
+            let path = MeterPath::of(&self.frame_caps);
+            if path.is_none() && !self.warned_exposure_format {
+                self.warned_exposure_format = true;
+                tracing::warn!("auto exposure is off: the device renders no float exposure format");
+            }
+            path
+        };
+        let Some(path) = path else {
+            self.meters.disable(group.camera);
+            if self.read_exposure && !group.passthrough {
+                self.readback.set(group.camera, s.exposure);
+            }
+            return None;
+        };
+        self.metered += 1;
+        Some(
+            self.meters
+                .plan(group.camera, rect, &s.auto_exposure, path, self.delta, reallocs),
+        )
+    }
+
+    /// A post group's LUT this frame: `(texture, N, sRGB)` for a single-layer N²×N strip that is
+    /// uploaded (others are ignored, warned once) with a positive contribution.
+    fn plan_lut(
+        &mut self,
+        assets: &RenderAssets,
+        lut: &ColorLut,
+        reallocs: &mut u32,
+    ) -> Option<(TextureHandle, u32, bool)> {
+        if lut.contribution.is_nan() || lut.contribution <= 0.0 {
+            return None;
+        }
+        let t = crate::node::texture_ref(assets, lut.texture)?;
+        let n = lut.size;
+        if t.layered || !(2..=lut::MAX_SIZE).contains(&n) || t.size != (n * n, n) {
+            if !self.warned_luts.contains(&lut.texture) {
+                tracing::warn!(
+                    size = n,
+                    texture = ?t.size,
+                    "color grading LUT ignored: the texture must be one N²×N strip of `ColorLut::size` N (2..=64)"
+                );
+                let capacity = self.warned_luts.capacity();
+                self.warned_luts.push(lut.texture);
+                *reallocs += u32::from(self.warned_luts.capacity() != capacity);
+            }
+            return None;
+        }
+        let tick = self.tick;
+        let srgb = t.format.is_srgb();
+        match self.luts.get_mut(&lut.texture) {
+            Some(e) if e.version == t.version => e.last_used = tick,
+            _ => {
+                self.lut_generation += 1;
+                let capacity = self.luts.capacity();
+                self.luts.insert(
+                    lut.texture,
+                    LutEntry {
+                        version: t.version,
+                        view: t.view,
+                        generation: self.lut_generation,
+                        srgb,
+                        size: n,
+                        last_used: tick,
+                    },
+                );
+                *reallocs += u32::from(self.luts.capacity() != capacity);
+            }
+        }
+        let e = &self.luts[&lut.texture];
+        Some((lut.texture, e.size, e.srgb))
+    }
+
+    /// A post group's grading hook this frame: the shader's current version, unless that version
+    /// failed to build (identity then).
+    fn plan_hook(&mut self, assets: &RenderAssets, handle: ShaderHandle, reallocs: &mut u32) -> Option<HookKey> {
+        let e = assets.shaders.get(handle.raw())?;
+        match self.hooks.get(&handle) {
+            Some((v, _)) if *v == e.version => {}
+            _ => {
+                let capacity = self.hooks.capacity();
+                self.hooks.insert(handle, (e.version, e.shader.clone()));
+                *reallocs += u32::from(self.hooks.capacity() != capacity);
+                // Older versions' pipelines and modules.
+                let version = e.version;
+                self.composite
+                    .retain(|(_, _, h), _| h.is_none_or(|(hh, v)| hh != handle || v == version));
+                self.hook_modules.retain(|(hh, v), _| *hh != handle || *v == version);
+            }
+        }
+        if self.hook_errors.get(&handle).is_some_and(|(v, _)| *v == e.version) {
+            return None;
+        }
+        Some((handle, e.version))
+    }
+
+    /// Resolve grading-hook pipelines whose (asynchronous) validation answered: a failed one is
+    /// reported and replaced by the plain composite from the next plan on.
+    fn poll_hooks(&mut self) {
+        let mut i = 0;
+        while i < self.hook_pending.len() {
+            let (key, task) = &mut self.hook_pending[i];
+            let result = match task.poll() {
+                Some(r) => r,
+                None if task.state() == space3d_tasks::TaskState::Cancelled => None,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let key = *key;
+            self.hook_pending.swap_remove(i);
+            if let Some(e) = result {
+                self.hook_failed(key, e);
+            }
+        }
+    }
+
+    /// Record (and log once) that the grading hook `key` failed to build; drop its pipelines.
+    fn hook_failed(&mut self, (handle, version): HookKey, error: String) {
+        let name = self.hooks.get(&handle).map_or("?", |(_, s)| s.name.as_str());
+        tracing::error!(
+            shader = name,
+            "color grading hook failed to build; grading without it:\n{error}"
+        );
+        self.hook_errors.insert(handle, (version, error));
+        self.composite.retain(|(_, _, h), _| *h != Some((handle, version)));
+        self.hook_modules.remove(&(handle, version));
+    }
+
+    /// Build error of the current version of a grading hook shader (see
+    /// `Renderer::shader_error`).
+    pub fn shader_error(&self, shader: ShaderHandle) -> Option<&str> {
+        let (version, e) = self.hook_errors.get(&shader)?;
+        (self.hooks.get(&shader).map(|(v, _)| *v) == Some(*version)).then_some(e.as_str())
+    }
+
     /// The bloom chain of a post group this frame, its pass uniforms written: bloom enabled
     /// with a non-zero intensity, in Hdr mode (off in the Ldr fallback, warned once; never in
-    /// the passthrough group) where `GraphicsCaps::bloom_format` exists.
-    fn plan_bloom(&mut self, group: &PostGroupPlan, reallocs: &mut u32) -> Option<BloomPlan> {
+    /// the passthrough group) where `GraphicsCaps::bloom_format` exists. `auto_exposure`: the
+    /// prefilter also multiplies by 2^E.
+    fn plan_bloom(&mut self, group: &PostGroupPlan, auto_exposure: bool, reallocs: &mut u32) -> Option<BloomPlan> {
         let s = &group.settings;
         let b = &s.bloom;
         if group.passthrough || !s.enabled || !b.enabled || b.intensity <= 0.0 {
@@ -514,8 +801,7 @@ impl PostState {
         let first_slot = self.bloom.slots;
         let (params, slot) = (&mut self.bloom.params, self.bloom.slot);
         let mut n = first_slot as usize;
-        // STUB(P-POST) PO2: with auto exposure the prefilter also multiplies by 2^E.
-        let exposure = (s.exposure.exp2(), false);
+        let exposure = (s.exposure.exp2(), auto_exposure);
         bloom::passes(group.scene_size, rect, &chain, b, exposure, |p| {
             params.write_at(n * slot, bytemuck::bytes_of(&p), reallocs);
             n += 1;
@@ -581,6 +867,10 @@ impl PostState {
             self.params_bg = Some((bg, generation, seeds_generation));
         }
         self.bloom.flush(device, encoder, up, &self.sampler);
+        self.meters.flush(device, encoder, up);
+        if self.read_exposure {
+            self.readback.begin(device, encoder, self.metered);
+        }
     }
 
     /// The persistent distortion buffer of a post group (created on demand; freed 60 frames
@@ -618,13 +908,16 @@ impl PostState {
     }
 
     /// Build the composite pipeline for an output target of `format` (`manual_srgb`: the shader
-    /// encodes sRGB) ahead of use (`Renderer::prewarm`), with FXAA (Medium) and the bloom chains.
-    /// STUB(P-POST): auto exposure (PO2).
+    /// encodes sRGB) ahead of use (`Renderer::prewarm`), with FXAA (Medium), the bloom chains and
+    /// the auto-exposure metering of this device's path.
     pub fn prewarm(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, manual_srgb: bool) {
         let kind = OutputKind::of(format, manual_srgb);
-        self.composite_pipeline(device, format, kind);
+        self.composite_pipeline(device, format, kind, None);
         // FXAA (Medium, the default quality) and the composite into its LDR intermediate.
-        self.composite_pipeline(device, LDR_FORMAT, OutputKind::Srgb);
+        self.composite_pipeline(device, LDR_FORMAT, OutputKind::Srgb, None);
+        if let Some((path, format)) = MeterPath::of(&self.frame_caps) {
+            self.meters.prewarm(device, path, format);
+        }
         self.fxaa_pipeline(device, FxaaQuality::Medium, format, kind);
         // The additive chain's format and the energy-conserving one's (see `plan_bloom`).
         for format in [self.caps.bloom_format, self.caps.hdr_format].into_iter().flatten() {
@@ -632,17 +925,71 @@ impl PostState {
         }
     }
 
-    /// The composite pipeline for `format` and `kind` (created on first use).
+    /// The composite pipeline for `format`, `kind` and the grading hook `hook` (created on first
+    /// use). A hook composite is validated with naga and built inside error scopes; if it fails
+    /// (now, or later when the scopes answer asynchronously) the hook is reported and the plain
+    /// composite is used. Returns the key of the pipeline to draw with.
     fn composite_pipeline(
         &mut self,
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         kind: OutputKind,
-    ) -> &wgpu::RenderPipeline {
-        let (module, layout) = (&self.module, &self.layout);
-        self.composite
-            .entry((format, kind))
-            .or_insert_with(|| fullscreen_pipeline(device, layout, module, "fs_composite", format, kind))
+        hook: Option<HookKey>,
+    ) -> (wgpu::TextureFormat, OutputKind, Option<HookKey>) {
+        let key = (format, kind, hook);
+        if self.composite.contains_key(&key) {
+            return key;
+        }
+        let Some((handle, version)) = hook else {
+            let (module, layout) = (&self.module, &self.layout);
+            let p = fullscreen_pipeline(device, layout, module, "fs_composite", format, kind);
+            self.composite.insert(key, p);
+            return key;
+        };
+        let Some((_, source)) = self.hooks.get(&handle).filter(|(v, _)| *v == version) else {
+            return self.composite_pipeline(device, format, kind, None);
+        };
+        let module = match self.hook_modules.get(&(handle, version)) {
+            Some(m) => Ok(m.clone()),
+            None => {
+                let src = composite_source_with(Some(source));
+                grading::validate_hook_module(&src).map(|()| {
+                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some(source.name.as_str()),
+                        source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)),
+                    })
+                })
+            }
+        };
+        let module = match module {
+            Ok(m) => m,
+            Err(e) => {
+                self.hook_failed((handle, version), e);
+                return self.composite_pipeline(device, format, kind, None);
+            }
+        };
+        // Backend translation failures are internal errors, not validation errors.
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let p = fullscreen_pipeline(device, &self.layout, &module, "fs_composite", format, kind);
+        let (internal, validation) = (internal.pop(), validation.pop());
+        let mut error = Box::pin(async move {
+            match internal.await {
+                Some(e) => Some(e.to_string()),
+                None => validation.await.map(|e| e.to_string()),
+            }
+        });
+        match futures::FutureExt::now_or_never(&mut error) {
+            Some(Some(e)) => {
+                self.hook_failed((handle, version), e);
+                return self.composite_pipeline(device, format, kind, None);
+            }
+            Some(None) => {}
+            None => self.hook_pending.push(((handle, version), space3d_tasks::spawn(error))),
+        }
+        self.hook_modules.insert((handle, version), module);
+        self.composite.insert(key, p);
+        key
     }
 
     /// The FXAA pipeline for a quality, `format` and `kind` (created on first use).
@@ -660,16 +1007,45 @@ impl PostState {
         })
     }
 
-    /// Record meter → bloom → composite (→ FXAA) for one post group into the frame encoder.
-    /// Bloom (PO1), the composite, FXAA and the lens effects (PO3); STUB(P-POST): metering (PO2).
+    /// Record meter → bloom → composite (→ FXAA) for one post group into the frame encoder: auto
+    /// exposure (PO2), bloom (PO1), the composite with the lens effects (PO3), grading (PO4)
+    /// and the distortion apply (PO5), FXAA (PO3).
     pub fn encode_group(&mut self, cx: &mut PostEncode<'_>, input: &PostGroupInput<'_>) {
         if self.params_bg.is_none() {
             return;
         }
         let group = self.groups.get(input.index).copied().unwrap_or_default();
+        // Auto exposure first: the bloom prefilter and the composite read E.
+        let exposure = group.meter.and_then(|plan| {
+            let scene = (input.scene, input.scene_generation);
+            let e = self
+                .meters
+                .encode(cx, input.camera, plan, scene, group.scene_rect, input.replay)?;
+            for i in 0..self.meters.pooled().len() {
+                let (generation, bytes) = self.meters.pooled()[i];
+                self.count_target(cx.stats, input.replay, generation, bytes);
+            }
+            if self.read_exposure
+                && !input.replay
+                && let Some((texture, format)) = self.meters.texture(input.camera)
+            {
+                self.readback
+                    .record(cx.encoder, input.camera, texture, format, group.compensation);
+            }
+            Some(e)
+        });
         let bloom = group.bloom.and_then(|plan| {
             let scene = (input.scene, input.scene_generation);
-            let (view, generation) = self.bloom.encode(cx, scene, &plan, &self.dummy, self.frame, None)?;
+            let e = exposure.as_ref().map_or((&self.dummy, 0), |(view, g)| (view, *g));
+            let timing = cx.timing;
+            let timestamps = timing
+                .span("post.bloom", Some(input.camera))
+                .map(|(query_set, begin, end)| bloom::ChainTimestamps {
+                    query_set,
+                    begin: Some(begin),
+                    end: Some(end),
+                });
+            let (view, generation) = self.bloom.encode(cx, scene, &plan, e, self.frame, timestamps)?;
             self.count_target(cx.stats, input.replay, generation, plan.bytes());
             Some((view, generation))
         });
@@ -694,7 +1070,11 @@ impl PostState {
             Some(_) => (LDR_FORMAT, OutputKind::Srgb),
             None => (input.output_format, kind),
         };
-        self.composite_pipeline(cx.device, composite_format, composite_kind);
+        let composite_key = self.composite_pipeline(cx.device, composite_format, composite_kind, group.hook);
+        let lut = group
+            .lut
+            .and_then(|h| self.luts.get(&h))
+            .map(|l| (l.view.clone(), l.generation));
         if let Some(q) = group.fxaa {
             self.fxaa_pipeline(cx.device, q, input.output_format, kind);
         }
@@ -703,14 +1083,20 @@ impl PostState {
         };
         let frame = self.frame;
         let (inputs_bgl, dummy) = (&self.inputs_bgl, &self.dummy);
-        let distortion = input
-            .distortion
-            .and_then(|_| self.distortion.get(&input.camera))
-            .map_or(0, |t| t.generation);
+        let distortion_target = input.distortion.and_then(|_| self.distortion.get(&input.camera));
+        let distortion = distortion_target.map_or(0, |t| t.generation);
+        if let Some(t) = distortion_target
+            && !input.replay
+        {
+            // Rgba8Unorm: 4 bytes per texel.
+            cx.stats.target_bytes += 4 * t.size.0 as u64 * t.size.1 as u64;
+        }
         let key = (
             input.scene_generation,
             distortion,
             bloom.as_ref().map_or(0, |(_, g)| *g),
+            exposure.as_ref().map_or(0, |(_, g)| *g),
+            lut.as_ref().map_or(0, |(_, g)| *g),
         );
         let entry = |binding, view| wgpu::BindGroupEntry {
             binding,
@@ -723,8 +1109,8 @@ impl PostState {
                 entries: &[
                     entry(0, input.scene),
                     entry(1, bloom.as_ref().map_or(dummy, |(view, _)| view)),
-                    entry(2, dummy),
-                    entry(3, dummy),
+                    entry(2, exposure.as_ref().map_or(dummy, |(view, _)| view)),
+                    entry(3, lut.as_ref().map_or(dummy, |(view, _)| view)),
                     entry(4, input.distortion.unwrap_or(dummy)),
                     // Never L: the composite renders into it.
                     entry(5, dummy),
@@ -743,9 +1129,10 @@ impl PostState {
             Some((view, _)) => (view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)),
             None => (input.output, output_load),
         };
-        let pipeline = &self.composite[&(composite_format, composite_kind)];
+        let pipeline = &self.composite[&composite_key];
         let pass = FullscreenPass {
             label: "space3d composite",
+            scope: ("post.composite", input.camera),
             target: composite_target,
             load: composite_load,
             viewport: input.output_viewport,
@@ -774,6 +1161,7 @@ impl PostState {
         let pipeline = &self.fxaa[&(q, input.output_format, kind)];
         let pass = FullscreenPass {
             label: "space3d fxaa",
+            scope: ("post.fxaa", input.camera),
             target: input.output,
             load: output_load,
             viewport: input.output_viewport,
@@ -795,8 +1183,14 @@ impl PostState {
     }
 
     pub fn end_frame(&mut self, stats: &mut RenderStats) {
-        stats.textures_created += std::mem::take(&mut self.created);
-        stats.cpu_reallocations += std::mem::take(&mut self.seeds.reallocations);
+        stats.textures_created += std::mem::take(&mut self.created) + self.meters.take_created();
+        stats.cpu_reallocations += std::mem::take(&mut self.seeds.reallocations)
+            + std::mem::take(&mut self.meters.reallocations)
+            + std::mem::take(&mut self.readback.reallocations);
+        self.meters.end_frame();
+        self.readback.end_frame();
+        let tick = self.tick;
+        self.luts.retain(|_, l| l.last_used + 60 > tick);
         let frame = self.frame;
         self.distortion.retain(|_, t| t.last_used + 60 > frame);
         // Bind groups of scene textures no longer composited (replaced or freed).
@@ -810,21 +1204,25 @@ impl PostState {
         distortion_mesh::register(nodes);
     }
 
-    /// Last read-back exposure (stops) of a post camera.
+    /// Last read-back exposure of a post camera (stops, compensation included; with
+    /// `FrameSettings::read_exposure`): metered cameras 1–3 frames late, others their manual
+    /// exposure.
     pub fn camera_exposure(&self, camera: Entity) -> Option<f32> {
-        let _ = camera; // STUB(P-POST)
-        None
+        self.readback.get(camera)
     }
 
-    /// Forget a camera's temporal history (auto exposure snaps next frame).
+    /// Forget a camera's temporal history: auto exposure snaps on its next frame.
     pub fn reset_history(&mut self, camera: Entity) {
         self.distortion.remove(&camera);
+        self.meters.reset(camera);
     }
 }
 
 /// A full-screen post pass: its target, load op and the post group's rect.
 struct FullscreenPass<'a> {
     label: &'static str,
+    /// GPU timing label and camera.
+    scope: (&'static str, Entity),
     target: &'a wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
     viewport: [f32; 4],
@@ -853,6 +1251,7 @@ impl FullscreenPass<'_> {
                     store: wgpu::StoreOp::Store,
                 },
             })],
+            timestamp_writes: cx.timing.render(self.scope.0, Some(self.scope.1)),
             ..Default::default()
         });
         let [x, y, w, h] = self.viewport;
@@ -970,12 +1369,19 @@ mod tests {
             distortion: false,
         };
         let mut reallocs = 0;
-        assert!(post.plan_group(&world, &plan, &mut reallocs).distortion);
+        assert!(
+            post.plan_group(&world, &RenderAssets::default(), &plan, &mut reallocs)
+                .distortion
+        );
         let passthrough = PostGroupPlan {
             passthrough: true,
             ..plan
         };
-        assert!(!post.plan_group(&world, &passthrough, &mut reallocs).distortion);
+        assert!(
+            !post
+                .plan_group(&world, &RenderAssets::default(), &passthrough, &mut reallocs)
+                .distortion
+        );
         post.reset_history(a);
         let mut stats = RenderStats::default();
         post.end_frame(&mut stats);

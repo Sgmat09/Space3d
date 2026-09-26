@@ -105,6 +105,8 @@ struct HdrScenePass<'a> {
     mode: FrameMode,
     depth: Option<wgpu::TextureView>,
     kind: OverlayTargetKind,
+    /// Group 0 of the view the overlays follow.
+    bind_group: usize,
 }
 
 impl Renderer {
@@ -182,6 +184,7 @@ impl Renderer {
                         mode: FrameMode::Direct,
                         depth,
                         kind,
+                        bind_group: view.bind_group,
                     };
                     self.encode_hdr_scene_overlays(encoder, i, &hdr);
                 }
@@ -207,6 +210,7 @@ impl Renderer {
                             primary_to_offscreen,
                             &mut state[g],
                             depth,
+                            view.bind_group,
                         );
                         presented |= is_primary;
                     }
@@ -363,7 +367,7 @@ impl Renderer {
                 .iter()
                 .position(|p| p.view == Some(i) && p.distortion)
         {
-            self.encode_distortion(encoder, i, pg, depth_1x.as_ref(), replay);
+            self.encode_distortion(encoder, i, view.bind_group, pg, depth_1x.as_ref(), replay);
         }
         depth_1x
     }
@@ -418,6 +422,7 @@ impl Renderer {
         replay: bool,
         state: &mut GroupEncode,
         depth: Option<wgpu::TextureView>,
+        bind_group: usize,
     ) {
         let group = &self.frame.groups[g];
         let (target, mode, scene_format, scene_size, transparent, post_groups, scale) = (
@@ -453,6 +458,7 @@ impl Renderer {
                 } else {
                     OverlayTargetKind::Offscreen
                 },
+                bind_group,
             };
             self.encode_hdr_scene_overlays(encoder, last, &hdr);
         }
@@ -504,6 +510,7 @@ impl Renderer {
                 encoder,
                 stats: &mut self.stats,
                 pool: &mut self.frame.pool,
+                timing: &self.timer,
             };
             self.post.encode_group(&mut cx, &input);
             self.frame.pool.release_all();
@@ -593,9 +600,11 @@ impl Renderer {
             _ if first => (wgpu::LoadOp::Clear(wgpu::Color::BLACK), clear),
             _ => (wgpu::LoadOp::Load, clear),
         };
+        let camera = Some(self.frame.cameras[view.camera].id);
         let mut pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("space3d forward"),
+                timestamp_writes: self.timer.render("scene", camera),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: p.color,
                     depth_slice: None,
@@ -632,7 +641,18 @@ impl Renderer {
         }
         let target = scene_target(p.format, p.samples, p.output);
         let nodes = |r: &mut Self, pass: &mut wgpu::RenderPass<'static>, list: SlotList, orders: Orders| {
-            r.draw_nodes(pass, i, list, orders, target, extent, viewport, scissor, None, replay);
+            r.draw_nodes(
+                pass,
+                (i, view.bind_group),
+                list,
+                orders,
+                target,
+                extent,
+                viewport,
+                scissor,
+                None,
+                replay,
+            );
         };
         let restore = |pass: &mut wgpu::RenderPass<'static>| {
             let [x, y, w, h] = viewport;
@@ -718,13 +738,14 @@ impl Renderer {
                         depth_ops: None,
                         stencil_ops: None,
                     }),
+                    timestamp_writes: self.timer.render("scene_read", camera),
                     ..Default::default()
                 })
                 .forget_lifetime();
             let target = read_target(p.format, p.output, attached);
             self.draw_nodes(
                 &mut pass,
-                i,
+                (i, view.bind_group),
                 SlotList::Reading,
                 Orders::All,
                 target,
@@ -756,6 +777,7 @@ impl Renderer {
             pipelines,
             scene_inputs,
             stats,
+            timer,
             ..
         } = self;
         let (pipeline, bgl) = pipelines.depth_resolve(device, samples);
@@ -771,6 +793,7 @@ impl Renderer {
                 }),
                 stencil_ops: None,
             }),
+            timestamp_writes: timer.render("depth_resolve", None),
             ..Default::default()
         });
         let [x, y, w, h] = scissor;
@@ -790,6 +813,7 @@ impl Renderer {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         i: usize,
+        bind_group: usize,
         pg: usize,
         depth: Option<&wgpu::TextureView>,
         replay: bool,
@@ -801,6 +825,7 @@ impl Renderer {
         let mut pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("space3d distortion"),
+                timestamp_writes: self.timer.render("distortion", Some(camera)),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &buffer,
                     depth_slice: None,
@@ -817,7 +842,7 @@ impl Renderer {
         let scissor = [0, 0, size.0, size.1];
         self.draw_nodes(
             &mut pass,
-            i,
+            (i, bind_group),
             SlotList::Distortion,
             Orders::All,
             distortion_target(depth.is_some()),
@@ -832,14 +857,14 @@ impl Renderer {
         self.stats.render_passes += 1;
     }
 
-    /// Record the node slots of `list` with work in view `i` into `pass` (see
-    /// [`super::NodeCache::draw`]), with scene depth `depth` bound in group 1 (the far dummy
-    /// without).
+    /// Record the node slots of `list` with work in view `i` (group 0: its bind group
+    /// `bind_group`) into `pass` (see [`super::NodeCache::draw`]), with scene depth `depth`
+    /// bound in group 1 (the far dummy without).
     #[allow(clippy::too_many_arguments)]
     fn draw_nodes(
         &mut self,
         pass: &mut wgpu::RenderPass<'static>,
-        i: usize,
+        (i, bind_group): (usize, usize),
         list: SlotList,
         orders: Orders,
         target: PassTarget,
@@ -859,7 +884,9 @@ impl Renderer {
             ..
         } = self;
         let n = nodes.len();
-        let Some((view_bind_group, _)) = &f.view_bg else { return };
+        let Some(view_bind_group) = f.view_bind_group(bind_group) else {
+            return;
+        };
         let (scene_bind_group, scene_depth) = match depth {
             Some(view) => {
                 let (bg, generation) = scene_inputs.with_depth(device, layouts, view);
@@ -904,9 +931,12 @@ impl Renderer {
             scene_inputs,
             layouts,
             stats,
+            timer,
             ..
         } = self;
-        let Some((view_bind_group, _)) = &f.view_bg else { return };
+        let Some(view_bind_group) = f.view_bind_group(hdr.bind_group) else {
+            return;
+        };
         let info = &f.view_infos[i];
         let size = extent(hdr.target);
         let (scene_bind_group, scene_depth) = match &hdr.depth {
@@ -954,6 +984,7 @@ impl Renderer {
         let mut pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("space3d overlays (hdr scene)"),
+                timestamp_writes: timer.render("overlays.hdr", None),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: hdr.target,
                     depth_slice: None,

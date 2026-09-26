@@ -3,15 +3,19 @@
 // FULLSCREEN_WGSL. Four entry points share one layout, each drawn as a full-screen triangle
 // over one level of the post group's bloom chain:
 //
-// * `fs_prefilter`: S (the post group's rect) → exactly half its size (level 0 at 1080p). 13
-//   taps in 5 boxes; each box is exposed (bloom works in exposed units: the composite adds it
-//   after exposure), soft-thresholded and weighted by its Karis factor 1 / (1 + luma)
-//   (normalized: a hot pixel cannot dominate its neighbourhood, so single-pixel fireflies do
-//   not flicker into large blobs). The taps weigh every source pixel alike only at exactly 2×.
+// * `fs_prefilter`: S (the post group's rect) → exactly half its size (level 0 at 1080p). Every
+//   scene pixel is exposed (bloom works in exposed units: the composite adds it after
+//   exposure), soft-thresholded and softly limited on its own (the firefly guard), then a
+//   separable [1 2 1] / 4 tent over 3 × 3 pixels filters them: linear after the per-pixel
+//   steps, so each pixel's weight over level 0 is exactly 1/4 wherever it sits and a small
+//   bright source adds the same light at every sub-pixel position (no shimmer while it moves).
+//   (M1 thresholded and Karis-weighted 2 × 2 box averages of bilinear taps: position-dependent
+//   for sources of 2–4 px, whose halo varied by 4–12 % as they moved, and small sources lost
+//   about 2/3 of their energy above the threshold.)
 // * `fs_resample`: the prefilter's half-resolution output → level 0 when level 0 has another
 //   size (the reference heights, post/bloom.rs `chain_size`): an area average, every pixel
 //   weighted by its overlap with the destination pixel's box (energy kept wherever it sits).
-// * `fs_down`: level i → level i + 1, the same 13 taps with the plain weights.
+// * `fs_down`: level i → level i + 1: 13 bilinear taps (Jimenez) with the plain weights.
 // * `fs_up`: level i + 1 → level i, a 3×3 tent, blended with src × scatter + dst × (1 − scatter)
 //   (the pipeline's blend constant), so level 0 ends up holding Σ (1 − s)·s^k · level_k.
 //
@@ -119,29 +123,61 @@ fn bloom_exposure_multiplier() -> f32 {
     return e;
 }
 
-// Karis-weighted box: its weight × 1 / (1 + luma) (luma of the exposed box).
-fn bloom_karis(box_exposed: vec3<f32>, weight: f32) -> f32 {
-    return weight / (1.0 + s3d_luma(box_exposed));
+// Bloom contribution above which a pixel is compressed (exposed units): the firefly guard.
+const S3D_BLOOM_KNEE: f32 = 32.0;
+
+// A single pixel's bloom contribution, softly limited: unchanged up to the knee (engines,
+// lasers, sparks), then compressed toward twice it, so a stray specular spike of radiance 1000
+// adds at most as much glow as a pixel of 64 (the firefly guard; per pixel, so it does not
+// depend on where the pixel sits).
+fn bloom_limit(c: vec3<f32>) -> vec3<f32> {
+    let br = max(c.r, max(c.g, c.b));
+    if (br <= S3D_BLOOM_KNEE) {
+        return c;
+    }
+    let x = br - S3D_BLOOM_KNEE;
+    return c * ((S3D_BLOOM_KNEE + x / (1.0 + x / S3D_BLOOM_KNEE)) / br);
+}
+
+// The bloom contribution of the scene pixel `p` (S pixels): exposed, soft-thresholded and
+// limited; 0 outside the post group's rect.
+fn bloom_pixel(p: vec2<i32>, lo: vec2<i32>, hi: vec2<i32>, e: f32) -> vec3<f32> {
+    if (any(p < lo) || any(p >= hi)) {
+        return vec3<f32>(0.0);
+    }
+    let c = clamp(textureLoad(bloom_src, p, 0).rgb, vec3<f32>(0.0), vec3<f32>(S3D_BLOOM_MAX));
+    return bloom_limit(bloom_threshold(c * e));
+}
+
+// Tent weight [1 2 1] / 4 of tap `k` (0..2).
+fn bloom_tent(k: i32) -> f32 {
+    return select(0.25, 0.5, k == 1);
 }
 
 @fragment
 fn fs_prefilter(in: FullscreenOut) -> @location(0) vec4<f32> {
-    let t = taps13(in.uv, true);
+    // Destination pixel i, per axis: a [1 2 1] / 4 tent over the rect's pixels 2i − 1, 2i,
+    // 2i + 1. Every scene pixel is exposed, thresholded and limited on its own, then filtered
+    // linearly: an even pixel weighs 1/2 in one destination pixel, an odd one 1/4 in two, so
+    // every pixel's total weight is exactly 1/4 wherever it sits and a small bright source adds
+    // the same light at every position (no shimmer while it moves), in proportion to its energy
+    // above the threshold. (9 loads: a [1 3 3 1] tent over 4 × 4 is as stable but costs twice
+    // as much at 4K, a 2 × 2 box half but leaves blocky glows along thin lines.) Destination
+    // pixel i is centered on scene pixel 2i, half a scene pixel before the 2 × 2 block it
+    // stands for: the composite samples bloom half a scene pixel further (composite.wgsl).
+    let lo = vec2<i32>(bloom.src_rect.xy);
+    let hi = lo + vec2<i32>(bloom.src_rect.zw);
+    let base = lo + vec2<i32>(in.pos.xy) * 2 - 1;
     let e = bloom_exposure_multiplier();
-    let b0 = (t.a + t.b + t.d + t.e) * (0.25 * e);
-    let b1 = (t.b + t.c + t.e + t.f) * (0.25 * e);
-    let b2 = (t.d + t.e + t.g + t.h) * (0.25 * e);
-    let b3 = (t.e + t.f + t.h + t.i) * (0.25 * e);
-    let b4 = (t.j + t.k + t.l + t.m) * (0.25 * e);
-    let w0 = bloom_karis(b0, 0.125);
-    let w1 = bloom_karis(b1, 0.125);
-    let w2 = bloom_karis(b2, 0.125);
-    let w3 = bloom_karis(b3, 0.125);
-    let w4 = bloom_karis(b4, 0.5);
-    let sum = bloom_threshold(b0) * w0 + bloom_threshold(b1) * w1 + bloom_threshold(b2) * w2
-        + bloom_threshold(b3) * w3 + bloom_threshold(b4) * w4;
-    let c = sum / (w0 + w1 + w2 + w3 + w4);
-    return vec4<f32>(min(c, vec3<f32>(S3D_BLOOM_MAX)), 1.0);
+    var sum = vec3<f32>(0.0);
+    for (var y = 0; y < 3; y += 1) {
+        var row = vec3<f32>(0.0);
+        for (var x = 0; x < 3; x += 1) {
+            row += bloom_pixel(base + vec2<i32>(x, y), lo, hi, e) * bloom_tent(x);
+        }
+        sum += row * bloom_tent(y);
+    }
+    return vec4<f32>(min(sum, vec3<f32>(S3D_BLOOM_MAX)), 1.0);
 }
 
 // The overlaps of source pixels `i` and `i + 1` (pixel `i` spans [i, i + 1]) with the box

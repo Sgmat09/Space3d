@@ -57,7 +57,9 @@ const FRAMES: usize = 100;
 /// draw path) plus ~10 %; other backends get twice the headroom. Measured: Direct 76; Hdr, Ldr
 /// and passthrough 106 each — one render pass (the composite) more, and wgpu-hal's Metal backend
 /// allocates about 30 times per render pass; nodes 119–120 (Direct + one SceneRead pass
-/// and three node draws); a still Hdr scene whose frame counter advances (as in `App::update`)
+/// and three node draws); a depth view (shadow map) 103 (Direct + one depth-only pass drawing
+/// the 400 casters); GPU timings 100 (Direct + the timestamp writes, a deferred resolve and
+/// the two callbacks wgpu boxes per timed frame); a still Hdr scene whose frame counter advances (as in `App::update`)
 /// with frames queued on the GPU 136 (150 while it uploaded its post seeds every frame; now a
 /// window of 64 frames' seeds goes up every 64th frame); 400 moving cubes in a loop that never
 /// waits for the GPU (three frames in flight) 148.
@@ -67,6 +69,8 @@ fn bound(mode: &str, backend: wgpu::Backend) -> u64 {
         "nodes" => 132,
         "hdr_seeds" => 165,
         "hdr_moving" => 167,
+        "depth_views" => 113,
+        "timings" => 110,
         _ => 117,
     };
     if backend == wgpu::Backend::Metal {
@@ -112,7 +116,7 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
         counted
     };
     type Setup = fn(&mut App, Entity);
-    let modes: [(&str, Setup); 5] = [
+    let modes: [(&str, Setup); 7] = [
         ("direct", |_, _| {}),
         // The composite alone: bloom's passes are measured in `tests/alloc_post.rs`.
         ("hdr", |app, cam| {
@@ -126,6 +130,22 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
         }),
         ("passthrough", |app, _| {
             app.resources.expect_mut::<FrameSettings>().render_scale = 0.75
+        }),
+        // A depth view (shadow map, graphics spec §1.12) over Direct: one depth-only pass drawing
+        // the casters, culled against the light's frustum.
+        ("depth_views", |app, _| {
+            let light = glam::camera::rh::proj::directx::orthographic(-4.0, 4.0, -4.0, 4.0, 0.0, 20.0)
+                * glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y);
+            space3d_render::testing::add_depth_view(
+                app.resources.expect_mut::<Renderer>(),
+                light,
+                512,
+                Default::default(),
+            );
+        }),
+        // GPU timings (graphics spec §2.2.6) over Direct, where the device offers timestamps.
+        ("timings", |app, _| {
+            *app.resources.expect_mut::<FrameSettings>() = FrameSettings::default().with_gpu_timing(true);
         }),
         ("nodes", |app, _| {
             use common::nodes::*;
@@ -151,6 +171,11 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
     for (name, setup) in modes {
         let _ = app.world.remove_one::<PostProcess>(cam);
         *app.resources.expect_mut::<FrameSettings>() = FrameSettings::default();
+        space3d_render::testing::clear_depth_views(app.resources.expect_mut::<Renderer>());
+        if name == "timings" && !app.resources.expect::<Renderer>().graphics_caps().timestamps {
+            eprintln!("timings: skipped (no TIMESTAMP_QUERY)");
+            continue;
+        }
         setup(&mut app, cam);
         for _ in 0..WARM_UP {
             step(&mut app);
@@ -167,10 +192,17 @@ fn every_frame_mode_allocates_a_small_constant_amount() {
             (0, 0, 0),
             "{name}: {s:?}"
         );
-        let intermediate = !matches!(name, "direct" | "nodes");
+        let intermediate = !matches!(name, "direct" | "nodes" | "depth_views" | "timings");
         assert_eq!(s.intermediate_groups, u32::from(intermediate), "{name}");
         if name == "nodes" {
             assert_eq!((s.node_draws, s.scene_read_passes), (3, 1), "{name}");
+        }
+        if name == "depth_views" {
+            assert_eq!((s.depth_views, s.shadow_casters), (1, 400), "{name}");
+        }
+        if name == "timings" {
+            let t = app.resources.expect::<GpuTimings>();
+            assert!(t.scope_ms("scene") > 0.0, "{name}: {t:?}");
         }
         let max = *per_frame.iter().max().unwrap();
         let (first, second) = per_frame.split_at(FRAMES / 2);

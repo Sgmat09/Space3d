@@ -1,5 +1,7 @@
-//! Post-processing effects (graphics spec §5.2 P-POST) on the default backend: bloom (PO1), FXAA,
-//! vignette, chromatic aberration and film grain (PO3).
+//! Post-processing effects (graphics spec §5.2 P-POST) on the default backend: bloom (PO1), auto
+//! exposure (PO2), FXAA, vignette, chromatic aberration and film grain (PO3), color grading, 3D
+//! LUTs and grading hooks (PO4), hardening (PO6: GPU timings, pass and memory counts, resizes,
+//! device loss). Distortion (PO5) is in `tests/post_distortion.rs`.
 //! The bodies live in `common/post.rs` (`cases`), shared with the GL run (`tests/gl_post.rs`);
 //! `WGPU_BACKEND=gl` runs this file on GL too.
 
@@ -8,7 +10,7 @@ mod common;
 mod post_common;
 
 use common::headless_app;
-use post_common::cases;
+use post_common::{cases, hardening};
 
 #[test]
 fn bloom_only_above_threshold() {
@@ -103,4 +105,85 @@ fn fxaa_ldr_fallback_and_steady_state() {
 #[test]
 fn transparent_rt_lens_effects_keep_alpha() {
     cases::transparent_rt_lens_effects_keep_alpha(headless_app);
+}
+
+#[test]
+fn auto_exposure_converges_and_matches_reference() {
+    cases::auto_exposure_converges_and_matches_reference(headless_app, false);
+}
+
+/// The render-pass metering path (WebGL2 class) on the default backend: ±0.5 EV.
+#[test]
+fn auto_exposure_downlevel_matches_reference() {
+    cases::auto_exposure_converges_and_matches_reference(headless_app, true);
+}
+
+#[test]
+fn instant_converges_frame_1() {
+    cases::instant_converges_frame_1(headless_app);
+}
+
+#[test]
+fn render_to_image_is_idempotent_with_ae_and_grain() {
+    cases::render_to_image_is_idempotent_with_ae_and_grain(headless_app);
+}
+
+#[test]
+fn auto_exposure_feeds_bloom() {
+    cases::auto_exposure_feeds_bloom(headless_app);
+}
+
+#[test]
+fn auto_exposure_per_post_group() {
+    cases::auto_exposure_per_post_group(headless_app);
+}
+
+#[test]
+fn auto_exposure_history_and_steady_state() {
+    cases::auto_exposure_history_and_steady_state(headless_app, false);
+}
+
+#[test]
+fn auto_exposure_downlevel_history_and_steady_state() {
+    cases::auto_exposure_history_and_steady_state(headless_app, true);
+}
+
+#[test]
+fn grading_matches_formulas() {
+    cases::grading_matches_formulas(headless_app);
+}
+
+#[test]
+fn lut_identity_is_neutral() {
+    cases::lut_identity_is_neutral(headless_app);
+}
+
+#[test]
+fn lut_changes_colors() {
+    cases::lut_changes_colors(headless_app);
+}
+
+#[test]
+fn invalid_grading_hook_falls_back() {
+    cases::invalid_grading_hook_falls_back(headless_app);
+}
+
+#[test]
+fn post_gpu_timings_are_labelled() {
+    hardening::post_gpu_timings_are_labelled(headless_app);
+}
+
+#[test]
+fn post_pass_and_memory_counts() {
+    hardening::post_pass_and_memory_counts(headless_app);
+}
+
+#[test]
+fn resize_reallocates_once_and_stays_bounded() {
+    hardening::resize_reallocates_once_and_stays_bounded(headless_app);
+}
+
+#[test]
+fn a_lost_device_degrades_with_every_effect() {
+    hardening::a_lost_device_degrades_with_every_effect(headless_app);
 }

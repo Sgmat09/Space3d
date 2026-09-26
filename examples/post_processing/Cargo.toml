@@ -1,0 +1,10 @@
+[package]
+name = "post_processing"
+description = "Space3d example: every post effect on a top-down space scene, toggled with keys (bloom, auto exposure, FXAA, lens effects, grading, distortion)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+space3d = { workspace = true, features = ["test"] }

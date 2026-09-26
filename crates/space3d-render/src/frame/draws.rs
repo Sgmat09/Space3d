@@ -118,6 +118,18 @@ impl FrameState {
     }
 }
 
+impl FrameState {
+    /// The material bind group `material`'s draws bind in group 1 and its texture kinds
+    /// (`PipelineKey::kinds`), once `prepare_material_bind_groups` built it (depth views'
+    /// alpha-masked casters).
+    pub(super) fn material_bind_group(&self, material: u32) -> Option<(&wgpu::BindGroup, u8)> {
+        let tex = self.materials.texture(material);
+        self.material_bgs
+            .get(&tex)
+            .map(|(bg, _, _, layered)| (bg, if *layered { KIND_COLOR_LAYERED } else { 0 }))
+    }
+}
+
 impl Renderer {
     /// Record the draws `range` (within `view.draws`) of a view into its pass. Sets every
     /// state it uses (bind groups, buffers, pipelines), so node draws may precede it.
@@ -131,7 +143,7 @@ impl Renderer {
         output: OutputEncoding,
     ) {
         let f = &self.frame;
-        let (Some((vb, ib)), Some((view_bg, _))) = (&f.arena_buffers, &f.view_bg) else {
+        let (Some((vb, ib)), Some(view_bg)) = (&f.arena_buffers, f.view_bind_group(view.bind_group)) else {
             return;
         };
         if range.is_empty() {

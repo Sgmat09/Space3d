@@ -1,14 +1,16 @@
-# Post-processing: bloom, FXAA, vignette, chromatic aberration, film grain
+# Post-processing: bloom, auto exposure, color grading, FXAA, lens effects, distortion
 
 Post effects run in a camera's post group after its scene is drawn, in exposed HDR units, and
 end in the one composite pass that writes the display target (see [`frame.md`](frame.md) for
 frame modes, post groups and the composite). The normative design is
 [`docs/design/graphics.md`](../design/graphics.md) §1.9 and §5.2 (P-POST).
 
-This page covers bloom (milestone PO1) and the display-space effects FXAA, vignette, chromatic
-aberration and film grain (PO3). Auto exposure, color grading and the distortion apply land
-with the next post milestones; their settings already exist on `PostProcess` and are ignored
-until then.
+This page covers bloom (milestone PO1, with the M1.1 position-stable prefilter), auto exposure
+(PO2), the display-space effects FXAA, vignette, chromatic aberration and film grain (PO3), color
+grading with 3D LUTs and WGSL hooks (PO4), screen-space distortion — heat haze, shockwaves —
+(PO5) and the hardening of the whole chain: GPU timings, pass and memory counts, allocations,
+resizes, device loss and the performance gate (PO6). `examples/post_processing` shows every
+effect on a top-down space scene, toggled with keys.
 
 ```rust
 use space3d::prelude::*; // PostProcess, Bloom
@@ -23,9 +25,12 @@ PostProcess::default()
 // The same set: PostProcess::cinematic()
 ```
 
-Order in a post group (normative, spec §1.9): scene (+ chromatic aberration taps) → exposure →
-bloom → vignette → tonemapper → [grading, LUT: PO4] → **last pass**: grain → dither → output
-encoding. The last pass is the composite, or the FXAA pass when FXAA is on.
+Order in a post group (normative, spec §1.9): [Distortion pass after the scene] → [auto-exposure
+metering → bloom chain] → composite: the distortion offset → scene (+ chromatic aberration and
+distortion split taps) → exposure (manual, or 2^(E + compensation)) → bloom (at the same
+offset) → vignette → white balance × saturation, contrast → `post_hdr_hook` → tonemapper →
+lift/gamma/gain, LUT → `post_ldr_hook` → **last pass**: grain → dither → output encoding. The
+last pass is the composite, or the FXAA pass when FXAA is on.
 
 ## Bloom
 
@@ -74,24 +79,65 @@ brightness). `PostProcess::with_quality(GraphicsQuality)` sets `mip_count`/`max_
 Per post group (camera rect), after its scene views and `HdrScene` overlays, before the
 composite:
 
-1. **Prefilter** (scene → level 0, half resolution): 13 bilinear taps (Jimenez 2014) in five
-   2×2 boxes. Each box is multiplied by the camera's exposure, soft-thresholded on its brightest
-   channel (a quadratic knee, continuous at `threshold ± knee`, so hue is kept) and weighted by
-   its Karis factor 1 / (1 + luma), normalized: a single hot pixel cannot dominate its
-   neighbourhood, so sub-pixel sparks do not flicker into blobs. Taps are clamped to the post
-   group's rect: split screens and picture-in-picture views never bleed into each other.
-2. **Downsample** level i → i + 1 (`mip_count − 1` passes): the same 13 taps, plain weights.
+1. **Prefilter** (scene → exactly half its size): every scene pixel is multiplied by the
+   camera's exposure (with auto exposure, 2^(E + compensation)), soft-thresholded on its
+   brightest channel (a quadratic knee, continuous at `threshold ± knee`, so hue is kept) and
+   softly limited — unchanged up to 32, compressed toward 64 above (the **firefly guard**: a
+   stray specular spike of 1000 glows like a pixel of about 63) — then a separable
+   [1 2 1] / 4 tent over 3 × 3 pixels filters them. Pixels outside the post group's rect
+   weigh nothing: split screens and picture-in-picture views never bleed into each other.
+2. **Downsample** level i → i + 1 (`mip_count − 1` passes): 13 bilinear taps (Jimenez 2014),
+   plain weights.
 3. **Upsample** level i + 1 → i (`mip_count − 1` passes): a 3×3 tent, blended into level i as
    `src × scatter + dst × (1 − scatter)`. Level 0 ends up holding Σ (1 − s)·s^k · level_k.
-4. **Composite:** level 0, sampled bilinearly, is added after exposure (bloom is already
-   exposed: never exposed twice) and before vignette, grading and the tonemapper:
-   `hdr + bloom × intensity`, or `mix(hdr, bloom, intensity)` when energy conserving.
+4. **Composite:** level 0, magnified by a cubic B-spline (4 bilinear taps), is added after
+   exposure (bloom is already exposed: never exposed twice) and before vignette, grading and
+   the tonemapper: `hdr + bloom × intensity`, or `mix(hdr, bloom, intensity)` when energy
+   conserving.
 
 Every pass is a full-screen triangle with explicit-LOD sampling only (no derivatives), and each
 reads one level view while writing another, which is portable to WebGL2.
 
 The chain is a normalized weighted average: without a threshold its mean equals the scene's, so
 `intensity` is the only gain (tested: energy-conserving bloom keeps the mean within 2 %).
+
+### Stable under motion, proportional to energy (M1.1)
+
+The prefilter's only non-linear steps (exposure, threshold, firefly limit) act on each pixel on
+its own, and everything after them is linear: an even pixel weighs 1/2 in one level-0 texel per
+axis, an odd one 1/4 in two, so every pixel's total weight is exactly 1/4 wherever it sits. The
+composite then magnifies level 0 with a cubic B-spline, whose weights (unlike bilinear ones at a
+non-integer ratio such as 720p's and 1440p's 2.67×) give every texel the same share of the frame.
+Two consequences, both measured on level 0 read back in float and the composite's lookup
+reproduced on the CPU (`post::bloom::tests`):
+
+* **No shimmer.** A small bright source moving over the pixel grid adds the same light at every
+  position: the spread over all phases is 0.02–0.1 % at 720p, 1080p and 1440p for sources of
+  1–4 px (`bloom_is_stable_under_motion`, limit 0.3 %). M1 thresholded and Karis-weighted 2 × 2
+  box averages of bilinear taps: a 2 px source's added light varied by 11 % and a 4 px source's
+  by 4 % as it moved (the M1 review measured up to 16 % at 720p); stars, bolts and sparks pulsed
+  while the camera panned.
+* **Glow in proportion to energy.** The light bloom adds is the energy above the threshold ×
+  `intensity`, whatever the source's size: 1.00 × for 1–32 px sources
+  (`bloom_energy_is_proportional_and_limited`). M1 gave 1–2 px sources a third of it, 4 px ones
+  43 % and 8 px ones 70 %, so small emissives (stars, sparks, laser heads, particles) now glow
+  about 1.5–3× more than they did, and large ones the same. If a dense starfield now veils the
+  image, keep its stars below the threshold (or the threshold above them) rather than lowering
+  `intensity`, which also dims engines and lasers.
+
+Karis averaging (M1's firefly guard) normalizes a pixel against its neighbours, which is exactly
+what made the result depend on position; the per-pixel limit replaces it. A destination texel
+of the [1 2 1] tent is centered on a scene pixel, half a pixel before the 2 × 2 block it stands
+for; the composite looks bloom up half a pixel further. (A [1 3 3 1] tent over 4 × 4 pixels is as
+stable but costs twice as much at 4K; a 2 × 2 box half as much but leaves blocky glows along
+thin lines such as lasers.)
+
+Cost, same GPU, loaded, A/B against the M1 prefilter in one session (`bloom_gpu_time_by_size`):
+the same at 720p (0.13 ms) and 1080p (0.15 ms), 0.19 against 0.16 ms at 1440p and 0.29
+against 0.20 ms at 4K — the prefilter loads 9 scene pixels per texel where M1 took 13 bilinear
+taps, which matters where the scene texture is large. A compute prefilter (each pixel loaded
+once through workgroup memory) is the follow-up with the compute chain (see "Cost"). The
+composite's B-spline lookup takes 4 bilinear taps of level 0 instead of 1.
 
 ### Resolution independence
 
@@ -106,8 +152,8 @@ half the rect, never above the rect's own size) stands for them; their weights m
 weight. The halo's size and energy relative to the frame are the same from 180p to 4K (only the
 tight glow of the merged levels widens), and smaller rects cost fewer passes.
 
-**The prefilter always halves the rect.** Its 13 taps (bilinear taps half a destination texel
-apart) weigh every scene pixel alike only at exactly 2× reduction. Level 0 at the reference
+**The prefilter always halves the rect.** Its fixed 3 × 3 footprint weighs every scene pixel
+alike only at exactly 2× reduction. Level 0 at the reference
 height is 2.67× below the rect at 720p, 1440p and 360p and 4× at 4K: there the taps left gaps,
 and a 1–2 px bright source (a star, spark, bolt head or running light) got a full halo, a double
 one or none depending on its sub-pixel position, so a moving one blinked (the light bloom added
@@ -119,31 +165,30 @@ pixel up to a 3-pixel box), so every pixel keeps its energy wherever it sits
 (`post::bloom::tests::resample_keeps_every_pixel_energy`; on the GPU,
 `bloom_halo_is_independent_of_position` in `tests/post.rs` and `tests/gl_post.rs`: a 1 px
 source's halo stays within 5 % over 12 positions at every ratio, 0.5–3 % measured). It costs
-one more render pass and a pooled texture (below); the chain's GPU time is unchanged within the
-measurement noise (it is bound by its dependent passes, see "Cost").
+one more render pass, a pooled texture (below) and GPU time where the half rect is larger than
+level 0: nothing at 1080p (no resample), +4 % at 1440p, +25 % at the `GraphicsQuality::Low` rect
+of T3 (1440 × 810: the prefilter writes 720 × 405 instead of 480 × 270) and +40 % at 4K (1920 ×
+1080 instead of 960 × 540) — best-of chain times 0.152 → 0.158, 0.081 → 0.101 and 0.145 →
+0.204 ms against the pre-change chain (M1 review round 3, interleaved sweeps; "Cost"), plus about
+7 % more render-thread CPU for the extra pass at 1440p. That is the price of a halo that does not
+blink.
 
-| rect | chain (level 0, levels; prefilter target) | bloom-added mean luma, `Engine/Post/Bloom` (before the half-rect prefilter; before the reference heights) |
+| rect | chain (level 0, levels; prefilter target) | bloom-added mean luma, `Engine/Post/Bloom` (M1.1; M1; before the half-rect prefilter; before the reference heights) |
 |---|---|---|
-| 3840 × 2160 | 960 × 540, 6; 1920 × 1080 | +7.8 (+7.6) |
-| 2560 × 1440 | 960 × 540, 6; 1280 × 720 | +7.8 (+7.7) |
-| 1920 × 1080 | 960 × 540, 6; level 0 | +7.6 (+7.6; +7.6) |
-| 1600 × 900 | 960 × 540, 6; 800 × 450 | +7.6 (+7.7) |
-| 1280 × 720 | 480 × 270, 5; 640 × 360 | +7.4 (+7.2; +9.3) |
-| 640 × 360 | 240 × 135, 4; 320 × 180 | +7.0 (+6.6; +11.7) |
-| 320 × 180 (the goldens) | 121 × 68, 3; 160 × 90 | +6.7 (+6.0; +14.1) |
+| 3840 × 2160 | 960 × 540, 6; 1920 × 1080 | +8.2 (+7.8; +7.6) |
+| 2560 × 1440 | 960 × 540, 6; 1280 × 720 | +8.1 (+7.8; +7.7) |
+| 1920 × 1080 | 960 × 540, 6; level 0 | +8.1 (+7.6; +7.6; +7.6) |
+| 1600 × 900 | 960 × 540, 6; 800 × 450 | +8.2 (+7.6; +7.7) |
+| 1280 × 720 | 480 × 270, 5; 640 × 360 | +8.2 (+7.4; +7.2; +9.3) |
+| 640 × 360 | 240 × 135, 4; 320 × 180 | +8.1 (+7.0; +6.6; +11.7) |
+| 320 × 180 (the goldens) | 121 × 68, 3; 160 × 90 | +8.5 (+6.7; +6.0; +14.1) |
 
-Below 1080p the added light falls slightly because small bright sources (stars) cover fewer
-scene pixels before the threshold, not because of the chain. Before the reference heights,
+With the per-pixel prefilter the added light is the same at every size within 5 %
+(`engine::post::tests::bloom_added_luma_by_size` in space3d-stories, ignored: a measurement).
+M1's fell below 1080p because its box averages thresholded small bright sources (stars), which
+cover fewer scene pixels at lower resolutions, more harshly. Before the reference heights,
 level 0 was simply half the rect with 6 levels at any size, so a 360p frame (a phone,
 `render_scale` 0.5) got 1.5× and the 180p goldens about 2× the desktop veil.
-
-**Known limitation: sub-pixel shimmer.** The prefilter's soft threshold and Karis weights are
-non-linear, so the light a 2-px source of radiance 10 adds varies by about 10 % at 1080p (a 4-px
-source of radiance 4 by about 5 %) as it moves by quarter pixels, and by about 16 % at 720p and
-1440p and 18 % at 4K, where the composite also magnifies level 0 by a non-integer factor (a 1 px
-source: 1–5 %). No fireflies and no blinking, but small bright sources (stars, bolts, sparks)
-shimmer slightly while the camera pans. Temporal smoothing of the prefilter (with the TAA work)
-is the fix; until then keep emissive sources above ~4 px or their radiance moderate.
 
 ### What gets bloomed
 
@@ -190,6 +235,16 @@ frames. `RenderStats::target_bytes` counts them once per frame.
 | 1280 × 720 (480 × 270, the 540 level merged; half 640 × 360) | 5 | 0.7 + 0.9 = 1.6 MB | 3.2 MB |
 | 1440 × 810, `GraphicsQuality::Low` (480 × 270; half 720 × 405) | 4 | 0.7 + 1.2 = 1.9 MB | 3.7 MB |
 
+**Driver memory per render pass (Metal).** `target_bytes` counts textures only. Each of the
+chain's render passes also holds GPU driver memory (IOAccelerator) while its frame is in flight —
+on Metal about 2.8 MB per pass per frame in flight, whatever the attachment's size: the default
+chain's 11–12 passes add about 60 MB to the process at 1080p with one frame in flight and 148 MB
+with three (a window keeps two to three), per post group (split screen doubles it), against 2.7 MB
+of `target_bytes` (`frame.md` "Cost"; `tests/footprint.rs` checks it). Budget it in addition to
+the table above (spec §4.4's VRAM line counts textures only). Compute passes cost about 0.5 MB
+each: a compute chain (one compute pass of dependent dispatches, below) would hold one pass's
+worth.
+
 ### Cost
 
 Render passes per post group: `2 × levels − 1`, one more for the resample where level 0 is not
@@ -215,19 +270,26 @@ of its first pass to the end of its last, best of 40:
 | `GraphicsQuality::Low` settings at 1080p (4 levels, level 0 480 × 270) | 0.08 ms |
 | `GraphicsQuality::High` (7 levels; level 0 still 960 × 540 at 1080p) | 0.17 ms |
 
+In real frames (`frame/ab`'s bloom sweep: the `post.bloom` scope of `GpuTimings`, medians of 48
+frames back to back, machine load ≈ 30, so above the best-of figures): 0.196 ms at 720p (11
+passes with the composite), 0.227 ms at 1080p, 0.254 ms at 1440p, 0.607 ms at 4K (the prefilter
+reads the whole 4K scene) and 0.122 ms for the Low chain at 1440 × 810.
+
 On this GPU the chain costs its 11 dependent render passes (about 14 µs each), not its pixels:
 a 128² chain costs as much as a 1080p one, and the two chain formats cost the same. When
 frames are isolated (the GPU idles between them and drops to low clocks) the same chain
 measures about 0.45 ms; as for the composite (`frame.md` "Cost"), the gate uses the loaded
 regime.
 
-CPU (release build, same machine, busy with other builds): with bloom the render stage grows by
-about 0.10 ms per post group over the composite alone, 11 render passes at roughly 10 µs of
-wgpu/Metal pass overhead each (the renderer's own work per pass is a few map lookups and
-allocates nothing); FXAA adds one more pass, about 0.01 ms. That is above the spec's §4.4 line
-"post ≤ 0.05 ms" of the Battle CPU budget; a compute chain (one compute pass of dependent
-dispatches on class A backends, the render-pass chain kept for WebGL2) would cut both the CPU
-and the GPU pass overhead and is the planned follow-up.
+CPU (release build, same machine): bloom adds 0.15–0.17 ms of render-thread CPU per post group
+over the composite alone at 1080p (the M1 record in `docs/performance.md`; an earlier estimate
+here said 0.10 ms, measured on a machine busy with other builds). That is 11 render passes at
+roughly 14 µs of wgpu/Metal pass overhead each (the renderer's own work per pass is a few map
+lookups and allocates nothing); FXAA adds one more pass, about 0.01 ms. It is above the spec's
+§4.4 line "post ≤ 0.05 ms" of the Battle CPU budget: **not met**. A compute chain (one compute
+pass of dependent dispatches on class A backends, the render-pass chain kept for WebGL2) would
+cut the CPU, the GPU pass overhead and the per-pass driver memory, and is the planned follow-up
+(not in M2).
 
 ### Gate
 
@@ -245,6 +307,166 @@ is retried (best of 3 runs). The gate is only meaningful on an idle Dev GPU: at 
 with other apps holding the shared GPU at 50–60 % device utilization, runs measured 0.188–0.265 ms
 and one of two invocations passed; on a quieter GPU the review measured 0.13–0.16 ms. It is not
 part of `cargo test --workspace` or CI (hosted runners have software or paravirtual GPUs).
+
+## Auto exposure
+
+```rust
+use space3d::prelude::*; // PostProcess
+use space3d::render::{AutoExposure, Metering};
+
+PostProcess::default()
+    .with_auto_exposure(AutoExposure {
+        min_ev: -4.0,               // darken a bright scene by 4 stops at most
+        max_ev: 4.0,                // brighten a dark one by 4 at most
+        metering: Metering::CenterWeighted,
+        ..AutoExposure::on()
+    })
+    .with_exposure(-1.0);           // compensation: a darker key for space
+// A cut or teleport: renderer.reset_post_history(camera) snaps on the next frame.
+```
+
+Each post group meters **its own rect** of the scene color (split screens and picture in
+picture keep their own history) and writes the camera's 1 × 1 exposure texture `E` (stops); the
+bloom prefilter and the composite multiply by 2^(E + `PostProcess::exposure`), so bloom's
+threshold follows the metered exposure. The metered value maps the scene's log-average
+luminance to middle grey (0.18) and is clamped to `min_ev..=max_ev`:
+
+* **Black is not metered** (luminance below 2⁻¹⁶): a starfield on black is exposed for its ships,
+  planets and nebulae, not brightened for the void. A frame with nothing metered holds the
+  exposure.
+* **Percentile window** (compute path): the darkest `low_percentile` (10 %) and the brightest
+  `1 − high_percentile` (10 %) of the metered weight are cut, so a small very bright light or a
+  deep shadow does not swing the exposure.
+* **Metering:** `CenterWeighted` (default) weighs the center 4× the corners, linearly in the
+  distance; `Average` weighs every pixel alike.
+* **Adaptation:** each frame closes `1 − 2^(−dt · rate)` of the gap to the target, with
+  `adapt_to_bright` (3/s: 7/8 of the gap in a second) when the scene got brighter and
+  `adapt_to_dark` (1/s: half the gap in a second) when it got darker. `dt` is
+  `FrameInfo::delta`: 0 when `Time::frame` did not advance (`render_to_image` twice, capture
+  replays), so exposure is a pure function of the frames rendered (deterministic under
+  `App::step_ticks`). `AutoExposure::instant()` (rates ∞) converges in the frame, even without
+  time.
+* **Snap:** a camera's first metered frame goes straight to the target (a one-shot capture is
+  exposed correctly: headless rule 4 of the spec), as do the frame after auto exposure was turned
+  on, after `Renderer::reset_post_history(camera)` and after a path change. Histories are freed
+  60 frames after a camera stops being metered.
+* **Readback:** with `FrameSettings::read_exposure`, `Renderer::camera_exposure(camera)` returns
+  the exposure applied (metered + compensation, stops), 1–3 frames late and without ever waiting
+  for the GPU; cameras without auto exposure report their manual exposure.
+* Auto exposure needs Hdr mode: in the Ldr fallback (no float targets, `HdrMode::Ldr`) it is off
+  (warned once) and the manual exposure applies. The passthrough group never meters.
+
+### How it is metered
+
+| path | when | passes (1080p) |
+|---|---|---|
+| **compute histogram** | `GraphicsCaps::compute_histogram` and an `R32Float` E (Metal, Vulkan, DX12, WebGPU; GLES 3.1+) | 1 compute pass (2 dispatches) + a 4-byte copy into E |
+| **render passes** | otherwise (WebGL2, GLES 3.0, `DownlevelOverride::no_compute`) | 4 (log-luminance level, 2 reductions, adapt) |
+
+* **Compute** (`shaders/post/exposure.wgsl`): 16 × 16 workgroups sample the rect every `stride`
+  pixels per axis (1 up to 655 k samples, 2 at 1080p, 4 at 1440p and 4K). Each metered sample
+  adds its weight (16 × the metering weight, an integer) to one of 255 log2-luminance bins over
+  [−16, 16] (1/8 EV each) and its weight × its position inside the bin (6 bits) to a second
+  counter, so a bin's samples count at their mean position, not the bin's center (no 1/8 EV
+  steps as a scene brightens slowly). A second dispatch of 256 threads prefix-sums the bins,
+  takes the part of each bin inside the percentile window, averages, clamps and adapts, writes
+  the camera's 16-byte state and clears the histogram for the next group. Integer atomics and a
+  fixed-order float reduction: bit-for-bit deterministic.
+* **Render passes** (`shaders/post/exposure_dl.wgsl`, texel loads only): the rect → a level a
+  quarter of its size holding Σ weight × log2 L and Σ weight of each 4 × 4 block (the same samples
+  as the compute path), reductions by 8 × 8 while larger than 16 × 16, then an adapt pass that
+  sums the last level and writes the camera's other E texture from the previous one (a ping-pong
+  pair). No percentile window (it needs a histogram): the plain weighted log-average.
+
+Accuracy against an exact reimplementation of the rule (every pixel, no bins,
+`reference_ev` in `tests/common/post.rs`) on the test scene: the compute path within 0.01 EV
+(spec: ±0.1), the render-pass path within 0.2 EV of the windowed rule (spec: ±0.5) and 0.002 EV
+of the unwindowed one it computes. E is `R32Float` where renderable, else `R16Float` (about
+0.004 EV of precision near ±8 EV).
+
+Cost (Apple M4 Max, loaded, 1080p rect, `post::exposure::tests::exposure_gpu_time`): compute
+0.008 ms of GPU, render passes 0.14 ms (mostly the passes' fixed overhead); spec §4.4 budgets
+0.05 ms on T1. Memory: E (4 bytes, two on the render-pass path) and a 16-byte state per camera,
+one shared 2 KiB histogram; the render-pass levels come from the frame's pool (1.05 MB of
+`Rgba16Float` at 1080p, shared by same-size groups, counted in `RenderStats::target_bytes`). Uploads: the group's 80-byte parameters
+when the settings or the rect change; per frame only the 16 bytes of adaptation factors when
+`dt` changes (never with a fixed tick rate) — the steady state creates, reallocates and uploads
+nothing (`auto_exposure_history_and_steady_state`, both paths).
+
+## Color grading
+
+```rust
+use space3d::prelude::*; // PostProcess
+use space3d::render::{ColorGrading, ColorLut, RenderAssets};
+use glam::Vec3;
+
+// A .cube LUT exported from Resolve, Photoshop, ... (display-referred, sRGB in and out).
+let strip = ColorLut::from_cube(&std::fs::read_to_string("grade.cube")?)?;
+let lut = app.resources.expect_mut::<RenderAssets>().add_texture(strip);
+PostProcess::default().with_color_grading(ColorGrading {
+    temperature: 0.15,                 // warmer
+    saturation: 1.1,
+    contrast: 1.1,                     // log2, around middle grey
+    lift: Vec3::new(0.0, 0.01, 0.03),  // blue-ish blacks
+    lut: Some(ColorLut { contribution: 0.8, ..ColorLut::new(lut, 33) }),
+    ..ColorGrading::default()
+});
+```
+
+Grading is fused into the composite (no extra pass) and costs nothing while neutral
+(`ColorGrading::default()`; each part has its own effect bit). Order, and the space each step
+works in:
+
+| step | space | formula |
+|---|---|---|
+| white balance (`temperature`, `tint`, −1..1) | linear HDR, before the tonemapper | von Kries in LMS: the D65 white moved along the daylight locus (temperature; + is warmer) and across it (tint; + is magenta) |
+| `saturation` | linear HDR | `luma + s · (c − luma)` (Rec. 709 luma; 0 grey, > 1 more saturated) |
+| `contrast` | linear HDR | `0.18 · (c / 0.18)^contrast` per channel (log2, pivoting on middle grey) |
+| `post_hdr_hook(c, uv)` | linear HDR | the hook shader's, if any |
+| tonemapper | | |
+| `gain`, `lift`, `gamma` | sRGB-encoded display color | ASC CDL: `(e · gain + lift)^(1 / gamma)` (gamma > 1 brightens the midtones) |
+| LUT | sRGB-encoded display color | 3D LUT lookup, blended by `contribution` |
+| `post_ldr_hook(c, uv)` | display-linear, 0..1 | the hook shader's, if any |
+
+White balance and saturation are one 3 × 3 matrix (built on the CPU), so the HDR part costs a
+matrix multiply and, with contrast, a `pow`. In the Ldr fallback everything runs on the already
+tonemapped display colors (no tonemapper in the composite there).
+
+**3D LUTs.** A `ColorLut` is an N²×N strip texture: blue slice `b` at x ∈ [b·N, (b + 1)·N), red
+along x inside the slice, green along y; the composite indexes it with the encoded color and
+blends two bilinear taps between the neighbouring blue slices. `ColorLut::identity(n)` gives a
+neutral strip (`Rgba8Unorm`) to export, grade in an image editor and load back
+(`RenderAssets::add_image`: an sRGB-format strip is re-encoded after sampling, so it behaves like
+a linear one). `ColorLut::from_cube(text)` parses Adobe/Resolve `.cube` 3D LUTs (`LUT_3D_SIZE`
+2..=64, `TITLE`, comments, `DOMAIN_MIN`/`DOMAIN_MAX` or `LUT_3D_INPUT_RANGE` — resampled onto
+0..1 — and unknown keywords ignored; 1D LUTs are rejected with `LutError::Parse`) into an
+`Rgba16Float` strip. A strip whose size is not `size² × size`, or an array texture, is ignored
+(warned once). Accuracy: an identity strip changes nothing within 1/255 (`.cube`, 16-bit) or
+2/255 (8-bit strips), 3/255 as an sRGB PNG (`lut_identity_is_neutral`).
+
+**WGSL hooks.** `ColorGrading::shader` takes a `CustomShader` (registered with
+`RenderAssets::add_shader`, hot-reloadable with `update_shader`) that defines `post_hdr_hook`
+and/or `post_ldr_hook`, both `fn(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32>` with `uv` 0..1 over
+the camera's rect; missing ones are identity. The hook may use the composite's helpers
+(`s3d_luma`, `s3d_linear_to_srgb`, `s3d_srgb_to_linear`, `s3d_tonemap`, …) but not declare
+resources, workgroup memory or pipeline constants without a default. The composite with the hook
+is validated with naga and built inside validation and internal error scopes; one that fails —
+at once, or later where the scopes answer asynchronously (browser WebGPU) — grades without its
+hooks, logs the error once and reports it through `Renderer::shader_error(handle)`
+(`invalid_grading_hook_falls_back`). Hook pipelines are cached per (output format, hook
+version); a new version compiles on first use (prewarm by rendering a frame with it on a loading
+screen).
+
+```rust
+// Night vision: green monochrome with scanlines (the Engine/Post/Color Grading story).
+let hook = assets.add_shader(CustomShader::new("night vision", r#"
+fn post_ldr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let l = s3d_luma(c);
+    let lines = 0.85 + 0.15 * step(0.5, fract(uv.y * 90.0));
+    return vec3<f32>(0.15, 1.0, 0.25) * pow(l, 0.8) * 1.4 * lines;
+}"#));
+PostProcess::default().with_color_grading(ColorGrading { shader: Some(hook), ..Default::default() });
+```
 
 ## FXAA
 
@@ -298,6 +520,240 @@ of animated grain and dither are uploaded for 64 frames at once (one aligned uni
 frame and post group, selected with a dynamic offset); everything else of a still scene uploads
 nothing.
 
+## Distortion
+
+Screen-space distortion bends the image under a *writer*: a heat haze behind an engine, a
+shockwave ring expanding from a warp arrival or an explosion. Writers draw offsets into the post
+group's distortion buffer, and the composite shows at each pixel the scene where the buffer
+points. It is on by default (`PostProcess::distortion`) and free while nothing writes: without
+a writer with work in the post camera's view there is no Distortion pass, no buffer write and
+no composite tap (`no_distortion_pass_without_writers`: bit-identical images).
+
+```rust
+use space3d::prelude::*;
+use space3d::render::{Distortion, DistortionMaterial, DistortionMode};
+
+// A shockwave ring on a quad (MeshData::plane: its UV center in the middle, UV radius 0.5 at
+// its edges); grow the transform's scale and fade `strength` to animate it.
+world.spawn((ring_transform, Mesh3d(quad), DistortionMaterial {
+    strength: 0.05, // view heights at the ring's crest
+    mode: DistortionMode::Radial { inner: 0.3, outer: 0.5 },
+    ..DistortionMaterial::default()
+}));
+// Engine heat haze: the built-in value noise, scrolling down the plume (UV per second).
+world.spawn((plume_transform, Mesh3d(strip), DistortionMaterial {
+    strength: 0.012,
+    scroll: Vec2::new(0.0, -1.2),
+    soft_depth: 0.3,
+    ..DistortionMaterial::default()
+}));
+// Per camera: a global multiplier, a spectral split and the buffer's resolution.
+PostProcess::default().with_distortion(Distortion { chromatic: 0.4, ..Distortion::default() });
+```
+
+### How it works
+
+* **The buffer.** One `Rgba8Unorm` texture per post group (`DISTORTION_FORMAT`), the group's
+  rect in `S` at half resolution (`DistortionResolution::Half`, default) or full, persistent per
+  settings camera (freed 60 frames after its last use; capture replays reuse it). Offsets are in
+  *view heights* (1.0 = the view's height; +x right, +y up) with split signs — R = +x, G = +y,
+  B = −x, A = −y — so writers blend additively (`DISTORTION_BLEND`, One/One) in a format every
+  device renders and blends, WebGL2 without float extensions included. Each axis holds up to
+  ±0.0625 view heights (`DISTORTION_RANGE`; overlapping writers saturate there, never wrap) in
+  steps of 0.00025 view heights: 0.26 px at 1080p.
+* **The Distortion pass** runs right after the settings camera's scene pass (and its SceneRead
+  pass): the buffer is cleared to 0 and the camera's `RenderPhase::Distortion` node slots draw
+  into it with that camera's view uniform, the view's single-sample scene depth bound in group 1
+  where there is one (spec §1.6, §1.8).
+* **The apply** is fused into the composite: it samples the buffer bilinearly at the pixel's
+  position in the rect, looks up the scene that far away (taps clamped to the group's rect: split
+  screens never pull each other's pixels in, `distortion_does_not_bleed_across_viewports`), with
+  red and blue at (1 − c) and (1 + c) times the offset for `Distortion::chromatic` = c, and reads
+  the bloom at the same offset. `Distortion::strength` scales every offset. Where the buffer is 0
+  the pixel is exactly the undistorted one (a texel load at render scale 1), elsewhere a bilinear
+  tap. HdrScene overlays are part of `S`, so they are distorted with the scene
+  (`hdr_scene_overlays_are_distorted`); AfterTonemap overlays and display views are not.
+* **Accuracy** (`distortion_shifts_the_background`, spec ±1 px): a constant writer of 0.04 view
+  heights moves a 128-px-high view's edges by 5.114 px against 5.114 expected — within 0.003 px on
+  Metal, ANGLE, with MSAA, at render scale 0.5 and under `DownlevelOverride::webgl2()`.
+
+### `DistortionMaterial` meshes
+
+The component draws the entity's mesh (`Mesh3d` + `GlobalTransform`, optional `Visibility`) into
+the distortion buffer of every post camera that sees it. Without a `Material` the mesh is
+invisible itself; with one it draws in color too. The built-in node `"space3d/distortion-meshes"`
+does it through the public node API only (graphics spec §5.2 PO5):
+
+* **Extraction and culling.** Once per frame the node gathers the writers, their meshes
+  (`MeshRef`) and textures into draw order (texture, mesh, entity); per camera view it culls
+  their bounding spheres against the view's frustum (only scene views of cameras whose
+  `PostProcess` enables distortion) and appends the visible ones' 96-byte instances to one
+  instance stream. A view's run is uploaded through the staging ring only when it differs from
+  what the GPU buffer holds: a still scene uploads nothing (`distortion_steady_state`).
+* **Drawing.** One instanced draw per run of equal mesh and texture, with the mesh arena bound at
+  the mesh's first vertex and the instance stream at the run's first instance: neither
+  `base_vertex` nor `first_instance`, so the WebGL2 path is the only path and every backend tests
+  it. Pipelines are built per pass signature (`prewarm`), with and without scene depth.
+* **`DistortionMode::Normal`**: the offset comes from `texture` (RG, 0.5 = none, 0 and 1 = −/+
+  `strength` along U and V; sampled with the texture's own sampler, so use `AddressMode::Repeat`
+  to scroll; sRGB formats are read back as their stored values) or, without one, the built-in
+  value noise (two octaves, 8 and 16 cells per UV unit, repeating every UV unit). `scroll` moves
+  it by render time (`FrameInfo::time`: deterministic, replays and `render_to_image` twice give
+  the same haze). The outer 0.2 of the UV square feathers out, so a quad has no visible edge.
+* **`DistortionMode::Radial { inner, outer }`**: a smooth ring (sin², zero slope at both radii)
+  between the two UV radii whose pixels look toward the UV center: the image under the ring is
+  pushed outward, up to `strength` halfway between the radii
+  (`radial_distortion_pushes_outward`).
+* **In UV space.** Offsets are laid out in the mesh's UV space and turned onto the screen through
+  the inverse of the UV Jacobian (screen-space derivatives), keeping their length: a rotated quad
+  rotates its haze and its ring stays round in perspective; a mesh seen edge-on writes nothing.
+  Vertex color alpha weights the offset (paint 0 where it should fade).
+* **Occlusion.** A writer behind closer geometry writes nothing there: hard (`soft_depth` 0) or
+  fading in over `soft_depth` world units, against the view's scene depth
+  (`distortion_occluded_by_closer_geometry`: the closer geometry is bit-identical to the scene
+  without the writer, with read-only depth, with the GL depth path forced, and with MSAA through
+  the depth resolve). And the **foreground guard**: a writer fragment whose offset would look at
+  scene depth closer than the writer writes nothing either, so a haze behind a ship never drags
+  the ship's edge over the background (`foreground_is_not_dragged_over_the_background`).
+
+### Writing distortion from a node (particles, custom effects)
+
+Any `RenderNode` can write distortion: particle layers with `SpriteTarget::Distortion` (the
+particles area) do, and so can a game's own effects. Register a slot in the Distortion phase,
+report work only when something is visible, and draw into the pass described by `ctx.target`:
+
+```rust
+static SLOTS: [PhaseSlot; 1] = [PhaseSlot::new(RenderPhase::Distortion, 100)];
+// Pipeline for ctx.target (DISTORTION_FORMAT, 1 sample, no depth attachment; scene depth in
+// group 1 when ctx.target.depth_access != DepthAccess::None):
+//   color target: ctx.target.color_target(Some(DISTORTION_BLEND))
+//   shader: VIEW_WGSL + scene_wgsl(&ctx.target) + DISTORTION_WGSL + your code
+// Draw: set_bind_group(0, ctx.view_bind_group, &[ctx.view.view_offset]),
+//       set_bind_group(1, ctx.scene_bind_group, &[]); viewport = the buffer (ctx.target_size).
+```
+
+```wgsl
+@fragment fn fs(in: Out) -> @location(0) vec4<f32> {
+    let offset = in.dir * in.strength;                        // view heights, +y up
+    let fade = distortion_depth_fade(in.pos, db_size, 0.2);  // db_size: ctx.target_size
+    return distortion_encode(offset, fade * in.alpha);
+}
+```
+
+`DISTORTION_WGSL` also has `s3d_distortion_decode` (the inverse of `distortion_encode`) and
+`s3d_distortion_guard(px, offset, frag_view_depth)` (the foreground guard). The slot only draws
+in a post group's settings camera whose `PostProcess::distortion` is enabled; everywhere else its
+mask bits are ignored.
+
+### Platforms
+
+| class (spec §4.1) | distortion |
+|---|---|
+| A (Metal, Vulkan, DX12, WebGPU) | ✓, occluded by scene depth (with MSAA through the depth resolve) |
+| B (WebGL2 / GLES 3.0 with float targets; ANGLE) | ✓, occluded at 1×; **not occluded with MSAA**: GLES 3.0 cannot sample multisampled depth (`gl_distortion_not_occluded_with_msaa`) |
+| C (WebGL2 without float targets) | as B, in the Ldr fallback |
+| D (GLES 3.1+ Android) | as B |
+
+The writer shader uses no storage buffers, no integer `%` of negative values (undefined in GLSL
+ES) and no `mix` of integer vectors; ANGLE runs every distortion test (`tests/gl_post.rs`).
+
+### Cost
+
+At 1080p on the dev machine (`benches/post.rs`): three writers covering about a third of the
+frame (two shockwaves and a haze) add 27 µs of GPU throughput over bloom (`post/ab`: 236.8 → 264.0
+µs over Direct); the Distortion pass's own timestamp reads 0.05 ms (0.52 ms at 4K with the same
+coverage). One render pass, 2.1 MB of buffer at 1080p (8.3 MB at full resolution); wgpu's
+bookkeeping adds 33 allocations per frame on Metal (`tests/alloc_post.rs`); the node itself
+allocates nothing in the steady state.
+
+### Limitations
+
+* Transparent draws in front of a writer (particles, blended meshes, HdrScene overlays) are part
+  of the scene color: they are distorted too (the depth test only sees opaque depth).
+* Offsets are capped at ±6.25 % of the view height per axis; a writer that needs more saturates.
+* Pixels bordering closer geometry blend across one buffer texel (half resolution): the
+  occluder's outline moves by at most about a pixel; its interior is exact.
+* No refraction of the scene color itself (a scene-color copy is deferred, spec D4).
+
+## Hardening (PO6)
+
+### GPU timings
+
+With `FrameSettings::gpu_timing` every post pass writes timestamps (F8's `GpuTimings`, 2–5 frames
+late) under the spec §4.4 labels, with the post group's settings camera
+(`post_gpu_timings_are_labelled`):
+
+| label | scope |
+|---|---|
+| `post.exposure` | the histogram's compute pass, or one span over the render-pass metering chain |
+| `post.bloom` | one span from the prefilter to the last upsample |
+| `post.composite` | the composite |
+| `post.fxaa` | the FXAA pass |
+| `distortion` (the frame's) | the Distortion pass |
+
+On Apple GPUs a pass's scope includes its overlap with the neighbouring passes, so the sum of the
+scopes overstates the chain (bloom's own scope reads 0.17 ms alone and 0.30–0.39 ms inside the
+full chain). The gate below therefore uses throughput.
+
+### Passes and memory
+
+Per post group at 1920 × 1080 (`post_pass_and_memory_counts`, on Metal and ANGLE):
+
+| configuration | render passes | compute passes | memory (`target_bytes`) |
+|---|---|---|---|
+| composite alone (exposure, tonemapper, dither) | 1 | 0 | — |
+| + bloom (6 levels) | +11 | 0 | +2.76 MB (`Rg11b10Ufloat`; 5.5 MB in `Rgba16Float`) |
+| + auto exposure (compute) | 0 | +1 | 1×1 textures only |
+| + auto exposure (render passes: WebGL2, `no_compute`) | +4 | 0 | +1.1 MB of levels |
+| + FXAA | +1 | 0 | +8.3 MB (the LDR intermediate) |
+| + distortion with a writer | +1 (the frame's Distortion pass) | 0 | +2.1 MB (half), +8.3 MB (full) |
+
+The steady state creates no textures and reallocates nothing in any configuration; a change of
+`DistortionResolution` recreates the buffer once. Allocations per frame (Metal, 320 × 180,
+`tests/alloc_post.rs`): distortion meshes on top of bloom 267 (+33), every effect at once 351 (9
+render passes and a compute pass), no growth, nothing retained.
+
+### Resizes and device loss
+
+`resize_reallocates_once_and_stays_bounded`: 30 resizes with every effect on; each new size
+reallocates on its first frame only, the targets in use stay within 24 bytes per pixel (+64 KiB),
+and back at the first size the frame uses exactly the memory it used before (pooled bloom levels
+of old sizes are evicted after 3 idle frames; the distortion buffer is resized in place).
+`a_lost_device_degrades_with_every_effect`: with auto exposure read back, bloom, FXAA, grading, a
+LUT and distortion meshes, a destroyed device drops frames and fails captures without a panic,
+also when writers, settings and the size change afterwards.
+
+### Performance and the gate
+
+`benches/post.rs` (release, dev machine: Apple M4 Max, Metal):
+
+* `post/gate`, spec §4.4 "all post on (AE compute, bloom, FXAA, CA, grain, grading, LUT,
+  distortion) ≤ 0.60 ms": **met, 0.387 ms**, measured as the paired throughput delta against
+  Direct at 1080p (frames back to back, interleaved rounds), the way the frame's "Hdr minimal
+  over Direct" gate is measured. The whole frame with every effect takes 0.49 ms of throughput,
+  so even charging all of it but the scene pass (0.05 ms) to post stays under the gate. The
+  per-pass timestamps sum to 1.0–1.3 ms (overlap, above).
+* `post/ab` (1080p throughput per frame over Direct): composite +46 µs, + bloom +237 µs,
+  + distortion +264 µs, every effect +388 µs.
+* `post/gpu` (per-pass timestamps, loaded GPU, medians; reference only):
+
+| mode | 1080p | 4K |
+|---|---|---|
+| composite | composite 0.16 | composite 1.16 |
+| bloom | bloom 0.19, composite 0.18 | bloom 0.79, composite 0.67 |
+| + auto exposure (compute) | exposure 0.04 | exposure 0.04 |
+| + auto exposure (render passes) | exposure 0.53 | exposure 0.74 |
+| + FXAA | fxaa 0.18 | fxaa 0.97 |
+| + distortion | distortion 0.05 | distortion 0.52 |
+
+* `post/cpu/<mode>` (criterion, the render stage's CPU at 1080p, load average 11–13 from other
+  builds): composite 0.12 ms, bloom 0.26 ms, lens effects 0.25 ms, distortion 0.25 ms, every
+  effect 0.25 ms, render-pass metering 0.29 ms (the auto-exposure and FXAA runs were disturbed by
+  the load: 0.5–0.8 ms with wide intervals). Bloom's 11 render passes remain most of post's CPU
+  cost; the spec's Battle line "post ≤ 0.05 ms" of CPU is **not met** (see Bloom, "Cost": the
+  compute chain is the planned fix). Distortion adds one render pass and the node's extraction
+  and culling, within the noise here.
+
 ## Display-space effects and overlays
 
 Grain, dither, vignette, chromatic aberration and FXAA run inside the post group: `HdrScene`
@@ -308,11 +764,17 @@ without post) never applies them.
 
 ## Determinism
 
-Bloom has no temporal state and no noise: the same scene gives bit-identical chains (tested with
-`render_to_image` twice). Capture replays re-run the chain from the scene texture. Grain and
-dither are seeded from `Time::frame` (never the wall clock or the renderer's own frame count);
-their seeds are hashed on the CPU (bit-identical to hashing per pixel), a window of frames at a
-time — each frame's seed is still a pure function of that frame.
+Distortion meshes are extracted in a fixed order (texture, mesh, entity) and scroll by render
+time (`FrameInfo::time`), never the wall clock; capture replays draw the last frame's instances
+again. Bloom and grading have no temporal state and no noise: the same scene gives bit-identical
+images (tested with `render_to_image` twice). Capture replays re-run the chain from the scene
+texture. Auto exposure adapts with `FrameInfo::delta` (0 when `Time::frame` did not advance) and
+its histogram reduction is order-independent, so the same ticks give the same exposure and
+capture replays never meter (`render_to_image_is_idempotent_with_ae_and_grain`: two apps
+stepped through the same ticks give identical images). Grain and dither are seeded from
+`Time::frame` (never the wall clock or the renderer's own frame count); their seeds are hashed on
+the CPU (bit-identical to hashing per pixel), a window of frames at a time — each frame's seed is
+still a pure function of that frame.
 
 ## Tests and stories
 
@@ -320,18 +782,56 @@ time — each frame's seed is still a pure function of that frame.
   `bloom_is_in_exposed_units`, `energy_conserving_preserves_mean`,
   `bloom_does_not_bleed_across_viewports`, `hdr_scene_overlays_feed_bloom`,
   `bloom_off_in_ldr_fallback`, `transparent_rt_bloom_weighted_by_alpha`, `bloom_steady_state`,
-  `bloom_downlevel_parity`, `bloom_halo_is_independent_of_position`; FXAA and lens effects —
-  `fxaa_softens_edges`, `film_grain_is_seeded`, `grain_after_fxaa`,
+  `bloom_downlevel_parity`, `bloom_halo_is_independent_of_position`; auto exposure —
+  `auto_exposure_converges_and_matches_reference` (and `auto_exposure_downlevel_matches_reference`
+  for the render-pass path on the default backend; on GL it is the only path),
+  `instant_converges_frame_1`, `render_to_image_is_idempotent_with_ae_and_grain`,
+  `auto_exposure_feeds_bloom`, `auto_exposure_per_post_group`,
+  `auto_exposure_history_and_steady_state` (both paths); grading — `grading_matches_formulas`,
+  `lut_identity_is_neutral`, `lut_changes_colors`, `invalid_grading_hook_falls_back`; FXAA and
+  lens effects — `fxaa_softens_edges`, `film_grain_is_seeded`, `grain_after_fxaa`,
   `after_tonemap_overlays_untouched_by_grain_ca_vignette`, `vignette_darkens_corners`,
   `chromatic_aberration_splits_toward_corners`, `lens_effects_do_not_bleed_across_viewports`,
   `fxaa_ldr_fallback_and_steady_state`, `transparent_rt_lens_effects_keep_alpha`;
-  `gl_bloom_matches_default_backend`.
-* `tests/alloc_post.rs`: allocations per frame with bloom on one and on two post groups, and with
-  `PostProcess::cinematic()` (261 on Metal at 320 × 180: the FXAA pass on top of bloom's 234).
-* Unit tests in `src/post/`: chain sizing, the soft threshold's CPU mirror, pass uniforms, WGSL
-  layouts, FXAA presets and their WGSL for every quality, the pre-hashed seeds, and the GPU-time
-  gate (`bloom_gate_1080p`, run alone with `--ignored`).
+  `gl_bloom_matches_default_backend`; hardening — `post_gpu_timings_are_labelled` (default
+  backend: GL has no timestamps), `post_pass_and_memory_counts`,
+  `resize_reallocates_once_and_stays_bounded`, `a_lost_device_degrades_with_every_effect`.
+* `tests/post_distortion.rs` (and the same cases in `tests/gl_post.rs`):
+  `distortion_shifts_the_background` (also under `DownlevelOverride::webgl2()`, at render scale
+  0.5 and with MSAA), `distortion_chromatic_split`, `distortion_occluded_by_closer_geometry`
+  (read-only depth, forced GL depth path, MSAA; on GL with MSAA: not occluded),
+  `foreground_is_not_dragged_over_the_background`, `hdr_scene_overlays_are_distorted`,
+  `no_distortion_pass_without_writers`, `radial_distortion_pushes_outward`,
+  `distortion_does_not_bleed_across_viewports`, `distortion_steady_state`.
+* `tests/alloc_post.rs`: allocations per frame (Metal, 320 × 180 unless noted) with bloom on one
+  post group (234) and on two (423), `PostProcess::cinematic()` (261: the FXAA pass on top of
+  bloom), auto exposure with the readback on the compute path (289) and on render passes (308),
+  bloom with every grading step, a LUT and a hook (234: grading adds nothing), distortion meshes
+  moving every frame (267), every effect at once (351) and bloom at 1080p (332).
+* Unit tests in `src/post/`: chain sizing, the soft threshold's and the firefly limit's CPU
+  mirrors, pass uniforms, the prefilter's stability and energy on the GPU
+  (`bloom_is_stable_under_motion`, `bloom_energy_is_proportional_and_limited`), WGSL layouts
+  (`PostParams`, `BloomPass`, `ExposureParams`), the exposure histogram's CPU mirror, strides,
+  adaptation factors and sanitizing, the grading matrices and CDL, hook composition, the `.cube`
+  parser (`cube_parser_*`) and the strip lookup's CPU mirror, FXAA presets, the pre-hashed seeds,
+  the distortion writer's WGSL (with and without scene depth) and instance layout, and GPU-time
+  measurements run alone with `--ignored` (`bloom_gate_1080p`, `bloom_gpu_time_by_size`,
+  `exposure_gpu_time`).
+* `benches/post.rs`: `post/cpu/*`, `post/gpu`, `post/ab` and `post/gate` (above).
 * Stories: `Engine/Post/Bloom` (engines, laser bolts, sparks, stars and a threshold ramp, with
   every `Bloom` field on a knob), `Engine/Post/Bloom Veil` (`Bloom::natural()`),
-  `Engine/Post/FXAA` (the same view without and with FXAA side by side; quality knob) and
-  `Engine/Post/Lens` (vignette, chromatic aberration and still grain on knobs, FXAA on).
+  `Engine/Post/Auto Exposure` (the same scene lit 16× dimmer, as authored and 16× brighter in
+  three post groups, exposed alike; knobs for every `AutoExposure` field that matters and the
+  compensation), `Engine/Post/FXAA` (the same view without and with FXAA side by side; quality
+  knob), `Engine/Post/Lens` (vignette, chromatic aberration and still grain on knobs, FXAA on)
+  and `Engine/Post/Color Grading` (ungraded and graded side by side: white balance, saturation,
+  contrast, lift/gamma/gain, generated teal-and-orange and bleach-bypass `.cube` LUTs, and a
+  night-vision `post_ldr_hook`), `Engine/Post/Distortion` (a shockwave ring and a heat haze over
+  a checkerboard; strength, chromatic split and resolution knobs), `Engine/Post/Warp Shockwave`
+  (a top-down warp arrival: the ring expanding under the ship over a nebula, stars and a planet;
+  `progress` knob; a GL golden variant), `Engine/Post/Engine Heat Haze` (top-down fighters over a
+  station deck, the haze scrolling down every plume; 20 ticks) and `Engine/Post/Tonemappers`
+  (four tonemappers side by side over an HDR ramp, saturated emissives and lit materials).
+* `examples/post_processing`: every effect on a top-down space scene, keys `1`–`9` toggle them,
+  `T` cycles the tonemappers, `G` prints the post passes' GPU timings once per second;
+  `SPACE3D_HEADLESS=1 cargo run -p post_processing` writes `post_processing.png` and exits.

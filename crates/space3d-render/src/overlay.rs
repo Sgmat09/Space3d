@@ -508,6 +508,7 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
+                timestamp_writes: self.timer.render("overlays", None),
                 ..Default::default()
             })
             .forget_lifetime();
