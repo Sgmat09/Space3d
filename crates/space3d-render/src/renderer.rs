@@ -832,9 +832,13 @@ impl Renderer {
     }
 
     /// Build error of the current version of a [`crate::CustomShader`], once a draw has used it
-    /// (its draws then use the built-in shader). `None` while it builds fine or is unused.
+    /// (its draws then use the built-in shader) or a post camera graded with it
+    /// (`ColorGrading::shader`: grading then runs without the hooks). `None` while it builds fine
+    /// or is unused.
     pub fn shader_error(&self, shader: crate::ShaderHandle) -> Option<&str> {
-        self.pipelines.custom_error(shader)
+        self.pipelines
+            .custom_error(shader)
+            .or_else(|| self.post.shader_error(shader))
     }
 
     /// Portability warning of the current version of a [`crate::CustomShader`], once a draw has
