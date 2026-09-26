@@ -518,79 +518,92 @@ fn gpu_100k_within_budget() {
 /// Graphics spec §4.4 CPU budget (Battle scene, Phase I): the GPU backend's `prepare` (plan,
 /// uploads, recording) for 500 moving layer instances and one tick, ≤ 0.1 ms — measured as the
 /// difference of `render_frame` with and without the particles' node (the draws' recording
-/// included). Reported, with a loose regression bound: CPU timings on a shared build machine
-/// swing by 2× (about 0.14 ms measured on an idle M4 Max).
+/// included), with the emitters moved in `Stage::FixedUpdate` and again in `Stage::Update`
+/// (the game's pattern: every emitter is also bridged to its render pose every frame, see
+/// `runtime::tests::bridges_of_a_battle_fleet_within_budget`). Reported, with a loose
+/// regression bound: CPU timings on a shared build machine swing by 2× (about 0.10–0.14 ms
+/// and 0.12–0.15 ms measured on an M4 Max).
 #[test]
 fn gpu_prepare_cpu_time() {
     use crate::prelude::*;
     use space3d_core::prelude::*;
-    let Some(renderer) = device() else {
-        eprintln!("skipping: no GPU adapter with compute");
-        return;
-    };
-    let mut app = App::new();
-    app.add_plugin(space3d_render::RenderPlugin::default());
-    app.add_plugin(ParticlesPlugin::default());
-    app.insert_resource(renderer);
-    app.world.spawn((
-        Transform::from_xyz(0.0, 120.0, 150.0).looking_at(Vec3::ZERO, Vec3::Y),
-        space3d_render::Camera3d::default(),
-    ));
-    let mut effect = ParticleEffect {
-        looping: true,
-        ..ParticleEffect::new("five")
-    };
-    for _ in 0..5 {
-        effect = effect.layer(ParticleLayer::continuous(20.0, 0.5));
-    }
-    let fx = app.resources.expect_mut::<ParticleEffects>().add(effect).unwrap();
-    let emitters: Vec<Entity> = (0..100)
-        .map(|i| app.spawn_effect(fx, EffectSpawn::at(Vec3::new(i as f32 - 50.0, 0.0, 0.0)).keep()))
-        .collect();
-    app.add_system(Stage::FixedUpdate, move |ctx: &mut SystemCtx| {
-        let t = ctx.time().tick as f32 * 0.05;
-        for (i, &e) in emitters.iter().enumerate() {
-            if let Ok(mut tr) = ctx.world.get::<&mut Transform>(e) {
-                tr.translation.z = (t + i as f32).sin() * 10.0;
-            }
+    for stage in [Stage::FixedUpdate, Stage::Update] {
+        let renderer = pollster::block_on(space3d_render::Renderer::new_headless(1280, 720)).ok();
+        let Some(renderer) = renderer.filter(|r| r.graphics_caps().compute) else {
+            eprintln!("skipping: no GPU adapter with compute");
+            return;
+        };
+        let mut app = App::new();
+        app.add_plugin(space3d_render::RenderPlugin::default());
+        app.add_plugin(ParticlesPlugin::default());
+        app.insert_resource(renderer);
+        app.world.spawn((
+            Transform::from_xyz(0.0, 120.0, 150.0).looking_at(Vec3::ZERO, Vec3::Y),
+            space3d_render::Camera3d::default(),
+        ));
+        let mut effect = ParticleEffect {
+            looping: true,
+            ..ParticleEffect::new("five")
+        };
+        for _ in 0..5 {
+            effect = effect.layer(ParticleLayer::continuous(20.0, 0.5));
         }
-    });
-    app.step_ticks(60);
-    let frame = |app: &mut App| {
-        let mut renderer = app.resources.remove::<space3d_render::Renderer>().unwrap();
-        app.step_ticks(1);
-        space3d_core::transform::propagate_transforms(&mut app.world);
-        let t = std::time::Instant::now();
-        renderer.render_frame(&app.world, &mut app.resources);
-        let ms = t.elapsed().as_secs_f64() * 1e3;
-        renderer.poll();
-        app.resources.insert(renderer);
-        ms
-    };
-    let median = |app: &mut App| {
-        let mut v: Vec<f64> = (0..80).map(|_| frame(app)).collect();
-        v.sort_by(f64::total_cmp);
-        v[v.len() / 2]
-    };
-    let with = median(&mut app);
-    let s = app.resources.expect::<crate::ParticleStats>().clone();
-    let node = app
-        .resources
-        .expect_mut::<space3d_render::RenderNodes>()
-        .remove("space3d/particles")
-        .unwrap();
-    let without = median(&mut app);
-    app.resources
-        .expect_mut::<space3d_render::RenderNodes>()
-        .insert_shared("space3d/particles", node);
-    eprintln!(
-        "GPU backend prepare + draws: {:.1} µs per frame ({} layer instances, {} dispatches, {} draws, {} B uploaded; render_frame {with:.3} ms vs {without:.3} ms)",
-        (with - without) * 1e3,
-        s.layer_instances,
-        s.dispatches,
-        s.draw_calls,
-        s.bytes_uploaded,
-    );
-    assert_eq!(s.layer_instances, 500);
-    assert!((with - without) <= 1.0 * budget_scale(), "{:.3} ms", with - without);
+        let fx = app.resources.expect_mut::<ParticleEffects>().add(effect).unwrap();
+        let emitters: Vec<Entity> = (0..100)
+            .map(|i| app.spawn_effect(fx, EffectSpawn::at(Vec3::new(i as f32 - 50.0, 0.0, 0.0)).keep()))
+            .collect();
+        // Throttles 0.9–1.1: the emitters' rate accumulators drift apart (in lockstep, all 500
+        // layer instances would bridge a particle on every third frame and none otherwise).
+        for (i, &e) in emitters.iter().enumerate() {
+            app.world.get::<&mut ParticleEmitter>(e).unwrap().rate_scale = 0.9 + 0.002 * i as f32;
+        }
+        app.add_system(stage, move |ctx: &mut SystemCtx| {
+            let t = ctx.time().tick as f32 * 0.05;
+            for (i, &e) in emitters.iter().enumerate() {
+                if let Ok(mut tr) = ctx.world.get::<&mut Transform>(e) {
+                    tr.translation.z = (t + i as f32).sin() * 10.0;
+                }
+            }
+        });
+        app.step_ticks(60);
+        let frame = |app: &mut App| {
+            let mut renderer = app.resources.remove::<space3d_render::Renderer>().unwrap();
+            app.step_ticks(1);
+            space3d_core::transform::propagate_transforms(&mut app.world);
+            let t = std::time::Instant::now();
+            renderer.render_frame(&app.world, &mut app.resources);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            renderer.poll();
+            app.resources.insert(renderer);
+            ms
+        };
+        let median = |app: &mut App| {
+            let mut v: Vec<f64> = (0..80).map(|_| frame(app)).collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let with = median(&mut app);
+        let s = app.resources.expect::<crate::ParticleStats>().clone();
+        let node = app
+            .resources
+            .expect_mut::<space3d_render::RenderNodes>()
+            .remove("space3d/particles")
+            .unwrap();
+        let without = median(&mut app);
+        app.resources
+            .expect_mut::<space3d_render::RenderNodes>()
+            .insert_shared("space3d/particles", node);
+        eprintln!(
+            "GPU backend prepare + draws, emitters moved in {stage:?}: {:.1} µs per frame ({} layer instances, {} dispatches, {} draws, {} B uploaded; render_frame {with:.3} ms vs {without:.3} ms)",
+            (with - without) * 1e3,
+            s.layer_instances,
+            s.dispatches,
+            s.draw_calls,
+            s.bytes_uploaded,
+        );
+        assert_eq!(s.layer_instances, 500);
+        // Moved after the tick, the emitters' bridges draw too (one direct draw per layer).
+        assert_eq!(s.draw_calls, if stage == Stage::Update { 10 } else { 5 });
+        assert!((with - without) <= 1.0 * budget_scale(), "{:.3} ms", with - without);
+    }
 }

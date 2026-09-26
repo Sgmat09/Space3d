@@ -83,42 +83,74 @@ pub(crate) fn subtick(t0: u32, t1: u32, k: u32, count: u32) -> u32 {
     }
 }
 
+/// `(sin, cos)` of `TAU × t` for a turn fraction `t` in 0..1 (a random spawn angle): the nearest
+/// quarter turn and minimax polynomials on ±π/4 (Cephes `sinf` / `cosf`), within 2 ulp of libm
+/// for about a quarter of its cost (the render-time bridges spawn thousands of particles a
+/// frame), with the same bits on every platform.
+pub(crate) fn sin_cos_turns(t: f32) -> (f32, f32) {
+    let x = 4.0 * t;
+    let q = x.round();
+    let r = (x - q) * std::f32::consts::FRAC_PI_2;
+    let r2 = r * r;
+    let s = r + r * r2 * (-1.666_665_5e-1 + r2 * (8.332_161e-3 + r2 * -1.951_529_6e-4));
+    let c = 1.0 - 0.5 * r2 + r2 * r2 * (4.166_664_6e-2 + r2 * (-1.388_731_6e-3 + r2 * 2.443_315_7e-5));
+    match (q as i32) & 3 {
+        0 => (s, c),
+        1 => (c, -s),
+        2 => (-s, -c),
+        _ => (-c, s),
+    }
+}
+
 /// A uniformly distributed unit vector from two uniforms.
 fn uniform_dir(u: f32, v: f32) -> Vec3 {
     let z = 1.0 - 2.0 * u;
     let r = (1.0 - z * z).max(0.0).sqrt();
-    let a = TAU * v;
-    Vec3::new(r * a.cos(), r * a.sin(), z)
+    let (sin, cos) = sin_cos_turns(v);
+    Vec3::new(r * cos, r * sin, z)
 }
 
-/// A direction in the cone of half-angle `half` around the unit `axis`.
-fn cone_dir(axis: Vec3, half: f32, u: f32, v: f32) -> Vec3 {
-    let cos_t = 1.0 - u * (1.0 - half.min(std::f32::consts::PI).cos());
-    let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
-    let a = TAU * v;
+/// A direction in the cone around the unit `axis` whose half-angle has the cosine `cos_half`
+/// ([`LayerSim`] keeps it per layer).
+fn cone_dir(axis: Vec3, cos_half: f32, u: f32, v: f32) -> Vec3 {
     let (bx, by) = axis.any_orthonormal_pair();
-    (axis * cos_t + (bx * a.cos() + by * a.sin()) * sin_t).normalize_or(axis)
+    cone_dir_in(axis, (bx, by), cos_half, u, v)
 }
 
-/// Emitter-local offset and "outward" direction of a spawn point of `shape` at `scale`.
-fn sample_shape(shape: EmitShape, seed: u32, scale: f32) -> (Vec3, Vec3) {
+/// [`cone_dir`] with the basis `(bx, by)` of the axis' normal plane given.
+fn cone_dir_in(axis: Vec3, (bx, by): (Vec3, Vec3), cos_half: f32, u: f32, v: f32) -> Vec3 {
+    let cos_t = 1.0 - u * (1.0 - cos_half);
+    let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
+    let (sin, cos) = sin_cos_turns(v);
+    (axis * cos_t + (bx * cos + by * sin) * sin_t).normalize_or(axis)
+}
+
+/// Emitter-local offset and "outward" direction of a spawn point of layer `s`'s shape at
+/// `scale`. Without `outward` (a fixed or random direction) the shapes that draw it only for
+/// the direction skip it (its random streams are its own: nothing else changes).
+fn sample_shape(s: &LayerSim, seed: u32, scale: f32, outward: bool) -> (Vec3, Vec3) {
     let (u, v, w) = (
         rnd(seed, stream::SHAPE_A),
         rnd(seed, stream::SHAPE_B),
         rnd(seed, stream::SHAPE_C),
     );
-    match shape {
+    match s.shape {
+        EmitShape::Point if !outward => (Vec3::ZERO, Vec3::NEG_Z),
         EmitShape::Point => (Vec3::ZERO, uniform_dir(u, v)),
         EmitShape::Sphere { radius, inner } => {
             let d = uniform_dir(u, v);
             let i3 = inner.clamp(0.0, 1.0).powi(3);
             (d * radius * (i3 + (1.0 - i3) * w).cbrt() * scale, d)
         }
-        EmitShape::Cone { angle, radius } => {
-            let a = TAU * u;
+        EmitShape::Cone { radius, .. } => {
+            let (sin, cos) = sin_cos_turns(u);
             let r = radius * v.sqrt() * scale;
-            let dir = cone_dir(Vec3::NEG_Z, angle, w, rnd(seed, stream::DIR_B));
-            (Vec3::new(r * a.cos(), r * a.sin(), 0.0), dir)
+            let dir = if outward {
+                cone_dir(Vec3::NEG_Z, s.cone_cos, w, rnd(seed, stream::DIR_B))
+            } else {
+                Vec3::NEG_Z
+            };
+            (Vec3::new(r * cos, r * sin, 0.0), dir)
         }
         EmitShape::Ring { radius, width, arc } => {
             let arc = if arc > 0.0 { arc } else { TAU };
@@ -444,34 +476,55 @@ fn spawn_particle(
     let f = fq as f32 * (1.0 / SUBTICKS as f32);
     let (origin, rot) = if s.local {
         (Vec3::ZERO, Quat::IDENTITY)
+    } else if row.prev_rot == row.rot {
+        (row.prev_pos.lerp(row.pos, f), row.rot)
     } else {
         (row.prev_pos.lerp(row.pos, f), row.prev_rot.lerp(row.rot, f))
     };
     let scale = row.scale;
-    let (offset, outward) = sample_shape(s.shape, seed, scale);
+    // A layer that emits at rest (speed 0, like a trail's glows) needs no direction: its
+    // random streams are its own, nothing else changes (the render-time bridges spawn
+    // thousands of trail glows a frame).
+    let moving = s.speed != (0.0, 0.0);
+    let needs_outward = moving
+        && matches!(
+            s.direction,
+            EmitDirection::Shape | EmitDirection::Inward | EmitDirection::Tangent
+        );
+    let (offset, outward) = sample_shape(s, seed, scale, needs_outward);
     let offset = flat(offset + s.offset * scale);
-    let mut dir = match s.direction {
-        EmitDirection::Shape => outward,
-        EmitDirection::Fixed(d) => d.normalize_or(Vec3::NEG_Z),
-        EmitDirection::Random => uniform_dir(rnd(seed, stream::DIR_A), rnd(seed, stream::DIR_B)),
-        EmitDirection::Inward => -outward,
-        EmitDirection::Tangent => Vec3::Y.cross(outward).try_normalize().unwrap_or(Vec3::X),
-    };
-    if s.flatten > 0.0 {
-        dir = flat(dir).try_normalize().unwrap_or(dir);
+    let mut vel = Vec3::ZERO;
+    if moving {
+        let fixed = matches!(s.direction, EmitDirection::Fixed(_));
+        let mut dir = match s.direction {
+            EmitDirection::Shape => outward,
+            EmitDirection::Fixed(_) => s.fixed_dir.0,
+            EmitDirection::Random => uniform_dir(rnd(seed, stream::DIR_A), rnd(seed, stream::DIR_B)),
+            EmitDirection::Inward => -outward,
+            EmitDirection::Tangent => Vec3::Y.cross(outward).try_normalize().unwrap_or(Vec3::X),
+        };
+        if s.flatten > 0.0 {
+            dir = flat(dir).try_normalize().unwrap_or(dir);
+        }
+        if s.spread > 0.0 {
+            let (u, v) = (rnd(seed, stream::SPREAD_A), rnd(seed, stream::SPREAD_B));
+            dir = if fixed && s.flatten == 0.0 {
+                // The layer's fixed direction: its basis is computed once.
+                cone_dir_in(dir, (s.fixed_dir.1, s.fixed_dir.2), s.spread_cos, u, v)
+            } else {
+                cone_dir(dir, s.spread_cos, u, v)
+            };
+        }
+        // `pow` only for a non-zero exponent (`x⁰` is 1 anyway), like the GPU kernel.
+        let speed_mul = if s.speed_exponent != 0.0 {
+            scale.max(0.0).powf(s.speed_exponent)
+        } else {
+            1.0
+        };
+        let speed = range(seed, stream::SPEED, s.speed.0, s.speed.1) * speed_mul;
+        vel = rot * dir * speed;
     }
-    if s.spread > 0.0 {
-        dir = cone_dir(dir, s.spread, rnd(seed, stream::SPREAD_A), rnd(seed, stream::SPREAD_B));
-    }
-    // `pow` only for a non-zero exponent (`x⁰` is 1 anyway), like the GPU kernel.
-    let speed_mul = if s.speed_exponent != 0.0 {
-        scale.max(0.0).powf(s.speed_exponent)
-    } else {
-        1.0
-    };
-    let speed = range(seed, stream::SPEED, s.speed.0, s.speed.1) * speed_mul;
     let mut pos = origin + rot * offset;
-    let mut vel = rot * dir * speed;
     if !s.local {
         vel += row.velocity * s.inherit;
     }
@@ -837,4 +890,27 @@ pub(crate) fn pack_bridges(
         k = end;
     }
     (out.len() - written) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sin_cos_turns` agrees with the f64 reference within 2.5e-7 (2 ulp of 1) over the turn,
+    /// and its quadrants are exact at the quarter turns.
+    #[test]
+    fn sin_cos_turns_is_accurate() {
+        let mut worst = 0.0f64;
+        for i in 0..=1_000_000u32 {
+            let t = i as f32 / 1_000_000.0;
+            let (s, c) = sin_cos_turns(t);
+            let a = std::f64::consts::TAU * t as f64;
+            worst = worst.max((s as f64 - a.sin()).abs()).max((c as f64 - a.cos()).abs());
+        }
+        assert!(worst < 2.5e-7, "{worst:e}");
+        assert_eq!(sin_cos_turns(0.0), (0.0, 1.0));
+        assert_eq!(sin_cos_turns(0.25), (1.0, -0.0));
+        assert_eq!(sin_cos_turns(0.5), (-0.0, -1.0));
+        assert_eq!(sin_cos_turns(0.75), (-1.0, 0.0));
+    }
 }

@@ -19,6 +19,13 @@ pub(crate) struct LayerSim {
     pub shape: EmitShape,
     pub direction: EmitDirection,
     pub spread: f32,
+    /// `cos(spread)` (the spread cone's half-angle, at most π).
+    pub spread_cos: f32,
+    /// `cos(angle)` of an `EmitShape::Cone` (at most π; 1 for other shapes).
+    pub cone_cos: f32,
+    /// An `EmitDirection::Fixed` direction, normalized, and a basis of its normal plane for the
+    /// spread (unused otherwise).
+    pub fixed_dir: (Vec3, Vec3, Vec3),
     pub offset: Vec3,
     pub flatten: f32,
     pub flatten_axis: Vec3,
@@ -61,6 +68,8 @@ impl LayerSim {
         for (slot, f) in forces.iter_mut().zip(&l.forces) {
             *slot = Some(*f);
         }
+        // NaN spreads count as 0.
+        let spread = l.spread.max(0.0);
         let facing = match l.render.facing {
             Facing::Plane { normal } => Facing::Plane {
                 normal: normal.normalize_or(Vec3::Y),
@@ -70,7 +79,20 @@ impl LayerSim {
         Self {
             shape: l.shape,
             direction: l.direction,
-            spread: l.spread.max(0.0),
+            spread,
+            spread_cos: spread.min(std::f32::consts::PI).cos(),
+            cone_cos: match l.shape {
+                EmitShape::Cone { angle, .. } => angle.min(std::f32::consts::PI).cos(),
+                _ => 1.0,
+            },
+            fixed_dir: {
+                let d = match l.direction {
+                    EmitDirection::Fixed(d) => d.normalize_or(Vec3::NEG_Z),
+                    _ => Vec3::NEG_Z,
+                };
+                let (bx, by) = d.any_orthonormal_pair();
+                (d, bx, by)
+            },
             offset: l.offset,
             flatten: l.flatten.clamp(0.0, 1.0),
             flatten_axis: l.flatten_axis.normalize_or(Vec3::Y),

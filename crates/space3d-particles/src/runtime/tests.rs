@@ -872,6 +872,82 @@ fn bridges_of_20_fast_bolts_within_budget() {
     assert!(ms <= budget, "{ms:.4} ms > {budget:.3} ms");
 }
 
+/// The render-time bridges of a Battle-sized fleet moved in `Stage::Update` (the game's
+/// pattern: every moving world-space emitter is bridged every frame): 300 ships' engine
+/// exhausts (`builtin::ENGINE_EXHAUST`) at 150 units/s and 20 bolts' laser trails at 3200
+/// units/s, each moved one 60 Hz frame after the tick — about 1200 plume particles and 1060
+/// trail glows, built and packed within 0.15 ms (Dev machine, release: about 0.10 ms, 0.15 ms
+/// before the spawn math skipped directions at rest, libm's `sin`/`cos` and per-particle
+/// constants). The render node adds the render poses, the upload and a draw: about 0.14 ms in
+/// all for this fleet (docs/performance.md, "Particles").
+#[test]
+fn bridges_of_a_battle_fleet_within_budget() {
+    use crate::cpu::{BridgeInput, PackLayer, pack_bridges};
+    use crate::registry::builtin;
+    let mut h = Harness::new();
+    h.settings.max_particles_cpu = 262_144;
+    let exhaust = h.add(builtin::effect(builtin::ENGINE_EXHAUST).expect("exhaust"));
+    let trail = h.add(builtin::effect(builtin::LASER_TRAIL).expect("laser trail"));
+    // Ships fly −Z (their exhaust points +Z), bolts +X.
+    let mut movers = Vec::new();
+    for i in 0..300 {
+        let ship = h
+            .world
+            .spawn((Transform::from_xyz((i % 20) as f32 * 60.0, 0.0, (i / 20) as f32 * 80.0),));
+        h.world
+            .spawn_effect(exhaust, EffectSpawn::at(Vec3::new(0.0, 0.0, 3.2)).follow(ship).seed(i));
+        movers.push((ship, Vec3::new(0.0, 0.0, -150.0 / 60.0)));
+    }
+    for i in 0..20 {
+        let bolt = h.world.spawn((Transform::from_xyz(0.0, 5.0, i as f32 * 10.0),));
+        h.world
+            .spawn_effect(trail, EffectSpawn::at(Vec3::ZERO).follow(bolt).seed(1000 + i));
+        movers.push((bolt, Vec3::new(3200.0 / 60.0, 0.0, 0.0)));
+    }
+    for _ in 0..40 {
+        for &(e, step) in &movers {
+            h.world.get::<&mut Transform>(e).unwrap().translation += step;
+        }
+        h.step();
+    }
+    // Render poses: one frame of motion past the tick (instances in spawn order: the ships',
+    // then the bolts').
+    let poses: Vec<(Vec3, Quat)> =
+        h.rt.instances
+            .iter()
+            .enumerate()
+            .map(|(i, inst)| (inst.pos + movers[i].1, inst.rot))
+            .collect();
+    let moved = vec![true; poses.len()];
+    let (mut keys, mut out, mut items) = (Vec::new(), Vec::new(), Vec::new());
+    let layer = PackLayer {
+        id: 0,
+        batched: true,
+        extent: 0.5,
+    };
+    let mut n = 0;
+    let ms = median_ms(100, || {
+        out.clear();
+        items.clear();
+        let input = BridgeInput {
+            rt: &h.rt,
+            poses: &poses,
+            moved: &moved,
+            dt: DT,
+            age: 0.5 * DT,
+        };
+        n = pack_bridges(&input, &|_| Some(layer), &mut keys, &mut out, &mut items);
+    });
+    let budget = 0.15 * budget_scale();
+    eprintln!(
+        "bridges: {n} particles of 300 exhausts and 20 bolts in {:.1} µs (budget {:.0} µs)",
+        ms * 1e3,
+        budget * 1e3
+    );
+    assert!((2000..=2600).contains(&n), "{n}");
+    assert!(ms <= budget, "{ms:.4} ms > {budget:.3} ms");
+}
+
 /// Pool slots each built-in reserves per instance (the sum of its layers' rings: design-particles
 /// §5.1), as documented in docs/graphics/particles.md "Budgets": on the CPU backend's web budget
 /// (8192, `Normal` priority 90 %) that is, e.g., 20 engine exhausts and 4 laser trails at once.
