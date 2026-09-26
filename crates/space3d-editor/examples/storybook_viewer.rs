@@ -1,7 +1,10 @@
-//! Storybook viewer on a small demo storybook.
+//! Storybook viewer on a small demo storybook, or on the engine's own book (`--engine`: every
+//! engine story, the graphics showcase included).
 //!
 //! ```sh
 //! cargo run -p space3d-editor --example storybook_viewer
+//! cargo run -p space3d-editor --example storybook_viewer -- --engine          # engine storybook
+//! cargo run -p space3d-editor --example storybook_viewer -- --engine --filter Showcase
 //! cargo run -p space3d-editor --example storybook_viewer -- --frames 120
 //! cargo run -p space3d-editor --example storybook_viewer -- --headless --frames 60
 //! ```
@@ -140,10 +143,23 @@ fn main() {
         .position(|a| a == "--frames")
         .and_then(|i| args.get(i + 1))
         .and_then(|n| n.parse().ok());
+    let engine = args.iter().any(|a| a == "--engine");
+    let book = if engine {
+        space3d_stories::engine_storybook()
+    } else {
+        demo_storybook()
+    };
+    let filter = args
+        .iter()
+        .position(|a| a == "--filter")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let initial_story = book.select(filter.as_deref()).first().map(|s| s.id.clone());
     let config = StorybookConfig {
         exit_after_frames: frames,
         headless: args.iter().any(|a| a == "--headless").then_some((1280, 720)),
+        initial_story,
         ..Default::default()
     };
-    run_storybook_with(demo_storybook(), config);
+    run_storybook_with(book, config);
 }

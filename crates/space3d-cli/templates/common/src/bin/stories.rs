@@ -4,6 +4,7 @@
 //! space3d stories                             # interactive viewer (--filter selects the first story)
 //! space3d stories --list                      # list story ids
 //! space3d stories --headless --out shots      # render every story + shots/index.html gallery
+//! space3d stories --engine                    # also the engine's stories (graphics showcase, …)
 //! ```
 //! (`space3d stories ...` runs `cargo run --bin stories -- ...`.)
 
@@ -20,7 +21,11 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let book = {{crate_name}}::stories::storybook();
+    let mut book = {{crate_name}}::stories::storybook();
+    if flag("--engine") {
+        // The engine's own book: every renderer feature, `Engine/Showcase/*` included.
+        book.extend(space3d::stories::engine_storybook());
+    }
     let filter = value("--filter");
 
     if flag("--list") {

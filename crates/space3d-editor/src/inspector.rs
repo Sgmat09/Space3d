@@ -1,16 +1,19 @@
 //! Inspector panel: typed editors for `Name`, `Transform`, `Parent`, `Material`, lights,
-//! `Camera3d`, `Visibility`, `MeshSource`, `Mesh3d`, plus a JSON editor for every other
-//! component registered in the scene `ComponentRegistry`. All edits are undoable.
+//! `Camera3d`, `Visibility`, `MeshSource`, `Mesh3d`, the graphics components (`CameraFrame`,
+//! `PostProcess`, `Skybox`, `EnvironmentLight`, `DirectionalShadow`), plus a JSON editor for
+//! every other component registered in the scene `ComponentRegistry`. All edits are undoable.
 
 use crate::components::{
-    MeshSource, can_remove, component_values, ensure_stable_id, names, remove_component, set_component_value,
+    ANTI_ALIASING, HDR_MODES, MeshSource, SHADOW_FILTERS, TONEMAPPERS, can_remove, component_values, ensure_stable_id,
+    names, remove_component, set_component_value,
 };
 use crate::history::{EditCommand, EditorHistory};
 use space3d_core::glam::{EulerRot, Quat, Vec3, Vec4};
 use space3d_core::hecs::{Component, Entity, World};
 use space3d_core::{Name, Parent, Transform};
 use space3d_render::{
-    Camera3d, DirectionalLight, Material, Mesh3d, PointLight, Projection, RenderAssets, RenderTarget, Visibility,
+    Camera3d, CameraFrame, DirectionalLight, DirectionalShadow, EnvironmentLight, Material, Mesh3d, PointLight,
+    PostProcess, Projection, RenderAssets, RenderTarget, Skybox, Visibility,
 };
 use space3d_scene::{ComponentRegistry, ComponentValue, StableId};
 use std::collections::{BTreeMap, HashMap};
@@ -30,7 +33,7 @@ pub struct InspectorState {
 }
 
 /// Handled by typed editors (not shown in the JSON section).
-const TYPED: [&str; 9] = [
+const TYPED: [&str; 12] = [
     "Name",
     space3d_scene::TRANSFORM,
     space3d_scene::PARENT,
@@ -40,6 +43,9 @@ const TYPED: [&str; 9] = [
     names::CAMERA,
     names::VISIBILITY,
     names::MESH_SOURCE,
+    names::CAMERA_FRAME,
+    names::POST_PROCESS,
+    names::DIRECTIONAL_SHADOW,
 ];
 
 /// Not offered in "Add component".
@@ -67,6 +73,42 @@ fn color3_edit(ui: &mut egui::Ui, c: &mut Vec3) -> egui::Response {
     let r = ui.color_edit_button_rgb(&mut rgb);
     if r.changed() {
         *c = Vec3::from(rgb);
+    }
+    r
+}
+
+/// A combo box over a `(value, name)` table; returns the response of the box.
+fn choice_edit<T: PartialEq + Copy>(ui: &mut egui::Ui, label: &str, v: &mut T, table: &[(T, &str)]) -> egui::Response {
+    let current = table.iter().find(|(t, _)| *t == *v).map_or("(other)", |(_, n)| n);
+    let mut r = egui::ComboBox::from_label(label)
+        .selected_text(current)
+        .show_ui(ui, |ui| {
+            let mut changed: Option<egui::Response> = None;
+            for (t, n) in table {
+                let item = ui.selectable_label(*t == *v, *n);
+                if item.clicked() {
+                    *v = *t;
+                }
+                changed = Some(match changed {
+                    Some(c) => c | item,
+                    None => item,
+                });
+            }
+            changed
+        });
+    if let Some(Some(inner)) = r.inner.take() {
+        r.response |= inner;
+    }
+    r.response
+}
+
+/// Yaw (degrees about +Y) of a rotation, edited as a slider.
+fn yaw_edit(ui: &mut egui::Ui, q: &mut Quat) -> egui::Response {
+    let (yaw, _, _) = q.to_euler(EulerRot::YXZ);
+    let mut deg = yaw.to_degrees();
+    let r = ui.add(egui::Slider::new(&mut deg, -180.0..=180.0).text("yaw°"));
+    if r.changed() {
+        *q = Quat::from_rotation_y(deg.to_radians());
     }
     r
 }
@@ -340,6 +382,121 @@ pub fn inspector_ui(
         Some(r)
     });
 
+    typed_section::<CameraFrame>(ui, world, registry, history, e, id, "Camera frame", |ui, f| {
+        let mut r = choice_edit(ui, "HDR", &mut f.hdr, &HDR_MODES);
+        let mut own = f.render_scale.is_some();
+        r |= ui.checkbox(&mut own, "own render scale");
+        match (own, &mut f.render_scale) {
+            (true, Some(scale)) => r |= ui.add(egui::Slider::new(scale, 0.25..=1.0).text("render scale")),
+            (true, None) => f.render_scale = Some(1.0),
+            (false, _) => f.render_scale = None,
+        }
+        Some(r)
+    });
+
+    typed_section::<PostProcess>(ui, world, registry, history, e, id, "Post-processing", |ui, p| {
+        let mut r = ui.checkbox(&mut p.enabled, "enabled");
+        r |= ui.add(
+            egui::DragValue::new(&mut p.exposure)
+                .speed(0.05)
+                .range(-16.0..=16.0)
+                .prefix("exposure (EV) "),
+        );
+        r |= ui.checkbox(&mut p.auto_exposure.enabled, "auto exposure");
+        r |= choice_edit(ui, "tonemapper", &mut p.tonemapper, &TONEMAPPERS);
+        r |= ui.checkbox(&mut p.bloom.enabled, "bloom");
+        r |= ui.add(egui::Slider::new(&mut p.bloom.intensity, 0.0..=2.0).text("bloom intensity"));
+        r |= ui.add(egui::Slider::new(&mut p.bloom.threshold, 0.0..=8.0).text("bloom threshold"));
+        r |= choice_edit(ui, "anti-aliasing", &mut p.anti_aliasing, &ANTI_ALIASING);
+        r |= ui.checkbox(&mut p.vignette.enabled, "vignette");
+        r |= ui.add(egui::Slider::new(&mut p.vignette.intensity, 0.0..=1.0).text("vignette intensity"));
+        let mut ca = if p.chromatic_aberration.enabled {
+            p.chromatic_aberration.intensity
+        } else {
+            0.0
+        };
+        let ca_r = ui.add(egui::Slider::new(&mut ca, 0.0..=1.0).text("chromatic aberration"));
+        if ca_r.changed() {
+            p.chromatic_aberration.enabled = ca > 0.0;
+            p.chromatic_aberration.intensity = ca;
+        }
+        r |= ca_r;
+        r |= ui.checkbox(&mut p.film_grain.enabled, "film grain");
+        r |= ui.add(egui::Slider::new(&mut p.film_grain.intensity, 0.0..=0.5).text("grain intensity"));
+        r |= ui.checkbox(&mut p.distortion.enabled, "distortion");
+        r |= ui.add(egui::Slider::new(&mut p.distortion.strength, 0.0..=4.0).text("distortion strength"));
+        r |= ui.add(egui::Slider::new(&mut p.color_grading.saturation, 0.0..=2.0).text("saturation"));
+        r |= ui.add(egui::Slider::new(&mut p.color_grading.contrast, 0.5..=2.0).text("contrast"));
+        r |= ui.add(egui::Slider::new(&mut p.color_grading.temperature, -1.0..=1.0).text("temperature"));
+        r |= ui.checkbox(&mut p.dither, "dither");
+        if p.color_grading.lut.is_some() {
+            ui.label("grades through a 3D LUT (session-local: not saved)");
+        }
+        Some(r)
+    });
+
+    typed_section::<Skybox>(ui, world, registry, history, e, id, "Skybox", |ui, sky| {
+        ui.label(format!("cubemap #{}", sky.cubemap.index()));
+        let mut r = ui.add(
+            egui::DragValue::new(&mut sky.intensity)
+                .speed(0.01)
+                .range(0.0..=100.0)
+                .prefix("intensity "),
+        );
+        r |= yaw_edit(ui, &mut sky.rotation);
+        Some(r)
+    });
+
+    typed_section::<EnvironmentLight>(ui, world, registry, history, e, id, "Environment light", |ui, env| {
+        ui.label(format!("cubemap #{}", env.cubemap.index()));
+        let mut r = ui.add(
+            egui::DragValue::new(&mut env.diffuse_intensity)
+                .speed(0.01)
+                .range(0.0..=100.0)
+                .prefix("diffuse "),
+        );
+        r |= ui.add(
+            egui::DragValue::new(&mut env.specular_intensity)
+                .speed(0.01)
+                .range(0.0..=100.0)
+                .prefix("specular "),
+        );
+        r |= yaw_edit(ui, &mut env.rotation);
+        Some(r)
+    });
+
+    typed_section::<DirectionalShadow>(ui, world, registry, history, e, id, "Directional shadow", |ui, sh| {
+        let sizes = [(512u32, "512"), (1024, "1024"), (2048, "2048"), (4096, "4096")];
+        let mut r = choice_edit(ui, "map size", &mut sh.map_size, &sizes);
+        r |= choice_edit(ui, "filter", &mut sh.filter, &SHADOW_FILTERS);
+        r |= ui.add(egui::Slider::new(&mut sh.strength, 0.0..=1.0).text("strength"));
+        r |= ui.add(
+            egui::DragValue::new(&mut sh.depth_bias)
+                .speed(0.001)
+                .range(0.0..=10.0)
+                .prefix("depth bias "),
+        );
+        r |= ui.add(
+            egui::DragValue::new(&mut sh.normal_bias)
+                .speed(0.01)
+                .range(0.0..=10.0)
+                .prefix("normal bias "),
+        );
+        r |= ui.add(
+            egui::DragValue::new(&mut sh.slope_bias)
+                .speed(0.01)
+                .range(0.0..=10.0)
+                .prefix("slope bias "),
+        );
+        r |= ui.add(
+            egui::DragValue::new(&mut sh.caster_depth)
+                .speed(1.0)
+                .range(0.0..=1e5)
+                .prefix("caster depth "),
+        );
+        Some(r)
+    });
+
     typed_section::<Visibility>(ui, world, registry, history, e, id, "Visibility", |ui, v| {
         let mut visible = *v == Visibility::Visible;
         let r = ui.checkbox(&mut visible, "visible");
@@ -507,6 +664,9 @@ fn insert_default(world: &mut World, e: Entity, name: &str) -> bool {
         names::CAMERA => world.insert_one(e, Camera3d::default()),
         names::VISIBILITY => world.insert_one(e, Visibility::Visible),
         names::MESH_SOURCE => world.insert_one(e, MeshSource::Cube { size: 1.0 }),
+        names::CAMERA_FRAME => world.insert_one(e, CameraFrame::default()),
+        names::POST_PROCESS => world.insert_one(e, PostProcess::default()),
+        names::DIRECTIONAL_SHADOW => world.insert_one(e, DirectionalShadow::default()),
         _ => return false,
     };
     r.is_ok()
@@ -574,5 +734,6 @@ mod tests {
         }
         assert!(!insert_default(&mut w, e, "Custom"));
         assert!(w.satisfies::<(&Camera3d, &MeshSource, &Visibility)>(e));
+        assert!(w.satisfies::<(&CameraFrame, &PostProcess, &DirectionalShadow)>(e));
     }
 }
