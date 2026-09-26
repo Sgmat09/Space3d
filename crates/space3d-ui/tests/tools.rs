@@ -891,3 +891,207 @@ fn tools_dock_back_when_the_area_is_tall_again() {
         }
     }
 }
+
+/// A tools app of a `screen` (points) at `ppp` physical pixels per point, with the overlay (with
+/// render stats), profiler and console open, docked in `dock` (with the overlay closed when
+/// `overlay` is false), after a few frames.
+fn tools_scaled(screen: (f32, f32), ppp: f32, dock: egui::Rect, overlay: bool) -> App {
+    let size = ((screen.0 * ppp).round() as u32, (screen.1 * ppp).round() as u32);
+    let mut app = tools_app(size, ppp, false);
+    app.insert_resource(window(size));
+    app.insert_resource(space3d_render::RenderStats::default());
+    app.resources.expect_mut::<DebugOverlay>().visible = overlay;
+    app.insert_resource(ToolDockArea(dock));
+    app.step_ticks(6);
+    app
+}
+
+/// Press at `from`, move to `to` in 10 steps, release (points, at `ppp`), calling `each` after
+/// every step of the move; then the pointer rests away from the tools.
+fn drag_scaled(app: &mut App, ppp: f32, from: egui::Pos2, to: egui::Pos2, mut each: impl FnMut(&App, usize)) {
+    let at = |app: &mut App, p: egui::Pos2| {
+        app.resources
+            .expect_mut::<Input>()
+            .inject_mouse_move(Vec2::new(p.x * ppp, p.y * ppp));
+        app.step_ticks(1);
+    };
+    at(app, from);
+    app.resources
+        .expect_mut::<Input>()
+        .inject_mouse_button_down(MouseButton::Left);
+    app.step_ticks(1);
+    for i in 1..=10 {
+        at(app, from + (to - from) * (i as f32 / 10.0));
+        each(app, i);
+    }
+    app.resources
+        .expect_mut::<Input>()
+        .inject_mouse_button_up(MouseButton::Left);
+    app.step_ticks(2);
+    at(app, egui::pos2(2.0, 2.0));
+    app.step_ticks(4);
+}
+
+/// The console's right edge, the profiler's left edge and the console's top edge, where a press
+/// grabs them.
+fn console_right(r: egui::Rect) -> egui::Pos2 {
+    egui::pos2(r.right() - 1.0, r.center().y)
+}
+
+fn profiler_left(r: egui::Rect) -> egui::Pos2 {
+    egui::pos2(r.left() + 1.0, r.center().y)
+}
+
+fn console_top(r: egui::Rect) -> egui::Pos2 {
+    egui::pos2(r.center().x, r.top() + 1.0)
+}
+
+fn same_size(a: egui::Rect, b: egui::Rect) -> bool {
+    (a.size() - b.size()).abs().max_elem() < 0.5
+}
+
+/// A console and a profiler the user resized in a tall area are squeezed side by side in a
+/// short band and get their sizes back when the area is tall again, at any scale: egui keeps
+/// only the size a window was last squeezed to (the console came back at the 347 pt the band
+/// left it instead of the user's 890 pt, the profiler at 467 pt instead of 640 pt, and the
+/// console's height at the band's instead of the user's).
+#[test]
+fn resized_tools_get_their_sizes_back_after_a_short_area() {
+    let tall = egui::Rect::from_min_max(egui::pos2(0.0, 23.0), egui::pos2(1024.0, 640.0));
+    let band = egui::Rect::from_min_max(egui::pos2(0.0, 300.0), egui::pos2(1024.0, 533.0));
+    for ppp in [1.0f32, 1.5, 2.0] {
+        let mut app = tools_scaled((1024.0, 640.0), ppp, tall, true);
+        let (_, profiler, console) = rects(&app);
+        drag_scaled(
+            &mut app,
+            ppp,
+            console_right(console),
+            console_right(console) + egui::vec2(250.0, 0.0),
+            |_, _| {},
+        );
+        let (_, _, console) = rects(&app);
+        drag_scaled(
+            &mut app,
+            ppp,
+            console_top(console),
+            console_top(console) - egui::vec2(0.0, 120.0),
+            |_, _| {},
+        );
+        drag_scaled(
+            &mut app,
+            ppp,
+            profiler_left(profiler),
+            profiler_left(profiler) - egui::vec2(200.0, 0.0),
+            |_, _| {},
+        );
+        let sized = rects(&app);
+        let label = format!("{ppp}x, resized {sized:?}");
+        assert!((sized.2.width() - 890.0).abs() < 1.0, "console widened: {label}");
+        assert!(sized.2.height() > 300.0, "console taller: {label}");
+        assert!((sized.1.width() - 640.0).abs() < 1.0, "profiler widened: {label}");
+        assert_stacked(&app, tall, &label);
+
+        app.insert_resource(ToolDockArea(band));
+        app.step_ticks(6);
+        assert_side_by_side(&app, band, &format!("{label}, band"));
+        for (dock, what) in [(tall, "tall again"), (band, "band again"), (tall, "tall once more")] {
+            app.insert_resource(ToolDockArea(dock));
+            app.step_ticks(6);
+            let now = rects(&app);
+            let label = format!("{label}, {what}: {now:?}");
+            if dock == tall {
+                assert!(
+                    same_size(now.1, sized.1) && same_size(now.2, sized.2),
+                    "the user's sizes: {label}"
+                );
+                assert_stacked(&app, tall, &label);
+            } else {
+                assert_side_by_side(&app, band, &label);
+            }
+        }
+    }
+}
+
+/// Dragging the console's edge toward the profiler beside it stops a gap from it on every
+/// frame of the drag, whatever width the console starts from, and neither loses a log line nor
+/// becomes resized when it could not move (the console's width limit was lifted every other
+/// frame: it was drawn over the profiler); in a wide, short area either tool resized toward the
+/// other stops a gap from it, and the tools keep their layout.
+#[test]
+fn an_edge_dragged_toward_the_other_tool_stops_a_gap_from_it() {
+    let apart = |app: &App, label: &str| {
+        let (_, profiler, console) = rects(app);
+        assert!(
+            console.right() + EDGE <= profiler.left() + 0.5,
+            "a gap apart: {label}: console {console:?}, profiler {profiler:?}"
+        );
+    };
+    let band = egui::Rect::from_min_max(egui::pos2(0.0, 300.0), egui::pos2(1024.0, 533.0));
+    for ppp in [1.0f32, 1.5, 2.0] {
+        let mut app = tools_scaled((1024.0, 640.0), ppp, band, true);
+        let before = rects(&app);
+        let from = console_right(before.2);
+        drag_scaled(&mut app, ppp, from, from + egui::vec2(300.0, 0.0), |app, i| {
+            let label = format!("{ppp}x, toward the profiler, move {i}");
+            apart(app, &label);
+            assert!(
+                same_size(rects(app).2, before.2),
+                "{label}: {:?} vs {before:?}",
+                rects(app)
+            );
+        });
+        assert_eq!(rects(&app), before, "{ppp}x: unchanged");
+        // Narrowed, then widened toward the profiler again: up to the same limit.
+        let from = console_right(before.2);
+        drag_scaled(&mut app, ppp, from, from - egui::vec2(150.0, 0.0), |_, _| {});
+        let narrowed = rects(&app).2;
+        assert!(
+            (narrowed.width() - (before.2.width() - 150.0)).abs() < 1.5,
+            "{ppp}x: {narrowed:?}"
+        );
+        let from = console_right(narrowed);
+        drag_scaled(&mut app, ppp, from, from + egui::vec2(300.0, 0.0), |app, i| {
+            apart(app, &format!("{ppp}x, narrowed, then toward the profiler, move {i}"));
+        });
+        let after = rects(&app);
+        assert!(
+            same_size(after.2, before.2) && after.1 == before.1,
+            "{ppp}x: {after:?} vs {before:?}"
+        );
+        assert_side_by_side(&app, band, &format!("{ppp}x, widened again"));
+    }
+
+    let wide = egui::Rect::from_min_size(egui::pos2(0.0, 300.0), egui::vec2(1920.0, 260.0));
+    for overlay in [true, false] {
+        let mut app = tools_scaled((1920.0, 640.0), 1.0, wide, overlay);
+        let before = rects(&app);
+        let from = console_right(before.2);
+        drag_scaled(&mut app, 1.0, from, from + egui::vec2(1000.0, 0.0), |app, i| {
+            apart(app, &format!("wide, overlay {overlay}, console widened, move {i}"));
+        });
+        let (_, profiler, console) = rects(&app);
+        let label = format!("overlay {overlay}: {before:?} -> {profiler:?} {console:?}");
+        assert!(
+            (profiler.left() - console.right() - EDGE).abs() < 1.0,
+            "up to the profiler: {label}"
+        );
+        assert_eq!(console.height(), before.2.height(), "{label}");
+        assert_eq!(profiler, before.1, "{label}");
+
+        let mut app = tools_scaled((1920.0, 640.0), 1.0, wide, overlay);
+        let from = profiler_left(before.1);
+        drag_scaled(&mut app, 1.0, from, from - egui::vec2(1000.0, 0.0), |_, _| {});
+        app.step_ticks(4);
+        let (_, profiler, console) = rects(&app);
+        let label = format!("overlay {overlay}: {before:?} -> {profiler:?} {console:?}");
+        assert!(
+            (profiler.left() - console.right() - EDGE).abs() < 1.0,
+            "up to the console: {label}"
+        );
+        assert!(
+            (profiler.right() - (wide.right() - EDGE)).abs() < 0.5,
+            "still docked: {label}"
+        );
+        assert_eq!(console, before.2, "the console keeps its place and size: {label}");
+    }
+}

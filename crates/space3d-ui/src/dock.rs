@@ -8,18 +8,29 @@
 //! * right of the debug overlay when the overlay reaches down into it;
 //! * left of the profiler (which then takes the area's height) when the profiler's smallest
 //!   layout with [`MIN_PROFILER_ROWS`] table rows (as drawn: without frames, its whole window)
-//!   does not fit above it. The profiler narrows (to [`crate::profiler::MIN_WIDTH`]) before the
-//!   console gets under [`CONSOLE_ROOM`] pt.
+//!   does not fit above it and the console reaches it (closer than a gap). The profiler narrows
+//!   (to [`crate::profiler::MIN_WIDTH`]) before the console gets under [`CONSOLE_ROOM`] pt.
 //!
 //! With neither tool above it, the console is as tall as the area (up to [`MAX_CONSOLE_HEIGHT`])
 //! instead of 40 % of it. When the console would get narrower than [`MIN_CONSOLE_WIDTH`] beside
 //! the profiler it stays under it (the profiler shows what rows fit above it); when not even the
 //! move right of the overlay leaves it that wide, it keeps its corner and the overlay covers part
-//! of it. The first tool system to run in a frame computes the plan (from the tools' open and
-//! docked state, where the overlay is drawn, the profiler's measured minimum height, the
-//! console's size and drawn height) and the others take it, so they agree within a frame; what
-//! they measure while drawing counts from the next frame. The edges the console docks against
-//! beside the others snap to the pixel grid, so the gaps stay [`EDGE`] wide as drawn.
+//! of it.
+//!
+//! Tools the user resized ([`crate::tool::user_size`]) dock by the same rules at their own
+//! sizes, each up to the other: beside the profiler the console stays left of the profiler as
+//! drawn (at the width a resized profiler keeps), the profiler right of the console. A profiler
+//! that does not fit above the console but is clear of it (a wide area, or a console the user
+//! narrowed) keeps its place, and neither is resized into the other. At its limit the console
+//! is a gap from the profiler in either layout, so the limit holds (it no longer lifts every
+//! other frame) while the console's edge is dragged toward the profiler.
+//!
+//! The first tool system to run in a frame computes the plan (from the tools' open and docked
+//! state, where the overlay is drawn, the profiler's measured minimum height, the console's size
+//! and drawn height) and the others take it, so they agree within a frame; what they measure
+//! while drawing counts from the next frame. The edges the console docks against beside the
+//! others (the area's own left edge too) snap to the pixel grid, so the gaps stay [`EDGE`] wide
+//! as drawn.
 
 use crate::tool::EDGE;
 use space3d_core::Resources;
@@ -56,8 +67,10 @@ pub(crate) struct Tools {
 /// The profiler's width and the smallest height it needs above the console.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ProfilerNeeds {
-    /// Its width (the default 440 pt, or what the user resized it to).
+    /// Its width (the default 440 pt, or the width the user gave it).
     pub width: f32,
+    /// The user resized it: it keeps its width wherever it docks, up to what is in the way.
+    pub user_sized: bool,
     /// Its height with [`MIN_PROFILER_ROWS`] table rows in its compact layout.
     pub min_height: f32,
 }
@@ -65,12 +78,13 @@ pub(crate) struct ProfilerNeeds {
 /// The console's size in the stacked layout.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ConsoleNeeds {
-    /// Its default size (640 pt × 40 % of the area), or the size the user resized it to.
+    /// Its default size (640 pt × 40 % of the area), or the size the user gave it
+    /// ([`crate::tool::user_size`]).
     pub size: egui::Vec2,
     /// Its height as drawn at `size` (capped to the area): a whole number of log lines, so up to
     /// a line shorter (at least 3 lines, so taller in a tiny area).
     pub height: f32,
-    /// The user resized it: it keeps that height wherever it docks.
+    /// The user resized it: it keeps that size wherever it docks, up to what is in the way.
     pub user_sized: bool,
 }
 
@@ -85,18 +99,18 @@ pub(crate) struct DockPlan {
     pub console_size: egui::Vec2,
     /// Width the console must stay within (a tool beside it), or infinity.
     pub console_max_width: f32,
-    /// The profiler is beside the console, not above it: its width and the width it must stay
-    /// within.
-    pub profiler_beside: Option<(f32, f32)>,
+    /// The profiler is beside the console, as tall as the area, at this width (instead of above
+    /// it).
+    pub profiler_beside: Option<f32>,
+    /// Width the profiler must stay within (the console beside it), or infinity.
+    pub profiler_max_width: f32,
 }
 
 #[cfg(test)]
 impl DockPlan {
     /// The console docks beside another tool (not in the stacked layout).
     fn console_moved(&self) -> bool {
-        self.console_pos != self.bounds.left_bottom()
-            || self.console_max_width.is_finite()
-            || self.profiler_beside.is_some()
+        self.console_pos != self.bounds.left_bottom() || self.profiler_beside.is_some()
     }
 }
 
@@ -109,22 +123,26 @@ pub(crate) fn arrange(t: &Tools) -> DockPlan {
         console_size: crate::console::window_rect(t.dock).size(),
         console_max_width: f32::INFINITY,
         profiler_beside: None,
+        profiler_max_width: f32::INFINITY,
     };
     let Some(console) = t.console else {
         return stacked;
     };
+    let ppp = t.pixels_per_point;
     let cs = console.size.min(b.size());
     // (Where it is drawn: its log is a whole number of lines.)
     let console_top = b.bottom() - console.height;
     let overlay = t.overlay;
-    // Right of the overlay when the overlay reaches down into it (on the pixel grid, so the gap
-    // stays whole as drawn).
+    // Right of the overlay when the overlay reaches down into it. Beside another tool its left
+    // edge is on the pixel grid (as egui draws a window's corner), so the gaps stay whole as
+    // drawn.
     let beside_overlay = overlay.filter(|o| o.bottom() + EDGE > console_top);
-    let left = beside_overlay.map_or(b.left(), |o| ceil_to_pixels(o.right() + EDGE, t.pixels_per_point));
+    let left = ceil_to_pixels(beside_overlay.map_or(b.left(), |o| o.right() + EDGE), ppp);
     let room = b.right() - left;
 
-    // The profiler where the stacked layout docks it: top-right, left of the overlay (or under
-    // it, on a narrow area).
+    // The profiler where the stacked layout docks it (top-right, left of the overlay, or under
+    // it on a narrow area): its left edge, and whether its smallest layout fits above the
+    // console.
     let profiler_above = t.profiler.map(|p| {
         let width = p.width.min(b.width());
         let (mut x, mut top) = (b.right() - width, b.top());
@@ -137,9 +155,13 @@ pub(crate) fn arrange(t: &Tools) -> DockPlan {
                 top = o.bottom() + EDGE;
             }
         }
-        let over_console = x < left + cs.x.min(room);
-        (p, over_console, console_top - EDGE - top >= p.min_height)
+        (p, x, console_top - EDGE - top >= p.min_height)
     });
+    // Whether a console `width` wide whose left edge is at `console_left` (on the pixel grid)
+    // reaches a profiler whose left edge is at `x`: they are closer than a gap, as drawn. (One
+    // the user resized up to the other is a gap from it either way: see below.)
+    let reaches =
+        |x: f32, console_left: f32, width: f32| floor_to_pixels(x, ppp) - (console_left + width) < EDGE - 0.01;
     let height = |nothing_above: bool| {
         if nothing_above && !console.user_sized {
             b.height().min(MAX_CONSOLE_HEIGHT)
@@ -148,40 +170,68 @@ pub(crate) fn arrange(t: &Tools) -> DockPlan {
         }
     };
 
-    // Left of the profiler when its smallest layout does not fit above the console. (The
-    // profiler, then as tall as the area, stays right of an overlay the console is under.)
-    if let Some((p, true, false)) = profiler_above {
+    // Left of the profiler when its smallest layout does not fit above the console and the
+    // console reaches it. (The profiler, then as tall as the area, stays right of an overlay the
+    // console is under.)
+    if let Some((p, x, false)) = profiler_above
+        && reaches(x, left, cs.x.min(room))
+    {
         let width = p.width.min(b.width());
-        let widest = match overlay {
-            Some(o) if beside_overlay.is_none() => width.min(b.right() - o.right() - EDGE),
-            _ => width,
+        let clear_of_overlay = match overlay {
+            Some(o) if beside_overlay.is_none() => b.right() - o.right() - EDGE,
+            _ => f32::INFINITY,
         };
+        let widest = width.min(clear_of_overlay);
         let narrowest = crate::profiler::MIN_WIDTH.min(width);
         let profiler = (room - EDGE - CONSOLE_ROOM).min(widest).max(narrowest);
         // Up to the profiler's left edge as egui draws it (its corner rounded to the pixel grid).
-        let console_room = floor_to_pixels(b.right() - profiler, t.pixels_per_point) - EDGE - left;
+        let console_room = floor_to_pixels(b.right() - profiler, ppp) - EDGE - left;
         let console_width = cs.x.min(console_room);
         if console_width >= MIN_CONSOLE_WIDTH && widest >= narrowest {
+            let profiler_max = (b.right() - (left + console_width) - EDGE).min(clear_of_overlay);
+            // A profiler the user resized keeps its width up to the console, and the console
+            // stays left of it as drawn.
+            let drawn = if p.user_sized {
+                width.min(profiler_max).max(profiler)
+            } else {
+                profiler
+            };
             let nothing_above = beside_overlay.is_some() || overlay.is_none();
             return DockPlan {
                 console_pos: egui::pos2(left, b.bottom()),
                 console_size: egui::vec2(console_width, height(nothing_above)),
-                console_max_width: console_room,
-                profiler_beside: Some((profiler, b.right() - (left + console_width) - EDGE)),
+                console_max_width: floor_to_pixels(b.right() - drawn, ppp) - EDGE - left,
+                profiler_beside: Some(profiler),
+                profiler_max_width: profiler_max,
                 ..stacked
             };
         }
     }
+    let mut plan = stacked;
+    let mut console_left = ceil_to_pixels(b.left(), ppp);
+    let mut console_width = cs.x;
     if beside_overlay.is_some() && cs.x.min(room) >= MIN_CONSOLE_WIDTH {
-        let nothing_above = profiler_above.is_none_or(|(_, over, _)| !over);
-        return DockPlan {
+        console_left = left;
+        console_width = cs.x.min(room);
+        let nothing_above = profiler_above.is_none_or(|(_, x, _)| !reaches(x, left, console_width));
+        plan = DockPlan {
             console_pos: egui::pos2(left, b.bottom()),
-            console_size: egui::vec2(cs.x.min(room), height(nothing_above)),
+            console_size: egui::vec2(console_width, height(nothing_above)),
             console_max_width: room,
             ..stacked
         };
     }
-    stacked
+    // A profiler that does not fit above the console, clear of it (a wide area, or a console
+    // the user narrowed), is beside it all the same: neither is resized into the other.
+    if let Some((_, x, false)) = profiler_above
+        && !reaches(x, console_left, console_width)
+    {
+        plan.console_max_width = plan
+            .console_max_width
+            .min(floor_to_pixels(x, ppp) - EDGE - console_left);
+        plan.profiler_max_width = b.right() - (console_left + console_width) - EDGE;
+    }
+    plan
 }
 
 /// `x` rounded up to the pixel grid.
@@ -213,12 +263,11 @@ pub(crate) fn plan(resources: &Resources, ctx: &egui::Context, dock: egui::Rect)
 
 /// What [`arrange`] needs to know about the tools this frame.
 fn tools(resources: &Resources, ctx: &egui::Context, dock: egui::Rect) -> Tools {
-    use crate::tool::{is_floating, is_user_sized};
-    let last = |id: &str| ctx.memory(|m| m.area_rect(egui::Id::new(id)));
+    use crate::tool::{is_floating, user_size};
     let overlay = resources
         .get::<crate::DebugOverlay>()
         .filter(|o| o.visible)
-        .and_then(|_| last(crate::debug::OVERLAY_ID))
+        .and_then(|_| ctx.memory(|m| m.area_rect(egui::Id::new(crate::debug::OVERLAY_ID))))
         .map(|r| {
             // Where it is docked, as egui places an area (its corner rounded to the pixel grid).
             // (Not where egui last put it: on its first frame egui sizes it somewhere else.)
@@ -229,12 +278,13 @@ fn tools(resources: &Resources, ctx: &egui::Context, dock: egui::Rect) -> Tools 
     let profiler = resources
         .get::<crate::Profiler>()
         .filter(|p| p.visible && !is_floating(ctx, crate::profiler::PROFILER_ID))
-        .map(|p| ProfilerNeeds {
-            width: match last(crate::profiler::PROFILER_ID) {
-                Some(r) if is_user_sized(ctx, crate::profiler::PROFILER_ID) => r.width(),
-                _ => crate::profiler::WIDTH,
-            },
-            min_height: p.min_height(ctx, MIN_PROFILER_ROWS),
+        .map(|p| {
+            let user = user_size(ctx, crate::profiler::PROFILER_ID);
+            ProfilerNeeds {
+                width: user.map_or(crate::profiler::WIDTH, |s| s.x),
+                user_sized: user.is_some(),
+                min_height: p.min_height(ctx, MIN_PROFILER_ROWS),
+            }
         });
     let console = resources
         .get::<crate::Console>()
@@ -242,25 +292,13 @@ fn tools(resources: &Resources, ctx: &egui::Context, dock: egui::Rect) -> Tools 
         .map(|c| {
             // (A window gets at most the area's height, at least a tool window's.)
             let fit = |h: f32| h.min(dock.height() - 2.0 * EDGE).max(crate::tool::MIN_SIZE.y);
-            match last(crate::console::CONSOLE_ID) {
-                // (As the user left it, unless the area is shorter.)
-                Some(r) if is_user_sized(ctx, crate::console::CONSOLE_ID) => ConsoleNeeds {
-                    size: r.size(),
-                    height: if fit(r.height()) < r.height() {
-                        c.drawn_height(fit(r.height()))
-                    } else {
-                        r.height()
-                    },
-                    user_sized: true,
-                },
-                _ => {
-                    let size = crate::console::window_rect(dock).size();
-                    ConsoleNeeds {
-                        size,
-                        height: c.drawn_height(fit(size.y)),
-                        user_sized: false,
-                    }
-                }
+            let user = user_size(ctx, crate::console::CONSOLE_ID);
+            // (As the user left it, capped to the area.)
+            let size = user.unwrap_or_else(|| crate::console::window_rect(dock).size());
+            ConsoleNeeds {
+                size,
+                height: c.drawn_height(fit(size.y)),
+                user_sized: user.is_some(),
             }
         });
     Tools {
@@ -279,6 +317,7 @@ mod tests {
     const OVERLAY: egui::Vec2 = egui::vec2(213.0, 144.0);
     const PROFILER: ProfilerNeeds = ProfilerNeeds {
         width: 440.0,
+        user_sized: false,
         min_height: 150.0,
     };
     /// The console's log line, the height of its window around the log and what the rest of it
@@ -370,7 +409,7 @@ mod tests {
         let plan = arrange(&tools(dock));
         let b = dock.shrink(EDGE);
         assert_eq!(plan.console_pos, egui::pos2(6.0 + OVERLAY.x + EDGE, b.bottom()));
-        let (profiler, _) = plan.profiler_beside.expect("the profiler beside the console");
+        let profiler = plan.profiler_beside.expect("the profiler beside the console");
         assert_eq!(profiler, 440.0);
         assert_eq!(plan.console_size.y, b.height(), "nothing above it: the area's height");
         let console_right = plan.console_pos.x + plan.console_size.x;
@@ -444,7 +483,8 @@ mod tests {
                     if let Some(o) = t.overlay {
                         assert!(!o.expand(EDGE - 0.01).intersects(console), "{label}");
                     }
-                    if let Some((width, max)) = plan.profiler_beside {
+                    if let Some(width) = plan.profiler_beside {
+                        let max = plan.profiler_max_width;
                         let profiler = egui::Rect::from_min_max(egui::pos2(b.right() - width, b.top()), b.max);
                         assert!(width >= crate::profiler::MIN_WIDTH && max >= width - 0.01, "{label}");
                         assert!(console.right() + EDGE <= profiler.left() + 0.01, "{label}");
@@ -461,7 +501,8 @@ mod tests {
     /// On a dock area off the pixel grid the edges the console docks against beside the others
     /// snap to it, so the gaps stay whole as egui draws the windows (their corners rounded to
     /// pixels): the overlay drawn half a pixel right of the area's corner, the profiler's corner
-    /// rounded either way.
+    /// rounded either way, and without the overlay the console's own corner (egui rounded the
+    /// area's 43.5 pt to 44 pt: 5.5 pt were left to the profiler).
     #[test]
     fn gaps_stay_whole_on_the_pixel_grid() {
         for ppp in [1.0f32, 1.25, 1.5, 2.0] {
@@ -471,26 +512,158 @@ mod tests {
                 (10.6, 0.0, 1100.9, 250.0),
                 (0.0, 0.0, 660.0, 240.0),
             ] {
-                let dock = area(x, y, w, h);
-                let px = |v: f32| (v * ppp).round() / ppp;
-                let mut t = tools(dock);
-                t.pixels_per_point = ppp;
-                let corner = dock.min + egui::Vec2::splat(EDGE);
-                t.overlay = Some(egui::Rect::from_min_size(
-                    egui::pos2(px(corner.x), px(corner.y)),
-                    egui::vec2(212.69, 144.0),
-                ));
-                let plan = arrange(&t);
-                let label = format!("{ppp}x {dock:?}: {plan:?}");
-                assert!(plan.console_moved(), "{label}");
-                let left = plan.console_pos.x;
-                assert!((px(left) - left).abs() < 1e-3, "on the grid: {label}");
-                assert!(left - t.overlay.unwrap().right() >= EDGE - 1e-3, "{label}");
-                if let Some((width, _)) = plan.profiler_beside {
+                for overlay in [true, false] {
+                    let dock = area(x, y, w, h);
                     let b = dock.shrink(EDGE);
-                    let profiler_left = px(b.right() - width);
-                    assert!(profiler_left - (left + plan.console_size.x) >= EDGE - 1e-3, "{label}");
-                    assert!(left + plan.console_max_width + EDGE <= profiler_left + 1e-3, "{label}");
+                    let px = |v: f32| (v * ppp).round() / ppp;
+                    let mut t = tools(dock);
+                    t.pixels_per_point = ppp;
+                    let corner = dock.min + egui::Vec2::splat(EDGE);
+                    t.overlay = overlay.then(|| {
+                        egui::Rect::from_min_size(egui::pos2(px(corner.x), px(corner.y)), egui::vec2(212.69, 144.0))
+                    });
+                    let plan = arrange(&t);
+                    let label = format!("{ppp}x {dock:?}, overlay {overlay}: {plan:?}");
+                    // (Where egui draws the console's corner: rounded to the grid.)
+                    let left = px(plan.console_pos.x);
+                    if plan.console_moved() {
+                        assert!((px(left) - plan.console_pos.x).abs() < 1e-3, "on the grid: {label}");
+                    }
+                    // (egui rounds a stacked console's corner either way.)
+                    let slack = if plan.console_moved() { 1e-3 } else { 0.5 / ppp };
+                    assert!(left >= b.left() - slack, "{label}");
+                    if let Some(o) = t.overlay {
+                        assert!(left - o.right() >= EDGE - 1e-3, "{label}");
+                    }
+                    // The profiler as egui draws it, beside the console or top-right above it.
+                    let profiler_left = px(b.right() - plan.profiler_beside.unwrap_or(PROFILER.width));
+                    if plan.console_max_width.is_finite() {
+                        assert!(left + plan.console_max_width + EDGE <= profiler_left + 1e-3, "{label}");
+                    } else {
+                        assert!(
+                            overlay && x == 10.6,
+                            "only the 1100 pt band fits the stacked layout: {label}"
+                        );
+                    }
+                    if plan.profiler_beside.is_some() {
+                        assert!(profiler_left - (left + plan.console_size.x) >= EDGE - 1e-3, "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A console the user sized docks by the same limit whatever its width: widened up to the
+    /// profiler, the plan at the width it is then drawn at keeps the limit that stopped it (at
+    /// the limit the profiler no longer overlapped it, which lifted the limit every other frame
+    /// of the drag: the console was drawn over the profiler). Its limit keeps it a gap from the
+    /// profiler as drawn, beside it or top-right above it.
+    #[test]
+    fn the_consoles_limit_holds_as_it_reaches_the_profiler() {
+        for ppp in [1.0f32, 1.5, 2.0] {
+            for dock in [
+                area(0.0, 300.0, 1024.0, 233.0),
+                area(0.0, 0.0, 800.0, 200.0),
+                area(0.0, 0.0, 1920.0, 260.0),
+                area(37.5, 123.25, 1011.5, 233.5),
+            ] {
+                for overlay in [true, false] {
+                    let b = dock.shrink(EDGE);
+                    let mut t = tools(dock);
+                    t.pixels_per_point = ppp;
+                    if !overlay {
+                        t.overlay = None;
+                    }
+                    let with_width = |w: f32| {
+                        let console = t.console.map(|c| ConsoleNeeds {
+                            size: egui::vec2(w, c.size.y),
+                            user_sized: true,
+                            ..c
+                        });
+                        arrange(&Tools { console, ..t })
+                    };
+                    for w in (160..1900).step_by(3) {
+                        let plan = with_width(w as f32);
+                        let label = format!("{ppp}x {dock:?}, overlay {overlay}, width {w}: {plan:?}");
+                        let left = ceil_to_pixels(plan.console_pos.x, ppp);
+                        let drawn = (w as f32).min(plan.console_max_width).min(b.right() - left);
+                        let again = with_width(drawn);
+                        let profiler_left = |plan: &DockPlan| {
+                            floor_to_pixels(b.right() - plan.profiler_beside.unwrap_or(PROFILER.width), ppp)
+                        };
+                        assert_eq!(again.console_max_width, plan.console_max_width, "{label}");
+                        assert_eq!(profiler_left(&again), profiler_left(&plan), "{label}");
+                        let profiler_left = profiler_left(&plan);
+                        assert!(left + plan.console_max_width + EDGE <= profiler_left + 1e-3, "{label}");
+                        assert!(
+                            b.right() - plan.profiler_max_width >= left + drawn + EDGE - 1e-3,
+                            "the profiler stays clear of it: {label}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A profiler the user resized keeps its width beside the console, up to the console (or
+    /// the overlay the console is under); the console keeps a gap from the profiler at the width
+    /// the profiler keeps, and a wide area's stacked tools stay clear of each other too.
+    #[test]
+    fn a_resized_profiler_and_the_console_stay_apart() {
+        for ppp in [1.0f32, 2.0] {
+            for dock in [
+                area(0.0, 300.0, 1024.0, 233.0),
+                area(0.0, 0.0, 1920.0, 260.0),
+                area(0.0, 0.0, 1100.0, 280.0),
+            ] {
+                for overlay in [Some(OVERLAY), Some(egui::vec2(213.0, 60.0)), None] {
+                    for console_width in [None, Some(200.0), Some(300.0), Some(900.0)] {
+                        for profiler_width in (240..1000).step_by(9) {
+                            let b = dock.shrink(EDGE);
+                            let mut t = tools(dock);
+                            t.pixels_per_point = ppp;
+                            t.overlay = overlay.map(|s| overlay_in(dock, s));
+                            t.profiler = Some(ProfilerNeeds {
+                                width: profiler_width as f32,
+                                user_sized: true,
+                                ..PROFILER
+                            });
+                            if let (Some(w), Some(c)) = (console_width, t.console.as_mut()) {
+                                c.size.x = w;
+                                c.user_sized = true;
+                            }
+                            let plan = arrange(&t);
+                            let label = format!(
+                                "{ppp}x {dock:?}, overlay {overlay:?}, console {console_width:?}, profiler {profiler_width}: {plan:?}"
+                            );
+                            let left = ceil_to_pixels(plan.console_pos.x, ppp);
+                            let cs = t.console.unwrap().size.x.min(b.width());
+                            let console_right = left + cs.min(plan.console_max_width).min(b.right() - left);
+                            // The profiler at the width it keeps (and at the plan's width, for
+                            // one the user did not resize).
+                            let mut profiler = (profiler_width as f32).min(plan.profiler_max_width).min(b.width());
+                            if let Some(planned) = plan.profiler_beside {
+                                profiler = profiler.max(planned);
+                                assert!(plan.profiler_max_width >= planned - 0.01, "{label}");
+                            } else if let Some(o) = t.overlay
+                                && b.right() - profiler < o.right() + EDGE
+                            {
+                                // (Top-right, it stays right of the overlay above the console.)
+                                profiler = profiler.min(b.right() - o.right() - EDGE);
+                            }
+                            let profiler_left = floor_to_pixels(b.right() - profiler, ppp);
+                            let profiler_in_rows =
+                                plan.profiler_beside.is_some() || plan.profiler_max_width.is_finite();
+                            if profiler_in_rows {
+                                assert!(console_right + EDGE <= profiler_left + 1e-3, "{label}");
+                                assert!(left + plan.console_max_width + EDGE <= profiler_left + 1e-3, "{label}");
+                            }
+                            if let (Some(o), Some(_)) = (t.overlay, plan.profiler_beside) {
+                                let p = egui::Rect::from_min_max(egui::pos2(b.right() - profiler, b.top()), b.max);
+                                assert!(!o.expand(EDGE - 0.01).intersects(p), "clear of the overlay: {label}");
+                            }
+                        }
+                    }
                 }
             }
         }

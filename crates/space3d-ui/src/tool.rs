@@ -8,7 +8,8 @@
 //! They dock to the corners of the [`ToolDockArea`] (the whole screen by default; side by side
 //! in a short one: [`crate::dock`]), follow it when it changes (the window or an editor panel is
 //! resized) until the user drags them away, keep their default size for the current area until
-//! the user resizes them, and sit on egui's foreground layer, above the game's own windows.
+//! the user resizes them (then the size the user gave them, as far as the area and the other
+//! tools leave room), and sit on egui's foreground layer, above the game's own windows.
 
 use crate::theme::{UiDensity, apply_density, visible_scroll_bars};
 use space3d_core::Resources;
@@ -195,14 +196,45 @@ const USER_SIZED: &str = "space3d_ui::user_sized";
 const FREE_EDGE_PRESS: &str = "space3d_ui::free_edge_press";
 /// Where the held press started, when it started on the window.
 const PRESS: &str = "space3d_ui::press";
+/// The axes ([x, y]) whose edges the held press grabbed.
+const GRABBED: &str = "space3d_ui::grabbed";
+/// The height a press that grabbed no top or bottom edge holds the window at.
+const HELD_HEIGHT: &str = "space3d_ui::held_height";
+/// The size the user gave the window (see [`user_size`]).
+const USER_SIZE: &str = "space3d_ui::user_size";
+/// The user's size as last applied to the docked window (capped to the dock area and the
+/// width left beside the other tools).
+const APPLIED_USER_SIZE: &str = "space3d_ui::applied_user_size";
+const DEFAULT_SIZE: &str = "space3d_ui::default_size";
+
+fn data<T: Clone + Send + Sync + 'static>(ctx: &egui::Context, id: &str, name: &'static str) -> Option<T> {
+    ctx.data(|d| d.get_temp::<T>(egui::Id::new(id).with(name)))
+}
+
+fn set_data<T: Clone + Send + Sync + 'static>(ctx: &egui::Context, id: &str, name: &'static str, value: T) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(id).with(name), value));
+}
+
+fn remove_data<T: Clone + Default + Send + Sync + 'static>(ctx: &egui::Context, id: &str, name: &'static str) {
+    ctx.data_mut(|d| d.remove_temp::<T>(egui::Id::new(id).with(name)));
+}
 
 /// The default size a docked tool window `id` last took (see [`window`]).
 fn applied_default(ctx: &egui::Context, id: &str) -> Option<egui::Vec2> {
-    ctx.data(|d| d.get_temp::<egui::Vec2>(egui::Id::new(id).with("space3d_ui::default_size")))
+    data(ctx, id, DEFAULT_SIZE)
 }
 
 fn set_applied_default(ctx: &egui::Context, id: &str, size: egui::Vec2) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new(id).with("space3d_ui::default_size"), size));
+    set_data(ctx, id, DEFAULT_SIZE, size);
+}
+
+/// The size the user gave the tool window `id` by resizing it (outer, for each axis the last
+/// size a drag of that axis' edge left it at; the other axis as it was then), when they did. A
+/// docked window gets it back when the dock area and the other tools leave room for it again
+/// (egui itself keeps only the size a window was last squeezed to). For a window drawn shorter
+/// than it is given (the console's whole log lines), the height it is given.
+pub(crate) fn user_size(ctx: &egui::Context, id: &str) -> Option<egui::Vec2> {
+    data(ctx, id, USER_SIZE).filter(|_| is_user_sized(ctx, id))
 }
 
 /// Whether the tool window `id` was dragged away from its dock (it stays where the user put it).
@@ -279,15 +311,21 @@ pub(crate) struct ToolWindow<'a> {
     /// Outer width the window must stay within this frame (another tool is in the way), or
     /// `f32::INFINITY`. Unlike `size.x`, applied every frame.
     pub max_width: f32,
+    /// How much taller than it is drawn the window must be given to be drawn as tall again (the
+    /// console, a whole number of log lines tall, is drawn up to a line shorter than it is
+    /// given); 0 for a window as tall as it is given.
+    pub height_slack: f32,
 }
 
 /// A tool window on the foreground layer: compact frame and header row (title, `summary`,
 /// close button) under any global style. `open` is cleared by the close button. While docked it
 /// keeps its `anchor` corner at `dock_pos` (so it follows the dock area) and, until the user
-/// resizes it, its default size `spec.size` (which follows the dock area too); dragging it (or
-/// resizing it by a docked edge) makes it float, double-clicking its title docks it again. The
-/// contents run with the tool density and get the screen y their last row must end above (the
-/// window's largest content bottom).
+/// resizes it, its default size `spec.size` (which follows the dock area too); once resized, the
+/// size the user gave it ([`user_size`]) within `bounds` and `spec.max_width`, which it gets back
+/// when those grow again. Only the edges a press grabbed resize it: a press that grabbed no top
+/// or bottom edge holds its height. Dragging it (or resizing it by a docked edge) makes it
+/// float, double-clicking its title docks it again. The contents run with the tool density and
+/// get the screen y their last row must end above (the window's largest content bottom).
 pub(crate) fn window<R>(
     ctx: &egui::Context,
     spec: ToolWindow<'_>,
@@ -354,28 +392,41 @@ pub(crate) fn window<R>(
         let origin = ctx.input(|i| i.pointer.press_origin());
         let grab = ctx.global_style().interaction.resize_grab_radius_corner;
         let on = origin.zip(last_rect).filter(|(p, r)| r.expand(grab).contains(*p));
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new(spec.id).with(PRESS), on.map(|(p, _)| p)));
-        // Resizing by a free edge (one away from the docked corner) leaves the window docked.
-        // egui moves the window's top-left corner before it applies the new size, so while the
-        // edge is dragged the docked corner seems to move with it; such a press must not undock
-        // it.
+        set_data(ctx, spec.id, PRESS, on.map(|(p, _)| p));
         if let Some((p, r)) = on {
             let resizable = [true, !spec.fit_height];
-            let free = grabs_only_free_edges(&ctx.global_style().interaction, r, p, spec.anchor, resizable);
-            set_flag(ctx, spec.id, FREE_EDGE_PRESS, free);
+            let edges = grabbed_edges(&ctx.global_style().interaction, r, p, resizable);
+            // Resizing by a free edge (one away from the docked corner) leaves the window
+            // docked. egui moves the window's top-left corner before it applies the new size, so
+            // while the edge is dragged the docked corner seems to move with it; such a press
+            // must not undock it.
+            set_flag(ctx, spec.id, FREE_EDGE_PRESS, only_free_edges(edges, spec.anchor));
+            let grabbed = edges.map(|e| e.contains(&true));
+            set_data(ctx, spec.id, GRABBED, grabbed);
+            // egui resizes a window by an edge to the rect it has as drawn, in both directions:
+            // a window drawn shorter than it is given (the console) would lose a line to a drag
+            // of its side edge, or to a move.
+            let held = (!grabbed[1] && !spec.fit_height).then(|| r.height() + spec.height_slack);
+            set_data(ctx, spec.id, HELD_HEIGHT, held);
         }
     }
-    let press = ctx.data(|d| {
-        d.get_temp::<Option<egui::Pos2>>(egui::Id::new(spec.id).with(PRESS))
-            .flatten()
-    });
+    let press = data::<Option<egui::Pos2>>(ctx, spec.id, PRESS).flatten();
     // (egui forgets the press origin on the frame it is released.)
     let pressed_on_window =
         press.is_some_and(|p| (down && ctx.input(|i| i.pointer.press_origin()) == Some(p)) || (released && !down));
     if press.is_some() && !down && !released {
-        ctx.data_mut(|d| d.insert_temp::<Option<egui::Pos2>>(egui::Id::new(spec.id).with(PRESS), None));
+        set_data::<Option<egui::Pos2>>(ctx, spec.id, PRESS, None);
     }
     let free_edge_press = pressed_on_window && flag(ctx, spec.id, FREE_EDGE_PRESS);
+    let grabbed = if pressed_on_window {
+        data::<[bool; 2]>(ctx, spec.id, GRABBED).unwrap_or_default()
+    } else {
+        [false; 2]
+    };
+    if pressed_on_window && let Some(held) = data::<Option<f32>>(ctx, spec.id, HELD_HEIGHT).flatten() {
+        let held = held.min(bounds.height());
+        window = window.min_height(held).max_height(held);
+    }
     // Docked and never resized by the user: when its default size changes (the dock area did,
     // or a host set one after the first frame), the window takes the new one, as if it had
     // started with it (egui keeps the size of the window's first frame). Its contents may keep
@@ -390,6 +441,34 @@ pub(crate) fn window<R>(
         }
         if applied != Some(spec.size) {
             set_applied_default(ctx, spec.id, spec.size);
+        }
+    }
+    // Docked and resized by the user: the size the user gave it, within the dock area and the
+    // width left beside the other tools. egui keeps only the size a window was last squeezed
+    // to, so when the room comes back (the area got larger again, or a tool beside it went
+    // away) the window takes the user's size again.
+    if floating {
+        // (Docked again, it takes the user's size once.)
+        remove_data::<egui::Vec2>(ctx, spec.id, APPLIED_USER_SIZE);
+    } else if user_sized
+        && !pressed_on_window
+        && let Some(last) = last_rect
+    {
+        let user =
+            data::<egui::Vec2>(ctx, spec.id, USER_SIZE).unwrap_or(last.size() + egui::vec2(0.0, spec.height_slack));
+        let target = user
+            .min(bounds.size())
+            .min(egui::vec2(spec.max_width, f32::INFINITY))
+            .max(MIN_SIZE);
+        let applied = data::<egui::Vec2>(ctx, spec.id, APPLIED_USER_SIZE);
+        if applied.is_none_or(|a| a.x != target.x) {
+            window = window.min_width(target.x).max_width(target.x);
+        }
+        if applied.is_none_or(|a| a.y != target.y) && !spec.fit_height {
+            window = window.min_height(target.y).max_height(target.y);
+        }
+        if applied != Some(target) {
+            set_data(ctx, spec.id, APPLIED_USER_SIZE, target);
         }
     }
     let mut close = false;
@@ -439,14 +518,28 @@ pub(crate) fn window<R>(
             set_flag(ctx, spec.id, FLOATING, false);
             ctx.request_repaint();
         }
-        // Resized by the user (a height that follows the contents does not count): the window
+        // Resized by the user by an edge the press grabbed (a height that follows the contents
+        // does not count, nor what the other tools or the area squeeze meanwhile): the window
         // keeps that size from now on.
-        if pressed_on_window
-            && let Some(last) = last_rect
-            && ((rect.width() - last.width()).abs() > 0.5
-                || (!spec.fit_height && (rect.height() - last.height()).abs() > 0.5))
-        {
-            set_flag(ctx, spec.id, USER_SIZED, true);
+        if let Some(last) = last_rect {
+            let resized = [
+                grabbed[0] && (rect.width() - last.width()).abs() > 0.5,
+                grabbed[1] && !spec.fit_height && (rect.height() - last.height()).abs() > 0.5,
+            ];
+            if resized.contains(&true) {
+                let mut user = data::<egui::Vec2>(ctx, spec.id, USER_SIZE)
+                    .filter(|_| user_sized)
+                    .unwrap_or(last.size() + egui::vec2(0.0, spec.height_slack));
+                if resized[0] {
+                    user.x = rect.width();
+                }
+                if resized[1] {
+                    user.y = rect.height() + spec.height_slack;
+                }
+                set_data(ctx, spec.id, USER_SIZE, user);
+                set_flag(ctx, spec.id, USER_SIZED, true);
+                remove_data::<egui::Vec2>(ctx, spec.id, APPLIED_USER_SIZE);
+            }
         }
     }
     if close {
@@ -455,16 +548,15 @@ pub(crate) fn window<R>(
     out.and_then(|r| r.inner)
 }
 
-/// Whether a press at `p` grabs a resize handle of the window `rect` (as egui places them: a
-/// corner square, else a side strip, for the `resizable` [x, y] directions) that moves only
-/// edges away from its docked `anchor` corner.
-fn grabs_only_free_edges(
+/// The edges of the window `rect` whose resize handle a press at `p` grabs (as egui places them:
+/// a corner square, else a side strip, for the `resizable` [x, y] directions): for each axis,
+/// [min edge, max edge].
+fn grabbed_edges(
     interaction: &egui::style::Interaction,
     rect: egui::Rect,
     p: egui::Pos2,
-    anchor: egui::Align2,
     resizable: [bool; 2],
-) -> bool {
+) -> [[bool; 2]; 2] {
     let (side, corner) = (
         interaction.resize_grab_radius_side,
         interaction.resize_grab_radius_corner,
@@ -484,8 +576,7 @@ fn grabs_only_free_edges(
     };
     let (in_corner, on_side) = (near(corner), near(side));
     let is_corner = in_corner[0].contains(&true) && in_corner[1].contains(&true);
-    let docked = [anchor.x() == egui::Align::Max, anchor.y() == egui::Align::Max].map(usize::from);
-    let mut grabbed = false;
+    let mut grabbed = [[false; 2]; 2];
     for axis in 0..2 {
         let other = 1 - axis;
         // A side strip leaves the corner squares to the corners.
@@ -498,16 +589,16 @@ fn grabs_only_free_edges(
         } else {
             [false; 2]
         };
-        for (edge, hit) in edges.into_iter().enumerate() {
-            if hit && resizable[axis] {
-                if edge == docked[axis] {
-                    return false;
-                }
-                grabbed = true;
-            }
-        }
+        grabbed[axis] = edges.map(|hit| hit && resizable[axis]);
     }
     grabbed
+}
+
+/// Whether the `grabbed` edges ([`grabbed_edges`]) are some and all away from the window's
+/// docked `anchor` corner.
+fn only_free_edges(grabbed: [[bool; 2]; 2], anchor: egui::Align2) -> bool {
+    let docked = [anchor.x() == egui::Align::Max, anchor.y() == egui::Align::Max].map(usize::from);
+    grabbed.iter().flatten().any(|&g| g) && (0..2).all(|axis| !grabbed[axis][docked[axis]])
 }
 
 /// An 18 pt "×" button (drawn, so it needs no glyph from the game's fonts).

@@ -509,6 +509,17 @@ impl Console {
         around + lines * line
     }
 
+    /// How much taller than it is drawn the console window must be given to be drawn as tall
+    /// again (see [`Self::drawn_height`]): what the rest of it reserves beyond what it takes as
+    /// drawn, and a hair (a height on a line boundary keeps the line).
+    pub(crate) fn height_slack(&self) -> f32 {
+        let (around, reserved) = match self.fit {
+            fit if fit.line > 0.0 && fit.around > 0.0 => (fit.around, fit.reserved),
+            _ => (ESTIMATED_AROUND, ESTIMATED_RESERVED),
+        };
+        (reserved - around).max(0.0) + 0.5
+    }
+
     /// Lines shown with the current level and text filter (`filter` lowercased by the caller).
     fn shown<'a>(&'a self, filter: &'a str) -> impl Iterator<Item = &'a LogLine> {
         self.lines.iter().filter(move |l| is_shown(l, self.min_level, filter))
@@ -821,6 +832,7 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
                 size: plan.console_size,
                 fit_height: false,
                 max_width: plan.console_max_width,
+                height_slack: c.height_slack(),
             },
             &mut open,
             |ui| {

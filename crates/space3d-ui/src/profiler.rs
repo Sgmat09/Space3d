@@ -325,8 +325,9 @@ impl Profiler {
     /// Draw the profiler contents into `ui`: a toolbar, then collapsible "Timeline" (the last
     /// frame's systems, flame style) and "Systems" (a striped table sorted by average time,
     /// numbers right-aligned, scrolling by whole rows within the space left in `ui`) sections,
-    /// both the full width of `ui` (not indented). Where the sections and three table rows do
-    /// not fit, the section headers are left out (the flame view and the table stay).
+    /// both the full width of `ui` (not indented). Where the sections and three table rows (all
+    /// of them, with fewer systems) do not fit, the section headers are left out (the flame view
+    /// and the table stay).
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let bottom = ui.available_rect_before_wrap().bottom();
         let _ = self.ui_until(ui, bottom);
@@ -345,8 +346,8 @@ impl Profiler {
     }
 
     /// [`Self::ui`] with the table ending above screen y `max_bottom`. When the sections and
-    /// [`crate::dock::MIN_PROFILER_ROWS`] table rows do not fit above it, the section headers
-    /// are left out (the compact layout: the flame and the table stay, always open). Returns the
+    /// [`crate::dock::MIN_PROFILER_ROWS`] table rows (all of them, with fewer systems) do not fit
+    /// above it, the section headers are left out (the compact layout: the flame and the table stay, always open). Returns the
     /// layout for [`Self::min_height`] when `ui` is the profiler window's (measured from the top
     /// of `ui`), if it could be measured.
     #[must_use]
@@ -378,7 +379,9 @@ impl Profiler {
         let pitch = table_pitch(ui);
         let spacing = ui.spacing().item_spacing.y;
         let section_header = ui.spacing().interact_size.y + spacing;
-        let table = pitch + spacing + crate::dock::MIN_PROFILER_ROWS as f32 * pitch;
+        // (All rows, with fewer systems.)
+        let rows = crate::dock::MIN_PROFILER_ROWS.min(self.stats.len());
+        let table = pitch + spacing + rows as f32 * pitch;
         let full = 2.0 * section_header + self.flame_height() + spacing + table;
         let rows_offset = if max_bottom - ui.cursor().top() < full {
             self.flame_ui(ui);
@@ -747,6 +750,7 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
             size: place.size,
             fit_height: true,
             max_width: place.max_width,
+            height_slack: 0.0,
         },
         &mut open,
         |ui| {
@@ -804,7 +808,7 @@ fn placement(
 ) -> Placement {
     let edge = crate::tool::EDGE;
     let bounds = dock.shrink(edge);
-    let width = plan.profiler_beside.map_or(WIDTH, |(w, _)| w).min(bounds.width());
+    let width = plan.profiler_beside.unwrap_or(WIDTH).min(bounds.width());
     let floating = crate::tool::is_floating(ctx, PROFILER_ID);
     let limit = if floating {
         ctx.content_rect().shrink(edge)
@@ -835,14 +839,14 @@ fn placement(
     let below = |profiler: egui::Rect, console: egui::Rect| {
         console.x_range().intersects(profiler.x_range()) && console.top() > profiler.top()
     };
-    let mut max_width = plan.profiler_beside.map_or(f32::INFINITY, |(_, max)| max);
+    let mut max_width = plan.profiler_max_width;
     if let Some(overlay) = overlay
         && plan.profiler_beside.is_none()
         && profiler.top() < overlay.bottom() + edge
     {
         let room = profiler.right() - overlay.right() - edge;
         if room >= MIN_WIDTH {
-            max_width = room;
+            max_width = max_width.min(room);
         } else if !floating {
             let stacked = placed(egui::pos2(bounds.right(), overlay.bottom() + edge));
             let floor = console
@@ -966,6 +970,7 @@ mod tests {
                         size,
                         fit_height: true,
                         max_width: f32::INFINITY,
+                        height_slack: 0.0,
                     },
                     &mut open,
                     |_| {},
@@ -1045,6 +1050,24 @@ mod tests {
             "a small minimum: {}",
             p.min_height(&ctx, 3)
         );
+    }
+
+    /// With fewer systems than 3 rows, the sections stay wherever they fit with all the rows
+    /// (they were left out wherever 3 rows would not have fit: 133 pt instead of 173 pt tall).
+    #[test]
+    fn a_profiler_with_few_systems_keeps_its_sections_where_they_fit() {
+        let mut p = profiler_with(2);
+        let (_, full) = painted(&mut p, egui::vec2(440.0, 400.0));
+        let (texts, window) = painted(&mut p, egui::vec2(440.0, full.height()));
+        let label = format!("{full:?} -> {window:?}");
+        let sections = ["Timeline", "Systems (2)"].map(|h| texts.iter().any(|(t, _)| t == h));
+        assert_eq!(sections, [true; 2], "section headers: {label}");
+        assert_eq!(rows(&texts, window), 2, "{label}");
+        assert!((window.height() - full.height()).abs() < 0.5, "{label}");
+        // A point shorter, the compact layout.
+        let (texts, window) = painted(&mut p, egui::vec2(440.0, full.height() - 1.0));
+        assert!(!texts.iter().any(|(t, _)| t == "Timeline"), "{window:?}");
+        assert_eq!(rows(&texts, window), 2, "{window:?}");
     }
 
     /// The header titles sit right above their right-aligned numbers, whether the table
