@@ -531,7 +531,7 @@ no composite tap (`no_distortion_pass_without_writers`: bit-identical images).
 
 ```rust
 use space3d::prelude::*;
-use space3d::render::{DistortionMaterial, DistortionMode};
+use space3d::render::{Distortion, DistortionMaterial, DistortionMode};
 
 // A shockwave ring on a quad (MeshData::plane: its UV center in the middle, UV radius 0.5 at
 // its edges); grow the transform's scale and fade `strength` to animate it.
