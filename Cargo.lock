@@ -4868,6 +4868,7 @@ dependencies = [
  "space3d-editor",
  "space3d-github",
  "space3d-net",
+ "space3d-particles",
  "space3d-physics",
  "space3d-platform",
  "space3d-render",
@@ -4899,6 +4900,7 @@ dependencies = [
  "serde",
  "serde_json",
  "space3d-core",
+ "space3d-render",
  "space3d-tasks",
  "tempfile",
  "thiserror 2.0.21",
@@ -5048,6 +5050,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "space3d-particles"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "bytemuck",
+ "image",
+ "naga",
+ "pollster",
+ "proptest",
+ "ron",
+ "serde",
+ "space3d-core",
+ "space3d-render",
+ "space3d-test",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "space3d-physics"
 version = "0.1.0"
 dependencies = [
@@ -5088,10 +5109,12 @@ dependencies = [
  "futures",
  "glam 0.33.9",
  "image",
+ "naga",
  "pollster",
  "rayon",
  "space3d-core",
  "space3d-tasks",
+ "space3d-test",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5177,6 +5200,7 @@ dependencies = [
  "serde",
  "serde_json",
  "space3d-core",
+ "space3d-particles",
  "space3d-physics",
  "space3d-render",
  "space3d-test",

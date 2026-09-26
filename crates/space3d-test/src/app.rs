@@ -637,7 +637,10 @@ impl TestApp {
 
     // ---- rendering -----------------------------------------------------------------------
 
-    fn with_renderer<R>(&mut self, f: impl FnOnce(&mut App) -> R) -> R {
+    /// Run `f` with the renderer in the app's resources, also when it is kept out of the frame
+    /// loop ([`TestAppBuilder::render_on_demand`]): setup code that sizes things from
+    /// `Renderer::size` or reads its capabilities sees the renderer the screenshots use.
+    pub fn with_renderer<R>(&mut self, f: impl FnOnce(&mut App) -> R) -> R {
         if let Some(r) = self.stashed.take() {
             self.app.insert_resource(r);
             let out = f(&mut self.app);

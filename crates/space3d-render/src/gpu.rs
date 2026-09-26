@@ -24,9 +24,17 @@ const PARALLEL_COPY_THRESHOLD: usize = 1 << 20;
 /// existing chunk creates a new one of exactly that size).
 pub(crate) const STAGING_CHUNK: u64 = 4 << 20;
 
-/// Frames per window of the peak-usage tracker: idle chunks beyond twice the busiest frame of
-/// the last one to two windows are released.
+/// Frames per window of the peak-usage tracker: idle chunks beyond what the last one to two
+/// windows needed (twice the busiest frame, or the busiest frame for each frame the GPU may
+/// still hold plus one) are released.
 const TRIM_WINDOW: u32 = 128;
+
+/// Frames per window of the queue-depth tracker: the allowance is the deepest queue of the last
+/// one to two windows. It follows a deeper queue at once and keeps it for 512–1024 frames, so a
+/// queue whose depth varies (frames recorded ahead of an unpaced GPU) keeps its chunks instead
+/// of dropping and re-creating them, while the chunks of a one-off stall (the GPU fell far
+/// behind once) are released within about 17 s at 60 Hz.
+const DEPTH_WINDOW: u32 = 4 * TRIM_WINDOW;
 
 /// Round `v` up to a multiple of `align` (power of two).
 pub(crate) fn align_up(v: u64, align: u64) -> u64 {
@@ -41,6 +49,8 @@ const MAP_FAILED: u8 = 2;
 /// One `MAP_WRITE | COPY_SRC` staging buffer of [`STAGING_CHUNK`] bytes.
 struct Chunk {
     buffer: wgpu::Buffer,
+    /// Frame (`Uploader::frames`) of its last submission.
+    frame: u64,
     /// Bytes handed out since the chunk was (re)mapped.
     offset: u64,
     /// Set by the `map_async` callback once the GPU is done with the chunk.
@@ -63,14 +73,24 @@ pub(crate) struct Uploader {
     /// Most chunks one frame used: in the current window, in the previous one.
     peak: [u32; 2],
     window_frames: u32,
+    /// Frames submitted (`recall` calls).
+    frames: u64,
+    /// Deepest queue (frames whose chunks the GPU still held after a submission): in the current
+    /// window of [`DEPTH_WINDOW`] frames, in the previous one.
+    depth: [u32; 2],
+    depth_frames: u32,
     /// Bytes written this frame.
     pub bytes: u64,
     /// Instance bytes written this frame.
     pub instance_bytes: u64,
-    /// GPU buffers (re)allocated this frame.
+    /// GPU buffers (re)allocated this frame (staging chunks not included).
     pub reallocations: u32,
+    /// Staging chunks created this frame.
+    pub chunks_created: u32,
     /// Whether the "device lost, skipping uploads" warning was already logged.
     lost_logged: bool,
+    /// Staging chunks created so far.
+    created: u64,
 }
 
 impl Uploader {
@@ -84,10 +104,15 @@ impl Uploader {
             used_this_frame: 0,
             peak: [0; 2],
             window_frames: 0,
+            frames: 0,
+            depth: [0; 2],
+            depth_frames: 0,
             bytes: 0,
             instance_bytes: 0,
             reallocations: 0,
+            chunks_created: 0,
             lost_logged: false,
+            created: 0,
         }
     }
 
@@ -95,6 +120,7 @@ impl Uploader {
         self.bytes = 0;
         self.instance_bytes = 0;
         self.reallocations = 0;
+        self.chunks_created = 0;
     }
 
     /// Copy `data` into `target` at `offset` through staging memory. `offset` and the length
@@ -179,16 +205,22 @@ impl Uploader {
         }
         let size = want.min(STAGING_CHUNK);
         self.collect_returned();
-        let mut chunk = self.free.pop().unwrap_or_else(|| Chunk {
-            buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("space3d staging"),
-                size: STAGING_CHUNK,
-                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                // MAP_WRITE buffers are mapped directly (no hidden staging copy).
-                mapped_at_creation: true,
-            }),
-            offset: 0,
-            state: Arc::new(AtomicU8::new(MAPPED)),
+        let (created, this_frame) = (&mut self.created, &mut self.chunks_created);
+        let mut chunk = self.free.pop().unwrap_or_else(|| {
+            *created += 1;
+            *this_frame += 1;
+            Chunk {
+                buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("space3d staging"),
+                    size: STAGING_CHUNK,
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    // MAP_WRITE buffers are mapped directly (no hidden staging copy).
+                    mapped_at_creation: true,
+                }),
+                offset: 0,
+                state: Arc::new(AtomicU8::new(MAPPED)),
+                frame: 0,
+            }
         });
         chunk.offset = size;
         self.active.push(chunk);
@@ -222,10 +254,12 @@ impl Uploader {
     }
 
     /// After submission: re-map the chunks just submitted (they come back once the GPU is
-    /// done with them) and release idle chunks beyond twice the recent per-frame peak.
+    /// done with them) and release idle chunks beyond what recent frames needed.
     pub fn recall(&mut self) {
-        for c in self.closed.drain(..) {
+        self.frames += 1;
+        for mut c in self.closed.drain(..) {
             c.state.store(MAPPING, Ordering::Relaxed);
+            c.frame = self.frames;
             let state = c.state.clone();
             c.buffer.slice(..).map_async(wgpu::MapMode::Write, move |r| {
                 state.store(if r.is_ok() { MAPPED } else { MAP_FAILED }, Ordering::Release);
@@ -241,10 +275,32 @@ impl Uploader {
             self.peak = [0, self.peak[0]];
             self.window_frames = 0;
         }
-        // Dropping a chunk frees it (it is idle: not referenced by any submission). One spare
-        // stays, so an occasional small edit after a quiet period does not create a chunk.
-        let keep = (2 * self.peak[0].max(self.peak[1]) as usize).max(1);
+        // Queue depth: the frames from the oldest submission the GPU still holds to this one.
+        let oldest = self.in_flight.iter().map(|c| c.frame).min();
+        let depth = oldest.map_or(0, |f| (self.frames - f + 1) as u32);
+        self.depth[0] = self.depth[0].max(depth);
+        self.depth_frames += 1;
+        if self.depth_frames >= DEPTH_WINDOW {
+            self.depth = [0, self.depth[0]];
+            self.depth_frames = 0;
+        }
+        let depth = self.depth[0].max(self.depth[1]) as usize;
+        // Dropping a chunk frees it (it is idle: not referenced by any submission). Kept: at
+        // least twice the busiest frame, and the busiest frame for every frame of the queue
+        // depth plus the next one — with frames queued, every frame's chunks are still in
+        // flight when the next frame allocates, and trimming them would create and drop a
+        // 4 MiB chunk every few frames even for a 16-byte upload. One spare stays, so an
+        // occasional small edit after a quiet period does not create a chunk.
+        let peak = self.peak[0].max(self.peak[1]) as usize;
+        let resident = (2 * peak).max(peak * (depth + 1)).max(1);
+        let keep = resident.saturating_sub(self.in_flight.len());
         self.free.truncate(keep);
+    }
+
+    /// Staging chunks created since the uploader was made (0 more in the steady state).
+    #[cfg(test)]
+    pub fn chunks_created(&self) -> u64 {
+        self.created
     }
 
     /// Staging chunks currently allocated (in any state).
@@ -770,6 +826,56 @@ mod tests {
         // A frame needs at most 5 chunks; frames in flight, spares for the next frame and
         // one-frame latency of the returns fit well within 16. The belt reached 64+.
         assert!(peak <= 16, "resident staging chunks: {peak}");
+    }
+
+    /// Regression (review): with several frames queued on the GPU, each frame's chunk is still
+    /// in flight when the next frame allocates. Trimming idle chunks to twice the per-frame peak
+    /// dropped the returning ones, so a still HDR scene (16 bytes of post seeds per frame)
+    /// created and dropped a 4 MiB chunk every few frames (0.5–1 ms of CPU each). The ring now
+    /// keeps what the recent in-flight depth needs: nothing is created in the steady state.
+    #[test]
+    fn queued_frames_do_not_churn_staging_chunks() {
+        let Some((device, queue)) = device_queue() else { return };
+        let mut up = Uploader::new(&device);
+        let target = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // The GPU is waited for only every `pace`th frame: up to `pace` frames (chunks) in
+        // flight.
+        let run = |up: &mut Uploader, frames: u32, pace: u32| {
+            for i in 0..frames {
+                let mut encoder = device.create_command_encoder(&Default::default());
+                up.write(&mut encoder, &target, 0, &[7u8; 16]);
+                up.finish();
+                queue.submit([encoder.finish()]);
+                up.recall();
+                if i % pace == pace - 1 {
+                    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+                }
+            }
+        };
+        // The ring grows to the queue's depth (at most 7 chunks: a wait every 6th frame
+        // returns them all; exactly when it gets there depends on the GPU's timing) and then
+        // creates nothing, across depth windows (512 frames) while the depth recurs. Trimming
+        // the in-flight chunks away created one every few frames: hundreds here.
+        run(&mut up, 1260, 6);
+        let created = up.chunks_created();
+        assert!(
+            created <= 8,
+            "{created} chunks created in 1260 frames of a 6-deep queue"
+        );
+        assert!(up.resident_chunks() <= 8, "{}", up.resident_chunks());
+        // A one-off stall (up to 40 frames unwaited: the ring grows to however far the GPU fell
+        // behind); once frames are paced again its chunks are released within two depth
+        // windows.
+        run(&mut up, 40, 40);
+        let grown = up.resident_chunks();
+        run(&mut up, 2 * DEPTH_WINDOW + 8, 1);
+        let kept = up.resident_chunks();
+        assert!(kept <= 2, "{kept} of {grown} chunks kept after the stall");
     }
 
     /// A one-off burst (e.g. a big asset upload) is released once it is no longer the recent

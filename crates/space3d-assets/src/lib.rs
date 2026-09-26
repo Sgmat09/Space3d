@@ -49,6 +49,8 @@ pub mod loaders;
 mod model;
 mod par;
 mod path;
+#[cfg(feature = "render")]
+pub mod render;
 mod server;
 mod source;
 
@@ -58,8 +60,13 @@ pub use handle::{AssetId, AssetIndex, Handle, UntypedAssetId};
 #[cfg(all(feature = "hot-reload", not(target_arch = "wasm32")))]
 pub use hot_reload::HotReloadWatcher;
 pub use loader::{AssetLoader, LoadContext, MAX_DEPENDENCY_ROUNDS};
-pub use loaders::{GltfLoader, ImageLoader, MeshLoader, ObjLoader};
-pub use model::{AlphaMode, MaterialData, ModelData, ModelMesh, NodeData, Primitive};
+pub use loaders::{
+    CubeConvention, CubemapData, GltfLoader, HdrImageLoader, ImageLoader, MeshLoader, ObjLoader, SkyboxLoader,
+};
+pub use model::{
+    AlphaMode, MaterialData, MaterialTextureInfo, ModelData, ModelMesh, NodeData, Primitive, PrimitiveExtras,
+    SamplerData, TextureInfo, UvTransformData, WrapMode,
+};
 pub use par::PAR_ROW_THRESHOLD;
 pub use path::AssetPath;
 pub use server::{AssetServer, LoadState};

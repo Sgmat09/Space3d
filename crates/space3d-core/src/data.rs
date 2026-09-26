@@ -53,6 +53,56 @@ impl ImageData {
     }
 }
 
+/// Linear floating-point RGBA image (HDR environments, HDR captures). Row-major, top row first.
+///
+/// Not in the core prelude; exported as `space3d_core::HdrImageData`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HdrImageData {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// `width * height` linear RGBA pixels.
+    pub pixels: Vec<[f32; 4]>,
+}
+
+impl HdrImageData {
+    /// An image from its pixels.
+    ///
+    /// # Panics
+    /// If `pixels.len() != width * height`.
+    pub fn new(width: u32, height: u32, pixels: Vec<[f32; 4]>) -> Self {
+        assert_eq!(
+            pixels.len(),
+            width as usize * height as usize,
+            "HdrImageData::new: {width}x{height} needs {} pixels, got {}",
+            width as usize * height as usize,
+            pixels.len()
+        );
+        Self { width, height, pixels }
+    }
+
+    /// An image filled with one color.
+    pub fn filled(width: u32, height: u32, c: [f32; 4]) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![c; width as usize * height as usize],
+        }
+    }
+
+    /// The pixel at `(x, y)` (panics outside the image).
+    pub fn get(&self, x: u32, y: u32) -> [f32; 4] {
+        assert!(
+            x < self.width && y < self.height,
+            "({x}, {y}) outside {}x{}",
+            self.width,
+            self.height
+        );
+        self.pixels[y as usize * self.width as usize + x as usize]
+    }
+}
+
 /// Indexed triangle mesh.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MeshData {
@@ -163,6 +213,13 @@ mod tests {
         }
         let (min, max) = MeshData::cube(2.0).aabb();
         assert_eq!((min, max), (Vec3::splat(-1.0), Vec3::splat(1.0)));
+    }
+    #[test]
+    fn hdr_images() {
+        let img = HdrImageData::new(2, 1, vec![[8.0, 0.5, 0.0, 1.0], [0.0; 4]]);
+        assert_eq!(img.get(0, 0), [8.0, 0.5, 0.0, 1.0]);
+        assert_eq!(HdrImageData::filled(3, 2, [1.0; 4]).pixels.len(), 6);
+        assert!(std::panic::catch_unwind(|| HdrImageData::new(2, 2, vec![[0.0; 4]])).is_err());
     }
     #[test]
     fn image_get_set() {

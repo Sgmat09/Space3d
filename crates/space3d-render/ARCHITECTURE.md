@@ -9,19 +9,21 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
 | module | role |
 |---|---|
 | `renderer.rs` | `Renderer`: instance/adapter/device/queue, capability detection, surfaces, offscreen target, asset upload, `capture()` |
-| `frame.rs` | per-frame extract → batch → cull → upload → encode; `RenderSettings`; material interning |
+| `frame/` | per-frame work: `mod.rs` (`render_frame` orchestration, `FrameState`, `RenderSettings`, uploads, frame facts), `plan.rs` (cameras, viewport rects, the frame plan: target groups, modes, post groups, view roles), `extract.rs` (ECS/explicit extraction, batching, material interning), `views.rs` (lights, `GpuView`s, draw commands, CPU culling, GPU culling jobs/dispatches), `draws.rs` (material bind groups, `encode_draws`), `passes.rs` (view passes with the node phases, depth resolve, SceneRead and Distortion passes, HdrScene overlays, group finish: composites and display views, capture replay), `nodes.rs` (the render-node snapshot and schedule, node `prepare`/`prepare_view`, pass targets and depth-read modes, scene-input bind groups), `targets.rs` (scene textures of intermediate groups, resolved depths, render-target feedback copies, the texture pool), `tests.rs` |
 | `instance.rs` | `InstanceData` trait, `InstanceLayout`/semantics, built-in formats, `InstanceBuffer<T>`, `InstanceBuffers`, `InstancedMesh` |
 | `gpu.rs` | `Uploader` (staging ring), `GrowBuffer`, `TrackedBuffer` (shadow-diffed uploads), parallel staging copies |
 | `arena.rs` | mesh arena: shared vertex/index buffers, first-fit range allocator, GPU-side growth |
 | `assets.rs` | `RenderAssets`: handle allocation without a GPU, pending uploads, textures/render targets |
 | `texture.rs` | `write_texture` uploads (block-aware pitch), GPU mip generation, sampler cache |
-| `pipeline.rs` | GPU uniform layouts, WGSL generation per instance layout (+ custom shader hooks), pipeline cache |
+| `pipeline/` | `mod.rs` (pipeline cache, `PipelineKey`, culling/blit/clear pipelines, culling uniforms), `view.rs` (`GpuView`, lights), `forward.rs` (forward shader composition, `GpuMaterial`, material layouts, forward pipelines, custom-shader validation), `instance.rs` (instance attributes, generated `InstanceInput` WGSL) |
 | `shader.rs` | `CustomShader`: user WGSL hooks spliced into the forward shader |
+| `settings.rs`, `caps.rs`, `output.rs`, `node.rs`, `timing.rs`, `quality.rs` | graphics API (frame): `FrameSettings`/`CameraFrame`, `GraphicsCaps`, `OutputEncoding`/`Tonemapper`/`OUTPUT_WGSL`, the render-node API, `GpuTimings`, `GraphicsQuality` (see `docs/graphics/api.md`) |
+| `material.rs`, `lighting/`, `post/` | graphics API hubs of the materials and post areas (`BlendMode`…, cubemaps/`Skybox`/shadows/`LightingSettings`, `PostProcess`…) and their crate-internal frame contracts (`Lighting`, `PostState`) |
 | `readback.rs` | non-blocking readback of GPU-culled visible counts for `RenderStats` |
 | `culling.rs` | `Frustum`, `Aabb`, `Sphere` (CPU side; mirrored in `shaders/cull.wgsl`) |
 | `dirty.rs` | `DirtyRanges`: sorted, coalescing range set |
 | `stats.rs` | `RenderStats`, `DrawPath` |
-| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears) |
+| `shaders/` | `forward.wgsl` (template), `cull.wgsl`, `compact.wgsl`, `blit.wgsl`, `clear.wgsl` (viewport clears); `common/` (`view`, `output`, `scene`, `fullscreen`, `hash`: the WGSL modules nodes and overlays compose), `frame/depth_resolve.wgsl` (minimum of a multisampled depth's samples), `post/composite.wgsl` (scene texture → display target), `post/distortion.wgsl` |
 
 ## Frame data flow
 
@@ -31,7 +33,7 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  RenderAssets.pending ──► upload_assets_into ──► mesh arena (staging ring)
                                               └► textures (write_texture + GPU mip blit)
 
- World ──┬─ lights (DirectionalLight ≤4, PointLight ≤16) ─────────────► GpuView (per camera)
+ World ──┬─ lights (DirectionalLight ≤4, PointLight: 16 nearest per view) ─► GpuView (per camera)
          ├─ cameras (Camera3d + GlobalTransform, sorted by order) ─────► views + frustums
          ├─ ECS: (GlobalTransform, Mesh3d, Material, Visibility?) — archetype columns
          │      intern Material → id (cached) ; key = class|material|mesh   (serial)
@@ -57,10 +59,16 @@ touches as few bytes as possible per frame**. It runs windowed (surface provided
  flush TrackedBuffers (only changed bytes) ─► staging ring ─► copy_buffer_to_buffer
    (CpuDirect: `ecs` uploads only ranges drawn from it; the rest stays pending)
  encoder: [uploads] → copy templates→args → clear counts
+          → [render nodes: prepare (compute), prepare_view per view]
           → compute(mark → scan → scatter [+compact]) → copy args → stats readback ring
           → per view: [copy own render target → feedback texture] → render pass
-                      (first pass into a target clears it; viewport: scissor [+ clear triangle])
-          → submit → present → staging recall → poll(Poll)
+                      (first pass into a target clears it; viewport: scissor [+ clear triangle];
+                       node slots around the built-in opaque and blended batches)
+                      [→ depth resolve → SceneRead pass] [→ Distortion pass]
+          → [HdrScene overlays] → post groups' composites → display views
+          → AfterTonemap overlays
+          → submit → present → staging recall
+          → wait for the frame submitted 3 frames earlier (at most 3 in flight; native), else poll(Poll)
  next frames: read the mapped args copy (visible counts) into RenderStats
 ```
 
@@ -106,13 +114,17 @@ a `const LAYOUT: &'static InstanceLayout` listing attributes and their *semantic
 | `TextureLayer` | texture-array layer (atlas page / animation frame) |
 | `Custom(n)` | bound as `inst.customN`; read by [custom shaders](#custom-shaders) via `instance_customN(inst)`, ignored by the built-in shader |
 
-`pipeline.rs` generates the `InstanceInput` struct and accessor functions for each layout and
+`pipeline/instance.rs` generates the `InstanceInput` struct and accessor functions for each layout and
 splices them into `forward.wgsl` (`instance_model`, `instance_color`, `instance_uv_rect`,
 `instance_layer`, `instance_custom0..3` plus one per declared `Custom(n)`). `validate()`
 enforces WebGPU's rules (offset aligned to `min(4, format size)`, each semantic once) and at
 most 12 instance shader locations (16 vertex attributes, 4 used by the mesh). Pipelines are
-cached by `(layout, class, format, samples, manual_srgb, layered, custom shader + version)`
-(`layered`: the material texture is an array, see Textures). `Unorm8x4Bgra`
+cached by `PipelineKey` `(layout, class, format, samples, output encoding, texture kinds,
+custom shader + version, pass kind, frame-wide overrides)` (`kinds` bit 0: the material texture
+is an array, see Textures) and shader modules by `(layout, kinds, ext stream, pass kind, custom
+shader)`: the output encoding (`S3D_OUTPUT`, and the legacy `MANUAL_SRGB` flag custom shaders
+read) and the other `S3D_*` switches are WGSL `override` constants specialized per pipeline,
+so one module serves every output. `Unorm8x4Bgra`
 attributes are fetched as `Unorm8x4` and swizzled in the generated shader: wgpu's GL backend
 passes `GL_BGRA` as the component count, which WebGL2/GLES reject.
 Built-ins: `InstanceTransform` (64 B), `InstanceTransformColor` (80 B), `InstanceCompact`
@@ -248,6 +260,13 @@ attachments, so per target and frame:
   `tests/headless.rs::the_first_view_of_a_frame_clears_its_target`).
 * Depth is per camera: every pass clears the whole depth attachment and discards it, so a
   camera never tests against another's geometry.
+* Viewports are not limited to the target: a rect within wgpu's viewport limits (at most
+  `max_texture_dimension_2d` wide and high, within twice that of the origin) is drawn as is;
+  any other — a 101× zoom viewport, a far-off or non-finite one — is drawn through its part
+  within the target with the projection remapped in clip space so each pixel shows what the
+  whole viewport would (`ViewportRect::fitted`), and one entirely outside draws nothing.
+  Passing such a rect to `set_viewport` failed validation and lost the frame
+  (`frame::tests::out_of_range_viewports_draw_their_visible_part`).
 * A pass's attachments have the size its views were prepared for on every path. When the
   window's surface is lost after a frame's views were prepared (`SurfaceAcquire::Recreate`),
   the frame's primary views are drawn offscreen, like the frames until a new surface is
@@ -265,6 +284,143 @@ target, viewports thinner than a pixel at the target's edges; `frame::tests::
 viewport_clear_writes_every_target_format` clears sRGB, linear 8/10-bit and `Rgba16Float`
 targets at 1 and 4 samples; the `viewports` portability scene matches the default backend
 on GL in `tests/gl.rs`).
+
+## Frame modes, scene textures and the composite
+Cameras are grouped by render target (a *target group*); each group renders in one mode per
+frame, chosen from components and settings only (graphics spec §1.2–§1.3, `frame/plan.rs`):
+
+| mode | when | scene color | fragments write | display target `D` written by |
+|---|---|---|---|---|
+| Direct (default) | no post camera, render scale 1 | none | `Linear` (or `ManualSrgb`) into `D` | the camera passes (everything above) |
+| Hdr | a post camera (`PostProcess` enabled, `FrameSettings::post`), float targets, lead's `HdrMode` not `Ldr` | `Rgba16Float` (`Rg11b10Ufloat` for `HdrMode::Compact` on an opaque-cleared, single-sample primary target) | `Linear`, unclamped | the composite, then display views |
+| Ldr | post camera without float targets (or `HdrMode::Ldr`): *fallback*; no post camera and render scale < 1: *passthrough* | `Rgba8UnormSrgb` | fallback: `Tonemapped` (exposure × tonemapper per fragment, clears tonemapped on the CPU with `Tonemapper::apply`); passthrough: `Linear` | the composite, then display views |
+
+A group's *lead camera* (its highest-order post camera, else its first) sets its `HdrMode` and
+render scale (`CameraFrame`, else `FrameSettings::render_scale` for the primary target; clamped
+to 0.25–1; HDR render targets always render Direct at scale 1 and ignore post). Every distinct
+viewport rect with a post camera is a *post group*: its settings come from the rect's
+highest-order post camera, and the views on that rect up to it are its *scene views*, which
+render into the group's scene texture `S` (at the scaled size, with the group's samples and a
+group depth; the viewport-clear rules above apply to `S`). Every other view of the group (a
+gizmo camera after a post camera on its rect, a minimap without post) is a *display view*.
+After the group's last scene view (`passes.rs` `finish_group`), each post group is
+composited into `D` in settings-camera order — the first composite into `D` clears it, drawing
+only its rect — and then the display views draw into `D` at 1 sample with the group's display
+depth, LDR, in camera order. A passthrough group has one implicit full-target post group.
+
+`S`, its multisampled twin, the group depth and the display depth are created while planning a
+frame whose key (scene size, format, samples, display size) changed, and freed 3 frames after
+their group last rendered intermediately (`targets.rs` `GroupTextures`); `RenderStats::
+{textures_created, target_bytes, intermediate_groups, post_groups, post_passes}` report them.
+`S` persists until the next frame's plan, so `Renderer::capture_scene_hdr` reads the last frame's
+scene color (as float RGBA; `Err` in Direct mode) and a windowed capture replays an intermediate
+primary group by compositing again from `S` (no scene pass) into the offscreen target, then its
+display views, then the overlays. A windowed frame whose surface texture was unavailable
+(`Occluded`/`Timeout`: minimized or covered, and every frame of a background-mode window on
+macOS) skips every primary view, scene views included, so `S` then holds an older frame (or
+zeros): `GroupTextures::scene_frame` records the frame whose scene views `S` holds, and a replay
+(`GroupEncode::render_scene`) or `capture_scene_hdr` whose `S` is not the last frame's renders the
+scene views into it first (node draws as `CaptureReplay`, SceneRead and Distortion passes, the
+HdrScene overlays as `Capture`). `capture_scene_hdr` errs when the last frame had no primary scene
+view. The distortion buffer is sized from the post group's rect in `S` (half, or all of it), so
+it follows the render scale.
+
+The composite (`shaders/post/composite.wgsl`, `post/mod.rs` `PostState::encode_group`) is one
+full-screen triangle per post group, viewport and scissor on the group's rect in `D`. It reads
+`S` at the rect (a texel load when the rects have the same size — render scale 1 is exact —
+otherwise bilinear with every tap clamped inside the rect, so split screens never bleed),
+un-premultiplies transparent render-target groups, multiplies by the exposure (`2^stops` in
+Hdr, 1 in Ldr), applies the tonemapper (Hdr; `None` otherwise), dithers (±1 LSB triangular in
+the encoded space, seed `pcg(0x9E3779B9 ^ frame)` with `frame = Time::frame`), encodes for `D`
+(hardware sRGB, manual sRGB for 8-bit non-sRGB surfaces, linear for float) and re-premultiplies
+(alpha is always kept). Its parameters (`post/chain.rs` `GpuPost`, one 256-byte slot per post
+group) are shadow-diffed like every renderer buffer and hold nothing per-frame; the dither and
+animated-grain seeds, which change every frame, are uploaded 64 frames at a time (`SeedWindow`:
+one aligned 16-byte slot per frame and group, bound with a second dynamic offset), so a still
+scene uploads nothing in 63 of 64 frames. Pipelines are per (output format, output
+kind) (`S3D_POST_OUT` override); the input bind group per scene texture generation. Effects
+(bloom, auto exposure, FXAA, lens, grading, distortion) are the post area's slots in the same
+shader and chain.
+
+Render targets take a `RenderTargetDesc` (`RenderAssets::add_render_target_with`): `Hdr` creates
+them in `GraphicsCaps::hdr_format` (linear radiance; sampling materials read it unclamped and
+their camera's post tonemaps it), `samples > 1` gives them a multisampled color and depth
+(resolved into the texture) for Direct passes. Depth textures are sampleable (`TEXTURE_BINDING`)
+at 1 sample, and multisampled only where multisampled depth can be resolved
+(`GraphicsCaps::msaa_depth_resolve`: not on GL, where a sampled multisampled texture needs GLES
+3.1).
+
+Tests: `tests/frame_modes.rs` (modes, exactness of passthrough, tonemapper monotonicity,
+exposure linearity, Ldr-fallback parity, alpha, compact HDR, split screen, gizmo display view,
+PiP, render scale, HDR and MSAA render targets, determinism, lazy resize, steady state, WebGL2
+override parity), `tests/capture_hdr.rs`, `frame::tests::{replay_path_equals_frame_output,
+occluded_window_captures_render_the_skipped_scene_views}` (a `simulate_occluded` renderer stands in
+for the window),
+`tests/alloc_frame.rs` (allocations per mode), `tests/gl.rs` (the portability scenes in Hdr and
+Ldr on ANGLE); `benches/frame.rs` (Direct vs Hdr minimal at 1080p).
+
+## Render nodes, scene depth and overlay stages
+Render nodes (`node.rs`, `frame/nodes.rs`, graphics spec §1.4–§1.8) draw into frame-owned
+passes. The renderer keeps a snapshot of the `RenderNodes` resource (re-read only when its
+generation changes, like the overlay snapshot) with one sorted slot list per scheduling list —
+Opaque, Skybox, Transparent, depth-reading Transparent, Distortion — ordered by `(order,
+registration, slot)`, and per node the slot bits of each list and of its negative-order slots.
+Each frame (`prepare_nodes`, after the views are prepared and before GPU culling): every node's
+`prepare` (with `&mut Resources`, the frame's `ViewInfo`s, the staging uploader and the encoder),
+then per camera view every node's `prepare_view` with the `PassTarget` each slot will draw with
+there. The returned masks (views × nodes, reused) are cut to the slots that can draw in the view
+(Distortion slots only in a distortion-enabled post group's settings camera) and reduced to the
+view's *work bits* (`nodes::work`); `prewarm` runs for each `(slot, PassTarget)` not seen before
+(tracked per node, kept across snapshots). Views with no node work record exactly what they did
+before nodes existed.
+
+In a view's scene pass (`passes.rs` `encode_view`): Opaque slots of negative order, the built-in
+opaque batches, the other Opaque slots, the Skybox slots, Transparent slots of negative order,
+the built-in blended batches (`ViewData::opaque_end` splits the view's draws; without node work
+between them the batches are one `encode_draws` call as before), the other non-reading
+Transparent slots, and the depth-reading ones when they draw in-pass. Node draws get the view's
+viewport and scissor, which are restored before built-in draws resume. The pass stores depth only
+when a reader of this view's depth has work: its SceneRead pass, the Distortion writers of its
+post group, or HdrScene overlays reading depth (after the last primary scene view). After the
+pass, by the depth matrix of `docs/graphics/frame.md`: a depth resolve
+(`shaders/frame/depth_resolve.wgsl`, the minimum of the samples into the group's
+`ResolvedDepth`, created at frame start by `ensure_resolved_depth`) for multisampled groups on
+read-only-depth devices, then the SceneRead pass — single sample, `Load` on the resolved color,
+the depth attached read-only (`depth_ops: None`) or not at all (GL) and bound in group 1 — or,
+for GL with MSAA or several views sharing a multisampled target (a later view would load
+multisampled content without the single-sample pass's draws), the in-pass fallback with the far
+dummy bound. Scene views of a post group's settings camera then run the Distortion pass into the
+group's persistent distortion buffer (`PostState::distortion_target`, created while preparing).
+
+Group 1 bind groups (`SceneInputs`): the far dummy (1×1 `R32Float` = 1.0) with the 0 EV
+exposure dummy, and one per depth texture read (created on first use, keyed by the view, dropped
+3 frames after the last use; their creation order gives `SceneDepthRef::generation`). Depth is
+sampled through a nearest sampler (binding 2): GLES 3.0 depth textures are incomplete unless
+filtered nearest, and `textureLoad` uses the texture's own (linear) filter state on GL.
+
+Overlays (`overlay.rs`) are split by `stage()`, read with `scene_reads()` at the start of every
+frame (`OverlayCache::sync`). HdrScene overlays run after the primary target's last scene view
+(`FrameState::hdr_scene_view`): in Direct mode right after that view into `D`; otherwise at the
+start of `finish_group`, into `S` before the composites; one pass, `prepare_scene` → `prepare` →
+`render` per overlay, the target at `OverlayTarget` size = scene size, `scale_factor ×
+render_scale`. AfterTonemap overlays run where all overlays ran before. Capture replays call
+node `draw`s with `FrameKind::CaptureReplay` (Direct groups: SceneRead passes included) and
+HdrScene overlays only for Direct primary groups (kind `Capture`); intermediate groups
+composite again from `S`, which already holds them — unless the frame skipped the scene views
+(above). Overlays build shaders on the pass's group 1 with `OverlayScene::scene_wgsl()`
+(`scene_wgsl_for(OverlayScene::depth_access())`: `SampledOnly` with depth, else `None`).
+
+`Renderer::prewarm` walks the last frame's views (and each requested extra format on primary
+views): forward pipelines for the requested materials × instance layouts, every node's `prewarm`
+for its slots' targets, and the composite pipelines of the intermediate groups' targets.
+
+Tests: `tests/nodes.rs` (order around the built-ins, masks, lifecycle, every depth row against an
+analytic plane, in-pass fallback, Distortion plumbing, renderer id, poisoning, prewarm),
+`tests/overlay_stages.rs` (incl. `hdr_scene_overlay_composes_scene_wgsl`: occlusion by
+`s3d_scene_occluded` matches the scene's coverage pixel for pixel),
+`frame::tests::{prepare_once_per_frame_not_in_replay, distortion_buffer_holds_the_writers_output,
+distortion_buffer_is_sized_from_the_scene_rect, hdr_scene_overlay_not_replayed_in_hdr}`,
+`tests/alloc_frame.rs` ("nodes"), `tests/gl.rs::gl_backend_reads_scene_depth` (ANGLE).
 
 ## Custom shaders
 A `CustomShader` is WGSL spliced into the built-in forward shader, registered with
@@ -293,8 +449,19 @@ cannot run alike on every backend: resources of its own (the forward pipeline la
 bindings for them, so their pipeline would be invalid), workgroup memory (`var<workgroup>`,
 used or not: WGSL allows it in compute shaders only, and backends disagree about it in the
 vertex and fragment stages the hooks run in — Metal accepts it, GL and browsers reject it),
-any other address space but `function`/`private`, and `override` constants without a default
-(the pipeline sets none). Its pipeline is then created inside validation and internal error
+any other address space but `function`/`private`, `override` constants without a default
+(the pipeline sets none). What WebGL2 / GLES 3.0 cannot compile is checked too. GLSL ES 3.00
+lacks `countOneBits`, `reverseBits`, `extractBits`, `insertBits`, `firstLeadingBit`,
+`firstTrailingBit`, `countTrailingZeros`, `ldexp`, `dot4I8Packed`/`dot4U8Packed`,
+`unpack4xI8`/`unpack4xU8` and `textureGather*`, and naga's GLSL backend emits them anyway. The
+forward entry points are also translated to GLSL ES 3.00 once, to catch what naga refuses there
+(`textureNumLevels`, `pack4x8unorm`, …). Such a shader is rejected only on devices that compile
+GLSL ES 3.00 (GL without compute shaders: WebGL2, GLES 3.0), where it cannot build. Everywhere
+else it builds and draws as it did before the graphics upgrade, and `Renderer::shader_warning`
+(plus one `tracing` warning) reports that it will not run on WebGL2. `CustomShader` has the
+per-backend table. Tests: `pipeline::tests::custom_shaders_using_what_webgl2_lacks_are_rejected_there_and_warned_elsewhere`,
+and `tests/custom_shader.rs::custom_shaders_using_what_webgl2_lacks_run_where_supported`, which
+also runs on ANGLE. Its pipeline is then created inside validation and internal error
 scopes, so no error reaches the uncaptured-error handler: a failure is logged once, reported
 by `Renderer::shader_error`, and the draws of that pipeline key fall back to the built-in
 shader. Native backends answer the scopes immediately. In the browser the answer
@@ -317,8 +484,12 @@ and reused only once the map callback reports the GPU is done with them, so it i
 frame-in-flight-aware ring: no write-after-read hazards, and no staging allocation in the
 steady state. Writes larger than a chunk are split into chunk-sized pieces (recorded in order,
 so ordering against other commands is unchanged). Every chunk is therefore interchangeable,
-and idle chunks beyond twice the busiest frame of the last 128–256 recalls are released: the
-ring follows the actual upload volume. (`wgpu::util::StagingBelt` was replaced because it never
+and idle chunks beyond what recent frames needed (twice the busiest frame, or the busiest frame
+for every frame still queued plus one) are released: the ring follows the actual upload volume.
+`render_frame` keeps at most three frames in flight (`frame::MAX_FRAMES_IN_FLIGHT`: it waits for
+the frame submitted three frames earlier, native only), so without a window to pace it — an
+unpaced `App::update` loop, a headless batch render — the queue, and the ring with it, stays
+bounded instead of following the GPU's backlog (Metal accepts 4096 command buffers). (`wgpu::util::StagingBelt` was replaced because it never
 frees a chunk and creates one of exactly the request size whenever a write is larger than every
 chunk it has, so a growing upload leaked one mapped chunk per frame. `queue.write_buffer_with`
 was rejected: it allocates a fresh staging buffer per call in wgpu-core and runs before the
@@ -479,6 +650,11 @@ count grows with the number of culling dispatches — two per source buffer (and
 views), whatever the number of views: 40 explicit buffers seen by 4 views allocate 298 times
 per frame on `GpuMultiDraw` (544 when every view had its own dispatches; `CpuDirect`: 124).
 
+`tests/alloc_frame.rs` pins the graphics frame modes the same way: Direct 76, Hdr / Ldr /
+passthrough 106 (one composite pass more) and render nodes 119 (Direct plus one SceneRead pass
+and three node draws) per frame on Metal; the renderer's own work allocates nothing in any of
+them.
+
 `tests/alloc.rs` pins this: a scene with 40k moving ECS entities (two materials, one
 textured), a 100k-instance dynamic buffer rewritten every frame, an f16 buffer and a custom
 shader allocates 82–86 times per frame on `CpuDirect` and 191–195 on the GPU paths on Metal
@@ -520,7 +696,11 @@ wgpu's device-wide snatch lock for the whole GPU wait, which stalled `queue.pres
 destruction on the main thread (`capture_blocking` waits on the calling thread for its own
 submission only). Windowed renderers re-record the last frame's primary
 views into the offscreen target before copying (surface textures are not readable), at the
-size those views were prepared for. `resize`/`set_msaa_samples` reallocate the headless target
+size those views were prepared for, then run the overlays (`OverlayTargetKind::Capture`) on top
+of them — views first, as in a frame (`Renderer::encode_capture_replay`;
+`frame::tests::capture_replay_draws_overlays_after_the_views` forces the replay headless and
+checks it equals the frame). Surface overlays get the frame's view format (the sRGB view of a
+browser canvas), not the surface texture's. `resize`/`set_msaa_samples` reallocate the headless target
 lazily at the next frame, so a capture in between still returns the last rendered frame.
 `render_to_image(&mut App)` propagates transforms, renders one frame without advancing time and
 blocks for the capture (native only). Output is deterministic on one machine on every draw
@@ -616,7 +796,8 @@ instances, 2 views) are unchanged within noise (25 → 9 dispatches).
 
 ## Known limitations
 * No shadows, IBL or post-processing; lighting is metallic/roughness Blinn-Phong with Schlick
-  Fresnel, 4 directional + 16 point lights.
+  Fresnel, 4 directional + 16 point lights per view (with more, the 16 nearest to the view's
+  camera, in query order; with at most 16, every light in query order).
 * After a `Lost` surface the platform runner attaches a new one on a later redraw (throttled
   to once per second), so the window can stay blank briefly.
 * Layer indices past a texture array's last layer sample the unused padding layer on GL for

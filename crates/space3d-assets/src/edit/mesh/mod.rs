@@ -9,6 +9,7 @@ mod bounds;
 mod export;
 mod normals;
 mod paint;
+mod tangents;
 mod topology;
 mod transform;
 mod uv;
@@ -17,6 +18,7 @@ pub use bounds::{Aabb, BoundingSphere, bounding_box, bounding_sphere};
 pub use export::{to_gltf, to_obj};
 pub use normals::{compute_tangents, recalculate_flat_normals, recalculate_smooth_normals};
 pub use paint::{fill_vertex_colors, paint_vertex_colors};
+pub use tangents::compute_mikktspace_tangents;
 pub use topology::{
     WeldOptions, append, decimate_to_grid, decimate_vertex_clustering, extrude_faces, flip_normals, flip_winding,
     merge, remove_degenerate_triangles, remove_unused_vertices, subdivide, weld_vertices,

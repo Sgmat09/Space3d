@@ -159,6 +159,7 @@ pub fn load_obj(bytes: &[u8], ctx: &LoadContext, load_materials: bool) -> Result
                     AlphaMode::Opaque
                 },
                 double_sided: false,
+                ..MaterialData::default()
             }
         })
         .collect();
@@ -222,6 +223,7 @@ pub fn load_obj(bytes: &[u8], ctx: &LoadContext, load_materials: bool) -> Result
                 mesh,
                 material: m.material_id.filter(|&i| i < mats.len()),
             }],
+            ..ModelMesh::default()
         });
         nodes.push(NodeData {
             name: (!model.name.is_empty()).then_some(model.name),

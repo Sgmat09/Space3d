@@ -13,8 +13,8 @@ categories = ["game-engines", "graphics", "wasm"]
 
 [features]
 default = ["render", "platform", "assets", "audio", "physics", "scene", "net", "db", "ui"]
-## wgpu renderer (meshes, materials, lights, instancing, headless capture).
-render = ["dep:space3d-render"]
+## wgpu renderer (meshes, materials, lights, instancing, headless capture, post, render nodes).
+render = ["dep:space3d-render", "space3d-assets?/render"]
 ## winit window + input runner (desktop, web, Android, iOS). Implies `render`.
 platform = ["render", "dep:space3d-platform"]
 ## Asset server, image/glTF/OBJ loaders, hot reload, texture & mesh editing.
@@ -39,6 +39,9 @@ github = ["dep:space3d-github"]
 stories = ["dep:space3d-stories"]
 ## Test harness: headless apps, input simulation, golden screenshots.
 test = ["dep:space3d-test"]
+## Particle effects (sprites, ribbons, beams) drawn by a render node: `space3d::particles`
+## (its own prelude; not in `space3d::prelude` or `DefaultPlugins`).
+particles = ["render", "dep:space3d-particles"]
 
 [dependencies]
 space3d-core.workspace = true
@@ -57,6 +60,7 @@ space3d-editor = { workspace = true, optional = true }
 space3d-github = { workspace = true, optional = true }
 space3d-stories = { workspace = true, optional = true }
 space3d-test = { workspace = true, optional = true }
+space3d-particles = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tracing-subscriber.workspace = true

@@ -7,10 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+## wgpu's ANGLE support (GLES through ANGLE's libEGL/libGLESv2 on macOS/Windows): the WebGL2-class
+## GL backend on a desktop, for tests (`WGPU_BACKEND=gl`, `tests/gl.rs`).
+angle = ["wgpu/angle"]
+
 [dependencies]
 space3d-core.workspace = true
 space3d-tasks.workspace = true
 wgpu.workspace = true
+# The same naga as wgpu's; `glsl-out` lets custom-shader validation check GLSL ES 3.00 (WebGL2).
+naga = { workspace = true, features = ["glsl-out"] }
 glam.workspace = true
 bytemuck.workspace = true
 ahash.workspace = true
@@ -32,7 +39,13 @@ wgpu = { workspace = true, features = ["webgl", "fragile-send-sync-non-atomic-wa
 pollster.workspace = true
 criterion.workspace = true
 image.workspace = true
+# Image comparison (`CompareOptions::perceptual`) in the integration tests.
+space3d-test.workspace = true
 
 [[bench]]
 name = "instancing"
+harness = false
+
+[[bench]]
+name = "frame"
 harness = false

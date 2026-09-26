@@ -1,6 +1,7 @@
 //! ECS components and resources understood by the renderer.
 
 use crate::handles::{MeshHandle, ShaderHandle, TextureHandle};
+use crate::material::{BlendMode, MapMask, ShadowMode, TextureTransform};
 use glam::{Mat4, Vec3, Vec4};
 
 /// Renders the entity's mesh with its [`Material`] at its `GlobalTransform`.
@@ -62,6 +63,34 @@ pub struct Material {
     /// Custom WGSL hooks ([`crate::CustomShader`], registered with
     /// [`crate::RenderAssets::add_shader`]); `None` uses the built-in shader only.
     pub shader: Option<ShaderHandle>,
+    /// Tangent-space normal map (linear; +Y green up). Default `None`.
+    pub normal_texture: Option<TextureHandle>,
+    /// Strength of the normal map's XY. Default 1.
+    pub normal_scale: f32,
+    /// Metallic-roughness map (linear; G roughness, B metallic, multiplying the factors).
+    /// Default `None`.
+    pub metallic_roughness_texture: Option<TextureHandle>,
+    /// Ambient occlusion map (linear, R). The same handle as `metallic_roughness_texture` is an
+    /// ORM-packed texture (one sample). Default `None`.
+    pub occlusion_texture: Option<TextureHandle>,
+    /// Occlusion strength (0 = none). Default 1.
+    pub occlusion_strength: f32,
+    /// Emissive map (sRGB), multiplied by `emissive`. Default `None`.
+    pub emissive_texture: Option<TextureHandle>,
+    /// Blend mode. Default `Opaque`; the legacy `alpha_blend` flag counts as `AlphaBlend`
+    /// ([`Self::effective_blend`]).
+    pub blend: BlendMode,
+    /// Alpha below which `AlphaMask` discards. Default 0.5.
+    pub alpha_cutoff: f32,
+    /// UV transform of every map. Default identity.
+    pub uv_transform: TextureTransform,
+    /// Maps sampled with the second UV set (`MeshExtras::uvs1`). Default none.
+    pub uv1_maps: MapMask,
+    /// Shadow participation. Default `Auto`.
+    pub shadows: ShadowMode,
+    /// Draw order among transparent meshes (lower first; then blend class, pipeline, …).
+    /// Default 0. Orders meshes only: particles have their own order.
+    pub render_order: i16,
 }
 
 impl Default for Material {
@@ -76,6 +105,18 @@ impl Default for Material {
             double_sided: false,
             alpha_blend: false,
             shader: None,
+            normal_texture: None,
+            normal_scale: 1.0,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            occlusion_strength: 1.0,
+            emissive_texture: None,
+            blend: BlendMode::Opaque,
+            alpha_cutoff: 0.5,
+            uv_transform: TextureTransform::IDENTITY,
+            uv1_maps: MapMask::NONE,
+            shadows: ShadowMode::Auto,
+            render_order: 0,
         }
     }
 }
@@ -120,6 +161,97 @@ impl Material {
     pub fn with_shader(mut self, shader: ShaderHandle) -> Self {
         self.shader = Some(shader);
         self
+    }
+    /// Set the normal map and its scale.
+    pub fn with_normal_map(mut self, t: TextureHandle, scale: f32) -> Self {
+        self.normal_texture = Some(t);
+        self.normal_scale = scale;
+        self
+    }
+    /// Set the metallic-roughness map.
+    pub fn with_metallic_roughness_map(mut self, t: TextureHandle) -> Self {
+        self.metallic_roughness_texture = Some(t);
+        self
+    }
+    /// Set the occlusion map and its strength.
+    pub fn with_occlusion_map(mut self, t: TextureHandle, strength: f32) -> Self {
+        self.occlusion_texture = Some(t);
+        self.occlusion_strength = strength;
+        self
+    }
+    /// Set an ORM-packed map (R occlusion, G roughness, B metallic) as both the
+    /// metallic-roughness and the occlusion map.
+    pub fn with_orm_map(mut self, t: TextureHandle) -> Self {
+        self.metallic_roughness_texture = Some(t);
+        self.occlusion_texture = Some(t);
+        self
+    }
+    /// Set the emissive map and the emissive factor it is multiplied by.
+    pub fn with_emissive_map(mut self, t: TextureHandle, factor: Vec3) -> Self {
+        self.emissive_texture = Some(t);
+        self.emissive = factor;
+        self
+    }
+    /// Set the blend mode.
+    pub fn with_blend(mut self, b: BlendMode) -> Self {
+        self.blend = b;
+        self
+    }
+    /// Alpha-tested holes below `cutoff` (`BlendMode::AlphaMask`).
+    pub fn with_alpha_mask(mut self, cutoff: f32) -> Self {
+        self.blend = BlendMode::AlphaMask;
+        self.alpha_cutoff = cutoff;
+        self
+    }
+    /// Set the UV transform of every map.
+    pub fn with_uv_transform(mut self, t: TextureTransform) -> Self {
+        self.uv_transform = t;
+        self
+    }
+    /// Sample these maps with the second UV set.
+    pub fn with_uv1_maps(mut self, m: MapMask) -> Self {
+        self.uv1_maps = m;
+        self
+    }
+    /// Set the shadow participation.
+    pub fn with_shadows(mut self, m: ShadowMode) -> Self {
+        self.shadows = m;
+        self
+    }
+    /// Set the transparent draw order.
+    pub fn with_render_order(mut self, o: i16) -> Self {
+        self.render_order = o;
+        self
+    }
+    /// The blend mode drawn: `blend`, or `AlphaBlend` for a legacy `alpha_blend` material.
+    pub fn effective_blend(&self) -> BlendMode {
+        if self.blend == BlendMode::Opaque && self.alpha_blend {
+            BlendMode::AlphaBlend
+        } else {
+            self.blend
+        }
+    }
+    /// Unlit, additive, double-sided glow of a linear color (`alpha_blend` is set too, so it
+    /// also draws blended where blend modes are not supported yet).
+    pub fn additive(color: Vec4) -> Self {
+        Self {
+            base_color: color,
+            unlit: true,
+            double_sided: true,
+            alpha_blend: true,
+            blend: BlendMode::Additive,
+            ..Default::default()
+        }
+    }
+    /// Unlit premultiplied color (a = 0 adds light; a > 0 also covers).
+    pub fn premultiplied(color: Vec4) -> Self {
+        Self {
+            base_color: color,
+            unlit: true,
+            alpha_blend: true,
+            blend: BlendMode::Premultiplied,
+            ..Default::default()
+        }
     }
 }
 
@@ -297,6 +429,42 @@ impl Default for AmbientLight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn material_extensions_default_to_the_legacy_look() {
+        let m = Material::default();
+        assert_eq!(
+            (m.normal_scale, m.occlusion_strength, m.alpha_cutoff, m.render_order),
+            (1.0, 1.0, 0.5, 0)
+        );
+        assert_eq!(
+            (m.blend, m.shadows, m.uv1_maps),
+            (BlendMode::Opaque, ShadowMode::Auto, MapMask::NONE)
+        );
+        assert_eq!(m.effective_blend(), BlendMode::Opaque);
+        let legacy = Material {
+            alpha_blend: true,
+            ..Material::default()
+        };
+        assert_eq!(legacy.effective_blend(), BlendMode::AlphaBlend);
+        let t = TextureHandle::from_raw(crate::handles::RawHandle {
+            index: 1,
+            generation: 0,
+        });
+        let orm = Material::default().with_orm_map(t).with_alpha_mask(0.3);
+        assert_eq!(
+            (orm.metallic_roughness_texture, orm.occlusion_texture),
+            (Some(t), Some(t))
+        );
+        assert_eq!((orm.blend, orm.alpha_cutoff), (BlendMode::AlphaMask, 0.3));
+        let glow = Material::additive(Vec4::ONE);
+        assert_eq!(glow.effective_blend(), BlendMode::Additive);
+        assert!(glow.unlit && glow.double_sided);
+        assert_eq!(
+            Material::premultiplied(Vec4::ONE).effective_blend(),
+            BlendMode::Premultiplied
+        );
+    }
+
     #[test]
     fn srgb_roundtrip() {
         for v in [0.0, 0.001, 0.2, 0.5, 1.0] {

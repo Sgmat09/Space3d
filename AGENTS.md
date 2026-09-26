@@ -32,7 +32,8 @@ Rust cross-platform game engine (desktop, web/wasm, Android, iOS). Cargo workspa
 |---|---|
 | `space3d-core` | App, Plugin, ECS (hecs), Resources, Events, Stage schedule, fixed tickrate, Transform |
 | `space3d-tasks` | async runtime bridge (tokio native / wasm-bindgen-futures web), `Task`, `AsyncQueue` |
-| `space3d-render` | wgpu renderer, meshes, materials, camera, lights, instancing, headless capture |
+| `space3d-render` | wgpu renderer: meshes, materials, cameras, lights, instancing, HDR frame modes + tonemapping, post (bloom, FXAA, vignette, CA, grain), RenderNode extension API, overlay stages, headless capture; see docs/graphics/ |
+| `space3d-particles` | GPU/CPU particle system: emitters, effect prefabs (RON), curves, flipbooks, soft particles, bridges; see docs/graphics/particles.md |
 | `space3d-assets` | asset server, handles, image/glTF/OBJ loading, hot reload, texture & mesh editing ops |
 | `space3d-net` | HTTP client/server, WebSocket client/server, native + web |
 | `space3d-replication` | multiplayer netcode shared by client + server (wasm-clean): transports, protocol, delta snapshots, interest, prediction/reconciliation, interpolation, test harness |

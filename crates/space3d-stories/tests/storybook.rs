@@ -12,6 +12,33 @@ use space3d_stories::*;
 // `crates/space3d-stories/tests/__screenshots__/Engine/**.png`.
 storybook_tests!(engine_storybook);
 
+/// Bit-exact engine goldens: the "exact" gate of the graphics upgrade (engine goldens must not
+/// change by a single channel step while the renderer is restructured). The golden test above
+/// allows a small tolerance so other GPUs pass; this one holds only on the machine that blessed
+/// the goldens, so it is opt-in:
+/// `cargo test -p space3d-stories --test storybook -- --ignored engine_goldens_are_exact`.
+#[test]
+#[ignore = "bit-exact goldens hold only on the machine that blessed them"]
+fn engine_goldens_are_exact() {
+    require_gpu!();
+    let mut book = Storybook::new();
+    for story in engine_storybook().iter() {
+        let mut story = story.clone();
+        story.tolerance = None;
+        book.add(story);
+    }
+    let golden = GoldenDir::for_crate(env!("CARGO_MANIFEST_DIR"), env!("CARGO_PKG_NAME"));
+    let options = StorybookTestOptions {
+        compare: CompareOptions::exact(),
+        filter: None,
+        policy: GoldenPolicy {
+            ci: true,
+            ..GoldenPolicy::default()
+        },
+    };
+    assert_storybook_in(&book, &golden, &options);
+}
+
 /// A story that only clears the screen to `color` (sRGB 0..1).
 fn clear_story(id: &str, color: [f32; 3]) -> Story {
     Story::new(id, move |app, _| {
@@ -192,4 +219,31 @@ fn storybook_check_reports_every_failure_and_honors_tolerance() {
             assert!(msg.contains(id), "{id} missing from:\n{msg}");
         }
     });
+}
+
+/// Stories that render their scene into a render target (`Soft Particles`, `Soft Depth`) size
+/// it from the capture: `story_app` applies a story with the renderer present, so
+/// `render_story` at another size than the story's renders the scene at that size instead of
+/// upscaling a 320 × 180 target (M1 review).
+#[test]
+fn screen_targets_follow_the_capture_size() {
+    if !gpu_available() {
+        return;
+    }
+    let book = engine_storybook();
+    for id in ["Engine/Particles/Features/Soft Particles", "Engine/Frame/Soft Depth"] {
+        let story = book.get(id).unwrap_or_else(|| panic!("no story {id}"));
+        let app = story_app(story, &KnobValues::default(), Some((640, 360)));
+        let assets = app.resources.expect::<space3d_render::RenderAssets>();
+        let sizes: Vec<Option<(u32, u32)>> = app
+            .world
+            .query::<&space3d_render::Material>()
+            .iter()
+            .filter_map(|m| m.base_color_texture)
+            .filter(|&t| assets.render_target_desc(t).is_some())
+            .map(|t| assets.texture_size(t))
+            .collect();
+        assert!(!sizes.is_empty(), "{id}: no render target");
+        assert!(sizes.iter().all(|&s| s == Some((640, 360))), "{id}: {sizes:?}");
+    }
 }

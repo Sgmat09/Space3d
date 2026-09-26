@@ -20,6 +20,13 @@
 //! opaque black before the overlays run (the surface is cleared by the renderer already), so
 //! UI-only apps never show stale pixels.
 //!
+//! That is the default stage, [`OverlayStage::AfterTonemap`]. An overlay returning
+//! [`OverlayStage::HdrScene`] from [`RenderOverlay::stage`] draws into the primary target's scene
+//! color instead — after its last scene view, before post (exposure, bloom, tonemapping), in the
+//! encoding [`OverlayScene::output`] names — or, in Direct mode (no post camera), into the target
+//! before every `AfterTonemap` overlay. See graphics spec §1.5 and `docs/graphics/frame.md`
+//! ("Overlay stages", with the migration of an additive overlay).
+//!
 //! Overlays are shared as `Arc<Mutex<dyn RenderOverlay>>` ([`SharedOverlay`]): the owner keeps a
 //! typed handle (returned by [`RenderOverlays::insert`]) to feed per-frame data, and the
 //! renderer keeps a snapshot of the list so windowed captures can replay it.
@@ -42,6 +49,8 @@
 
 use crate::assets::RenderAssets;
 use crate::handles::TextureHandle;
+use crate::node::{DepthAccess, FrameLayouts, FrameMode, SceneDepthRef, SceneReads, ViewInfo};
+use crate::output::{OutputEncoding, Tonemapper};
 use crate::pipeline::OFFSCREEN_FORMAT;
 use crate::renderer::Renderer;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,6 +95,13 @@ pub struct OverlayTarget {
 /// [`RenderOverlay::render`] in the same order. For windowed captures the overlays run again
 /// with [`OverlayTargetKind::Capture`], possibly with a different texture format than the
 /// surface, so implementations must handle any `target.format`.
+///
+/// Overlays whose [`Self::stage`] is [`OverlayStage::HdrScene`] follow the same contract in an
+/// earlier pass: into the primary scene color (`Rgba16Float`, `Rg11b10Ufloat`, or
+/// `Rgba8UnormSrgb` in the Ldr fallback) after its last scene view, with
+/// [`Self::prepare_scene`] called before [`Self::prepare`]. They are skipped in frames without a
+/// primary view, and capture replays call them again only when the primary target rendered in
+/// Direct mode (otherwise they are already in the scene color the capture composites again).
 pub trait RenderOverlay: Send + Sync + 'static {
     /// Upload per-frame data. Called once per overlay pass, before [`Self::render`], with the
     /// frame's encoder (work recorded here executes before the overlay pass).
@@ -100,6 +116,110 @@ pub trait RenderOverlay: Send + Sync + 'static {
     /// Record draw commands into the shared overlay pass (single sample, no depth,
     /// `target.format`). Viewport and scissor are reset to the full target for each overlay.
     fn render(&self, pass: &mut wgpu::RenderPass<'static>, target: &OverlayTarget);
+
+    /// Where the overlay draws; read every frame. The default, [`OverlayStage::AfterTonemap`],
+    /// is exactly the placement described above.
+    fn stage(&self) -> OverlayStage {
+        OverlayStage::AfterTonemap
+    }
+
+    /// [`OverlayStage::HdrScene`] only: scene inputs sampled ([`SceneReads::DEPTH`] keeps the
+    /// last primary scene view's depth stored for [`OverlayScene::scene_depth`]).
+    fn scene_reads(&self) -> SceneReads {
+        SceneReads::NONE
+    }
+
+    /// [`OverlayStage::HdrScene`] only: called before [`Self::prepare`] with the scene inputs of
+    /// the pass (the encoding the overlay must apply, the last primary view, …).
+    fn prepare_scene(&mut self, scene: &OverlayScene<'_>) {
+        let _ = scene;
+    }
+}
+
+/// Where a [`RenderOverlay`] draws (graphics spec §1.5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OverlayStage {
+    /// Into the primary scene color before post: distorted, metered, bloomed and tonemapped
+    /// with the scene. In Direct mode, into the target after the primary views and before every
+    /// `AfterTonemap` overlay. Writes values in [`OverlayScene::output`]'s encoding.
+    HdrScene,
+    /// Into the final target after tonemapping (the placement of every overlay before stages
+    /// existed; egui).
+    #[default]
+    AfterTonemap,
+}
+
+/// Scene inputs of an [`OverlayStage::HdrScene`] pass ([`RenderOverlay::prepare_scene`]).
+#[non_exhaustive]
+pub struct OverlayScene<'a> {
+    /// The last primary scene view (matrices, near/far, rect).
+    pub view: &'a ViewInfo,
+    /// Frame mode of the primary target group.
+    pub mode: FrameMode,
+    /// Encoding the overlay must apply (`Tonemapped` in the Ldr fallback; see
+    /// [`crate::OUTPUT_WGSL`]'s `s3d_output`).
+    pub output: OutputEncoding,
+    /// Linear exposure for `Tonemapped`.
+    pub exposure: f32,
+    /// Operator for `Tonemapped`.
+    pub tonemapper: Tonemapper,
+    /// The last primary scene view's 1× depth, when `scene_reads()` contains `DEPTH` and the
+    /// device can sample it.
+    pub scene_depth: Option<SceneDepthRef<'a>>,
+    /// Group 0 of the view ([`FrameLayouts::view`], dynamic offset `view.view_offset`).
+    pub view_bind_group: &'a wgpu::BindGroup,
+    /// Group 1 ([`FrameLayouts::scene`]).
+    pub scene_bind_group: &'a wgpu::BindGroup,
+    /// The shared layouts.
+    pub layouts: &'a FrameLayouts,
+}
+
+impl OverlayScene<'_> {
+    /// How this pass sees scene depth: `SampledOnly` when [`Self::scene_depth`] is bound in
+    /// group 1 (the overlay pass has no depth attachment: test with `s3d_scene_occluded`),
+    /// else `None` (the far dummy is bound). Key pipelines by it: it can change between frames.
+    pub fn depth_access(&self) -> DepthAccess {
+        if self.scene_depth.is_some() {
+            DepthAccess::SampledOnly
+        } else {
+            DepthAccess::None
+        }
+    }
+
+    /// The group-1 declarations and helpers for this pass (`s3d_scene_depth`,
+    /// `s3d_scene_occluded`, `s3d_soft_fade`, …; [`crate::scene_wgsl`]), after
+    /// [`crate::VIEW_WGSL`].
+    pub fn scene_wgsl(&self) -> &'static str {
+        crate::node::scene_wgsl_for(self.depth_access())
+    }
+}
+
+impl OverlayTarget {
+    /// The shader must encode sRGB itself: only 8-bit non-sRGB unorm formats (false for sRGB
+    /// *and* float formats — `!format.is_srgb()` is wrong for float targets).
+    pub fn shader_encodes_srgb(&self) -> bool {
+        use wgpu::TextureFormat as F;
+        matches!(
+            self.format,
+            F::Rgba8Unorm | F::Bgra8Unorm | F::Rgba8Snorm | F::Rgb10a2Unorm | F::Rgba16Unorm
+        )
+    }
+
+    /// `format` is a float (HDR) format.
+    pub fn is_hdr(&self) -> bool {
+        use wgpu::TextureFormat as F;
+        matches!(
+            self.format,
+            F::Rgba16Float
+                | F::Rgba32Float
+                | F::Rg11b10Ufloat
+                | F::R16Float
+                | F::R32Float
+                | F::Rg16Float
+                | F::Rg32Float
+        )
+    }
 }
 
 /// A registered overlay, shared between its owner and the renderer.
@@ -233,11 +353,14 @@ impl RenderOverlays {
 }
 
 /// The renderer's snapshot of [`RenderOverlays`] (re-cloned only when the list changes), kept so
-/// windowed captures can replay the overlays outside of `render_frame`.
+/// windowed captures can replay the overlays outside of `render_frame`, and every overlay's
+/// stage and scene reads (read at the start of every frame).
 #[derive(Default)]
 pub(crate) struct OverlayCache {
     generation: u64,
     list: Vec<SharedOverlay>,
+    /// Stage and scene reads of each overlay of `list`, this frame.
+    stages: Vec<(OverlayStage, SceneReads)>,
     scale_factor: f32,
 }
 
@@ -257,39 +380,87 @@ impl OverlayCache {
                 self.generation = 0;
             }
         }
+        self.stages.clear();
+        for overlay in &self.list {
+            let o = lock_overlay(overlay);
+            let stage = o.stage();
+            let reads = if stage == OverlayStage::HdrScene {
+                o.scene_reads()
+            } else {
+                SceneReads::NONE
+            };
+            self.stages.push((stage, reads));
+        }
+    }
+
+    /// Some overlay draws in `stage` this frame.
+    pub(crate) fn has_stage(&self, stage: OverlayStage) -> bool {
+        self.stages.iter().any(|(s, _)| *s == stage)
+    }
+
+    /// Some HdrScene overlay reads scene depth this frame.
+    pub(crate) fn hdr_scene_depth(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|(s, r)| *s == OverlayStage::HdrScene && r.contains(SceneReads::DEPTH))
+    }
+
+    /// Overlays in draw order with their stage and scene reads this frame.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&SharedOverlay, OverlayStage, SceneReads)> {
+        self.list
+            .iter()
+            .zip(&self.stages)
+            .map(|(o, &(stage, reads))| (o, stage, reads))
+    }
+
+    /// Scale factor of the overlays' targets.
+    pub(crate) fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+}
+
+/// Overlay target of a surface frame. Its format is the one frames render into — the surface's
+/// sRGB *view* format where the surface texture itself has none (browser WebGPU canvases) —
+/// never `config.format`: an overlay pipeline built for the texture's own format would not
+/// match the pass, a validation error that loses the frame.
+fn surface_target(config: &wgpu::SurfaceConfiguration, view_format: wgpu::TextureFormat, scale: f32) -> OverlayTarget {
+    OverlayTarget {
+        size: (config.width, config.height),
+        format: view_format,
+        scale_factor: scale,
+        kind: OverlayTargetKind::Surface,
     }
 }
 
 impl Renderer {
     /// Overlays of a regular frame: surface when windowed, offscreen target when headless.
+    /// Called after every view of the frame is encoded (overlays draw on top of them).
     pub(crate) fn encode_frame_overlays(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         surface_view: Option<&wgpu::TextureView>,
     ) {
-        if self.overlays.list.is_empty() {
+        if !self.overlays.has_stage(OverlayStage::AfterTonemap) {
             return;
         }
         match (&self.surface, surface_view) {
             (Some(s), Some(view)) => {
-                let target = OverlayTarget {
-                    size: (s.config.width, s.config.height),
-                    format: s.config.format,
-                    scale_factor: self.overlays.scale_factor,
-                    kind: OverlayTargetKind::Surface,
-                };
+                let target = surface_target(&s.config, s.view_format, self.overlays.scale_factor);
                 // The renderer already cleared the surface if no camera drew to it.
                 self.encode_overlays(encoder, view, &target, false);
             }
             // Surface frame unavailable (minimized/occluded): nothing to draw into.
             (Some(_), None) => {}
+            (None, _) if self.presents_to_window() => {}
             (None, _) => self.encode_offscreen_overlays(encoder, OverlayTargetKind::Offscreen),
         }
     }
 
-    /// Overlays replayed into the offscreen target for a windowed capture.
+    /// Overlays replayed into the offscreen target for a windowed capture. They run after the
+    /// replayed views ([`Renderer::encode_capture_replay`]): drawn before them, the re-recorded
+    /// scene would paint over them.
     pub(crate) fn encode_capture_overlays(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        if !self.overlays.list.is_empty() {
+        if self.overlays.has_stage(OverlayStage::AfterTonemap) {
             self.encode_offscreen_overlays(encoder, OverlayTargetKind::Capture);
         }
     }
@@ -315,8 +486,10 @@ impl Renderer {
         target: &OverlayTarget,
         clear: bool,
     ) {
-        for overlay in &self.overlays.list {
-            lock_overlay(overlay).prepare(&self.device, &self.queue, encoder, target);
+        for (overlay, stage, _) in self.overlays.iter() {
+            if stage == OverlayStage::AfterTonemap {
+                lock_overlay(overlay).prepare(&self.device, &self.queue, encoder, target);
+            }
         }
         let load = if clear {
             wgpu::LoadOp::Clear(wgpu::Color::BLACK)
@@ -339,7 +512,10 @@ impl Renderer {
             })
             .forget_lifetime();
         let (w, h) = target.size;
-        for overlay in &self.overlays.list {
+        for (overlay, stage, _) in self.overlays.iter() {
+            if stage != OverlayStage::AfterTonemap {
+                continue;
+            }
             pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, w, h);
             lock_overlay(overlay).render(&mut pass, target);
@@ -389,5 +565,53 @@ mod tests {
         assert_eq!(cache.list.len(), 2);
         cache.sync(None);
         assert!(cache.list.is_empty());
+    }
+
+    #[test]
+    fn stages_and_target_encodings() {
+        assert_eq!(Nop.stage(), OverlayStage::AfterTonemap);
+        assert_eq!(Nop.scene_reads(), SceneReads::NONE);
+        assert_eq!(OverlayStage::default(), OverlayStage::AfterTonemap);
+        let target = |format| OverlayTarget {
+            size: (1, 1),
+            format,
+            scale_factor: 1.0,
+            kind: OverlayTargetKind::Offscreen,
+        };
+        use wgpu::TextureFormat as F;
+        for (format, manual, hdr) in [
+            (F::Rgba8UnormSrgb, false, false),
+            (F::Bgra8UnormSrgb, false, false),
+            (F::Bgra8Unorm, true, false),
+            (F::Rgba8Unorm, true, false),
+            (F::Rgba16Float, false, true),
+            (F::Rg11b10Ufloat, false, true),
+        ] {
+            let t = target(format);
+            assert_eq!((t.shader_encodes_srgb(), t.is_hdr()), (manual, hdr), "{format:?}");
+        }
+    }
+
+    /// Regression: surface overlays got the surface texture's format while frames render
+    /// through its sRGB view format (browser WebGPU canvases): egui's pipeline then did not
+    /// match the pass. They now get the view format, like the frame's own passes.
+    #[test]
+    fn surface_overlays_get_the_view_format() {
+        use wgpu::TextureFormat as F;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: F::Bgra8Unorm,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: 640,
+            height: 360,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![F::Bgra8UnormSrgb],
+        };
+        let target = surface_target(&config, F::Bgra8UnormSrgb, 2.0);
+        assert_eq!(target.format, F::Bgra8UnormSrgb);
+        assert_eq!((target.size, target.scale_factor), ((640, 360), 2.0));
+        assert_eq!(target.kind, OverlayTargetKind::Surface);
     }
 }

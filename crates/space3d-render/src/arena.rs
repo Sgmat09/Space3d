@@ -223,7 +223,7 @@ impl MeshArena {
 
     /// Replace the GPU buffer(s) whose allocator capacity changed since `old_*` (or that do
     /// not exist yet), copying the old contents GPU→GPU. Record this before the frame's
-    /// [`Self::write`]s so they land after the copy.
+    /// [`Self::write_all`] so its writes land after the copy.
     pub fn realloc_gpu(
         &mut self,
         device: &wgpu::Device,

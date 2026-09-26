@@ -57,8 +57,9 @@ jobs:
           cargo check --target wasm32-unknown-unknown \
             -p space3d-core -p space3d-tasks -p space3d-render -p space3d-platform \
             -p space3d-assets -p space3d-net -p space3d-db -p space3d-audio \
-            -p space3d-physics -p space3d-scene -p space3d-ui -p space3d \
+            -p space3d-physics -p space3d-scene -p space3d-ui -p space3d-particles -p space3d \
             -p space3d-replication
+          cargo check --target wasm32-unknown-unknown -p space3d --features particles
       # Web game clients build the replication crate client-only (§15.3).
       - name: Check the replication client for web
         run: cargo check --target wasm32-unknown-unknown -p space3d-replication --no-default-features --features client

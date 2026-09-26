@@ -289,3 +289,136 @@ fn custom_shaders_using_workgroup_memory_fall_back() {
     assert!(err.contains("`var<workgroup> tint`"), "{err}");
     assert_eq!(r.gpu_error_count(), 0);
 }
+
+/// Built-ins WebGL2 / GLES 3.0 (GLSL ES 3.00) lack: on such devices (`WGPU_BACKEND=gl` on
+/// ANGLE, GLES 3.0) the shader is rejected before any GPU work and draws with the built-in
+/// shader; everywhere else it draws exactly as written — as before the graphics upgrade — and
+/// `shader_warning` reports that it will not run on WebGL2. The built-ins naga polyfills for
+/// GLSL ES 3.00 build everywhere, with neither error nor warning.
+#[test]
+fn custom_shaders_using_what_webgl2_lacks_run_where_supported() {
+    let Some(mut app) = headless_app(64, 64) else { return };
+    let gles3 = |app: &App| {
+        let caps = app.resources.expect::<Renderer>().capabilities().clone();
+        // ANGLE / WebGL2: GL without compute shaders compiles GLSL ES 3.00.
+        caps.adapter.backend == wgpu::Backend::Gl && !caps.compute
+    };
+    // A shader as written before the graphics upgrade: `countOneBits` and `pack4x8unorm` on
+    // runtime values (red = 2 bits × 0.5 = 1, green = byte 1 of the packed color = 128/255
+    // linear, 188 in sRGB).
+    let bits = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+        "bits",
+        "fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {\n\
+         \x20   let p = pack4x8unorm(vec4<f32>(0.0, color.g * 128.0 / 255.0, 0.0, 0.0));\n\
+         \x20   let g = f32((p >> 8u) & 0xffu) / 255.0;\n\
+         \x20   return vec4<f32>(f32(countOneBits(u32(color.r * 3.0))) * 0.5, g, 0.0, 1.0);\n}\n",
+    ));
+    let portable = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+        "portable",
+        "fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {\n\
+         \x20   let f = frexp(4.0);\n\
+         \x20   let lz = f32(countLeadingZeros(1u)) / 31.0;\n\
+         \x20   let g = fma(0.5, 0.5, 0.25) + dpdxFine(in.uv.x) * 0.0 + unpack4x8unorm(0xff00u).y;\n\
+         \x20   return vec4<f32>(f.fract * 2.0 * lz, g - 1.0, 0.0, 1.0);\n}\n",
+    ));
+    let a = scene(&mut app, Material::unlit(Vec4::ONE).with_shader(bits));
+    let img = render_to_image(&mut app).expect("capture");
+    let r = app.resources.expect::<Renderer>();
+    let backend = r.capabilities().adapter.backend;
+    if gles3(&app) {
+        assert_eq!(img.get(20, 32), [255, 255, 255, 255], "built-in shader on {backend:?}");
+        let err = r.shader_error(bits).unwrap_or_default();
+        assert!(err.contains("`countOneBits`") && err.contains("WebGL2"), "{err}");
+        assert_eq!(r.shader_warning(bits), None);
+    } else {
+        // Drawn with the custom shader, pixel for pixel as before the upgrade.
+        assert_eq!(img.get(20, 32), [255, 188, 0, 255], "custom shader on {backend:?}");
+        assert_eq!(r.shader_error(bits), None, "{backend:?}");
+        let warning = r.shader_warning(bits).unwrap_or_default();
+        assert!(
+            warning.contains("`countOneBits`") && warning.contains("WebGL2"),
+            "{warning}"
+        );
+    }
+    app.world.get::<&mut InstancedMesh>(a).unwrap().material = Material::unlit(Vec4::ONE).with_shader(portable);
+    let img = render_to_image(&mut app).expect("capture");
+    let r = app.resources.expect::<Renderer>();
+    assert_eq!(r.shader_error(portable), None, "{backend:?}");
+    assert_eq!(r.shader_warning(portable), None, "{backend:?}");
+    // frexp(4) = 0.5 · 2³, countLeadingZeros(1) = 31, fma = 0.5, unpack4x8unorm(0xff00).y = 1.
+    assert_eq!(img.get(20, 32), [255, 188, 0, 255], "custom shader on {backend:?}");
+    assert_eq!(r.gpu_error_count(), 0);
+}
+
+/// Every custom-shader fixture of this file renders in every frame mode — Direct, the HDR scene
+/// texture (`Linear` output), the Ldr fallback (`Tonemapped` output) and render-scale
+/// passthrough — with MSAA on and off, and never falls back to the built-in shader (graphics
+/// spec §3.2; the unit test of the same name builds every pipeline permutation).
+#[test]
+fn custom_shaders_compile_against_every_permutation() {
+    let Some(mut app) = headless_app(32, 32) else { return };
+    let fixtures = [
+        TINT,
+        "fn fragment_hook(in: VsOut, color: vec4<f32>) -> vec4<f32> {
+             if (MANUAL_SRGB) { return color; }
+             return vec4<f32>(s3d_tonemap(view.output.y, color.rgb * view.exposure.x), color.a);
+         }",
+        "fn vertex_hook(v: VertexInput, inst: InstanceInput, out: VsOut) -> VsOut {
+             var o = out;
+             o.clip = view.proj * view.view * vec4<f32>(o.world_pos, 1.0);
+             return o;
+         }",
+    ];
+    let shaders: Vec<ShaderHandle> = fixtures
+        .iter()
+        .enumerate()
+        .map(|(i, wgsl)| {
+            app.resources
+                .expect_mut::<RenderAssets>()
+                .add_shader(CustomShader::new(format!("fixture {i}"), *wgsl))
+        })
+        .collect();
+    let camera = {
+        let mut q = app.world.query::<(Entity, &Camera3d)>();
+        q.iter().next().map(|(e, _)| e)
+    };
+    let camera = camera.unwrap_or_else(|| spawn_camera(&mut app, 4.0));
+    let mut entities = Vec::new();
+    for &shader in &shaders {
+        entities.push(scene(&mut app, Material::color(Vec4::splat(0.5)).with_shader(shader)));
+    }
+    type Setup = fn(&mut App, Entity);
+    let modes: [(&str, Setup); 4] = [
+        ("direct", |_, _| {}),
+        ("hdr", |app, cam| {
+            app.world.insert_one(cam, PostProcess::default()).unwrap()
+        }),
+        ("ldr", |app, cam| {
+            app.world.insert_one(cam, PostProcess::default()).unwrap();
+            app.resources.expect_mut::<FrameSettings>().downlevel.no_float_targets = true;
+        }),
+        ("passthrough", |app, _| {
+            app.resources.expect_mut::<FrameSettings>().render_scale = 0.5
+        }),
+    ];
+    for (name, setup) in modes {
+        for samples in [1, 4] {
+            let _ = app.world.remove_one::<PostProcess>(camera);
+            *app.resources.expect_mut::<FrameSettings>() = FrameSettings::default();
+            app.resources.expect_mut::<Renderer>().set_msaa_samples(samples);
+            setup(&mut app, camera);
+            render_to_image(&mut app).expect("capture");
+            let r = app.resources.expect::<Renderer>();
+            for &shader in &shaders {
+                assert_eq!(r.shader_error(shader), None, "{name} ×{samples}");
+            }
+            assert_eq!(r.gpu_error_count(), 0, "{name} ×{samples}");
+            assert_eq!(
+                stats(&app).intermediate_groups,
+                u32::from(name != "direct"),
+                "{name} ×{samples}"
+            );
+        }
+    }
+    let _ = entities;
+}

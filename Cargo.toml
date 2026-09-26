@@ -35,6 +35,7 @@ space3d-stories = { path = "crates/space3d-stories" }
 space3d-test = { path = "crates/space3d-test" }
 space3d-replication = { path = "crates/space3d-replication" }
 space3d-server = { path = "crates/space3d-server" }
+space3d-particles = { path = "crates/space3d-particles" }
 
 # core / ecs / math
 hecs = "0.11.1"

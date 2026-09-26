@@ -68,6 +68,10 @@ pub struct RenderStats {
     pub instance_bytes_uploaded: u64,
     /// GPU buffers (re)allocated this frame (growth or first use).
     pub buffer_reallocations: u32,
+    /// Staging chunks (4 MiB `MAP_WRITE` buffers) the upload ring created this frame. The ring
+    /// grows to what the frames the GPU still holds need (their chunks cannot be reused until
+    /// it is done with them), then creates none: 0 in the steady state.
+    pub staging_chunks_created: u32,
     /// CPU-side scratch `Vec`s that had to grow this frame (0 in the steady state).
     pub cpu_reallocations: u32,
     /// Compute dispatches recorded (GPU culling).
@@ -85,6 +89,43 @@ pub struct RenderStats {
     pub meshes_uploaded: u32,
     /// Textures uploaded this frame.
     pub textures_uploaded: u32,
+    /// Render passes recorded by the graphics features (0 in Direct mode without them).
+    pub render_passes: u32,
+    /// Compute passes recorded by the graphics features (particles, auto exposure, …); render
+    /// nodes report theirs with `PrepareContext::count_compute_passes`.
+    pub compute_passes: u32,
+    /// Full-screen passes (composite, bloom levels, FXAA, depth resolves, …).
+    pub fullscreen_passes: u32,
+    /// Target groups rendered through a scene texture (Hdr or Ldr mode).
+    pub intermediate_groups: u32,
+    /// Post groups (a rect with at least one post camera).
+    pub post_groups: u32,
+    /// Passes recorded by post (metering, bloom, composite, FXAA).
+    pub post_passes: u32,
+    /// SceneRead passes (depth-reading node slots).
+    pub scene_read_passes: u32,
+    /// MSAA depth resolves.
+    pub depth_resolves: u32,
+    /// Distortion passes (writers into a post group's distortion buffer).
+    pub distortion_passes: u32,
+    /// `RenderNode::draw` calls.
+    pub node_draws: u32,
+    /// Compute dispatches reported by nodes (`PrepareContext::count_dispatches`).
+    pub node_dispatches: u32,
+    /// Depth-only views (shadow maps).
+    pub depth_views: u32,
+    /// Draw calls of the depth-only views.
+    pub shadow_draw_calls: u32,
+    /// Instances submitted to the depth-only views.
+    pub shadow_casters: u64,
+    /// Transparent instances sorted back to front (`TransparentSort::PerInstance`).
+    pub sorted_instances: u32,
+    /// Image-based-lighting bake passes.
+    pub ibl_bake_passes: u32,
+    /// Frame and post textures created this frame (0 in the steady state).
+    pub textures_created: u32,
+    /// Bytes of the frame's and post's own render targets.
+    pub target_bytes: u64,
 }
 
 impl RenderStats {

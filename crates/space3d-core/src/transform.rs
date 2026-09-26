@@ -59,8 +59,18 @@ pub struct Parent(pub hecs::Entity);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Name(pub String);
 
+/// A child of the hierarchy: entity, parent, local matrix.
+type ChildEntry = (hecs::Entity, hecs::Entity, Mat4);
+
+thread_local! {
+    /// Scratch of [`propagate_transforms`], kept between calls so a steady-state frame with
+    /// parented entities allocates nothing.
+    static CHILDREN: std::cell::Cell<Vec<ChildEntry>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 /// Propagates `Transform` → `GlobalTransform` (supports one-level-deep and
-/// deeper hierarchies via iterative resolution).
+/// deeper hierarchies via iterative resolution). Allocates only while entities gain their
+/// `GlobalTransform` or the hierarchy outgrows its largest size so far.
 pub fn propagate_transforms(world: &mut hecs::World) {
     // Roots first.
     let mut missing = Vec::new();
@@ -77,11 +87,14 @@ pub fn propagate_transforms(world: &mut hecs::World) {
         let _ = world.insert_one(e, g);
     }
     // Children: resolve until fixed point (depth-bounded).
-    let children: Vec<(hecs::Entity, hecs::Entity, Mat4)> = world
-        .query::<(hecs::Entity, &Parent, &Transform)>()
-        .iter()
-        .map(|(e, p, t)| (e, p.0, t.matrix()))
-        .collect();
+    let mut children = CHILDREN.take();
+    children.clear();
+    children.extend(
+        world
+            .query::<(hecs::Entity, &Parent, &Transform)>()
+            .iter()
+            .map(|(e, p, t)| (e, p.0, t.matrix())),
+    );
     for _depth in 0..32 {
         let mut changed = false;
         for &(e, parent, local) in &children {
@@ -107,4 +120,5 @@ pub fn propagate_transforms(world: &mut hecs::World) {
             break;
         }
     }
+    CHILDREN.set(children);
 }

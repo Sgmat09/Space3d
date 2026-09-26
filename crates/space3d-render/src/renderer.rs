@@ -158,9 +158,15 @@ pub(crate) struct Attachments {
     pub color_view: Option<wgpu::TextureView>,
     pub msaa_view: Option<wgpu::TextureView>,
     pub depth_view: wgpu::TextureView,
+    /// A multisampled depth texture here is sampleable (`GraphicsCaps::msaa_depth_resolve`).
+    pub msaa_depth_binding: bool,
 }
 
 impl Attachments {
+    /// Color (offscreen only), MSAA color and depth attachments. The depth texture can be
+    /// sampled (`TEXTURE_BINDING`, graphics spec §1.6) at 1 sample, and multisampled only with
+    /// `msaa_depth_binding` (`GraphicsCaps::msaa_depth_resolve`: GL cannot sample multisampled
+    /// depth, and a sampled depth texture there is a texture instead of a renderbuffer).
     pub fn new(
         device: &wgpu::Device,
         width: u32,
@@ -168,6 +174,7 @@ impl Attachments {
         samples: u32,
         format: wgpu::TextureFormat,
         offscreen: bool,
+        msaa_depth_binding: bool,
     ) -> Self {
         let size = wgpu::Extent3d {
             width: width.max(1),
@@ -205,17 +212,18 @@ impl Attachments {
             )
             .create_view(&Default::default())
         });
-        let depth = tex(
-            "space3d depth",
-            DEPTH_FORMAT,
-            samples,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
+        let depth_usage = if samples == 1 || msaa_depth_binding {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
+        let depth = tex("space3d depth", DEPTH_FORMAT, samples, depth_usage);
         Self {
             width: size.width,
             height: size.height,
             samples,
             format,
+            msaa_depth_binding,
             color_view: color.as_ref().map(|c| c.create_view(&Default::default())),
             color,
             msaa_view,
@@ -245,7 +253,15 @@ impl SurfaceState {
         self.view_format = self.config.format;
         self.manual_srgb = !self.view_format.is_srgb();
         let a = &self.attachments;
-        self.attachments = Attachments::new(device, a.width, a.height, a.samples, self.view_format, false);
+        self.attachments = Attachments::new(
+            device,
+            a.width,
+            a.height,
+            a.samples,
+            self.view_format,
+            false,
+            a.msaa_depth_binding,
+        );
         self.surface.configure(device, &self.config);
     }
 }
@@ -302,6 +318,48 @@ pub struct Renderer {
     pub(crate) overlays: crate::overlay::OverlayCache,
     /// Uncaptured wgpu errors so far (see [`install_error_handler`]).
     pub(crate) gpu_errors: Arc<AtomicU64>,
+    /// The device was lost (`FrameInfo::device_lost`).
+    pub(crate) device_lost: Arc<AtomicBool>,
+    /// Graphics capabilities of the device, unmasked (`frame_graphics` is what
+    /// [`Renderer::graphics_caps`] reports).
+    pub(crate) graphics: crate::caps::GraphicsCaps,
+    /// Shared node / overlay layouts.
+    pub(crate) layouts: crate::node::FrameLayouts,
+    /// Unique id of this renderer (see `FrameInfo::renderer`).
+    pub(crate) id: u64,
+    /// GPU pass timings (see [`Renderer::gpu_timings`]).
+    pub(crate) gpu_timings: crate::timing::GpuTimings,
+    /// `graphics` masked by the last frame's `FrameSettings::downlevel`.
+    pub(crate) frame_graphics: crate::caps::GraphicsCaps,
+    /// Post-processing state: composite pipelines, per-camera history.
+    pub(crate) post: crate::post::PostState,
+    /// Frame-plan warnings already logged.
+    pub(crate) plan_warnings: crate::frame::PlanWarnings,
+    /// Snapshot of the `RenderNodes` resource and its schedule.
+    pub(crate) nodes: crate::frame::NodeCache,
+    /// Scene-input bind groups (group 1 of node and overlay passes) and depth resolves.
+    pub(crate) scene_inputs: crate::frame::SceneInputs,
+    /// Submissions of the last [`crate::frame::MAX_FRAMES_IN_FLIGHT`] frames (slot: frame index
+    /// modulo the count): `render_frame` waits for the oldest before it is replaced.
+    pub(crate) in_flight: [Option<wgpu::SubmissionIndex>; crate::frame::MAX_FRAMES_IN_FLIGHT],
+}
+
+/// What [`Renderer::prewarm`] builds, in addition to the post pipelines of the current post
+/// cameras and every node's `prewarm` for the pass targets reachable in the current modes.
+#[derive(Clone, Debug, Default)]
+pub struct PrewarmRequest {
+    /// Materials whose forward pipelines to build.
+    pub materials: Vec<crate::Material>,
+    /// Instance layouts to build them for (the ECS layout is always included).
+    pub layouts: Vec<&'static crate::InstanceLayout>,
+    /// Extra color formats to build for (e.g. the capture format when windowed).
+    pub formats: Vec<wgpu::TextureFormat>,
+}
+
+/// Renderer ids: unique per process.
+fn next_renderer_id() -> u64 {
+    static ID: AtomicU64 = AtomicU64::new(1);
+    ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl std::fmt::Debug for Renderer {
@@ -335,10 +393,10 @@ thread_local! {
 /// consequence of the loss, not bugs, so from the device-lost callback on they are only
 /// logged, in debug builds too: a lost device degrades (captures fail, frames are dropped)
 /// instead of crashing.
-pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> Arc<AtomicU64> {
+pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> (Arc<AtomicU64>, Arc<AtomicBool>) {
     let count = Arc::new(AtomicU64::new(0));
     let lost = Arc::new(AtomicBool::new(false));
-    let (counter, lost_seen) = (count.clone(), lost.clone());
+    let (counter, lost_seen, lost_flag) = (count.clone(), lost.clone(), lost.clone());
     device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
         let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
         let lost = lost_seen.load(Ordering::Acquire);
@@ -360,7 +418,7 @@ pub(crate) fn install_error_handler(device: &wgpu::Device, panic: bool) -> Arc<A
             _ => tracing::error!(?reason, %message, "GPU device lost"),
         }
     });
-    count
+    (count, lost_flag)
 }
 
 /// Primary target size within `1..=max_dimension` (the device's `max_texture_dimension_2d`):
@@ -458,7 +516,8 @@ impl Renderer {
             | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::TEXTURE_COMPRESSION_ASTC
-            | wgpu::Features::TEXTURE_COMPRESSION_ETC2;
+            | wgpu::Features::TEXTURE_COMPRESSION_ETC2
+            | crate::caps::WANTED_FEATURES;
         #[cfg_attr(not(test), expect(unused_mut))]
         let mut required_limits = adapter.limits();
         #[cfg(test)]
@@ -476,7 +535,7 @@ impl Renderer {
             })
             .await
             .map_err(|e| RenderError::Device(e.to_string()))?;
-        let gpu_errors = install_error_handler(&device, cfg!(debug_assertions));
+        let (gpu_errors, device_lost) = install_error_handler(&device, cfg!(debug_assertions));
         let caps = RenderCapabilities::detect(&adapter, &device);
         tracing::info!(
             adapter = %caps.adapter.name,
@@ -487,6 +546,7 @@ impl Renderer {
         config.msaa_samples = if config.msaa_samples > 1 { caps.max_msaa } else { 1 };
         (config.width, config.height) =
             target_size(config.width, config.height, device.limits().max_texture_dimension_2d);
+        let graphics = crate::caps::GraphicsCaps::detect(&adapter, &device, &caps);
         let offscreen = Attachments::new(
             &device,
             config.width,
@@ -494,13 +554,28 @@ impl Renderer {
             config.msaa_samples,
             OFFSCREEN_FORMAT,
             true,
+            graphics.msaa_depth_resolve,
         );
-        let pipelines = Pipelines::new(&device, caps.compute && caps.indirect);
+        // wgpu's GL backend compiles GLSL ES 3.00 on WebGL2 and GLES 3.0 (no compute shaders);
+        // GLES 3.1+ (compute) has what custom shaders may use beyond it.
+        let glsl_es_300 = caps.adapter.backend == wgpu::Backend::Gl
+            && !adapter
+                .get_downlevel_capabilities()
+                .flags
+                .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
+        let pipelines = Pipelines::new(&device, caps.compute && caps.indirect, glsl_es_300);
         let white = white_texture(&device, &queue);
         let mut samplers = SamplerCache::default();
         let white_sampler = samplers.get(&device, Default::default());
         let frame = FrameState::new(&caps, &device);
         let uploader = Uploader::new(&device);
+        let layouts = crate::node::FrameLayouts::new(&device, &pipelines.view_bgl);
+        let gpu_timings = crate::timing::GpuTimings {
+            supported: graphics.timestamps,
+            ..Default::default()
+        };
+        let post = crate::post::PostState::new(&device, &graphics);
+        let scene_inputs = crate::frame::SceneInputs::new(&device, &queue, &layouts);
         let mut renderer = Self {
             instance,
             adapter,
@@ -520,6 +595,17 @@ impl Renderer {
             frame_index: 0,
             overlays: Default::default(),
             gpu_errors,
+            device_lost,
+            layouts,
+            id: next_renderer_id(),
+            gpu_timings,
+            frame_graphics: graphics.clone(),
+            graphics,
+            post,
+            plan_warnings: Default::default(),
+            nodes: Default::default(),
+            scene_inputs,
+            in_flight: Default::default(),
         };
         if let Some(surface) = surface {
             renderer.configure_surface(surface)?;
@@ -574,7 +660,15 @@ impl Renderer {
             1
         };
         // The MSAA and depth attachments are separate textures: they use the view format.
-        let attachments = Attachments::new(&self.device, config.width, config.height, samples, view_format, false);
+        let attachments = Attachments::new(
+            &self.device,
+            config.width,
+            config.height,
+            samples,
+            view_format,
+            false,
+            self.graphics.msaa_depth_resolve,
+        );
         self.surface = Some(SurfaceState {
             surface,
             view_format,
@@ -620,7 +714,15 @@ impl Renderer {
             s.config.width = width;
             s.config.height = height;
             s.surface.configure(&self.device, &s.config);
-            s.attachments = Attachments::new(&self.device, width, height, s.attachments.samples, s.view_format, false);
+            s.attachments = Attachments::new(
+                &self.device,
+                width,
+                height,
+                s.attachments.samples,
+                s.view_format,
+                false,
+                self.graphics.msaa_depth_resolve,
+            );
         }
     }
 
@@ -645,7 +747,15 @@ impl Renderer {
         let (w, h, samples) = (w.max(1), h.max(1), self.config.msaa_samples);
         let a = &self.offscreen;
         if (a.width, a.height, a.samples) != (w, h, samples) {
-            self.offscreen = Attachments::new(&self.device, w, h, samples, OFFSCREEN_FORMAT, true);
+            self.offscreen = Attachments::new(
+                &self.device,
+                w,
+                h,
+                samples,
+                OFFSCREEN_FORMAT,
+                true,
+                self.graphics.msaa_depth_resolve,
+            );
         }
     }
 
@@ -671,6 +781,7 @@ impl Renderer {
                 samples,
                 s.view_format,
                 false,
+                self.graphics.msaa_depth_resolve,
             );
         }
     }
@@ -726,6 +837,16 @@ impl Renderer {
         self.pipelines.custom_error(shader)
     }
 
+    /// Portability warning of the current version of a [`crate::CustomShader`], once a draw has
+    /// used it: the shader builds and draws on this device, but uses what WebGL2 / GLES 3.0
+    /// (GLSL ES 3.00) lacks, so on those devices it fails to build and its draws use the
+    /// built-in shader (see [`crate::CustomShader`], "Portability"). Also logged once through
+    /// `tracing`. `None` for portable shaders, and on WebGL2 / GLES 3.0 devices themselves,
+    /// where such a shader is a [`Self::shader_error`].
+    pub fn shader_warning(&self, shader: crate::ShaderHandle) -> Option<&str> {
+        self.pipelines.custom_warning(shader)
+    }
+
     /// Number of wgpu errors that reached the uncaptured-error handler so far. Release builds
     /// log these instead of panicking; tests and tools can assert that it stays 0.
     pub fn gpu_error_count(&self) -> u64 {
@@ -764,6 +885,12 @@ impl Renderer {
                 if entry.render_target && entry.gpu.is_some() {
                     continue;
                 }
+                let targets = crate::texture::TargetCaps {
+                    hdr_format: self.frame_graphics.hdr_format,
+                    hdr_msaa: self.frame_graphics.hdr_msaa,
+                    max_msaa: self.caps.max_msaa,
+                    msaa_depth_binding: self.graphics.msaa_depth_resolve,
+                };
                 match create_gpu_texture(
                     &self.adapter,
                     &self.device,
@@ -771,6 +898,7 @@ impl Renderer {
                     encoder,
                     &mut self.pipelines,
                     &mut self.samplers,
+                    targets,
                     entry,
                 ) {
                     Ok(bytes) => {
@@ -892,7 +1020,10 @@ impl Renderer {
     /// Read back the primary target of the last rendered frame as sRGB RGBA8.
     ///
     /// Headless: copies the offscreen target. Windowed: re-renders the last frame's primary
-    /// views into the offscreen target first (surface textures are not readable).
+    /// views into the offscreen target first (surface textures are not readable). A
+    /// post-processed primary target composites its persisted scene color again, and also
+    /// re-renders its scene views when the frame skipped them (no surface texture: occluded or
+    /// minimized window).
     /// Poll the returned task from a system, `.block()` it in tests, or `.wait().await` it.
     ///
     /// Never blocks: on native a background task resolves it with non-blocking device polls
@@ -952,9 +1083,8 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d capture"),
         });
-        if self.surface.is_some() {
-            self.encode_primary_to_offscreen(&mut encoder);
-            self.encode_capture_overlays(&mut encoder);
+        if self.capture_replays() {
+            self.encode_capture_replay(&mut encoder);
         }
         let (w, h) = (self.offscreen.width, self.offscreen.height);
         let padded = align_up(w as u64 * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
@@ -1035,6 +1165,208 @@ impl Renderer {
     pub fn poll(&self) {
         let _ = self.device.poll(wgpu::PollType::Poll);
     }
+
+    /// Graphics capabilities of the device (one probe for every graphics feature), masked by
+    /// [`crate::FrameSettings::downlevel`] as of the last rendered frame (unmasked before the
+    /// first frame).
+    pub fn graphics_caps(&self) -> &crate::caps::GraphicsCaps {
+        &self.frame_graphics
+    }
+
+    /// Shared layouts for render nodes and overlays (renderer lifetime).
+    pub fn frame_layouts(&self) -> &crate::node::FrameLayouts {
+        &self.layouts
+    }
+
+    /// Unique id of this renderer: a new renderer (or device) has a new one, so nodes rebuild
+    /// their GPU state.
+    pub fn renderer_id(&self) -> u64 {
+        self.id
+    }
+
+    /// GPU pass timings of a recent frame ([`crate::FrameSettings::gpu_timing`]).
+    pub fn gpu_timings(&self) -> &crate::timing::GpuTimings {
+        &self.gpu_timings
+    }
+
+    /// The primary target group's scene color `S` of the last frame — after `HdrScene`
+    /// overlays, before post (graphics spec §1.10) — as linear float pixels: `Rgba16Float`
+    /// as stored, `Rg11b10Ufloat` with alpha 1, the Ldr fallback's `Rgba8UnormSrgb` decoded.
+    /// `Err(RenderError::Capture)` when the primary group rendered in Direct mode (no post
+    /// camera and render scale 1): there is no scene texture — or when the last frame had no
+    /// primary view. A window whose last frame got no surface texture (occluded, minimized;
+    /// always so in background mode on macOS) skipped its scene views: they are rendered into
+    /// `S` first, like [`Self::capture`]'s replay does. For tests and tools; never blocks.
+    pub fn capture_scene_hdr(&mut self) -> Task<Result<space3d_core::HdrImageData, RenderError>> {
+        let submitted = self.submit_scene_capture();
+        #[cfg(not(target_arch = "wasm32"))]
+        let device = self.device.clone();
+        space3d_tasks::spawn(async move {
+            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+            let (readback, mut rx, _, error) = submitted?;
+            if let Some(e) = error.await {
+                return Err(RenderError::Capture(e));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let mapped = loop {
+                let _ = device.poll(wgpu::PollType::Poll);
+                match rx.try_recv() {
+                    Ok(Some(r)) => break Ok(r),
+                    Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+                    Err(_) => break Err(()),
+                }
+            };
+            #[cfg(target_arch = "wasm32")]
+            let mapped = rx.await.map_err(|_| ());
+            readback.read(mapped)
+        })
+    }
+
+    /// [`Self::capture_scene_hdr`], waiting on the calling thread (tests and tools only).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn capture_scene_hdr_blocking(&mut self) -> Result<space3d_core::HdrImageData, RenderError> {
+        let (readback, mut rx, submission, error) = self.submit_scene_capture()?;
+        if let Some(e) = futures::FutureExt::now_or_never(error).flatten() {
+            return Err(RenderError::Capture(e));
+        }
+        let mapped = loop {
+            match rx.try_recv() {
+                Ok(Some(r)) => break Ok(r),
+                Ok(None) => {}
+                Err(_) => break Err(()),
+            }
+            if self
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission.clone()),
+                    timeout: None,
+                })
+                .is_err()
+            {
+                break rx.try_recv().ok().flatten().ok_or(());
+            }
+        };
+        readback.read(mapped)
+    }
+
+    /// Record and submit the copy of the primary group's `S` into a `MAP_READ` buffer (inside a
+    /// validation error scope, like [`Self::submit_capture`]).
+    #[allow(clippy::type_complexity)]
+    fn submit_scene_capture(
+        &mut self,
+    ) -> Result<
+        (
+            SceneReadback,
+            MapReceiver,
+            wgpu::SubmissionIndex,
+            impl Future<Output = Option<String>> + use<>,
+        ),
+        RenderError,
+    > {
+        let primary = crate::frame::GroupTarget::Primary;
+        let Some(t) = self.frame.intermediate_textures(primary) else {
+            return Err(RenderError::Capture(
+                "the primary target rendered in Direct mode (no post camera, render scale 1): there \
+                 is no scene texture"
+                    .into(),
+            ));
+        };
+        // A window whose surface texture was unavailable (occluded, minimized) skipped the scene
+        // views: render them into `S` first, as a capture replay does (the windowed offscreen
+        // target it also composites into only serves captures). Headless frames always render
+        // them, unless the frame had no primary scene view: `S` is then an older frame's.
+        let stale = t.scene_frame != self.frame_index;
+        let rerender = stale && self.capture_replays() && self.frame.plans_primary_scene();
+        if stale && !rerender {
+            return Err(RenderError::Capture(
+                "the last frame rendered no primary scene view: the scene texture is stale".into(),
+            ));
+        }
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("space3d scene capture"),
+        });
+        if rerender {
+            self.encode_primary_to_offscreen(&mut encoder);
+        }
+        let texture = self
+            .frame
+            .intermediate_textures(primary)
+            .expect("checked above")
+            .scene
+            .clone();
+        let format = texture.format();
+        let (w, h) = (texture.width(), texture.height());
+        let texel = format.block_copy_size(None).unwrap_or(4) as u64;
+        let padded = align_up(w as u64 * texel, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("space3d scene capture readback"),
+            size: padded * h as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let (tx, rx) = futures::channel::oneshot::channel();
+        encoder.map_buffer_on_submit(&buffer, wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        let submission = self.queue.submit([encoder.finish()]);
+        let error = scope.pop();
+        #[cfg(not(target_arch = "wasm32"))]
+        let error = std::future::ready(futures::FutureExt::now_or_never(error).flatten().map(|e| e.to_string()));
+        #[cfg(target_arch = "wasm32")]
+        let error = async move { error.await.map(|e| e.to_string()) };
+        let readback = SceneReadback {
+            buffer,
+            size: (w, h),
+            padded,
+            format,
+        };
+        Ok((readback, rx, submission, error))
+    }
+
+    /// Last read-back exposure (stops, incl. compensation) of a post camera
+    /// ([`crate::FrameSettings::read_exposure`]).
+    pub fn camera_exposure(&self, camera: space3d_core::Entity) -> Option<f32> {
+        self.post.camera_exposure(camera)
+    }
+
+    /// Forget a camera's temporal post history (auto exposure snaps next frame).
+    pub fn reset_post_history(&mut self, camera: space3d_core::Entity) {
+        self.post.reset_history(camera);
+    }
+
+    /// Build pipelines ahead of use (loading screens: WebGL2 links programs at creation, 50–150
+    /// ms each): for the pass signatures of the last rendered frame (render one frame of the
+    /// scene first) and `request.formats` on primary views (the capture format when windowed),
+    /// the forward pipelines of `request.materials` × instance layouts, every render node's
+    /// `prewarm` for the targets its slots draw with, and the post pipelines of the post groups'
+    /// targets (the composite, FXAA and the bloom chain in both chain formats). STUB(P-MAT):
+    /// material variants join when they land.
+    pub fn prewarm(&mut self, request: &PrewarmRequest) {
+        self.prewarm_pipelines(request);
+    }
+
+    /// Where a cubemap is on its way to being usable as an environment.
+    pub fn environment_state(&self, cubemap: crate::handles::CubemapHandle) -> crate::lighting::api::EnvironmentState {
+        let _ = cubemap; // STUB(P-MAT)
+        crate::lighting::api::EnvironmentState::Missing
+    }
 }
 
 /// Receives the result of a capture buffer's mapping.
@@ -1075,10 +1407,100 @@ impl CaptureReadback {
     }
 }
 
+/// A submitted copy of a scene texture: `MAP_READ` buffer with rows padded to `padded` bytes.
+struct SceneReadback {
+    buffer: wgpu::Buffer,
+    size: (u32, u32),
+    padded: u64,
+    format: wgpu::TextureFormat,
+}
+
+impl SceneReadback {
+    /// Decode the mapped rows into linear float RGBA.
+    fn read(
+        self,
+        mapped: Result<Result<(), wgpu::BufferAsyncError>, ()>,
+    ) -> Result<space3d_core::HdrImageData, RenderError> {
+        mapped
+            .map_err(|()| RenderError::Capture("map callback dropped".into()))?
+            .map_err(|e| RenderError::Capture(e.to_string()))?;
+        let (w, h) = self.size;
+        let view = self
+            .buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| RenderError::Capture(format!("{e:?}")))?;
+        let texel = self.format.block_copy_size(None).unwrap_or(4) as usize;
+        let mut pixels = Vec::with_capacity(w as usize * h as usize);
+        for y in 0..h as usize {
+            let row = &view[y * self.padded as usize..][..w as usize * texel];
+            for p in row.chunks_exact(texel) {
+                pixels.push(decode_texel(self.format, p));
+            }
+        }
+        drop(view);
+        self.buffer.unmap();
+        Ok(space3d_core::HdrImageData::new(w, h, pixels))
+    }
+}
+
+/// Linear RGBA of one texel of a scene-texture format.
+pub(crate) fn decode_texel(format: wgpu::TextureFormat, p: &[u8]) -> [f32; 4] {
+    use crate::instance::f16_to_f32;
+    match format {
+        wgpu::TextureFormat::Rgba16Float => [0, 2, 4, 6].map(|i| f16_to_f32(u16::from_le_bytes([p[i], p[i + 1]]))),
+        wgpu::TextureFormat::Rg11b10Ufloat => {
+            let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+            // Unsigned floats: 5-bit exponent (bias 15), 6- or 5-bit mantissa.
+            let small = |bits: u32, mantissa_bits: u32| {
+                let m = bits & ((1 << mantissa_bits) - 1);
+                let e = bits >> mantissa_bits;
+                let scale = (1u32 << mantissa_bits) as f32;
+                match e {
+                    0 => m as f32 / scale * 2f32.powi(-14),
+                    31 => f32::INFINITY,
+                    e => 2f32.powi(e as i32 - 15) * (1.0 + m as f32 / scale),
+                }
+            };
+            [small(v & 0x7ff, 6), small((v >> 11) & 0x7ff, 6), small(v >> 22, 5), 1.0]
+        }
+        wgpu::TextureFormat::Rgba32Float => {
+            [0, 4, 8, 12].map(|i| f32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]))
+        }
+        f if f.is_srgb() => {
+            let c = |i: usize| crate::components::srgb_to_linear(p[i] as f32 / 255.0);
+            [c(0), c(1), c(2), p[3] as f32 / 255.0]
+        }
+        _ => [0, 1, 2, 3].map(|i| p[i] as f32 / 255.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use space3d_core::MeshData;
+
+    #[test]
+    fn scene_texels_decode() {
+        use crate::instance::f32_to_f16;
+        let half: Vec<u8> = [8.0f32, 0.5, 0.0, 1.0]
+            .iter()
+            .flat_map(|v| f32_to_f16(*v).to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_texel(wgpu::TextureFormat::Rgba16Float, &half),
+            [8.0, 0.5, 0.0, 1.0]
+        );
+        // Rg11b10: 1.0 = exponent 15, mantissa 0; 8.0 = exponent 18; 0.5 = exponent 14.
+        let packed = (15u32 << 6) | ((18u32 << 6) << 11) | ((14u32 << 5) << 22);
+        assert_eq!(
+            decode_texel(wgpu::TextureFormat::Rg11b10Ufloat, &packed.to_le_bytes()),
+            [1.0, 8.0, 0.5, 1.0]
+        );
+        let srgb = decode_texel(wgpu::TextureFormat::Rgba8UnormSrgb, &[255, 0, 188, 128]);
+        assert!((srgb[0] - 1.0).abs() < 1e-6 && srgb[1] == 0.0 && (srgb[2] - 0.5).abs() < 0.01);
+        assert!((srgb[3] - 128.0 / 255.0).abs() < 1e-6);
+    }
 
     fn renderer() -> Option<Renderer> {
         match pollster::block_on(Renderer::new_headless(16, 16)) {
@@ -1212,12 +1634,12 @@ mod tests {
     fn uncaptured_wgpu_errors_are_logged_in_release_and_panic_in_debug() {
         let Some(r) = renderer() else { return };
         assert_eq!(r.gpu_error_count(), 0);
-        let count = install_error_handler(&r.device, false);
+        let (count, _) = install_error_handler(&r.device, false);
         invalid_buffer(&r.device);
         invalid_buffer(&r.device);
         assert_eq!(count.load(Ordering::Relaxed), 2, "logged, not panicked");
 
-        let count = install_error_handler(&r.device, true);
+        let (count, _) = install_error_handler(&r.device, true);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invalid_buffer(&r.device)));
         assert!(panicked.is_err());
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -1228,7 +1650,7 @@ mod tests {
     #[test]
     fn errors_after_device_loss_do_not_panic_in_debug() {
         let Some(r) = renderer() else { return };
-        let count = install_error_handler(&r.device, true);
+        let (count, _) = install_error_handler(&r.device, true);
         r.device.destroy();
         // `destroy` loses the device once its in-flight work is done: the callback fires here.
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());

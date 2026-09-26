@@ -47,6 +47,8 @@ pub type BoxedSystem = Box<dyn FnMut(&mut SystemCtx) + Send>;
 
 pub(crate) struct NamedSystem {
     pub name: &'static str,
+    /// Position within the stage (ascending; ties keep registration order).
+    pub order: i32,
     pub run: BoxedSystem,
 }
 

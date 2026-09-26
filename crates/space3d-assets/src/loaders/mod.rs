@@ -1,12 +1,16 @@
 //! Built-in loaders: images (`image` crate), glTF 2.0 (`gltf`), Wavefront OBJ (`tobj`).
 
 mod gltf;
+mod hdr;
 mod image;
 mod obj;
+mod skybox;
 
 pub use self::gltf::{GltfLoader, load_gltf};
+pub use self::hdr::HdrImageLoader;
 pub use self::image::ImageLoader;
 pub use self::obj::{ObjLoader, load_obj};
+pub use self::skybox::{CubeConvention, CubemapData, SkyboxLoader};
 
 use crate::assets::Asset;
 use crate::error::AssetError;
@@ -35,10 +39,13 @@ impl<L: AssetLoader<Asset = ModelData>> AssetLoader for MeshLoader<L> {
 
 /// Register the built-in loaders on a server:
 /// * [`ImageLoader`] → `ImageData`
+/// * [`HdrImageLoader`] → `HdrImageData`, [`SkyboxLoader`] → [`CubemapData`]
 /// * [`GltfLoader`], [`ObjLoader`] → [`ModelData`]
 /// * [`MeshLoader`] over glTF/OBJ (without textures) → `MeshData`
 pub fn register_builtin_loaders(server: &mut AssetServer) {
     server.register_loader(ImageLoader);
+    server.register_loader(HdrImageLoader);
+    server.register_loader(SkyboxLoader);
     server.register_loader(GltfLoader::default());
     server.register_loader(ObjLoader::default());
     server.register_loader(MeshLoader(GltfLoader { load_images: false }));
