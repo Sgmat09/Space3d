@@ -4,8 +4,9 @@
 //! * `resumed` — create the window once; create the [`Renderer`] (blocking on native,
 //!   asynchronously on the web) or, on mobile resume, recreate its surface.
 //! * `suspended` — drop the surface (Android destroys the native window in background).
-//! * `window_event` — feed [`Input`] (keyboard events with their logical keys), track
-//!   size/DPI/focus, render on `RedrawRequested`.
+//! * `window_event` — feed [`Input`] (keyboard events with their logical keys; physical keys
+//!   winit 0.30 misses or conflates are corrected: macOS ISO `IntlBackslash`, JIS `IntlRo`),
+//!   track size/DPI/focus, render on `RedrawRequested`.
 //!   Before rendering, a surface the renderer dropped as lost (Vulkan `SURFACE_LOST`, DX12)
 //!   is recreated, at most once per `SurfaceRetry::INTERVAL`.
 //! * `about_to_wait` — request the next redraw (continuous rendering).
@@ -454,8 +455,17 @@ impl ApplicationHandler for WinitRunner {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
-                match event.physical_key {
+                // winit 0.30 leaves some keys unidentified or reports two keys as one (macOS
+                // ISO and JIS keys): see `layout::physical_key`.
+                match crate::layout::physical_key(event.physical_key) {
                     PhysicalKey::Code(code) => {
+                        #[cfg(target_os = "macos")]
+                        let code = if pressed {
+                            code
+                        } else {
+                            let input = self.input();
+                            crate::layout::macos_released_key(code, |k| input.pressed(k))
+                        };
                         let key_event = KeyEvent {
                             physical: code,
                             key_without_modifiers: key_without_modifiers(&event),

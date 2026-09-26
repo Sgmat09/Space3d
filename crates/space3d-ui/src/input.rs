@@ -22,7 +22,7 @@
 //! deterministic under `App::step_ticks`.
 
 use space3d_core::glam::Vec2;
-use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton, NamedKey, is_writing_system_key, writing_system_keys};
+use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton, NamedKey, is_writing_system_key};
 
 /// Map a logical (layout) key to an egui key — the mapping egui-winit uses: characters by
 /// [`egui::Key::from_name`] (`"z"` → `Z`, `"?"` → `Questionmark`), named keys (Enter, arrows,
@@ -122,17 +122,25 @@ fn press_key(input: &Input, code: KeyCode) -> Option<egui::Key> {
 /// `KeyCode::KeyU`, on QWERTY and QWERTZ it is `KeyCode::KeyM`.
 ///
 /// It is the writing-system key whose layout label ([`Input::key_label`]) egui reads as
-/// `key`; else the physical key [`egui_key`] maps to `key`, unless the layout makes that key
-/// send another egui key (a label egui has no key for, such as Cyrillic `я` in Z's position,
-/// still sends the physical key's). `None` when the layout moved `key` to a position whose
-/// label is still unknown (no OS table, key not pressed yet), or no key sends it.
+/// `key` (the first in keyboard order when several are); else the physical key [`egui_key`]
+/// maps to `key`, unless the layout makes that key send another egui key (a label egui has no
+/// key for, such as Cyrillic `я` in Z's position, still sends the physical key's). `None` when
+/// the layout moved `key` to a position whose label is still unknown (no OS table, key not
+/// pressed yet), or no key sends it.
+///
+/// Cheap enough for every frame: it walks the layout's cached reverse map
+/// ([`KeyboardLayout::key_for_label_matching`](space3d_platform::KeyboardLayout::key_for_label_matching)),
+/// which is rebuilt only when the labels change, and does not allocate otherwise.
 pub fn physical_key_for_egui_key(input: &Input, key: egui::Key) -> Option<KeyCode> {
-    let sends = |label: String| egui_logical_key(&LogicalKey::Character(label.into()));
-    if let Some(code) = writing_system_keys().find(|&k| input.key_label(k).and_then(sends) == Some(key)) {
+    // What egui reads for a typed character: `egui_logical_key(&LogicalKey::Character(label))`.
+    let sends = egui::Key::from_name;
+    let layout = input.keyboard_layout();
+    if let Some(code) = layout.key_for_label_matching(|label| sends(label) == Some(key)) {
         return Some(code);
     }
     KEYS.iter().copied().find(|&code| {
-        egui_key(code) == Some(key) && (!is_writing_system_key(code) || input.key_label(code).and_then(sends).is_none())
+        egui_key(code) == Some(key)
+            && (!is_writing_system_key(code) || layout.label_text(code).and_then(sends).is_none())
     })
 }
 
@@ -161,6 +169,8 @@ pub fn egui_key(code: KeyCode) -> Option<egui::Key> {
         K::Paste => E::Paste,
         K::Comma => E::Comma,
         K::Backslash => E::Backslash,
+        // The ISO key right of left Shift (`<` on AZERTY/QWERTZ), as egui-winit maps it.
+        K::IntlBackslash => E::IntlBackslash,
         K::Slash | K::NumpadDivide => E::Slash,
         K::BracketLeft => E::OpenBracket,
         K::BracketRight => E::CloseBracket,
@@ -257,6 +267,7 @@ const KEYS: &[KeyCode] = {
         K::Paste,
         K::Comma,
         K::Backslash,
+        K::IntlBackslash,
         K::Slash,
         K::NumpadDivide,
         K::BracketLeft,
@@ -773,7 +784,7 @@ mod tests {
         let mut input = Input::default();
         // (physical key, modifier-free key, logical key if different, egui key, egui physical key)
         type Case = (KeyCode, LogicalKey, Option<LogicalKey>, E, Option<E>);
-        let cases: [Case; 9] = [
+        let cases: [Case; 11] = [
             // AZERTY: QWERTY's W position is labelled Z.
             (KeyCode::KeyW, ch("z"), None, E::Z, Some(E::W)),
             // QWERTZ: QWERTY's Y position is labelled Z.
@@ -792,6 +803,22 @@ mod tests {
             (KeyCode::KeyZ, ch("w"), Some(ch("Ω")), E::W, Some(E::Z)),
             // A key egui has no physical key for, whose character it knows (JIS ろ).
             (KeyCode::IntlRo, ch("\\"), None, E::Backslash, None),
+            // The ISO key right of left Shift: "`" on US/British Macs, "<" (no egui key: the
+            // physical key, like egui-winit) on French/German keyboards.
+            (
+                KeyCode::IntlBackslash,
+                ch("`"),
+                None,
+                E::Backtick,
+                Some(E::IntlBackslash),
+            ),
+            (
+                KeyCode::IntlBackslash,
+                ch("<"),
+                None,
+                E::IntlBackslash,
+                Some(E::IntlBackslash),
+            ),
         ];
         for (code, key, logical, want, want_physical) in cases {
             let mut press = space3d_platform::KeyEvent::press(code, key.clone());
@@ -874,7 +901,7 @@ mod tests {
         type Layout = &'static [(KeyCode, &'static str)];
         type Expected = &'static [(E, Option<KeyCode>)];
         // (layout, keys taught, egui key → expected physical key)
-        let cases: [(&str, Layout, Expected); 6] = [
+        let cases: [(&str, Layout, Expected); 8] = [
             (
                 "unknown (US assumed)",
                 &[],
@@ -909,6 +936,19 @@ mod tests {
                 "Cyrillic",
                 &[(KeyCode::KeyM, "ь"), (KeyCode::KeyZ, "я")],
                 &[(E::M, Some(KeyCode::KeyM)), (E::Z, Some(KeyCode::KeyZ))],
+            ),
+            (
+                "US on an ISO Mac: ` right of left Shift",
+                &[(KeyCode::Backquote, "§"), (KeyCode::IntlBackslash, "`")],
+                &[(E::Backtick, Some(KeyCode::IntlBackslash))],
+            ),
+            (
+                "German on an ISO Mac",
+                &[(KeyCode::Backquote, "^"), (KeyCode::IntlBackslash, "<")],
+                &[
+                    (E::IntlBackslash, Some(KeyCode::IntlBackslash)),
+                    (E::Backtick, Some(KeyCode::Backquote)),
+                ],
             ),
             (
                 "named keys",

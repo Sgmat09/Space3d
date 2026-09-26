@@ -225,3 +225,32 @@ fn a_new_os_layout_replaces_learned_labels() {
     assert_eq!(input.key_label(KeyCode::KeyA).as_deref(), Some("a"));
     assert_eq!(input.key_label_info(KeyCode::KeyA).unwrap().source, KeyLabelSource::Os);
 }
+
+#[test]
+fn a_pinned_layout_keeps_its_labels_until_unpinned() {
+    let mut app = app();
+    let input = app.resources.expect_mut::<Input>();
+    let layout = input.keyboard_layout_mut();
+    // A sample AZERTY table shown on a machine whose keys type QWERTY.
+    layout.set_os_layout(
+        Some("sample-azerty".into()),
+        [
+            (KeyCode::KeyA, "q".into(), Some("Q".into())),
+            (KeyCode::Semicolon, "m".into(), Some("M".into())),
+        ],
+    );
+    layout.set_pinned(true);
+    let g = layout.generation();
+    type_layout(&mut app, &[(KeyCode::KeyA, "a"), (KeyCode::Semicolon, ";")]);
+    let input = app.resources.expect_mut::<Input>();
+    assert_eq!(input.keyboard_layout().generation(), g, "key events teach nothing");
+    assert_eq!(input.key_cap(KeyCode::KeyA), "Q");
+    assert_eq!(input.keyboard_layout().key_for_label("m"), Some(KeyCode::Semicolon));
+    assert!(!input.refresh_keyboard_layout(), "no OS read while pinned");
+    // Unpinned, key events teach again.
+    input.keyboard_layout_mut().set_pinned(false);
+    type_layout(&mut app, &[(KeyCode::KeyA, "a")]);
+    let input = app.resources.expect::<Input>();
+    assert_eq!(input.key_cap(KeyCode::KeyA), "A");
+    assert_eq!(input.keyboard_layout().key_for_label("a"), Some(KeyCode::KeyA));
+}
