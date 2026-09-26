@@ -5253,6 +5253,8 @@ dependencies = [
  "space3d-core",
  "space3d-platform",
  "space3d-render",
+ "space3d-stories",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "tracing-wasm",

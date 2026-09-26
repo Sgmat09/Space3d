@@ -23,3 +23,6 @@ tracing-wasm.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true
+# tests/kinsoku.rs: the golden screenshot story and the Cargo.lock guard.
+space3d-stories.workspace = true
+toml.workspace = true
