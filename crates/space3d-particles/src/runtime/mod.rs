@@ -980,6 +980,18 @@ impl Runtime {
         }
     }
 
+    /// Despawn every light flash entity (the particles are disabled).
+    pub fn remove_lights(&mut self, world: &mut World) {
+        for e in self.dead_lights.drain(..) {
+            let _ = world.despawn(e);
+        }
+        for inst in &mut self.instances {
+            if let Some(e) = inst.light.take() {
+                let _ = world.despawn(e);
+            }
+        }
+    }
+
     /// Emission of instance `i` this tick (records into the log).
     fn schedule(&mut self, i: u32, effect: &ParticleEffect, dt: f32, quality: f32, distance: f32, extra_age: f32) {
         let inst = self.instances[i as usize];

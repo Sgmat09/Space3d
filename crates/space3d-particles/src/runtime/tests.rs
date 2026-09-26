@@ -1139,6 +1139,26 @@ fn light_flash_plays_a_point_light() {
     };
     let mut reader = EventReader::default();
     let (mut first, mut last) = (None, None);
+    // Disabled particles light nothing: a flash under way goes out.
+    {
+        let mut probe = App::new();
+        probe.add_plugin(ParticlesPlugin::default());
+        let fx = probe
+            .resources
+            .expect_mut::<ParticleEffects>()
+            .add(ParticleEffect {
+                duration: 0.0,
+                light: Some(LightFlash::default()),
+                ..ParticleEffect::new("flash")
+            })
+            .unwrap();
+        probe.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).keep());
+        probe.step_ticks(2);
+        assert_eq!(probe.world.query::<&PointLight>().iter().count(), 1);
+        probe.resources.expect_mut::<crate::ParticleSettings>().enabled = false;
+        probe.step_ticks(1);
+        assert_eq!(probe.world.query::<&PointLight>().iter().count(), 0);
+    }
     for t in 1..=40u32 {
         app.step_ticks(1);
         let l = lights(&app);
@@ -1165,4 +1185,85 @@ fn light_flash_plays_a_point_light() {
         }
     }
     panic!("never finished (lights {first:?}..{last:?})");
+}
+
+/// Hot reload (`ParticleEffects::set`): a change that keeps the layers' structure updates the
+/// running instance in place (same layer instances, new parameters); a structural change (a
+/// layer added, a ring resized, a ribbon added) restarts the emitter as a new instance while the
+/// old one's particles drain and it is freed once they are dead.
+#[test]
+fn hot_reload_structure_change_drains() {
+    use crate::effect::RibbonLayer;
+    let mut h = Harness::new();
+    let layer = ParticleLayer::continuous(60.0, 0.5).speed((1.0, 2.0));
+    let fx = h.add(ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("reload").layer(layer.clone())
+    });
+    let e = h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).keep());
+    for _ in 0..30 {
+        h.step();
+    }
+    let i = h.rt.by_entity[&e];
+    let entry = h.rt.instances[i as usize].entries()[0];
+    // Same structure, new color and speed: in place.
+    let mut tweaked = layer.clone();
+    tweaked.speed = FloatRange::new(3.0, 4.0);
+    h.effects
+        .set(
+            fx,
+            ParticleEffect {
+                looping: true,
+                ..ParticleEffect::new("reload").layer(tweaked.clone())
+            },
+        )
+        .unwrap();
+    h.step();
+    assert_eq!(h.rt.by_entity[&e], i, "same instance");
+    assert_eq!(h.rt.instances[i as usize].entries()[0], entry, "same layer instance");
+    assert_eq!(h.rt.entries[entry as usize].sim.speed, (3.0, 4.0), "new parameters");
+    // A second layer and a ribbon: a new instance; the old one drains.
+    h.effects
+        .set(
+            fx,
+            ParticleEffect {
+                looping: true,
+                ..ParticleEffect::new("reload")
+                    .layer(tweaked.clone())
+                    .layer(tweaked)
+                    .ribbon(RibbonLayer::default())
+            },
+        )
+        .unwrap();
+    h.step();
+    let j = h.rt.by_entity[&e];
+    assert_ne!(j, i, "a new instance for the entity");
+    assert_eq!(
+        (
+            h.rt.instances[j as usize].n_entries,
+            h.rt.instances[j as usize].n_tracks
+        ),
+        (2, 1)
+    );
+    assert!(
+        h.rt.instances[i as usize].live && !h.rt.instances[i as usize].attached,
+        "draining"
+    );
+    assert!(
+        h.alive().iter().any(|(_, p)| p.misc[2] == entry),
+        "the old particles still live"
+    );
+    for _ in 0..window_ticks(0.5, DT) + 1 {
+        h.step();
+    }
+    assert!(
+        !h.rt.instances[i as usize].live || h.rt.instances[i as usize].entity != e,
+        "drained and freed"
+    );
+    assert!(
+        !h.alive()
+            .iter()
+            .any(|(_, p)| p.misc[2] == entry && h.rt.entries[entry as usize].live)
+    );
+    assert_eq!(h.rt.entries.iter().filter(|x| x.live).count(), 2, "only the new layers");
 }

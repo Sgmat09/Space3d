@@ -188,10 +188,11 @@ pub fn tick_system(ctx: &mut SystemCtx) {
     // Light flashes: `PointLight` child entities of their emitters while they play.
     let world = &mut *ctx.world;
     ctx.resources.scope::<runtime::ParticleRuntime, _>(|res, runtime| {
-        if let Some(effects) = res.get::<ParticleEffects>()
-            && res.get::<ParticleSettings>().is_some_and(|s| s.enabled)
-        {
-            runtime.rt.update_lights(world, effects);
+        let enabled = res.get::<ParticleSettings>().is_some_and(|s| s.enabled);
+        match res.get::<ParticleEffects>() {
+            Some(effects) if enabled => runtime.rt.update_lights(world, effects),
+            // Disabled: nothing plays, so no flash lights anything either.
+            _ => runtime.rt.remove_lights(world),
         }
     });
     if !finished {

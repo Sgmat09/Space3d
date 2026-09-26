@@ -173,7 +173,7 @@ fn fs_strip(in: S3dpStripOut) -> @location(0) vec4<f32> {
     var body = mix(soft, hard, p.y);
     var core = exp(-d * d * white.x) * white.y * p.x;
     var tex_rgb = vec3<f32>(1.0);
-    if (s3dp_draw.mode.w != 0u) {
+    if (S3DP_TEXTURED && s3dp_draw.mode.w != 0u) {
         let tex = s3dp_tex(tuv, 0.0, gx, gy);
         body = body * tex.a;
         core = core * tex.a;

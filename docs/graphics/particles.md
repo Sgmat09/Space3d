@@ -488,10 +488,10 @@ cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --noca
 
 | item | measured | gate (graphics spec §4.4) |
 |---|---|---|
-| GPU: 100k alive, one tick of `simulate` + `emit` and the compaction (`mark` + `scatter`), nothing else on the GPU | 0.018 + 0.028 = **0.046 ms** | ≤ 0.06 ms |
+| GPU: 100k alive, one tick of `simulate` + `emit` and the compaction (`mark` + `scatter`), nothing else on the GPU | 0.017 + 0.027 = **0.044 ms** | ≤ 0.06 ms |
 | the same inside frames that also draw the 100k billboards (reported, not gated: see below) | 0.08–0.09 ms | — |
-| GPU: draw 100k billboards into the HDR scene texture (8–16 px, 12 px average, spread over 1080p: 14.9 M fragments, ≈ 7× overdraw; "overdraw 2" cannot hold with 12 px sprites at 1080p, so this is the heavier reading) | **0.35 ms** | ≤ 0.40 ms |
-| the same draws into Direct mode's 8-bit sRGB target (reported) | 0.37–0.44 ms idle, up to 0.8 ms with other GPU load | — |
+| GPU: draw 100k billboards into the HDR scene texture (8–16 px, 12 px average, spread over 1080p: 14.9 M fragments, ≈ 7× overdraw; "overdraw 2" cannot hold with 12 px sprites at 1080p, so this is the heavier reading) | **0.38 ms** (0.35–0.37 before the M1.1 footprint widening: the glow's widened exponents are computed per sprite in the vertex shader, and the texture and flipbook paths are compiled out of untextured pipelines, to keep it at that) | ≤ 0.40 ms |
+| the same draws into Direct mode's 8-bit sRGB target (reported) | 0.39–0.48 ms idle, up to 0.8 ms with other GPU load | — |
 | GPU backend CPU cost: `prepare` + draw recording, 500 moving layer instances, one tick (`gpu::tests::gpu_prepare_cpu_time`) | 0.10–0.14 ms idle machine (0.2–0.3 ms under load); moved in `Update` instead (bridged every frame, one particle each): +0.01–0.02 ms | ≤ 0.1 ms (Battle scene, Phase I) |
 | CPU backend: tick + simulate + pack 16 384 particles, one thread (test profile) | 0.28 ms | ≤ 0.35 ms |
 | `tick_system`, 500 layer instances | 13 µs | ≤ 60 µs |

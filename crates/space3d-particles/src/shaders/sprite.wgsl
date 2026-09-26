@@ -24,7 +24,8 @@ struct S3dpOut {
     @location(1) color: vec4<f32>,
     // x coverage, y fade, z stretch, w white-core brightness.
     @location(2) @interpolate(flat) a: vec4<f32>,
-    // x radius in pixels.
+    // x radius in pixels, y and z: the glow's halo and white-core exponents widened by the
+    // pixel footprint (`s3dp_widen`, per sprite).
     @location(3) @interpolate(flat) b: vec4<f32>,
     // Positive view distance of the fragment (soft fade).
     @location(4) view_depth: f32,
@@ -180,15 +181,19 @@ fn vs_sprite(in: S3dpIn) -> S3dpOut {
         fade = clamp((distance(center, view.camera_pos.xyz) - near.x) / (near.y - near.x), 0.0, 1.0);
     }
     out.a = vec4<f32>(coverage, fade, stretch, white);
-    out.b = vec4<f32>(px, 0.0, 0.0, 0.0);
+    out.b = vec4<f32>(px, s3dp_widen(4.0, px).x, s3dp_widen(28.0, px).x, 0.0);
     out.bits = in.rot_frame.y;
-    out.frame = s3dp_frames(age, age_secs, in.rot_frame.y);
+    out.frame = vec3<f32>(0.0);
+    if (S3DP_TEXTURED) {
+        out.frame = s3dp_frames(age, age_secs, in.rot_frame.y);
+    }
     return out;
 }
 
 // Shape of a sprite at quad position `uv`: (color weight, white core, coverage mask). `peak`
 // is the sprite's brightest channel as the tonemapper sees it (color × opacity × exposure).
-fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32, peak: f32) -> vec3<f32> {
+fn s3dp_shape(uv: vec2<f32>, stretch: f32, b: vec4<f32>, bits: u32, peak: f32) -> vec3<f32> {
+    let px = b.x;
     let p = s3dp_draw.shape;
     switch s3dp_draw.mode.z {
         case 1u: {
@@ -283,8 +288,10 @@ fn s3dp_shape(uv: vec2<f32>, stretch: f32, px: f32, bits: u32, peak: f32) -> vec
             if (peak > 1.0) {
                 win = win * pow(win, min(0.5 * log2(peak), 3.0));
             }
-            let halo = s3dp_widen(4.0, px);
-            let white = s3dp_widen(28.0, px);
+            // The widened exponents come from the vertex shader (the amplitude keeps the light:
+            // k' / k).
+            let halo = vec2<f32>(b.y, b.y / 4.0);
+            let white = vec2<f32>(b.z, b.z / 28.0);
             let soft = exp(-d * d * halo.x) * halo.y * win;
             let hard = clamp((1.0 - d) * px + 0.5, 0.0, 1.0);
             let body = mix(soft, hard, p.y);
@@ -299,15 +306,16 @@ fn fs_sprite(in: S3dpOut) -> @location(0) vec4<f32> {
     if (S3DP_MANUAL_DEPTH && s3d_scene_occluded(px, in.clip.z)) {
         discard;
     }
-    // Texture coordinates (v down) and their derivatives, before any non-uniform branch.
-    let tuv = vec2<f32>(in.uv.x, -in.uv.y) * 0.5 + 0.5;
-    let cells = vec2<f32>(max(s3dp_draw.book.y, 1.0), max(s3dp_draw.book.z, 1.0));
-    let gx = dpdx(tuv) / cells;
-    let gy = dpdy(tuv) / cells;
     let peak = max(in.color.r, max(in.color.g, in.color.b)) * in.color.a * view.exposure.x;
     var s: vec3<f32>;
     var tex_rgb = vec3<f32>(1.0);
-    if (s3dp_draw.mode.z == 5u) {
+    if (S3DP_TEXTURED && s3dp_draw.mode.z == 5u) {
+        // Texture coordinates (v down) and their derivatives (a uniform branch: the layer's
+        // draw parameters; compiled out of the untextured pipelines).
+        let tuv = vec2<f32>(in.uv.x, -in.uv.y) * 0.5 + 0.5;
+        let cells = vec2<f32>(max(s3dp_draw.book.y, 1.0), max(s3dp_draw.book.z, 1.0));
+        let gx = dpdx(tuv) / cells;
+        let gy = dpdy(tuv) / cells;
         // A texture (or a flipbook frame of it, blended toward the next): its color multiplies
         // the particle's, its alpha is the shape (straight alpha).
         let c0 = s3dp_cell(tuv, in.frame.x);
@@ -319,7 +327,7 @@ fn fs_sprite(in: S3dpOut) -> @location(0) vec4<f32> {
         s = vec3<f32>(tex.a, 0.0, tex.a);
         tex_rgb = tex.rgb;
     } else {
-        s = s3dp_shape(in.uv, in.a.z, in.b.x, in.bits, peak);
+        s = s3dp_shape(in.uv, in.a.z, in.b, in.bits, peak);
     }
     var fade = in.a.y;
     if (s3dp_view.flags.y != 0u) {

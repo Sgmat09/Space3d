@@ -121,15 +121,16 @@ pub(crate) enum TexVariant {
 fn texture_wgsl(tex: TexVariant) -> &'static str {
     match tex {
         TexVariant::None => {
-            "fn s3dp_tex(uv: vec2<f32>, layer: f32, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {\n    return vec4<f32>(1.0);\n}\n"
+            "const S3DP_TEXTURED: bool = false;\n\
+             fn s3dp_tex(uv: vec2<f32>, layer: f32, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {\n    return vec4<f32>(1.0);\n}\n"
         }
         TexVariant::D2 => {
-            "@group(3) @binding(0) var s3dp_tex_t: texture_2d<f32>;\n@group(3) @binding(1) var s3dp_tex_s: sampler;\n\
+            "const S3DP_TEXTURED: bool = true;\n@group(3) @binding(0) var s3dp_tex_t: texture_2d<f32>;\n@group(3) @binding(1) var s3dp_tex_s: sampler;\n\
              fn s3dp_tex(uv: vec2<f32>, layer: f32, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {\n    \
              return textureSampleGrad(s3dp_tex_t, s3dp_tex_s, uv, gx, gy);\n}\n"
         }
         TexVariant::Array => {
-            "@group(3) @binding(0) var s3dp_tex_t: texture_2d_array<f32>;\n@group(3) @binding(1) var s3dp_tex_s: sampler;\n\
+            "const S3DP_TEXTURED: bool = true;\n@group(3) @binding(0) var s3dp_tex_t: texture_2d_array<f32>;\n@group(3) @binding(1) var s3dp_tex_s: sampler;\n\
              fn s3dp_tex(uv: vec2<f32>, layer: f32, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {\n    \
              let l = clamp(i32(layer), 0, i32(textureNumLayers(s3dp_tex_t)) - 1);\n    \
              return textureSampleGrad(s3dp_tex_t, s3dp_tex_s, uv, l, gx, gy);\n}\n"
