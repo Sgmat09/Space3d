@@ -500,9 +500,12 @@ closer cameras). At that view:
 | `SHIELD_RIPPLE` | soft arc and bubble bands (thickness 0.16 / 0.14 with a fill), streaks 2.2 units (3 px) |
 | `WARP_IN` / `WARP_OUT` | the vortex about 4 hulls across (150 units, collapsing to 18), rings ending at 128 and 160 units, flash 130 / core 56 units |
 | `ENGINE_EXHAUST` | a plume of 4–6-unit glows, one per unit flown |
+| `EMP` | a flash about 90 units across; two soft shock bands (10–25 px wide, thickness 0.10 / 0.14 with a faint fill) expanding to about 190 units in 0.45 s; arcs 3 px wide |
 
 Nothing in a built-in is a thin crisp ring at that scale (a 1–2 px circle reads as a selection
-marker, not energy), and sparks and streaks are at least 3 px wide (thinner ones twinkle as the
+marker, not energy: every visible `Ring` has a thickness of at least 0.1,
+`registry::tests::builtins_have_no_thin_rings`; `EMP`'s shock was 0.03, a 3–5 px circle, until
+the M2 review), and sparks and streaks are at least 3 px wide (thinner ones twinkle as the
 camera pans). Before M2's retune `WARP_IN` spanned 214–419 units (5–10 hulls), `EXPLOSION`'s
 shockwave 400 and its fireball stayed opaque for 1.4–2.1 s.
 

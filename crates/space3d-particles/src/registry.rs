@@ -446,6 +446,25 @@ mod tests {
     }
 
     /// Every built-in parses, validates, round-trips through RON and sits at its handle.
+    /// The built-ins' reference view (docs/graphics/particles.md): nothing is a thin crisp
+    /// ring. Every visible `Ring` is a band of at least a tenth of its radius (EMP's shock was
+    /// 0.03: a 3–5 px circle at 1.4 px per unit, game#11's "UI marker"); distortion rings only
+    /// bend the image and may be anything.
+    #[test]
+    fn builtins_have_no_thin_rings() {
+        use crate::effect::{SpriteShape, SpriteTarget};
+        for &h in &builtin::ALL {
+            let fx = builtin::effect(h).unwrap();
+            for l in &fx.layers {
+                if let SpriteShape::Ring { thickness, .. } = l.render.shape
+                    && !matches!(l.render.target, SpriteTarget::Distortion { .. })
+                {
+                    assert!(thickness >= 0.1, "{} / {}: ring thickness {thickness}", fx.name, l.name);
+                }
+            }
+        }
+    }
+
     #[test]
     fn builtins_parse_and_round_trip() {
         assert_eq!(builtin::SOURCES.len(), builtin::ALL.len());
