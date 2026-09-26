@@ -288,7 +288,15 @@ impl GpuTimer {
                         timings.scopes.clear();
                         timings.total_ms = 0.0;
                         for p in &t.scopes {
-                            let ms = (ticks(p.end).saturating_sub(ticks(p.begin)) as f64 * period / 1e6) as f32;
+                            // A timestamp never written (a pass that was not recorded) reads 0,
+                            // or Metal's error value `u64::MAX`: that scope reports 0.
+                            let (b, e) = (ticks(p.begin), ticks(p.end));
+                            let valid = b != 0 && e != u64::MAX && e >= b;
+                            let ms = if valid {
+                                ((e - b) as f64 * period / 1e6) as f32
+                            } else {
+                                0.0
+                            };
                             timings.total_ms += ms;
                             timings.scopes.push(GpuScope {
                                 label: p.label,

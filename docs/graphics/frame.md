@@ -382,9 +382,9 @@ resources (environment cubes, BRDF LUT, shadow map and comparison sampler); dept
 neutral ones (a texture cannot be sampled while it is the pass's depth attachment).
 
 Cost (dev machine, `benches/frame.rs` `depth_view`: one 2048² map of 400 cubes and a ground
-plane over the 1080p frame scene): 0.02 ms of GPU (`GpuTimings` scope `shadow`), +40–50 µs of
+plane over the 1080p frame scene): 0.02 ms of GPU (`GpuTimings` scope `shadow`), +37 to +46 µs of
 render-thread CPU per frame (the culling of the casters, the pass and its draws), 16.8 MB of map
-and about 23 MB of process memory in all with the pass's Metal driver memory (below). The
+and about 23 MB of process memory in all with the pass's Metal driver memory ("Cost" below). The
 steady state uploads nothing for a still scene and allocates nothing in the renderer
 (`tests/depth_views.rs`, `tests/alloc_frame.rs` "depth_views"). `RenderStats::{depth_views,
 shadow_casters, shadow_draw_calls}` count them (the camera counters `instances`,
