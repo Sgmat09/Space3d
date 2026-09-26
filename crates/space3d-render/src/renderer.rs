@@ -1377,10 +1377,13 @@ impl Renderer {
         self.prewarm_pipelines(request);
     }
 
-    /// Where a cubemap is on its way to being usable as an environment.
+    /// Where a cubemap is on its way to being usable as an environment, as of the last rendered
+    /// frame: `Missing` for cubemaps that frame did not have (removed, or added since),
+    /// `Uploading` until it is on the GPU, then `Baking` (the passes left of its environment
+    /// bake, which starts in the first frame a camera's `EnvironmentLight` uses it) until
+    /// `Ready`; `Failed` if the upload failed (logged).
     pub fn environment_state(&self, cubemap: crate::handles::CubemapHandle) -> crate::lighting::api::EnvironmentState {
-        let _ = cubemap; // STUB(P-MAT)
-        crate::lighting::api::EnvironmentState::Missing
+        self.lighting.environment_state(cubemap)
     }
 }
 
