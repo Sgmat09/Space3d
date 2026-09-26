@@ -9,6 +9,14 @@
 //!   `extract_upload/ecs_static_mixed/100k` of `benches/instancing.rs`).
 //! * `materials/transparent_sort/4096`: one 4096-instance alpha-blended batch sorted back to
 //!   front per frame (`TransparentSort::PerInstance`), camera looking at it.
+//! * `materials/shadow_view/{ecs,explicit}/100k` and `…/{ecs,explicit}_off/100k`: 100k static
+//!   cubes on a 316 × 316 grid (entities, or one explicit `InstanceBuffer<InstanceCompact>`)
+//!   under a top-down camera that sees a few thousand of them, on `CpuDirect`, with and without
+//!   the sun's `DirectionalShadow` (fitted with `ShadowFit::top_down`): the difference is the
+//!   shadow view's CPU cost — fitting, the depth view's culling of every caster and its draws
+//!   (design budget +0.4 ms at 100k ECS). `…/ecs{,_off}_gpu/100k`: the same entities on the
+//!   adapter's best draw path, where the depth view is one more frustum of the culling
+//!   dispatches.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use space3d_core::prelude::*;
@@ -143,5 +151,91 @@ fn transparent_sort(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, ecs_pbr, ecs_plain, transparent_sort);
+fn shadow_scene(c: &mut Criterion, name: &str, explicit: bool, shadow: bool, gpu: bool) {
+    let Some(mut app) = app(false) else { return };
+    if gpu {
+        app.resources.expect_mut::<RenderSettings>().draw_path = None;
+    }
+    let camera = app
+        .world
+        .query::<(Entity, &Camera3d)>()
+        .iter()
+        .map(|(e, _)| e)
+        .next()
+        .unwrap();
+    *app.world.get::<&mut Transform>(camera).unwrap() =
+        Transform::from_xyz(0.0, 60.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z);
+    let n = 100_000u32;
+    let cube = app.resources.expect_mut::<RenderAssets>().add_mesh(MeshData::cube(0.6));
+    let material = Material::srgb(0.6, 0.55, 0.5);
+    let at = |i: u32| {
+        Vec3::new(
+            (i % 316) as f32 - 158.0,
+            0.5 + (i % 7) as f32 * 0.3,
+            (i / 316) as f32 - 158.0,
+        )
+    };
+    if explicit {
+        let data = (0..n)
+            .map(|i| InstanceCompact::new(at(i), Quat::from_rotation_y(i as f32 * 0.37), 1.0))
+            .collect();
+        let instances = app
+            .resources
+            .expect_mut::<InstanceBuffers>()
+            .insert(InstanceBuffer::from_vec(data, BufferUsage::Static));
+        app.world.spawn((InstancedMesh {
+            mesh: cube,
+            material,
+            instances,
+        },));
+    } else {
+        for i in 0..n {
+            let p = at(i);
+            app.world.spawn((
+                Transform::from_xyz(p.x, p.y, p.z).with_rotation(Quat::from_rotation_y(i as f32 * 0.37)),
+                Mesh3d(cube),
+                material.clone(),
+            ));
+        }
+    }
+    let sun = app.world.spawn((
+        Transform::IDENTITY.looking_at(Vec3::new(-0.3, -1.0, -0.2), Vec3::Y),
+        DirectionalLight::default(),
+    ));
+    if shadow {
+        app.world
+            .insert_one(
+                sun,
+                DirectionalShadow::new().with_fit(ShadowFit::top_down(0.0, 5.0, 200.0)),
+            )
+            .unwrap();
+    }
+    app.step_ticks(1);
+    wait(&app);
+    let mut group = c.benchmark_group("materials");
+    group.throughput(Throughput::Elements(n as u64));
+    group.bench_function(name, |b| {
+        b.iter(|| {
+            app.run_stage(Stage::Render);
+            wait(&app);
+        })
+    });
+    group.finish();
+    let s = app.resources.expect::<RenderStats>();
+    eprintln!(
+        "{name}: {} depth views, {} casters, {} shadow draws; camera {} of {} instances drawn",
+        s.depth_views, s.shadow_casters, s.shadow_draw_calls, s.instances_drawn, s.instances
+    );
+}
+
+fn shadow_view(c: &mut Criterion) {
+    shadow_scene(c, "shadow_view/ecs_off/100k", false, false, false);
+    shadow_scene(c, "shadow_view/ecs/100k", false, true, false);
+    shadow_scene(c, "shadow_view/explicit_off/100k", true, false, false);
+    shadow_scene(c, "shadow_view/explicit/100k", true, true, false);
+    shadow_scene(c, "shadow_view/ecs_off_gpu/100k", false, false, true);
+    shadow_scene(c, "shadow_view/ecs_gpu/100k", false, true, true);
+}
+
+criterion_group!(benches, ecs_pbr, ecs_plain, transparent_sort, shadow_view);
 criterion_main!(benches);
