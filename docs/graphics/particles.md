@@ -172,13 +172,20 @@ target needs it. Direct mode has no tonemapper: there each sprite soft-clips wit
 **Authoring for HDR.** The built-ins are calibrated for the HDR frame a game with `PostProcess`
 renders (AgX + `Bloom::glow()`, threshold 1): what should glow is authored well above 1 (laser
 trail 5× and head 10× the tint, explosion flash 5, sparks and embers up to 15, fireball 4.5), so
-it blooms and reaches white, and colors keep low off-channels (a red tint of `(1, 0.1, 0.05)`,
-shield blue `(0.12, 0.55, 2.8)`) so AgX desaturates them toward white only where they are
-hottest. Plumes and trails are soft glows without cores or rims (`core` only on heads and
-nozzles), so overlapping chains read as one beam or flame instead of beads. For more saturation
-and contrast in effect-heavy scenes, `Tonemapper::AgXPunchy` (post.md) keeps saturated
-emissives saturated. `Engine/Particles/HDR/*` shows every built-in through `PostProcess::default()`
-(with a `tonemapper` knob); `Engine/Particles/Builtin/*` the same scenes in Direct mode.
+it blooms and reaches white, and colors keep their off-channels low (shield blue `(0.12, 0.55,
+2.8)`; tints are best pure primaries like the game's tier colors: a red laser tinted `(1, 0, 0)`
+keeps a `(233, 101, 104)` core where `(1, 0.1, 0.05)` turns `(228, 142, 128)`) so AgX
+desaturates them toward white only where they are hottest. A large flash is a small white-hot
+core over a dimmer saturated halo, not one big bright glow (AgX turns a 280-unit glow of 4.5
+into a flat milky disc): the warp flashes are a blue halo of `(0.3, 0.75, 3)` around a core of
+`(10, 11, 16)` with `core: 3` at 0.43× its size, the shield's impact a `(0.15, 0.7, 4)` glow
+with `core: 2.5`. Plumes and trails are soft glows without cores or rims (`core` only on heads
+and nozzles), so overlapping chains read as one beam or flame instead of beads. For more
+saturation and contrast in effect-heavy scenes, `Tonemapper::AgXPunchy` keeps saturated
+emissives saturated (with half a stop of exposure it is the recommended battle look: frame.md,
+"Choose the look explicitly"). `Engine/Particles/HDR/*` shows every built-in through
+`PostProcess::default()` (with a `tonemapper` knob); `Engine/Particles/Builtin/*` the same
+scenes in Direct mode.
 
 ## Built-in effects
 
@@ -190,9 +197,9 @@ in `crates/space3d-particles/assets/particles/` (`builtin::SOURCES`), the game's
 | `EXPLOSION` | flash, afterglow, fireball billows (premultiplied), hot core, sparks, embers, two shockwave rings, smoke | `EffectSpawn::at(p).scale(hull / 40)` |
 | `HIT_SPARK` | flash, sparks thrown along −Z, a ring, smoke; tinted | `.facing(-bolt_dir).tint(color)` |
 | `SHIELD_RIPPLE` | focused arc toward −Z, faint bubble, surface flash, streaks; local-space | `.facing(-bolt_dir).scale(radius / 20).follow(ship)` |
-| `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash, two rings | `EffectSpawn::at(portal)` |
+| `WARP_IN` / `WARP_OUT` | vortex, streaks rushing in / out, flash (white-hot core, blue halo), two rings | `EffectSpawn::at(portal)` |
 | `ENGINE_EXHAUST` | looping plume along +Z, sparks, nozzle glow; `rate_scale` = throttle. Near-neutral (white-hot): the flame takes its hue from the tint | emitter child behind the hull, `.tint(flame color)` (linear, largest component about 2 like the game's `engine_color`: `(0.3, 0.9, 2.0)` ion blue, `(2.0, 0.9, 0.2)` orange) |
-| `LASER_TRAIL` | looping white-hot head + a continuous beam laid per unit of distance (up to about 3800 units/s) | `.follow(bolt).tint(color)` (a saturated tint: `(1, 0.1, 0.05)`); the bolt may move in any stage |
+| `LASER_TRAIL` | looping white-hot head + a continuous beam laid per unit of distance (up to about 3800 units/s) | `.follow(bolt).tint(color)` (a saturated tint: the game's pure primaries such as `(1, 0, 0)` stay the most saturated); the bolt may move in any stage |
 | `LASER_BEAM` | reserved: beams arrive with PA3 (until then an emitter with it plays nothing and finishes at once, warned once) | |
 
 An emitter whose handle has no effect data — a removed effect, `EffectHandle::INVALID`, or
@@ -265,7 +272,7 @@ editor's storybook viewer, golden tests).
   (`ParticleStats::{shrunk, refused}`, logged once per effect). `EffectPriority::Low` stops at
   75 % of the pool, `Normal` at 90 %, `High` may use it all. Slots a built-in reserves per
   instance (`runtime::tests::builtin_slots`): `EXPLOSION` 81, `HIT_SPARK` 16, `SHIELD_RIPPLE` 8,
-  `WARP_IN` / `WARP_OUT` 26, `ENGINE_EXHAUST` 237 (its rates × the afterburner's
+  `WARP_IN` / `WARP_OUT` 27, `ENGINE_EXHAUST` 237 (its rates × the afterburner's
   `max_rate_scale` 2), `LASER_TRAIL` 581. The CPU backend's web budget (8192 × 90 %) holds, for
   example, 20 exhausts and 4 laser trails at once; the GPU pool (262 144) is not a practical
   limit for them.
@@ -332,11 +339,27 @@ cargo test -p space3d-particles --lib gpu_100k_within_budget -- --ignored --noca
 | the same inside frames that also draw the 100k billboards (reported, not gated: see below) | 0.08–0.09 ms | — |
 | GPU: draw 100k billboards into the HDR scene texture (8–16 px, 12 px average, spread over 1080p: 14.9 M fragments, ≈ 7× overdraw; "overdraw 2" cannot hold with 12 px sprites at 1080p, so this is the heavier reading) | **0.35 ms** | ≤ 0.40 ms |
 | the same draws into Direct mode's 8-bit sRGB target (reported) | 0.37–0.44 ms idle, up to 0.8 ms with other GPU load | — |
-| GPU backend CPU cost: `prepare` + draw recording, 500 moving layer instances, one tick | 0.14 ms idle machine (0.2–0.3 ms under load) | ≤ 0.1 ms (Battle scene, Phase I) |
+| GPU backend CPU cost: `prepare` + draw recording, 500 moving layer instances, one tick (`gpu::tests::gpu_prepare_cpu_time`) | 0.10–0.14 ms idle machine (0.2–0.3 ms under load); moved in `Update` instead (bridged every frame, one particle each): +0.01–0.02 ms | ≤ 0.1 ms (Battle scene, Phase I) |
 | CPU backend: tick + simulate + pack 16 384 particles, one thread (test profile) | 0.28 ms | ≤ 0.35 ms |
 | `tick_system`, 500 layer instances | 13 µs | ≤ 60 µs |
-| render-time bridges: 20 bolts at 3200 units/s moved a frame after the tick (1060 glows built and packed) | 63 µs (about 60 ns per glow, one thread, under load) | within the `prepare` line above (`runtime::tests::bridges_of_20_fast_bolts_within_budget`, ≤ 0.1 ms) |
+| render-time bridges: 20 bolts at 3200 units/s moved a frame after the tick (1060 glows built and packed) | 25–30 µs (about 25 ns per glow, one thread; 50–65 µs before the spawn math below) | ≤ 0.1 ms (`runtime::tests::bridges_of_20_fast_bolts_within_budget`) |
+| render-time bridges of a Battle fleet moved in `Update`: 300 engine exhausts at 150 units/s and 20 bolts (2260 particles built and packed) | 0.10–0.12 ms (0.15–0.16 ms before) | ≤ 0.15 ms (`runtime::tests::bridges_of_a_battle_fleet_within_budget`); **on top of** the `prepare` line, see below |
 | allocations per frame, ~1000 particles, 80–90 draws, the exhaust moved in `Update` (wgpu's bookkeeping; our code: 0) | CPU backend 184, GPU backend 307 (a direct draw and upload for the exhaust's bridge) | pinned +10 % (`tests/alloc.rs`) |
+
+**Bridges are not free, plainly.** A game that moves its ships and bolts in `Stage::Update`
+(SpaceCorps2027 does) bridges every moving world-space emitter on every frame, on the CPU, on
+both backends: about 45 ns per bridged exhaust particle and 25 ns per trail glow, plus the
+render poses, the upload and one draw per layer. For the fleet above the particles node's
+render-thread CPU grows from about 0.14 ms (the same fleet moved in `FixedUpdate`: nothing
+bridged) to about 0.29 ms (1080p, HDR + bloom, GPU backend; 0.35–0.44 ms before this round:
+directions are no longer drawn for particles emitted at rest, the spawn angles use a
+polynomial `sin`/`cos` instead of libm's, and cone cosines and the fixed direction's basis are
+computed once per layer). That misses the Battle scene's 0.1 ms `prepare` line about 3×; the
+cost is linear in moving world-space emitters (about 0.33 µs per exhaust per frame) and is paid
+on every frame at refresh rates above the tick rate. Moving gameplay in `FixedUpdate` removes
+it (the tick then sees every move); building the bridges on the GPU (spawn records for the
+`emit` kernel into a scratch region, drawn once) is the planned fix, with the Battle scene's
+integration (Phase I).
 
 **Gate caveats, plainly.** The simulation gate is measured with the draws of the previous frame
 out of the way. With the camera drawing the 100k billboards every frame, the two particle
@@ -380,3 +403,4 @@ and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 | engine trails and nozzle flames | `ParticleEmitter::new(builtin::ENGINE_EXHAUST)` per nozzle, `rate_scale` = throttle, `tint` = `engine_color(e).extend(1.0)` (the plume is neutral: the tier and faction colors come through) |
 | bolt afterglow | `builtin::LASER_TRAIL` following the bolt, which `fx::animate` keeps moving in `Stage::Update` (the render-time bridge joins the trail to the head; beams: `LASER_BEAM`, PA3) |
 | `1 − e^−x` soft clip in the overlay | `direct_soft_clip` in Direct mode; with `PostProcess` the tonemapper and bloom take over |
+| the battle camera's look | choose it explicitly: `PostProcess::default().with_tonemapper(Tonemapper::AgXPunchy).with_exposure(0.5)` keeps faction exhaust, lasers and fire saturated; the default `AgX` turns them pastel (frame.md, "Choose the look explicitly") |

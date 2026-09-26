@@ -210,8 +210,15 @@ Rules:
   persists, so they are not called again — unless the frame skipped its scene views (no surface texture) and the
   replay renders them into `S` (§1.10): then they are called again (`Capture`).
 
-Game migration of `client/src/game/additive.rs`:
-1. Add `fn stage(&self) -> OverlayStage { OverlayStage::HdrScene }`.
+Game migration of `client/src/game/additive.rs` (worked through in `docs/graphics/frame.md`,
+"Migrating an additive overlay"):
+1. Stage per instance, not per type: keep an `OverlayStage` field and return it,
+   `fn stage(&self) -> OverlayStage { self.stage }`. The game registers its `ParticleOverlay`
+   type twice: the in-world copy (`"fx-additive-particles"`, priority −100) becomes `HdrScene`;
+   the copy drawn over egui (`"fx-additive-ui-particles"`, priority 1100, the wiki model
+   viewer's `UiParticles`) stays `AfterTonemap` — `HdrScene` draws before every `AfterTonemap`
+   overlay, egui included, so a type-level `HdrScene` would hide it under the UI. Steps 2–4
+   apply to the `HdrScene` instance.
 2. Pick the encoding from `prepare_scene` (`scene.output`) instead of `!target.format.is_srgb()`.
 3. Drop the `1 − e^−x` soft clip when `scene.mode != FrameMode::Direct` (values > 1 feed bloom).
 4. Add `Rgba16Float` to its per-format pipeline cache.
@@ -1491,7 +1498,7 @@ pub(crate) struct TexturePool;   // acquire(desc) → PoolTexture (per-mip views
 | item | change | why it is safe |
 |---|---|---|
 | `Material` | +12 `pub` fields (defaults = legacy), + builder methods, `Default` extended | Downstream uses FRU or field mutation only. The in-workspace editor literal is converted to FRU in F0. It is not `#[non_exhaustive]`, which would forbid FRU. |
-| `RenderStats` | +18 `pub` counters | FRU-only construction downstream. `PartialEq`/`Default` still derive. |
+| `RenderStats` | +19 `pub` counters (`staging_chunks_created` *added at the M1 review*) | FRU-only construction downstream. `PartialEq`/`Default` still derive. |
 | `RenderOverlay` trait | +3 provided methods (`stage`, `scene_reads`, `prepare_scene`) | Existing impls compile unchanged. Default = AfterTonemap = today's placement and pixels (test `legacy_overlay_unchanged`). |
 | `OverlayTarget` | +2 inherent methods | Fields unchanged. |
 | `OverlayTargetKind` | **unchanged** (no variant) | The game compares kinds and keeps per-kind buffers. HdrScene reuses the kinds. |
@@ -1501,7 +1508,7 @@ pub(crate) struct TexturePool;   // acquire(desc) → PoolTexture (per-mip views
 | `RenderPlugin` | **unchanged struct**; `build` inits more resources and built-in nodes | The facade literal `RenderPlugin { headless }` still compiles. |
 | `space3d_render::prelude` / `space3d::prelude` | + 8 names (§2.2.10) | Checked against every type name in the game (`prelude_policy.rs` fixture of 793 names) and the workspace preludes. No collision. |
 | `MaterialData`, `ModelMesh` (assets) | + `#[serde(default)]` fields | FRU-only downstream (grep of the game at every pin: never built literally). Old RON/JSON still deserialize. `Primitive` is frozen (the game builds it literally; *amended at the M1 review*). |
-| `space3d-core` | + `HdrImageData` (root export, not prelude) | Additive. |
+| `space3d-core` | + `HdrImageData` (root export, not prelude); `App` + `add_system_ordered(stage, order, name, system)`, and `add_system` / `add_system_named` insert at order 0 by `partition_point` (*added at the M1 review* for `ParticlesPlugin::TICK_ORDER`) | Additive. Systems added with `add_system` all have order 0, so they keep running in registration order, as before (`space3d-core` app tests; `docs/graphics/api.md`); only an ordered system (the particles' tick at 1000) runs after them. |
 | `engine_storybook()` | returns more stories | Additive. |
 | **Frozen, unchanged:** `Camera3d`, `Projection`, `RenderTarget`, `DirectionalLight`, `PointLight`, `AmbientLight`, `MeshData`, `InstancedMesh`, `InstanceLayout`, `RenderSettings`, `RendererConfig`, `RenderCapabilities`, `DrawPath`, `SamplerSettings`, `OverlayTarget` fields, `DefaultPlugins`/`MinimalPlugins` fields, `GltfLoader`, `space3d_assets::Primitive` | — | New configuration lives in new components/resources (`CameraFrame`, `DirectionalShadow`, `Skybox`, `EnvironmentLight`, `FrameSettings`, `LightingSettings`, `MeshExtras`). |
 

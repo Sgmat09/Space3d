@@ -7,11 +7,12 @@ has not implemented the behaviour yet. Stubs never panic.
 
 ## Semver policy (spec §2.7)
 
-Code written against Space3d 249c874 (what SpaceCorps2027 pins) keeps compiling and renders the
-same pixels by default — with up to 16 point lights. With more, each view is lit by the 16
-nearest to its camera instead of the first 16 in query order (spec D19, §2.7): a scene with more
-than 16 point lights renders differently (the farthest lights go unlit instead of the last
-queried). Migration notes must say so.
+Code written against Space3d a614a02 (what SpaceCorps2027 pins at its HEAD 25b240c; it pinned
+249c874 when the spec was written, and `api_compat_249c874.rs` keeps that name) keeps compiling
+and renders the same pixels by default — with up to 16 point lights. With more, each view is lit
+by the 16 nearest to its camera instead of the first 16 in query order (spec D19, §2.7): a scene
+with more than 16 point lights renders differently (the farthest lights go unlit instead of the
+last queried). Migration notes must say so.
 `crates/space3d/tests/api_compat_249c874.rs` compiles the game's own forms of every touched type;
 `crates/space3d/tests/prelude_policy.rs` checks the prelude additions against every type name of
 the game.

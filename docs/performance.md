@@ -384,8 +384,9 @@ selected with a dynamic offset (`SeedWindow`, post/mod.rs) — the seeds themsel
 (`tests/alloc_frame.rs`: 18 uploading frames in 1184).
 
 **Allocations of the 1080p bloom chain.** `tests/alloc_post.rs` measures bloom at 1920×1080 again
-(the 6-level chain every rect of 1080p or more gets, 11 bloom passes): 332 allocations per frame,
-pinned at +10 %, besides the 3-level chain at 320×180 (211).
+(the 6-level chain of 1080p, 11 bloom passes; 1440p and 4K add the resample pass): 332
+allocations per frame, pinned at +10 %, besides the 3-level chain at 320×180 (234 since the
+resample pass of the M1 review's round 2; 211 before).
 
 **Gates at M1 close** (Dev machine, 1080p headless):
 
@@ -401,6 +402,13 @@ In real frames bloom costs more GPU than the isolated chain the gate times: `hdr
 (the chain plus the composite's bloom reads, against a GPU shared with other work).
 
 **Particles.** Emitters moved after the tick get a render-time bridge (particles.md "Time
-model"): about 60 ns per bridged glow on one thread — 63 µs for 20 bolts at 3200 units/s moved
-a frame after the tick — and, on the GPU backend, one direct draw and a small upload per frame
-(`tests/alloc.rs`: 307 allocations per frame, was 304).
+model"), built on the CPU on both backends: about 25 ns per bridged trail glow and 45 ns per
+exhaust particle on one thread — 25–30 µs for 20 bolts at 3200 units/s moved a frame after the
+tick, 0.10–0.12 ms for a Battle fleet of 300 exhausts and 20 bolts (2260 particles; 0.15 ms
+before the M1 review's round 2 made the spawn math cheaper) — and, on the GPU backend, one
+direct draw per layer and an upload per frame (`tests/alloc.rs`: 307 allocations per frame,
+was 304). Moved in `Stage::Update`, as SpaceCorps2027 moves ships and bolts, that fleet costs
+the particles node about 0.29 ms of render-thread CPU per frame against 0.14 ms moved in
+`FixedUpdate` (1080p, HDR + bloom; 0.35–0.44 ms before), so the Battle scene's "particles
+prepare ≤ 0.1 ms" line is missed about 3× until the bridges move to the GPU (particles.md,
+"Bridges are not free").

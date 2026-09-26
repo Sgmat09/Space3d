@@ -38,6 +38,24 @@ applies the exposure and the tonemapper and writes the display target. Tonemappe
 | `KhronosPbrNeutral` | faithful base colors (UI and product previews) |
 | `None` | clamp to 0..1 (with exposure 0: the legacy look through the HDR path, `PostProcess::passthrough()`) |
 
+**Choose the look explicitly.** `AgX` is the default because it is safe for any content: dim
+scenes keep their brightness and nothing clips. In an effect-heavy scene it is pastel: in a
+composed battle, faction exhaust (an alien red `(2.05, 0.63, 0.34)`) comes out as a near-white
+peach core and fire as cream. `AgXPunchy` keeps those hues (the red exhaust core `(243, 177,
+158)` instead of `(234, 197, 186)`, the shockwave orange instead of khaki) but darkens dim
+content (the battle's mean luma 46 → 29 at 720p, a dim laser story 12 → 2.6); half a stop of
+exposure restores most of it (37 with `+0.5`, 42 with `+0.75`). For SpaceCorps2027's battles
+the recommended look is
+
+```rust
+PostProcess::default()
+    .with_tonemapper(Tonemapper::AgXPunchy)
+    .with_exposure(0.5)
+```
+
+(the exposure also lowers the bloom threshold by half a stop: bloom works in exposed units);
+keep `AgX` for dim, atmospheric scenes and menus.
+
 `Tonemapper::apply` is the CPU mirror of every curve (tests, UI previews). Radiance 1.0 is
 diffuse white at exposure 0; clear colors are radiance too, so they are exposed and tonemapped
 like everything else (`Tonemapper::None` reproduces them).
@@ -354,7 +372,10 @@ four steps). Lasers become particle beams instead (particles area).
 
 ## Cost
 
-Measured on the dev machine (Apple M4 Max, 1080p, `benches/frame.rs`): the HDR path with the
-composite only adds about 10 µs of CPU and about 0.06 ms of GPU per frame over Direct mode; the
-steady state allocates nothing in the renderer and creates no textures (see
-[`docs/performance.md`](../performance.md)).
+Measured on the dev machine (Apple M4 Max, 1080p, `benches/frame.rs`, the M1 record in
+[`docs/performance.md`](../performance.md), "Gates at M1 close"): the HDR path with the
+composite only (no bloom or lens effects) adds +13 to +17 µs of render-thread CPU per frame over
+Direct mode on a quiet machine (+19 to +32 µs under heavy load; the gate is +20 µs) and +32 to
++38 µs of GPU throughput (gate +0.10 ms); the composite's extra render pass is most of the CPU.
+Bloom adds 0.10–0.17 ms of CPU and 0.14–0.17 ms of GPU per post group at 1080p (post.md,
+"Cost"). The steady state allocates nothing in the renderer and creates no textures.

@@ -100,31 +100,50 @@ the frame only if the level heights do not depend on the rect. The chain is ther
 by a **reference chain** of `mip_count` levels of heights `max_mip_height / 2^k` — what a 1080p
 rect gets with the defaults (540, 270, … 17 px). A smaller rect keeps those heights: it drops the
 `n` finest reference levels, where `2^n` is the power of two nearest to
-`max_mip_height / (rect height / 2)`, and its level 0 (resampled from the rect to
-`max_mip_height / 2^n`, within √2 of half the rect, never above the rect's own size) stands for
-them; their weights merge into it (the upsample into level 0 blends with `scatter^(n + 1)`), so
-every level keeps its reference weight. The halo's size and energy relative to the frame are
-the same at 1080p, 720p and 360p (only the tight glow of the merged levels widens), and smaller
-rects cost fewer passes:
+`max_mip_height / (rect height / 2)`, and its level 0 (`max_mip_height / 2^n` high, within √2 of
+half the rect, never above the rect's own size) stands for them; their weights merge into it
+(the upsample into level 0 blends with `scatter^(n + 1)`), so every level keeps its reference
+weight. The halo's size and energy relative to the frame are the same from 180p to 4K (only the
+tight glow of the merged levels widens), and smaller rects cost fewer passes.
 
-| rect | chain (level 0, levels) | bloom-added mean luma, `Engine/Post/Bloom` (before this rule) |
+**The prefilter always halves the rect.** Its 13 taps (bilinear taps half a destination texel
+apart) weigh every scene pixel alike only at exactly 2× reduction. Level 0 at the reference
+height is 2.67× below the rect at 720p, 1440p and 360p and 4× at 4K: there the taps left gaps,
+and a 1–2 px bright source (a star, spark, bolt head or running light) got a full halo, a double
+one or none depending on its sub-pixel position, so a moving one blinked (the light bloom added
+to a moving 1–2 px source went from none to 2.6× its mean at 720p, 1440p, 360p and 4K, within
+1 % at 1080p). So the prefilter writes exactly half the rect (rounded up) and, when level 0 has
+another size, an area resample makes level 0 from it: each level-0 pixel averages the
+half-resolution pixels under its box, fractional ones by their overlap (2 × 2 bilinear taps per
+pixel up to a 3-pixel box), so every pixel keeps its energy wherever it sits
+(`post::bloom::tests::resample_keeps_every_pixel_energy`; on the GPU,
+`bloom_halo_is_independent_of_position` in `tests/post.rs` and `tests/gl_post.rs`: a 1 px
+source's halo stays within 5 % over 12 positions at every ratio, 0.5–3 % measured). It costs
+one more render pass and a pooled texture (below); the chain's GPU time is unchanged within the
+measurement noise (it is bound by its dependent passes, see "Cost").
+
+| rect | chain (level 0, levels; prefilter target) | bloom-added mean luma, `Engine/Post/Bloom` (before the half-rect prefilter; before the reference heights) |
 |---|---|---|
-| 1920 × 1080 | 960 × 540, 6 | +7.6 (+7.6) |
-| 1280 × 720 | 480 × 270, 5 | +7.3 (+9.3) |
-| 640 × 360 | 240 × 135, 4 | +6.6 (+11.7) |
-| 320 × 180 (the goldens) | 121 × 68, 3 | +6.0 (+14.1) |
+| 3840 × 2160 | 960 × 540, 6; 1920 × 1080 | +7.8 (+7.6) |
+| 2560 × 1440 | 960 × 540, 6; 1280 × 720 | +7.8 (+7.7) |
+| 1920 × 1080 | 960 × 540, 6; level 0 | +7.6 (+7.6; +7.6) |
+| 1600 × 900 | 960 × 540, 6; 800 × 450 | +7.6 (+7.7) |
+| 1280 × 720 | 480 × 270, 5; 640 × 360 | +7.4 (+7.2; +9.3) |
+| 640 × 360 | 240 × 135, 4; 320 × 180 | +7.0 (+6.6; +11.7) |
+| 320 × 180 (the goldens) | 121 × 68, 3; 160 × 90 | +6.7 (+6.0; +14.1) |
 
 Below 1080p the added light falls slightly because small bright sources (stars) cover fewer
-scene pixels before the threshold, not because of the chain. Before, level 0 was simply half
-the rect with 6 levels at any size, so a 360p frame (a phone, `render_scale` 0.5) got 1.5× and
-the 180p goldens about 2× the desktop veil.
+scene pixels before the threshold, not because of the chain. Before the reference heights,
+level 0 was simply half the rect with 6 levels at any size, so a 360p frame (a phone,
+`render_scale` 0.5) got 1.5× and the 180p goldens about 2× the desktop veil.
 
 **Known limitation: sub-pixel shimmer.** The prefilter's soft threshold and Karis weights are
-non-linear, so the light a 2-px source of radiance 10 adds varies by about 10 % (a 4-px source
-of radiance 4 by about 6 %) as it moves by quarter pixels: no fireflies, but small bright
-sources (stars, bolts, sparks) shimmer slightly while the camera pans. Temporal smoothing of the
-prefilter (with the TAA work) is the fix; until then keep emissive sources above ~4 px or their
-radiance moderate.
+non-linear, so the light a 2-px source of radiance 10 adds varies by about 10 % at 1080p (a 4-px
+source of radiance 4 by about 5 %) as it moves by quarter pixels, and by about 16 % at 720p and
+1440p and 18 % at 4K, where the composite also magnifies level 0 by a non-integer factor (a 1 px
+source: 1–5 %). No fireflies and no blinking, but small bright sources (stars, bolts, sparks)
+shimmer slightly while the camera pans. Temporal smoothing of the prefilter (with the TAA work)
+is the fix; until then keep emissive sources above ~4 px or their radiance moderate.
 
 ### What gets bloomed
 
@@ -158,26 +177,29 @@ over the chain's writes the additive glow loses about 5 % of its energy (7 % of 
 `Rgba16Float`. `HdrMode::Ldr` (or no float targets) turns bloom off: the LDR scene texture
 holds tonemapped values.
 
-The chain is one texture from the frame's pool (per-level views created once). Post groups of
-the same size in one frame share it (split screens cost one chain), and it is freed after 3
-unused frames. `RenderStats::target_bytes` counts it once per frame.
+The chain is one texture from the frame's pool (per-level views created once), plus the
+prefilter's half-resolution target where level 0 is resampled from it. Post groups of the same
+size in one frame share them (split screens cost one chain), and they are freed after 3 unused
+frames. `RenderStats::target_bytes` counts them once per frame.
 
-| rect | levels | `Rg11b10Ufloat` | `Rgba16Float` |
+| rect | levels | `Rg11b10Ufloat` (chain + half-resolution target) | `Rgba16Float` |
 |---|---|---|---|
 | 1920 × 1080 (level 0 960 × 540) | 6 | 2.8 MB | 5.5 MB |
-| 3840 × 2160 (capped to 960 × 540) | 6 | 2.8 MB | 5.5 MB |
-| 1280 × 720 (480 × 270, the 540 level merged) | 5 | 0.7 MB | 1.4 MB |
-| 1440 × 810, `GraphicsQuality::Low` (480 × 270) | 4 | 0.7 MB | 1.4 MB |
+| 3840 × 2160 (capped to 960 × 540; half 1920 × 1080) | 6 | 2.8 + 8.3 = 11.1 MB | 22.1 MB |
+| 2560 × 1440 (960 × 540; half 1280 × 720) | 6 | 2.8 + 3.7 = 6.5 MB | 12.9 MB |
+| 1280 × 720 (480 × 270, the 540 level merged; half 640 × 360) | 5 | 0.7 + 0.9 = 1.6 MB | 3.2 MB |
+| 1440 × 810, `GraphicsQuality::Low` (480 × 270; half 720 × 405) | 4 | 0.7 + 1.2 = 1.9 MB | 3.7 MB |
 
 ### Cost
 
-Render passes per post group: `2 × levels − 1` (11 for the default 6 levels at 1080p and
-above, 9 at 720p, 5 at 180p) plus the composite. Their uniforms (one 64-byte slot per pass) are
-written when the settings or the rect change, and the per-frame seeds of grain and dither a
+Render passes per post group: `2 × levels − 1`, one more for the resample where level 0 is not
+half the rect (11 for the default 6 levels at 1080p, 12 at 1440p and 4K, 10 at 720p, 6 at 180p)
+plus the composite. Their uniforms (one 64-byte slot per pass) are written when the settings or
+the rect change, and the per-frame seeds of grain and dither a
 window of 64 frames at a time: a still scene uploads nothing except that window (16 KiB per post
 group, every 64th frame). The steady state creates no textures and reallocates nothing
 (`tests/post.rs`, `tests/alloc_post.rs`); wgpu-hal on Metal allocates about 20 times per render
-pass (211 allocations per frame with bloom at 320 × 180, 5 bloom passes, vs 106 for the
+pass (234 allocations per frame with bloom at 320 × 180, 6 bloom passes, vs 106 for the
 composite alone).
 
 GPU time on the dev machine (Apple M4 Max, Metal; `bloom_gate_1080p` below): the GPU kept busy
@@ -298,13 +320,14 @@ time — each frame's seed is still a pure function of that frame.
   `bloom_is_in_exposed_units`, `energy_conserving_preserves_mean`,
   `bloom_does_not_bleed_across_viewports`, `hdr_scene_overlays_feed_bloom`,
   `bloom_off_in_ldr_fallback`, `transparent_rt_bloom_weighted_by_alpha`, `bloom_steady_state`,
-  `bloom_downlevel_parity`; FXAA and lens effects — `fxaa_softens_edges`, `film_grain_is_seeded`,
-  `grain_after_fxaa`, `after_tonemap_overlays_untouched_by_grain_ca_vignette`,
-  `vignette_darkens_corners`, `chromatic_aberration_splits_toward_corners`,
-  `lens_effects_do_not_bleed_across_viewports`, `fxaa_ldr_fallback_and_steady_state`,
-  `transparent_rt_lens_effects_keep_alpha`; `gl_bloom_matches_default_backend`.
+  `bloom_downlevel_parity`, `bloom_halo_is_independent_of_position`; FXAA and lens effects —
+  `fxaa_softens_edges`, `film_grain_is_seeded`, `grain_after_fxaa`,
+  `after_tonemap_overlays_untouched_by_grain_ca_vignette`, `vignette_darkens_corners`,
+  `chromatic_aberration_splits_toward_corners`, `lens_effects_do_not_bleed_across_viewports`,
+  `fxaa_ldr_fallback_and_steady_state`, `transparent_rt_lens_effects_keep_alpha`;
+  `gl_bloom_matches_default_backend`.
 * `tests/alloc_post.rs`: allocations per frame with bloom on one and on two post groups, and with
-  `PostProcess::cinematic()` (240 on Metal at 320 × 180: the FXAA pass on top of bloom's 211).
+  `PostProcess::cinematic()` (261 on Metal at 320 × 180: the FXAA pass on top of bloom's 234).
 * Unit tests in `src/post/`: chain sizing, the soft threshold's CPU mirror, pass uniforms, WGSL
   layouts, FXAA presets and their WGSL for every quality, the pre-hashed seeds, and the GPU-time
   gate (`bloom_gate_1080p`, run alone with `--ignored`).
