@@ -529,7 +529,7 @@ impl Renderer {
             .chain(request.layouts.iter().copied())
             .map(|l| pipelines.layout_id(l))
             .collect();
-        let forward = |pipelines: &mut Pipelines, format, samples, output| {
+        let forward = |f: &FrameState, pipelines: &mut Pipelines, format, samples, output| {
             for m in &request.materials {
                 let shader = match m.shader {
                     Some(h) => match pipelines.custom_version(h) {
@@ -540,20 +540,8 @@ impl Renderer {
                     None => None,
                 };
                 for &layout in &layouts {
-                    pipelines.forward(
-                        device,
-                        crate::pipeline::PipelineKey {
-                            layout,
-                            class: extract::material_class(m),
-                            format,
-                            samples,
-                            output,
-                            kinds: 0,
-                            shader,
-                            pass: crate::pipeline::PassKind::Forward,
-                            globals: 0,
-                        },
-                    );
+                    // The materials area's key (class, texture kinds, globals) and caster.
+                    f.prewarm_material(device, pipelines, m, shader, layout, (format, samples, output));
                 }
             }
         };
@@ -562,7 +550,7 @@ impl Renderer {
         } else {
             crate::output::OutputEncoding::Linear
         };
-        forward(pipelines, primary.format, primary.samples, primary_output);
+        forward(f, pipelines, primary.format, primary.samples, primary_output);
         for v in 0..f.views.len() {
             let is_primary = matches!(f.views[v].target, ViewTarget::Primary);
             let extra = request
@@ -572,7 +560,7 @@ impl Renderer {
                 .map(|&format| Some(format));
             for format in std::iter::once(None).chain(extra) {
                 let t = f.view_targets(v, frame_graphics, format);
-                forward(pipelines, t.scene.color, t.scene.samples, t.scene.output);
+                forward(f, pipelines, t.scene.color, t.scene.samples, t.scene.output);
                 for i in 0..nodes.len() {
                     let c = &nodes.nodes[i];
                     f.slot_targets.clear();
