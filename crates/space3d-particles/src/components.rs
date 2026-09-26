@@ -31,16 +31,21 @@ pub struct ParticleEmitter {
     pub on_remove: OnRemove,
     /// Bump to restart from t = 0 (old particles drain).
     pub restart: u32,
-    /// Seconds (0: off, the default): paces the time-rate (`Spawn::rate`) emission of
-    /// world-space layers by the distance the emitter moves each tick, against its speed
-    /// low-passed over about this time. Particles emitted in a tick are spread along that
-    /// tick's motion, so an emitter moving in **steps** (a ship easing toward 20 Hz server
-    /// updates: a long tick, then short or still ones) lays a trail that is sparse where it
-    /// jumped and beaded where it paused; paced, each tick emits in proportion to how far it
-    /// moved and the trail keeps an even density. The average rate is unchanged. `0.1`–`0.2`
-    /// covers 20 Hz steps; an emitter that stops dead thins its time-rate emission for about
-    /// twice this time. `rate_per_distance` is spatial already and unaffected.
-    pub velocity_smoothing: f32,
+    /// Velocity smoothing in seconds (`None`, the default: the effect's
+    /// [`crate::ParticleEffect::velocity_smoothing`], 0.1 for the built-in engine plumes and 0
+    /// (off) for everything else; `Some(0.0)`: off). An emitter moving in **steps** (a ship
+    /// easing toward 20 Hz server updates: a long tick, then short or still ones) lays each
+    /// tick's particles along that tick's motion, so its time rate is sparse where it jumped
+    /// and beaded where it paused, and the particles of a fast tick inherit more velocity
+    /// (`inherit_velocity`) than those of a slow one and bunch up as they drift. With
+    /// smoothing, world-space layers emit their time rate (`Spawn::rate`) in proportion to each
+    /// tick's distance against the speed low-passed over about this time, and particles
+    /// inherit the low-passed velocity: the trail keeps an even density and its length does
+    /// not depend on the step pattern. The average rate is unchanged. `0.1`–`0.2` covers 20 Hz
+    /// steps; an emitter that stops dead thins its time-rate emission for about twice this time
+    /// and its particles inherit a velocity that fades over it. A jump of more than 8× the
+    /// smoothed speed (a teleport, a start from rest) restarts the smoothing.
+    pub velocity_smoothing: Option<f32>,
 }
 
 impl ParticleEmitter {
@@ -58,7 +63,7 @@ impl ParticleEmitter {
             finish: FinishAction::Keep,
             on_remove: OnRemove::Drain,
             restart: 0,
-            velocity_smoothing: 0.0,
+            velocity_smoothing: None,
         }
     }
     /// A one-shot: despawned once it has fully played.
@@ -93,9 +98,9 @@ impl ParticleEmitter {
         self.prewarm = secs;
         self
     }
-    /// Set [`Self::velocity_smoothing`].
+    /// Set [`Self::velocity_smoothing`] (`0.0`: off, whatever the effect's default).
     pub fn with_velocity_smoothing(mut self, secs: f32) -> Self {
-        self.velocity_smoothing = secs;
+        self.velocity_smoothing = Some(secs);
         self
     }
     /// Stop emitting (`playing = false`).

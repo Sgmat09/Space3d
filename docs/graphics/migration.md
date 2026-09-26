@@ -389,11 +389,16 @@ its authoring):
 * **Moving ships in `Stage::Update`** (`fx::animate`, the exhaust emitters): emission no longer
   beads at 30 and 45 fps — each fixed tick extrapolates the steady motion measured over the
   previous frame to its own time (game#2; particles.md, "Moving emitters").
-* **Ships easing toward 20 Hz server updates**: set `ParticleEmitter::velocity_smoothing` (0.1–
-  0.2 s) on exhaust emitters: the time rate then follows each tick's distance against the
-  smoothed speed, and the plume keeps an even density (game#8). The game's own exhaust recipe —
-  mostly per distance flown, cores wider than their spacing, a small time rate — is what the
-  built-in `ENGINE_EXHAUST` does now too, and what particles.md recommends (game#12).
+* **Ships easing toward 20 Hz server updates**: the built-in `ENGINE_EXHAUST` and
+  `ENGINE_AFTERBURNER` now smooth their emitters' velocity over 0.1 s by default
+  (`ParticleEffect::velocity_smoothing`): the time rate follows each tick's distance against the
+  smoothed speed and particles inherit the smoothed velocity, so the plume keeps an even density
+  and its length does not depend on the step pattern (game#8; particles.md, "Uneven motion").
+  For the game's own exhaust effects, add `velocity_smoothing: 0.1` to the `.pfx.ron` (or
+  `ParticleEmitter::with_velocity_smoothing(0.1)` on the emitters). Its `EXHAUST_FOLLOW` easing
+  of the emitter poses can stay. The game's exhaust recipe (mostly per distance flown, cores
+  wider than their spacing, a small time rate) is what the built-in `ENGINE_EXHAUST` does now
+  too, and what particles.md recommends (game#12).
 * **Fast emitters**: `rate_per_distance` rings are sized for `Spawn::max_speed` (100 units/s by
   default); looping effects now grow them with the emitter's speed, so the exhaust's
   `capacity: Some(192)` override can go; one-shots on fast bolts set `max_speed` (game#10).
@@ -491,7 +496,7 @@ signatures, every node's pipelines (particles, sky) and the post pipelines.
 | 3 | ship materials get their maps (`apply_material_maps`, emissive factor seeded where there is a map) and tangents; the maps are no longer discarded |
 | 4 | the sky is a `Skybox` cubemap and an `EnvironmentLight`; `ShadingModel::Standard` |
 | 5 | the key light has a `DirectionalShadow` (`ShadowFit::top_down`); grid and walls opt out |
-| 6 | done at M1 (particles, the overlay in `HdrScene`); M2: `follow_world` for hits on moving ships, `velocity_smoothing` on exhausts |
+| 6 | done at M1 (particles, the overlay in `HdrScene`); M2: `follow_world` for hits on moving ships, `velocity_smoothing: 0.1` in the game's exhaust effects |
 | 8 | previews use MSAA render targets and post; bloom only above ~240 px (`Bloom::min_rect_height`) |
 | 9 | map loads prewarm |
 | 11 | goldens re-blessed; GL variants where needed |

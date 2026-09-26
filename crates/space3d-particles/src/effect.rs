@@ -41,6 +41,11 @@ pub struct ParticleEffect {
     pub light: Option<LightFlash>,
     /// Who gets refused first when the particle budget runs out.
     pub priority: EffectPriority,
+    /// Default velocity smoothing (seconds, 0: off) of the emitters playing this effect whose
+    /// `ParticleEmitter::velocity_smoothing` is `None`: plumes and trails of emitters that may
+    /// move in steps (ships easing toward server updates) set about 0.1. See
+    /// [`crate::ParticleEmitter::velocity_smoothing`].
+    pub velocity_smoothing: f32,
 }
 
 impl Default for ParticleEffect {
@@ -54,6 +59,7 @@ impl Default for ParticleEffect {
             beams: Vec::new(),
             light: None,
             priority: EffectPriority::Normal,
+            velocity_smoothing: 0.0,
         }
     }
 }

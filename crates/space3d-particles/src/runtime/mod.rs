@@ -149,15 +149,22 @@ pub(crate) struct Instance {
     /// agrees: steady motion, not a teleport, a start or a stop).
     pub measured_vel: Vec3,
     pub measured_spin: Vec3,
+    /// Measured velocity of the last tick (+ `ParticleEmitter::velocity`).
     pub velocity: Vec3,
+    /// The velocity particles inherit (`inherit_velocity`): [`Self::velocity`], or its
+    /// low-passed value with velocity smoothing.
+    pub inherit: Vec3,
     /// World distance the emitter moved in the last tick (the render-time bridge's share of a
     /// tick's time-rate emission).
     pub distance: f32,
     /// Quality × LOD rate multiplier of the last tick.
     pub quality: f32,
-    /// Distance moved per tick, low-passed over `ParticleEmitter::velocity_smoothing` (−1
-    /// before the first motion): what the time rate is paced against.
+    /// Distance moved per tick, low-passed over the velocity smoothing time (−1 before the
+    /// first motion): what the time rate is paced against.
     pub smoothed: f32,
+    /// Velocity (without `ParticleEmitter::velocity`) low-passed like [`Self::smoothed`]: what
+    /// particles inherit with velocity smoothing.
+    pub smoothed_vel: Vec3,
     /// × the time rate this tick (pacing; 1 without).
     pub pace: f32,
     /// Speed (units/s) the `rate_per_distance` rings are sized for (0: the layers'
@@ -408,29 +415,47 @@ pub(crate) fn ring_level(q: f32, t: f32) -> f32 {
 /// [`pace`]'s ratio, so a still emitter emits at its plain time rate.
 const PACE_STILL_SPEED: f32 = 8.0;
 
-/// The time-rate multiplier of an instance that moved `distance` this tick of `dt` seconds with
-/// `ParticleEmitter::velocity_smoothing` `tau` (updating its low-passed distance): `(d + k) /
-/// (d̄ + k)`, the distance against the smoothed one, softened by `k` = [`PACE_STILL_SPEED`] ×
-/// `dt`, within 0..4. 1 without pacing or before the emitter first moved (the smoothing starts
-/// from its first motion).
-fn pace(inst: &mut Instance, tau: f32, distance: f32, dt: f32) -> f32 {
+/// A tick moving this many times farther than the smoothed distance (+ the still softening)
+/// is a jump (a teleport, a respawn, a start from rest), not uneven motion: the smoothing
+/// restarts from the next motion instead of spreading the jump over the following ticks.
+const PACE_JUMP_RATIO: f32 = 8.0;
+
+/// Velocity smoothing of an instance that moved `distance` (at `velocity`, the measured part
+/// without `ParticleEmitter::velocity`) this tick of `dt` seconds with smoothing time `tau`
+/// (`ParticleEmitter::velocity_smoothing`, or the effect's): updates the low-passed distance
+/// and velocity and returns the time-rate multiplier and the velocity particles inherit.
+///
+/// The multiplier is `(d + k) / (d̄ + k)`, the distance against the smoothed one, softened by
+/// `k` = [`PACE_STILL_SPEED`] × `dt`, within 0..4; the inherited velocity is the low-passed
+/// one. Without smoothing, before the emitter first moved and on a jump (the smoothing starts
+/// from its first motion): 1 and the measured velocity (a jump inherits the smoothed velocity
+/// before it, not the jump).
+fn smooth_motion(inst: &mut Instance, tau: f32, distance: f32, velocity: Vec3, dt: f32) -> (f32, Vec3) {
     if tau.is_nan() || tau <= 0.0 || dt <= 0.0 || !distance.is_finite() || inst.orphaned {
         inst.smoothed = -1.0;
-        return 1.0;
+        return (1.0, velocity);
+    }
+    let k = PACE_STILL_SPEED * dt;
+    if inst.smoothed >= 0.0 && distance > PACE_JUMP_RATIO * (inst.smoothed + k) {
+        let before = inst.smoothed_vel;
+        inst.smoothed = -1.0;
+        return (1.0, before);
     }
     if inst.smoothed < 0.0 {
         if distance > 0.0 {
             inst.smoothed = distance;
+            inst.smoothed_vel = velocity;
         }
-        return 1.0;
+        return (1.0, velocity);
     }
     let a = 1.0 - (-dt / tau).exp();
     let before = inst.smoothed;
     inst.smoothed += a * (distance - inst.smoothed);
+    inst.smoothed_vel += a * (velocity - inst.smoothed_vel);
     // Against the mean of the smoothed distance before and after this tick: the ratio then
     // averages to 1 over steady periodic motion (either end alone biases it by about ±10 %).
-    let k = PACE_STILL_SPEED * dt;
-    ((distance + k) / (0.5 * (before + inst.smoothed) + k)).clamp(0.0, 4.0)
+    let pace = ((distance + k) / (0.5 * (before + inst.smoothed) + k)).clamp(0.0, 4.0);
+    (pace, inst.smoothed_vel)
 }
 
 /// LOD multiplier at `distance` (1 at `near`, `min_scale` at `far`).
@@ -600,9 +625,11 @@ impl Runtime {
             measured_vel: Vec3::ZERO,
             measured_spin: Vec3::ZERO,
             velocity: em.velocity,
+            inherit: em.velocity,
             distance: 0.0,
             quality: 1.0,
             smoothed: -1.0,
+            smoothed_vel: Vec3::ZERO,
             pace: 1.0,
             ring_speed,
             fast_ticks: 0,
@@ -1107,6 +1134,7 @@ impl Runtime {
             }
             if !inst.attached || inst.orphaned || !inst.playing || inst.finished {
                 inst.velocity = Vec3::ZERO;
+                inst.inherit = Vec3::ZERO;
             }
             if inst.finished {
                 continue;
@@ -1118,7 +1146,7 @@ impl Runtime {
                 prev_rot: inst.prev_rot,
                 pos: inst.pos,
                 rot: inst.rot,
-                velocity: inst.velocity,
+                velocity: inst.inherit,
                 scale: inst.scale,
                 throttle: inst.rate_scale,
             });
@@ -1131,7 +1159,8 @@ impl Runtime {
                 .map(|&e| window_ticks(self.entries[e as usize].sim.window, dt))
                 .max()
                 .unwrap_or(0);
-            self.paths[i as usize].record(t, window.min(1 << 20), inst.prev_pos, inst.pos, inst.velocity.length());
+            let speed = inst.velocity.length().max(inst.inherit.length());
+            self.paths[i as usize].record(t, window.min(1 << 20), inst.prev_pos, inst.pos, speed);
             let emitting = self.instances[i as usize].emitting();
             let ribbons_done = inst.tracks().iter().all(|&k| {
                 let tr = &self.tracks[k as usize];
@@ -1409,20 +1438,26 @@ impl Runtime {
         inst.orphaned |= n.broken;
         inst.prev_pos = inst.pos;
         inst.prev_rot = inst.rot;
-        let distance = if inst.orphaned {
-            inst.velocity = Vec3::ZERO;
-            0.0
+        let (distance, measured) = if inst.orphaned {
+            (0.0, Vec3::ZERO)
         } else {
             inst.pos = n.pos;
             inst.rot = n.rot;
             let moved = n.pos - inst.prev_pos;
-            inst.velocity = if dt > 0.0 { moved / dt } else { Vec3::ZERO } + em.velocity;
-            moved.length()
+            (moved.length(), if dt > 0.0 { moved / dt } else { Vec3::ZERO })
         };
+        let effect = effects.get(em.effect);
+        let tau = em
+            .velocity_smoothing
+            .unwrap_or_else(|| effect.map_or(0.0, |e| e.velocity_smoothing));
+        let (pace, inherit) = smooth_motion(inst, tau, distance, measured, dt);
+        let extra = if inst.orphaned { Vec3::ZERO } else { em.velocity };
+        inst.velocity = measured + extra;
+        inst.inherit = inherit + extra;
         inst.distance = distance;
         inst.quality = n.quality;
-        inst.pace = pace(inst, em.velocity_smoothing, distance, dt);
-        let Some(effect) = effects.get(em.effect) else {
+        inst.pace = pace;
+        let Some(effect) = effect else {
             return;
         };
         // A looping instance whose budget refused a layer retries it now and then (spread over
@@ -1502,6 +1537,7 @@ impl Runtime {
             let inst = &mut self.instances[i as usize];
             inst.finished = true;
             inst.velocity = Vec3::ZERO;
+            inst.inherit = Vec3::ZERO;
         } else {
             self.free_instance(i);
         }
@@ -1602,7 +1638,7 @@ impl Runtime {
                 prev_rot: inst.rot,
                 pos,
                 rot,
-                velocity: inst.velocity,
+                velocity: inst.inherit,
                 scale: inst.scale,
                 throttle: inst.rate_scale,
             },

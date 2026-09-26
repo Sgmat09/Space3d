@@ -1753,3 +1753,127 @@ fn emitter_churn_counts_no_reallocations() {
     }
     assert_eq!(h.rt.reallocations, 0);
 }
+
+/// The built-in engine plume `fx` on a ship flying +X at 150 units/s for two seconds, `mode`
+/// 0 steady, 1 in 20 Hz steps (7.5 units every third tick), 2 easing toward 20 Hz server
+/// positions (half the gap per tick, as the game does), with `smoothing` (`None`: the
+/// effect's default). Particles alive per 2.5-unit bin from 5 to 50 units behind the ship
+/// summed over 8 seeds, and the plume length (95th percentile of the world-space particles'
+/// distance behind it).
+fn plume_bins(fx: EffectHandle, smoothing: Option<f32>, mode: u8) -> (Vec<u32>, f32) {
+    let mut bins = vec![0u32; 18];
+    let mut behind = Vec::new();
+    for seed in 0..8 {
+        let mut h = Harness::new();
+        let fx = h.add(crate::registry::builtin::effect(fx).unwrap());
+        let mut em = ParticleEmitter::new(fx).with_seed(seed);
+        em.velocity_smoothing = smoothing;
+        // The flame (the emitter's +Z) points to −X.
+        let rot = Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+        let e = h.world.spawn((Transform::IDENTITY.with_rotation(rot), em));
+        let (mut eased, mut x) = (0.0f32, 0.0);
+        for tick in 1..=120u32 {
+            x = match mode {
+                0 => tick as f32 * 2.5,
+                1 => (tick / 3 * 3) as f32 * 2.5,
+                _ => {
+                    eased += ((tick / 3 * 3 + 3) as f32 * 2.5 - eased) * 0.5;
+                    eased
+                }
+            };
+            h.world.get::<&mut Transform>(e).unwrap().translation.x = x;
+            h.step();
+        }
+        for (_, p) in h.alive() {
+            let d = x - p.pos().x;
+            // (Local-space layers keep emitter-relative positions: far out of this range.)
+            if (-10.0..200.0).contains(&d) {
+                behind.push(d);
+            }
+            let k = ((d - 5.0) / 2.5).floor();
+            if (0.0..18.0).contains(&k) {
+                bins[k as usize] += 1;
+            }
+        }
+    }
+    behind.sort_by(f32::total_cmp);
+    (bins, behind[behind.len() * 95 / 100])
+}
+
+fn cv(v: &[u32]) -> f32 {
+    sd(v) / (v.iter().sum::<u32>() as f32 / v.len() as f32).max(1e-3)
+}
+
+/// game#8 with the real plumes: a ship easing toward 20 Hz server positions swings between
+/// about 65 and 260 units/s within every step. Pacing only the time rate (round 0) left
+/// ENGINE_EXHAUST beaded (cv 0.54 with 0.15 s, 0.61 without): the particles of a fast tick
+/// inherited 4× the velocity of a slow tick's and bunched up as they drifted. Velocity
+/// smoothing now low-passes the inherited velocity too, and the engine plumes default to 0.1 s:
+/// the eased plume is as even as a steady one (cv within 1.5×) and as long, and the stepped
+/// one too; with smoothing off the repro still beads.
+#[test]
+fn engine_plumes_stay_even_when_easing_toward_20hz_updates() {
+    use crate::registry::builtin;
+    for fx in [builtin::ENGINE_EXHAUST, builtin::ENGINE_AFTERBURNER] {
+        let name = &builtin::effect(fx).unwrap().name;
+        let (steady, steady_len) = plume_bins(fx, None, 0);
+        let (off, _) = plume_bins(fx, Some(0.0), 2);
+        let (eased, eased_len) = plume_bins(fx, None, 2);
+        let (stepped, stepped_len) = plume_bins(fx, None, 1);
+        eprintln!(
+            "{name}: steady {steady:?} cv {:.3} length {steady_len:.1}\n  eased, off {off:?} cv {:.3}\n  \
+             eased {eased:?} cv {:.3} length {eased_len:.1}\n  stepped {stepped:?} cv {:.3} length {stepped_len:.1}",
+            cv(&steady),
+            cv(&off),
+            cv(&eased),
+            cv(&stepped),
+        );
+        assert!(
+            cv(&off) > 2.5 * cv(&steady),
+            "{name}: the repro beads without smoothing"
+        );
+        assert!(
+            cv(&eased) < 1.5 * cv(&steady),
+            "{name}: eased {eased:?} vs steady {steady:?}"
+        );
+        assert!(
+            cv(&stepped) < 1.7 * cv(&steady),
+            "{name}: stepped {stepped:?} vs steady {steady:?}"
+        );
+        for len in [eased_len, stepped_len] {
+            assert!(
+                (len / steady_len - 1.0).abs() < 0.08,
+                "{name}: length {len} vs {steady_len}"
+            );
+        }
+    }
+}
+
+/// A jump of more than 8× the smoothed speed (a teleport) restarts the velocity smoothing
+/// instead of feeding it: the particles after it inherit the flight velocity, not the jump,
+/// and the time rate carries on (it is not paced against the jump).
+#[test]
+fn velocity_smoothing_restarts_on_a_teleport() {
+    let mut h = Harness::new();
+    let mut layer = ParticleLayer::continuous(60.0, 1.0).speed(0.0);
+    layer.inherit_velocity = 1.0;
+    layer.lod = false;
+    let fx = h.add(ParticleEffect {
+        looping: true,
+        velocity_smoothing: 0.1,
+        ..ParticleEffect::new("teleport").layer(layer)
+    });
+    let e = h.world.spawn((Transform::IDENTITY, ParticleEmitter::new(fx)));
+    let mut x = 0.0;
+    for t in 1..=60u32 {
+        x += if t == 30 { 1000.0 } else { 1.0 };
+        h.world.get::<&mut Transform>(e).unwrap().translation.x = x;
+        h.step();
+    }
+    let alive = h.alive();
+    let fastest = alive.iter().map(|(_, p)| p.vel().length()).fold(0.0, f32::max);
+    let after = alive.iter().filter(|(_, p)| p.pos().x > 1000.0).count();
+    eprintln!("fastest {fastest:.1} units/s, {after} particles after the jump");
+    assert!(fastest < 61.0, "a particle inherited the jump: {fastest}");
+    assert!((29..=32).contains(&after), "time rate after the jump: {after}");
+}

@@ -90,7 +90,7 @@ chain every tick (exact, not last frame's `GlobalTransform`):
 | `finish` | `Keep`, `Despawn` or `RemoveEmitter` once a non-looping effect has fully played |
 | `on_remove` | `Drain` (particles play out) or `Clear` when the component or entity goes away |
 | `restart` | bump it (`restart()`) to start over; the old particles drain |
-| `velocity_smoothing` | seconds (0: off): paces the time rate of world-space layers by the distance each tick moved against the speed low-passed over this time, so an emitter moving in steps keeps an even trail ("Uneven motion" below) |
+| `velocity_smoothing` | `None` (default): the effect's `ParticleEffect::velocity_smoothing` (0.1 s for `ENGINE_EXHAUST` and `ENGINE_AFTERBURNER`, else off); `Some(secs)`, `with_velocity_smoothing(secs)`: this time, `Some(0.0)` off. Paces the time rate of world-space layers by the distance each tick moved against the speed low-passed over this time, and particles inherit the low-passed velocity, so an emitter moving in steps keeps an even trail ("Uneven motion" below) |
 
 **Moving emitters.** The tick reads each emitter's pose through its `Parent` chain of
 `Transform`s. Move emitters in `Stage::FixedUpdate` (or `PreUpdate`) and every tick emits from
@@ -107,14 +107,26 @@ agree within a quarter): a teleport, a start or a stop is laid as it happened. P
 `App::update` calls (tests stepping ticks) are read as the next ticks' poses, not extrapolated.
 
 **Uneven motion.** Particles emitted in a tick are spread along that tick's motion, so the
-*time* rate's density follows the speed: an emitter easing toward 20 Hz server updates (a long
-tick, then short or still ones) lays sparse stretches and beads where it paused (ENGINE_EXHAUST's
-old 180/s + 0.4/unit plume in 7.5-unit steps: 8, 2, 2 particles per 2.5 units). Two remedies:
-lay the trail mostly per unit of distance (`rate_per_distance`, below, which is spatial by
-construction), or set `ParticleEmitter::velocity_smoothing` (0.1–0.2 s covers 20 Hz steps): each
-tick then emits its time rate in proportion to its distance against the smoothed speed — 4, 4, 4
-for the same steps, the same count (`velocity_smoothing_evens_out_stepped_motion`). An emitter
-that stops dead thins its time-rate emission for about twice the smoothing time.
+*time* rate's density follows each tick's speed, and particles inherit the tick's measured
+velocity (`inherit_velocity`). An emitter moving in uneven ticks — a ship easing toward 20 Hz
+server updates closes half the gap per tick, 260, 130 and 65 units/s within every step of 7.5
+units — therefore beads twice over: the time rate lays sparse stretches where a tick was fast and
+dense ones where it was slow, and the particles of a fast tick inherit four times the velocity of
+a slow tick's and bunch up as they drift. Emitting per distance (`rate_per_distance`) evens out
+the placement at emission but not the drift: `ENGINE_EXHAUST` without smoothing lays beads 7.5
+units apart (particles per 2.5 units behind the ship, 8 seeds: coefficient of variation 0.42
+against 0.12 for steady flight). `ParticleEmitter::velocity_smoothing` handles both: each tick
+emits its time rate in proportion to its distance against the speed low-passed over the
+smoothing time, and particles inherit the low-passed velocity. The engine plumes default to
+0.1 s (`ParticleEffect::velocity_smoothing`), which covers 20 Hz steps: the eased plume is as even
+(0.17; 0.12 with 0.15 s) and as long (61 units against 61) as a steady one, and so is a plume
+moving in hard 7.5-unit steps (`runtime::tests::engine_plumes_stay_even_when_easing_toward_20hz_updates`;
+at the reference view the along-plume luma ripple is 0.030 eased against 0.030 steady and 0.141
+without smoothing). Give your own plumes and trails the same (`velocity_smoothing: 0.1` in the
+effect, or per emitter). An emitter that stops dead thins its time-rate emission for about
+twice the smoothing time, and its particles keep inheriting a fading velocity for about the
+smoothing time; a jump of more than 8× the smoothed speed (a teleport, a start from rest)
+restarts the smoothing instead of feeding it (`velocity_smoothing_restarts_on_a_teleport`).
 
 An emitter whose parent disappears is *orphaned*: it stops where it was, drains, then finishes
 (a destroyed ship's exhaust lingers and fades). `ParticleEffectFinished { entity, effect }` is
@@ -569,7 +581,8 @@ when run by tools):
   must reach a fast emitter emits per distance (`Spawn::rate_per_distance`).
 * **Plumes and trails: lay them per distance.** A time rate places particles by time, so their
   spacing along the path is the emitter's speed over the rate, and every uneven frame, tick or
-  speed step shows as beads. What reads as one continuous flame at any frame rate and speed
+  speed step shows as beads (for emitters that move in uneven ticks, add velocity smoothing:
+  "Uneven motion"). What reads as one continuous flame at any frame rate and speed
   (the game's own exhaust, game#12): emit mostly **per unit of distance flown**
   (`rate_per_distance` about 1 per unit), make the **cores wider than their spacing** (glows of
   4–8 units for a spacing of about 1), and add a **small time rate** for the plume of a ship at
