@@ -35,7 +35,7 @@ pub(crate) struct SpawnTick {
 }
 
 /// `n` scaled by `mul`, kept at ≥ 1 when `n` ≥ 1 and `mul` > 0 (bursts never vanish).
-fn scaled_count(n: u32, mul: f32) -> u32 {
+pub(crate) fn scaled_count(n: u32, mul: f32) -> u32 {
     if n == 0 || mul <= 0.0 {
         return 0;
     }

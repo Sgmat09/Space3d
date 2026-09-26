@@ -28,7 +28,7 @@ use crate::stats::EffectState;
 use crate::{ParticleLod, ParticleSettings, rng};
 use space3d_core::glam::{Mat4, Quat, Vec3, Vec4};
 use space3d_core::{Entity, GlobalTransform, Parent, Transform, World};
-use space3d_render::{Camera3d, PointLight, RenderTarget, Visibility};
+use space3d_render::{Camera3d, PointLight, Projection, RenderTarget, Visibility};
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 
@@ -59,8 +59,11 @@ pub(crate) struct Entry {
     /// Continuous emission accumulator (32.32 fixed point; time and distance rates together).
     pub acc: u64,
     pub seed: u32,
-    /// Budget shrink (`capacity / full_capacity`) applied to spawn counts.
+    /// Budget shrink (`capacity / ` the ring asked for) applied to spawn counts.
     pub rate_mul: f32,
+    /// `ParticleSettings::quality` the ring was sized for (`lod` layers; 1 for the others): the
+    /// quality × LOD multiplier never exceeds it, so the ring always holds its particles.
+    pub quality_cap: f32,
     pub sim: LayerSim,
 }
 
@@ -91,6 +94,7 @@ impl Entry {
             acc: 1 << 31,
             seed,
             rate_mul,
+            quality_cap: 1.0,
             sim,
         }
     }
@@ -138,6 +142,13 @@ pub(crate) struct Instance {
     pub distance: f32,
     /// Quality × LOD rate multiplier of the last tick.
     pub quality: f32,
+    /// The quality × LOD level its `lod` layers' rings are sized for ([`ring_level`]).
+    pub ring: f32,
+    /// A layer was refused (budget): a looping instance retries it every
+    /// [`RETRY_TICKS`] ticks.
+    pub missing: bool,
+    /// The effect has enabled `lod` layers (sized by `ring`).
+    pub lod_layers: bool,
     pub tint: Vec4,
     pub scale: f32,
     pub rate_scale: f32,
@@ -240,6 +251,11 @@ pub(crate) struct Runtime {
     pub reallocations: u32,
     warned_refused: Vec<EffectHandle>,
     warned_unknown: Vec<EffectHandle>,
+    /// Width / height of the primary target (the renderer's size; 0: unknown, 16:9 is
+    /// assumed), for the off-screen LOD.
+    pub aspect: f32,
+    /// Emitters new this tick (scratch: started after the others, the most visible first).
+    new_emitters: Vec<NewEmitter>,
 }
 
 /// World position and rotation of an entity with `t` and `parent`, through the `Parent` chain
@@ -270,6 +286,83 @@ fn priority_limit(p: EffectPriority) -> f32 {
     }
 }
 
+/// The primary camera as the LOD sees it (from ECS transforms and the target's aspect ratio:
+/// deterministic).
+#[derive(Clone, Copy, Debug)]
+struct CameraView {
+    pos: Vec3,
+    rot: Quat,
+    perspective: bool,
+    /// Perspective: tan(fov_y / 2); orthographic: half the height.
+    extent: f32,
+    /// Width / height of the camera's view.
+    aspect: f32,
+}
+
+/// Margin of the "on screen" test: the view grown by a quarter on each side, so particles do
+/// not fly into view from a thinned emitter just off screen.
+const ONSCREEN_MARGIN: f32 = 1.25;
+
+impl CameraView {
+    /// Whether `p` may be on screen: inside the camera's view grown by [`ONSCREEN_MARGIN`].
+    fn sees(&self, p: Vec3) -> bool {
+        let v = self.rot.inverse() * (p - self.pos);
+        let depth = -v.z;
+        let half_h = if self.perspective {
+            if depth <= 0.0 {
+                return false;
+            }
+            depth * self.extent
+        } else {
+            self.extent
+        } * ONSCREEN_MARGIN;
+        v.y.abs() <= half_h && v.x.abs() <= half_h * self.aspect
+    }
+
+    /// The LOD multiplier of an emitter at `p`: distance LOD × `offscreen_scale` off screen.
+    fn lod(&self, settings: &ParticleSettings, p: Vec3) -> f32 {
+        let off = if settings.offscreen_scale < 1.0 && !self.sees(p) {
+            settings.offscreen_scale.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        lod_scale(&settings.lod, self.pos.distance(p)) * off
+    }
+}
+
+/// An emitter seen by the tick: its component, pose, visibility and quality × LOD.
+#[derive(Clone, Debug)]
+struct NewEmitter {
+    entity: Entity,
+    em: ParticleEmitter,
+    pos: Vec3,
+    rot: Quat,
+    broken: bool,
+    hidden: bool,
+    quality: f32,
+}
+
+/// Ticks between a looping instance's retries of layers its budget refused.
+const RETRY_TICKS: u64 = 15;
+
+/// Levels of ring sizes below the quality ([`ring_level`]).
+const RING_LEVELS: i32 = 4;
+
+/// The ring size level (a fraction of the full rings) for the quality × LOD multiplier `t` at
+/// quality `q`: `q / 2^k`, the smallest of `q, q/2, … q/16` that holds `t`, or 0 when `t` is 0
+/// (an off-screen emitter with `offscreen_scale` 0: one slot per layer). Levels keep a looping
+/// emitter drifting across LOD distances from restarting on every tick: it restarts with
+/// bigger rings once `t` exceeds its level, with smaller ones once `t` falls to a quarter of it
+/// (`Runtime::lod_rings_outgrown`).
+pub(crate) fn ring_level(q: f32, t: f32) -> f32 {
+    let q = q.clamp(0.0, 1.0);
+    if q <= 0.0 || t <= 0.0 {
+        return 0.0;
+    }
+    let k = ((q / t).log2().floor() as i32).clamp(0, RING_LEVELS);
+    q / (1u32 << k) as f32
+}
+
 /// LOD multiplier at `distance` (1 at `near`, `min_scale` at `far`).
 fn lod_scale(lod: &ParticleLod, distance: f32) -> f32 {
     if !lod.near.is_finite() || distance <= lod.near {
@@ -294,7 +387,7 @@ impl Runtime {
             self.log.capacity(),
             self.finished.capacity(),
             self.tracks.capacity() + self.free_tracks.capacity() + self.points.capacity(),
-            self.ribbon_pool.capacity() + self.dead_lights.capacity(),
+            self.ribbon_pool.capacity() + self.dead_lights.capacity() + self.new_emitters.capacity(),
         ]
     }
 
@@ -360,6 +453,7 @@ impl Runtime {
         pos: Vec3,
         rot: Quat,
         settings: &ParticleSettings,
+        ring: f32,
     ) -> u32 {
         let seed = em.seed.unwrap_or_else(|| {
             let bits = entity.to_bits().get();
@@ -412,6 +506,9 @@ impl Runtime {
             velocity: em.velocity,
             distance: 0.0,
             quality: 1.0,
+            ring,
+            missing: false,
+            lod_layers: false,
             tint: em.tint,
             scale: em.scale,
             rate_scale: em.rate_scale,
@@ -432,20 +529,56 @@ impl Runtime {
                 self.instances.len() as u32 - 1
             }
         };
-        self.allocate_layers(i, handle, effect);
+        self.allocate_layers(i, handle, effect, false);
         self.by_entity.insert(entity, i);
         i
     }
 
-    fn allocate_layers(&mut self, i: u32, handle: EffectHandle, effect: &ParticleEffect) {
+    /// Whether looping instance `i` should restart with rings for the quality × LOD multiplier
+    /// `t`: its `lod` rings are too small for it (it came closer, or the quality rose), or four
+    /// times too big (it went far away).
+    fn lod_rings_outgrown(&self, i: u32, t: f32) -> bool {
+        let inst = &self.instances[i as usize];
+        if !inst.looping || !inst.attached || inst.finished || inst.orphaned {
+            return false;
+        }
+        let ring = inst.ring;
+        inst.lod_layers && (t > ring * 1.0001 || (t <= ring * 0.25 && ring > 0.0))
+    }
+
+    /// Reserve the rings of `effect`'s enabled layers for instance `i` — all of them, or with
+    /// `retry` those a budget refused before (kept in layer order; a failed retry is not counted
+    /// again).
+    fn allocate_layers(&mut self, i: u32, handle: EffectHandle, effect: &ParticleEffect, retry: bool) {
         let seed = self.instances[i as usize].seed;
-        let mut n = 0usize;
+        let ring = self.instances[i as usize].ring;
+        let old = self.instances[i as usize];
+        let held = if retry { old.n_entries as usize } else { 0 };
+        let mut entries = [u32::MAX; MAX_LAYERS_PER_EFFECT];
+        let (mut n, mut k) = (0usize, 0usize);
+        let mut missing = false;
         for (li, layer) in effect.layers.iter().enumerate().take(MAX_LAYERS_PER_EFFECT) {
             if !layer.enabled {
                 continue;
             }
-            let cap = capacity(layer);
+            if k < held && self.entries[old.entries[k] as usize].layer as usize == li {
+                entries[n] = old.entries[k];
+                (n, k) = (n + 1, k + 1);
+                continue;
+            }
+            // `lod` layers get rings for the instance's quality × LOD level (looping ones
+            // restart with other rings when it moves past that level: `lod_rings_outgrown`);
+            // none at level 0 (they would emit nothing: off screen with `offscreen_scale` 0).
+            if layer.lod && ring <= 0.0 {
+                continue;
+            }
+            let q = if layer.lod { ring } else { 1.0 };
+            let cap = layer::capacity_at(layer, q);
             let Some((base, c)) = self.reserve(cap, effect.priority) else {
+                missing = true;
+                if retry {
+                    continue;
+                }
                 self.refused += 1;
                 if !self.warned_refused.contains(&handle) {
                     self.warned_refused.push(handle);
@@ -470,13 +603,23 @@ impl Runtime {
                 LayerSim::new(layer),
                 c as f32 / cap as f32,
             );
-            entry.full_capacity = cap;
-            let e = self.alloc_entry(entry);
-            self.instances[i as usize].entries[n] = e;
+            entry.full_capacity = capacity(layer);
+            entry.quality_cap = q;
+            if retry {
+                // A retried layer starts its emission from this tick.
+                entry.last_spawn_tick = self.tick;
+            }
+            entries[n] = self.alloc_entry(entry);
             n += 1;
         }
-        self.instances[i as usize].n_entries = n as u8;
-        self.allocate_tracks(i, handle, effect);
+        let inst = &mut self.instances[i as usize];
+        inst.entries = entries;
+        inst.n_entries = n as u8;
+        inst.missing = missing;
+        inst.lod_layers = effect.layers.iter().any(|l| l.enabled && l.lod);
+        if !retry {
+            self.allocate_tracks(i, handle, effect);
+        }
     }
 
     /// The ribbon tracks of instance `i` (rings in the point pool, under
@@ -658,15 +801,28 @@ impl Runtime {
     }
 
     /// Position of the primary camera (LOD), lowest order first.
-    fn camera_position(world: &World) -> Option<Vec3> {
-        let mut best: Option<(i32, u64, Vec3)> = None;
+    fn camera_view(world: &World, target_aspect: f32) -> Option<CameraView> {
+        let mut best: Option<(i32, u64, CameraView)> = None;
         for (e, cam, t, parent) in world.query::<(Entity, &Camera3d, &Transform, Option<&Parent>)>().iter() {
-            if cam.target != RenderTarget::Primary {
+            if cam.target != RenderTarget::Primary || !cam.active {
                 continue;
             }
             let key = (cam.order, e.to_bits().get());
             if best.is_none_or(|b| key < (b.0, b.1)) {
-                best = Some((key.0, key.1, world_pose(world, t, parent).0));
+                let (pos, rot, _) = world_pose(world, t, parent);
+                let (perspective, extent) = match cam.projection {
+                    Projection::Perspective { fov_y, .. } => (true, (0.5 * fov_y).tan()),
+                    Projection::Orthographic { height, .. } => (false, 0.5 * height),
+                };
+                let aspect = target_aspect * cam.viewport.map_or(1.0, |v| v[2] / v[3].max(1e-6));
+                let view = CameraView {
+                    pos,
+                    rot,
+                    perspective,
+                    extent,
+                    aspect,
+                };
+                best = Some((key.0, key.1, view));
             }
         }
         best.map(|b| b.2)
@@ -700,8 +856,8 @@ impl Runtime {
                 mask: a.mask,
             });
         }
-        let camera = if settings.lod.near.is_finite() {
-            Self::camera_position(world)
+        let camera = if settings.lod.near.is_finite() || settings.offscreen_scale < 1.0 {
+            Self::camera_view(world, if self.aspect > 0.0 { self.aspect } else { 16.0 / 9.0 })
         } else {
             None
         };
@@ -718,90 +874,56 @@ impl Runtime {
             Option<&Parent>,
             Option<&Visibility>,
         )>();
+        // With a LOD, emitters new this tick start after the others, the most visible first
+        // (a full budget refuses the least visible).
+        let mut new = std::mem::take(&mut self.new_emitters);
+        new.clear();
         for (entity, em, tr, parent, vis) in query.iter() {
             let (pos, rot, broken) = world_pose(world, tr, parent);
+            // Quality × LOD (distance, off screen) of this emitter this tick.
+            let lod = camera.map_or(1.0, |c| c.lod(settings, pos));
+            let quality = settings.quality.clamp(0.0, 1.0) * lod;
             let mut found = self.by_entity.get(&entity).copied();
             if let Some(i) = found {
                 let inst = &self.instances[i as usize];
-                if inst.effect != em.effect || inst.restart != em.restart {
+                // Another effect, a restart, or (looping) `lod` rings sized for another LOD
+                // level: the old instance drains and a new one plays on.
+                if inst.effect != em.effect || inst.restart != em.restart || self.lod_rings_outgrown(i, quality) {
                     self.detach(i, OnRemove::Drain);
                     found = None;
                 }
             }
-            let i = match found {
-                Some(i) => i,
+            let emitter = NewEmitter {
+                entity,
+                em: em.clone(),
+                pos,
+                rot,
+                broken,
+                hidden: vis == Some(&Visibility::Hidden),
+                quality,
+            };
+            match found {
+                Some(i) => self.play(i, &emitter, effects, dt),
                 // An effect asset still loading: the emitter starts once it has loaded.
-                None if effects.is_pending(em.effect) => continue,
+                None if effects.is_pending(em.effect) => {}
+                None if camera.is_some() => new.push(emitter),
                 None => {
-                    let effect = match effects.get(em.effect) {
-                        Some(effect) => effect,
-                        None => {
-                            // A stale handle, one never issued, or a built-in whose data was
-                            // not registered: play nothing and finish this tick, so the event is sent and the `FinishAction` runs (a
-                            // `spawn_effect` entity despawns instead of staying forever).
-                            if !self.warned_unknown.contains(&em.effect) {
-                                self.warned_unknown.push(em.effect);
-                                tracing::warn!(
-                                    handle = em.effect.index(),
-                                    "particle emitter with an unknown effect handle: it plays nothing and finishes"
-                                );
-                            }
-                            &nothing
-                        }
-                    };
-                    let i = self.create(entity, em, em.effect, effect, pos, rot, settings);
-                    if em.prewarm > 0.0 && dt > 0.0 {
-                        self.prewarm(i, effect, em.prewarm, dt, settings);
-                    }
-                    i
+                    let i = self.start(&emitter, settings, effects, dt, &nothing);
+                    self.play(i, &emitter, effects, dt);
                 }
-            };
-            let inst = &mut self.instances[i as usize];
-            inst.seen_tick = t;
-            inst.tint = em.tint;
-            inst.scale = em.scale;
-            inst.rate_scale = em.rate_scale;
-            inst.finish = em.finish;
-            inst.on_remove = em.on_remove;
-            inst.hidden = vis == Some(&Visibility::Hidden);
-            if inst.finished
-                && em.playing
-                && !inst.playing
-                && let Some(effect) = effects.get(em.effect)
-            {
-                // Played again after it finished (stopped, then restarted by `playing`).
-                inst.finished = false;
-                inst.time = 0.0;
-                inst.created_tick = t;
-                inst.last_spawn_tick = t;
-                self.allocate_layers(i, em.effect, effect);
             }
-            let inst = &mut self.instances[i as usize];
-            inst.playing = em.playing;
-            inst.orphaned |= broken;
-            inst.prev_pos = inst.pos;
-            inst.prev_rot = inst.rot;
-            let distance = if inst.orphaned {
-                inst.velocity = Vec3::ZERO;
-                0.0
-            } else {
-                inst.pos = pos;
-                inst.rot = rot;
-                let moved = pos - inst.prev_pos;
-                inst.velocity = if dt > 0.0 { moved / dt } else { Vec3::ZERO } + em.velocity;
-                moved.length()
-            };
-            let lod = camera.map_or(1.0, |c| lod_scale(&settings.lod, c.distance(pos)));
-            let quality = settings.quality.clamp(0.0, 1.0) * lod;
-            inst.distance = distance;
-            inst.quality = quality;
-            let Some(effect) = effects.get(em.effect) else {
-                continue;
-            };
-            self.schedule(i, effect, dt, quality, distance, 0.0);
-            self.record_ribbons(i, dt);
         }
         drop(query);
+        new.sort_unstable_by(|a, b| {
+            b.quality
+                .total_cmp(&a.quality)
+                .then(a.entity.to_bits().cmp(&b.entity.to_bits()))
+        });
+        for emitter in &new {
+            let i = self.start(emitter, settings, effects, dt, &nothing);
+            self.play(i, emitter, effects, dt);
+        }
+        self.new_emitters = new;
 
         // Instances whose entity or emitter is gone; rows; finish.
         for i in 0..self.instances.len() as u32 {
@@ -994,6 +1116,95 @@ impl Runtime {
         }
     }
 
+    /// Create the instance of a new emitter (its rings for its LOD level) and prewarm it.
+    fn start(
+        &mut self,
+        n: &NewEmitter,
+        settings: &ParticleSettings,
+        effects: &ParticleEffects,
+        dt: f32,
+        nothing: &ParticleEffect,
+    ) -> u32 {
+        let em = &n.em;
+        let effect = match effects.get(em.effect) {
+            Some(effect) => effect,
+            None => {
+                // A stale handle, one never issued, or a built-in whose data was not registered:
+                // play nothing and finish this tick, so the event is sent and the `FinishAction`
+                // runs (a `spawn_effect` entity despawns instead of staying forever).
+                if !self.warned_unknown.contains(&em.effect) {
+                    self.warned_unknown.push(em.effect);
+                    tracing::warn!(
+                        handle = em.effect.index(),
+                        "particle emitter with an unknown effect handle: it plays nothing and finishes"
+                    );
+                }
+                nothing
+            }
+        };
+        let ring = ring_level(settings.quality, n.quality);
+        let i = self.create(n.entity, em, em.effect, effect, n.pos, n.rot, settings, ring);
+        if em.prewarm > 0.0 && dt > 0.0 {
+            self.prewarm(i, effect, em.prewarm, dt, settings);
+        }
+        i
+    }
+
+    /// One tick of instance `i` for its emitter `n`: follow it, restart a finished one played
+    /// again, retry refused layers, schedule the emission and record the ribbons.
+    fn play(&mut self, i: u32, n: &NewEmitter, effects: &ParticleEffects, dt: f32) {
+        let (t, em) = (self.tick, &n.em);
+        let inst = &mut self.instances[i as usize];
+        inst.seen_tick = t;
+        inst.tint = em.tint;
+        inst.scale = em.scale;
+        inst.rate_scale = em.rate_scale;
+        inst.finish = em.finish;
+        inst.on_remove = em.on_remove;
+        inst.hidden = n.hidden;
+        if inst.finished
+            && em.playing
+            && !inst.playing
+            && let Some(effect) = effects.get(em.effect)
+        {
+            // Played again after it finished (stopped, then restarted by `playing`).
+            inst.finished = false;
+            inst.time = 0.0;
+            inst.created_tick = t;
+            inst.last_spawn_tick = t;
+            self.allocate_layers(i, em.effect, effect, false);
+        }
+        let inst = &mut self.instances[i as usize];
+        inst.playing = em.playing;
+        inst.orphaned |= n.broken;
+        inst.prev_pos = inst.pos;
+        inst.prev_rot = inst.rot;
+        let distance = if inst.orphaned {
+            inst.velocity = Vec3::ZERO;
+            0.0
+        } else {
+            inst.pos = n.pos;
+            inst.rot = n.rot;
+            let moved = n.pos - inst.prev_pos;
+            inst.velocity = if dt > 0.0 { moved / dt } else { Vec3::ZERO } + em.velocity;
+            moved.length()
+        };
+        inst.distance = distance;
+        inst.quality = n.quality;
+        let Some(effect) = effects.get(em.effect) else {
+            return;
+        };
+        // A looping instance whose budget refused a layer retries it now and then (spread over
+        // the ticks by instance).
+        let inst = &self.instances[i as usize];
+        if inst.missing && inst.looping && inst.attached && !inst.finished && (t + i as u64).is_multiple_of(RETRY_TICKS)
+        {
+            self.allocate_layers(i, em.effect, effect, true);
+        }
+        self.schedule(i, effect, dt, n.quality, distance, 0.0);
+        self.record_ribbons(i, dt);
+    }
+
     /// Emission of instance `i` this tick (records into the log).
     fn schedule(&mut self, i: u32, effect: &ParticleEffect, dt: f32, quality: f32, distance: f32, extra_age: f32) {
         let inst = self.instances[i as usize];
@@ -1002,7 +1213,7 @@ impl Runtime {
         for &e in inst.entries() {
             let entry = &mut self.entries[e as usize];
             let layer = &effect.layers[entry.layer as usize];
-            let mul = if layer.lod { quality } else { 1.0 } * entry.rate_mul;
+            let mul = if layer.lod { quality.min(entry.quality_cap) } else { 1.0 } * entry.rate_mul;
             let n = spawn::spawn_tick(
                 entry,
                 layer,
@@ -1136,7 +1347,7 @@ impl Runtime {
             looping: inst.looping,
             duration: inst.duration,
             rate_scale: inst.rate_scale,
-            mul: if c.lod { inst.quality } else { 1.0 } * e.rate_mul,
+            mul: if c.lod { inst.quality.min(e.quality_cap) } else { 1.0 } * e.rate_mul,
             distance: gap,
             extra_age: 0.0,
         };
@@ -1170,7 +1381,18 @@ impl Runtime {
         };
         let tint = if e.sim.tinted { inst.tint } else { Vec4::ONE };
         let (size, bright) = e.sim.draw_throttle(inst.rate_scale);
-        ((tint.truncate() * bright).extend(tint.w), inst.scale * size)
+        // A `lod` layer thinned by quality × LOD (its ring level) draws its fewer particles
+        // bigger and brighter by (1 / level)^¼ each, so a sparse plume stays continuous and
+        // keeps most of its light (level 0.25: × 1.41; 1: unchanged).
+        let lod = if e.sim.spawn.lod && e.quality_cap < 1.0 {
+            e.quality_cap.max(1.0 / 16.0).recip().sqrt().sqrt()
+        } else {
+            1.0
+        };
+        (
+            (tint.truncate() * (bright * lod)).extend(tint.w),
+            inst.scale * size * lod,
+        )
     }
 
     /// Layer instance `e` may still have particles alive (it emitted within its life window).

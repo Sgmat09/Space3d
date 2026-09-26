@@ -175,6 +175,10 @@ pub fn tick_system(ctx: &mut SystemCtx) {
         let dt = res.get::<Time>().map_or(0.0, Time::fixed_delta_secs);
         let rt = &mut runtime.rt;
         rt.budget = Some(pool_budget(settings, res));
+        rt.aspect = res.get::<Renderer>().map_or(0.0, |r| {
+            let (w, h) = r.size();
+            w as f32 / h.max(1) as f32
+        });
         rt.tick(world, settings, effects, dt);
         let (live, layers) = rt.counts();
         let (total, reserved, spawned) = (rt.pool.total(), rt.pool.reserved(), rt.spawned);
@@ -270,6 +274,12 @@ pub struct ParticleSettings {
     pub quality: f32,
     /// Distance-based rate scaling (off by default).
     pub lod: ParticleLod,
+    /// Rate multiplier (0..=1) of `lod` layers whose emitter is off screen: outside the
+    /// primary camera's view (at the renderer's aspect ratio, grown by a quarter on each side).
+    /// Looping emitters get rings for it and restart with bigger ones when they come into view
+    /// (their old particles drain), so a battle's off-screen engines cost a fraction of the
+    /// budget. Default 1 (off).
+    pub offscreen_scale: f32,
     /// 0 freezes every effect (deterministic). Default 1.
     pub time_scale: f32,
     /// Simulation substeps per tick. Default 1.
@@ -302,6 +312,7 @@ impl Default for ParticleSettings {
             max_ribbon_segments: 65_536,
             quality: 1.0,
             lod: ParticleLod::default(),
+            offscreen_scale: 1.0,
             time_scale: 1.0,
             substeps: 1,
             max_catchup_ticks: 1200,
@@ -315,10 +326,51 @@ impl Default for ParticleSettings {
 }
 
 impl ParticleSettings {
-    /// Budgets and backend for a quality tier (graphics spec §4.4).
+    /// Budgets, backend, spawn quality and distance LOD for a quality tier (graphics spec §4.4;
+    /// calibrated with the Battle scene, `tests/battle.rs`):
+    ///
+    /// | | Low (WebGL2 / C-class) | Medium (iGPU, Apple, mobile) | High (dGPU) |
+    /// |---|---|---|---|
+    /// | backend, budget | CPU, 16 384 (8 192 on the web) | GPU, 262 144 (65 536 on Android / iOS) | GPU, 262 144 |
+    /// | `quality` (spawn counts of `lod` layers, and their rings) | 0.5 | 1 (0.75 mobile) | 1 |
+    /// | `lod` (rate × `min_scale` from `far`) | 1000 → 2500, × 0.25 | 1200 → 3000, × 0.5 | off |
+    /// | `max_ribbon_segments` | 16 384 | 65 536 | 65 536 |
+    /// | `max_screen_size` (fill rate) | 0.6 | 1 | 1 |
+    ///
+    /// The LOD distances are for a top-down camera 400–1000 units above the flight plane (the
+    /// SpaceCorps2027 battle view): emitters on screen keep their full rate, those far off screen
+    /// thin out. Other tiers use the defaults.
     pub fn for_quality(q: GraphicsQuality) -> Self {
-        let _ = q; // STUB(I): the §4.4 preset table
-        Self::default()
+        let mobile = cfg!(any(target_os = "android", target_os = "ios"));
+        let web = cfg!(target_arch = "wasm32");
+        match q {
+            GraphicsQuality::Low => Self {
+                backend: ParticleBackend::Cpu,
+                max_particles_cpu: if web { 8_192 } else { 16_384 },
+                max_ribbon_segments: 16_384,
+                quality: if web { 0.125 } else { 0.25 },
+                lod: ParticleLod {
+                    near: 1000.0,
+                    far: 2500.0,
+                    min_scale: 0.25,
+                },
+                offscreen_scale: 0.0,
+                max_screen_size: 0.6,
+                ..Self::default()
+            },
+            GraphicsQuality::Medium => Self {
+                max_particles: if mobile { 65_536 } else { 262_144 },
+                quality: if mobile { 0.75 } else { 1.0 },
+                lod: ParticleLod {
+                    near: 1200.0,
+                    far: 3000.0,
+                    min_scale: 0.5,
+                },
+                offscreen_scale: if mobile { 0.125 } else { 0.5 },
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
     }
 }
 

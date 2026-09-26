@@ -114,19 +114,25 @@ fn fs_distortion(in: S3dpDistOut) -> @location(0) vec4<f32> {
             }
         }
     }
+    // Shape × opacity over life × near fade.
+    var w = weight * in.color.a * in.a.y;
+    let o = offset * s3dp_draw.fade.w;
+    // Below half a step of the buffer's encoding: nothing to write (most of a ring's quad, a
+    // glow's rim); skip the depth reads.
+    if (max(abs(o.x), abs(o.y)) * w < DISTORTION_RANGE * (0.5 / 255.0)) {
+        return vec4<f32>(0.0);
+    }
     // The scene pixel under this fragment (the buffer may be smaller than the scene).
     let ndc = in.clip_xyw.xy / in.clip_xyw.z;
     let suv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     let px = vec2<i32>(floor(view.viewport.xy + suv * view.viewport.zw));
-    // Shape × opacity over life × near fade, faded against scene depth.
-    var w = weight * in.color.a * in.a.y;
+    // Faded against scene depth.
     let soft = s3dp_draw.stretch.w;
     if (soft > 0.0) {
         w = w * s3d_soft_fade(px, in.view_depth, soft);
     } else if (s3d_depth_valid() && s3d_view_depth_at(px) < in.view_depth) {
         w = 0.0;
     }
-    let o = offset * s3dp_draw.fade.w;
     w = w * s3d_distortion_guard(px, o, in.view_depth);
     return distortion_encode(o, max(w, 0.0));
 }

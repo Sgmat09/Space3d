@@ -754,6 +754,180 @@ fn lod_scales_with_camera_distance() {
     assert_eq!(lod_scale(&crate::ParticleLod::default(), 1e6), 1.0, "off by default");
 }
 
+/// Ring levels: `q / 2^k`, the smallest of q … q/16 holding quality × LOD, 0 for nothing.
+#[test]
+fn ring_levels_quantize_quality_times_lod() {
+    assert_eq!(ring_level(1.0, 1.0), 1.0);
+    assert_eq!(ring_level(1.0, 0.6), 1.0);
+    assert_eq!(ring_level(1.0, 0.5), 0.5);
+    assert_eq!(ring_level(1.0, 0.49), 0.5);
+    assert_eq!(ring_level(0.25, 0.25), 0.25);
+    assert_eq!(ring_level(0.25, 0.1), 0.125);
+    assert_eq!(ring_level(1.0, 0.001), 1.0 / 16.0, "at most four levels down");
+    assert_eq!(ring_level(1.0, 0.0), 0.0);
+    assert_eq!(ring_level(0.0, 1.0), 0.0);
+    // Quality scales every `lod` ring (bursts keep at least one particle).
+    let exhaust = crate::registry::builtin::effect(crate::registry::builtin::ENGINE_EXHAUST).unwrap();
+    let full: u32 = exhaust.layers.iter().map(capacity).sum();
+    let quarter: u32 = exhaust.layers.iter().map(|l| layer::capacity_at(l, 0.25)).sum();
+    assert_eq!(full, 164);
+    assert_eq!(quarter, 47);
+    let explosion = crate::registry::builtin::effect(crate::registry::builtin::EXPLOSION).unwrap();
+    for l in &explosion.layers {
+        assert!(layer::capacity_at(l, 0.01) >= 1);
+        assert_eq!(layer::capacity_at(l, 1.0), capacity(l));
+    }
+}
+
+/// A camera 400 above the origin looking down (fov 60°, 16:9), and a looping one-layer effect
+/// (60/s for 0.5 s: 33 slots at full quality).
+fn lod_scene(h: &mut Harness) -> EffectHandle {
+    use space3d_render::Camera3d;
+    h.world.spawn((
+        Transform::from_xyz(0.0, 400.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z),
+        Camera3d::default(),
+    ));
+    h.rt.aspect = 16.0 / 9.0;
+    h.add(ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("engine").layer(ParticleLayer::continuous(60.0, 0.5))
+    })
+}
+
+/// Off screen (`offscreen_scale`), a looping emitter gets rings for its LOD level — none at
+/// all at scale 0 — and restarts with full rings when it comes into view (the old instance
+/// drains), then back down (after a fall of two levels) when it leaves; a raised quality
+/// regrows it the same way. Its fewer particles draw bigger and brighter.
+#[test]
+fn offscreen_emitters_get_small_rings_and_regrow_in_view() {
+    let mut h = Harness::new();
+    let fx = lod_scene(&mut h);
+    h.settings.offscreen_scale = 0.25;
+    // 400 below the camera the view is ±231 tall and ±410 wide (×1.25 margin: ±289, ±513).
+    let e = h
+        .world
+        .spawn_effect(fx, EffectSpawn::at(Vec3::new(800.0, 0.0, 0.0)).keep());
+    h.step();
+    let reserved = |h: &Harness| h.rt.state(e).unwrap().reserved;
+    let full = capacity(&ParticleLayer::continuous(60.0, 0.5));
+    assert_eq!(
+        reserved(&h),
+        layer::capacity_at(&ParticleLayer::continuous(60.0, 0.5), 0.25)
+    );
+    let i = h.rt.by_entity[&e];
+    let entry = h.rt.entries[h.rt.instances[i as usize].entries[0] as usize];
+    let (_, size) = h.rt.draw_tint_scale(&entry);
+    assert!((size - 2f32.sqrt()).abs() < 1e-6, "thinned 4×: particles 1.41× as big");
+    for _ in 0..30 {
+        h.step();
+    }
+    // Into view: a full ring (the off-screen instance drains).
+    h.world.get::<&mut Transform>(e).unwrap().translation.x = 300.0;
+    h.step();
+    assert_eq!(reserved(&h), full);
+    assert_eq!(h.rt.counts().0, 2, "the old instance drains");
+    let (_, size) =
+        h.rt.draw_tint_scale(&h.rt.entries[h.rt.instances[h.rt.by_entity[&e] as usize].entries[0] as usize]);
+    assert_eq!(size, 1.0);
+    // Out again: a quarter is two levels down, so it shrinks back.
+    h.world.get::<&mut Transform>(e).unwrap().translation.x = -900.0;
+    h.step();
+    assert!(reserved(&h) < full);
+    // Culled entirely: no ring for its `lod` layers, and full ones once in view.
+    h.settings.offscreen_scale = 0.0;
+    let hidden = h
+        .world
+        .spawn_effect(fx, EffectSpawn::at(Vec3::new(0.0, 0.0, 700.0)).keep());
+    h.step();
+    assert_eq!(h.rt.state(hidden).unwrap().reserved, 0);
+    h.world.get::<&mut Transform>(hidden).unwrap().translation.z = 0.0;
+    h.step();
+    assert_eq!(h.rt.state(hidden).unwrap().reserved, full);
+    // Quality: a quarter, then raised back to 1 (the looping emitter regrows).
+    h.settings.quality = 0.25;
+    let q = h
+        .world
+        .spawn_effect(fx, EffectSpawn::at(Vec3::new(10.0, 0.0, 0.0)).keep());
+    h.step();
+    assert_eq!(
+        h.rt.state(q).unwrap().reserved,
+        layer::capacity_at(&ParticleLayer::continuous(60.0, 0.5), 0.25)
+    );
+    h.settings.quality = 1.0;
+    h.step();
+    assert_eq!(h.rt.state(q).unwrap().reserved, full);
+    assert_eq!(h.rt.refused, 0);
+}
+
+/// Under a LOD, the emitters new in a tick start the most visible first: when the budget holds
+/// only some, the ones in view get it.
+#[test]
+fn new_emitters_in_view_are_served_first() {
+    let mut h = Harness::new();
+    let fx = lod_scene(&mut h);
+    h.settings.offscreen_scale = 0.5;
+    let full = capacity(&ParticleLayer::continuous(60.0, 0.5));
+    // Room for 4 full rings (Normal priority stops at 90 %).
+    h.settings.max_particles_cpu = (full as f32 * 4.0 / 0.9).ceil() as u32 + 1;
+    // Off-screen emitters spawned first (entity order), then 4 in view.
+    let off: Vec<Entity> = (0..6)
+        .map(|k| {
+            h.world
+                .spawn_effect(fx, EffectSpawn::at(Vec3::new(900.0 + 10.0 * k as f32, 0.0, 0.0)).keep())
+        })
+        .collect();
+    let on: Vec<Entity> = (0..4)
+        .map(|k| {
+            h.world
+                .spawn_effect(fx, EffectSpawn::at(Vec3::new(20.0 * k as f32, 0.0, 0.0)).keep())
+        })
+        .collect();
+    h.step();
+    for e in &on {
+        assert_eq!(h.rt.state(*e).unwrap().reserved, full, "in view: a full ring");
+    }
+    assert!(off.iter().all(|e| h.rt.state(*e).unwrap().reserved < full));
+}
+
+/// A looping instance whose layer the budget refused retries it every `RETRY_TICKS` ticks and
+/// gets it once there is room (the failed retries are not counted as refusals again).
+#[test]
+fn refused_looping_layers_retry() {
+    let mut h = Harness::new();
+    let fx = h.add(ParticleEffect {
+        looping: true,
+        ..ParticleEffect::new("engine").layer(ParticleLayer::continuous(60.0, 0.5))
+    });
+    let full = capacity(&ParticleLayer::continuous(60.0, 0.5));
+    // The burst leaves too little for even an eighth of the ring under Normal's 90 %.
+    h.settings.max_particles_cpu = full + 3;
+    let hog = h.add(ParticleEffect {
+        priority: EffectPriority::Critical,
+        ..burst(full, 0.5)
+    });
+    h.world.spawn_effect(hog, EffectSpawn::at(Vec3::ZERO));
+    h.step();
+    let e = h.world.spawn_effect(fx, EffectSpawn::at(Vec3::ZERO).keep());
+    h.step();
+    assert_eq!(
+        h.rt.state(e).unwrap().reserved,
+        0,
+        "refused while the burst holds the pool"
+    );
+    let refused = h.rt.refused;
+    // The burst ends after 0.5 s; the retry comes within RETRY_TICKS after that.
+    for _ in 0..(32 + RETRY_TICKS) {
+        h.step();
+    }
+    let got = h.rt.state(e).unwrap().reserved;
+    assert!(
+        got > 0 && got < full,
+        "retried: a ring (shrunk to fit 90 % of the pool): {got}"
+    );
+    assert_eq!(h.rt.refused, refused, "failed retries are not counted");
+    assert!(!h.alive().is_empty());
+}
+
 /// The render-time bridge of an emitter that gameplay moved after the tick (`Stage::Update`)
 /// is the next tick's emission laid from the last tick's pose to the render pose: the same
 /// spawn indices, count and span of the tick, and the same positions along the same motion,
@@ -992,7 +1166,7 @@ fn bridges_of_a_battle_fleet_within_budget() {
 fn builtin_slots() {
     use crate::registry::builtin;
     let table = [
-        (builtin::EXPLOSION, 87, 0),
+        (builtin::EXPLOSION, 82, 0),
         (builtin::HIT_SPARK, 16, 0),
         (builtin::SHIELD_RIPPLE, 8, 0),
         (builtin::WARP_IN, 29, 0),

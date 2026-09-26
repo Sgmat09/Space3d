@@ -268,18 +268,27 @@ pub(crate) fn window_ticks(window: f32, dt: f32) -> u32 {
 /// window × 1.05, the bursts that can overlap within the window, the distance rate at 100 u/s,
 /// clamped to 1..=65 536; `ParticleLayer::capacity` overrides it.
 pub(crate) fn capacity(l: &ParticleLayer) -> u32 {
+    capacity_at(l, 1.0)
+}
+
+/// [`capacity`] at quality `q` (0..=1): the rates × `q` and every burst's count scaled the way
+/// the spawn scales it (`spawn::scaled_count`: at least 1). `capacity_at(l, 1.0) ==
+/// capacity(l)`; an explicit `ParticleLayer::capacity` scales too.
+pub(crate) fn capacity_at(l: &ParticleLayer, q: f32) -> u32 {
+    let q = q.clamp(0.0, 1.0);
     if let Some(c) = l.capacity {
+        let c = if q < 1.0 { (c as f32 * q).ceil() as u32 } else { c };
         return c.clamp(1, MAX_LAYER_CAPACITY);
     }
     let win = window_secs(l);
     let s = &l.spawn;
     // The rates at the largest throttle (`ThrottleResponse::rate`), never below 1×.
-    let scale = crate::effect::ThrottleResponse::factor(s.max_rate_scale.max(1.0), l.throttle.rate).max(1.0);
+    let scale = crate::effect::ThrottleResponse::factor(s.max_rate_scale.max(1.0), l.throttle.rate).max(1.0) * q;
     let mut n = 0.0f64;
-    if s.rate > 0.0 {
+    if s.rate > 0.0 && scale > 0.0 {
         n += (s.rate as f64 * scale as f64 * win as f64 * 1.05).ceil() + 1.0;
     }
-    if s.rate_per_distance > 0.0 {
+    if s.rate_per_distance > 0.0 && scale > 0.0 {
         n += (s.rate_per_distance as f64 * scale as f64 * V_REF as f64 * win as f64).ceil() + 1.0;
     }
     for b in &s.bursts {
@@ -293,7 +302,8 @@ pub(crate) fn capacity(l: &ParticleLayer) -> u32 {
         } else {
             b.cycles.max(1) as u64
         };
-        n += (b.count.max.max(b.count.min) as u64 * overlapping) as f64;
+        let count = crate::runtime::spawn::scaled_count(b.count.max.max(b.count.min), q);
+        n += (count as u64 * overlapping) as f64;
     }
     (n.min(MAX_LAYER_CAPACITY as f64) as u32).max(1)
 }
