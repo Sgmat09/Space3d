@@ -330,7 +330,7 @@ impl ParticleSettings {
     /// Budgets, backend, spawn quality and distance LOD for a quality tier (graphics spec §4.4;
     /// calibrated with the Battle scene, `tests/battle.rs`):
     ///
-    /// | | Low (WebGL2 / C-class) | Medium (iGPU, Apple, mobile) | High (dGPU) |
+    /// | | Low (WebGL2 / C-class) | Medium (iGPU, Apple, mobile) | High (dGPU) and Ultra |
     /// |---|---|---|---|
     /// | backend, budget | CPU, 16 384 (8 192 on the web) | GPU, 262 144 (65 536 on Android / iOS) | GPU, 262 144 |
     /// | `quality` (spawn counts of `lod` layers, and their rings) | 0.25 (0.125 on the web) | 1 (0.75 mobile) | 1 |
@@ -338,6 +338,11 @@ impl ParticleSettings {
     /// | `offscreen_scale` | 0 (nothing off screen) | 0.5 (0.125 mobile) | 1 |
     /// | `max_ribbon_segments` | 16 384 | 65 536 | 65 536 |
     /// | `max_screen_size` (fill rate) | 0.6 | 1 | 1 |
+    ///
+    /// Medium and up assume the GPU backend: on a device without compute (WebGL2, GLES 3.0)
+    /// they fall back to the CPU backend's budget, which their loads do not fit. Use
+    /// [`Self::for_quality_on`] with the device's capabilities (or
+    /// `GraphicsQuality::recommended`, which picks Low there).
     ///
     /// The LOD distances are for a top-down camera 400–1000 units above the flight plane (the
     /// SpaceCorps2027 battle view): emitters on screen keep their full rate, those off screen or
@@ -374,6 +379,17 @@ impl ParticleSettings {
                 ..Self::default()
             },
             _ => Self::default(),
+        }
+    }
+
+    /// [`Self::for_quality`] for a device: Low's settings where the GPU backend is unavailable
+    /// (`GraphicsCaps::compute` false: WebGL2, GLES 3.0, `DownlevelOverride::no_compute`),
+    /// whatever the tier, so the CPU backend gets a load its budget holds.
+    pub fn for_quality_on(q: GraphicsQuality, graphics: &space3d_render::GraphicsCaps) -> Self {
+        if graphics.compute {
+            Self::for_quality(q)
+        } else {
+            Self::for_quality(GraphicsQuality::Low)
         }
     }
 }

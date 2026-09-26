@@ -112,13 +112,15 @@ impl PostProcess {
     }
 
     /// Adjust only the performance-relevant fields to a tier: bloom mips and first-level height
-    /// (Low 4 / 270, Medium 6 / 540, High 7 / 720), the FXAA quality when FXAA is on, and no
-    /// chromatic aberration on Low.
+    /// (Low 4 / 270, Medium 6 / 540, High 7 / 720, Ultra 8 / 1080), the FXAA quality when FXAA
+    /// is on, and no chromatic aberration on Low. [`GraphicsQuality::post`] applies the whole
+    /// tier (anti-aliasing, auto exposure and lens effects too).
     pub fn with_quality(mut self, q: GraphicsQuality) -> Self {
         let (mips, height, fxaa) = match q {
             GraphicsQuality::Low => (4, 270, FxaaQuality::Low),
             GraphicsQuality::Medium => (6, 540, FxaaQuality::Medium),
-            _ => (7, 720, FxaaQuality::High),
+            GraphicsQuality::High => (7, 720, FxaaQuality::High),
+            _ => (8, 1080, FxaaQuality::Ultra),
         };
         self.bloom.mip_count = mips;
         self.bloom.max_mip_height = height;
