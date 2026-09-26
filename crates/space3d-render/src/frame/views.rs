@@ -487,7 +487,10 @@ impl FrameState {
                     out_cursor
                 };
                 let fits = region_start + s.count as u64 * s.stride as u64 <= f.max_storage_binding;
-                if gpu && s.cull != CullSource::None && fits {
+                // Instances sorted back to front per view (`TransparentSort::PerInstance`) are
+                // culled and ordered on the CPU on every path.
+                let sort = f.materials.sorts(&s);
+                if gpu && s.cull != CullSource::None && fits && !sort {
                     // GPU culling: reserve an output region, emit a job and an indirect draw.
                     if multi && !same_run {
                         out_cursor = region_start;
@@ -600,7 +603,33 @@ impl FrameState {
                             visible_overflow = true;
                             visible = s.count;
                         }
-                        if visible == s.count {
+                        let sorted_fits = f.cpu_visible.len() as u64 + visible as u64 * 64 <= f.max_buffer_size;
+                        if sort && visible > 0 && sorted_fits {
+                            // Back to front: the visible instances in view-depth order, copied
+                            // (diffed) into `cpu_visible`.
+                            let mask = culling.then_some(&f.cull_mask[..]);
+                            let sorted = f.materials.sort_back_to_front(
+                                order,
+                                mask,
+                                &f.ecs_matrices,
+                                camera_view,
+                                &mut cpu_reallocs,
+                            );
+                            let at = f.cpu_visible.len();
+                            let matrices = &f.ecs_matrices;
+                            f.cpu_visible.write_all(
+                                at,
+                                sorted.len(),
+                                sorted.iter().map(|&i| &matrices[i as usize]),
+                                &mut cpu_reallocs,
+                            );
+                            f.draws.push(DrawCmd {
+                                vb: VertexSource::CpuVisible,
+                                vb_offset: at as u64,
+                                kind: DrawKind::Direct { instances: visible },
+                                ..base_cmd
+                            });
+                        } else if visible == s.count {
                             f.draws.push(DrawCmd {
                                 vb: VertexSource::Ecs,
                                 vb_offset: s.first as u64 * 64,

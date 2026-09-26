@@ -121,9 +121,6 @@ pub(crate) struct FrameState {
     explicit: Vec<Option<GpuInstances>>,
     materials: MaterialTable,
     view_bg: Option<(wgpu::BindGroup, u32)>,
-    /// Material bind group per texture: (bind group, materials buffer generation, texture
-    /// version, texture is an array — selects the pipeline variant).
-    material_bgs: FastMap<Option<TextureHandle>, (wgpu::BindGroup, u32, u32, bool)>,
     /// Culling bind group per (source buffer, window of frustums).
     cull_bgs: FastMap<(SourceBuffer, u32), (wgpu::BindGroup, [u32; 5])>,
     compact_bg: Option<(wgpu::BindGroup, [u32; 5])>,
@@ -280,7 +277,6 @@ impl FrameState {
             explicit: Vec::new(),
             materials: MaterialTable::default(),
             view_bg: None,
-            material_bgs: FastMap::default(),
             cull_bgs: FastMap::default(),
             compact_bg: None,
             arena_buffers: None,
@@ -869,6 +865,10 @@ impl Renderer {
                     .count() as u32;
             }
         }
+        let lighting = resources
+            .get::<crate::lighting::api::LightingSettings>()
+            .cloned()
+            .unwrap_or_default();
         f.extract(
             world,
             assets,
@@ -877,6 +877,7 @@ impl Renderer {
             encoder,
             up,
             pipelines,
+            &lighting,
             frame_index,
             stats,
             &mut cpu_reallocs,
@@ -941,8 +942,8 @@ impl Renderer {
         // last frame fall back to the built-in shader before anything is drawn with them.
         pipelines.poll_pending(device);
         f.prepare_view_bind_group(device, pipelines);
+        f.prepare_feedback(device, assets, frame_index);
         f.prepare_material_bind_groups(device, assets, pipelines, white, white_sampler);
-        f.prepare_feedback(device, assets, pipelines, frame_index);
         f.prepare_cull_bind_groups(device, pipelines, frame_index);
 
         let caps_after = f.capacities();

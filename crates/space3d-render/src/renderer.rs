@@ -1015,6 +1015,8 @@ impl Renderer {
             });
             self.stats.meshes_uploaded += 1;
         }
+        // The extension stream (tangents, second UV set) of the meshes just placed.
+        assets.upload_extras(&self.device, encoder, &pending, &mut self.uploader);
     }
 
     /// Read back the primary target of the last rendered frame as sRGB RGBA8.
