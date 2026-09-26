@@ -780,7 +780,10 @@ pub enum SpriteShape {
 pub enum SpriteTexture {
     /// A procedural built-in.
     Builtin(BuiltinTexture),
-    /// An asset path.
+    /// An asset path (the asset server's root, or `source://path`): with the `assets` feature
+    /// and an `AssetServer`, `ParticlesPlugin` loads the image, uploads it (sRGB; linear for a
+    /// distortion layer) and swaps it into the effect as [`Self::Handle`]; the layer draws
+    /// untextured until then. Without them the path is warned about once and never drawn.
     Path(String),
     /// A registered texture (not serialized).
     #[serde(skip)]

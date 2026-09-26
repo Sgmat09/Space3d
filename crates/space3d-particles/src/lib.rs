@@ -158,6 +158,7 @@ impl Plugin for ParticlesPlugin {
             app.init_asset::<ParticleEffect>()
                 .register_asset_loader(asset::ParticleEffectLoader);
             app.add_system_named(Stage::Update, "particles::effect_assets", asset::sync_effect_assets);
+            app.add_system_named(Stage::Update, "particles::texture_paths", asset::resolve_texture_paths);
         }
         // The render node (the frame's `RenderNodes` exists with or without a renderer; a
         // `RenderPlugin` added later keeps it).

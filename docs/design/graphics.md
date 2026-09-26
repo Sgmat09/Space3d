@@ -2564,9 +2564,6 @@ lands during PM3/PM4 → PM5; PA4 after PO5 → I.
     format, so the fragment path would build those mips): halves the sky and IBL memory (VRAM line above).
   * **GPU strip builder / incremental strip uploads** (particles) and the **compute bloom chain** (post): the
     Battle's CPU sub-budgets.
-  * **`SpriteTexture::Path`** (a texture by asset path in a `.pfx.ron`): needs the particles' asset loader to
-    resolve dependencies; until then `SpriteTexture::Handle` (and built-ins) only — a path draws untextured and
-    is warned once (particles.md).
   * **wasm budgets** (§4.4, "measured manually … in Phase I"): the web build compiles and links for wasm32 and
     the Low look is covered by the `WebGL2 *` stories and the ANGLE runs, but no browser measurement was taken
     (no wasm-bindgen toolchain on the build machine).

@@ -129,13 +129,16 @@ impl RenderLayers {
             SpriteTexture::Builtin(b) => Some(TexKey::Builtin(*b)),
             SpriteTexture::Handle(h) => Some(TexKey::Handle(*h)),
             SpriteTexture::Path(p) => {
-                if !self.warned_path {
+                // With the `assets` feature the plugin resolves paths into handles (the layer
+                // draws untextured while the image loads): only a build without it is warned.
+                if !cfg!(feature = "assets") && !self.warned_path {
                     self.warned_path = true;
                     tracing::warn!(
                         effect = %effect,
                         path = %p,
-                        "particle textures by path need an asset loader, which this version lacks: use \
-                         SpriteTexture::Handle (RenderAssets::add_texture) or a built-in; drawing without it"
+                        "particle textures by path are loaded with the `assets` feature and an AssetServer \
+                         (until then, or without them, the layer draws untextured): or use \
+                         SpriteTexture::Handle (RenderAssets::add_texture) or a built-in"
                     );
                 }
                 None

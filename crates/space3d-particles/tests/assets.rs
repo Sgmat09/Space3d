@@ -107,3 +107,53 @@ fn failed_effect_assets_play_nothing() {
     run_until(&mut app, |app| !app.world.contains(e));
     assert!(!app.resources.expect::<ParticleEffects>().is_pending(fx));
 }
+
+/// `SpriteTexture::Path` (reviewer round M2: a public no-op before): the plugin loads the image
+/// through the asset server, uploads it (sRGB for a color layer, linear for a distortion layer)
+/// and swaps it into the effect as a `SpriteTexture::Handle`; ribbons and beams too. A path that
+/// fails to load stays a path (drawn untextured, warned once).
+#[test]
+fn texture_paths_resolve_to_handles() {
+    use space3d_particles::{SpriteShape, SpriteTexture};
+    use space3d_render::{RenderAssets, TextureHandle};
+    const TEXTURED: &str = r#"ParticleEffect(
+        name: "test/textured",
+        looping: true,
+        layers: [
+            (spawn: (rate: 10.0), lifetime: 0.5, render: (shape: Texture(Path("mem://tex/dot.png")))),
+            (spawn: (rate: 10.0), lifetime: 0.5, render: (shape: Texture(Path("mem://tex/missing.png")))),
+        ],
+        ribbons: [(name: "trail", texture: Some(Path("mem://tex/dot.png")))],
+    )"#;
+    let (mut app, mem) = app();
+    app.resources.init::<RenderAssets>();
+    let png = space3d_assets::edit::texture::encode_png(&ImageData::filled(4, 4, [255, 0, 0, 255])).unwrap();
+    mem.insert("tex/dot.png", png);
+    let fx = app
+        .resources
+        .expect_mut::<ParticleEffects>()
+        .add(ParticleEffect::from_ron(TEXTURED).unwrap())
+        .unwrap();
+    let handle_of = |app: &App| -> (Option<TextureHandle>, Option<TextureHandle>, bool) {
+        let e = app.resources.expect::<ParticleEffects>().get(fx).unwrap().clone();
+        let h = |s: &SpriteShape| match s {
+            SpriteShape::Texture(SpriteTexture::Handle(h)) => Some(*h),
+            _ => None,
+        };
+        let ribbon = match &e.ribbons[0].texture {
+            Some(SpriteTexture::Handle(h)) => Some(*h),
+            _ => None,
+        };
+        let missing = matches!(e.layers[1].render.shape, SpriteShape::Texture(SpriteTexture::Path(_)));
+        (h(&e.layers[0].render.shape), ribbon, missing)
+    };
+    run_until(&mut app, |app| handle_of(app).0.is_some());
+    let (layer, ribbon, missing) = handle_of(&app);
+    assert_eq!(layer, ribbon, "one upload per path and color space");
+    assert!(missing, "the missing image stays a path");
+    assert!(app.resources.expect::<RenderAssets>().contains_texture(layer.unwrap()));
+    // Nothing more to do: the effect is left alone.
+    let version = app.resources.expect::<ParticleEffects>().get(fx).cloned();
+    app.step_ticks(5);
+    assert_eq!(app.resources.expect::<ParticleEffects>().get(fx).cloned(), version);
+}

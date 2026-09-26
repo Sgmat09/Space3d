@@ -169,8 +169,9 @@ ctx.spawn_effect(plasma, EffectSpawn::at(p)); // waits until the file has loaded
 ```
 
 Editing the file reloads it (`ParticleEffects::set` semantics); a file that fails to load plays
-nothing (its emitters finish, warned) — `tests/assets.rs`. Referencing a `SpriteTexture::Path` from
-such a file is not resolved yet (use built-ins or handles).
+nothing (its emitters finish, warned) — `tests/assets.rs`. A `SpriteTexture::Path` in such a file
+(or in any registered effect) is loaded through the same asset server and swapped in as a handle
+(below).
 
 ### Layer reference
 
@@ -305,8 +306,13 @@ particle's, its alpha is the shape), from:
   64² with full mip chains.
 * `SpriteTexture::Handle(h)`: any texture of the renderer's `RenderAssets` (`add_texture`,
   `TextureSource::from_layers` for arrays), with its own sampler.
-* `SpriteTexture::Path(..)` needs the asset loader, which is not in this version: such layers
-  draw untextured (warned once).
+* `SpriteTexture::Path("tex/flare.png")` (the asset server's root, or `source://path`): with the
+  `assets` feature and an `AssetServer`, the plugin loads the image, uploads it (sRGB for a color
+  layer, linear for a distortion layer's offsets) and swaps it into the effect as a `Handle`
+  (like `ParticleEffects::set`); the layer draws untextured while the image loads, and a path
+  that fails to load stays untextured (warned once). Sprite layers, ribbons and beams
+  (`tests/assets.rs::texture_paths_resolve_to_handles`). Without the feature a path is warned
+  once and never drawn.
 
 `SpriteRender::flipbook: Some(Flipbook { frames, columns, rows, mode, blend })` animates it:
 frame *k* is cell `k mod (columns × rows)` of array layer `k / (columns × rows)` — so a texture
