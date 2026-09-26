@@ -580,17 +580,58 @@ pub fn spawn_previews(world: &mut World, resources: &mut Resources, assets: &Sho
             })
         },
     ));
-    for (i, rt) in quads.into_iter().enumerate() {
+    // Each preview sits on a dark translucent panel with a thin frame, so it reads as a HUD
+    // inset rather than a giant ship in the fight (the render targets clear to transparent).
+    let face = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let quad = |world: &mut World, name: String, at: Vec3, size: Vec2, material: Material| {
         world.spawn((
-            Name(format!("preview quad {i}")),
-            Transform::from_xyz(HUD.x + 1.42 - 0.56 * i as f32, HUD.y - 0.72, HUD.z)
-                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
-                .with_scale(Vec3::splat(0.5)),
+            Name(name),
+            Transform::from_xyz(at.x, at.y, at.z)
+                .with_rotation(face)
+                .with_scale(Vec3::new(size.x, 1.0, size.y)),
             Mesh3d(assets.quad),
+            material,
+        ));
+    };
+    let (panel, frame, line) = (0.53, 0.536, 0.004);
+    for (i, rt) in quads.into_iter().enumerate() {
+        let at = Vec3::new(HUD.x + 1.42 - 0.56 * i as f32, HUD.y - 0.72, HUD.z);
+        let dark = Material::unlit(Vec4::new(0.004, 0.006, 0.012, 0.62)).with_blend(BlendMode::AlphaBlend);
+        quad(
+            world,
+            format!("preview panel {i}"),
+            at - Vec3::Z * 0.02,
+            Vec2::splat(panel),
+            dark,
+        );
+        let edge = Material::unlit(Vec4::new(0.25, 0.42, 0.6, 0.85)).with_blend(BlendMode::AlphaBlend);
+        let o = (frame - line) * 0.5;
+        for (k, (offset, size)) in [
+            (Vec3::Y * o, Vec2::new(frame, line)),
+            (-Vec3::Y * o, Vec2::new(frame, line)),
+            (Vec3::X * o, Vec2::new(line, frame)),
+            (-Vec3::X * o, Vec2::new(line, frame)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            quad(
+                world,
+                format!("preview frame {i}.{k}"),
+                at + offset - Vec3::Z * 0.01,
+                size,
+                edge.clone(),
+            );
+        }
+        quad(
+            world,
+            format!("preview quad {i}"),
+            at,
+            Vec2::splat(0.5),
             Material::unlit(Vec4::ONE)
                 .with_texture(rt)
                 .with_blend(BlendMode::AlphaBlend),
-        ));
+        );
     }
     cameras.push(hud);
     cameras
