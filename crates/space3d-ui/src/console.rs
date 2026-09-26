@@ -714,29 +714,30 @@ fn entry_galley(
 /// Egui id of the console window.
 pub(crate) const CONSOLE_ID: &str = "space3d_console";
 
-/// Default place of the docked console window in the dock area `dock`: bottom-left, 640 pt wide
-/// and 40 % of the area's height (140 to 360 pt), [`crate::tool::EDGE`] in from its edges.
+/// Default place of the docked console window in the dock area `dock` in the stacked layout:
+/// bottom-left, 640 pt wide and 40 % of the area's height (140 to 360 pt), [`crate::tool::EDGE`]
+/// in from its edges. (In a short area it may dock beside the other tools instead:
+/// [`crate::dock`].)
 pub(crate) fn window_rect(dock: egui::Rect) -> egui::Rect {
     let edge = crate::tool::EDGE;
     let size = egui::vec2(
         (dock.width() - 2.0 * edge).min(640.0),
         (dock.height() * 0.4)
-            .clamp(140.0, 360.0)
+            .clamp(140.0, crate::dock::MAX_CONSOLE_HEIGHT)
             .min(dock.height() - 2.0 * edge),
     );
     egui::Rect::from_min_size(egui::pos2(dock.left() + edge, dock.bottom() - edge - size.y), size)
 }
 
-/// Where the console window is this frame (docked in `dock` or where the user moved it).
-pub(crate) fn placed_rect(ctx: &egui::Context, dock: egui::Rect) -> egui::Rect {
-    let bounds = dock.shrink(crate::tool::EDGE);
+/// Where the console window is this frame (docked as `plan` says, or where the user moved it).
+pub(crate) fn placed_rect(ctx: &egui::Context, plan: &crate::dock::DockPlan) -> egui::Rect {
     crate::tool::placed_rect(
         ctx,
         CONSOLE_ID,
         egui::Align2::LEFT_BOTTOM,
-        bounds.left_bottom(),
-        window_rect(dock).size(),
-        bounds,
+        plan.console_pos,
+        plan.console_size,
+        plan.bounds,
         true,
     )
 }
@@ -749,13 +750,15 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
     {
         c.pull_logs();
     }
-    let dock = ctx.as_ref().map(|ctx| crate::tool::dock_rect(sys.resources, ctx));
-    if let (Some(ctx), Some(dock)) = (ctx, dock)
+    let plan = ctx.as_ref().map(|ctx| {
+        let dock = crate::tool::dock_rect(sys.resources, ctx);
+        crate::dock::plan(sys.resources, ctx, dock)
+    });
+    if let (Some(ctx), Some(plan)) = (ctx, plan)
         && let Some(c) = sys.resources.get_mut::<Console>()
         && c.visible
     {
         let mut open = true;
-        let bounds = dock.shrink(crate::tool::EDGE);
         let filter = c.filter.to_lowercase();
         let (shown, total) = (c.shown(&filter).count(), c.lines.len());
         crate::tool::window(
@@ -764,11 +767,11 @@ pub(crate) fn console_system(sys: &mut SystemCtx) {
                 id: CONSOLE_ID,
                 title: "Console",
                 anchor: egui::Align2::LEFT_BOTTOM,
-                dock_pos: bounds.left_bottom(),
-                bounds,
-                size: window_rect(dock).size(),
+                dock_pos: plan.console_pos,
+                bounds: plan.bounds,
+                size: plan.console_size,
                 fit_height: false,
-                max_width: f32::INFINITY,
+                max_width: plan.console_max_width,
             },
             &mut open,
             |ui| {

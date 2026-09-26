@@ -5,10 +5,10 @@
 //! `Ui` (a scoped copy of the style), keeps the context's colors, and draws its own compact
 //! header instead of egui's title bar (whose height follows the global heading size).
 //!
-//! They dock to the corners of the [`ToolDockArea`] (the whole screen by default), follow it
-//! when it changes (the window or an editor panel is resized) until the user drags them away,
-//! keep their default size for the current area until the user resizes them, and sit on egui's
-//! foreground layer, above the game's own windows.
+//! They dock to the corners of the [`ToolDockArea`] (the whole screen by default; side by side
+//! in a short one: [`crate::dock`]), follow it when it changes (the window or an editor panel is
+//! resized) until the user drags them away, keep their default size for the current area until
+//! the user resizes them, and sit on egui's foreground layer, above the game's own windows.
 
 use crate::theme::{UiDensity, apply_density, visible_scroll_bars};
 use space3d_core::Resources;
@@ -41,8 +41,11 @@ const MARGIN: egui::Margin = egui::Margin {
 
 /// Screen area (egui points) the engine tools dock inside (resource; [`set_tool_dock_area`]): the debug overlay (F3) in
 /// its top-left corner, the profiler (F4) top-right and the console bottom-left, each 6 pt in
-/// from its edges. A docked tool follows the area when it moves or changes size; one the user
-/// dragged away stays where it was put (double-click its title to dock it again).
+/// from its edges. In an area too short to stack them (a band a HUD leaves free) the console
+/// docks between the overlay and the profiler instead, so they stay inside and apart
+/// (`docs/ui.md`, "Short dock areas"). A docked tool follows the area when it moves or changes
+/// size; one the user dragged away stays where it was put (double-click its title to dock it
+/// again).
 ///
 /// Without the resource the tools dock to the whole screen (games). Hosts that cover part of the
 /// screen with their own panels set it every frame to what is left, so the tools never cover
@@ -241,6 +244,16 @@ pub(crate) fn placed_rect(
     }
 }
 
+/// The frame of a tool window under `style` (the context's colors and stroke, the tools' margin).
+fn frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::window(style).inner_margin(MARGIN).corner_radius(4)
+}
+
+/// Size a tool window's frame adds around its contents (margins and stroke).
+pub(crate) fn chrome(ctx: &egui::Context) -> egui::Vec2 {
+    frame(&ctx.global_style()).total_margin().sum()
+}
+
 /// How a tool window is placed and sized.
 pub(crate) struct ToolWindow<'a> {
     /// Stable id (egui remembers where the user moved / resized the window).
@@ -280,8 +293,7 @@ pub(crate) fn window<R>(
     summary: impl FnOnce(&mut egui::Ui),
     contents: impl FnOnce(&mut egui::Ui, f32) -> R,
 ) -> Option<R> {
-    let style = ctx.global_style();
-    let frame = egui::Frame::window(&style).inner_margin(MARGIN).corner_radius(4);
+    let frame = frame(&ctx.global_style());
     let chrome = frame.total_margin().sum();
     let floating = is_floating(ctx, spec.id);
     let user_sized = is_user_sized(ctx, spec.id);

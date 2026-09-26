@@ -31,8 +31,9 @@
 //!   command registry.
 //! * The three tools are compact under any egui style: they size themselves (their own `Ui`
 //!   only) and never change the global style (see `docs/ui.md`). They dock to the corners of the
-//!   screen, or of the [`ToolDockArea`] a host with its own panels sets (the editor's viewport),
-//!   follow it when it is resized, and stay above the game's windows.
+//!   screen, or of the [`ToolDockArea`] a host with its own panels sets (the editor's viewport,
+//!   a band a game's HUD leaves free: side by side when it is too short to stack them), follow
+//!   it when it is resized, and stay above the game's windows.
 //! * [`UiTextures`] shows renderer render targets (e.g. a `Camera3d` rendering to a texture) as
 //!   egui images.
 //! * Opt-in density ([`theme`]): `app.insert_resource(UiTheme::compact())` applies the compact
@@ -65,6 +66,7 @@
 pub mod console;
 mod context;
 pub mod debug;
+mod dock;
 mod input;
 mod overlay;
 pub mod profiler;

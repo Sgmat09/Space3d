@@ -118,7 +118,9 @@ Environment switches understood by both:
 
 Default: `render`, `platform`, `assets`, `audio`, `physics`, `scene`, `net`, `db`, `ui`.
 Optional: `editor`, `github`, `stories`, `test` (generated projects enable `stories` and
-`editor`, plus `test` for their tests). A dedicated server can use
+`editor`, plus `test` for their tests; `stories` holds the engine's UI stories, so it builds
+egui even without `ui`). The engine crates of features you leave off stay out of your
+`Cargo.lock` too. A dedicated server can use
 `space3d = { …, default-features = false, features = ["net"] }` (see
 `examples/multiplayer_chat`).
 

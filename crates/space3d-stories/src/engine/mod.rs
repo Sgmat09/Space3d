@@ -128,7 +128,8 @@ pub(super) fn ambient(app: &mut App, intensity: f32) {
 /// single material, 10k instanced cubes, textured checker plane, point lights, camera
 /// projections, transform hierarchy and a physics drop.
 ///
-/// With feature `ui` (off by default; the editor turns it on) it also holds the UI stories: `Engine/UI/Theme/Default`
+/// With feature `ui` (off by default; the editor and the facade's `stories` feature turn it on)
+/// it also holds the UI stories: `Engine/UI/Theme/Default`
 /// and `Engine/UI/Theme/Compact` (the same tool panel under egui's default style and the opt-in
 /// compact density) and `Engine/UI/Tools/*` (debug overlay, profiler, console, and all three
 /// under a roomy game style).

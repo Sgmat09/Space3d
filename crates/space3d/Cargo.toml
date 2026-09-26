@@ -29,15 +29,18 @@ scene = ["dep:space3d-scene"]
 net = ["dep:space3d-net"]
 ## SQLite (native) / localStorage (web): KV, save slots, leaderboards.
 db = ["dep:space3d-db"]
-## egui integration, debug overlay, profiler. Implies `platform`. With `stories`, the engine
-## storybook also holds the UI stories.
-ui = ["platform", "dep:space3d-ui", "space3d-stories?/ui"]
+## egui integration, debug overlay, profiler. Implies `platform`.
+ui = ["platform", "dep:space3d-ui"]
 ## Scene inspector, texture editor, model editor. Implies `ui`.
 editor = ["ui", "dep:space3d-editor"]
 ## GitHub releases / update checker / crash reporter.
 github = ["dep:space3d-github"]
-## Storybook: stories, knobs, viewer, batch screenshots.
-stories = ["dep:space3d-stories"]
+## Storybook: stories, knobs, viewer, batch screenshots. The engine storybook always holds the
+## UI stories (`Engine/UI/*`), so this pulls in `space3d-ui` / egui (the storybook viewer is egui
+## anyway). Deliberately not a weak `space3d-stories?/ui` on `ui`: Cargo writes every package a
+## weak dependency feature could reach into downstream lockfiles, so games with `ui` but without
+## `stories` would list the whole storybook tree (physics, rapier, test harness) unbuilt.
+stories = ["dep:space3d-stories", "space3d-stories/ui"]
 ## Test harness: headless apps, input simulation, golden screenshots.
 test = ["dep:space3d-test"]
 ## Particle effects (sprites, ribbons, beams) drawn by a render node: `space3d::particles`

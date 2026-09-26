@@ -165,7 +165,8 @@ normal text. Scroll bars stay visible while content is hidden, with the handle i
 ### Docking
 
 The tools dock to the corners of the **dock area**, 6 pt in from its edges (and from each other):
-the overlay top-left, the profiler top-right, the console bottom-left. The dock area is the whole
+the overlay top-left, the profiler top-right, the console bottom-left (in an area too short for
+that, side by side: [Short dock areas](#short-dock-areas)). The dock area is the whole
 screen, or the `ToolDockArea` resource when a host sets it: hosts that cover part of the screen
 with their own panels set it every frame to what is left, and the tools then never cover their
 menu bars or side panels — the editor sets it to its viewport (between the menu bar, hierarchy
@@ -199,18 +200,49 @@ app.add_root_ui_system(|ui: &mut egui::Ui, sys: &mut SystemCtx| {
   to bring it back on top).
 
 The profiler is exactly as tall as its contents, up to 45 % of the dock area's height (at least
-300 pt) and never down into the open console. With the debug overlay open beside it (small
-screens, e.g. 640 × 360 pt at 2x) it ends 6 pt right of the overlay, down to 240 pt wide (where
-names would get narrower than 12 digits, under about 370 pt, its table keeps the avg and calls
-columns only); when not even that fits (a tall, narrow screen such as a phone held upright) it
-docks under the overlay if 160 pt fit there. Only on screens too small for all three (about
-430 × 240 pt) do they overlap. Its table scrolls by whole rows (no row is ever cut), under a
-header whose titles sit right above their right-aligned columns whether or not the scroll bar
-takes a column of its own. The console is 640 × 40 % of the dock area (140–360 pt), a whole
-number of log lines tall (stuck to the newest line, the oldest shown is never a sliver), and
-wraps long lines (paths, backtraces) under their message instead of widening. It lays out only
-the lines in view (the others keep the height measured when they arrived, or when the log's width
-last changed), so its cost per frame does not grow with the 1000 lines it holds.
+300 pt, but never more than the area) and never down into the open console. With the debug
+overlay open beside it (small screens, e.g. 640 × 360 pt at 2x) it ends 6 pt right of the
+overlay, down to 240 pt wide (where names would get narrower than 12 digits, under about 370 pt,
+its table keeps the avg and calls columns only); when not even that fits (a tall, narrow screen
+such as a phone held upright) it docks under the overlay if 160 pt fit there. Its table scrolls
+by whole rows (no row is ever cut), under a header whose titles sit right above their
+right-aligned columns whether or not the scroll bar takes a column of its own. In a window too
+short for its two sections and 3 table rows (under about 190 pt) it leaves out the *Timeline*
+and *Systems* section headers — the flame view and the table stay, always open — so 3 rows still
+fit in about 150 pt. The console is 640 × 40 % of the dock area (140–360 pt), a whole number of
+log lines tall (stuck to the newest line, the oldest shown is never a sliver; at least 3 lines,
+about 125 pt), and wraps long lines (paths, backtraces) under their message instead of widening.
+It lays out only the lines in view (the others keep the height measured when they arrived, or
+when the log's width last changed), so its cost per frame does not grow with the 1000 lines it
+holds.
+
+#### Short dock areas
+
+A game whose HUD leaves only a band of the screen free sets a dock area too short to stack the
+tools (SpaceCorps2027: 1024 × 233 pt of a 1024 × 640 screen, where the overlay, the profiler's
+300 pt and the console's 40 % used to overlap). The console then docks beside the tools instead
+of under them, so all three stay inside the area and apart:
+
+* **Right of the overlay** when the overlay reaches down into it (the overlay's height, 6 pt and
+  the console's default height are more than the area's height). It stays docked at the bottom.
+* **Left of the profiler** when the profiler's smallest layout with 3 table rows (about 150 pt,
+  measured as drawn) does not fit above it; the profiler then takes the area's height. The
+  profiler gives up width (440 down to 240 pt) before the console gets narrower than 320 pt.
+* With neither tool above it the console is **as tall as the area** (up to 360 pt) instead of
+  40 % of it. In the band above: overlay | console (347 pt wide) | profiler (440 pt), each as tall
+  as the area's 221 pt allow.
+* When the area gets tall again the tools **dock back** to their corners, at the sizes a fresh
+  start at that area gives them. A console or profiler the user resized keeps its size (capped to
+  the area) and docks by the same rules; a dragged one floats and is left out.
+* **Overlap only where nothing else fits.** Side by side needs an area about 640 pt wide
+  (overlay 213, console 160, profiler 240 and the 6 pt gaps). In a narrower short area the console still docks right of the
+  overlay, under the profiler, which shows what rows fit (at least one, about 115 pt) and covers
+  the console's top when not even that fits; with the overlay alone the console needs 160 pt
+  right of it or keeps its corner under the overlay. The overlay (about 145 pt tall with render
+  stats, 200 with its details) and the smallest profiler and console do not shrink further: in an
+  area shorter than them they reach past its bottom edge.
+* Normal and tall areas keep the layout above: the console moves only when the stacked layout
+  would overlap. Every tool computes the same plan each frame (`space3d-ui/src/dock.rs`).
 
 * **Debug overlay** (`DebugOverlay`): a small panel at the top-left that never takes the pointer,
   opaque (the renderer blends in linear space, where a translucent black lets a bright scene or
@@ -267,8 +299,7 @@ density), and its panels still keep their width.
 ## Stories and tests
 
 The engine storybook (`space3d_stories::engine_storybook`, feature `ui`: not a default feature, since
-it pulls in egui; the editor turns it on, and so does the facade's `ui` feature together with
-`stories`) holds
+it pulls in egui; the editor and the facade's `stories` feature turn it on) holds
 `Engine/UI/Theme/Default`, `Engine/UI/Theme/Compact`, `Engine/UI/Tools/Debug Overlay`,
 `Engine/UI/Tools/Profiler`, `Engine/UI/Tools/Console` and `Engine/UI/Tools/Game Style`, with
 goldens in `crates/space3d-stories/tests/__screenshots__/Engine/UI/`. The tool stories have a
@@ -283,9 +314,14 @@ debug overlay and above the console on 640 × 330–400 pt screens and shares 48
 or the dock area, at the size a fresh start gives them (also when a host sets the area after the
 first frame, as the editor does), while a tool the user resized keeps its size and stays docked;
 a dragged tool floats until its title is double-clicked; tools dock inside a `ToolDockArea`; a
-game window never covers them), the profiler's
+game window never covers them; in short dock areas — the reported 1024 × 233 band and 800 × 200,
+1280 × 180, 1920 × 260, 640 × 240, 1100 × 300 pt — they dock side by side, inside and apart, and
+dock back when the area gets tall again), the dock plan's unit tests (`dock.rs`: roomy areas stay
+stacked, the band goes side by side, the console moves right of a tall overlay, a tiny area keeps
+the corners), the profiler's
 `table_headers_line_up_with_their_columns` (header titles over their columns with and without a
-scroll bar, and in a narrow table), `crates/space3d-ui/tests/alloc_free.rs` (no allocation while
+scroll bar, and in a narrow table) and `a_short_profiler_leaves_out_its_section_headers` (at
+least 3 rows from about 150 pt; the measured minimum is exact), `crates/space3d-ui/tests/alloc_free.rs` (no allocation while
 the theme is unchanged or absent; the console allocates as much per frame with 1000 lines as with
 40) and the editor's `standalone_tools_are_compact_and_the_plugin_keeps_a_games_style`,
 `editor_panels_keep_their_width_under_any_style`, `tool_windows_stay_over_the_viewport`,

@@ -49,7 +49,7 @@
 //! | `ui` | egui integration, debug overlay | `ui` (yes) |
 //! | `editor` | scene inspector, texture & model editors | `editor` (no) |
 //! | `github` | releases, update checker, crash reporter | `github` (no) |
-//! | `stories` | storybook | `stories` (no) |
+//! | `stories` | storybook, with the engine's UI stories (builds egui) | `stories` (no) |
 //! | `test` | test harness, input simulation, golden screenshots | `test` (no) |
 //!
 //! ## Environment variables understood by the plugin groups

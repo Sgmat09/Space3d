@@ -15,7 +15,7 @@ engine = ["dep:space3d-physics", "particles"]
 particles = ["dep:space3d-particles"]
 ## UI stories (`Engine/UI/Theme/*`, `Engine/UI/Tools/*`) in the engine storybook (pulls in
 ## `space3d-ui` / egui). Not in `default`: the editor, which has egui anyway, turns it on, and so
-## does the facade's `ui` feature when its `stories` feature is on.
+## does the facade's `stories` feature.
 ui = ["engine", "dep:space3d-ui"]
 
 [dependencies]

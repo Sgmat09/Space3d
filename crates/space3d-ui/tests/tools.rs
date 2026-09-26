@@ -597,3 +597,123 @@ fn tools_stay_above_the_games_windows() {
     assert_eq!(top.id, egui::Id::new("space3d_profiler"), "the profiler is on top");
     assert_eq!(top.order, egui::Order::Foreground);
 }
+
+/// A tools app of `screen` with the overlay (with render stats, as in a game), profiler and
+/// console open, docked in `dock`, after a few frames.
+fn tools_in(screen: (u32, u32), dock: egui::Rect) -> App {
+    let mut app = tools_app(screen, 1.0, false);
+    app.insert_resource(window(screen));
+    app.insert_resource(space3d_render::RenderStats::default());
+    app.resources.expect_mut::<DebugOverlay>().visible = true;
+    app.insert_resource(ToolDockArea(dock));
+    app.step_ticks(6);
+    app
+}
+
+/// The overlay, profiler and console inside `dock` (6 pt in), apart (6 pt between them), side
+/// by side: the overlay top-left, the console bottom-docked right of it and the profiler
+/// top-right, right of the console.
+fn assert_side_by_side(app: &App, dock: egui::Rect, label: &str) {
+    let (_, profiler, console) = rects(app);
+    let overlay = area(app, "space3d_debug_overlay");
+    let label = format!("{label}: dock {dock:?}, overlay {overlay:?}, profiler {profiler:?}, console {console:?}");
+    let inside = dock.shrink(EDGE - 0.5);
+    for r in [overlay, profiler, console] {
+        assert!(inside.contains_rect(r), "inside the dock area: {label}");
+    }
+    let apart = |a: egui::Rect, b: egui::Rect| !a.expand(EDGE - 0.5).intersects(b);
+    assert!(
+        apart(overlay, profiler) && apart(overlay, console) && apart(profiler, console),
+        "no overlaps: {label}"
+    );
+    assert!(
+        overlay.left_top().distance(dock.left_top() + egui::vec2(EDGE, EDGE)) < 1.0,
+        "overlay top-left: {label}"
+    );
+    assert!(
+        profiler
+            .right_top()
+            .distance(dock.right_top() + egui::vec2(-EDGE, EDGE))
+            < 1.0,
+        "profiler top-right: {label}"
+    );
+    assert!(
+        (console.bottom() - (dock.bottom() - EDGE)).abs() < 1.0,
+        "console docked at the bottom: {label}"
+    );
+    assert!(
+        console.left() >= overlay.right() + EDGE - 0.5 && console.right() <= profiler.left() - EDGE + 0.5,
+        "console between the overlay and the profiler: {label}"
+    );
+    assert!(console.width() >= 160.0 - 0.5, "{label}");
+}
+
+/// SpaceCorps2027's HUD leaves a 1024 × 233 pt band of a 1024 × 640 screen free: with F3, F4 and
+/// the console open the three used to overlap (the profiler's 300 pt minimum height, the overlay
+/// over the console's 40 %). In a short area they dock side by side: overlay | console |
+/// profiler, each as tall as the area allows.
+#[test]
+fn tools_dock_side_by_side_in_a_short_dock_area() {
+    let band = egui::Rect::from_min_max(egui::pos2(0.0, 300.0), egui::pos2(1024.0, 533.0));
+    let mut app = tools_in((1024, 640), band);
+    assert_side_by_side(&app, band, "1024 x 233 band");
+    let (_, profiler, console) = rects(&app);
+    assert_eq!(profiler.width(), 440.0, "the profiler keeps its width");
+    assert!(
+        console.height() > 0.8 * (band.height() - 2.0 * EDGE),
+        "nothing above the console: it takes the area's height, {console:?}"
+    );
+    app.step_ticks(30);
+    assert_eq!(rects(&app), (screen(&app), profiler, console), "stable");
+}
+
+/// Short areas of several shapes: side by side, inside, no overlaps.
+#[test]
+fn short_dock_areas_never_overlap() {
+    for (w, h) in [
+        (800, 200),
+        (1280, 180),
+        (1920, 260),
+        (640, 240),
+        (1024, 233),
+        (1100, 300),
+    ] {
+        let dock = egui::Rect::from_min_size(egui::pos2(0.0, 300.0), egui::vec2(w as f32, h as f32));
+        let mut app = tools_in((w, h + 400), dock);
+        let label = format!("{w} x {h}");
+        assert_side_by_side(&app, dock, &label);
+        let before = rects(&app);
+        app.step_ticks(20);
+        assert_eq!(rects(&app), before, "stable: {label}");
+    }
+}
+
+/// When the dock area gets short the tools go side by side; when it gets tall again they dock
+/// back to their corners, at the sizes a fresh start at each area gives them.
+#[test]
+fn tools_dock_back_when_the_area_is_tall_again() {
+    let tall = egui::Rect::from_min_max(egui::pos2(0.0, 23.0), egui::pos2(1024.0, 640.0));
+    let band = egui::Rect::from_min_max(egui::pos2(0.0, 300.0), egui::pos2(1024.0, 533.0));
+    let mut app = tools_in((1024, 640), tall);
+    let fresh_tall = rects(&app);
+    assert_docked(&app, tall, "tall");
+    let fresh_band = rects(&tools_in((1024, 640), band));
+    for (dock, fresh, label) in [
+        (band, fresh_band, "short"),
+        (tall, fresh_tall, "tall again"),
+        (band, fresh_band, "short again"),
+    ] {
+        app.insert_resource(ToolDockArea(dock));
+        app.step_ticks(6);
+        let now = rects(&app);
+        assert!(
+            same_rect(now.1, fresh.1) && same_rect(now.2, fresh.2),
+            "{label}: {now:?} vs fresh {fresh:?}"
+        );
+        if dock == tall {
+            assert_docked(&app, dock, label);
+        } else {
+            assert_side_by_side(&app, dock, label);
+        }
+    }
+}

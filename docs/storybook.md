@@ -48,9 +48,13 @@ The engine ships its own book (`space3d::stories::engine_storybook()`: lighting,
 instancing, textures, cameras, hierarchies, physics, and the UI stories `Engine/UI/Theme/*` and
 `Engine/UI/Tools/*` — see [ui.md](ui.md)) — `book.extend(engine_storybook())` to browse both. The
 UI stories need egui, so they sit behind `space3d-stories`' `ui` feature (not a default): the
-editor's storybook viewer turns it on, and so does the facade when both its `stories` and `ui`
-features are on (`cargo test -p space3d-stories --features ui` checks their goldens alone;
-`cargo test --workspace` always does). The viewer itself uses the compact UI density.
+editor's storybook viewer turns it on, and so does the facade's `stories` feature (which thus
+builds egui even without the facade's `ui`; `cargo test -p space3d-stories --features ui` checks
+their goldens alone; `cargo test --workspace` always does). The facade deliberately does not tie
+it to its `ui` feature with a weak `space3d-stories?/ui`: Cargo writes every package such a
+feature could reach into the lockfiles of downstream crates, so a game with `ui` but no `stories`
+would list the storybook's whole tree (physics, rapier, the test harness) without ever building
+it. The viewer itself uses the compact UI density.
 
 ## The storybook binary
 
