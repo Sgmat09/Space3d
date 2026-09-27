@@ -197,8 +197,12 @@ pub fn ready(admin: u16) -> bool {
 }
 
 /// Wait until `admin`'s `/readyz` answers 200.
+///
+/// Generous deadline: a debug-build server starting next to a busy machine (parallel suites,
+/// other builds; load averages of 30+) has taken over 15 s to become ready. A server that is
+/// actually broken still fails the test, just later.
 pub fn wait_ready(admin: u16, what: &str) {
-    let end = Instant::now() + Duration::from_secs(15);
+    let end = Instant::now() + Duration::from_secs(60);
     while !ready(admin) {
         assert!(Instant::now() < end, "{what} did not become ready");
         std::thread::sleep(Duration::from_millis(50));
