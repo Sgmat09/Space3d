@@ -33,13 +33,13 @@ pub use content::{
 pub use perf::{BattleReport, headless_battle, measure_battle};
 pub use scenes::{
     BattleHandles, BattleScene, ENV_DIFFUSE, ENV_SPECULAR, LookScene, SPACE, add_environment, battle_look,
-    dress_battle, fill_direction, particle_settings, spawn_asteroids, spawn_battle, spawn_engines, spawn_fill,
-    spawn_look, spawn_previews, spawn_ship, spawn_sun, turn_previews,
+    dress_battle, fill_direction, fill_lift, particle_settings, spawn_asteroids, spawn_battle, spawn_engines,
+    spawn_fill, spawn_look, spawn_previews, spawn_ship, spawn_sun, turn_previews,
 };
 
 use crate::Story;
 use space3d_core::prelude::*;
-use space3d_particles::ParticlesPlugin;
+use space3d_particles::{ParticleSettings, ParticlesPlugin};
 use space3d_render::{DownlevelOverride, DrawPath, FrameSettings, GraphicsQuality, RenderAssets, RenderSettings};
 use std::sync::OnceLock;
 
@@ -79,6 +79,18 @@ fn webgl2_device(app: &mut App) {
     });
 }
 
+/// The stories' particle settings: the WebGL2 stories show what the web build (wasm32) runs
+/// at Low whatever the tier (`ParticleSettings::for_quality_web`: the CPU backend's 8 192,
+/// spawn quality 0.1, detail layers left out — T3's budget), the native ones the tier's on
+/// this device ([`particle_settings`]).
+fn story_particle_settings(app: &App, quality: GraphicsQuality, webgl2: bool) -> ParticleSettings {
+    if webgl2 {
+        ParticleSettings::for_quality_web(GraphicsQuality::Low)
+    } else {
+        particle_settings(&app.resources, quality)
+    }
+}
+
 fn look_story(webgl2: bool) -> Story {
     let id = if webgl2 {
         "Engine/Showcase/WebGL2 SpaceCorps Look"
@@ -88,10 +100,12 @@ fn look_story(webgl2: bool) -> Story {
     let description = if webgl2 {
         "The SpaceCorps Look on a WebGL2-class device (`DownlevelOverride::webgl2()`: no compute, \
          no float render targets, CPU-built draws) at `GraphicsQuality::Low`, the tier \
-         `recommended` picks there: the particles on the CPU backend (16k budget, fewer \
-         spawns), the Ldr fallback (per-fragment AgX punchy, no bloom), FXAA Low, a 1024² PCF4 \
-         shadow, the Classic shading model with the 128² environment bake, render scale 0.75. \
-         The same scene, knobs and content as the native story."
+         `recommended` picks there: the particles as the web build runs them (the CPU \
+         backend's 8k budget, fewer spawns, no engine sparks or heat haze), the Ldr fallback \
+         (per-fragment AgX punchy, no bloom), FXAA Low, a 1024² PCF4 shadow, the Classic \
+         shading model with the 128² environment bake, render scale 0.75, the fill rig raised \
+         for the missing bloom veil (`fill_lift`). The same scene, knobs and content as the \
+         native story."
     } else {
         "Every graphics feature in the SpaceCorps look: a close-up skirmish from the game's \
          top-down camera. Procedural hulls with all four maps (base color, packed ORM, normal, \
@@ -111,7 +125,7 @@ fn look_story(webgl2: bool) -> Story {
             webgl2_device(app);
         }
         let quality = TIERS[k.choice("quality").min(3)];
-        let settings = particle_settings(&app.resources, quality);
+        let settings = story_particle_settings(app, quality, webgl2);
         app.add_plugin(ParticlesPlugin::with_settings(settings));
         let assets = story_content().upload(app.resources.init::<RenderAssets>());
         spawn_look(
@@ -148,9 +162,10 @@ fn battle_story(webgl2: bool) -> Story {
     };
     let description = if webgl2 {
         "The Battle reference scene on a WebGL2-class device (`DownlevelOverride::webgl2()`) at \
-         `GraphicsQuality::Low`: the particles' CPU backend holds the battle in its 16k budget \
-         (fewer spawns, nothing off screen), no float targets (no bloom), FXAA Low, render \
-         scale 0.75 — what the web build shows."
+         `GraphicsQuality::Low`: the particles as the web build runs them \
+         (`ParticleSettings::for_quality_web`), the CPU backend holding the battle in T3's 8k \
+         budget (fewer spawns, no engine sparks or heat haze, nothing off screen), no float \
+         targets (no bloom), FXAA Low, render scale 0.75 — what the web build shows."
     } else {
         "The graphics spec's Battle reference scene (§4.4) at `GraphicsQuality::High`, 2 s in, \
          through the game's battle camera (432 units away, 70° pitch): 300 ships of three \
@@ -167,7 +182,7 @@ fn battle_story(webgl2: bool) -> Story {
             webgl2_device(app);
         }
         let quality = TIERS[k.choice("quality").min(3)];
-        let settings = particle_settings(&app.resources, quality);
+        let settings = story_particle_settings(app, quality, webgl2);
         app.add_plugin(ParticlesPlugin::with_settings(settings));
         let scene = BattleScene {
             quality,
@@ -193,7 +208,6 @@ fn battle_story(webgl2: bool) -> Story {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use space3d_particles::ParticleSettings;
     use space3d_test::TestApp;
 
     /// The showcase's lighting rig keeps the sides the sun does not reach readable (M2 final
@@ -246,8 +260,14 @@ mod tests {
                 let _ = app.world.despawn(sun);
             }
             if rig {
-                add_environment(&mut app.world, &mut app.resources, &assets, camera);
-                spawn_fill(&mut app.world);
+                add_environment(
+                    &mut app.world,
+                    &mut app.resources,
+                    &assets,
+                    camera,
+                    GraphicsQuality::High,
+                );
+                spawn_fill(&mut app.world, GraphicsQuality::High);
             } else {
                 // Before the M2 final review.
                 let _ = app.world.insert_one(
@@ -311,6 +331,18 @@ mod tests {
                     ParticleSettings::for_quality(GraphicsQuality::Low)
                 );
             });
+            // The WebGL2 stories run the web build's particles (T3's 8k), whatever the tier.
+            for story in [battle_story(true), look_story(true)] {
+                let mut knobs = crate::KnobValues::default();
+                knobs.set("quality", crate::KnobValue::Choice(2));
+                let app = crate::story_app(&story, &knobs, Some((64, 36)));
+                assert_eq!(
+                    *app.resources.expect::<ParticleSettings>(),
+                    ParticleSettings::for_quality_web(GraphicsQuality::Low),
+                    "{}",
+                    story.id
+                );
+            }
         }
     }
 }

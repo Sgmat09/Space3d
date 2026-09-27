@@ -240,16 +240,24 @@ lost in every shadow. Plan the fill as a ratio of the key light:
   (the showcase's nebula, irradiance ≈ 0.03: `ENV_DIFFUSE = 6`). The specular intensity is tuned
   on its own (reflections of a dark zenith: `ENV_SPECULAR = 2.5`).
 * **A fill light** gives the shadowed sides shape: a shadowless `DirectionalLight` from the side
-  opposite the sun and a little from below (the nebula's glow bouncing up), in the nebula's hue,
-  at about 15 % of the sun (the showcase: 0.35 violet against a 2.2 sun; `spawn_fill`,
-  `fill_direction`). It costs one light in the forward loop.
+  opposite the sun and a little from below (the nebula's glow bouncing up), in a muted version of
+  the nebula's hue, at about 15 % of the sun (the showcase: 0.35 lavender, (0.59, 0.53, 0.82),
+  against a 2.2 sun; `spawn_fill`, `fill_direction`). It costs one light in the forward loop. Keep
+  its color muted and let the diffuse lighting carry the nebula's: from a top-down camera the fill
+  reaches few visible faces but crease walls at grazing angles, and a saturated violet (0.62, 0.5,
+  1.0) outlined them in thin violet slivers.
+* **Per tier.** The lower tiers darken shadows on screen: they lose bloom's veil (Medium's is
+  smaller, Low's smaller still, none without float render targets) and, at Low, GGX shading. With
+  one rig a top in a cast shadow read 6.4 % of a sunlit one at High, 4.3 % at Medium, 3.4 % at Low
+  and 2.4 % on WebGL2 (the Look, 1080p). The showcase raises the diffuse intensity, the ambient and
+  the fill by `showcase::fill_lift` (× 1.3 at Medium, × 1.8 at Low): 6.2 %, 8.6 % and 5.9 %.
 * **`AmbientLight`** stays faint (0.03 in the showcase): it is flat, and what lights a scene
   before its environment is baked.
 
 The showcase's rig (`space3d_stories::showcase::{add_environment, spawn_sun, spawn_fill}`) gives
 a side facing away from the sun 15 % of a sunlit top's light, a side facing the sun 72 % and a
-top in a cast shadow 17 % (`showcase::tests::fill_keeps_shadowed_sides_readable`; before the M2
-final review 1.6 % and 3 %).
+top in a cast shadow 17 % at High (`showcase::tests::fill_keeps_shadowed_sides_readable`; before
+the M2 final review 1.6 % and 3 %).
 
 `EnvironmentLight::new` keeps both intensities at 1: radiance-true, right for a bright sky (a
 studio or daylight HDR, whose irradiance already fills the shadows). The dark-sky tuning above
@@ -437,8 +445,9 @@ the prewarm builds no pipeline for them (`prewarm_builds_what_materials_draw_wit
   0.28 ms at 2048² (`shadow_map_gate`, gate 0.30 ms; the same cubes from an explicit instance
   buffer cost the same); the depth view adds 0.1 ms of CPU at 100k entities on GPU draw paths and
   0.4 ms on `CpuDirect` (`materials/shadow_view/*`). A bake is one-time: 1024² faces → 256² specular + 32² irradiance
-  in about 1–2 ms of GPU on the dev machine with compute (`ibl_bake_gate`, gate ≤ 3 ms for LDR
-  faces, HDR faces and an HDR panorama: 0.5–1.3, 1.8 and 2.0–2.2 ms), many ms with render passes (each
+  in well under a millisecond of GPU on the dev machine with compute (`ibl_bake_gate`, gate ≤ 3 ms
+  for LDR faces, HDR faces and an HDR panorama, the first of each kind included, on a loaded GPU:
+  0.3–0.4, 0.5–0.7 and 0.6–1.0 ms; 2–5 times that on an idle GPU at a low clock), many ms with render passes (each
   pass has a fixed cost of tens of µs to a few hundred on Metal, and holds driver memory while its
   frame is in flight: 102 of them for LDR faces, 108 for an `Rg11b10Ufloat` sky, against 17–18
   dispatches in one compute pass).

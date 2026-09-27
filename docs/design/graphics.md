@@ -1868,13 +1868,23 @@ each other instead of through), and the sun has a shadowless violet fill `Direct
 with the sky's diffuse IBL at 6: shadowed sides get about 15 % of a sunlit top's light instead of 1.6 % (black after
 tonemapping; `docs/graphics/materials.md`, "Fill light").
 
+*(Amended at the M2 final review's verification.)* The fill's hue is muted to lavender (0.59, 0.53, 0.82, the same
+luminance): the saturated violet outlined crease walls in thin violet slivers. Below High the rig is raised by
+`showcase::fill_lift` (diffuse IBL, ambient and fill × 1.3 at Medium, × 1.8 at Low): those tiers lose bloom's veil
+and GGX shading, and a top in a cast shadow fell to 4.3 % (Medium), 3.4 % (Low) and 2.4 % (WebGL2) of a sunlit top
+on screen against 6.4 % at High; with the lift Medium reads 6.2 %, Low 8.6 %, WebGL2 5.9 %. The asteroids are cube spheres whose faces each map
+one tile of border-symmetric detail maps: a UV sphere's pole pinched the maps into a starburst.
+
 *(Amended at the M2 final review.)* T3's 8k: the Battle at Low refused layer instances from about 5 s in (engine
 plumes and afterburners dropped on the web; the calibration test stopped at 5 s). On the web
 `ParticleSettings::for_quality(Low)` now uses quality 0.1 (0.125), the built-ins leave their detail layers out below
 quality 0.3 (`ParticleLayer::min_quality`: engine sparks and heat haze) and their plumes outrank combat leftovers
 under a full budget (`ParticleLayer::priority`: plumes `Normal`, an explosion's smoke and embers `Low`).
 `tests/battle.rs::battle_fits_the_web_budget_at_low` holds 20 s at 16:9 with four seeds without a refusal (the
-busiest tick at 84 % of the engines' 75 % share); at 21:9 details are refused, never a plume.
+busiest tick at 84 % of the engines' 75 % share). At 21:9 the budget binds with two of the four seeds (seed 1: 103
+layer instances refused; seed 4: 226 refused, 3 shrunk; seeds 2 and 3: none), and with every seed every engine in
+view burns at every tick checked (every 10th) and every explosion plays. The `WebGL2 *` stories run these web
+settings (`ParticleSettings::for_quality_web(Low)`), as the web build does.
 
 **GPU budget per phase** (design targets per tier; `GpuTimings` labels in brackets):
 
@@ -1981,6 +1991,13 @@ more. Record those figures for reference; they are not the gate.
   memory (+33.5 MB for a 1024² sky) rather than 66 render passes once (7.6–9.6 ms of GPU on Dev). The trade
   touches HDR skies on WebGPU only: 8-bit skies (the game's) stay `Rgba8UnormSrgb` everywhere, and the web's
   recommended 512² faces cost 16.8 MB as `Rgba16Float` with mips. `ibl_bake_gate` gates all three skies.
+  *(Amended at the M2 final review's verification.)* The gate measured medians of 5 on a nearly idle GPU: it passed
+  round 1's fallback in 2 of 6 runs (its warm uploads cost 2.2–3.5 ms; the cold first one, what a game pays, 7.6–9.3)
+  and failed the fix in 3 of 20 (an Apple GPU idling at a low clock takes 2–5× longer, run to run). It now keeps the
+  GPU loaded (a compute load of about 4 ms runs to completion before every frame), gates the first (cold) cubemap
+  of a fresh renderer as well as the median of 5, and asserts every upload's and bake's steps (one dispatch per mip
+  where compute exists): 0.3–0.4 / 0.5–0.7 / 0.6–1.0 ms for LDR faces, HDR faces and the HDR panorama, cold and
+  warm alike (10 runs), while the round-1 fallback fails on its steps (66, 67) and its 7.3–9.5 ms cold upload.
 * *(Amended at M1.1, measured on Dev: `docs/performance.md` "F7 / F8 and M1.1".)* The figures above are textures.
   With the half-rect prefilter the bloom chain's textures are 2.8 MB at 1080p (`Rg11b10Ufloat`), 11.1 MB at 4K
   and, for T3's Low chain at 1440 × 810, 1.9 MB (`Rg11b10Ufloat`) or 3.7 MB (`Rgba16Float`, the format ANGLE and
@@ -2597,6 +2614,17 @@ lands during PM3/PM4 → PM5; PA4 after PO5 → I.
   * **wasm budgets** (§4.4, "measured manually … in Phase I"): the web build compiles and links for wasm32 and
     the Low look is covered by the `WebGL2 *` stories and the ANGLE runs, but no browser measurement was taken
     (no wasm-bindgen toolchain on the build machine).
+* *(Added at the M2 final review's verification; M3.)*
+  * **Soft particles over MSAA edges:** soft particles draw after a depth resolve that keeps the nearest sample, so
+    behind a partly covered edge pixel they fade out and the silhouette in front of a large bright additive glow
+    stair-steps (the Look's enemy wing over its shield glow at High). Accepted in `frame.md` (edge aliasing
+    instead of halos); an edge-aware fade, or large additive glows drawn inside the MSAA pass, would keep the
+    edge's anti-aliasing.
+  * **Triplanar or object-space detail mapping** (`Material`): the showcase rocks' detail maps are UV-mapped on a
+    cube sphere (no pole, no seam), but steep crater walls still stretch them into streaks.
+  * **Feature stories on the fill rig:** `Engine/Lights/Directional Shadow` has no fill or environment (its cast
+    shadows are black), and the `Skybox` / `Nebula Ship` stories' small skies draw stars as 3–5 px soft ovals at
+    1080p. The showcase is the reference rig for games (`materials.md`, "Fill light").
 
 ---
 

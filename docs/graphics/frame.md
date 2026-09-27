@@ -256,7 +256,10 @@ Write shaders that handle all three accesses: `s3d_depth_valid()` is false with 
 `s3d_soft_fade` then returns 1 and `s3d_scene_occluded` false; use
 `target.depth_stencil(compare, false)` (it is `None` without a depth attachment). The minimum of
 the samples is conservative: readers behind partially covered silhouette pixels are hidden
-(slight edge aliasing instead of halos). Group 1 samples depth through a nearest sampler
+(slight edge aliasing instead of halos: a silhouette in front of a large, bright additive glow
+stair-steps where the same edge over the sky is anti-aliased — the Look's enemy wing over its
+shield glow at High; an edge-aware fade or drawing such glows inside the MSAA pass is an M3
+item, graphics spec §6.2). Group 1 samples depth through a nearest sampler
 (binding 2): WebGL2 reads depth textures as 0 through `textureLoad`. `DownlevelOverride {
 no_read_only_depth: true, .. }` forces the WebGL2 rows on any device.
 

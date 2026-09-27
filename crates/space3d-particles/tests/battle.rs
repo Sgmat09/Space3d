@@ -35,7 +35,8 @@ struct Outcome {
     effects: u32,
     refused: u32,
     shrunk: u32,
-    /// Engines in view (a 16:9 frame), and those without a ring.
+    /// Engines in view at the end (the frame's aspect ratio, 60° fov), and the most of those in
+    /// view without a ring at any tick checked (every 10th).
     engines_in_view: u32,
     engines_in_view_empty: u32,
     /// Explosions spawned, and those without a ring on their first tick.
@@ -60,8 +61,12 @@ fn run_for(settings: ParticleSettings, size: (u32, u32), seed: u32, ticks: u32) 
     );
     let mut o = Outcome::default();
     let mut checked = 0;
-    for _ in 0..ticks {
+    for tick in 1..=ticks {
         app.step_ticks(1);
+        if tick % 10 == 0 {
+            let (_, empty) = engines_in_view(&app, size);
+            o.engines_in_view_empty = o.engines_in_view_empty.max(empty);
+        }
         let s = stats(&app);
         o.refused += s.refused;
         o.shrunk += s.shrunk;
@@ -79,29 +84,39 @@ fn run_for(settings: ParticleSettings, size: (u32, u32), seed: u32, ticks: u32) 
     }
     let s = settled_stats(&mut app);
     (o.alive, o.reserved, o.capacity, o.effects) = (s.alive, s.pool_reserved, s.pool_capacity, s.effects);
-    // Engines in view of the camera (16:9, 60° fov).
+    let (in_view, empty) = engines_in_view(&app, size);
+    o.engines_in_view = in_view;
+    o.engines_in_view_empty = o.engines_in_view_empty.max(empty);
+    assert_eq!(gpu_errors(&app), 0);
+    Some(o)
+}
+
+/// Engine exhausts in view of the camera (a frame of `size`, 60° fov), and those without a
+/// ring.
+fn engines_in_view(app: &App, size: (u32, u32)) -> (u32, u32) {
     let (cam_pos, cam_rot) = {
         let mut q = app.world.query::<(&Transform, &Camera3d)>();
         let (t, _) = q.iter().next().expect("camera");
         (t.translation, t.rotation)
     };
     let tan = 30f32.to_radians().tan();
+    let aspect = size.0 as f32 / size.1 as f32;
     let rt = app.resources.expect::<ParticleRuntime>();
+    let (mut in_view, mut empty) = (0, 0);
     for (e, em, g) in app.world.query::<(Entity, &ParticleEmitter, &GlobalTransform)>().iter() {
         if em.effect != builtin::ENGINE_EXHAUST {
             continue;
         }
         let v = cam_rot.inverse() * (g.0.w_axis.truncate() - cam_pos);
         let depth = -v.z;
-        if depth > 0.0 && v.y.abs() <= depth * tan && v.x.abs() <= depth * tan * 16.0 / 9.0 {
-            o.engines_in_view += 1;
+        if depth > 0.0 && v.y.abs() <= depth * tan && v.x.abs() <= depth * tan * aspect {
+            in_view += 1;
             if rt.state(e).is_none_or(|s| s.reserved == 0) {
-                o.engines_in_view_empty += 1;
+                empty += 1;
             }
         }
     }
-    assert_eq!(gpu_errors(&app), 0);
-    Some(o)
+    (in_view, empty)
 }
 
 /// Every tier holds the battle: no refused or shrunk layers, every engine in view burning,
@@ -157,12 +172,14 @@ fn battle_fits_every_quality_tier() {
 /// T3's budget (graphics spec §4.4: WebGL2 at 1440 × 810, the CPU backend's 8 192 on the web)
 /// holds the Battle at Low for 20 s through the game's camera at T3's 16:9 (the on-screen test
 /// depends on the aspect ratio only), whatever the battle's seed: no layer instance refused or
-/// shrunk, every engine in view burning, every explosion playing (M2 final review: at 0.125,
-/// without detail layers left out and with the plumes as `Low` as the rest of the engine,
-/// refusals began 5.2 s in and dropped engine plumes and afterburners). The peak reservation
-/// stays below the engines' 75 % with a margin. Wider than 16:9 (21:9) more engines are in
-/// view and the budget binds: details are refused, never a plume — every engine in view keeps
-/// burning.
+/// shrunk, every engine in view burning at every tick checked, every explosion playing (M2
+/// final review: at 0.125, without detail layers left out and with the plumes as `Low` as the
+/// rest of the engine, refusals began 5.2 s in and dropped engine plumes and afterburners). The
+/// peak reservation stays below the engines' 75 % with a margin. Wider than 16:9 (21:9) more
+/// engines are in view and with some seeds the budget binds (seeds 1 and 4 of these four:
+/// 103 and 226 layer instances refused, 3 shrunk with seed 4; the plumes outrank the details
+/// they refuse), yet every engine in view keeps burning at every tick checked and every
+/// explosion plays, whatever the seed.
 #[test]
 fn battle_fits_the_web_budget_at_low() {
     let settings = ParticleSettings::for_quality_web(GraphicsQuality::Low);
@@ -181,13 +198,22 @@ fn battle_fits_the_web_budget_at_low() {
         assert!(o.explosions > 600, "seed {seed}: {o:?}");
         assert_eq!(o.explosions_empty, 0, "seed {seed}: every explosion plays");
     }
-    let Some(o) = run_for(settings, (840, 360), 1, 1200) else {
-        return;
-    };
-    eprintln!("21:9: {o:?}");
-    assert!(o.engines_in_view > 100, "{o:?}");
-    assert_eq!(o.engines_in_view_empty, 0, "21:9: the plumes outrank the details");
-    assert_eq!(o.explosions_empty, 0, "21:9: every explosion plays");
+    let mut bound = 0;
+    for seed in 1..=4 {
+        let Some(o) = run_for(settings.clone(), (840, 360), seed, 1200) else {
+            return;
+        };
+        eprintln!("21:9, seed {seed}: {o:?}");
+        bound += u32::from(o.refused + o.shrunk > 0);
+        assert!(o.engines_in_view > 100, "seed {seed}: {o:?}");
+        assert_eq!(
+            o.engines_in_view_empty, 0,
+            "21:9, seed {seed}: the plumes outrank the details"
+        );
+        assert_eq!(o.explosions_empty, 0, "21:9, seed {seed}: every explosion plays");
+    }
+    // The case above is exercised: the budget binds at 21:9 with some of the seeds.
+    assert!(bound > 0, "21:9: no seed reached the budget");
 }
 
 /// The GPU cost of the battle's particles at 1080p through `PostProcess::default()` on the Dev

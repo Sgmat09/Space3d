@@ -572,7 +572,7 @@ each gate run alone, but the GPU was shared: another app kept it at 72–78 % de
 |---|---|---|---|
 | shadow 2048², 100k instanced casters ≤ 0.30 ms | `--test shadows -- --ignored shadow_map_gate` | ECS 0.277 / 0.277 / 0.278 ms (3 runs, `GpuMultiDraw`) | met |
 | forward full screen, all maps + IBL + PCF9 ≤ +0.20 ms | `--test environment -- --ignored forward_full_screen_gate` | legacy 0.181 → 0.298 ms, paired +0.121 ms | met |
-| IBL bake ≤ 3 ms (1024² faces) | `--test environment -- --ignored ibl_bake_gate` | compute 0.98 ms (upload 0.32 + bake 0.66); fragment path 5.5 ms (recorded); HDR skies gated since the M2 final review (below) | met |
+| IBL bake ≤ 3 ms (1024² faces) | `--test environment -- --ignored ibl_bake_gate` | compute 0.98 ms (upload 0.32 + bake 0.66); fragment path 5.5 ms (recorded); HDR skies gated since the M2 final review, on a loaded GPU with cold uploads and steps since its verification: 0.3–1.0 ms (below) | met |
 | all post ≤ 0.60 ms | `cargo bench -p space3d-render --bench post -- post/gate` | 0.405 ms over Direct (throughput) | met |
 | particles 100k: sim + compaction ≤ 0.06 ms, draw ≤ 0.40 ms | `-p space3d-particles --lib -- --ignored gpu_100k_within_budget` | 0.048 ms; 0.382 ms into the HDR scene texture | met |
 | bloom 6 levels at 1080p ≤ 0.20 ms | `--lib -- --ignored bloom_gate_1080p` | best 0.193 ms in the first invocation; 0.211 and 0.232 ms (best of 3 runs each) in the next two | soft: the test's own note says 30–70 % device utilization from other apps reads 0.19–0.30 ms; the lane measured 0.15–0.17 ms on an idle GPU |
@@ -824,3 +824,68 @@ details, combat's leftovers) refused, no plume (`tests/battle.rs::battle_fits_th
 **Other gates on this tree.** `battle_gpu_cost` passes (particle draws 0.300 ms);
 `battle_steady_state` and `battle_steady_state_low_and_medium`: no reallocations, no textures or
 render objects created in the steady state.
+
+### M2 final review, verified — the IBL gate, T3 at 21:9, rocks and the lower tiers' shadows
+
+Graphics maintainer, answering the verifiers of the M2 final review. Dev machine (M4 Max, Metal),
+release; load averages 4–10 (a simulator app at 100 % throughout).
+
+**`ibl_bake_gate` on a loaded GPU, cold uploads gated, steps pinned.** The gate took medians of 5
+cubemaps on a nearly idle GPU. An Apple GPU idling at a low clock runs the same upload and bake
+2–5 times slower, at a clock that changes from run to run: the HDR panorama read 1.94–3.18 ms
+over 20 quiet runs of 1399f68 (3 over the line), and with round 1's render-pass fallback put back
+(`compact` from `compact_hdr_format`, `Writes::new(compute, false)`: 66 steps for HDR faces) the
+gate still passed 2 of 6 runs, because the median dropped the cold first upload — 7.6–9.3 ms, what
+a game pays — while warm ones cost 2.2–3.5 ms. The gate now runs a calibrated compute load of about
+4 ms to completion before every frame (it never overlaps the timed passes; the GPU clocks as it
+does under a game's frames), gates the first cubemap of a fresh renderer (cold) as well as the
+median of 5, and asserts every upload's and bake's steps against `gate_steps` (one dispatch per
+mip where compute exists: 10 / 11 / 12 + 7). Ten interleaved runs of each tree:
+
+| upload + bake, ms (10 runs) | LDR faces | HDR faces | HDR panorama | gate |
+|---|---|---|---|---|
+| this commit, cold / median of 5 | 0.31–0.43 / 0.31–0.40 | 0.51–0.66 / 0.51–0.58 | 0.60–0.97 / 0.61–0.68 | 10 of 10 pass |
+| round-1 fallback (mutation), cold / median of 5 | 0.31–0.42 / 0.31–0.34 | 7.29–8.34 / 1.46–2.47 | 7.99–9.53 / 2.14–2.69 | 10 of 10 fail: steps (66, 7) and (67, 7), and the cold uploads |
+| fragment path (WebGL2's, recorded), cold / median | 8.2–10.1 / 2.8–3.5 | 8.1–10.1 / 2.9–3.5 | 9.6–11.4 / 3.6–4.5 | — (T3: ≤ 50 ms total, ≤ 8 per frame) |
+
+Under the load the cold upload costs what a warm one does (the fix's cold samples over 3 ms at
+1399f68 were the idle clock, not the first upload), while the fallback's cold upload stays at
+7–9 ms: its first render passes into a fresh cube. The unit test
+`lighting::tests::hdr_sky_upload_steps_and_format` keeps catching the fallback as well (42 steps
+for 7).
+
+**The Battle's CPU gate.** `render_frame` at High reads 1.33–1.42 ms in quiet windows (3 runs; GPU
+frame 1.47–1.65 ms), 2–11 % under the 1.5 ms line, and anything else on the machine only adds. A
+High window over a line is now measured again, up to three windows of 60 frames, and each
+figure's best window is gated: a regression fails all three, a burst from another process one
+(forced with `SPACE3D_PERF_BUDGET_SCALE=0.85`: 1.361, 1.339, 1.401 ms, gated 1.339).
+
+**T3 at 21:9, every seed.** `battle_fits_the_web_budget_at_low` ran 21:9 with seed 1 only and
+counted engines in a 16:9 frame at the last tick. It now checks the frame's own aspect ratio every
+10th tick and runs 21:9 with seeds 1–4: seed 1 refuses 103 layer instances, seed 4 refuses 226 and
+shrinks 3, seeds 2 and 3 none; with every seed no engine in view goes dark at any tick checked and
+every explosion plays. 16:9 is unchanged (no refusal, peaks 4 481–5 187 slots).
+
+**The WebGL2 stories run the web's particles.** `WebGL2 SpaceCorps Look` and `WebGL2 Battle` used
+native Low's settings (16 384, quality 0.25) where the web build uses 8 192 and 0.1; they now use
+`ParticleSettings::for_quality_web(Low)` (goldens re-blessed: fewer sparks and debris, a smaller
+explosion cloud).
+
+**Rocks without a pole.** The asteroids were 64 × 40 UV spheres: at the poles `u` collapses and
+the tiling detail maps pinched into a radial starburst (the Look's hero rock at tick 10). They are
+now cube spheres, 6 × 20 × 20 quads (4 800 triangles and 2 646 vertices against 5 120 and 2 665),
+each face one tile of the maps. The maps' noise has border-symmetric lattice values
+(`noise2_border_symmetric`): along every tile border it is the same function in every orientation
+and flat across it, so faces meeting turned or mirrored join without a seam
+(`showcase::content::tests::{asteroids_are_closed_and_welded, rock_noise_joins_at_the_borders}`:
+at 128²–512² the maps' albedo mismatch across a border is 10–15 % of neighbouring texels'
+difference, the normals' slope along it 4–13 %). Steep crater walls still stretch the detail (as before: a
+triplanar mapping is an M3 item, graphics spec §6.2).
+
+**The lower tiers' shadows.** With one rig a top in a cast shadow read, over a sunlit one on
+screen (the Look, 1080p, display-linear): 6.4 % at High, 4.3 % Medium, 3.4 % Low, 2.4 % WebGL2
+— bloom's veil shrinks and disappears down the tiers and Low shades Classic. `showcase::fill_lift`
+raises the diffuse lighting, the ambient and the fill × 1.3 at Medium and × 1.8 at Low: 6.2 %,
+8.6 % and 5.9 %; High and Ultra are unchanged. The fill's hue is muted from violet (0.62, 0.5, 1.0)
+to lavender (0.59, 0.53, 0.82) at the same luminance: the violet slivers along crease walls go
+(`fill_keeps_shadowed_sides_readable`: 14.8 %, 71.6 %, 17.1 %, as before).

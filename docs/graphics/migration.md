@@ -293,7 +293,9 @@ or build it from the six images the game already loads:
   irradiance is about 0.03 needs about 6), and add a shadowless `DirectionalLight` from the side
   opposite the sun and a little from below, in the nebula's hue, at about 15 % of the sun — the
   showcase's rig (`space3d_stories::showcase::{add_environment, spawn_fill}`: diffuse 6,
-  specular 2.5, a 0.35 violet fill against a 2.2 sun) gives 15 %. Keep the ambient faint.
+  specular 2.5, a 0.35 lavender fill against a 2.2 sun, all raised × 1.3 at Medium and × 1.8 at
+  Low by `fill_lift`) gives 15 %. Keep the fill's color muted (a saturated one outlines crease
+  walls) and the ambient faint.
   [`materials.md`](materials.md#fill-light-dark-skies) explains the ratio. The backdrop variant
   (`spawn_backdrop_sky`, softened highlights under the station panels) becomes a second cubemap
   built from softened images, or the same one with a lower `Skybox::intensity`.

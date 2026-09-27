@@ -76,14 +76,44 @@ fn noise2(x: f32, y: f32, period: i32, seed: u32) -> f32 {
 
 /// Tiling fractal noise over the unit square (`base` cells at the first octave).
 fn fbm2(u: f32, v: f32, base: i32, seed: u32, octaves: u32) -> f32 {
+    fbm2_with(noise2, u, v, base, seed, octaves)
+}
+
+/// [`fbm2`] made of `noise` octaves.
+fn fbm2_with(noise: fn(f32, f32, i32, u32) -> f32, u: f32, v: f32, base: i32, seed: u32, octaves: u32) -> f32 {
     let (mut sum, mut amp, mut cells, mut norm) = (0.0, 0.5, base, 0.0);
     for o in 0..octaves {
-        sum += amp * noise2(u * cells as f32, v * cells as f32, cells, seed.wrapping_add(o));
+        sum += amp * noise(u * cells as f32, v * cells as f32, cells, seed.wrapping_add(o));
         norm += amp;
         amp *= 0.5;
         cells *= 2;
     }
     sum / norm
+}
+
+/// [`noise2`] whose lattice values on the tile's borders are the same under the square's eight
+/// symmetries: the lattice point `(0, j)` shares its value with `(0, period − j)`, `(j, 0)` and
+/// `(period − j, 0)`. Along a border the noise is then the same function whichever way the tile
+/// is turned or mirrored, and across a border it is flat (value noise's smoothstep weights have
+/// no slope at lattice lines): tiles that meet at their borders in any orientation (the faces
+/// of [`asteroid_mesh`]) join without a seam, in value and in slope.
+fn noise2_border_symmetric(x: f32, y: f32, period: i32, seed: u32) -> f32 {
+    let (fx, fy) = (x.floor(), y.floor());
+    let (tx, ty) = (x - fx, y - fy);
+    let (ux, uy) = (tx * tx * (3.0 - 2.0 * tx), ty * ty * (3.0 - 2.0 * ty));
+    let w = |i: i32| i.rem_euclid(period);
+    let (x0, y0) = (fx as i32, fy as i32);
+    let v = |dx: i32, dy: i32| {
+        let (i, j) = match (w(x0 + dx), w(y0 + dy)) {
+            (0, j) => (j.min(period - j), 0),
+            (i, 0) => (i.min(period - i), 0),
+            ij => ij,
+        };
+        unit(hash(i, j, 0, seed))
+    };
+    let top = v(0, 0) + (v(1, 0) - v(0, 0)) * ux;
+    let bottom = v(0, 1) + (v(1, 1) - v(0, 1)) * ux;
+    top + (bottom - top) * uy
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -415,12 +445,73 @@ pub fn hull_mesh(kind: usize) -> MeshData {
     b.m
 }
 
-/// An asteroid of unit radius: a sphere (64 × 40) displaced by value noise with craters and a
+/// Quads along a cube face's edge in [`asteroid_mesh`].
+const ASTEROID_GRID: u32 = 20;
+
+/// A unit cube sphere: 6 faces of [`ASTEROID_GRID`]² quads, spaced by equal angles, each face
+/// its own vertices (the shared edges' positions are bitwise equal, so smooth normals weld
+/// them) and UVs spanning one tile of the rock maps, `0..1`. The four side faces run around
+/// +Y with `u` eastward (their shared edges continue the tile), the top and bottom faces meet
+/// them at the tile's borders in other orientations, which [`rock_maps`] makes seamless.
+fn cube_sphere() -> MeshData {
+    let n = ASTEROID_GRID;
+    // The cube coordinate of grid line `i`: `tan` of its angle, exactly ±1 at the edges and
+    // odd in `i − n/2` (bitwise), so neighbouring faces compute the same edge positions.
+    let coord = |i: u32| {
+        let k = (2 * i).abs_diff(n);
+        let c = if k == n {
+            1.0
+        } else {
+            (k as f32 / n as f32 * std::f32::consts::FRAC_PI_4).tan()
+        };
+        if 2 * i < n { -c } else { c }
+    };
+    // Outward axis, `u` axis, `v` axis.
+    let faces = [
+        (Vec3::Z, Vec3::X, Vec3::Y),
+        (Vec3::X, Vec3::NEG_Z, Vec3::Y),
+        (Vec3::NEG_Z, Vec3::NEG_X, Vec3::Y),
+        (Vec3::NEG_X, Vec3::Z, Vec3::Y),
+        (Vec3::Y, Vec3::X, Vec3::Z),
+        (Vec3::NEG_Y, Vec3::X, Vec3::Z),
+    ];
+    let mut m = MeshData::default();
+    for (axis, u_axis, v_axis) in faces {
+        let base = m.positions.len() as u32;
+        for j in 0..=n {
+            for i in 0..=n {
+                let p = axis + coord(i) * u_axis + coord(j) * v_axis;
+                // `+ 0.0`: no negative zeros.
+                let d = (p.normalize() + Vec3::ZERO).to_array();
+                m.positions.push(d);
+                m.normals.push(d);
+                m.uvs.push([i as f32 / n as f32, j as f32 / n as f32]);
+            }
+        }
+        let outward = u_axis.cross(v_axis).dot(axis) > 0.0;
+        let at = |i: u32, j: u32| base + j * (n + 1) + i;
+        for j in 0..n {
+            for i in 0..n {
+                let (a, b, c, d) = (at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
+                if outward {
+                    m.indices.extend([a, b, c, a, c, d]);
+                } else {
+                    m.indices.extend([a, c, b, a, d, c]);
+                }
+            }
+        }
+    }
+    m
+}
+
+/// An asteroid of unit radius: a cube sphere (6 × 20 × 20 quads: no poles, where a UV
+/// sphere's detail maps pinch into a starburst) displaced by value noise with craters and a
 /// fine octave (no faceted silhouette at the showcase's close-ups), smooth normals, per-vertex
 /// albedo (linear, multiplying the material: mottled rock, darker crater floors, paler dust on
-/// the high ground) and UVs tiling the rock detail maps ([`rock_maps`]) 4 × 2 times around it.
+/// the high ground) and UVs mapping one tile of the rock detail maps ([`rock_maps`]) onto each
+/// face, without seams.
 pub fn asteroid_mesh(seed: u32) -> MeshData {
-    let mut m = MeshData::sphere(1.0, 64, 40);
+    let mut m = cube_sphere();
     let mut colors = Vec::with_capacity(m.positions.len());
     for p in &mut m.positions {
         let d = Vec3::from_array(*p);
@@ -437,9 +528,6 @@ pub fn asteroid_mesh(seed: u32) -> MeshData {
         colors.push([a, a * (0.95 + 0.02 * warm), a * (0.88 + 0.06 * (1.0 - warm)), 1.0]);
     }
     m.colors = colors;
-    for uv in &mut m.uvs {
-        *uv = [uv[0] * 4.0, uv[1] * 2.0];
-    }
     space3d_assets::edit::mesh::recalculate_smooth_normals(&mut m);
     m
 }
@@ -454,18 +542,21 @@ pub struct RockMaps {
     pub normal: ImageData,
 }
 
-/// Generate the tiling rock detail maps at `n`² texels (at least 64).
+/// Generate the tiling rock detail maps at `n`² texels (at least 64). Their noise is the same
+/// along every border and flat across it ([`noise2_border_symmetric`]): a tile meets another
+/// turned or mirrored at a border without a seam (the cube faces of [`asteroid_mesh`]).
 pub fn rock_maps(n: u32) -> RockMaps {
     let n = n.max(64);
     let mut height = vec![0f32; (n * n) as usize];
     let mut base_color = ImageData::new(n, n);
     let srgb = |c: f32| (linear_to_srgb(c.clamp(0.0, 1.0)) * 255.0).round() as u8;
+    let fbm = |u, v, base, seed, octaves| fbm2_with(noise2_border_symmetric, u, v, base, seed, octaves);
     for y in 0..n {
         for x in 0..n {
             let (u, v) = ((x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32);
-            let grain = fbm2(u, v, 8, 131, 5);
-            let pits = (0.38 - fbm2(u, v, 16, 137, 3)).max(0.0);
-            let flecks = (fbm2(u, v, 32, 139, 2) - 0.68).max(0.0) * 3.0;
+            let grain = fbm(u, v, 8, 131, 5);
+            let pits = (0.38 - fbm(u, v, 16, 137, 3)).max(0.0);
+            let flecks = (fbm(u, v, 32, 139, 2) - 0.68).max(0.0) * 3.0;
             height[(y * n + x) as usize] = grain - 1.6 * pits;
             let c = (0.72 + 0.35 * (grain - 0.5) - 0.8 * pits + flecks).clamp(0.3, 1.0);
             base_color.set(x, y, [srgb(c), srgb(c * 0.98), srgb(c * 0.95), 255]);
@@ -1066,6 +1157,110 @@ mod tests {
         assert!(a.orm.pixels.chunks(4).any(|p| p[2] == 255));
         let lit = a.emissive.pixels.chunks(4).filter(|p| p[0] > 0).count();
         assert!(lit < 64 * 64 / 8, "{lit} emissive texels");
+    }
+
+    /// The asteroids are closed cube spheres wound outward, welded across the faces' edges
+    /// (equal normals and albedo where faces meet), with every face's UVs spanning one tile.
+    #[test]
+    fn asteroids_are_closed_and_welded() {
+        let m = cube_sphere();
+        let n = ASTEROID_GRID as usize;
+        assert_eq!(m.positions.len(), 6 * (n + 1) * (n + 1));
+        assert_eq!(m.indices.len(), 6 * n * n * 6);
+        for t in m.indices.chunks(3) {
+            let [a, b, c] = [0, 1, 2].map(|i| Vec3::from_array(m.positions[t[i] as usize]));
+            assert!((b - a).cross(c - a).dot(a + b + c) > 0.0, "wound outward");
+        }
+        // Every edge of the welded surface borders two triangles.
+        let key = |p: [f32; 3]| p.map(|v| (v * 1e5).round() as i64);
+        let mut edges = std::collections::HashMap::new();
+        for t in m.indices.chunks(3) {
+            for k in 0..3 {
+                let (a, b) = (
+                    key(m.positions[t[k] as usize]),
+                    key(m.positions[t[(k + 1) % 3] as usize]),
+                );
+                *edges.entry(if a < b { (a, b) } else { (b, a) }).or_insert(0) += 1;
+            }
+        }
+        assert!(edges.values().all(|&c| c == 2), "closed");
+        for seed in [3, 8] {
+            let a = asteroid_mesh(seed);
+            let mut seen: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
+            let mut shared = 0;
+            for (i, p) in a.positions.iter().enumerate() {
+                match seen.get(&key(*p)) {
+                    Some(&j) => {
+                        shared += 1;
+                        assert_eq!(a.normals[i], a.normals[j], "{seed}: welded normals");
+                        assert_eq!(a.colors[i], a.colors[j], "{seed}: continuous albedo");
+                    }
+                    None => {
+                        seen.insert(key(*p), i);
+                    }
+                }
+            }
+            // 12 edges of n + 1 vertices (the 8 corners are on three faces).
+            assert_eq!(shared, 12 * (n + 1) - 8, "{seed}");
+            assert!(a.uvs.iter().flatten().all(|&c| (0.0..=1.0).contains(&c)));
+        }
+    }
+
+    /// The rock maps' noise is the same along the tile's borders in every orientation and flat
+    /// across them, so cube faces meeting turned or mirrored show no seam.
+    #[test]
+    fn rock_noise_joins_at_the_borders() {
+        let f = |u: f32, v: f32| fbm2_with(noise2_border_symmetric, u, v, 8, 131, 5);
+        for i in 0..64 {
+            let t = (i as f32 + 0.37) / 64.0;
+            let b = f(0.0, t);
+            for (u, v) in [(t, 0.0), (1.0 - t, 0.0), (0.0, 1.0 - t), (1.0, t), (t, 1.0)] {
+                assert!((f(u, v) - b).abs() < 1e-5, "{t}: ({u}, {v})");
+            }
+            // Flat across (the finest octave, 128 cells, bends within 1e-4 by about 1e-5).
+            let e = 1e-4;
+            assert!((f(e, t) - f(-e, t)).abs() < 5e-5, "{t}: flat across");
+            assert!((f(t, e) - f(t, -e)).abs() < 5e-5, "{t}: flat across");
+        }
+        // The plain tiling noise differs along the borders (what the maps were before).
+        let g = |u: f32, v: f32| fbm2(u, v, 8, 131, 5);
+        assert!((0..64).any(|i| (g(0.0, i as f32 / 64.0) - g(i as f32 / 64.0, 0.0)).abs() > 0.05));
+        // The maps' bilinear samples on a border match the transposed ones much more closely
+        // than neighbouring texels inside the tile differ: the albedo, and the normals' slope
+        // along the border. Across it the slope a texel either side is at the maps' texel-to-
+        // texel noise (flat only on the border itself): no crease stands out.
+        for n in [128, 256, 512] {
+            let maps = rock_maps(n);
+            let albedo = |x: u32, y: u32| maps.base_color.get(x % n, y % n)[0] as f32;
+            // Slopes as encoded (x: −∂h/∂u, y: +∂h/∂v).
+            let slope = |x: u32, y: u32| {
+                let p = maps.normal.get(x % n, y % n);
+                Vec2::new(p[0] as f32 - 127.5, p[1] as f32 - 127.5)
+            };
+            let (mut seam, mut inside) = (0.0, 0.0);
+            let (mut along, mut across, mut inside_n) = (0.0, 0.0, 0.0);
+            for t in 0..n {
+                // Along the border u = 0 at v = t, and along v = 0 at u = t.
+                seam += ((albedo(0, t) + albedo(n - 1, t)) * 0.5 - (albedo(t, 0) + albedo(t, n - 1)) * 0.5).abs();
+                inside += (albedo(n / 2, t) - albedo(n / 2 + 1, t)).abs();
+                let (a, b) = (
+                    (slope(0, t) + slope(n - 1, t)) * 0.5,
+                    (slope(t, 0) + slope(t, n - 1)) * 0.5,
+                );
+                along += (a.y + b.x).abs();
+                across += a.x.abs() + b.y.abs();
+                inside_n += (slope(n / 2, t) - slope(n / 2 + 1, t)).abs().element_sum();
+            }
+            assert!(seam < 0.5 * inside, "{n}²: albedo seam {seam} vs neighbours {inside}");
+            assert!(
+                along < 0.5 * inside_n,
+                "{n}²: slope along {along} vs neighbours {inside_n}"
+            );
+            assert!(
+                across < inside_n,
+                "{n}²: slope across {across} vs neighbours {inside_n}"
+            );
+        }
     }
 
     #[test]

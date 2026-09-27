@@ -736,9 +736,11 @@ of the engine, the Battle refused layer instances from 5.2 s in (393 in 20 s; wi
 from the first seconds, at 21:9 at once) — engine plumes and afterburners were dropped. With the
 details left out, the plumes `Normal` and quality 0.1, four seeds run 20 s at 16:9 without a
 refusal; the busiest tick reserves 4 481–5 187 slots (seed 4: 84 % of the engines' 6 144). At
-21:9 more engines are in view and the budget binds (103 `Low` layer instances refused in 20 s:
-nozzle glows, shock diamonds, combat's smoke, embers and debris), but no plume: every engine in
-view burns.
+21:9 more engines are in view and with two of the four seeds the budget binds (seed 1: 103 `Low`
+layer instances refused in 20 s — nozzle glows, shock diamonds, combat's smoke, embers and
+debris; seed 4: 226 refused and 3 shrunk; seeds 2 and 3: none), yet with every seed every engine
+in view burns at every tick the test checks (every 10th, in the 21:9 frame) and every explosion
+plays. The `WebGL2 *` stories run these settings (`for_quality_web(Low)`), as the web build does.
 
 Story `Engine/Particles/Stress/Battle` renders it (knob `quality`).
 
@@ -875,6 +877,6 @@ and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 | lasers drawn in the egui overlay | `builtin::LASER_SHOT` per hitscan shot (`EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color)`, it despawns itself), or `LASER_BEAM` for a held laser (`beam_to(BeamEnd::Entity(..))`, looping: stop or despawn it); they are HDR particles now, so they bloom and sit in the scene's depth |
 | missiles, heavy hits, EMPs, repairs | `MISSILE_TRAIL` (follow the missile), `DEBRIS_SPARKS`, `EMP`, `REPAIR_BEAM` |
 | `1 − e^−x` soft clip in the overlay | `direct_soft_clip` in Direct mode and at render scales below 1 without post; with `PostProcess` the tonemapper and bloom take over |
-| the game's graphics quality setting | `ParticleSettings::for_quality(GraphicsQuality::…)` (Low on WebGL2: the CPU backend, 16k / 8k on the web, quality 0.25 / 0.1, off-screen engines culled, detail layers left out) |
+| the game's graphics quality setting | `ParticleSettings::for_quality(GraphicsQuality::…)` (Low on WebGL2: the CPU backend, 16k / 8k on the web, quality 0.25 / 0.1, off-screen engines culled, detail layers left out; `for_quality_web` gives the web's column on any target, as the `WebGL2 *` stories use it) |
 | heat haze, shockwaves (none in the game today) | built in: `EXPLOSION`, `WARP_IN` / `WARP_OUT`, `EMP`, `ENGINE_EXHAUST`, `ENGINE_AFTERBURNER` bend the image behind them through `PostProcess` (distortion on by default); custom ones with `SpriteRender::distortion(strength)` or `DistortionMaterial` meshes |
 | the battle camera's look | choose it explicitly (frame.md, "Choose the look explicitly"): `AgXPunchy` + 0.5 EV keeps faction exhaust, lasers and fire saturated but skews dim saturated nebulae toward their strongest channel; plain `AgX` with `ColorGrading::vivid()` keeps both; `KhronosPbrNeutralNoToe` passes display-authored art unchanged |

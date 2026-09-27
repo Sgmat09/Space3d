@@ -520,15 +520,22 @@ fn invalid_cubemap_fails() {
     assert_eq!(gpu_errors(&app), 0);
 }
 
+/// What [`ibl_bake_times`] measured for one sky: GPU times (`ibl.bake` scope) in ms, and the
+/// steps (`RenderStats::ibl_bake_passes`) of each cubemap's upload and bake.
+struct IblTimes {
+    /// Upload + bake of the first cubemap (cold: the renderer's first of its kind).
+    cold: f32,
+    /// Median upload + bake of the cubemaps.
+    median: f32,
+    steps: Vec<(u32, u32)>,
+    caps: GraphicsCaps,
+}
+
 /// The GPU time (`ibl.bake` scope) of uploading 5 cubemaps made by `make` (each uploaded in one
-/// frame, its environment baked in the next) at 1080p headless, the GPU kept busy by
-/// back-to-back frames: the median upload and the median bake, in ms. `None` without an adapter
-/// or `TIMESTAMP_QUERY`.
-fn ibl_bake_times(label: &str, no_compute: bool, make: &dyn Fn(u8) -> CubemapSource) -> Option<(f32, f32)> {
-    let median = |mut v: Vec<f32>| {
-        v.sort_by(f32::total_cmp);
-        v[v.len() / 2]
-    };
+/// frame, its environment baked in the next) at 1080p headless, the first on a fresh renderer.
+/// `loaded`: [`GpuLoad`] runs before every frame (the timed passes never overlap it), so the
+/// GPU clocks as it does under a game's frames. `None` without an adapter or `TIMESTAMP_QUERY`.
+fn ibl_bake_times(label: &str, no_compute: bool, loaded: bool, make: &dyn Fn(u8) -> CubemapSource) -> Option<IblTimes> {
     let mut app = headless_app(1920, 1080)?;
     if !app.resources.expect::<Renderer>().graphics_caps().timestamps {
         eprintln!("skipping: no TIMESTAMP_QUERY");
@@ -551,7 +558,13 @@ fn ibl_bake_times(label: &str, no_compute: bool, make: &dyn Fn(u8) -> CubemapSou
     let camera = app
         .world
         .spawn((Transform::from_xyz(0.0, 0.0, 3.0), Camera3d::default()));
+    // (A device without compute shaders runs unloaded.)
+    let compute = app.resources.expect::<Renderer>().graphics_caps().compute;
+    let load = (loaded && compute).then(|| GpuLoad::new(app.resources.expect::<Renderer>(), 4.0));
     let frame = |app: &mut App| {
+        if let Some(load) = &load {
+            load.run(app.resources.expect::<Renderer>());
+        }
         space3d_core::transform::propagate_transforms(&mut app.world);
         app.run_stage(Stage::Render);
         let _ = app
@@ -575,35 +588,166 @@ fn ibl_bake_times(label: &str, no_compute: bool, make: &dyn Fn(u8) -> CubemapSou
     for _ in 0..60 {
         frame(&mut app);
     }
-    let path = if no_compute { "fragment" } else { "default" };
-    let (mut uploads, mut bakes) = (Vec::new(), Vec::new());
+    let path = match (no_compute, loaded) {
+        (false, true) => "default path",
+        (false, false) => "default path, unloaded GPU",
+        (true, _) => "fragment path",
+    };
+    let (mut totals, mut steps) = (Vec::new(), Vec::new());
     for k in 0..5u8 {
         let cube = add_cubemap(&mut app, make(k));
         let f = frame(&mut app);
         let upload_steps = app.resources.expect::<RenderStats>().ibl_bake_passes;
-        uploads.push(timed(&mut app, f));
+        let upload = timed(&mut app, f);
         app.world.insert_one(camera, EnvironmentLight::new(cube)).unwrap();
         let f = frame(&mut app);
-        let steps = app.resources.expect::<RenderStats>().ibl_bake_passes;
-        bakes.push(timed(&mut app, f));
+        let bake_steps = app.resources.expect::<RenderStats>().ibl_bake_passes;
+        let bake = timed(&mut app, f);
         assert_eq!(
             app.resources.expect::<Renderer>().environment_state(cube),
             EnvironmentState::Ready
         );
         eprintln!(
-            "{label}, {path} path, cubemap {k}: upload {:.3} ms ({upload_steps} steps), bake {:.3} ms ({steps} steps)",
-            uploads[k as usize], bakes[k as usize]
+            "{label}, {path}, cubemap {k}: upload {upload:.3} ms ({upload_steps} steps), bake {bake:.3} ms ({bake_steps} steps)"
         );
+        totals.push(upload + bake);
+        steps.push((upload_steps, bake_steps));
         app.world.remove_one::<EnvironmentLight>(camera).unwrap();
         app.resources.expect_mut::<RenderAssets>().remove_cubemap(cube);
     }
     assert_eq!(gpu_errors(&app), 0);
-    let (upload, bake) = (median(uploads), median(bakes));
-    eprintln!(
-        "{label}, {path} path: upload {upload:.3} ms + bake {bake:.3} ms = {:.3} ms (medians)",
-        upload + bake
-    );
-    Some((upload, bake))
+    let cold = totals[0];
+    totals.sort_by(f32::total_cmp);
+    let median = totals[totals.len() / 2];
+    eprintln!("{label}, {path}: upload + bake {cold:.3} ms cold, {median:.3} ms median");
+    let caps = app.resources.expect::<Renderer>().graphics_caps().clone();
+    Some(IblTimes {
+        cold,
+        median,
+        steps,
+        caps,
+    })
+}
+
+/// A compute load of about `ms` of GPU time (calibrated by wall time), run to completion
+/// before each frame of [`ibl_bake_times`]: without it the gate's near-empty frames leave an
+/// Apple GPU at a low clock, where the same upload and bake take 2–5 times longer, depending
+/// on its power state from run to run.
+struct GpuLoad {
+    pipeline: wgpu::ComputePipeline,
+    bind: wgpu::BindGroup,
+    groups: u32,
+}
+
+impl GpuLoad {
+    fn new(r: &Renderer, ms: f32) -> Self {
+        let device = r.device();
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu load"),
+            source: wgpu::ShaderSource::Wgsl(
+                "@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+                 @compute @workgroup_size(64)
+                 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+                     var x = f32(id.x % 4096u) * 1e-4;
+                     for (var i = 0u; i < 2048u; i++) { x = fract(sin(x) * 43758.5453 + 0.1); }
+                     out[id.x % 65536u] = x;
+                 }"
+                .into(),
+            ),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gpu load"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu load"),
+            size: 65536 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu load"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        let mut load = Self {
+            pipeline,
+            bind,
+            groups: 256,
+        };
+        for _ in 0..8 {
+            let t = std::time::Instant::now();
+            for _ in 0..4 {
+                load.run(r);
+            }
+            let each = t.elapsed().as_secs_f32() * 1e3 / 4.0;
+            load.groups = ((load.groups as f32 * ms / each.max(0.01)) as u32).clamp(1, 65535);
+        }
+        load
+    }
+
+    fn run(&self, r: &Renderer) {
+        let mut encoder = r.device().create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.dispatch_workgroups(self.groups, 1, 1);
+        }
+        r.queue().submit([encoder.finish()]);
+        let _ = r.device().poll(wgpu::PollType::wait_indefinitely());
+    }
+}
+
+/// The gate's skies.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GateSky {
+    LdrFaces,
+    HdrFaces,
+    HdrPanorama,
+}
+
+impl GateSky {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LdrFaces => "LDR faces",
+            Self::HdrFaces => "HDR faces",
+            Self::HdrPanorama => "HDR panorama",
+        }
+    }
+
+    /// The sky's `k`th cubemap.
+    fn make(self, k: u8) -> CubemapSource {
+        match self {
+            Self::LdrFaces => ldr_gate_faces(k),
+            Self::HdrFaces => hdr_gate_faces(k),
+            Self::HdrPanorama => hdr_gate_panorama(k),
+        }
+    }
+}
+
+/// The upload and bake steps of a gate sky on the default path: one compute dispatch per mip
+/// where compute shaders exist, a render pass per face and mip elsewhere. 1024² faces: 10 mips
+/// below mip 0, after a conversion unless the cube keeps the source's format (LDR faces; HDR
+/// faces where `GraphicsCaps::hdr_sky_format` is `Rgba16Float`); the panorama renders its
+/// second mip first (a render pass) and is converted into the cube. The bake: 6 specular mips
+/// (256²) and the irradiance cube.
+fn gate_steps(sky: GateSky, caps: &GraphicsCaps) -> (u32, u32) {
+    use wgpu::TextureFormat as F;
+    let per_mip = if caps.compute { 1 } else { 6 };
+    let upload = match sky {
+        GateSky::LdrFaces => per_mip * 10,
+        GateSky::HdrFaces => per_mip * (10 + u32::from(caps.hdr_sky_format() != Some(F::Rgba16Float))),
+        GateSky::HdrPanorama => u32::from(caps.hdr_format == Some(F::Rgba16Float)) + per_mip * 11,
+    };
+    (upload, per_mip * 7)
 }
 
 /// 1024² LDR faces (an sRGB XOR pattern, varied by `k`).
@@ -668,12 +812,18 @@ fn hdr_gate_panorama(k: u8) -> CubemapSource {
 /// Perf gate "IBL bake" (graphics spec §4.4: one-time, ≤ 3 ms on T1; design-materials §9: a
 /// 1024² cubemap → 256² specular + 32² irradiance): the GPU time (`ibl.bake` scope) of the
 /// cubemap's upload (its conversion and mip chain) plus its environment bake, 1080p headless,
-/// the GPU kept busy by back-to-back frames; medians of 5 cubemaps, each uploaded in one frame
-/// and baked in the next. Three skies: 1024² LDR faces, 1024² HDR faces (`Rgba16Float`, the
-/// showcase's sky: a compact `Rg11b10Ufloat` radiance cube where that renders) and a 4096 ×
-/// 2048 HDR panorama (the stories' nebula). The gate applies to the default path (compute
-/// dispatches where available) of each; the fragment path (WebGL2's, forced with
-/// `no_compute`) is printed for the record. Needs `TIMESTAMP_QUERY`; run alone:
+/// each cubemap uploaded in one frame and baked in the next, on a loaded GPU ([`GpuLoad`]).
+/// Three skies: 1024² LDR faces, 1024² HDR faces (`Rgba16Float`, the showcase's sky: a compact
+/// `Rg11b10Ufloat` radiance cube where that renders) and a 4096 × 2048 HDR panorama (the
+/// stories' nebula). For each, on the default path (compute dispatches where available):
+/// * the steps of every upload and bake are [`gate_steps`] (deterministic: a sky rendered a
+///   pass per face and mip where compute exists, as at the M2 review's round 1, fails here);
+/// * the first cubemap's upload + bake (cold: what a game pays once) and the median of 5 are
+///   ≤ 3 ms (M2 final review: the median alone missed round 1's cold 7–9 ms).
+///
+/// The same on an unloaded GPU (idle clocks: 2–5 times longer, varying from run to run) and
+/// the fragment path (WebGL2's, forced with `no_compute`) are printed for the record. Needs
+/// `TIMESTAMP_QUERY`; run alone:
 /// `cargo test -p space3d-render --release --test environment -- --ignored --nocapture ibl_bake_gate`.
 #[test]
 #[ignore = "perf gate: run alone with --ignored"]
@@ -682,28 +832,30 @@ fn ibl_bake_gate() {
         .ok()
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(1.0);
-    let skies: [(&str, &dyn Fn(u8) -> CubemapSource); 3] = [
-        ("LDR faces", &ldr_gate_faces),
-        ("HDR faces", &hdr_gate_faces),
-        ("HDR panorama", &hdr_gate_panorama),
-    ];
     let mut failed = Vec::new();
-    for (label, make) in skies {
-        let Some((upload, bake)) = ibl_bake_times(label, false, make) else {
+    for sky in [GateSky::LdrFaces, GateSky::HdrFaces, GateSky::HdrPanorama] {
+        let (label, make) = (sky.label(), &|k| sky.make(k));
+        let Some(t) = ibl_bake_times(label, false, true, make) else {
             return;
         };
-        ibl_bake_times(label, true, make);
-        let total = upload + bake;
-        if total > 3.0 * scale {
-            failed.push(format!("{label}: {total:.3} ms"));
+        ibl_bake_times(label, false, false, make);
+        ibl_bake_times(label, true, true, make);
+        let expected = gate_steps(sky, &t.caps);
+        if let Some((k, steps)) = t.steps.iter().enumerate().find(|(_, s)| **s != expected) {
+            failed.push(format!(
+                "{label}: (upload, bake) steps {steps:?} for cubemap {k}, expected {expected:?}"
+            ));
+        }
+        for (what, ms) in [("cold", t.cold), ("median", t.median)] {
+            if ms > 3.0 * scale {
+                failed.push(format!(
+                    "{label}: upload + bake {ms:.3} ms {what}, over {:.1} ms",
+                    3.0 * scale
+                ));
+            }
         }
     }
-    assert!(
-        failed.is_empty(),
-        "IBL upload + bake over {:.1} ms: {}",
-        3.0 * scale,
-        failed.join(", ")
-    );
+    assert!(failed.is_empty(), "IBL bake gate: {}", failed.join("; "));
 }
 
 /// Perf gate "forward full-screen lit pixels, all maps + IBL + PCF9, vs today's shader ≤ +0.20

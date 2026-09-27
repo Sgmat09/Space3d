@@ -74,19 +74,42 @@ pub const ENV_DIFFUSE: f32 = 6.0;
 
 /// The sky as `camera`'s `Skybox` and its image-based lighting (`EnvironmentLight`: diffuse
 /// [`ENV_DIFFUSE`], specular [`ENV_SPECULAR`]), and a faint blue ambient for the shadowed sides
-/// (0.03: what reaches them before the environment is baked, and with the environment off).
-pub fn add_environment(world: &mut World, resources: &mut Resources, assets: &ShowcaseAssets, camera: Entity) {
+/// (0.03: what reaches them before the environment is baked, and with the environment off);
+/// the diffuse lighting and the ambient lifted by [`fill_lift`] at `quality`.
+pub fn add_environment(
+    world: &mut World,
+    resources: &mut Resources,
+    assets: &ShowcaseAssets,
+    camera: Entity,
+    quality: GraphicsQuality,
+) {
+    let lift = fill_lift(quality);
     let _ = world.insert(
         camera,
         (
             Skybox::new(assets.sky),
-            EnvironmentLight::new(assets.sky).with_intensity(ENV_DIFFUSE, ENV_SPECULAR),
+            EnvironmentLight::new(assets.sky).with_intensity(ENV_DIFFUSE * lift, ENV_SPECULAR),
         ),
     );
     resources.insert(AmbientLight {
         color: Vec3::new(0.45, 0.55, 1.0),
-        intensity: 0.03,
+        intensity: 0.03 * lift,
     });
+}
+
+/// How much the fill ([`add_environment`]'s diffuse lighting and ambient, [`spawn_fill`]) is
+/// raised at `quality`: 1 at High and Ultra, 1.3 at Medium, 1.8 at Low. The lower tiers lose
+/// what lifts High's shadows on screen — bloom's veil (Medium's is smaller, Low's smaller still,
+/// none without float targets: WebGL2) and GGX shading (Low's Classic) — and, with the same
+/// rig, a top in a cast shadow fell to 4–5 % of a sunlit one at Medium, 3–4 % at Low and 2–3 %
+/// on WebGL2 against 6–7 % at High (M2 final review; "below 5 % they read as holes",
+/// docs/graphics/materials.md).
+pub fn fill_lift(quality: GraphicsQuality) -> f32 {
+    match quality {
+        GraphicsQuality::Low => 1.8,
+        GraphicsQuality::Medium => 1.3,
+        _ => 1.0,
+    }
 }
 
 /// Direction the fill light travels: up from the nebula below the flight plane and away from
@@ -96,17 +119,20 @@ pub fn fill_direction() -> Vec3 {
     Vec3::new(-sun.x, 0.55, -sun.z).normalize()
 }
 
-/// The fill: a shadowless violet `DirectionalLight` (intensity 0.35, 16 % of the sun)
-/// along [`fill_direction`] — the nebula's glow bouncing up onto the hulls. Together with the
-/// sky's diffuse lighting ([`ENV_DIFFUSE`]) it keeps the shadowed side of a hull readable from
-/// the top-down camera.
-pub fn spawn_fill(world: &mut World) -> Entity {
+/// The fill: a shadowless lavender `DirectionalLight` (intensity 0.35, 16 % of the sun, ×
+/// [`fill_lift`] at `quality`) along [`fill_direction`] — the nebula's glow bouncing up onto
+/// the hulls. Together with the sky's diffuse lighting ([`ENV_DIFFUSE`]) it keeps the shadowed
+/// side of a hull readable from the top-down camera. Its hue is muted (the diffuse lighting
+/// carries the nebula's color): from the top-down camera the fill reaches few visible faces
+/// but crease walls at grazing angles, which a saturated violet (0.62, 0.5, 1.0 at the M2 final
+/// review) outlined in thin violet slivers.
+pub fn spawn_fill(world: &mut World, quality: GraphicsQuality) -> Entity {
     world.spawn((
         Name("fill".into()),
         Transform::IDENTITY.looking_at(fill_direction(), Vec3::Y),
         DirectionalLight {
-            color: Vec3::new(0.62, 0.5, 1.0),
-            intensity: 0.35,
+            color: Vec3::new(0.59, 0.53, 0.82),
+            intensity: 0.35 * fill_lift(quality),
         },
     ))
 }
@@ -247,12 +273,12 @@ pub fn spawn_look(app: &mut App, assets: &ShowcaseAssets, look: &LookScene) -> E
             }),
         post,
     ));
-    add_environment(&mut app.world, &mut app.resources, assets, camera);
+    add_environment(&mut app.world, &mut app.resources, assets, camera, look.quality);
     if !look.environment {
         let _ = app.world.remove_one::<EnvironmentLight>(camera);
     }
     let sun = spawn_sun(&mut app.world, ShadowFit::top_down(-20.0, 60.0, 400.0));
-    spawn_fill(&mut app.world);
+    spawn_fill(&mut app.world, look.quality);
     if !look.shadows {
         let _ = app.world.remove_one::<DirectionalShadow>(sun);
     }
@@ -498,7 +524,7 @@ pub fn spawn_battle(app: &mut App, scene: &BattleScene) -> BattleHandles {
         battle_look(),
     ));
     let sun = spawn_sun(&mut app.world, ShadowFit::top_down(-30.0, 90.0, 900.0));
-    spawn_fill(&mut app.world);
+    spawn_fill(&mut app.world, scene.quality);
     space3d_particles::testing::battle(
         app,
         Battle {
@@ -551,7 +577,7 @@ pub fn dress_battle(
         scene.seed,
     );
     if let Some(camera) = handles.camera {
-        add_environment(world, resources, assets, camera);
+        add_environment(world, resources, assets, camera, scene.quality);
     }
     if scene.previews {
         handles.previews = spawn_previews(world, resources, assets, scene.hud);
