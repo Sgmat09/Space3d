@@ -23,7 +23,8 @@
 #   SPACE3D_KEEP_EMULATOR=1 leave the emulator running (it is shut down otherwise, if this run
 #                           started it)
 set -euo pipefail
-
+# The whole script is one block, read before it runs: editing the file meanwhile is harmless.
+{
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 OUT="$TARGET_DIR/android-smoke"
@@ -106,8 +107,7 @@ done
 for s in window_animation_scale transition_animation_scale animator_duration_scale; do
   adb shell settings put global "$s" 0
 done
-adb shell settings put system accelerometer_rotation 0
-adb shell settings put system user_rotation 0
+adb shell wm user-rotation lock 0   # portrait, no auto-rotation
 adb shell setprop debug.space3d.wgpu_backend "${BACKEND:-''}"
 log "emulator: Android $(adb shell getprop ro.build.version.release | tr -d '\r'), $(adb shell getprop ro.product.cpu.abi | tr -d '\r'), page size $(adb shell getconf PAGE_SIZE | tr -d '\r'), wgpu backend ${BACKEND:-default}"
 # A freshly booted emulator may show "System UI / Launcher isn't responding" for a while.
@@ -171,11 +171,19 @@ dump_stacks() { # NAME: native stacks of the app's threads (needs a debuggable b
   echo "  thread stacks: $OUT/$1-stacks.txt (symbolize with the unstripped library in target/)"
 }
 
-check_screen() { # NAME DESCRIPTION [SECONDS]: wait (default 60 s) for the screen to show content
-  local png="$OUT/$1.png" summary=""
+check_screen() { # NAME DESCRIPTION [SECONDS] [landscape]: wait (default 60 s) for content
+  local png="$OUT/$1.png" summary="" w h seen=""
   for _ in $(seq 1 "$(( ${3:-60} / 3 ))"); do
     adb exec-out screencap -p >"$png"
-    if summary="$(png_check "$png")"; then pass "$2: $summary ($png)"; return 0; fi
+    if summary="$(png_check "$png")"; then
+      w="${summary%%x*}"; h="${summary#*x}"; h="${h%% *}"
+      [ "${4:-}" != landscape ] && { pass "$2: $summary ($png)"; return 0; }
+      # Landscape: the second landscape capture in a row (the first can be mid-rotation).
+      if [ "$w" -gt "$h" ]; then
+        [ -n "$seen" ] && { pass "$2: $summary ($png)"; return 0; }
+        seen=1
+      fi
+    fi
     sleep 3
   done
   fail "$2: looks empty: $summary ($png)"
@@ -211,10 +219,9 @@ for ex in "${EXAMPLES[@]}"; do
   check_screen "$ex-2-resumed" "$ex renders after resume"
 
   log "$ex: rotate to landscape"
-  adb shell settings put system user_rotation 1
-  sleep 5
-  check_screen "$ex-3-landscape" "$ex renders in landscape"
-  adb shell settings put system user_rotation 0
+  adb shell wm user-rotation lock 1
+  check_screen "$ex-3-landscape" "$ex renders in landscape" 60 landscape
+  adb shell wm user-rotation lock 0
   sleep 3
 
   if [ "$ex" = hello_cube ]; then
@@ -280,3 +287,5 @@ if [ ${#FAILURES[@]} -eq 0 ]; then
 else
   log "android smoke: ${#FAILURES[@]} failure(s)"; printf '  - %s\n' "${FAILURES[@]}"; exit 1
 fi
+exit 0
+}

@@ -340,7 +340,14 @@ fn android(ctx: &Ctx, project: &Project, args: &BuildArgs, out: &Path) -> Result
             .join(abi.rust_target())
             .join(profile_dir(sel.release))
             .join(&so_name);
-        stage(ctx, &built, &jni_libs.join(abi.name()).join(&so_name))?;
+        let dest = jni_libs.join(abi.name()).join(&so_name);
+        // A hard link where possible: debug libraries are hundreds of MB.
+        let linked = !ctx.exec.dry_run
+            && dest.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+            && std::fs::hard_link(&built, &dest).is_ok();
+        if !linked {
+            stage(ctx, &built, &dest)?;
+        }
     }
 
     // 3. The Gradle project: the package's own `android/`, else generated from the metadata.
