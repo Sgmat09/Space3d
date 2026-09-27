@@ -235,7 +235,14 @@ pub struct Profiler {
     last_index: Option<u64>,
     frames: u64,
     fit: Option<TableFit>,
+    /// Tallest [`TableFit`] seen recently and frames since it was last reached: the dock plan
+    /// uses it so a flame graph whose depth changes from frame to frame cannot flip the tools
+    /// between layouts every frame (it rises at once and falls after [`FIT_PEAK_FRAMES`]).
+    fit_peak: Option<(TableFit, u32)>,
 }
+
+/// Frames a smaller profiler layout must last before the dock plan uses it (about 2 s at 60 fps).
+const FIT_PEAK_FRAMES: u32 = 120;
 
 /// The profiler's layout as last drawn in its window, for [`Profiler::min_height`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -248,6 +255,15 @@ struct TableFit {
 }
 
 impl Profiler {
+    /// Remember the layout just drawn (see `fit_peak`).
+    fn record_fit(&mut self, fit: TableFit) {
+        self.fit = Some(fit);
+        self.fit_peak = match self.fit_peak {
+            Some((peak, age)) if fit.rows_offset < peak.rows_offset && age < FIT_PEAK_FRAMES => Some((peak, age + 1)),
+            _ => Some((fit, 0)),
+        };
+    }
+
     /// Turn span timing on/off process-wide (off removes nearly all profiling overhead).
     pub fn set_enabled(enabled: bool) {
         ENABLED.store(enabled, Ordering::Relaxed);
@@ -337,7 +353,7 @@ impl Profiler {
     /// [`Self::ui_until`]; fewer when it has fewer systems), as last drawn (estimated before the
     /// first time). Without frames yet it has no table: the height of its message.
     pub(crate) fn min_height(&self, ctx: &egui::Context, rows: usize) -> f32 {
-        let TableFit { rows_offset, pitch } = self.fit.unwrap_or(TableFit {
+        let TableFit { rows_offset, pitch } = self.fit_peak.map(|(f, _)| f).or(self.fit).unwrap_or(TableFit {
             // Header row, separator, toolbar, a one-level flame and the table's header.
             rows_offset: 85.0,
             pitch: 17.0,
@@ -759,7 +775,7 @@ pub(crate) fn profiler_system(sys: &mut SystemCtx) {
         |ui, max_bottom| p.ui_until(ui, max_bottom),
     );
     if let Some(Some(fit)) = fit {
-        p.fit = Some(fit);
+        p.record_fit(fit);
     }
     if !open {
         p.visible = false;
@@ -876,6 +892,36 @@ fn placement(
 mod tests {
     use super::*;
 
+    /// A flame graph whose depth changes every frame must not change the height the dock plan
+    /// works with (that flipped short areas between layouts every frame): the tallest recent
+    /// layout holds until a smaller one has lasted `FIT_PEAK_FRAMES`.
+    #[test]
+    fn the_dock_height_ignores_a_flame_depth_that_changes_every_frame() {
+        let ctx = egui::Context::default();
+        let mut p = Profiler::default();
+        let deep = TableFit {
+            rows_offset: 120.0,
+            pitch: 17.0,
+        };
+        let shallow = TableFit {
+            rows_offset: 85.0,
+            pitch: 17.0,
+        };
+        p.record_fit(deep);
+        let tall = p.min_height(&ctx, 3);
+        for i in 0..(2 * FIT_PEAK_FRAMES) {
+            p.record_fit(if i % 2 == 0 { shallow } else { deep });
+            assert_eq!(p.min_height(&ctx, 3), tall, "frame {i}");
+        }
+        for _ in 0..FIT_PEAK_FRAMES {
+            p.record_fit(shallow);
+        }
+        p.record_fit(shallow);
+        assert!(p.min_height(&ctx, 3) < tall, "a lasting smaller layout is used");
+        p.record_fit(deep);
+        assert_eq!(p.min_height(&ctx, 3), tall, "a taller one is used at once");
+    }
+
     #[test]
     fn short_names_and_aggregation() {
         assert_eq!(short_name("render::render_frame"), "render::render_frame");
@@ -977,7 +1023,7 @@ mod tests {
                     |ui, max_bottom| p.ui_until(ui, max_bottom),
                 );
                 if let Some(Some(fit)) = fit {
-                    p.fit = Some(fit);
+                    p.record_fit(fit);
                 }
             });
             shapes = out.shapes;
