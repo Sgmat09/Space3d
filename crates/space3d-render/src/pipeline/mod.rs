@@ -153,6 +153,16 @@ pub(crate) fn output_constants(output: OutputEncoding) -> ([(&'static str, f64);
 pub(crate) type ModuleKey = (u16, u8, bool, PassKind, Option<(ShaderHandle, u32)>);
 
 const CULL_SHADER: &str = include_str!("../shaders/cull.wgsl");
+
+/// The culling shaders (`cull.wgsl`, `compact.wgsl`) write their workgroup memory before
+/// reading it, so wgpu's zero-initialization is skipped: a saved pass per dispatch, and the
+/// Vulkan workgroup-variable initializers it emits are what the Android emulator's translators
+/// fail on (MoltenVK rejects the shader and loses the device; SwiftShader never finishes
+/// parsing it).
+const CULL_COMPILATION: wgpu::PipelineCompilationOptions<'static> = wgpu::PipelineCompilationOptions {
+    constants: &[],
+    zero_initialize_workgroup_memory: false,
+};
 const COMPACT_SHADER: &str = include_str!("../shaders/compact.wgsl");
 const BLIT_TEMPLATE: &str = include_str!("../shaders/blit.wgsl");
 const CLEAR_SHADER: &str = include_str!("../shaders/clear.wgsl");
@@ -436,7 +446,7 @@ impl Pipelines {
                     layout: Some(&pl),
                     module: &module,
                     entry_point: Some(name),
-                    compilation_options: Default::default(),
+                    compilation_options: CULL_COMPILATION,
                     cache: None,
                 })
             };
@@ -470,7 +480,7 @@ impl Pipelines {
                 layout: Some(&cpl),
                 module: &cmodule,
                 entry_point: Some("compact"),
-                compilation_options: Default::default(),
+                compilation_options: CULL_COMPILATION,
                 cache: None,
             });
             CullPipelines {

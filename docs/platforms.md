@@ -226,13 +226,21 @@ SPACE3D_KEEP_EMULATOR=1 scripts/android-smoke.sh graphics_showcase
 ```
 
 The image uses 16 KB memory pages, so it also proves the libraries are 16 KB-aligned.
-Emulator GPUs and wgpu: the emulator's Vulkan is not a real driver — with `-gpu host` on macOS
-it translates to MoltenVK, whose shader compiler rejects one of the engine's compute shaders
-(the device is lost right away), and with `-gpu swiftshader_indirect` (software) compute
-pipelines take minutes to build. The script therefore runs the emulator with the host GPU and
-the OpenGL ES backend (`SPACE3D_WGPU_BACKEND=gl`, via the `debug.space3d.wgpu_backend`
-property); set `SPACE3D_WGPU_BACKEND=` to test the default (Vulkan) path. Real devices use
-their Vulkan drivers.
+
+Emulator GPUs are translators, not drivers, and each trips over something:
+
+| `-gpu` | backend | hello_cube, web_demo, a new `3d` project | graphics_showcase |
+|---|---|---|---|
+| `swiftshader_indirect` (default) | GLES (default `SPACE3D_WGPU_BACKEND=gl`) | ✓ (software: a few fps) | ✓ |
+| `swiftshader_indirect` | Vulkan | ✗ SwiftShader never finishes parsing the culling shader | ✗ |
+| `host` (macOS: MoltenVK / Metal) | Vulkan (`SPACE3D_WGPU_BACKEND=`) | ✓ | ✗ MoltenVK rejects a particle compute shader (device lost) |
+| `host` | GLES | ✓ | ✗ the GL translator hangs on a buffer unmap |
+
+So the script defaults to SwiftShader + GLES (also what a Linux CI runner without a GPU can
+run), and `SPACE3D_EMULATOR_GPU=host SPACE3D_WGPU_BACKEND= scripts/android-smoke.sh hello_cube
+web_demo` checks the Vulkan path real devices take (GPU-driven culling included). The culling
+shaders skip wgpu's workgroup-memory zeroing (they write it before reading), which is what
+MoltenVK's translator failed on.
 
 ## iOS
 

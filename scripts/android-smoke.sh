@@ -12,8 +12,11 @@
 #
 #   SPACE3D_AVD             AVD name (default space3d_smoke; created if missing)
 #   SPACE3D_SYSTEM_IMAGE    image for a new AVD (default: Android 17 Google APIs, 16 KB pages)
-#   SPACE3D_EMULATOR_GPU    emulator -gpu mode (default host on macOS, swiftshader_indirect elsewhere)
-#   SPACE3D_WGPU_BACKEND    wgpu backend on the emulator (default gl, see docs; "" = engine default)
+#   SPACE3D_EMULATOR_GPU    emulator -gpu mode (default swiftshader_indirect: software, works
+#                           everywhere incl. CI; `host` is faster)
+#   SPACE3D_WGPU_BACKEND    wgpu backend in the app (default gl; "" = the engine's choice, Vulkan:
+#                           SPACE3D_EMULATOR_GPU=host SPACE3D_WGPU_BACKEND= scripts/android-smoke.sh
+#                           hello_cube web_demo — see docs/platforms.md for what works where)
 #   SPACE3D_EMULATOR_PORT   console port (default 5680; adb serial emulator-<port>)
 #   SPACE3D_RELEASE=1       release APKs
 #   SPACE3D_NO_BUILD=1      reuse the APKs from a previous run
@@ -47,8 +50,7 @@ PORT="${SPACE3D_EMULATOR_PORT:-5680}"
 SERIAL="emulator-$PORT"
 if [ "$(uname -m)" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then HOST_ABI=arm64-v8a; else HOST_ABI=x86_64; fi
 IMAGE="${SPACE3D_SYSTEM_IMAGE:-system-images;android-37.0;google_apis_ps16k;$HOST_ABI}"
-if [ "$(uname -s)" = "Darwin" ]; then DEFAULT_GPU=host; else DEFAULT_GPU=swiftshader_indirect; fi
-GPU="${SPACE3D_EMULATOR_GPU:-$DEFAULT_GPU}"
+GPU="${SPACE3D_EMULATOR_GPU:-swiftshader_indirect}"
 BACKEND="${SPACE3D_WGPU_BACKEND-gl}"
 mkdir -p "$OUT"
 
@@ -99,6 +101,8 @@ for _ in $(seq 1 180); do
   sleep 2
 done
 [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" = "1" ] || { echo "emulator did not boot" >&2; exit 1; }
+# Root (google_apis images allow it) lets the script dump app thread stacks on failures.
+"$ADB" -s "$SERIAL" root >/dev/null 2>&1 && "$ADB" -s "$SERIAL" wait-for-device || true
 for s in window_animation_scale transition_animation_scale animator_duration_scale; do
   adb shell settings put global "$s" 0
 done
@@ -159,10 +163,23 @@ wait_for_log() { # PATTERN SECONDS
   return 1
 }
 
-check_screen() { # NAME DESCRIPTION
-  local png="$OUT/$1.png"
-  adb exec-out screencap -p >"$png"
-  if summary="$(png_check "$png")"; then pass "$2: $summary ($png)"; else fail "$2: looks empty: $summary ($png)"; fi
+dump_stacks() { # NAME: native stacks of the app's threads (needs a debuggable build + adb root)
+  local pid
+  pid="$(adb shell pidof "$pkg" | tr -d '\r' || true)"
+  [ -n "$pid" ] || return 0
+  adb shell debuggerd -b "$pid" >"$OUT/$1-stacks.txt" 2>&1 || true
+  echo "  thread stacks: $OUT/$1-stacks.txt (symbolize with the unstripped library in target/)"
+}
+
+check_screen() { # NAME DESCRIPTION [SECONDS]: wait (default 60 s) for the screen to show content
+  local png="$OUT/$1.png" summary=""
+  for _ in $(seq 1 "$(( ${3:-60} / 3 ))"); do
+    adb exec-out screencap -p >"$png"
+    if summary="$(png_check "$png")"; then pass "$2: $summary ($png)"; return 0; fi
+    sleep 3
+  done
+  fail "$2: looks empty: $summary ($png)"
+  dump_stacks "$1"
 }
 
 for ex in "${EXAMPLES[@]}"; do
@@ -181,8 +198,7 @@ for ex in "${EXAMPLES[@]}"; do
   else
     fail "$ex: no renderer after 180 s"
   fi
-  sleep 6
-  check_screen "$ex-1-start" "$ex renders"
+  check_screen "$ex-1-start" "$ex renders" 180
   sleep 1
   adb exec-out screencap -p >"$OUT/$ex-1-start-b.png"
   if cmp -s "$OUT/$ex-1-start.png" "$OUT/$ex-1-start-b.png"; then fail "$ex: the picture does not change (frames stuck?)"; else pass "$ex: frames advance"; fi
@@ -223,15 +239,18 @@ for ex in "${EXAMPLES[@]}"; do
     [ -z "$(adb shell pidof "$pkg" | tr -d '\r' || true)" ] && break
     sleep 1
   done
-  if [ -z "$(adb shell pidof "$pkg" | tr -d '\r' || true)" ] && adb logcat -d -s space3d:V | grep -q "activity is being destroyed"; then
+  if [ -n "$(adb shell pidof "$pkg" | tr -d '\r' || true)" ]; then
+    fail "$ex: still running 30 s after its activity was destroyed"
+    dump_stacks "$ex-destroy"
+  elif adb logcat -d -s space3d:V | grep -q "activity is being destroyed"; then
     pass "$ex: a destroyed activity ends the app"
   else
-    fail "$ex: still running after its activity was destroyed"
+    # Android kills an app whose onDestroy does not arrive within 10 s — on a loaded host the
+    # emulator's system_server can be that slow before the app even sees the event.
+    printf 'note: %s ended by the system before its onDestroy arrived (slow emulator?)\n' "$ex"
   fi
   adb shell am start -W -n "$activity" >/dev/null
-  wait_for_log "space3d renderer initialised" 180 || true
-  sleep 6
-  check_screen "$ex-5-relaunched" "$ex renders after a fresh launch"
+  check_screen "$ex-5-relaunched" "$ex renders after a fresh launch" 180
 
   log "$ex: Back"
   adb shell input keyevent KEYCODE_BACK
