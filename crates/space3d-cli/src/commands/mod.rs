@@ -3,6 +3,7 @@
 pub mod build;
 pub mod ci;
 pub mod doctor;
+pub mod ios;
 pub mod new;
 pub mod publish;
 pub mod run;

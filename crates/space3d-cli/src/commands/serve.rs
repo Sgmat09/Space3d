@@ -17,6 +17,7 @@ pub fn run(ctx: &Ctx, args: &ServeArgs) -> Result<()> {
         out: None,
         install_tools: args.install_tools,
         sim: false,
+        xcode: false,
         no_wasm_opt: !args.cargo.release,
     };
     let dist = project.dist_dir(Platform::Web.name());

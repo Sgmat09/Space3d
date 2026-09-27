@@ -15,6 +15,12 @@ default-run = "{{name}}"
 #   tests/              input-simulation and golden-screenshot tests (`space3d test`)
 #   mobile/             Android (`cargo apk`) + iOS (Xcode) library — see android/ and ios/
 
+# `space3d build --target ios [--sim]` bundles the game binary as an iOS app (ios/README.md).
+[package.metadata.space3d.ios]
+bundle-id = "{{ios_bundle_id}}"
+display-name = "{{title}}"
+orientations = "landscape"
+
 [dependencies]
 # Default engine features + the storybook and editor (dev tools; drop "editor" and delete
 # src/bin/editor.rs to trim compile times).

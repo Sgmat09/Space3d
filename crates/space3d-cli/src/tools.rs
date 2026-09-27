@@ -113,6 +113,85 @@ pub fn xcode_version(exec: &Exec) -> Option<String> {
         .map(|s| first_line(&s))
 }
 
+/// SDK version of an Xcode platform SDK (`iphonesimulator`, `iphoneos`), e.g. `27.0`.
+pub fn apple_sdk_version(exec: &Exec, sdk: &str) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    exec.probe(&Cmd::new("xcrun").args(["--sdk", sdk, "--show-sdk-version"]))
+        .map(|s| first_line(&s))
+        .filter(|s| !s.is_empty())
+}
+
+/// An installed simulator runtime (`xcrun simctl list runtimes --json`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimRuntime {
+    /// `iOS 27.0`.
+    pub name: String,
+    /// `com.apple.CoreSimulator.SimRuntime.iOS-27-0`.
+    pub identifier: String,
+    /// `iOS`, `tvOS`, `watchOS`, `visionOS`.
+    pub platform: String,
+    /// `27.0`.
+    pub version: String,
+    /// `false` when the runtime is installed but unusable (e.g. needs a newer Xcode).
+    pub available: bool,
+}
+
+/// Parse `xcrun simctl list runtimes --json` (unparsable input: empty).
+pub fn parse_simctl_runtimes(json: &str) -> Vec<SimRuntime> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let text = |r: &serde_json::Value, key: &str| r.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+    value
+        .get("runtimes")
+        .and_then(|r| r.as_array())
+        .map(|runtimes| {
+            runtimes
+                .iter()
+                .map(|r| SimRuntime {
+                    name: text(r, "name"),
+                    identifier: text(r, "identifier"),
+                    // Older Xcodes have no `platform`: take it from the name (`iOS 17.5`).
+                    platform: r
+                        .get("platform")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| text(r, "name").split(' ').next().unwrap_or_default().to_owned()),
+                    version: text(r, "version"),
+                    available: r.get("isAvailable").and_then(|v| v.as_bool()).unwrap_or(false),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Installed simulator runtimes (`None`: simctl unavailable).
+pub fn simulator_runtimes(exec: &Exec) -> Option<Vec<SimRuntime>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    exec.probe(&Cmd::new("xcrun").args(["simctl", "list", "runtimes", "--json"]))
+        .map(|json| parse_simctl_runtimes(&json))
+}
+
+/// Parse the `N valid identities found` line of `security find-identity -v -p codesigning`.
+pub fn parse_identity_count(s: &str) -> Option<usize> {
+    s.lines()
+        .find(|l| l.contains("valid identities found") || l.contains("valid identity found"))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+}
+
+/// Number of code-signing identities in the keychain (`None`: not on macOS / unknown).
+pub fn codesign_identities(exec: &Exec) -> Option<usize> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    parse_identity_count(&exec.probe(&Cmd::new("security").args(["find-identity", "-v", "-p", "codesigning"]))?)
+}
+
 /// `true` if `gh` is installed and logged in.
 pub fn gh_logged_in(exec: &Exec) -> bool {
     exec.probe(&Cmd::new("gh").args(["auth", "status"])).is_some()
@@ -163,6 +242,36 @@ mod tests {
             cmd.display()
                 .ends_with("install wasm-bindgen-cli --version 0.2.128 --locked")
         );
+    }
+
+    #[test]
+    fn simulator_runtimes_are_parsed() {
+        let json = r#"{"runtimes": [
+            {"isAvailable": true, "version": "27.0", "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+             "platform": "iOS", "name": "iOS 27.0", "supportedDeviceTypes": []},
+            {"isAvailable": false, "version": "17.5", "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-17-5",
+             "name": "iOS 17.5"},
+            {"isAvailable": true, "version": "27.0", "identifier": "com.apple.CoreSimulator.SimRuntime.watchOS-27-0",
+             "platform": "watchOS", "name": "watchOS 27.0"}
+        ]}"#;
+        let runtimes = parse_simctl_runtimes(json);
+        assert_eq!(runtimes.len(), 3);
+        assert_eq!(runtimes[0].name, "iOS 27.0");
+        assert!(runtimes[0].available && !runtimes[1].available);
+        assert_eq!(runtimes[1].platform, "iOS", "platform from the name");
+        assert_eq!(runtimes[2].platform, "watchOS");
+        assert!(parse_simctl_runtimes("not json").is_empty());
+        assert!(parse_simctl_runtimes("{}").is_empty());
+    }
+
+    #[test]
+    fn identity_counts() {
+        assert_eq!(parse_identity_count("     0 valid identities found\n"), Some(0));
+        assert_eq!(
+            parse_identity_count("  1) ABC \"Apple Development: A (X)\"\n     1 valid identities found"),
+            Some(1)
+        );
+        assert_eq!(parse_identity_count("security: error"), None);
     }
 
     #[test]

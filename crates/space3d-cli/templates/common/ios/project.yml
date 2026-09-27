@@ -22,6 +22,14 @@ targets:
       properties:
         CFBundleDisplayName: "{{title}}"
         UILaunchScreen: {}
+        # iOS 27 SDK apps must use the UIScene life cycle; the engine registers this delegate
+        # class (space3d_platform::IOS_SCENE_DELEGATE_CLASS) and shows the game in its scene.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+                UISceneDelegateClassName: Space3dSceneDelegate
         UIRequiresFullScreen: true
         UIStatusBarHidden: true
         UISupportedInterfaceOrientations:
@@ -31,9 +39,14 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: {{ios_bundle_id}}
         TARGETED_DEVICE_FAMILY: "1,2"
-        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": $(PROJECT_DIR)/../target/aarch64-apple-ios/$(CARGO_PROFILE)
-        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": $(PROJECT_DIR)/../target/aarch64-apple-ios-sim/$(CARGO_PROFILE)
-        OTHER_LDFLAGS: -l$(RUST_LIB_NAME) -lc++ -framework Metal -framework QuartzCore -framework UIKit -framework Foundation -framework CoreGraphics -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -framework CoreAudio -framework Security -framework SystemConfiguration
+        "RUST_TARGET[sdk=iphoneos*]": aarch64-apple-ios
+        "RUST_TARGET[sdk=iphonesimulator*]": aarch64-apple-ios-sim
+        # The Rust library exists for arm64 only (Apple silicon simulators, devices).
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+        # The static library by path: `-l` would pick a `.dylib` next to it (the crate's Android
+        # cdylib, after a plain `cargo build --target aarch64-apple-ios*`). The frameworks are
+        # what `cargo rustc … -- --print native-static-libs` lists for the engine.
+        OTHER_LDFLAGS: $(PROJECT_DIR)/../target/$(RUST_TARGET)/$(CARGO_PROFILE)/lib$(RUST_LIB_NAME).a -lc++ -liconv -framework Metal -framework QuartzCore -framework UIKit -framework Foundation -framework CoreGraphics -framework CoreFoundation -framework AudioToolbox -framework AVFAudio -framework AVFoundation -framework CoreAudio -framework Security -framework SystemConfiguration
       configs:
         Debug:
           CARGO_PROFILE: debug
@@ -49,9 +62,10 @@ targets:
           if [ -n "${DEVELOPER_SDK_DIR:-}" ]; then
             export LIBRARY_PATH="${DEVELOPER_SDK_DIR}/MacOSX.sdk/usr/lib:${LIBRARY_PATH:-}"
           fi
-          if [ "$PLATFORM_NAME" = "iphonesimulator" ]; then TARGET=aarch64-apple-ios-sim; else TARGET=aarch64-apple-ios; fi
           PROFILE_FLAG=""
           if [ "$CONFIGURATION" = "Release" ]; then PROFILE_FLAG="--release"; fi
           cd "$PROJECT_DIR/.."
-          cargo build -p "$CARGO_PACKAGE" --lib --target "$TARGET" $PROFILE_FLAG
+          # Only the staticlib: the crate's cdylib (for Android) would be linked for iOS here,
+          # against the macOS libraries LIBRARY_PATH points at, and fail.
+          cargo rustc -p "$CARGO_PACKAGE" --lib --crate-type staticlib --target "$RUST_TARGET" $PROFILE_FLAG
     scheme: {}

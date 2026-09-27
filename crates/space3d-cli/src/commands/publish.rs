@@ -33,6 +33,7 @@ pub fn run(ctx: &Ctx, args: &PublishArgs) -> Result<()> {
             out: None,
             install_tools: false,
             sim: false,
+            xcode: false,
             no_wasm_opt: false,
         };
         let out = if args.no_build {

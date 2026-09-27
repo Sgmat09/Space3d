@@ -8,3 +8,8 @@ publish = false
 
 [dependencies]
 space3d.workspace = true
+
+# `space3d build --target ios [--sim]` (docs/platforms.md).
+[package.metadata.space3d.ios]
+bundle-id = "com.spacecorps.space3d.hello-cube"
+display-name = "Hello Cube"

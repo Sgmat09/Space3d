@@ -10,3 +10,9 @@ publish = false
 # `stories`: the showcase content and scenes (`space3d::stories::showcase`); `test`: the
 # headless PNG.
 space3d = { workspace = true, features = ["particles", "stories", "test"] }
+
+# `space3d build --target ios [--sim]` (docs/platforms.md). The battle is framed for wide screens.
+[package.metadata.space3d.ios]
+bundle-id = "com.spacecorps.space3d.graphics-showcase"
+display-name = "Space3d Showcase"
+orientations = "landscape"

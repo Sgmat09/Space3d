@@ -157,23 +157,7 @@ pub fn collect(ctx: &Ctx, platforms: &[Platform]) -> Vec<Check> {
     // iOS.
     if wants(Platform::Ios) {
         if cfg!(target_os = "macos") {
-            checks.push(target_check("ios", IOS_TARGET, Level::Warn));
-            checks.push(target_check("ios", IOS_SIM_TARGET, Level::Warn));
-            checks.push(match tools::xcode_version(exec) {
-                Some(v) => Check::new("ios", "Xcode", Level::Ok, v),
-                None => Check::new("ios", "Xcode", Level::Warn, "not selected (Command Line Tools only?)")
-                    .fix("install Xcode, then sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"),
-            });
-            checks.push(match which("xcodegen") {
-                Some(_) => Check::new("ios", "XcodeGen", Level::Ok, "found"),
-                None => Check::new(
-                    "ios",
-                    "XcodeGen",
-                    Level::Warn,
-                    "not found — needed to generate ios/*.xcodeproj",
-                )
-                .fix("brew install xcodegen"),
-            });
+            checks.extend(ios_checks(exec, &target_check));
         } else {
             checks.push(Check::new(
                 "ios",
@@ -211,6 +195,106 @@ pub fn collect(ctx: &Ctx, platforms: &[Platform]) -> Vec<Check> {
         Check::new("github", "gh auth", Level::Warn, "not logged in").fix("gh auth login")
     });
     checks
+}
+
+/// iOS checks (macOS only): Xcode, the iOS SDKs, a simulator runtime, the Rust targets,
+/// signing identities (device builds) and XcodeGen (`--xcode` only).
+fn ios_checks(exec: &crate::process::Exec, target_check: &dyn Fn(&'static str, &str, Level) -> Check) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let xcode = tools::xcode_version(exec);
+    checks.push(match &xcode {
+        Some(v) => Check::new("ios", "Xcode", Level::Ok, v.clone()),
+        None => Check::new(
+            "ios",
+            "Xcode",
+            Level::Warn,
+            "not selected (Command Line Tools only?) — the iOS SDK comes with Xcode",
+        )
+        .fix("install Xcode, then sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"),
+    });
+    if xcode.is_some() {
+        let sim = tools::apple_sdk_version(exec, "iphonesimulator");
+        let device = tools::apple_sdk_version(exec, "iphoneos");
+        checks.push(ios_sdk_check(sim.as_deref(), device.as_deref()));
+        checks.push(simulator_runtime_check(tools::simulator_runtimes(exec).as_deref()));
+    }
+    checks.push(target_check("ios", IOS_SIM_TARGET, Level::Warn));
+    checks.push(target_check("ios", IOS_TARGET, Level::Warn));
+    checks.push(signing_check(tools::codesign_identities(exec)));
+    checks.push(match which("xcodegen") {
+        Some(_) => Check::new("ios", "XcodeGen (optional)", Level::Ok, "found"),
+        None => Check::new(
+            "ios",
+            "XcodeGen (optional)",
+            Level::Warn,
+            "not found — only `space3d build --target ios --xcode` needs it",
+        )
+        .fix("brew install xcodegen"),
+    });
+    checks
+}
+
+/// The iOS platform SDKs that ship with Xcode.
+pub fn ios_sdk_check(simulator: Option<&str>, device: Option<&str>) -> Check {
+    match (simulator, device) {
+        (Some(s), Some(d)) => Check::new("ios", "iOS SDKs", Level::Ok, format!("simulator {s}, device {d}")),
+        _ => Check::new(
+            "ios",
+            "iOS SDKs",
+            Level::Warn,
+            format!(
+                "simulator {}, device {}",
+                simulator.unwrap_or("missing"),
+                device.unwrap_or("missing")
+            ),
+        )
+        .fix("xcodebuild -downloadPlatform iOS   (or Xcode > Settings > Components)"),
+    }
+}
+
+/// An available iOS simulator runtime (`None`: simctl did not answer).
+pub fn simulator_runtime_check(runtimes: Option<&[tools::SimRuntime]>) -> Check {
+    let what = "iOS simulator runtime";
+    let fix = "xcodebuild -downloadPlatform iOS   (or Xcode > Settings > Components)";
+    let Some(runtimes) = runtimes else {
+        return Check::new("ios", what, Level::Warn, "`xcrun simctl` failed").fix(fix);
+    };
+    let ios: Vec<&tools::SimRuntime> = runtimes.iter().filter(|r| r.platform == "iOS").collect();
+    let available: Vec<&str> = ios.iter().filter(|r| r.available).map(|r| r.name.as_str()).collect();
+    if available.is_empty() {
+        let detail = if ios.is_empty() {
+            "none installed — `space3d build --target ios --sim` works, running it needs one".to_owned()
+        } else {
+            format!(
+                "{} installed but unavailable (needs another Xcode?)",
+                ios.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        };
+        Check::new("ios", what, Level::Warn, detail).fix(fix)
+    } else {
+        Check::new("ios", what, Level::Ok, available.join(", "))
+    }
+}
+
+/// Code-signing identities: none is fine for the simulator, devices need one.
+pub fn signing_check(identities: Option<usize>) -> Check {
+    let what = "code signing (devices)";
+    match identities {
+        Some(n) if n > 0 => Check::new(
+            "ios",
+            what,
+            Level::Ok,
+            format!("{n} signing identit{}", if n == 1 { "y" } else { "ies" }),
+        ),
+        Some(_) => Check::new(
+            "ios",
+            what,
+            Level::Warn,
+            "no signing identity — simulator builds only; device bundles stay unsigned",
+        )
+        .fix("sign in with your Apple ID in Xcode > Settings > Accounts (docs/platforms.md: signing)"),
+        None => Check::new("ios", what, Level::Warn, "`security find-identity` failed"),
+    }
 }
 
 /// Kinsoku (Chinese and Japanese line breaking) for a project that uses `space3d-ui`: egui lays
@@ -433,6 +517,36 @@ mod tests {
         assert!(text.contains("to fix:\n  wasm-bindgen CLI: cargo install wasm-bindgen-cli\n"));
         assert!(!text.contains("never shown"));
         assert!(render(&checks[..1]).contains("everything needed is installed"));
+    }
+
+    #[test]
+    fn ios_checks_explain_what_is_missing() {
+        assert_eq!(ios_sdk_check(Some("27.0"), Some("27.0")).level, Level::Ok);
+        let missing = ios_sdk_check(Some("27.0"), None);
+        assert_eq!(missing.level, Level::Warn);
+        assert!(missing.detail.contains("device missing") && missing.fix.unwrap().contains("-downloadPlatform iOS"));
+
+        let runtime = |name: &str, platform: &str, available: bool| tools::SimRuntime {
+            name: name.into(),
+            identifier: String::new(),
+            platform: platform.into(),
+            version: String::new(),
+            available,
+        };
+        let ok = simulator_runtime_check(Some(&[
+            runtime("iOS 27.0", "iOS", true),
+            runtime("watchOS 27.0", "watchOS", true),
+        ]));
+        assert_eq!((ok.level, ok.detail.as_str()), (Level::Ok, "iOS 27.0"));
+        let only_watch = simulator_runtime_check(Some(&[runtime("watchOS 27.0", "watchOS", true)]));
+        assert!(only_watch.level == Level::Warn && only_watch.detail.starts_with("none installed"));
+        let stale = simulator_runtime_check(Some(&[runtime("iOS 17.5", "iOS", false)]));
+        assert!(stale.detail.contains("iOS 17.5 installed but unavailable"));
+        assert_eq!(simulator_runtime_check(None).level, Level::Warn);
+
+        assert_eq!(signing_check(Some(2)).detail, "2 signing identities");
+        let none = signing_check(Some(0));
+        assert!(none.level == Level::Warn && none.detail.contains("simulator builds only"));
     }
 
     #[test]

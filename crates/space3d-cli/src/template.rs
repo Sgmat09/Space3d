@@ -473,9 +473,9 @@ pub fn patch_workflow_for_mobile_crate(yaml: &str, mobile_package: &str) -> Stri
         &format!("cargo apk build --release -p {mobile_package} --lib --target aarch64-linux-android"),
     )
     .replace(
-        "      - run: cargo build --release --lib --target aarch64-apple-ios\n",
+        "      - run: cargo rustc --release --lib --crate-type staticlib --target aarch64-apple-ios\n",
         &format!(
-            "      - run: cargo build --release -p {mobile_package} --lib --target aarch64-apple-ios\n      \
+            "      - run: cargo rustc --release -p {mobile_package} --lib --crate-type staticlib --target aarch64-apple-ios\n      \
              - name: Generate the Xcode project (XcodeGen)\n        \
              run: brew install xcodegen && (cd ios && xcodegen generate)\n"
         ),
@@ -690,6 +690,27 @@ mod tests {
                     .unwrap()
                     .contains("space3d::main!(demo_game::build)")
             );
+            // iOS: the plain bundle's settings, and the Xcode project's scene delegate and link.
+            let ios = crate::commands::ios::IosMeta::from_metadata(
+                &serde_json::to_value(&manifest["package"]["metadata"]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(ios.bundle_id.as_deref(), Some("com.example.demo-game"));
+            assert_eq!(ios.orientations, crate::commands::ios::Orientations::Landscape);
+            let spec = files.iter().find(|f| f.path == Path::new("ios/project.yml")).unwrap();
+            let spec = std::str::from_utf8(&spec.contents).unwrap();
+            let delegate = format!(
+                "UISceneDelegateClassName: {}",
+                crate::commands::ios::SCENE_DELEGATE_CLASS
+            );
+            for needle in [
+                delegate.as_str(),
+                "--crate-type staticlib --target \"$RUST_TARGET\"",
+                "\"EXCLUDED_ARCHS[sdk=iphonesimulator*]\": x86_64",
+                "lib$(RUST_LIB_NAME).a",
+            ] {
+                assert!(spec.contains(needle), "{kind:?}: ios/project.yml lacks {needle}");
+            }
         }
     }
 
@@ -712,7 +733,11 @@ mod tests {
             yaml.contains("cargo apk build --release -p arena-mobile --lib"),
             "{yaml}"
         );
-        assert!(yaml.contains("cargo build --release -p arena-mobile --lib --target aarch64-apple-ios"));
+        assert!(
+            yaml.contains(
+                "cargo rustc --release -p arena-mobile --lib --crate-type staticlib --target aarch64-apple-ios"
+            )
+        );
         assert!(yaml.contains("xcodegen generate"));
         assert!(yaml.contains("--bin arena"));
         // A second run refuses to overwrite …

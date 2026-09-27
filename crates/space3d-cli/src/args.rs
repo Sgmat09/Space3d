@@ -154,7 +154,7 @@ pub enum Platform {
     Web,
     /// Android `.apk` via `cargo apk`.
     Android,
-    /// iOS static library + Xcode project (XcodeGen) / `xcodebuild`.
+    /// iOS `.app`: a plain bundle of the game binary, or the Xcode project with `--xcode`.
     Ios,
 }
 
@@ -188,6 +188,10 @@ pub struct BuildArgs {
     /// iOS: build for the simulator (`aarch64-apple-ios-sim`) instead of devices.
     #[arg(long)]
     pub sim: bool,
+    /// iOS: build the Xcode project (`ios/project.yml`, XcodeGen + `xcodebuild`, linking the
+    /// `mobile/` staticlib) instead of bundling the game binary directly.
+    #[arg(long)]
+    pub xcode: bool,
     /// Web: skip `wasm-opt` even when it is installed.
     #[arg(long)]
     pub no_wasm_opt: bool,

@@ -460,6 +460,9 @@ const IOS_JOB: &str = r#"
     # Expects an Xcode project that links the Rust static library built below.
     needs: test
     runs-on: macos-latest
+    env:
+      # rustc's default (iOS 10) is older than Xcode supports: C dependencies fail to link.
+      IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -467,7 +470,7 @@ const IOS_JOB: &str = r#"
           toolchain: __TOOLCHAIN__
           targets: aarch64-apple-ios
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --lib --target aarch64-apple-ios
+      - run: cargo rustc --release --lib --crate-type staticlib --target aarch64-apple-ios
       - name: xcodebuild
         run: |
           xcodebuild -project "__IOS_PROJECT__" -scheme "__IOS_SCHEME__" -configuration Release \
@@ -587,6 +590,8 @@ mod tests {
         assert_eq!(doc["jobs"]["ios"]["runs-on"].as_str(), Some("macos-latest"));
         assert!(yaml.contains("cargo apk build"));
         assert!(yaml.contains("xcodebuild"));
+        assert!(yaml.contains("IPHONEOS_DEPLOYMENT_TARGET: \"16.0\""));
+        assert!(yaml.contains("cargo rustc --release --lib --crate-type staticlib --target aarch64-apple-ios"));
         assert!(yaml.contains("wasm-bindgen-cli@0.2.128"));
     }
 

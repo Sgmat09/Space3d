@@ -3,7 +3,8 @@
 # package never link those extra library types.
 #
 #   space3d build --target android     # = cargo apk build -p {{name}}-mobile --lib
-#   space3d build --target ios --sim   # = cargo build -p {{name}}-mobile --lib --target aarch64-apple-ios-sim
+#   space3d build --target ios --sim --xcode   # cargo build -p {{name}}-mobile --lib --target aarch64-apple-ios-sim + ios/project.yml
+#   (without --xcode, iOS builds bundle the game binary itself and do not use this crate)
 [package]
 name = "{{name}}-mobile"
 version = "0.1.0"

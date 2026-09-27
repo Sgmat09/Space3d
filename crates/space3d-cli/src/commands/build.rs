@@ -5,7 +5,7 @@ use crate::Ctx;
 use crate::args::{BuildArgs, CargoSel, Platform};
 use crate::process::{Cmd, which};
 use crate::project::Project;
-use crate::tools::{self, ANDROID_TARGET, IOS_SIM_TARGET, IOS_TARGET, WASM_TARGET};
+use crate::tools::{self, ANDROID_TARGET, WASM_TARGET};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -26,12 +26,13 @@ pub fn build(ctx: &Ctx, project: &Project, args: &BuildArgs) -> Result<PathBuf> 
         Platform::Desktop => desktop(ctx, project, &args.cargo, &out),
         Platform::Web => web(ctx, project, args, &out),
         Platform::Android => android(ctx, project, &args.cargo, &out),
-        Platform::Ios => ios(ctx, project, &args.cargo, args.sim, &out),
+        Platform::Ios => super::ios::build(ctx, project, &args.cargo, args.sim, args.xcode, &out).map(|_| ()),
     }?;
     Ok(out)
 }
 
-fn with_package(sel: &CargoSel, project: &Project) -> CargoSel {
+/// `sel` with the project's selected package filled in when none was given.
+pub(crate) fn with_package(sel: &CargoSel, project: &Project) -> CargoSel {
     let mut sel = sel.clone();
     sel.package.get_or_insert_with(|| project.package().name.clone());
     sel
@@ -273,106 +274,6 @@ fn android(ctx: &Ctx, project: &Project, sel: &CargoSel, out: &Path) -> Result<(
         }
     }
     finish(ctx, "android", out);
-    Ok(())
-}
-
-// ------------------------------------------------------------------------------------ ios
-
-fn ios(ctx: &Ctx, project: &Project, sel: &CargoSel, sim: bool, out: &Path) -> Result<()> {
-    if !cfg!(target_os = "macos") && !ctx.exec.dry_run {
-        bail!("iOS builds need macOS with Xcode");
-    }
-    let Some(pkg) = project.mobile_package("staticlib") else {
-        bail!(
-            "no package builds a `staticlib` for iOS.\n\
-             Projects created by `space3d new` have `mobile/` (package `{0}-mobile`); otherwise add\n\
-             [lib] crate-type = [\"lib\", \"staticlib\"] and `space3d::main!` to your library.",
-            project.package().name
-        );
-    };
-    let triple = if sim { IOS_SIM_TARGET } else { IOS_TARGET };
-    if !tools::has_target(&ctx.exec, project.dir(), triple) {
-        let msg =
-            format!("the {triple} target is not installed; run:\n    rustup target add {IOS_TARGET} {IOS_SIM_TARGET}");
-        if !ctx.exec.dry_run {
-            bail!(msg);
-        }
-        eprintln!("[dry-run] {msg}");
-    }
-    let xcode = tools::xcode_version(&ctx.exec);
-    if xcode.is_none() {
-        let msg = "Xcode is not installed or not selected (C dependencies need the iOS SDK).\n\
-                   Install Xcode, then: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer";
-        if !ctx.exec.dry_run {
-            bail!(msg);
-        }
-        eprintln!("[dry-run] {msg}");
-    }
-    let cmd = Cmd::cargo("build")
-        .cwd(project.dir())
-        .arg_if(sel.release, "--release")
-        .args(["-p", &pkg.name, "--lib", "--target", triple])
-        .opt("--features", sel.features.as_deref());
-    ctx.exec.run(&cmd)?;
-    let lib_name = pkg.lib().map_or_else(|| pkg.name.replace('-', "_"), |l| l.name.clone());
-    let staticlib = project
-        .target_dir
-        .join(triple)
-        .join(profile_dir(sel.release))
-        .join(format!("lib{lib_name}.a"));
-    stage(
-        ctx,
-        &staticlib,
-        &out.join(triple).join(staticlib.file_name().unwrap_or_default()),
-    )?;
-
-    let ios_dir = project.dir().join("ios");
-    let spec = ios_dir.join("project.yml");
-    let app_name = xcodegen_project_name(&spec).unwrap_or_else(|| project.package().name.clone());
-    let xcodeproj = ios_dir.join(format!("{app_name}.xcodeproj"));
-    let configuration = if sel.release { "Release" } else { "Debug" };
-    let sdk = if sim { "iphonesimulator" } else { "iphoneos" };
-    let xcodebuild = Cmd::new("xcodebuild")
-        .arg("-project")
-        .arg(&xcodeproj)
-        .args(["-scheme", &app_name, "-configuration", configuration, "-sdk", sdk])
-        .arg("-derivedDataPath")
-        .arg(project.target_dir.join("xcode"))
-        .args(["CODE_SIGNING_ALLOWED=NO", "build"]);
-    if spec.is_file() && which("xcodegen").is_some() {
-        ctx.exec.run(
-            &Cmd::new("xcodegen")
-                .args(["generate", "--spec"])
-                .arg(&spec)
-                .cwd(&ios_dir),
-        )?;
-    }
-    if xcodeproj.exists() && xcode.is_some() {
-        ctx.exec.run(&xcodebuild)?;
-        let app = project
-            .target_dir
-            .join("xcode/Build/Products")
-            .join(format!("{configuration}-{sdk}"))
-            .join(format!("{app_name}.app"));
-        eprintln!("app bundle: {}", app.display());
-        if sim {
-            let bundle_id = yaml_value(&spec, "PRODUCT_BUNDLE_IDENTIFIER").unwrap_or_else(|| "<bundle id>".into());
-            eprintln!(
-                "run it in the simulator:\n  open -a Simulator\n  xcrun simctl install booted '{}'\n  xcrun simctl launch booted {bundle_id}",
-                app.display(),
-            );
-        }
-    } else {
-        eprintln!(
-            "\nNext: create the Xcode project and build the app\n  \
-             brew install xcodegen && (cd ios && xcodegen generate)   # from ios/project.yml\n  \
-             {}\n\
-             or open {} in Xcode (set your signing team to run on a device).",
-            xcodebuild.display(),
-            xcodeproj.display()
-        );
-    }
-    finish(ctx, "ios", out);
     Ok(())
 }
 
