@@ -343,10 +343,16 @@ Space3d's egui breaks Chinese and Japanese text by the kinsoku (禁則処理) ru
 and the W3C JLREQ/CLREQ: no line starts with a closing bracket or quote, a comma or full stop
 (、。，．), a colon, ?, !, a middle dot, a small kana (ッ ャ ェ), the prolonged sound mark ー, an
 iteration mark (々), a postfixed sign (％ ℃) or an ellipsis; no line ends with an opening
-bracket or quote (「（【“) or ￥; "——" and "……" stay whole; Latin words and numbers inside
-CJK text stay whole and get breaks around them. Upstream egui starts lines with "，" "？" "）"
-"、" and ends them with "「". Text without Chinese or Japanese characters lays out exactly as
-with upstream egui (German „…“ quotes included). The rules and their limits are in
+bracket or quote (「（【“) or ￥, also not across spaces (「　重要　」); "——" and "……" stay
+whole; Latin words and numbers inside CJK text stay whole and get breaks around them. A run
+the rules keep together that is wider than the row breaks where the row is full, never inside
+"——" "……" that fit a row, and the rules never make a row wider than the wrap width.
+Upstream egui
+starts lines with "，" "？" "）" "、" and ends them with "「". Text without Chinese or Japanese
+characters lays out as with upstream egui (German „…“ quotes included), except around
+ellipses and doubled dashes, in every script: no line starts with "…" after a word, and
+"——" "……" are not split, so at narrow widths such text can wrap differently ("ove" | "r……"
+where upstream has "over" | "……"). The rules and their limits are in
 `third_party/README.md`; games that lay text out themselves can use them directly:
 `egui::epaint::text::kinsoku::{line_break, Break, is_line_start_prohibited,
 is_line_end_prohibited}`.

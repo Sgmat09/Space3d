@@ -42,6 +42,10 @@ const SIMPLIFIED_CHINESE: &[&str] = &[
     "欢迎来到 SpaceCorps。本周末双倍经验值活动进行中。4-2 星区目前海盗活动频繁，请谨慎前往。",
 ];
 
+/// Japanese with spaces between brackets and their text; not in the test font (replacement
+/// glyphs), which the rules don't look at.
+const SPACED: &[&str] = &["第一章　「　始まり　」　そして誰も（ 注意 ）いなくなった　。「重要」　です。『 完 』"];
+
 /// May not start a line (JIS X 4051: closing brackets and quotes, punctuation, small kana,
 /// the prolonged sound mark, iteration marks, postfixed signs, ellipses).
 const NOT_FIRST: &str =
@@ -73,10 +77,15 @@ fn cjk_context() -> egui::Context {
     ctx
 }
 
-fn is_breakable(before: char, after: char) -> bool {
-    let pair: String = [before, after].iter().collect();
-    before.is_whitespace()
-        || !(NOT_FIRST.contains(after) || NOT_LAST.contains(before) || INSEPARABLE.contains(&pair.as_str()))
+/// May a line break after `chars[i]`? Spaces don't separate a bracket from its text: the rules
+/// look at the nearest characters that aren't spaces on either side.
+fn is_breakable(chars: &[char], i: usize) -> bool {
+    let pair: String = chars[i..=i + 1].iter().collect();
+    let last = chars[..=i].iter().rev().find(|c| !c.is_whitespace());
+    let first = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+    !(first.is_some_and(|&c| NOT_FIRST.contains(c))
+        || last.is_some_and(|&c| NOT_LAST.contains(c))
+        || INSEPARABLE.contains(&pair.as_str()))
 }
 
 /// The widest run of `text` that the rules keep on one line ("茶？ェェッ！", "%）、"): below
@@ -86,7 +95,7 @@ fn widest_unit(fonts: &mut egui::epaint::text::FontsView<'_>, text: &str, font: 
     let mut widest = 0.0_f32;
     let mut start = 0;
     for i in 0..chars.len() {
-        if chars.get(i + 1).is_none_or(|&next| is_breakable(chars[i], next)) {
+        if i + 1 == chars.len() || is_breakable(&chars, i) {
             let unit: String = chars[start..=i].iter().collect();
             widest = widest.max(fonts.layout_no_wrap(unit, font.clone(), Color32::WHITE).size().x);
             start = i + 1;
@@ -100,17 +109,23 @@ fn rows(fonts: &mut egui::epaint::text::FontsView<'_>, text: &str, font: &FontId
     galley.rows.iter().map(|row| row.text()).collect()
 }
 
-/// Japanese, Traditional and Simplified Chinese paragraphs, with Latin words and numbers, at 13,
-/// 16 and 20 pt and every fourth width from the widest unbreakable run to 480 pt: no line
-/// starts with a closing mark, none ends with an opening one, "——" and "……" stay whole, and no
-/// character is lost.
+/// Japanese, Traditional and Simplified Chinese paragraphs, with Latin words and numbers and
+/// spaces around brackets, at 13, 16 and 20 pt and every fourth width from the widest
+/// unbreakable run to 480 pt: no line starts with a closing mark, none ends with an opening one
+/// (also not across spaces), "——" and "……" stay whole, and no character is lost.
 #[test]
 fn cjk_paragraphs_wrap_by_kinsoku_at_every_width() {
     let ctx = cjk_context();
     let mut bad = Vec::new();
     let mut layouts = 0;
     ctx.fonts_mut(|fonts| {
-        for text in JAPANESE.iter().chain(TRADITIONAL_CHINESE).chain(SIMPLIFIED_CHINESE) {
+        for text in JAPANESE
+            .iter()
+            .chain(TRADITIONAL_CHINESE)
+            .chain(SIMPLIFIED_CHINESE)
+            .chain(SPACED)
+        {
+            let chars: Vec<char> = text.chars().collect();
             for size in [13.0, 16.0, 20.0] {
                 let font = FontId::proportional(size);
                 let min_width = widest_unit(fonts, text, &font).ceil() as u32 + 2;
@@ -121,11 +136,11 @@ fn cjk_paragraphs_wrap_by_kinsoku_at_every_width() {
                     let rows = rows(fonts, text, &font, width as f32);
                     layouts += 1;
                     assert_eq!(rows.concat(), *text, "{size} pt at {width}");
-                    for (i, pair) in rows.windows(2).enumerate() {
-                        let (Some(last), Some(first)) = (pair[0].chars().last(), pair[1].chars().next()) else {
-                            continue;
-                        };
-                        if !is_breakable(last, first) {
+                    let mut end = 0;
+                    for (i, row) in rows.iter().enumerate().take(rows.len() - 1) {
+                        end += row.chars().count();
+                        if !is_breakable(&chars, end - 1) {
+                            let (last, first) = (chars[end - 1], chars[end]);
                             bad.push(format!(
                                 "{size} pt, {width}: {last:?} | {first:?} after row {i}: {rows:?}"
                             ));

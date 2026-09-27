@@ -683,7 +683,8 @@ fn line_break(
                 });
                 row_start_x += first_row_indentation;
                 first_row_indentation = 0.0;
-            } else if let Some(last_kept_index) = row_break_candidates.get(job.wrap.break_anywhere)
+            } else if let Some(last_kept_index) =
+                row_break_candidates.get(job.wrap.break_anywhere, &paragraph.glyphs, i, wrap_width)
             {
                 let glyphs: Vec<Glyph> = paragraph.glyphs[row_start_idx..=last_kept_index]
                     .iter()
@@ -1280,20 +1281,32 @@ struct RowBreakCandidates {
 
     /// Space3d patch (kinsoku): like `any`, but only where [`kinsoku`] doesn't prohibit a break.
     any_allowed: Option<usize>,
+
+    /// Space3d patch (kinsoku): like `any`, but not inside "——", "……" or a cluster.
+    any_separable: Option<usize>,
+
+    /// Space3d patch (kinsoku): the rules along the paragraph.
+    kinsoku: kinsoku::Scan,
 }
 
 impl RowBreakCandidates {
     fn add(&mut self, index: usize, glyphs: &[Glyph]) {
         let chr = glyphs[0].chr;
-        // Space3d patch (kinsoku): no break where kinsoku prohibits one (`any` is the last
-        // resort), a word-boundary break where it allows one egui's rules below lack.
-        match glyphs.get(1).map(|next| kinsoku::line_break(chr, next.chr)) {
-            Some(kinsoku::Break::Prohibited) => {
+        // Space3d patch (kinsoku): no break where kinsoku prohibits one (only the fallbacks
+        // `any_separable` and `any`), a word-boundary break where it allows one egui lacks.
+        if glyphs
+            .get(1)
+            .is_none_or(|next| kinsoku::separable(&glyphs[0], next))
+        {
+            self.any_separable = Some(index);
+        }
+        match self.kinsoku.next(glyphs) {
+            kinsoku::Break::Prohibited => {
                 self.any = Some(index);
                 return;
             }
-            Some(kinsoku::Break::Allowed) => self.pre_cjk = Some(index),
-            Some(kinsoku::Break::Upstream) | None => {}
+            kinsoku::Break::Allowed => self.pre_cjk = Some(index),
+            kinsoku::Break::Upstream => {}
         }
         self.any_allowed = Some(index);
         const NON_BREAKING_SPACE: char = '\u{A0}';
@@ -1326,15 +1339,39 @@ impl RowBreakCandidates {
         }
     }
 
-    fn get(&self, break_anywhere: bool) -> Option<usize> {
+    fn get(
+        &self,
+        break_anywhere: bool,
+        glyphs: &[Glyph],
+        overflowing: usize,
+        wrap_width: f32,
+    ) -> Option<usize> {
         if break_anywhere {
             self.any
         } else {
+            // Space3d patch (kinsoku): no break that leaves more Chinese or Japanese for the
+            // next row than fits there; before a run kinsoku keeps together if the whole run
+            // fits on the next row, else where the row is full (as upstream), but not inside
+            // "——" or "……" unless the pair alone is wider than a row, nor inside a cluster.
+            let carried = |index: usize| &glyphs[index + 1..=overflowing];
+            let may_carry =
+                |&index: &usize| kinsoku::may_carry(&glyphs[index..=overflowing], wrap_width);
             self.word_boundary()
-                .or(self.dash)
-                .or(self.punctuation)
-                .or(self.any_allowed) // Space3d patch (kinsoku)
-                .or(self.any)
+                .filter(may_carry)
+                .or_else(|| self.dash.filter(may_carry))
+                .or_else(|| self.punctuation.filter(may_carry))
+                .or_else(|| {
+                    self.any_allowed
+                        .filter(|&index| kinsoku::run_fits(glyphs, index, wrap_width))
+                })
+                .or_else(|| {
+                    self.any_separable
+                        .filter(|&index| kinsoku::fits(carried(index), wrap_width))
+                })
+                .or_else(|| {
+                    self.any
+                        .filter(|&index| !kinsoku::continues(&glyphs[index], &glyphs[index + 1]))
+                })
         }
     }
 
@@ -1346,7 +1383,9 @@ impl RowBreakCandidates {
             dash,
             punctuation,
             any,
-            any_allowed, // Space3d patch (kinsoku)
+            any_allowed,   // Space3d patch (kinsoku)
+            any_separable, // Space3d patch (kinsoku)
+            kinsoku: _,    // Space3d patch (kinsoku)
         } = self;
         if space.is_some_and(|s| s < index) {
             *space = None;
@@ -1368,6 +1407,9 @@ impl RowBreakCandidates {
         }
         if any_allowed.is_some_and(|s| s < index) {
             *any_allowed = None;
+        }
+        if any_separable.is_some_and(|s| s < index) {
+            *any_separable = None;
         }
     }
 }

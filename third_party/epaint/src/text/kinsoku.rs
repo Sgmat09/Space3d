@@ -13,8 +13,11 @@
 //! [`line_break`] rules on every position between two characters before egui records it as a
 //! break candidate:
 //!
-//! * [`Break::Prohibited`]: no break here. egui still breaks here when a row has no other place
-//!   to break at all (a run of marks or a word wider than the row), rather than overflowing.
+//! * [`Break::Prohibited`]: no break here. A run of characters kinsoku keeps together moves to
+//!   the next row whole when it fits there; one wider than a row (a run of marks, a word and
+//!   its "、" in a very narrow column) still breaks where the row is full, as upstream egui
+//!   breaks a word wider than the row — but not inside "——" or "……" when the pair fits a row,
+//!   nor inside a character and its combining mark or variation selector.
 //! * [`Break::Allowed`]: a word boundary, also where egui had none: after CJK punctuation
 //!   before a Latin word or a number ("、" | "Thulium", "。" | "4"), before an opening bracket
 //!   that follows a Latin word or a mark ("Skylab" | "「", "！" | "（").
@@ -24,16 +27,23 @@
 //!   “ ‘ « — which open a quote in Chinese and English but close one in German („Tor“) — only
 //!   count as opening brackets next to Chinese or Japanese characters.
 //!
+//! Row breaking uses [`line_break`] through a paragraph-level scan (crate-private), which also
+//! looks past spaces: a space between a bracket and its text ("「　重要　」") doesn't let the
+//! bracket end or start a line.
+//!
 //! The character classes follow JIS X 4051 (Japanese) and the W3C requirements for Japanese
 //! and Chinese layout (JLREQ, CLREQ), strict level: no line starts with a closing bracket or
 //! quote, a comma, full stop, colon, semicolon, ?, !, middle dot, hyphen or wave dash, small
 //! kana, the prolonged sound mark, an iteration mark, a postfixed sign (％ ℃) or an ellipsis;
 //! no line ends with an opening bracket or quote or a prefixed sign (￥ ＄); "——" "……" "‥‥"
-//! stay together. Hanging punctuation (ぶら下げ) and justification are out of scope.
+//! stay together; no line breaks on either side of a straight quote `"` `'` (it may open or
+//! close). Hanging punctuation (ぶら下げ) and justification are out of scope.
+
+use crate::text::Glyph;
 
 /// Revision of these rules, bumped whenever they change. Its presence tells a program or a
 /// test that epaint is Space3d's patched copy (`egui::epaint::text::kinsoku::VERSION`).
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Kinsoku's ruling on a line break between two characters, see [`line_break`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,14 +62,22 @@ pub enum Break {
 ///
 /// Text without Chinese or Japanese characters gets [`Break::Upstream`] (except that no line
 /// starts with an ellipsis after a non-space, and "——" "……" stay together), so it lays out
-/// exactly as with upstream egui. A space decides for itself: a line breaks after it as
-/// egui does.
+/// as with upstream egui. A space decides for itself — a line breaks after it as egui does —
+/// except that next to Chinese or Japanese no line starts with a closing mark after it or ends
+/// with an opening one before it ("字　」", "（\u{3000}").
 pub fn line_break(before: char, after: char) -> Break {
     if is_inseparable(before, after) {
         return Break::Prohibited;
     }
     if before.is_whitespace() || after.is_whitespace() {
-        return Break::Upstream;
+        // A space breaks as egui decides, but next to Chinese or Japanese it takes no closing
+        // mark to the start of a line and leaves no opening one at the end ("字　」", "「 字").
+        let cjk = is_cjk(before) || is_cjk(after);
+        return if cjk && (is_line_start_prohibited(after) || is_line_end_prohibited(before)) {
+            Break::Prohibited
+        } else {
+            Break::Upstream
+        };
     }
     if !is_cjk(before) && !is_cjk(after) {
         // Unicode line breaking (UAX #14, LB22) keeps an ellipsis with what precedes it in
@@ -72,6 +90,7 @@ pub fn line_break(before: char, after: char) -> Break {
     }
     if is_line_end_prohibited(before)
         || is_line_start_prohibited(after)
+        || is_straight_quote(before)
         || is_glue(before)
         || is_glue(after)
         || is_mark(after)
@@ -169,6 +188,12 @@ pub fn is_inseparable(before: char, after: char) -> bool {
         || (matches!(before, '〳' | '〴') && after == '〵')
 }
 
+/// `"` and `'` open and close quotes (Unicode line breaking class QU): next to Chinese or
+/// Japanese no line breaks on either side of them.
+fn is_straight_quote(c: char) -> bool {
+    matches!(c, '"' | '\'')
+}
+
 fn is_ellipsis(c: char) -> bool {
     matches!(c, '…' | '‥' | '⋯' | '︙')
 }
@@ -190,12 +215,111 @@ fn is_mark(c: char) -> bool {
     )
 }
 
+// ---- Glyph level (used by `RowBreakCandidates` in `text_layout.rs`) -------------------------
+
+/// Kinsoku along a paragraph: [`line_break`] at each position between two glyphs, plus what
+/// takes more than the two characters around a position. Spaces between a bracket and its text
+/// keep the bracket on the line of its text ("「　字", "字　」": no line ends with "「　" or
+/// starts with "　」"), and a cluster stays whole even when the shaper gave its variation
+/// selector the base's character (see [`continues`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Scan {
+    /// In a run of spaces after an opening bracket of Chinese or Japanese text.
+    after_opener: bool,
+
+    /// In (or right before) a run of spaces that a closing mark of Chinese or Japanese text
+    /// follows.
+    before_closer: bool,
+}
+
+impl Scan {
+    /// Kinsoku's ruling on the position after `glyphs[0]` (`glyphs`: the rest of the
+    /// paragraph). Call it for every position of a paragraph, in order.
+    pub(crate) fn next(&mut self, glyphs: &[Glyph]) -> Break {
+        let glyph = &glyphs[0];
+        let Some(next) = glyphs.get(1) else {
+            return Break::Upstream;
+        };
+        if !glyph.chr.is_whitespace() {
+            self.after_opener = is_cjk(glyph.chr) && is_line_end_prohibited(glyph.chr);
+            // Before a run of spaces, look past it once.
+            self.before_closer = next.chr.is_whitespace()
+                && glyphs[1..]
+                    .iter()
+                    .find(|g| !g.chr.is_whitespace())
+                    .is_some_and(|g| is_cjk(g.chr) && is_line_start_prohibited(g.chr));
+        }
+        if (glyph.chr.is_whitespace() && self.after_opener)
+            || (next.chr.is_whitespace() && self.before_closer)
+            || continues(glyph, next)
+        {
+            Break::Prohibited
+        } else {
+            line_break(glyph.chr, next.chr)
+        }
+    }
+}
+
+/// `next` continues the cluster of `glyph`, a Chinese or Japanese character: it has no width
+/// (a combining mark, or a variation selector or joiner, which the shaper gives the base's
+/// character when the font lacks it). No row breaks between them, not even as a last resort:
+/// that would only start the next row with an empty glyph.
+pub(crate) fn continues(glyph: &Glyph, next: &Glyph) -> bool {
+    next.advance_width <= 0.0 && is_cjk(glyph.chr)
+}
+
+/// A last-resort break between `glyph` and `next` is better than one elsewhere in the row:
+/// not inside "——" "……" (unless the pair alone is wider than the row) or a cluster.
+pub(crate) fn separable(glyph: &Glyph, next: &Glyph) -> bool {
+    !is_inseparable(glyph.chr, next.chr) && !continues(glyph, next)
+}
+
+/// Whether `glyphs` (from the first after a break to the one that overflowed the row) fit on
+/// a row `width` wide.
+pub(crate) fn fits(glyphs: &[Glyph], width: f32) -> bool {
+    match (glyphs.first(), glyphs.last()) {
+        (Some(first), Some(last)) => last.max_x() - first.pos.x <= width,
+        _ => true,
+    }
+}
+
+/// Whether a row may break after `glyphs[0]` and leave the rest (up to the glyph that
+/// overflowed the row) for the next row: they fit there, or there is no Chinese or Japanese
+/// in `glyphs` — then kinsoku had no say about the breaks in them, and the rest of a Latin
+/// word may overflow a little as with upstream egui.
+pub(crate) fn may_carry(glyphs: &[Glyph], width: f32) -> bool {
+    fits(&glyphs[1..], width) || !glyphs.iter().any(|glyph| is_cjk(glyph.chr))
+}
+
+/// Whether the run kinsoku keeps together after a break after `glyphs[index]` (up to the next
+/// position it allows a break at) fits on a row `width` wide. `RowBreakCandidates` moves such
+/// a run to the next row only when it fits there whole; a wider one breaks where the row is
+/// full, as upstream egui does, instead of overflowing the next row.
+pub(crate) fn run_fits(glyphs: &[Glyph], index: usize, width: f32) -> bool {
+    let Some(first) = glyphs.get(index + 1) else {
+        return true;
+    };
+    // A break is allowed after `index`, so a scan from there sees what the paragraph's saw.
+    let mut scan = Scan::default();
+    scan.next(&glyphs[index..]);
+    for end in index + 1..glyphs.len() {
+        if glyphs[end].max_x() - first.pos.x > width {
+            return false;
+        }
+        if scan.next(&glyphs[end..]) != Break::Prohibited {
+            return true;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::{
-        Break, is_cjk, is_inseparable, is_line_end_prohibited, is_line_start_prohibited, line_break,
+        Break, Scan, is_cjk, is_inseparable, is_line_end_prohibited, is_line_start_prohibited,
+        line_break,
     };
     use crate::text::{
         FontDefinitions, FontId, FontsImpl, LayoutJob, TextFormat, TextOptions,
@@ -437,6 +561,50 @@ mod tests {
         // “ ” and ‘ ’ open and close quotes in Chinese.
         expect(Break::Allowed, &["说“", "：“", "”然", "’字"]);
         expect(Break::Prohibited, &["“你", "‘你", "好”", "！”", "好’"]);
+        // " and ' open and close: no break on either side of them next to CJK.
+        expect(
+            Break::Prohibited,
+            &["说\"", "\"你", "好'", "'你", "\"（", "）\""],
+        );
+        expect(Break::Upstream, &["s'", "'s", "\"T", "T\""]);
+    }
+
+    /// A space next to a bracket of Chinese or Japanese text: no line starts with the closing
+    /// mark after it or ends with the opening one before it (as upstream, a line still breaks
+    /// after a space elsewhere).
+    #[test]
+    fn spaces_do_not_separate_brackets_from_their_text() {
+        expect(
+            Break::Prohibited,
+            &[
+                "\u{3000}」",
+                " 」",
+                "\u{A0}）",
+                "\u{3000}。",
+                "\u{3000}…",
+                "\u{3000})",
+                "（\u{3000}",
+                "（\u{A0}",
+                "「 ",
+                "【 ",
+                "“\u{3000}",
+                "‘\u{3000}",
+            ],
+        );
+        expect(
+            Break::Upstream,
+            &[
+                "字 ",
+                " 字",
+                "\u{3000}字",
+                "」\u{3000}",
+                "\u{3000}「",
+                "。 ",
+                "“ ",
+                " )",
+                "a ",
+            ],
+        );
     }
 
     /// No Chinese or Japanese character in the pair: egui's own rules, so text without them
@@ -588,6 +756,160 @@ mod tests {
                 rows.iter().skip(1).all(|r| !r.starts_with('、')),
                 "{width}: {rows:?}"
             );
+        }
+    }
+
+    /// Glyphs of `text` laid out on one row.
+    fn glyphs(fonts: &mut FontsImpl, text: &str) -> Vec<crate::text::Glyph> {
+        let job = LayoutJob::single_section(
+            text.to_owned(),
+            TextFormat::simple(FontId::proportional(14.0), crate::Color32::WHITE),
+        );
+        let galley = layout(fonts, 1.0, Arc::new(job));
+        galley
+            .rows
+            .iter()
+            .flat_map(|row| row.glyphs.clone())
+            .collect()
+    }
+
+    /// Width of the widest run of `text` that a paragraph's [`Scan`] keeps together.
+    fn widest_scanned_unit(fonts: &mut FontsImpl, text: &str) -> f32 {
+        let glyphs = glyphs(fonts, text);
+        let mut scan = Scan::default();
+        let (mut widest, mut start) = (0.0_f32, 0);
+        for i in 0..glyphs.len() {
+            if scan.next(&glyphs[i..]) != Break::Prohibited {
+                widest = widest.max(glyphs[i].max_x() - glyphs[start].pos.x);
+                start = i + 1;
+            }
+        }
+        widest
+    }
+
+    /// Spaces between brackets and their text, as Japanese sometimes has: at every width that
+    /// holds the widest run kept together, no row starts with a closing mark after its leading
+    /// spaces or ends with an opening one before its trailing spaces.
+    #[test]
+    fn brackets_stay_with_their_text_across_spaces() {
+        let mut fonts = fonts();
+        let text = "第一章　「　始まり　」　そして誰も（ 注意 ）いなくなった　。「重要」　です";
+        let min_width = widest_scanned_unit(&mut fonts, text).ceil() as usize + 1;
+        assert!(min_width < 120, "{min_width}");
+        for width in (min_width..=420).step_by(1) {
+            let rows = rows(&mut fonts, text, width as f32);
+            for pair in rows.windows(2) {
+                let last = pair[0].trim_end_matches(char::is_whitespace).chars().last();
+                let first = pair[1]
+                    .trim_start_matches(char::is_whitespace)
+                    .chars()
+                    .next();
+                assert!(
+                    !last.is_some_and(is_line_end_prohibited)
+                        && !first.is_some_and(is_line_start_prohibited),
+                    "{width}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    /// Row widths of `text` wrapped at `width` points, with the number of glyphs with a width
+    /// in each row.
+    fn row_widths(fonts: &mut FontsImpl, text: &str, width: f32) -> Vec<(String, f32, usize)> {
+        let mut job = LayoutJob::single_section(
+            text.to_owned(),
+            TextFormat::simple(FontId::proportional(14.0), crate::Color32::WHITE),
+        );
+        job.wrap.max_width = width;
+        let galley = layout(fonts, 1.0, Arc::new(job));
+        galley
+            .rows
+            .iter()
+            .map(|row| {
+                let visible = row.glyphs.iter().filter(|g| g.advance_width > 0.0).count();
+                (row.text(), row.size.x, visible)
+            })
+            .collect()
+    }
+
+    /// Chinese and Japanese rows never overflow the width (egui's rounding allows half a point)
+    /// unless a single glyph is wider, also where a run kinsoku keeps together is wider than a
+    /// row and must break: it breaks where the row is full, and a run moved to the next row
+    /// whole fits there.
+    #[test]
+    fn cjk_rows_never_overflow() {
+        let mut fonts = fonts();
+        let texts = CJK.iter().copied().chain([
+            "字「『（【〔〈《“‘字’”》〉〕】）』」。字「『（【〔〈《“‘字’”》〉〕】）』」、字",
+            "「えっ？」「ちょっと待って！」――彼は言った。「そんな……まさか」。ァィゥェォッャュョ",
+            "。。。。。。、、、、、，，，，！！！？？？：：；；・・・ーーーーッッッ",
+        ]);
+        for text in texts {
+            let mut width = 1.0;
+            while width <= 240.0 {
+                for (row, row_width, visible) in row_widths(&mut fonts, text, width) {
+                    assert!(
+                        row_width <= width + 0.5 + 1e-3 || visible <= 1,
+                        "{width}: {row:?} is {row_width} wide"
+                    );
+                }
+                width += 0.5;
+            }
+        }
+    }
+
+    /// "——" and "……" stay whole at every width that holds them, in any script — also where
+    /// the rest of the row is a word wider than the row ("over……").
+    #[test]
+    fn dashes_and_ellipses_stay_whole() {
+        let mut fonts = fonts();
+        let pair_width = ["——", "……", "――"]
+            .map(|t| width(&mut fonts, t))
+            .into_iter()
+            .fold(0.0, f32::max);
+        for text in [
+            "Wait… what? He said——no, he shouted——that it was over……",
+            "Loading…… please wait… still loading… — done — really—really—done",
+            "连接中断……正在重新连接——请稍候。服务器没有响应……请检查网络",
+            "コーヒー――それとも……紅茶？",
+        ] {
+            let mut width = pair_width.ceil();
+            while width <= 300.0 {
+                let rows = rows(&mut fonts, text, width);
+                for pair in rows.windows(2) {
+                    let (Some(last), Some(first)) =
+                        (pair[0].chars().last(), pair[1].chars().next())
+                    else {
+                        continue;
+                    };
+                    assert!(!is_inseparable(last, first), "{width}: {rows:?}");
+                }
+                width += 0.5;
+            }
+        }
+    }
+
+    /// A Chinese or Japanese character stays with its combining mark or variation selector at
+    /// every width, even where the shaper gives the selector the base's character (egui's
+    /// default fonts have no glyph for it) and even when the row is narrower than one glyph.
+    #[test]
+    fn clusters_stay_whole() {
+        let mut fonts = fonts();
+        let text = "葛\u{E0100}字\u{FE0F}か\u{3099}き\u{3099}葛\u{E0100}辻\u{E0101}";
+        for width in (0..=120).map(|w| w as f32 * 0.5) {
+            let mut job = LayoutJob::single_section(
+                text.to_owned(),
+                TextFormat::simple(FontId::proportional(14.0), crate::Color32::WHITE),
+            );
+            job.wrap.max_width = width;
+            let galley = layout(&mut fonts, 1.0, Arc::new(job));
+            for row in galley.rows.iter().skip(1) {
+                assert!(
+                    row.glyphs.first().is_some_and(|g| g.advance_width > 0.0),
+                    "{width}: a row starts inside a cluster: {:?}",
+                    galley.rows.iter().map(|r| r.text()).collect::<Vec<_>>()
+                );
+            }
         }
     }
 
