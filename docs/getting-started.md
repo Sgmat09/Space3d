@@ -134,7 +134,7 @@ Space3d is consumed by git revision. After bumping the pinned `rev`, run `cargo 
 egui Space3d's Chinese and Japanese line breaking, and only applies while it comes from the same
 Space3d revision (a game created before it existed adds it by hand, see
 [UI: Chinese and Japanese line breaking](ui.md#chinese-and-japanese-line-breaking-kinsoku);
-`space3d doctor` warns when it is missing or unused). Space3d always tracks the latest stable release of its dependencies, so a
+`space3d doctor` warns when it is missing, unused or not Space3d's). Space3d always tracks the latest stable release of its dependencies, so a
 consumer lockfile pinned to an older version can fail to resolve, e.g. `space3d-net` needs
 `hyper-util ^0.1.21` ("failed to select a version for `hyper-util`"): update that crate too —
 `cargo update -p hyper-util` — or simply `cargo update`.

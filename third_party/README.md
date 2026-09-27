@@ -162,4 +162,5 @@ equivalent rules; the space3d-ui tests say whether it does.
 
 Games get kinsoku with the same one-line `[patch.crates-io]` (git form, same `rev` as their
 `space3d` dependency); see `docs/ui.md`, "Chinese and Japanese line breaking". `space3d new`
-writes it, `space3d doctor` warns when it is missing.
+writes it; `space3d doctor` warns when it is missing, unused, not Space3d's copy (a game's own
+older one), or from another Space3d revision than `space3d`.

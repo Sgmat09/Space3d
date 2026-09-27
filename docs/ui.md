@@ -381,7 +381,10 @@ When the entry is missing, or points at a Space3d revision whose egui differs fr
 `space3d` uses, cargo only warns (`Patch 'epaint v… (…)' was not used in the crate graph`) and
 builds crates.io's epaint, without kinsoku. Check with:
 
-* `space3d doctor` — the `ui` line warns and prints the entry to add;
+* `space3d doctor` — the `ui` line warns and prints the entry to add when epaint comes from
+  crates.io, from another Space3d revision than `space3d`, or from a path without Space3d's
+  kinsoku module (a game's own older copy), and says when `space3d`'s revision predates
+  `third_party/epaint` (update `space3d` first);
 * `cargo tree -i epaint` — shows `epaint v0.36.2 (https://github.com/SpaceCorps/Space3d?rev=…)`
   (or the local path), not a bare version;
 * a test in the game that only compiles with the patched epaint:
