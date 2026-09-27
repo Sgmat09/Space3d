@@ -11,6 +11,7 @@
     /* `!important`: the runner sets the canvas' CSS size from the window size; the page decides. */
     canvas#space3d { display: block; width: 100vw !important; height: 100vh !important; touch-action: none; outline: none; }
     #status { position: fixed; left: 12px; bottom: 10px; opacity: .7; pointer-events: none; }
+    #status.error { opacity: 1; color: #f88; }
   </style>
 </head>
 <body>
@@ -20,9 +21,18 @@
     // `space3d build --target web` runs wasm-bindgen with --out-name web_demo.
     import init from "./web_demo.js";
     const status = document.getElementById("status");
-    init()
-      .then(() => { status.textContent = "drag to orbit · wheel/pinch to zoom · tap to recolor · 1–3 patterns"; })
-      .catch((e) => { status.textContent = "failed to start: " + e; console.error(e); });
+    const canvas = document.getElementById("space3d");
+    // The engine tells the page when it renders (`space3d-ready`: `init()` resolves before the
+    // renderer exists) or cannot (`space3d-error`, the reason in `detail`: no WebGPU/WebGL2, a
+    // lost GPU context).
+    canvas.addEventListener("space3d-ready", () => {
+      status.textContent = "drag to orbit · wheel/pinch to zoom · tap to recolor · 1–3 patterns";
+    });
+    canvas.addEventListener("space3d-error", (e) => {
+      status.textContent = e.detail;
+      status.className = "error";
+    });
+    init().catch((e) => { status.textContent = "failed to start: " + e; status.className = "error"; console.error(e); });
   </script>
 </body>
 </html>

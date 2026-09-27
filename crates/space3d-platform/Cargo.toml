@@ -22,7 +22,7 @@ pollster.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
-web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlCanvasElement", "Navigator", "Location", "console"] }
+web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlCanvasElement", "Navigator", "Location", "console", "CustomEvent", "CustomEventInit", "Event", "EventTarget"] }
 console_error_panic_hook.workspace = true
 # The browser-console `tracing` layer (`console_log`).
 tracing-subscriber.workspace = true

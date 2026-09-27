@@ -14,7 +14,8 @@
 //!   ([`Input::key_label`]) that follow the player's layout; see [`layout`].
 //! * Web: canvas attachment via [`WindowPlugin::canvas_id`]; browser-console logging at each
 //!   event's level ([`console_log`]: `init_web_logging()`, wasm32 only); `?webgl2` in the page
-//!   URL forces the WebGL2 backend (`?webgpu`: WebGPU only).
+//!   URL forces the WebGL2 backend (`?webgpu`: WebGPU only); the page learns that the game
+//!   renders, or cannot, from the [`PAGE_READY_EVENT`] / [`PAGE_ERROR_EVENT`] DOM events.
 //! * Mobile: `android_main_entry` (Android) and the iOS `start_app` pattern — see [`mobile`].
 //!
 //! ```no_run
@@ -82,7 +83,7 @@ pub use layout::{
 pub use mobile::{AndroidApp, android_main_entry};
 #[cfg(target_arch = "wasm32")]
 pub use web::find_canvas;
-pub use window::{PlatformEvent, WindowPlugin, WindowState, backends_from_query};
+pub use window::{PAGE_ERROR_EVENT, PAGE_READY_EVENT, PlatformEvent, WindowPlugin, WindowState, backends_from_query};
 
 pub use winit;
 

@@ -26,6 +26,8 @@ use space3d::assets::render::{ModelUploadOptions, PreparedModel, prepare_model_a
 use space3d::prelude::*;
 
 const SIDE: usize = 64;
+/// Pointer travel (physical pixels) up to which a press and release is a click/tap, not a drag.
+const TAP_SLOP: f32 = 10.0;
 
 /// Camera orbit + pattern state.
 struct Demo {
@@ -37,6 +39,9 @@ struct Demo {
     pattern: u32,
     /// Distance between the two touches last frame (pinch zoom).
     pinch: Option<f32>,
+    /// How far the mouse moved since the left button went down: a release after less than
+    /// [`TAP_SLOP`] is a click, after more the end of a drag.
+    mouse_travel: f32,
     /// The crystal model while it loads, then its root entity.
     crystal: Crystal,
 }
@@ -120,6 +125,7 @@ fn setup(ctx: &mut SystemCtx) {
         palette: 0,
         pattern: 1,
         pinch: None,
+        mouse_travel: 0.0,
         crystal,
     });
 }
@@ -162,22 +168,29 @@ fn spawn_crystal(ctx: &mut SystemCtx) {
 
 fn controls(ctx: &mut SystemCtx) {
     let input = ctx.resources.expect::<Input>();
-    let mut drag = if input.mouse_pressed(MouseButton::Left) {
+    let mouse_down = input.mouse_just_pressed(MouseButton::Left);
+    let mouse_drag = if input.mouse_pressed(MouseButton::Left) {
         input.mouse_delta()
     } else {
         Vec2::ZERO
     };
+    let mouse_up = input.mouse_just_released(MouseButton::Left);
     let touches = input.touches().to_vec();
-    if touches.len() == 1 {
-        drag = touches[0].delta;
-    }
+    let drag = if touches.len() == 1 {
+        touches[0].delta
+    } else {
+        mouse_drag
+    };
     let pinch_now = (touches.len() == 2).then(|| touches[0].position.distance(touches[1].position));
-    let tapped = input.mouse_just_released(MouseButton::Left) || !input.just_ended_touches().is_empty();
+    // A finger lifted close to where it went down (and not moving this frame) is a tap.
+    let touch_tap = input
+        .just_ended_touches()
+        .first()
+        .is_some_and(|t| t.position.distance(t.start) < TAP_SLOP && drag.length() < 1.0);
     let pattern = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3]
         .iter()
         .position(|k| input.just_pressed(*k));
     let wheel = input.wheel_delta().y;
-    let travelled = input.just_ended_touches().first().map(|t| t.position.distance(t.start));
 
     let demo = ctx.resources.expect_mut::<Demo>();
     demo.yaw -= drag.x * 0.005;
@@ -187,8 +200,15 @@ fn controls(ctx: &mut SystemCtx) {
         demo.distance = (demo.distance * before / now.max(1.0)).clamp(15.0, 160.0);
     }
     demo.pinch = pinch_now;
-    // A tap (not the end of a drag) cycles the palette.
-    if tapped && drag.length() < 1.0 && travelled.is_none_or(|d| d < 10.0) {
+    // The mouse button's release frame has no drag left: whether it was a click is decided
+    // by the whole press's travel.
+    if mouse_down {
+        demo.mouse_travel = 0.0;
+    }
+    demo.mouse_travel += mouse_drag.length();
+    let mouse_click = mouse_up && demo.mouse_travel < TAP_SLOP;
+    // A click or tap (not the end of a drag) cycles the palette.
+    if mouse_click || touch_tap {
         demo.palette = (demo.palette + 1) % PALETTES.len();
         space3d::tracing::info!("palette {}", demo.palette + 1);
     }
@@ -262,6 +282,85 @@ space3d::main!(build);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app with only [`controls`], its input and a demo state.
+    fn controls_app() -> App {
+        let mut app = App::new();
+        let buffer = InstanceBuffers::default().insert(InstanceBuffer::from_vec(
+            Vec::<InstancePacked>::new(),
+            BufferUsage::Dynamic,
+        ));
+        app.insert_resource(Input::default());
+        app.insert_resource(Demo {
+            buffer,
+            yaw: 0.0,
+            pitch: 0.5,
+            distance: 70.0,
+            palette: 0,
+            pattern: 1,
+            pinch: None,
+            mouse_travel: 0.0,
+            crystal: Crystal::Failed,
+        });
+        app.add_system(Stage::Update, controls);
+        app
+    }
+
+    /// One frame: `input` happens, `controls` runs, the frame's edges are cleared.
+    fn frame(app: &mut App, input: impl FnOnce(&mut Input)) {
+        input(app.resources.expect_mut::<Input>());
+        app.run_stage(Stage::Update);
+        app.resources.expect_mut::<Input>().end_frame();
+    }
+
+    #[test]
+    fn click_cycles_the_palette() {
+        let mut app = controls_app();
+        frame(&mut app, |i| i.inject_mouse_move(Vec2::new(400.0, 300.0)));
+        frame(&mut app, |i| i.inject_mouse_button_down(MouseButton::Left));
+        frame(&mut app, |i| i.inject_mouse_move(Vec2::new(403.0, 301.0)));
+        frame(&mut app, |i| i.inject_mouse_button_up(MouseButton::Left));
+        assert_eq!(app.resources.expect::<Demo>().palette, 1);
+    }
+
+    #[test]
+    fn drag_orbits_without_changing_the_palette() {
+        let mut app = controls_app();
+        frame(&mut app, |i| i.inject_mouse_move(Vec2::new(400.0, 300.0)));
+        frame(&mut app, |i| i.inject_mouse_button_down(MouseButton::Left));
+        for step in 1..=20 {
+            frame(&mut app, |i| {
+                i.inject_mouse_move(Vec2::new(400.0 + step as f32 * 15.0, 300.0))
+            });
+        }
+        frame(&mut app, |i| i.inject_mouse_button_up(MouseButton::Left));
+        let demo = app.resources.expect::<Demo>();
+        assert_eq!(demo.palette, 0, "the end of a drag is not a click");
+        assert!(demo.yaw < -1.0, "the drag orbited: yaw {}", demo.yaw);
+    }
+
+    #[test]
+    fn touch_tap_and_drag() {
+        let mut app = controls_app();
+        let at = Vec2::new(200.0, 200.0);
+        frame(&mut app, |i| i.inject_touch(1, TouchPhase::Started, at));
+        frame(&mut app, |i| i.inject_touch(1, TouchPhase::Ended, at));
+        assert_eq!(app.resources.expect::<Demo>().palette, 1, "a tap");
+        frame(&mut app, |i| i.inject_touch(2, TouchPhase::Started, at));
+        for step in 1..=10 {
+            frame(&mut app, |i| {
+                i.inject_touch(2, TouchPhase::Moved, at + Vec2::new(step as f32 * 20.0, 0.0))
+            });
+        }
+        frame(&mut app, |i| {
+            i.inject_touch(2, TouchPhase::Ended, at + Vec2::new(200.0, 0.0))
+        });
+        assert_eq!(
+            app.resources.expect::<Demo>().palette,
+            1,
+            "the end of a one-finger drag is not a tap"
+        );
+    }
 
     #[test]
     fn waves_stay_in_range() {

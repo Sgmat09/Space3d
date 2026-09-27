@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Drive one Space3d web build in headless Google Chrome over the DevTools protocol and check
 // that it really runs: the renderer initialises on the expected backend, frames are drawn
-// (two screenshots differ and are not blank), input reaches the game, assets and the wasm
+// (the page draws to its canvas every animation frame and the screen is not blank; with
+// --expect-animation two screenshots also differ), input reaches the game, assets and the wasm
 // arrive over HTTP with the right MIME type, and nothing panics or logs an error.
 //
 // Usually run by scripts/web-smoke.sh (which builds and serves the example). By hand:
@@ -16,20 +17,27 @@
 //   --backend B           webgpu | webgl2 | any: backend the engine must report (default any)
 //   --no-webgpu           start Chrome without a WebGPU adapter: the WebGL2 fallback
 //   --chrome PATH         Chrome binary (default: $CHROME, else the macOS/Linux default path)
-//   --profile DIR         throwaway --user-data-dir (default: $TMPDIR/space3d-web-smoke-chrome)
+//   --profile DIR         throwaway --user-data-dir (default: a new directory in $TMPDIR, removed
+//                         afterwards); Chrome processes still using it at the end are killed
 //   --size WxH            viewport (default 1280x720)
 //   --timeout SECS        wait for the renderer at most this long (default 120)
 //   --settle SECS         run this long after the renderer exists before the first shot (default 3)
 //   --ready-log REGEX     also wait for this console line before the first shot
+//   --drag                drag the mouse from the canvas centre 300 px to the right (left button,
+//                         20 moves) as the first input
 //   --click               click the canvas centre (pointer down/up) as the input test
 //   --key CODE            press a key (KeyboardEvent.code, e.g. Digit2, KeyQ); repeatable
 //   --wheel DY            scroll the wheel over the canvas centre by DY pixels
+//   --expect-animation    the scene moves by itself: two screenshots 0.5 s apart must differ
+//                         (without it a still scene passes when the page keeps drawing frames)
 //   --expect-log REGEX    console line that must appear after the input; repeatable
+//   --reject-log REGEX    console line that must not appear after the input; repeatable
 //   --expect-request RE   a request whose URL matches must succeed (e.g. assets/); repeatable
 //   --expect-color-shift  the mean colour (chromaticity) of lit pixels must move after the input:
 //                         by 0.04 at least, and 1.5× more than between the shots before it
-//   --expect-audio        the game's AudioContext is suspended before the input (browser autoplay
-//                         policy) and running after it (the input is the page's first gesture)
+//   --expect-audio        audio starts with the input (the page's first gesture): before it no
+//                         AudioContext runs (browser autoplay policy), after it one runs, and the
+//                         browser logged no autoplay warning (none was created or resumed early)
 //   --min-lit FRACTION    fraction of pixels brighter than the background (default 0.02)
 //   --allow-error REGEX   console errors matching this are not failures; repeatable
 //   --keep-open           leave Chrome running (debugging)
@@ -38,8 +46,8 @@
 // <out>/<name>.json, console output to <out>/<name>.console.log, screenshots to
 // <out>/<name>-{1,2,3}.png. Needs Node 22+ (global fetch/WebSocket); no npm packages.
 
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { inflateSync } from "node:zlib";
@@ -47,9 +55,18 @@ import { inflateSync } from "node:zlib";
 // ------------------------------------------------------------------------------ arguments
 
 function parseArgs(argv) {
-  const repeat = new Set(["key", "expect-log", "expect-request", "allow-error"]);
-  const flags = new Set(["click", "expect-color-shift", "expect-audio", "keep-open", "no-webgpu", "help"]);
-  const o = { key: [], "expect-log": [], "expect-request": [], "allow-error": [] };
+  const repeat = new Set(["key", "expect-log", "reject-log", "expect-request", "allow-error"]);
+  const flags = new Set([
+    "click",
+    "drag",
+    "expect-animation",
+    "expect-color-shift",
+    "expect-audio",
+    "keep-open",
+    "no-webgpu",
+    "help",
+  ]);
+  const o = { key: [], "expect-log": [], "reject-log": [], "expect-request": [], "allow-error": [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("--")) throw new Error(`unexpected argument ${a}`);
@@ -81,7 +98,9 @@ const [width, height] = (opts.size ?? "1280x720").split("x").map(Number);
 const timeoutMs = Number(opts.timeout ?? 120) * 1000;
 const settleMs = Number(opts.settle ?? 3) * 1000;
 const minLit = Number(opts["min-lit"] ?? 0.02);
-const profile = resolve(opts.profile ?? join(tmpdir(), "space3d-web-smoke-chrome"));
+// A profile of our own per run: concurrent runs (other worktrees, CI jobs) never share one.
+const ownProfile = !opts.profile;
+const profile = ownProfile ? mkdtempSync(join(tmpdir(), "space3d-web-smoke-chrome-")) : resolve(opts.profile);
 const chrome =
   opts.chrome ??
   process.env.CHROME ??
@@ -146,7 +165,16 @@ async function launchChrome() {
     await sleep(100);
   }
   proc.kill("SIGKILL");
+  killProfileChrome();
   throw new Error(`Chrome did not open a DevTools port within 30 s:\n${stderr}`);
+}
+
+/// Kill every process still started with our --user-data-dir (the profile path is unique to
+/// this run): killing the process we spawned is not always enough (a Chrome that was slow to
+/// start under heavy load was seen outliving it).
+function killProfileChrome() {
+  const escaped = profile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  spawnSync("pkill", ["-KILL", "-f", `user-data-dir=${escaped}( |$)`], { stdio: "ignore" });
 }
 
 /// Minimal CDP client on Node's built-in WebSocket.
@@ -341,9 +369,10 @@ function lineMatches(re) {
   return consoleLines.some((l) => re.test(l.text));
 }
 
-async function waitFor(pred, ms, what) {
+async function waitFor(pred, ms, what, refresh = async () => {}) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
+    await refresh();
     if (pred()) return true;
     if (exceptions.length || errors.some((e) => /panicked at/.test(e))) break;
     await sleep(100);
@@ -405,18 +434,43 @@ try {
   ]);
   await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
   await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
-  // Count the browser's animation frames (the engine draws one frame per rAF), and keep the
-  // AudioContexts the page creates to report their state (suspended until a user gesture).
+  // Count the browser's animation frames and those in which the page drew to a canvas (a
+  // WebGPU canvas texture was acquired, or a WebGL draw/clear/blit ran: the engine draws one
+  // frame per rAF, whether or not the scene moves), and keep the AudioContexts the page
+  // creates to report their state (suspended until a user gesture).
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-    source: `window.__smokeFrames = 0;
-      (function t() { window.__smokeFrames++; requestAnimationFrame(t); })();
+    // In a function: no globals but the __smoke* ones (a page script may use the same names).
+    source: `(() => {
+      window.__smokeFrames = 0;
+      window.__smokeDrawnFrames = 0;
+      let drew = false;
+      (function t() {
+        window.__smokeFrames++;
+        if (drew) { window.__smokeDrawnFrames++; drew = false; }
+        requestAnimationFrame(t);
+      })();
+      const count = (proto, names) => {
+        for (const n of names) {
+          const f = proto && proto[n];
+          if (typeof f === "function") proto[n] = function (...a) { drew = true; return f.apply(this, a); };
+        }
+      };
+      count(window.GPUCanvasContext?.prototype, ["getCurrentTexture"]);
+      const gl = ["drawArrays", "drawElements", "drawArraysInstanced", "drawElementsInstanced", "drawRangeElements", "clear", "blitFramebuffer"];
+      count(window.WebGL2RenderingContext?.prototype, gl);
+      count(window.WebGLRenderingContext?.prototype, gl);
+      // The engine's DOM events for the page (they bubble from its canvas).
+      window.__smokePage = { ready: false, errors: [] };
+      addEventListener("space3d-ready", () => { window.__smokePage.ready = true; });
+      addEventListener("space3d-error", (e) => { window.__smokePage.errors.push(String(e.detail)); });
       window.__smokeAudio = [];
       if (window.AudioContext) {
         const Base = window.AudioContext;
         window.AudioContext = class extends Base {
           constructor(...a) { super(...a); window.__smokeAudio.push(this); }
         };
-      }`,
+      }
+    })();`,
   });
   const audioStates = async () =>
     (await cdp.send("Runtime.evaluate", { expression: "window.__smokeAudio.map((c) => c.state)", returnByValue: true }))
@@ -439,6 +493,18 @@ try {
     if (backend === "webgpu" && summary.reportedBackend !== "BrowserWebGpu")
       fail(`expected the WebGPU (BrowserWebGpu) backend, got ${summary.reportedBackend}`);
   }
+  // The page hears about the renderer through the engine's `space3d-ready` event.
+  if (initLine) {
+    await waitFor(
+      () => summary.page?.ready,
+      5_000,
+      "the `space3d-ready` DOM event",
+      async () =>
+        (summary.page = (
+          await cdp.send("Runtime.evaluate", { expression: "window.__smokePage", returnByValue: true })
+        ).result.value),
+    );
+  }
   summary.navigatorGpu = (
     await cdp.send("Runtime.evaluate", { expression: "typeof navigator.gpu", returnByValue: true })
   ).result.value;
@@ -447,8 +513,14 @@ try {
   }
 
   // 2. Frames: let it run, then two screenshots half a second apart.
-  const frames0 = (await cdp.send("Runtime.evaluate", { expression: "window.__smokeFrames", returnByValue: true }))
-    .result.value;
+  const frameCounts = async () =>
+    (
+      await cdp.send("Runtime.evaluate", {
+        expression: "[window.__smokeFrames, window.__smokeDrawnFrames]",
+        returnByValue: true,
+      })
+    ).result.value;
+  const [frames0, drawn0] = await frameCounts();
   await sleep(settleMs);
   const shoot = async (i) => {
     const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
@@ -460,9 +532,9 @@ try {
   const shot1 = await shoot(1);
   await sleep(500);
   const shot2 = await shoot(2);
-  const frames1 = (await cdp.send("Runtime.evaluate", { expression: "window.__smokeFrames", returnByValue: true }))
-    .result.value;
+  const [frames1, drawn1] = await frameCounts();
   summary.framesDuringSettle = frames1 - frames0;
+  summary.drawnFramesDuringSettle = drawn1 - drawn0;
   summary.fps = Math.round((frames1 - frames0) / ((settleMs + 500) / 1000));
   const s1 = imageStats(shot1.png);
   const s2 = imageStats(shot2.png);
@@ -470,19 +542,37 @@ try {
   summary.lit = [s1.lit, s2.lit].map((v) => +v.toFixed(4));
   summary.audioContexts = { beforeInput: await audioStates() };
   summary.animated = +changedFraction(shot1.png, shot2.png).toFixed(4);
-  log(`frames ${summary.framesDuringSettle} (~${summary.fps}/s), lit ${summary.lit}, changed ${summary.animated}`);
+  log(
+    `frames ${summary.framesDuringSettle} (~${summary.fps}/s), drawn ${summary.drawnFramesDuringSettle}, ` +
+      `lit ${summary.lit}, changed ${summary.animated}`,
+  );
   if (summary.framesDuringSettle < 10) fail(`only ${summary.framesDuringSettle} animation frames ran`);
+  // The engine draws every frame; half of them allows for a busy machine.
+  if (summary.drawnFramesDuringSettle < summary.framesDuringSettle / 2)
+    fail(`the page drew to its canvas in only ${summary.drawnFramesDuringSettle} of ${summary.framesDuringSettle} frames`);
   if (s1.lit < minLit || s2.lit < minLit) fail(`screen nearly blank (lit fraction ${summary.lit}, need ${minLit})`);
-  if (summary.animated === 0) fail("two screenshots 0.5 s apart are identical (no frames drawn?)");
+  if (opts["expect-animation"] && summary.animated === 0)
+    fail("two screenshots 0.5 s apart are identical (--expect-animation: the scene should move)");
 
   // 3. Input.
   const inputStart = consoleLines.length;
   const cx = Math.round(width / 2);
   const cy = Math.round(height / 2);
-  const hadInput = opts.click || opts.key.length || opts.wheel;
+  const hadInput = opts.drag || opts.click || opts.key.length || opts.wheel;
   if (hadInput) {
     // Pointer over the canvas first (focus follows the click; keys need a focused canvas).
     await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
+    if (opts.drag) {
+      const button = { button: "left", clickCount: 1 };
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, ...button });
+      for (let i = 1; i <= 20; i++) {
+        await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx + i * 15, y: cy, button: "left", buttons: 1 });
+        await sleep(16);
+      }
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: cx + 300, y: cy, ...button });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
+      await sleep(150);
+    }
     if (opts.click) {
       await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
       await sleep(80);
@@ -516,13 +606,19 @@ try {
       );
       summary.audioContexts.afterInput = await audioStates();
       const { beforeInput, afterInput } = summary.audioContexts;
-      if (!beforeInput.length) fail("the page created no AudioContext");
+      // Before the first gesture the engine creates no AudioContext (one created then stays
+      // suspended and makes the browser warn).
       if (beforeInput.some((st) => st !== "suspended"))
-        fail(`AudioContext ${beforeInput} before any gesture (expected suspended: is the autoplay policy on?)`);
+        fail(`AudioContext ${beforeInput} before any gesture (expected none, or suspended: is the autoplay policy on?)`);
       if (!afterInput.length || afterInput.some((st) => st !== "running"))
-        fail(`AudioContext ${afterInput} after the first gesture (expected running)`);
+        fail(`AudioContext [${afterInput}] after the first gesture (expected running)`);
     }
     await sleep(800);
+    for (const re of opts["reject-log"]) {
+      const rx = new RegExp(re);
+      const line = consoleLines.slice(inputStart).find((l) => rx.test(l.text));
+      if (line) fail(`/${re}/ appeared after the input: ${line.text}`);
+    }
     const shot3 = await shoot(3);
     summary.screenshots.push(shot3.file);
     const s3 = imageStats(shot3.png);
@@ -565,6 +661,10 @@ try {
   const allowed = opts["allow-error"].map((r) => new RegExp(r));
   for (const e of exceptions) fail(`uncaught exception: ${e}`);
   for (const e of errors) if (!allowed.some((r) => r.test(e)) && !isFavicon(e)) fail(`console error: ${e}`);
+  summary.page = (await cdp.send("Runtime.evaluate", { expression: "window.__smokePage", returnByValue: true })).result.value;
+  // The autoplay policy's complaint about an AudioContext created or resumed before a gesture.
+  if (opts["expect-audio"])
+    for (const w of warnings) if (/AudioContext was not allowed to start/.test(w)) fail(`autoplay warning: ${w}`);
   summary.warnings = warnings;
   summary.errors = errors;
 } catch (e) {
@@ -586,6 +686,8 @@ try {
     chromeProc?.kill("SIGTERM");
     await sleep(500);
     if (chromeProc && chromeProc.exitCode === null) chromeProc.kill("SIGKILL");
+    killProfileChrome();
+    if (ownProfile) rmSync(profile, { recursive: true, force: true });
   }
   log(summary.ok ? "PASS" : `FAIL (${failures.length})\n  - ${failures.join("\n  - ")}`);
   process.exit(summary.ok ? 0 : 1);

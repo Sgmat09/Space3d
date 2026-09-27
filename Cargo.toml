@@ -92,7 +92,7 @@ base64 = "0.23.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # audio
-kira = "0.12.4"
+kira = "0.12.5"
 
 # serialization / errors / logging
 serde = { version = "1.0.229", features = ["derive"] }
@@ -118,10 +118,10 @@ include_dir = "0.7.4"
 tempfile = "3.27.0"
 
 # web / wasm
-wasm-bindgen = "0.2.128"
-wasm-bindgen-futures = "0.4.78"
-web-sys = "0.3.105"
-js-sys = "0.3.105"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = "0.3.106"
+js-sys = "0.3.106"
 # Windows keyboard layout labels (space3d-platform); latest stable, already locked via other deps.
 windows-sys = "0.61.2"
 console_error_panic_hook = "0.1.7"

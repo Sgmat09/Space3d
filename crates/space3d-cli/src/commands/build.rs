@@ -203,10 +203,15 @@ pub fn default_index_html(bin: &str) -> String {
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
   <link rel="icon" href="data:,">
   <title>{bin}</title>
-  <style>html,body{{margin:0;height:100%;background:#000;overflow:hidden}}canvas{{display:block;width:100vw!important;height:100vh!important;touch-action:none;outline:none}}</style>
+  <style>html,body{{margin:0;height:100%;background:#000;color:#f88;font:14px system-ui,sans-serif;overflow:hidden}}canvas{{display:block;width:100vw!important;height:100vh!important;touch-action:none;outline:none}}</style>
 </head>
 <body>
-  <script type="module">import init from "./{bin}.js"; init();</script>
+  <script type="module">
+    import init from "./{bin}.js";
+    // The engine's `space3d-error` event (bubbles from its canvas): the game cannot render.
+    addEventListener("space3d-error", (e) => document.body.insertAdjacentText("afterbegin", e.detail));
+    init();
+  </script>
 </body>
 </html>
 "#

@@ -51,7 +51,14 @@ What `space3d build --target web` does:
    it).
 5. Copies `web/` (your `index.html`, icons, …) and `assets/` into `dist/web`.
 
-The page loads the bundle with `import init from "./<game>.js"; init();`. Set
+The page loads the bundle with `import init from "./<game>.js"; init();`. `init()` resolves as
+soon as the game starts; the renderer is created asynchronously after that, and the engine
+tells the page with DOM events on its canvas (they bubble to `document` and `window`):
+`space3d-ready` once it renders, `space3d-error` (a `CustomEvent`, the message in `detail`,
+also logged as an error) when it cannot — no WebGPU or WebGL2, a `?webgpu`/`?webgl2` override
+the browser cannot satisfy, or a lost GPU context. The templates show "loading…" until
+`space3d-ready` and the message on `space3d-error`
+(`space3d_platform::PAGE_READY_EVENT`/`PAGE_ERROR_EVENT`). Set
 `WindowPlugin::canvas_id` to render into an existing `<canvas id="…">` (the templates use
 `space3d`); otherwise a canvas is appended to `<body>`. winit gives the canvas an inline CSS
 size from `WindowPlugin::width`/`height`; to let the page decide (e.g. fill the viewport), use
@@ -63,14 +70,25 @@ Web specifics:
 
 * **Renderer**: created asynchronously — WebGPU when the browser has an adapter, WebGL2
   otherwise (WebGL2 uses the CPU draw path). `?webgl2` in the page URL forces WebGL2 in a
-  browser that has WebGPU (`?webgpu`: WebGPU only), in any Space3d page — the quickest way to
-  see a game's WebGL2 path. The console says which one started:
-  `space3d renderer initialised … backend=BrowserWebGpu` (or `Gl`).
+  browser that has WebGPU (`?webgpu`: WebGPU only, no fallback), in any Space3d page — the
+  quickest way to see a game's WebGL2 path. The console says which one started:
+  `space3d renderer initialised … backend=BrowserWebGpu` (or `Gl`). When the forced backend is
+  missing the error says so: ``failed to create renderer: … `?webgpu` in the page URL allows
+  only WebGPU, which this browser could not provide: remove it …``.
+* **GPU context loss**: browsers can take the WebGL context (or the WebGPU device) away — a GPU
+  reset, memory pressure, too many contexts, some mobile browsers after backgrounding. The
+  engine does not restore it (every GPU resource would have to be recreated): it logs an error
+  (`the browser lost the WebGL context …` / `GPU device lost`), dispatches `space3d-error`, and
+  the canvas stays black. Offer a reload from the page:
+  `canvas.addEventListener("space3d-error", (e) => showReloadPrompt(e.detail))`.
 * **Assets** are fetched over HTTP relative to the page (`assets/…`, copied next to it).
 * **Audio**: browsers keep a page's `AudioContext` suspended until its first user gesture
-  (click, tap, key press — the autoplay policy). The output starts on the first frame after one
-  (`audio output running` in the console); sounds started earlier (e.g. music at start-up)
-  begin then. Nothing to do in the game.
+  (click, tap, key press — the autoplay policy) and warn about each one created or resumed
+  before it. The engine creates its `AudioContext` only inside the page's first gesture (a
+  `keydown`/`pointerdown`/`pointerup`/`touchend` listener on `window`), so audio starts right
+  then (`audio output running` in the console) with no warning; sounds started earlier (e.g.
+  music at start-up) begin then. A context the browser suspends later (a phone call, the tab in
+  the background) resumes at the next gesture. Nothing to do in the game.
 * **Logging** goes to the browser console at each event's level (`console.error`, `.warn`,
   `.info`, `.debug`), filtered by `LogPlugin::filter`; panics are printed with
   `console.error`. `println!` output is lost on the web — log with `space3d::tracing`.
@@ -110,23 +128,29 @@ BACKENDS=webgpu NO_BUILD=1 scripts/web-smoke.sh graphics_showcase
 | `webgl2` | no WebGPU adapter (`--disable-features=WebGPUService`): wgpu's automatic fallback | `backend=Gl` |
 | `webgl2-url` | WebGPU available, page opened with `?webgl2` | `backend=Gl` |
 
-Each run checks that the renderer starts on the expected backend; frames are drawn (two
-screenshots 0.5 s apart differ and are not blank); input reaches the game (a click and/or key
-press sent as real input events, then a log line the game prints in response — and for
-`web_demo` a colour change on screen); the `.wasm` is served as `application/wasm` (and with
+Each run checks that the renderer starts on the expected backend and the page gets
+`space3d-ready`; frames are drawn (the page draws to its canvas in each animation frame, the
+screen is not blank, and — `--expect-animation`, both examples — two screenshots 0.5 s apart
+differ); input reaches the game (a drag, a click and/or key press sent as real input events,
+then a log line the game prints in response — for `web_demo` a colour change on screen, and no
+palette change from the drag); the `.wasm` is served as `application/wasm` (and with
 COOP/COEP); the assets arrive over HTTP (`web_demo` loads `assets/crystal.obj` → `.mtl` →
-`.png`); the `AudioContext` is suspended before the first gesture and running after it
-(`graphics_showcase`); and nothing throws, panics or logs an error. Chrome runs with its
-desktop autoplay policy and a throwaway profile (`CHROME_PROFILE`, removed afterwards).
+`.png`); no `AudioContext` runs before the first gesture, one runs after it and the browser
+logged no autoplay warning (`graphics_showcase`); and nothing throws, panics or logs an error.
+Chrome runs with its desktop autoplay policy and a throwaway profile (`CHROME_PROFILE`, by
+default a new directory per run, removed afterwards; Chrome processes still using it are
+killed).
 
 Output in `target/web-smoke/`: `<example>-<backend>-1.png`, `-2.png` (before the input), `-3.png`
 (after it), `.console.log` (browser console, engine logs, browser warnings) and `.json` (every
 measurement and the failures). The exit status is non-zero when any run failed. To check any
-other page, run the driver directly (`node scripts/web-smoke.mjs --help` lists the options):
+other page — e.g. a game from `space3d new` served by `space3d serve` — run the driver directly
+(`node scripts/web-smoke.mjs --help` lists the options). A still scene passes (it only has to
+keep drawing); add `--expect-animation` when it moves by itself:
 
 ```sh
 node scripts/web-smoke.mjs --url 'http://127.0.0.1:8080/?webgl2' --backend webgl2 \
-  --click --expect-log 'palette 2' --name mygame
+  --key ArrowUp --name mygame
 ```
 
 ## Android

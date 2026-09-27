@@ -11,6 +11,7 @@
     /* `!important`: the runner sets the canvas' CSS size from the window size; the page decides. */
     canvas#space3d { display: block; width: 100vw !important; height: 100vh !important; touch-action: none; outline: none; }
     #status { position: fixed; left: 12px; bottom: 10px; opacity: .7; pointer-events: none; }
+    #status.error { opacity: 1; color: #f88; }
   </style>
 </head>
 <body>
@@ -21,9 +22,16 @@
     // `space3d build --target web` bundles the game as {{name}}.js + {{name}}_bg.wasm.
     import init from "./{{name}}.js";
     const status = document.getElementById("status");
-    init()
-      .then(() => status.remove())
-      .catch((e) => { status.textContent = "failed to start: " + e; console.error(e); });
+    const canvas = document.getElementById("space3d");
+    // `init()` resolves once the game starts; the engine then creates the renderer and tells
+    // the page: `space3d-ready`, or `space3d-error` with the reason in `detail` (no WebGPU or
+    // WebGL2, or the browser lost the GPU context: offer a reload).
+    canvas.addEventListener("space3d-ready", () => status.remove());
+    canvas.addEventListener("space3d-error", (e) => {
+      status.textContent = e.detail;
+      status.className = "error";
+    });
+    init().catch((e) => { status.textContent = "failed to start: " + e; status.className = "error"; console.error(e); });
   </script>
 </body>
 </html>

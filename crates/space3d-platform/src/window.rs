@@ -100,16 +100,45 @@ pub struct WindowState {
 /// when the browser has an adapter, WebGL2 otherwise. The window runner applies it on the web,
 /// so `http://localhost:8080/?webgl2` shows a game's WebGL2 path in a browser with WebGPU.
 pub fn backends_from_query(query: &str) -> Option<space3d_render::wgpu::Backends> {
+    backend_override(query).map(|(_, backends)| backends)
+}
+
+/// The backend key in a page URL query (`webgl2`, `webgpu`) and the backends it allows.
+fn backend_override(query: &str) -> Option<(&'static str, space3d_render::wgpu::Backends)> {
     use space3d_render::wgpu::Backends;
     query
         .trim_start_matches('?')
         .split('&')
         .find_map(|pair| match pair.split('=').next().unwrap_or_default() {
-            "webgl2" => Some(Backends::GL),
-            "webgpu" => Some(Backends::BROWSER_WEBGPU),
+            "webgl2" => Some(("webgl2", Backends::GL)),
+            "webgpu" => Some(("webgpu", Backends::BROWSER_WEBGPU)),
             _ => None,
         })
 }
+
+/// What to do when the renderer could not be created and the page URL query restricted the
+/// backends ([`backends_from_query`]); `None` without a restriction.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) fn backend_override_hint(query: &str) -> Option<String> {
+    let (key, _) = backend_override(query)?;
+    let only = if key == "webgpu" { "WebGPU" } else { "WebGL2" };
+    Some(format!(
+        "`?{key}` in the page URL allows only {only}, which this browser could not provide: remove it to let the engine choose (WebGPU, else WebGL2)"
+    ))
+}
+
+/// DOM event the web runner dispatches on the game's canvas once the renderer exists (it
+/// bubbles to `document` and `window`). A page can show "loading…" until then: `init()` of the
+/// wasm-bindgen module resolves as soon as the game starts, before the renderer is created
+/// asynchronously.
+pub const PAGE_READY_EVENT: &str = "space3d-ready";
+
+/// DOM event (a `CustomEvent` whose `detail` is the message) the web runner dispatches on the
+/// game's canvas when the game cannot render: the renderer could not be created (no WebGPU or
+/// WebGL2, a `?webgpu`/`?webgl2` override the browser cannot satisfy), or the browser lost the
+/// WebGL context or the WebGPU device (GPU reset, memory pressure, too many contexts). The
+/// engine does not recover from a loss; the page can offer a reload. Also logged as an error.
+pub const PAGE_ERROR_EVENT: &str = "space3d-error";
 
 #[cfg(test)]
 mod tests {
@@ -124,6 +153,17 @@ mod tests {
         assert_eq!(backends_from_query("?level=3&webgl2=1"), Some(Backends::GL));
         assert_eq!(backends_from_query("webgpu"), Some(Backends::BROWSER_WEBGPU));
         assert_eq!(backends_from_query("?webgl"), None);
+    }
+
+    #[test]
+    fn backend_hint_names_the_override() {
+        assert_eq!(backend_override_hint("?level=3"), None);
+        let hint = backend_override_hint("?level=3&webgpu").unwrap();
+        assert!(
+            hint.starts_with("`?webgpu` in the page URL allows only WebGPU"),
+            "{hint}"
+        );
+        assert!(backend_override_hint("?webgl2=1").unwrap().contains("only WebGL2"));
     }
 }
 

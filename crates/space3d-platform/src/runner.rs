@@ -55,6 +55,9 @@ pub(crate) struct WinitRunner {
     buttons: ButtonReconciler,
     #[cfg(target_arch = "wasm32")]
     pending: std::rc::Rc<std::cell::RefCell<Option<Result<Renderer, space3d_render::RenderError>>>>,
+    /// The page was told that the GPU device is lost (`PAGE_ERROR_EVENT`).
+    #[cfg(target_arch = "wasm32")]
+    device_loss_reported: bool,
 }
 
 fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
@@ -165,6 +168,8 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         buttons: ButtonReconciler::default(),
         #[cfg(target_arch = "wasm32")]
         pending: Default::default(),
+        #[cfg(target_arch = "wasm32")]
+        device_loss_reported: false,
     };
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -286,6 +291,7 @@ impl WinitRunner {
                 tracing::error!("window has no canvas");
                 return;
             };
+            crate::web::watch_context_loss(&canvas);
             let pending = self.pending.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let target = space3d_render::wgpu::SurfaceTarget::Canvas(canvas);
@@ -342,6 +348,7 @@ impl WinitRunner {
         let Some(result) = self.pending.borrow_mut().take() else {
             return;
         };
+        let canvas = self.window.as_ref().and_then(|w| crate::web::canvas_of(w));
         match result {
             Ok(mut r) => {
                 if let Some(w) = &self.window {
@@ -349,14 +356,48 @@ impl WinitRunner {
                     r.resize(s.width.max(1), s.height.max(1));
                 }
                 self.app.insert_resource(r);
+                if let Some(canvas) = &canvas {
+                    crate::web::notify_page(canvas, crate::PAGE_READY_EVENT, None);
+                }
             }
-            Err(e) => tracing::error!("failed to create renderer: {e}"),
+            Err(e) => {
+                let msg = match crate::web::backend_override_hint() {
+                    Some(hint) => format!("failed to create renderer: {e}. {hint}"),
+                    None => format!("failed to create renderer: {e}"),
+                };
+                tracing::error!("{msg}");
+                if let Some(canvas) = &canvas {
+                    crate::web::notify_page(canvas, crate::PAGE_ERROR_EVENT, Some(&msg));
+                }
+            }
+        }
+    }
+
+    /// Web: tell the page once when the GPU device is lost (the renderer logged it already).
+    #[cfg(target_arch = "wasm32")]
+    fn report_device_loss(&mut self) {
+        if self.device_loss_reported
+            || !self
+                .app
+                .resources
+                .get::<Renderer>()
+                .is_some_and(Renderer::is_device_lost)
+        {
+            return;
+        }
+        self.device_loss_reported = true;
+        if let Some(canvas) = self.window.as_ref().and_then(|w| crate::web::canvas_of(w)) {
+            let msg = "the GPU device was lost: nothing renders until the page is reloaded";
+            crate::web::notify_page(&canvas, crate::PAGE_ERROR_EVENT, Some(msg));
         }
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_arch = "wasm32")]
-        self.poll_pending_renderer();
+        {
+            self.poll_pending_renderer();
+            self.report_device_loss();
+        }
         if self.exiting || self.state().suspended {
             return;
         }

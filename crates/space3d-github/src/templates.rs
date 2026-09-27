@@ -163,7 +163,7 @@ impl Default for TemplateOptions {
         Self {
             bin_name: "game".into(),
             rust_toolchain: "stable".into(),
-            wasm_bindgen_version: "0.2.128".into(),
+            wasm_bindgen_version: "0.2.129".into(),
             deploy_pages: true,
             release_on_tag: true,
             ios_project: None,
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(doc["jobs"]["ios"]["runs-on"].as_str(), Some("macos-latest"));
         assert!(yaml.contains("cargo apk build"));
         assert!(yaml.contains("xcodebuild"));
-        assert!(yaml.contains("wasm-bindgen-cli@0.2.128"));
+        assert!(yaml.contains("wasm-bindgen-cli@0.2.129"));
     }
 
     #[test]

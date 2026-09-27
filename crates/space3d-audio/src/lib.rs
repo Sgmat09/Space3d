@@ -7,8 +7,9 @@
 //! * [`Audio`] plays one-shots and looping music from [`StaticSoundData`] or encoded bytes,
 //!   controls per-sound volume/pan/pitch, bus volumes and fades.
 //! * Web: browsers keep audio suspended until the page's first user gesture (autoplay policy);
-//!   the output starts on the first frame after one (sounds played before then start with
-//!   it). Everything else works as natively.
+//!   the output (and its `AudioContext`) starts inside that gesture's event handler, so the
+//!   browser logs no autoplay warning (sounds played before then start with it). Everything
+//!   else works as natively.
 //! * No output device (headless CI, servers)? [`Audio`] falls back to
 //!   [`AudioMode::Disabled`]: every call is a cheap no-op, a single warning is logged, and
 //!   the backend-independent state (bus levels, listener/emitter sync) keeps working.

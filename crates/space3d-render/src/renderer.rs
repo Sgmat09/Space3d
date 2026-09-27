@@ -747,6 +747,13 @@ impl Renderer {
         self.surface.is_some()
     }
 
+    /// Whether the GPU device was lost (driver reset, GPU removed, the browser's WebGPU device
+    /// lost; see `FrameInfo::device_lost`). The renderer keeps running but draws nothing; it is
+    /// not recreated.
+    pub fn is_device_lost(&self) -> bool {
+        self.device_lost.load(Ordering::Acquire)
+    }
+
     /// Resize the primary target. The window surface is reconfigured now; the headless
     /// offscreen target is reallocated by the next frame, so [`Self::capture`] until then
     /// still returns the last rendered frame. Each side is clamped to the device's

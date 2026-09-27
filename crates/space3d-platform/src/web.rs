@@ -13,9 +13,13 @@
 //! }
 //! ```
 //! The renderer is created asynchronously (WebGPU when available, WebGL2 otherwise) and
-//! inserted as soon as it is ready; frames before that run simulation only.
+//! inserted as soon as it is ready; frames before that run simulation only. The page hears
+//! about it through DOM events on the canvas: [`crate::PAGE_READY_EVENT`], or
+//! [`crate::PAGE_ERROR_EVENT`] when the renderer could not be created or the GPU context was
+//! lost later.
 
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use web_sys::HtmlCanvasElement;
 use winit::platform::web::{WindowAttributesExtWebSys, WindowExtWebSys};
 use winit::window::{Window, WindowAttributes};
@@ -28,6 +32,49 @@ pub(crate) fn backends_from_url() -> Option<space3d_render::wgpu::Backends> {
         tracing::info!("renderer backends restricted to {b:?} by the page URL ({search})");
     }
     backends
+}
+
+/// [`crate::window::backend_override_hint`] for this page's URL.
+pub(crate) fn backend_override_hint() -> Option<String> {
+    let search = web_sys::window()?.location().search().ok()?;
+    crate::window::backend_override_hint(&search)
+}
+
+/// Dispatch a bubbling DOM event on the game's canvas for the page ([`crate::PAGE_READY_EVENT`],
+/// [`crate::PAGE_ERROR_EVENT`] with the message as `detail`).
+pub(crate) fn notify_page(canvas: &HtmlCanvasElement, event: &str, detail: Option<&str>) {
+    let init = web_sys::CustomEventInit::new();
+    init.set_bubbles(true);
+    if let Some(detail) = detail {
+        init.set_detail(&detail.into());
+    }
+    match web_sys::CustomEvent::new_with_event_init_dict(event, &init) {
+        Ok(ev) => {
+            let _ = canvas.dispatch_event(&ev);
+        }
+        Err(e) => tracing::debug!("cannot create the {event} event: {e:?}"),
+    }
+}
+
+/// Report a lost WebGL context (GPU reset, memory pressure, too many contexts, the tab in the
+/// background on some mobile browsers): an error in the log and [`crate::PAGE_ERROR_EVENT`].
+/// The engine does not restore the context (every GPU resource would have to be recreated), so
+/// the canvas stays black; the page can offer a reload. Without this nothing tells.
+pub(crate) fn watch_context_loss(canvas: &HtmlCanvasElement) {
+    let target = canvas.clone();
+    let listener = Closure::<dyn FnMut()>::new(move || {
+        let msg = "the browser lost the WebGL context (GPU reset, memory pressure or too many contexts): \
+                   nothing renders until the page is reloaded";
+        tracing::error!("{msg}");
+        notify_page(&target, crate::PAGE_ERROR_EVENT, Some(msg));
+    });
+    if canvas
+        .add_event_listener_with_callback("webglcontextlost", listener.as_ref().unchecked_ref())
+        .is_ok()
+    {
+        // Lives as long as the canvas (one per game).
+        listener.forget();
+    }
 }
 
 /// Find `<canvas id=...>` in the document.

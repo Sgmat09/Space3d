@@ -13,7 +13,8 @@
 # `?webgl2` in the URL: the engine's override).
 #
 # Environment: CHROME (browser binary), CHROME_PROFILE (throwaway --user-data-dir, removed
-# afterwards unless KEEP_PROFILE=1), OUT (default target/web-smoke).
+# afterwards unless KEEP_PROFILE=1; default: a new directory in $TMPDIR per run, so concurrent
+# runs never share one), OUT (default target/web-smoke).
 # Output per example and backend: $OUT/<example>-<backend>-{1,2,3}.png (two shots 0.5 s apart,
 # one after the input), .console.log and .json (the checks' summary). Exit status 0 when every
 # run passed. Needs: rustup target wasm32-unknown-unknown, the wasm-bindgen CLI matching
@@ -28,7 +29,7 @@ EXAMPLES=("$@")
 read -r -a BACKEND_LIST <<< "${BACKENDS:-webgpu webgl2 webgl2-url}"
 PROFILE=${PROFILE:-release}
 OUT=${OUT:-$ROOT/target/web-smoke}
-CHROME_PROFILE=${CHROME_PROFILE:-${TMPDIR:-/tmp}/space3d-web-smoke-chrome}
+CHROME_PROFILE=${CHROME_PROFILE:-$(mktemp -d "${TMPDIR:-/tmp}/space3d-web-smoke-chrome.XXXXXX")}
 mkdir -p "$OUT"
 
 node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
@@ -46,16 +47,19 @@ export CHROME
 example_args() {
   case "$1" in
     web_demo)
-      # A click cycles the palette (colours change), `3` switches the wave pattern; the crystal
+      # A drag orbits (and does not change the palette: no `palette 3`), a click cycles the
+      # palette (colours change), `3` switches the wave pattern; the crystal
       # (assets/crystal.obj + .mtl + .png) comes over HTTP.
-      args=(--click --key Digit3 --expect-log 'palette 2' --expect-log 'pattern 3'
-        --expect-color-shift --ready-log 'crystal loaded' --expect-request 'assets/crystal\.obj'
-        --expect-request 'assets/crystal\.mtl' --expect-request 'assets/crystal\.png')
+      args=(--drag --click --key Digit3 --expect-log 'palette 2' --reject-log 'palette 3'
+        --expect-log 'pattern 3' --expect-animation --expect-color-shift --ready-log 'crystal loaded'
+        --expect-request 'assets/crystal\.obj' --expect-request 'assets/crystal\.mtl'
+        --expect-request 'assets/crystal\.png')
       ;;
     graphics_showcase)
       # The content is generated in the page (inline on the web) before the first shot; `1`
-      # turns bloom off. Its audio stays suspended until that key press, the first gesture.
-      args=(--ready-log 'content ready' --settle 4 --key Digit1 --expect-log 'bloom: off' --expect-audio)
+      # turns bloom off. Its audio starts with that key press, the first gesture.
+      args=(--ready-log 'content ready' --settle 4 --key Digit1 --expect-log 'bloom: off' --expect-audio
+        --expect-animation)
       ;;
     *) args=(--click) ;;
   esac

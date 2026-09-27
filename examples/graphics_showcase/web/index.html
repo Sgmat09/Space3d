@@ -11,6 +11,7 @@
     /* `!important`: the runner sets the canvas' CSS size from the window size; the page decides. */
     canvas#space3d { display: block; width: 100vw !important; height: 100vh !important; touch-action: none; outline: none; }
     #status { position: fixed; left: 12px; bottom: 10px; opacity: .7; pointer-events: none; }
+    #status.error { opacity: 1; color: #f88; }
   </style>
 </head>
 <body>
@@ -20,11 +21,18 @@
     // `space3d build --target web` runs wasm-bindgen with --out-name graphics_showcase.
     import init from "./graphics_showcase.js";
     const status = document.getElementById("status");
+    const canvas = document.getElementById("space3d");
     // `?webgl2` in the URL: the engine takes the WebGL2 path (the Low tier's) even where the
-    // browser has WebGPU.
-    init()
-      .then(() => { status.textContent = "Q quality · 1 bloom · 2 shadows · 3 IBL · 4 distortion · C follow · arrows pan · wheel zoom"; })
-      .catch((e) => { status.textContent = "failed to start: " + e; console.error(e); });
+    // browser has WebGPU. The engine tells the page when it renders (`space3d-ready`) or
+    // cannot (`space3d-error`, the reason in `detail`).
+    canvas.addEventListener("space3d-ready", () => {
+      status.textContent = "Q quality · 1 bloom · 2 shadows · 3 IBL · 4 distortion · C follow · arrows pan · wheel zoom";
+    });
+    canvas.addEventListener("space3d-error", (e) => {
+      status.textContent = e.detail;
+      status.className = "error";
+    });
+    init().catch((e) => { status.textContent = "failed to start: " + e; status.className = "error"; console.error(e); });
   </script>
 </body>
 </html>
