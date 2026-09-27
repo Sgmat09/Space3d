@@ -4,8 +4,8 @@ Two ways to build the iOS app:
 
 * **`space3d build --target ios --sim`** (simulator) / **`--target ios`** (devices): the game
   binary (`src/main.rs`, `space3d::main!`) bundled as `dist/ios/<target>/{{name}}.app` with a
-  generated `Info.plist` — no Xcode project, no extra tools. Bundle id, name and orientations
-  come from `[package.metadata.space3d.ios]` in `../Cargo.toml`.
+  generated `Info.plist` — no Xcode project, no extra tools. Bundle id, name, orientations and
+  minimum iOS version come from `[package.metadata.space3d.ios]` in `../Cargo.toml`.
 * **`space3d build --target ios --sim --xcode`**: the Xcode project described by `project.yml`
   ([XcodeGen](https://github.com/yonaskolb/XcodeGen), so there is no hand-edited `.pbxproj` to
   merge). It links the `staticlib` of the `mobile/` crate into a tiny Objective‑C app (`main.m`

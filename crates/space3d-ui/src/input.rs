@@ -24,6 +24,14 @@
 //! left it) is sent at the last position egui saw, and the pointer is gone again right after
 //! (`PointerGone`), so it re-enters no hover: nothing at (0, 0) reacts.
 //!
+//! **Touches.** Touch starts, moves and ends are sent in the order they happened
+//! ([`Input::touch_events`]), so a tap that began and ended within one frame — a quick tap, or
+//! any tap during a long frame — still presses and releases. The first finger down also drives
+//! egui's pointer (press, moves, release, then `PointerGone`: no hover stays behind), like
+//! egui-winit. A finger the system cancels (a swipe into Notification Center or the app
+//! switcher) releases it as a cancel, like the cancelled releases below; so does a finger that
+//! lifted while the UI was not listening.
+//!
 //! **Focus.** `Event::WindowFocused` is sent when the window's focus changes; egui then forgets
 //! the keys and modifiers it holds.
 //!
@@ -44,7 +52,7 @@
 //! deterministic under `App::step_ticks`.
 
 use space3d_core::glam::Vec2;
-use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton, NamedKey, is_writing_system_key};
+use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton, NamedKey, TouchPhase, is_writing_system_key};
 
 /// Map a logical (layout) key to an egui key — the mapping egui-winit uses: characters by
 /// [`egui::Key::from_name`] (`"z"` → `Z`, `"?"` → `Questionmark`), named keys (Enter, arrows,
@@ -613,76 +621,86 @@ impl InputTranslator {
             out.push(egui::Event::Text(text));
         }
 
-        // Touches (the first finger also drives the pointer, like egui-winit).
+        // Touches in the order they happened ([`Input::touch_events`]); the first finger also
+        // drives the pointer, like egui-winit.
         let device_id = egui::TouchDeviceId(0);
-        for &id in input.just_started_touches() {
-            if let Some(t) = input.touch(id) {
-                let p = to_points(t.position);
-                out.push(egui::Event::Touch {
-                    device_id,
-                    id: egui::TouchId(id),
-                    phase: egui::TouchPhase::Start,
-                    pos: p,
-                    force: None,
-                });
-                if self.pointer_touch.is_none() && input.mouse_position().is_none() {
-                    self.pointer_touch = Some(id);
-                    out.push(egui::Event::PointerMoved(p));
-                    out.push(egui::Event::PointerButton {
-                        pos: p,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: mods,
-                    });
-                    self.last_pos = Some(p);
-                    self.known_pos = Some(p);
-                }
-            }
-        }
-        for t in input.touches() {
-            if t.delta != Vec2::ZERO && !input.just_started_touches().contains(&t.id) {
-                let p = to_points(t.position);
-                out.push(egui::Event::Touch {
-                    device_id,
-                    id: egui::TouchId(t.id),
-                    phase: egui::TouchPhase::Move,
-                    pos: p,
-                    force: None,
-                });
-                if self.pointer_touch == Some(t.id) {
-                    out.push(egui::Event::PointerMoved(p));
-                    self.last_pos = Some(p);
-                    self.known_pos = Some(p);
-                }
-            }
-        }
-        for t in input.just_ended_touches() {
-            let p = to_points(t.position);
+        for e in input.touch_events() {
+            let p = to_points(e.position);
+            let phase = match e.phase {
+                TouchPhase::Started => egui::TouchPhase::Start,
+                TouchPhase::Moved => egui::TouchPhase::Move,
+                TouchPhase::Ended => egui::TouchPhase::End,
+                TouchPhase::Cancelled => egui::TouchPhase::Cancel,
+            };
             out.push(egui::Event::Touch {
                 device_id,
-                id: egui::TouchId(t.id),
-                phase: egui::TouchPhase::End,
+                id: egui::TouchId(e.id),
+                phase,
                 pos: p,
                 force: None,
             });
-            if self.pointer_touch == Some(t.id) {
-                self.pointer_touch = None;
-                out.push(egui::Event::PointerButton {
-                    pos: p,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: mods,
-                });
-                out.push(egui::Event::PointerGone);
-                self.last_pos = None;
-                self.known_pos = Some(p);
+            match e.phase {
+                TouchPhase::Started => {
+                    if self.pointer_touch.is_none() && input.mouse_position().is_none() {
+                        self.pointer_touch = Some(e.id);
+                        out.push(egui::Event::PointerMoved(p));
+                        out.push(egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: mods,
+                        });
+                        self.last_pos = Some(p);
+                        self.known_pos = Some(p);
+                    }
+                }
+                TouchPhase::Moved => {
+                    if self.pointer_touch == Some(e.id) {
+                        out.push(egui::Event::PointerMoved(p));
+                        self.last_pos = Some(p);
+                        self.known_pos = Some(p);
+                    }
+                }
+                TouchPhase::Ended | TouchPhase::Cancelled => {
+                    if self.pointer_touch == Some(e.id) {
+                        let cancel = e.phase == TouchPhase::Cancelled;
+                        cancelled |= cancel;
+                        self.release_touch(p, cancel, mods, out);
+                    }
+                }
             }
+        }
+        // The pointer's finger lifted while egui was not listening (the UI was disabled,
+        // `Input` was replaced): released as a cancel.
+        if let Some(id) = self.pointer_touch
+            && input.touch(id).is_none()
+        {
+            cancelled = true;
+            self.release_touch(self.known_pos.unwrap_or(egui::Pos2::ZERO), true, mods, out);
         }
         cancelled
     }
 }
 
 impl InputTranslator {
+    /// Release the button the pointer's finger holds at `pos` (a cancel: [`Self::detour`] first,
+    /// no click) and take the pointer away.
+    fn release_touch(&mut self, pos: egui::Pos2, cancel: bool, modifiers: egui::Modifiers, out: &mut Vec<egui::Event>) {
+        self.pointer_touch = None;
+        if cancel {
+            self.detour(out);
+        }
+        out.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers,
+        });
+        out.push(egui::Event::PointerGone);
+        self.last_pos = None;
+        self.known_pos = Some(pos);
+    }
+
     /// A button event at `at` (points; `None`: the cursor is outside the window). Inside, egui's
     /// pointer moves there first. Outside, the event goes to the last position egui saw and the
     /// pointer is gone again right after, so it re-enters no hover.
@@ -1386,5 +1404,98 @@ mod tests {
                 .any(|e| matches!(e, egui::Event::PointerButton { pressed: false, .. }))
         );
         assert_eq!(ev.last(), Some(&egui::Event::PointerGone));
+    }
+
+    /// egui's pointer and touch events of a frame, in a compact form.
+    fn touch_script(ev: &[egui::Event]) -> Vec<String> {
+        ev.iter()
+            .filter_map(|e| match e {
+                egui::Event::Touch { id, phase, pos, .. } => Some(format!("touch {} {phase:?} {}", id.0, pos.x)),
+                egui::Event::PointerMoved(p) => Some(format!("move {}", p.x)),
+                egui::Event::PointerButton { pressed, pos, .. } => {
+                    Some(format!("{} {}", if *pressed { "press" } else { "release" }, pos.x))
+                }
+                egui::Event::PointerGone => Some("gone".into()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tap that begins and ends between two frames (a quick tap, or any tap during a long
+    /// frame) presses and releases: the finger is already gone from `Input::touches`.
+    #[test]
+    fn a_tap_within_one_frame_presses_and_releases() {
+        use space3d_platform::TouchPhase::*;
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_touch(3, Started, Vec2::new(10.0, 5.0));
+        input.inject_touch(3, Moved, Vec2::new(11.0, 5.0));
+        input.inject_touch(3, Ended, Vec2::new(12.0, 5.0));
+        let mut ev = Vec::new();
+        assert!(!t.translate(&input, 2.0, 0.0, "", &mut ev));
+        assert_eq!(
+            touch_script(&ev),
+            [
+                "touch 3 Start 5",
+                "move 5",
+                "press 5",
+                "touch 3 Move 5.5",
+                "move 5.5",
+                "touch 3 End 6",
+                "release 6",
+                "gone",
+            ]
+        );
+        // The finger id comes back in the next frame: it drives the pointer again.
+        input.end_frame();
+        input.inject_touch(3, Started, Vec2::new(40.0, 5.0));
+        ev.clear();
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
+        assert_eq!(touch_script(&ev), ["touch 3 Start 20", "move 20", "press 20"]);
+    }
+
+    /// A finger the system cancels, or one that lifted while the UI was not listening, releases
+    /// the pointer as a cancel: a detour beyond the click distance first.
+    #[test]
+    fn cancelled_and_lost_touches_release_as_cancels() {
+        use space3d_platform::TouchPhase::*;
+        let far = CANCEL_DETOUR.x;
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_touch(1, Started, Vec2::new(10.0, 0.0));
+        input.inject_touch(1, Cancelled, Vec2::new(10.0, 0.0));
+        let mut ev = Vec::new();
+        assert!(t.translate(&input, 1.0, 0.0, "", &mut ev), "a cancel");
+        assert_eq!(
+            touch_script(&ev),
+            [
+                "touch 1 Start 10".to_owned(),
+                "move 10".into(),
+                "press 10".into(),
+                "touch 1 Cancel 10".into(),
+                format!("move {far}"),
+                "release 10".into(),
+                "gone".into(),
+            ]
+        );
+        // Lost: the finger went down, then up while the translator did not run.
+        input.end_frame();
+        input.inject_touch(2, Started, Vec2::new(30.0, 0.0));
+        ev.clear();
+        t.translate(&input, 1.0, 0.0, "", &mut ev);
+        input.end_frame();
+        input.inject_touch(2, Ended, Vec2::new(30.0, 0.0));
+        input.end_frame();
+        ev.clear();
+        assert!(t.translate(&input, 1.0, 0.0, "", &mut ev), "a cancel");
+        assert_eq!(
+            touch_script(&ev),
+            [format!("move {far}"), "release 30".into(), "gone".into()]
+        );
+        // The next finger drives the pointer again.
+        input.inject_touch(4, Started, Vec2::new(50.0, 0.0));
+        ev.clear();
+        t.translate(&input, 1.0, 0.0, "", &mut ev);
+        assert_eq!(touch_script(&ev), ["touch 4 Start 50", "move 50", "press 50"]);
     }
 }

@@ -26,6 +26,12 @@
 //! ([`MouseButtonEvent::cancelled`]): the UI registers no click and no drop for them, and games
 //! can tell them apart too.
 //!
+//! Touches keep their order the same way: [`Input::touch_events`] lists each finger's start,
+//! moves and end as they happened. The per-frame state ([`Input::touches`],
+//! [`Input::just_started_touches`], [`Input::just_ended_touches`]) cannot tell a tap that began
+//! and ended within one frame (a quick tap, or any tap during a long frame) from other orders,
+//! and a finger id can be reused once its finger lifts (Android numbers fingers from 0).
+//!
 //! Keys are **physical** ([`KeyCode`]: the key's position). The runner also records what each
 //! key means on the player's layout ([`KeyEvent`], [`Input::key_events`],
 //! [`Input::logical_key`]) and what it prints ([`Input::key_label`]); see
@@ -55,6 +61,8 @@ pub use winit::keyboard::KeyCode;
 const MAX_KEY_EVENTS: usize = 256;
 /// Upper bound on [`Input::mouse_button_events`] kept per frame (same purpose).
 const MAX_MOUSE_BUTTON_EVENTS: usize = 64;
+/// Upper bound on [`Input::touch_events`] kept per frame (same purpose).
+const MAX_TOUCH_EVENTS: usize = 256;
 
 /// One keyboard event as the OS reported it: the physical key plus what it means on the
 /// player's keyboard layout. Recorded by the runner (and [`Input::inject_key_event`]) in
@@ -305,6 +313,18 @@ pub struct Touch {
     pub delta: Vec2,
 }
 
+/// One touch change, in the order of the frame's events ([`Input::touch_events`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct TouchEvent {
+    /// Finger id (reused once the finger lifts on some platforms).
+    pub id: u64,
+    /// Started, moved, ended or cancelled by the system.
+    pub phase: TouchPhase,
+    /// Position in physical pixels.
+    pub position: Vec2,
+}
+
 /// Gamepad buttons (stub layout; no backend is wired yet — inject for tests).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GamepadButton {
@@ -441,6 +461,7 @@ pub struct Input {
     touches: Vec<Touch>,
     started_touches: Vec<u64>,
     ended_touches: Vec<Touch>,
+    touch_events: Vec<TouchEvent>,
     text: String,
     gamepads: HashMap<u32, Gamepad>,
     window_size: Vec2,
@@ -520,9 +541,20 @@ impl Input {
     pub fn just_started_touches(&self) -> &[u64] {
         &self.started_touches
     }
-    /// Touches that ended this frame (last known state).
+    /// Touches that ended (or the system cancelled) this frame (last known state).
     pub fn just_ended_touches(&self) -> &[Touch] {
         &self.ended_touches
+    }
+    /// This frame's touch starts, moves, ends and cancels in order. Only changes are recorded:
+    /// a move to the same position, or a move or end of a finger that is not down, adds
+    /// nothing. Cleared in `end_frame`.
+    ///
+    /// The per-frame state loses the order: a finger that went down and up within one frame is
+    /// in [`Self::just_started_touches`] and [`Self::just_ended_touches`] but no longer in
+    /// [`Self::touches`], and when a lifted finger's id comes back in the same frame, the
+    /// events say which came first.
+    pub fn touch_events(&self) -> &[TouchEvent] {
+        &self.touch_events
     }
     /// Text typed this frame.
     pub fn text(&self) -> &str {
@@ -740,11 +772,16 @@ impl Input {
     pub fn inject_wheel(&mut self, delta: Vec2) {
         self.wheel += delta;
     }
-    /// Touch event (multi-touch: one call per finger).
+    /// Touch event (multi-touch: one call per finger), recorded in [`Self::touch_events`]. A
+    /// start with the id of a finger that is still down (its end was lost) cancels that finger
+    /// first.
     pub fn inject_touch(&mut self, id: u64, phase: TouchPhase, position: Vec2) {
         match phase {
             TouchPhase::Started => {
-                self.touches.retain(|t| t.id != id);
+                if let Some(t) = self.touch(id) {
+                    let at = t.position;
+                    self.inject_touch(id, TouchPhase::Cancelled, at);
+                }
                 self.touches.push(Touch {
                     id,
                     position,
@@ -754,20 +791,29 @@ impl Input {
                 self.started_touches.push(id);
             }
             TouchPhase::Moved => {
-                if let Some(t) = self.touches.iter_mut().find(|t| t.id == id) {
-                    t.delta += position - t.position;
-                    t.position = position;
+                let Some(t) = self.touches.iter_mut().find(|t| t.id == id) else {
+                    return;
+                };
+                if t.position == position {
+                    return;
                 }
+                t.delta += position - t.position;
+                t.position = position;
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
-                if let Some(i) = self.touches.iter().position(|t| t.id == id) {
-                    let mut t = self.touches.remove(i);
-                    t.delta += position - t.position;
-                    t.position = position;
-                    self.ended_touches.push(t);
-                }
+                let Some(i) = self.touches.iter().position(|t| t.id == id) else {
+                    return;
+                };
+                let mut t = self.touches.remove(i);
+                t.delta += position - t.position;
+                t.position = position;
+                self.ended_touches.push(t);
             }
         }
+        if self.touch_events.len() >= MAX_TOUCH_EVENTS {
+            self.touch_events.remove(0);
+        }
+        self.touch_events.push(TouchEvent { id, phase, position });
     }
     /// Typed text (IME/committed characters).
     pub fn inject_text(&mut self, text: &str) {
@@ -820,6 +866,7 @@ impl Input {
         self.wheel = Vec2::ZERO;
         self.started_touches.clear();
         self.ended_touches.clear();
+        self.touch_events.clear();
         self.text.clear();
         self.key_events.clear();
         self.mouse_button_events.clear();
@@ -1286,6 +1333,65 @@ mod tests {
         i.inject_touch(2, TouchPhase::Ended, Vec2::new(100.0, 0.0));
         assert_eq!(i.touches().len(), 1);
         assert_eq!(i.just_ended_touches()[0].id, 2);
+    }
+
+    #[test]
+    fn touch_events_keep_order() {
+        use TouchPhase::*;
+        let ev = |id, phase, x: f32| TouchEvent {
+            id,
+            phase,
+            position: Vec2::new(x, 0.0),
+        };
+        let mut i = Input::default();
+        i.inject_touch(0, Started, Vec2::new(1.0, 0.0));
+        i.end_frame();
+        assert!(i.touch_events().is_empty(), "cleared in end_frame");
+        // In one frame: finger 0 lifts, a quick tap reuses id 0, finger 0 comes back again.
+        // Moves to the same place, and moves or ends of fingers that are not down, add nothing.
+        i.inject_touch(0, Moved, Vec2::new(2.0, 0.0));
+        i.inject_touch(0, Moved, Vec2::new(2.0, 0.0));
+        i.inject_touch(0, Ended, Vec2::new(3.0, 0.0));
+        i.inject_touch(0, Moved, Vec2::new(4.0, 0.0));
+        i.inject_touch(0, Started, Vec2::new(10.0, 0.0));
+        i.inject_touch(0, Ended, Vec2::new(11.0, 0.0));
+        i.inject_touch(9, Ended, Vec2::new(11.0, 0.0));
+        i.inject_touch(0, Started, Vec2::new(20.0, 0.0));
+        assert_eq!(
+            i.touch_events(),
+            [
+                ev(0, Moved, 2.0),
+                ev(0, Ended, 3.0),
+                ev(0, Started, 10.0),
+                ev(0, Ended, 11.0),
+                ev(0, Started, 20.0),
+            ]
+        );
+        // The per-frame state keeps the last finger and both ended ones.
+        assert_eq!(i.touches().len(), 1);
+        assert_eq!(i.touch(0).unwrap().start, Vec2::new(20.0, 0.0));
+        assert_eq!(i.just_started_touches(), [0, 0]);
+        let ended: Vec<_> = i
+            .just_ended_touches()
+            .iter()
+            .map(|t| (t.start.x, t.position.x))
+            .collect();
+        assert_eq!(ended, [(1.0, 3.0), (10.0, 11.0)]);
+        i.end_frame();
+        // A start while the id is still down (its end was lost) cancels that finger first.
+        i.inject_touch(0, Moved, Vec2::new(21.0, 0.0));
+        i.inject_touch(0, Started, Vec2::new(30.0, 0.0));
+        assert_eq!(
+            i.touch_events(),
+            [ev(0, Moved, 21.0), ev(0, Cancelled, 21.0), ev(0, Started, 30.0)]
+        );
+        assert_eq!(i.touches().len(), 1);
+        assert_eq!(i.just_ended_touches().len(), 1);
+        // Bounded when `end_frame` never runs.
+        for n in 0..(MAX_TOUCH_EVENTS + 10) {
+            i.inject_touch(0, Moved, Vec2::new(n as f32, 1.0));
+        }
+        assert_eq!(i.touch_events().len(), MAX_TOUCH_EVENTS);
     }
 
     #[test]

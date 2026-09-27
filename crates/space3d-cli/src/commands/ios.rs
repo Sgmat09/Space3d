@@ -23,6 +23,10 @@
 //! orientations = "landscape"          # "all" (default), "landscape" or "portrait"
 //! deployment-target = "16.0"          # minimum iOS (default: $IPHONEOS_DEPLOYMENT_TARGET, else 16.0)
 //! ```
+//!
+//! With `--xcode`, `ios/project.yml` names the app, bundle id and orientations; a
+//! `deployment-target` in the metadata still wins over the project's (it is passed to
+//! `xcodebuild`), so both builds of the Rust library use one version.
 
 use super::profile_dir;
 use crate::Ctx;
@@ -178,6 +182,15 @@ pub fn deployment_target(metadata: Option<&str>) -> String {
                 .filter(|v| is_version(v))
         })
         .unwrap_or_else(|| DEFAULT_DEPLOYMENT_TARGET.to_owned())
+}
+
+/// The minimum iOS version an XcodeGen spec sets: an `IPHONEOS_DEPLOYMENT_TARGET` build
+/// setting, else `options.deploymentTarget.iOS` (what `space3d new` writes).
+pub fn xcode_deployment_target(spec: &Path) -> Option<String> {
+    [DEPLOYMENT_TARGET_ENV, "iOS"]
+        .into_iter()
+        .filter_map(|key| super::build::yaml_value(spec, key))
+        .find(|v| is_version(v))
 }
 
 /// `16`, `16.0`, `16.4.1`.
@@ -516,6 +529,16 @@ fn xcode_project(ctx: &Ctx, project: &Project, sel: &CargoSel, sim: bool, out: &
             if sim { " --sim" } else { "" }
         );
     }
+    // The minimum iOS version, the same for both builds of the staticlib (here, and in the
+    // project's pre-build phase with Xcode's IPHONEOS_DEPLOYMENT_TARGET): C dependencies built
+    // for another version would be rebuilt every time. `deployment-target` from the package
+    // metadata overrides the project's setting (as a build setting for xcodebuild).
+    let meta = IosMeta::from_package(project.package())?;
+    let deployment = meta
+        .deployment_target
+        .clone()
+        .or_else(|| xcode_deployment_target(&spec))
+        .unwrap_or_else(|| deployment_target(None));
     // The project's pre-build phase builds the staticlib for the SDK being built; building it
     // here first gives cargo's own error output when Rust code does not compile. Only the
     // staticlib: the mobile crate's cdylib is for Android.
@@ -533,7 +556,7 @@ fn xcode_project(ctx: &Ctx, project: &Project, sel: &CargoSel, sim: bool, out: &
                 triple,
             ])
             .opt("--features", sel.features.as_deref())
-            .env(DEPLOYMENT_TARGET_ENV, deployment_target(None)),
+            .env(DEPLOYMENT_TARGET_ENV, &deployment),
     )?;
     let configuration = if sel.release { "Release" } else { "Debug" };
     let sdk = if sim { "iphonesimulator" } else { "iphoneos" };
@@ -545,6 +568,11 @@ fn xcode_project(ctx: &Ctx, project: &Project, sel: &CargoSel, sim: bool, out: &
             .args(["-scheme", &app_name, "-configuration", configuration, "-sdk", sdk])
             .arg("-derivedDataPath")
             .arg(&derived)
+            .args(
+                meta.deployment_target
+                    .as_ref()
+                    .map(|v| format!("{DEPLOYMENT_TARGET_ENV}={v}")),
+            )
             .args(["CODE_SIGNING_ALLOWED=NO", "build"]),
     )?;
     let built = derived
@@ -690,6 +718,28 @@ mod tests {
         if std::env::var_os(DEPLOYMENT_TARGET_ENV).is_none() {
             assert_eq!(deployment_target(None), DEFAULT_DEPLOYMENT_TARGET);
         }
+    }
+
+    #[test]
+    fn xcodegen_spec_deployment_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("project.yml");
+        let template = include_str!("../../templates/common/ios/project.yml");
+        std::fs::write(&spec, template).unwrap();
+        assert_eq!(xcode_deployment_target(&spec).as_deref(), Some("16.0"));
+        let setting = template.replace(
+            "    CARGO_PACKAGE:",
+            "    IPHONEOS_DEPLOYMENT_TARGET: 17.4\n    CARGO_PACKAGE:",
+        );
+        std::fs::write(&spec, setting).unwrap();
+        assert_eq!(
+            xcode_deployment_target(&spec).as_deref(),
+            Some("17.4"),
+            "the build setting wins"
+        );
+        std::fs::write(&spec, "name: x\noptions:\n  deploymentTarget:\n    iOS: latest\n").unwrap();
+        assert_eq!(xcode_deployment_target(&spec), None);
+        assert_eq!(xcode_deployment_target(&dir.path().join("missing.yml")), None);
     }
 
     #[test]

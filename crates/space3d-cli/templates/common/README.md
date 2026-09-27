@@ -27,7 +27,7 @@ Controls: {{controls}}
 | `tests/screenshots.rs` | golden screenshot tests (incl. every story) |
 | `assets/` | textures, models, sounds |
 | `web/index.html` | page for the web build |
-| `mobile/` | Android/iOS library crate (same `build` function) |
+| `mobile/` | library crate for Android and the iOS Xcode project (same `build` function) |
 
 ```sh
 space3d test                        # all tests + screenshot report (target/space3d-report/index.html)

@@ -25,6 +25,10 @@ fn env_var(name: &str) -> Option<String> {
 /// Installs a global `tracing` subscriber: formatted stderr output filtered by `RUST_LOG`
 /// (falling back to [`LogPlugin::filter`]) on native, the browser console (plus a panic hook
 /// that prints Rust panics) on the web. Installing twice is harmless.
+///
+/// On iOS (with the `platform` feature) winit's per-frame event-order messages stay quiet
+/// either way, unless the filter names their target
+/// ([`space3d_platform::log_directives`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogPlugin {
     /// `tracing_subscriber::EnvFilter` directives used when `RUST_LOG` is unset (native only).
@@ -35,10 +39,7 @@ impl Default for LogPlugin {
     fn default() -> Self {
         Self {
             // `egui_wgpu=error`: it warns about the sRGB targets the engine always uses.
-            // winit's iOS backend logs a warning or info line per frame about event order.
-            filter:
-                "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error,winit::platform_impl::ios::app_state=error"
-                    .into(),
+            filter: "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error".into(),
         }
     }
 }
@@ -48,7 +49,21 @@ impl Plugin for LogPlugin {
         #[cfg(not(target_arch = "wasm32"))]
         {
             use tracing_subscriber::EnvFilter;
-            let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.filter));
+            let rust_log = std::env::var("RUST_LOG").ok();
+            #[cfg(feature = "platform")]
+            let (directives, fallback) = (
+                space3d_platform::log_directives(rust_log.as_deref(), &self.filter),
+                space3d_platform::log_directives(None, &self.filter),
+            );
+            #[cfg(not(feature = "platform"))]
+            let (directives, fallback) = (
+                rust_log
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| self.filter.clone()),
+                self.filter.clone(),
+            );
+            // An invalid `RUST_LOG` falls back to the plugin's filter.
+            let filter = EnvFilter::try_new(&directives).unwrap_or_else(|_| EnvFilter::new(&fallback));
             // iOS: stderr and the unified log (`log stream`, Console.app), without colors.
             #[cfg(all(target_os = "ios", feature = "platform"))]
             let _ = tracing_subscriber::fmt()

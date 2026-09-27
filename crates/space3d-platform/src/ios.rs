@@ -13,13 +13,16 @@
 //! * [`register_scene_delegate`] defines that Objective-C class before `UIApplicationMain`;
 //! * [`attach_to_scene`] puts the game's window into the connected window scene — right away
 //!   when the scene is already connected (the usual order: winit creates the window on
-//!   `applicationDidBecomeActive`), else when the scene connects.
+//!   `applicationDidBecomeActive`), else when the scene connects. UIKit may also disconnect a
+//!   background scene to reclaim memory while the process lives on; when a new scene connects
+//!   later, the game's windows move into it (the window keeps its view, and so the renderer's
+//!   surface layer).
 //!
 //! UIKit still posts the application-level notifications winit listens to (did become active,
 //! will resign active, did enter background, …) in a scene-based app, so `resumed` /
 //! `suspended` work as before.
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::NSObjectProtocol;
 use objc2::{ClassType, MainThreadMarker, MainThreadOnly, define_class};
 use objc2_foundation::NSObject;
@@ -31,8 +34,8 @@ use std::cell::RefCell;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 thread_local! {
-    /// Windows created before a window scene was connected.
-    static PENDING: RefCell<Vec<Retained<UIWindow>>> = const { RefCell::new(Vec::new()) };
+    /// The game's windows (winit owns them), to show in each window scene that connects.
+    static WINDOWS: RefCell<Vec<Weak<UIWindow>>> = const { RefCell::new(Vec::new()) };
 }
 
 define_class!(
@@ -51,9 +54,20 @@ define_class!(
                 return;
             };
             tracing::debug!("iOS window scene connected");
-            for window in PENDING.with_borrow_mut(std::mem::take) {
-                show_in_scene(&window, scene);
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            // Windows created before any scene, or left behind by a scene UIKit disconnected.
+            for window in game_windows() {
+                if !in_connected_scene(&window, mtm) {
+                    show_in_scene(&window, scene);
+                }
             }
+        }
+
+        #[unsafe(method(sceneDidDisconnect:))]
+        fn scene_did_disconnect(&self, _scene: &UIScene) {
+            tracing::debug!("iOS window scene disconnected; the game window moves to the next one that connects");
         }
     }
 
@@ -77,16 +91,37 @@ pub(crate) fn attach_to_scene(window: &winit::window::Window) {
         tracing::error!("no UIWindow behind the winit window; it will not be shown");
         return;
     };
+    WINDOWS.with_borrow_mut(|w| {
+        w.retain(|w| w.load().is_some());
+        w.push(Weak::from_retained(&ui_window));
+    });
     if ui_window.windowScene().is_some() {
         return;
     }
     match connected_window_scene(mtm) {
         Some(scene) => show_in_scene(&ui_window, &scene),
-        None => {
-            tracing::debug!("no window scene yet; the window is shown when it connects");
-            PENDING.with_borrow_mut(|p| p.push(ui_window));
-        }
+        None => tracing::debug!("no window scene yet; the window is shown when it connects"),
     }
+}
+
+/// The game's live windows.
+fn game_windows() -> Vec<Retained<UIWindow>> {
+    WINDOWS.with_borrow_mut(|w| {
+        w.retain(|w| w.load().is_some());
+        w.iter().filter_map(Weak::load).collect()
+    })
+}
+
+/// Whether `window` is in a window scene that is still connected.
+fn in_connected_scene(window: &UIWindow, mtm: MainThreadMarker) -> bool {
+    let Some(scene) = window.windowScene() else {
+        return false;
+    };
+    let scene: &UIScene = &scene;
+    UIApplication::sharedApplication(mtm)
+        .connectedScenes()
+        .iter()
+        .any(|s| std::ptr::eq(&*s, scene))
 }
 
 fn ui_window(window: &winit::window::Window) -> Option<Retained<UIWindow>> {

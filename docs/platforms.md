@@ -159,6 +159,11 @@ orientations = "landscape"           # "all" (default), "landscape" or "portrait
 deployment-target = "16.0"           # minimum iOS; default: $IPHONEOS_DEPLOYMENT_TARGET, else 16.0
 ```
 
+`--xcode` builds take the app's name, bundle id and orientations from `ios/project.yml`; a
+`deployment-target` here overrides the project's (the CLI passes it to `xcodebuild`), and
+without one the CLI builds the Rust library for the project's version, like Xcode's pre-build
+phase does.
+
 The CLI always sets `IPHONEOS_DEPLOYMENT_TARGET` (16.0 unless configured) for rustc and the C
 compilers. rustc's own default for `aarch64-apple-ios` is iOS 10.0, older than Xcode supports,
 and the device link then fails (`___chkstk_darwin` undefined, from aws-lc): plain
@@ -179,7 +184,10 @@ xcrun simctl spawn "My iPhone" log stream --predicate 'subsystem == "space3d"'
 ```
 
 Environment variables reach the app with the `SIMCTL_CHILD_` prefix (`RUST_LOG`,
-`SPACE3D_EXIT_AFTER_FRAMES`, `SPACE3D_QUALITY`, …).
+`SPACE3D_EXIT_AFTER_FRAMES`, `SPACE3D_QUALITY`, …). A `RUST_LOG` replaces the engine's default
+filter, but winit's iOS event-order messages (about four lines per frame, target
+`winit::platform_impl::ios::app_state`) stay at errors unless it names that target
+(`space3d_platform::log_directives`).
 
 ### Smoke test
 
@@ -199,7 +207,8 @@ headless; it never opens Simulator.app or touches other simulators), then:
    (`suspended`), recreate it (`resumed`) and render again (second screenshot);
 3. relaunches with `SPACE3D_EXIT_AFTER_FRAMES` and expects the engine's auto-exit line (with
    the average fps) and the process gone;
-4. fails on panics, `ERROR` lines, wgpu validation errors and new crash reports.
+4. fails on panics, `ERROR` lines, wgpu validation errors, winit's per-frame event-order lines
+   (the first launch sets a `RUST_LOG` without a winit directive) and new crash reports.
 
 Screenshots and logs go to `target/ios-smoke/`. The device is shut down at the end, and deleted
 if the run created it (`--keep-device` leaves it running). Rotation is not tested: `simctl`
@@ -240,7 +249,11 @@ starts in landscape.
   against the executable's directory: iOS apps start in `/`); hot reload is off. A relative
   `DbPlugin` path is inside the app container's `Library/Application Support`.
 * **Input.** Touches arrive as multi-touch `Touch`es; a hardware keyboard (or the simulator's
-  Mac keyboard) as key events.
+  Mac keyboard) as key events. A quick tap often begins and ends between two frames: it is in
+  `just_started_touches` and `just_ended_touches` but never in `touches`, and
+  `Input::touch_events` has the frame's touches in order. The egui integration presses and
+  releases for it like for a slower tap; a touch the system cancels (a swipe into Notification
+  Center) is no click.
 
 ### Devices and signing
 

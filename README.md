@@ -32,8 +32,8 @@ fn build(app: &mut App) {
     });
 }
 
-// `fn main` on desktop, `#[wasm_bindgen(start)]` on the web,
-// `android_main` on Android, `extern "C" start_app` on iOS.
+// `fn main` on desktop and iOS, `#[wasm_bindgen(start)]` on the web,
+// `android_main` on Android (plus `extern "C" start_app` for an iOS Xcode project).
 space3d::main!(build);
 ```
 
@@ -199,8 +199,8 @@ Other commands: `space3d build --target desktop|web|android|ios [--release]`,
 | | Windows | macOS | Linux | Web | Android | iOS |
 |---|---|---|---|---|---|---|
 | graphics backend | DX12 / Vulkan | Metal | Vulkan / GLES | WebGPU / WebGL2 | Vulkan / GLES | Metal |
-| typical draw path | GPU multi-draw-count | GPU multi-draw | GPU multi-draw-count | GPU indirect / CPU | GPU / CPU | GPU multi-draw |
-| entry point (`main!`) | `fn main` | `fn main` | `fn main` | `#[wasm_bindgen(start)]` | `android_main` | `start_app()` |
+| typical draw path | GPU multi-draw-count | GPU multi-draw | GPU multi-draw-count | GPU indirect / CPU | GPU / CPU | GPU multi-draw (simulator: CPU) |
+| entry point (`main!`) | `fn main` | `fn main` | `fn main` | `#[wasm_bindgen(start)]` | `android_main` | `fn main` (app bundle) / `start_app()` (Xcode) |
 | build | `space3d build` | `space3d build` | `space3d build` | `space3d build -t web` | `space3d build -t android` | `space3d build -t ios` |
 | input | keyboard, mouse | keyboard, mouse | keyboard, mouse | keyboard, mouse, touch | touch | touch |
 | audio | ✓ | ✓ | ✓ | ✓ (after a user gesture) | ✓ | ✓ |

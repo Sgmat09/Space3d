@@ -16,7 +16,8 @@
 #   4. background (launch Settings) and foreground again: the app must survive, drop and
 #      recreate its surface (`suspended` / `resumed` in the log) and render again;
 #   5. relaunch with SPACE3D_EXIT_AFTER_FRAMES and expect the engine's auto-exit line (fps);
-#   6. fail on panics, `ERROR` log lines, wgpu validation errors and new crash reports.
+#   6. fail on panics, `ERROR` log lines, wgpu validation errors, winit's per-frame iOS
+#      event-order lines (the console run sets a RUST_LOG without them) and new crash reports.
 #
 # Rotation is not covered: simctl cannot rotate a device (only Simulator.app can).
 #
@@ -242,8 +243,9 @@ for EXAMPLE in "${EXAMPLES[@]}"; do
     --predicate "process == \"$EXAMPLE\"" > "$OSLOG" 2>&1 &
   STREAM_PID=$!
 
-  # Run with the console attached (stderr: the engine's log lines), in the background.
-  SIMCTL_CHILD_RUST_LOG="info,space3d_platform=debug,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error,winit::platform_impl::ios::app_state=error" \
+  # Run with the console attached (stderr: the engine's log lines), in the background. The
+  # RUST_LOG leaves winit out: the engine keeps its per-frame iOS event-order lines quiet.
+  SIMCTL_CHILD_RUST_LOG="info,space3d_platform=debug,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error" \
     deadline 600 xcrun simctl launch --console-pty --terminate-running-process "$UDID" "$BUNDLE_ID" \
     > "$CONSOLE" 2>&1 &
   CONSOLE_PID=$!
@@ -294,6 +296,8 @@ for EXAMPLE in "${EXAMPLES[@]}"; do
   STREAM_PID=""
   BAD="$(bad_lines "$CONSOLE"; bad_lines "$EXIT_LOG"; bad_lines "$OSLOG")"
   [ -z "$BAD" ] || { echo "$BAD" | head -20 >&2; die "$EXAMPLE: errors in the logs ($OUT)"; }
+  ! grep -q "platform_impl::ios::app_state" "$CONSOLE" \
+    || die "$EXAMPLE: winit's per-frame event-order lines reached the log with RUST_LOG set ($CONSOLE)"
   grep -q "\[space3d:log\]" "$OSLOG" || die "$EXAMPLE: no engine lines in the unified log ($OSLOG)"
   CRASHES="$(find "$HOME/Library/Logs/DiagnosticReports" -name "$EXAMPLE-*.ips" -newer "$START_MARK" 2>/dev/null || true)"
   [ -z "$CRASHES" ] || die "$EXAMPLE: crash report(s): $CRASHES"

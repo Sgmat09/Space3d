@@ -21,7 +21,7 @@
 //! Keys: `Q` next quality tier, `1` bloom, `2` shadows, `3` image-based lighting, `4`
 //! distortion, `5` post-processing, `C` follow a ship / battle view, arrows or `WASD` pan,
 //! mouse wheel or `+`/`-` zoom, `G` print GPU timings, `Esc` quit. An egui window shows the
-//! tier, frame times and counters.
+//! tier, frame times and counters, with buttons for the tier and the toggles (touch screens).
 //!
 //! The content is generated off the frame (`spawn_compute`, AGENTS rule 2) once the tier is
 //! known (larger maps and sky for higher tiers); the battle simulates from the first frame and
@@ -56,6 +56,21 @@ struct Showcase {
     zoom: f32,
     timings: bool,
     report_at: f64,
+    /// HUD buttons clicked since `controls` last ran (touch screens have no keys).
+    hud: Vec<HudButton>,
+}
+
+/// The HUD's buttons: the same actions as the keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HudButton {
+    Tier,
+    Bloom,
+    Shadows,
+    Environment,
+    Distortion,
+    Post,
+    Follow,
+    Timings,
 }
 
 /// Headless run: the capture in flight, and the frame (after the content) to request it at.
@@ -118,6 +133,7 @@ fn add_game(app: &mut App) {
         zoom: 1.0,
         timings: false,
         report_at: 0.0,
+        hud: Vec::new(),
     });
     app.add_system(Stage::FixedUpdate, showcase::turn_previews);
     app.add_system(Stage::PreUpdate, choose_quality);
@@ -216,20 +232,21 @@ fn load_content(ctx: &mut SystemCtx) {
 }
 
 fn controls(ctx: &mut SystemCtx) {
+    let hud = std::mem::take(&mut ctx.resources.expect_mut::<Showcase>().hud);
     let Some(input) = ctx.resources.get::<Input>() else {
         return;
     };
-    let pressed = |k: KeyCode| input.just_pressed(k);
+    let pressed = |k: KeyCode, b: HudButton| input.just_pressed(k) || hud.contains(&b);
     let (quit, tier, bloom, shadows, env, distortion, post, follow, timings) = (
-        pressed(KeyCode::Escape),
-        pressed(KeyCode::KeyQ),
-        pressed(KeyCode::Digit1),
-        pressed(KeyCode::Digit2),
-        pressed(KeyCode::Digit3),
-        pressed(KeyCode::Digit4),
-        pressed(KeyCode::Digit5),
-        pressed(KeyCode::KeyC),
-        pressed(KeyCode::KeyG),
+        input.just_pressed(KeyCode::Escape),
+        pressed(KeyCode::KeyQ, HudButton::Tier),
+        pressed(KeyCode::Digit1, HudButton::Bloom),
+        pressed(KeyCode::Digit2, HudButton::Shadows),
+        pressed(KeyCode::Digit3, HudButton::Environment),
+        pressed(KeyCode::Digit4, HudButton::Distortion),
+        pressed(KeyCode::Digit5, HudButton::Post),
+        pressed(KeyCode::KeyC, HudButton::Follow),
+        pressed(KeyCode::KeyG, HudButton::Timings),
     );
     let dt = ctx.time().delta_secs();
     let mut pan = Vec2::ZERO;
@@ -364,12 +381,15 @@ fn report(ctx: &mut SystemCtx) {
     println!("{line}");
 }
 
-/// The egui HUD: tier, frame times, counters, keys.
+/// The egui HUD: tier, frame times, counters, and buttons for what the keys do (for touch
+/// screens).
 fn hud(ui: &egui::Context, ctx: &mut SystemCtx) {
     let stats = ctx.resources.get::<RenderStats>().cloned().unwrap_or_default();
     let particles = ctx.resources.get::<ParticleStats>().cloned().unwrap_or_default();
     let gpu = ctx.resources.get::<GpuTimings>().map(|t| t.total_ms).unwrap_or(0.0);
+    let post = ctx.resources.get::<FrameSettings>().is_some_and(|f| f.post);
     let fps = 1.0 / ctx.time().delta_secs().max(1e-6);
+    let mut clicked = Vec::new();
     let s = ctx.resources.expect::<Showcase>();
     egui::Window::new("Graphics")
         .default_pos([12.0, 12.0])
@@ -400,20 +420,27 @@ fn hud(ui: &egui::Context, ctx: &mut SystemCtx) {
                 );
                 row("render passes", format!("{}", stats.render_passes));
                 row("targets", format!("{:.0} MB", stats.target_bytes as f64 / 1e6));
-                let on = |b: bool| if b { "on" } else { "off" };
-                row(
-                    "bloom · shadows · IBL · distortion",
-                    format!(
-                        "{} · {} · {} · {}",
-                        on(s.bloom),
-                        on(s.shadows),
-                        on(s.environment),
-                        on(s.distortion)
-                    ),
-                );
             });
-            ui.small("Q tier · 1 bloom · 2 shadows · 3 IBL · 4 distortion · 5 post · C follow · G timings");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("next tier (Q)").clicked() {
+                    clicked.push(HudButton::Tier);
+                }
+                for (label, on, button) in [
+                    ("bloom (1)", s.bloom, HudButton::Bloom),
+                    ("shadows (2)", s.shadows, HudButton::Shadows),
+                    ("IBL (3)", s.environment, HudButton::Environment),
+                    ("distortion (4)", s.distortion, HudButton::Distortion),
+                    ("post (5)", post, HudButton::Post),
+                    ("follow (C)", s.follow, HudButton::Follow),
+                    ("GPU timings (G)", s.timings, HudButton::Timings),
+                ] {
+                    if ui.selectable_label(on, label).clicked() {
+                        clicked.push(button);
+                    }
+                }
+            });
         });
+    ctx.resources.expect_mut::<Showcase>().hud.extend(clicked);
 }
 
 /// Headless: capture a while after the content arrived, write the PNG, exit.
@@ -495,5 +522,12 @@ mod tests {
         assert_eq!(app.resources.expect::<Showcase>().quality, Some(next));
         render_to_image(&mut app).expect("capture");
         assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+        // The HUD's buttons do what the keys do (touch screens have no keys).
+        let showcase = app.resources.expect_mut::<Showcase>();
+        showcase.hud.extend([HudButton::Tier, HudButton::Bloom]);
+        app.step_ticks(1);
+        let showcase = app.resources.expect::<Showcase>();
+        assert_ne!(showcase.quality, Some(next), "the tier button switched the tier");
+        assert!(!showcase.bloom, "the bloom button turned bloom off");
     }
 }

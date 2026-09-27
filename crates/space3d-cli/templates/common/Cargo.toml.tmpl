@@ -9,11 +9,12 @@ default-run = "{{name}}"
 
 # Layout (all discovered automatically by cargo):
 #   src/lib.rs          the game: `build` (full app) + `GamePlugin` (gameplay only)
-#   src/main.rs         desktop + web entry point (`space3d::main!`)
+#   src/main.rs         desktop, web and iOS entry point (`space3d::main!`)
 #   src/bin/stories.rs  storybook viewer / headless gallery (`space3d stories`)
 #   src/bin/editor.rs   scene editor with the game loaded (`space3d editor`)
 #   tests/              input-simulation and golden-screenshot tests (`space3d test`)
-#   mobile/             Android (`cargo apk`) + iOS (Xcode) library — see android/ and ios/
+#   mobile/             library for Android (`cargo apk`) and the iOS Xcode project (`--xcode`)
+#                       — see android/ and ios/
 
 # `space3d build --target ios [--sim]` bundles the game binary as an iOS app (ios/README.md).
 [package.metadata.space3d.ios]

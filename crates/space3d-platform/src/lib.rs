@@ -62,6 +62,7 @@ mod ios;
 #[cfg(target_os = "ios")]
 pub mod ios_log;
 pub mod layout;
+mod log_filter;
 pub mod mobile;
 mod os_buttons;
 mod runner;
@@ -72,12 +73,13 @@ mod window;
 pub use background::{background_mode, set_background_mode};
 pub use input::{
     ActionMap, ActionState, ActionValue, Binding, ButtonState, Gamepad, GamepadAxis, GamepadButton, Input, InputPlugin,
-    KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchPhase,
+    KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchEvent, TouchPhase,
 };
 pub use layout::{
     KeyLabel, KeyLabelSource, KeyLocation, KeyboardLayout, LogicalKey, NamedKey, english_key_name,
     is_writing_system_key, us_qwerty_label, writing_system_keys,
 };
+pub use log_filter::{WINIT_IOS_EVENT_ORDER_TARGET, log_directives};
 pub use mobile::IOS_SCENE_DELEGATE_CLASS;
 #[cfg(target_os = "android")]
 pub use mobile::{AndroidApp, android_main_entry};

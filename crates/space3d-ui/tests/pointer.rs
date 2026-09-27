@@ -5,7 +5,7 @@
 
 use space3d_core::glam::UVec2;
 use space3d_core::prelude::*;
-use space3d_platform::{Input, KeyCode, MouseButton, WindowState};
+use space3d_platform::{Input, KeyCode, MouseButton, TouchPhase, WindowState};
 use space3d_ui::*;
 use std::sync::{Arc, Mutex};
 
@@ -449,6 +449,70 @@ fn release_outside_the_window_is_not_sent_to_the_corner() {
     assert!(!e.is_pointer_over_ui() && !e.wants_pointer_input());
     assert!(!page(&app).corner_hovered);
     assert_eq!(ctx(&app).input(|i| i.pointer.interact_pos()), None);
+}
+
+// ---- 6. touches -----------------------------------------------------------------------------
+
+fn touch(app: &mut App, id: u64, phase: TouchPhase, p: egui::Pos2) {
+    input(app).inject_touch(id, phase, Vec2::new(p.x, p.y));
+}
+
+/// A tap whose finger goes down and up between two frames — an instant tap, or any tap during
+/// a long frame — clicks like a slower one. The finger is already gone from `Input::touches`
+/// when the frame runs; the old translation only pressed for fingers still down, so egui saw
+/// the release alone.
+#[test]
+fn a_tap_within_one_frame_clicks() {
+    let mut app = page_app();
+    let button = page(&app).button.center();
+    touch(&mut app, 1, TouchPhase::Started, button);
+    touch(&mut app, 1, TouchPhase::Ended, button);
+    app.step_ticks(1);
+    assert_eq!(page(&app).clicks, 1, "the instant tap clicked");
+    assert!(!page(&app).primary_down);
+    // A slower tap (down for a frame) clicks too; the same finger id comes back (Android).
+    touch(&mut app, 1, TouchPhase::Started, button);
+    app.step_ticks(1);
+    assert!(page(&app).primary_down);
+    touch(&mut app, 1, TouchPhase::Ended, button);
+    app.step_ticks(1);
+    assert_eq!(page(&app).clicks, 2);
+    // Up and down again within one frame, then up: two clicks, not one long press.
+    app.step_ticks(20);
+    touch(&mut app, 1, TouchPhase::Started, button);
+    app.step_ticks(1);
+    touch(&mut app, 1, TouchPhase::Ended, button);
+    touch(&mut app, 1, TouchPhase::Started, button);
+    app.step_ticks(1);
+    assert_eq!(page(&app).clicks, 3);
+    assert!(page(&app).primary_down, "the second press holds");
+    touch(&mut app, 1, TouchPhase::Ended, button);
+    app.step_ticks(1);
+    assert_eq!(page(&app).clicks, 4);
+    // Nothing hovers once the finger lifted.
+    app.step_ticks(1);
+    assert!(!app.resources.expect::<EguiContext>().is_pointer_over_ui());
+}
+
+/// A finger the system takes over (a swipe into Notification Center, the app switcher) is no
+/// click, not even within one frame.
+#[test]
+fn a_cancelled_touch_is_not_a_click() {
+    let mut app = page_app();
+    let button = page(&app).button.center();
+    touch(&mut app, 5, TouchPhase::Started, button);
+    app.step_ticks(1);
+    touch(&mut app, 5, TouchPhase::Cancelled, button);
+    app.step_ticks(1);
+    touch(&mut app, 6, TouchPhase::Started, button);
+    touch(&mut app, 6, TouchPhase::Cancelled, button);
+    app.step_ticks(1);
+    assert_eq!(page(&app).clicks, 0);
+    assert!(!page(&app).primary_down);
+    touch(&mut app, 7, TouchPhase::Started, button);
+    touch(&mut app, 7, TouchPhase::Ended, button);
+    app.step_ticks(1);
+    assert_eq!(page(&app).clicks, 1, "the next tap clicks");
 }
 
 // ---- cancelled releases ---------------------------------------------------------------------

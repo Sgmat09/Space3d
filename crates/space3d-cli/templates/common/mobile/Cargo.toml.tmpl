@@ -1,10 +1,11 @@
-# The game packaged for phones. Android (`cargo apk`) loads a `cdylib`, iOS (Xcode) links a
-# `staticlib`; keeping them in this separate crate means desktop and web builds of the main
-# package never link those extra library types.
+# The game packaged for phones. Android (`cargo apk`) loads a `cdylib`, the Xcode project
+# (`--xcode`) links a `staticlib`; keeping them in this separate crate means desktop and web
+# builds of the main package never link those extra library types.
 #
-#   space3d build --target android     # = cargo apk build -p {{name}}-mobile --lib
-#   space3d build --target ios --sim --xcode   # cargo build -p {{name}}-mobile --lib --target aarch64-apple-ios-sim + ios/project.yml
-#   (without --xcode, iOS builds bundle the game binary itself and do not use this crate)
+#   space3d build --target android            # = cargo apk build -p {{name}}-mobile --lib
+#   space3d build --target ios --sim --xcode  # = cargo rustc -p {{name}}-mobile --lib --crate-type staticlib
+#                                             #   --target aarch64-apple-ios-sim, then xcodebuild (ios/project.yml)
+#   (without --xcode, iOS builds bundle the game binary, src/main.rs, and do not use this crate)
 [package]
 name = "{{name}}-mobile"
 version = "0.1.0"

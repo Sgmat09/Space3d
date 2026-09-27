@@ -14,10 +14,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 /// Default log directives (stderr / browser console and the in-game console).
 /// (`egui_wgpu=error`: it warns about sRGB targets, which the engine always uses and egui handles.)
-/// (`winit::platform_impl::ios::app_state=error`: winit's iOS backend logs a line per frame
-/// about its event order.)
-pub(crate) const DEFAULT_FILTER: &str =
-    "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error,winit::platform_impl::ios::app_state=error";
+/// On iOS, [`space3d_platform::log_directives`] also keeps winit's per-frame event-order lines
+/// quiet.
+pub(crate) const DEFAULT_FILTER: &str = "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error";
 
 /// How the UI `tracing` layers are installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,12 +53,17 @@ pub fn tracing_install_state() -> TracingInstall {
     }
 }
 
+/// `RUST_LOG` (native), else `default`; an invalid one falls back to `default`, an invalid
+/// `default` to [`DEFAULT_FILTER`].
 fn env_filter(default: &str) -> EnvFilter {
+    use space3d_platform::log_directives;
     #[cfg(not(target_arch = "wasm32"))]
-    if let Ok(f) = EnvFilter::try_from_default_env() {
-        return f;
-    }
-    EnvFilter::try_new(default).unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
+    let rust_log = std::env::var("RUST_LOG").ok();
+    #[cfg(target_arch = "wasm32")]
+    let rust_log: Option<String> = None;
+    EnvFilter::try_new(log_directives(rust_log.as_deref(), default))
+        .or_else(|_| EnvFilter::try_new(log_directives(None, default)))
+        .unwrap_or_else(|_| EnvFilter::new(log_directives(None, DEFAULT_FILTER)))
 }
 
 /// Filter selecting the spans the profiler aggregates.

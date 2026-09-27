@@ -158,6 +158,37 @@ fn project_commands_work_in_a_generated_project() {
         out.contains("apk build -p cmd_game-mobile --lib --target aarch64-linux-android"),
         "{out}"
     );
+    // iOS through the Xcode project: both builds of the staticlib (the CLI's and the project's
+    // pre-build phase) for one minimum iOS version — ios/project.yml's, or the metadata's,
+    // which xcodebuild then gets too.
+    let xcode = ["--dry-run", "build", "--target", "ios", "--sim", "--xcode"];
+    let out = run(space3d().current_dir(&dir).args(xcode));
+    assert!(
+        out.contains(
+            "IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo rustc -p cmd_game-mobile --lib --crate-type staticlib --target aarch64-apple-ios-sim"
+        ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("IPHONEOS_DEPLOYMENT_TARGET=16.0 CODE_SIGNING_ALLOWED"),
+        "{out}"
+    );
+    let manifest = dir.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    let text = text.replace(
+        "orientations = \"landscape\"\n",
+        "orientations = \"landscape\"\ndeployment-target = \"17.2\"\n",
+    );
+    std::fs::write(&manifest, text).unwrap();
+    let out = run(space3d().current_dir(&dir).args(xcode));
+    assert!(
+        out.contains("IPHONEOS_DEPLOYMENT_TARGET=17.2 cargo rustc -p cmd_game-mobile"),
+        "{out}"
+    );
+    assert!(
+        out.contains("IPHONEOS_DEPLOYMENT_TARGET=17.2 CODE_SIGNING_ALLOWED=NO build"),
+        "{out}"
+    );
     let out = run(space3d().current_dir(&dir).args([
         "--dry-run",
         "publish",
