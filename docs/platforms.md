@@ -161,8 +161,9 @@ deployment-target = "16.0"           # minimum iOS; default: $IPHONEOS_DEPLOYMEN
 
 `--xcode` builds take the app's name, bundle id and orientations from `ios/project.yml`; a
 `deployment-target` here overrides the project's (the CLI passes it to `xcodebuild`), and
-without one the CLI builds the Rust library for the project's version, like Xcode's pre-build
-phase does.
+without one the CLI builds the Rust library for the project's version. It also builds with
+Xcode's `SDKROOT`, so the project's pre-build phase finds the library up to date instead of
+rebuilding the C dependencies (aws-lc, SQLite) on every build.
 
 The CLI always sets `IPHONEOS_DEPLOYMENT_TARGET` (16.0 unless configured) for rustc and the C
 compilers. rustc's own default for `aarch64-apple-ios` is iOS 10.0, older than Xcode supports,

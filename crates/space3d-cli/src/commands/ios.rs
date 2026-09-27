@@ -26,7 +26,8 @@
 //!
 //! With `--xcode`, `ios/project.yml` names the app, bundle id and orientations; a
 //! `deployment-target` in the metadata still wins over the project's (it is passed to
-//! `xcodebuild`), so both builds of the Rust library use one version.
+//! `xcodebuild`). The CLI's build of the Rust library and the project's pre-build phase use
+//! the same minimum iOS version and `SDKROOT`, so the second finds the first up to date.
 
 use super::profile_dir;
 use crate::Ctx;
@@ -541,25 +542,36 @@ fn xcode_project(ctx: &Ctx, project: &Project, sel: &CargoSel, sim: bool, out: &
         .unwrap_or_else(|| deployment_target(None));
     // The project's pre-build phase builds the staticlib for the SDK being built; building it
     // here first gives cargo's own error output when Rust code does not compile. Only the
-    // staticlib: the mobile crate's cdylib is for Android.
-    ctx.exec.run(
-        &Cmd::cargo("rustc")
-            .cwd(project.dir())
-            .arg_if(sel.release, "--release")
-            .args([
-                "-p",
-                &pkg.name,
-                "--lib",
-                "--crate-type",
-                "staticlib",
-                "--target",
-                triple,
-            ])
-            .opt("--features", sel.features.as_deref())
-            .env(DEPLOYMENT_TARGET_ENV, &deployment),
-    )?;
-    let configuration = if sel.release { "Release" } else { "Debug" };
+    // staticlib: the mobile crate's cdylib is for Android. The environment matches the
+    // phase's where build scripts look (SDKROOT, which Xcode sets and cc-built C dependencies
+    // track; the macOS SDK's libraries for build scripts, as in the phase), so neither build
+    // redoes the other's work.
     let sdk = if sim { "iphonesimulator" } else { "iphoneos" };
+    let mut cargo = Cmd::cargo("rustc")
+        .cwd(project.dir())
+        .arg_if(sel.release, "--release")
+        .args([
+            "-p",
+            &pkg.name,
+            "--lib",
+            "--crate-type",
+            "staticlib",
+            "--target",
+            triple,
+        ])
+        .opt("--features", sel.features.as_deref());
+    if let Some(root) = sdk_probe(ctx, sdk, "--show-sdk-path") {
+        cargo = cargo.env("SDKROOT", root);
+    }
+    if let Some(mac) = sdk_probe(ctx, "macosx", "--show-sdk-path") {
+        let libs = match std::env::var("LIBRARY_PATH") {
+            Ok(p) if !p.is_empty() => format!("{mac}/usr/lib:{p}"),
+            _ => format!("{mac}/usr/lib"),
+        };
+        cargo = cargo.env("LIBRARY_PATH", libs);
+    }
+    ctx.exec.run(&cargo.env(DEPLOYMENT_TARGET_ENV, &deployment))?;
+    let configuration = if sel.release { "Release" } else { "Debug" };
     let derived = project.target_dir.join("xcode");
     ctx.exec.run(
         &Cmd::new("xcodebuild")
