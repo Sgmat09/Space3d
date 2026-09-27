@@ -95,6 +95,38 @@ pub struct WindowState {
     pub cursor_grab: bool,
 }
 
+/// Renderer backends asked for by a web page's URL query (`location.search`): `webgl2` →
+/// WebGL2 only (`wgpu::Backends::GL`), `webgpu` → WebGPU only. `None` (neither key): WebGPU
+/// when the browser has an adapter, WebGL2 otherwise. The window runner applies it on the web,
+/// so `http://localhost:8080/?webgl2` shows a game's WebGL2 path in a browser with WebGPU.
+pub fn backends_from_query(query: &str) -> Option<space3d_render::wgpu::Backends> {
+    use space3d_render::wgpu::Backends;
+    query
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| match pair.split('=').next().unwrap_or_default() {
+            "webgl2" => Some(Backends::GL),
+            "webgpu" => Some(Backends::BROWSER_WEBGPU),
+            _ => None,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use space3d_render::wgpu::Backends;
+
+    #[test]
+    fn backend_query() {
+        assert_eq!(backends_from_query(""), None);
+        assert_eq!(backends_from_query("?level=3"), None);
+        assert_eq!(backends_from_query("?webgl2"), Some(Backends::GL));
+        assert_eq!(backends_from_query("?level=3&webgl2=1"), Some(Backends::GL));
+        assert_eq!(backends_from_query("webgpu"), Some(Backends::BROWSER_WEBGPU));
+        assert_eq!(backends_from_query("?webgl"), None);
+    }
+}
+
 /// Window/application lifecycle events (`Events<PlatformEvent>`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlatformEvent {

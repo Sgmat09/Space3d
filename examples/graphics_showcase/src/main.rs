@@ -16,6 +16,7 @@
 //! cargo run -p space3d-cli -- serve
 //! # (the page's full-window <canvas id="space3d">; add `?webgl2` to the URL to take the WebGL2
 //! # path in a browser that also has WebGPU)
+//! scripts/web-smoke.sh graphics_showcase   # from the repository root: headless Chrome check
 //! ```
 //!
 //! Keys: `Q` next quality tier, `1` bloom, `2` shadows, `3` image-based lighting, `4`
@@ -36,6 +37,7 @@ use space3d::render::{
 };
 use space3d::stories::showcase::{self, BattleHandles, BattleScene, ContentOptions, ShowcaseAssets, ShowcaseContent};
 use space3d::tasks::Task;
+use space3d::tracing::info;
 
 /// The scene's state and what the keys toggle.
 struct Showcase {
@@ -167,7 +169,8 @@ fn choose_quality(ctx: &mut SystemCtx) {
         return;
     };
     let q = quality_from_env().unwrap_or_else(|| GraphicsQuality::recommended_for(renderer));
-    println!(
+    // `tracing`, not `println!`: stdout goes nowhere on the web; this reaches the browser console.
+    info!(
         "graphics_showcase: {} on {} ({:?}); keys: Q tier, 1 bloom, 2 shadows, 3 IBL, 4 distortion, 5 post, C follow, G timings",
         q,
         renderer.capabilities().adapter.name,
@@ -199,6 +202,7 @@ fn load_content(ctx: &mut SystemCtx) {
         s.handles = handles;
         s.assets = Some(assets);
         s.dressed_frames = 0;
+        info!("graphics_showcase: content ready");
         return;
     }
     let Some(assets) = s.assets.as_ref() else {
@@ -255,7 +259,7 @@ fn controls(ctx: &mut SystemCtx) {
     }
     if tier && let Some(q) = ctx.resources.expect::<Showcase>().quality {
         let next = GraphicsQuality::ALL[(GraphicsQuality::ALL.iter().position(|&t| t == q).unwrap_or(0) + 1) % 4];
-        println!("quality: {next}");
+        info!("quality: {next}");
         set_quality(ctx, next);
     }
     let s = ctx.resources.expect_mut::<Showcase>();
@@ -311,7 +315,7 @@ fn controls(ctx: &mut SystemCtx) {
         ("distortion", d, distortion),
     ] {
         if toggled {
-            println!("{name}: {}", if on { "on" } else { "off" });
+            info!("{name}: {}", if on { "on" } else { "off" });
         }
     }
 }
@@ -361,7 +365,7 @@ fn report(ctx: &mut SystemCtx) {
     for scope in &t.scopes {
         line += &format!(" {} {:.3}", scope.label, scope.ms);
     }
-    println!("{line}");
+    info!("{line}");
 }
 
 /// The egui HUD: tier, frame times, counters, keys.

@@ -6,6 +6,9 @@
 //!   propagation) and starts queued emitter sounds.
 //! * [`Audio`] plays one-shots and looping music from [`StaticSoundData`] or encoded bytes,
 //!   controls per-sound volume/pan/pitch, bus volumes and fades.
+//! * Web: browsers keep audio suspended until the page's first user gesture (autoplay policy);
+//!   the output starts on the first frame after one (sounds played before then start with
+//!   it). Everything else works as natively.
 //! * No output device (headless CI, servers)? [`Audio`] falls back to
 //!   [`AudioMode::Disabled`]: every call is a cheap no-op, a single warning is logged, and
 //!   the backend-independent state (bus levels, listener/emitter sync) keeps working.
@@ -32,6 +35,8 @@
 mod backend;
 mod spatial;
 mod volume;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 pub use kira;
 pub use kira::sound::PlaybackState;
@@ -418,6 +423,7 @@ impl Audio {
         match self.backend.as_mut() {
             Some(m) => {
                 let b = m.get_mut().unwrap_or_else(|p| p.into_inner());
+                b.poll_output();
                 b.sync_spatial(listener, frame);
                 b.collect_finished();
             }

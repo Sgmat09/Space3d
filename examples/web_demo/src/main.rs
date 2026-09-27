@@ -7,7 +7,7 @@
 //! # or by hand
 //! cargo build -p web_demo --release --target wasm32-unknown-unknown
 //! wasm-bindgen --target web --no-typescript --out-dir dist ../../target/wasm32-unknown-unknown/release/web_demo.wasm
-//! cp web/index.html dist/
+//! cp -R web/index.html assets dist/        # then serve dist/ over HTTP (not file://)
 //! # desktop
 //! cargo run -p web_demo
 //! ```
@@ -15,8 +15,14 @@
 //! the palette · `1`–`3` switch the wave pattern.
 //!
 //! The scene is 4 096 cubes in one explicit [`InstanceBuffer`] rewritten every frame —
-//! a single draw call on WebGPU and WebGL2 alike.
+//! a single draw call on WebGPU and WebGL2 alike — and a textured crystal loaded through the
+//! [`AssetServer`] (`assets/crystal.obj` → `crystal.mtl` → `crystal.png`: over HTTP relative
+//! to the page on the web, from disk on desktop).
+//!
+//! `scripts/web-smoke.sh web_demo` builds it, serves it and checks it in headless Chrome on
+//! WebGPU and WebGL2 (the palette/pattern/crystal log lines below are what it waits for).
 
+use space3d::assets::render::{ModelUploadOptions, PreparedModel, prepare_model_async, spawn_model};
 use space3d::prelude::*;
 
 const SIDE: usize = 64;
@@ -31,6 +37,16 @@ struct Demo {
     pattern: u32,
     /// Distance between the two touches last frame (pinch zoom).
     pinch: Option<f32>,
+    /// The crystal model while it loads, then its root entity.
+    crystal: Crystal,
+}
+
+enum Crystal {
+    Loading(Handle<ModelData>),
+    /// Upload preparation off the frame (AGENTS rule 2; trivial for this model).
+    Preparing(Task<PreparedModel>),
+    Spawned(Entity),
+    Failed,
 }
 
 const PALETTES: [[Vec3; 2]; 3] = [
@@ -49,10 +65,18 @@ fn build(app: &mut App) {
                 canvas_id: Some("space3d".into()),
                 ..WindowPlugin::default()
             })
+            // The web fetches `assets/…` relative to the page (`space3d build` copies the
+            // folder next to it); desktop reads this example's folder wherever it runs from.
+            .assets_root(if cfg!(target_arch = "wasm32") {
+                "assets"
+            } else {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/assets")
+            })
             .without_physics()
             .without_audio(),
     );
     app.add_system(Stage::Startup, setup);
+    app.add_system(Stage::Update, spawn_crystal);
     app.add_system(Stage::Update, controls);
     app.add_system(Stage::Update, animate);
     app.add_system(Stage::Update, camera);
@@ -87,6 +111,7 @@ fn setup(ctx: &mut SystemCtx) {
         Transform::default(),
         Camera3d::default().with_clear_color(Vec4::new(0.02, 0.02, 0.04, 1.0)),
     ));
+    let crystal = Crystal::Loading(ctx.resources.expect_mut::<AssetServer>().load("crystal.obj"));
     ctx.resources.insert(Demo {
         buffer,
         yaw: 0.7,
@@ -95,7 +120,44 @@ fn setup(ctx: &mut SystemCtx) {
         palette: 0,
         pattern: 1,
         pinch: None,
+        crystal,
     });
+}
+
+/// Once the crystal (and its material and texture) arrived: prepare, upload and spawn it.
+fn spawn_crystal(ctx: &mut SystemCtx) {
+    let prepared = match &mut ctx.resources.expect_mut::<Demo>().crystal {
+        Crystal::Loading(handle) => {
+            let handle = handle.clone();
+            let model = match ctx.resources.expect::<AssetServer>().load_state(&handle) {
+                LoadState::Loaded => ctx.resources.expect::<Assets<ModelData>>().get(&handle).cloned(),
+                LoadState::Failed(e) => {
+                    space3d::tracing::error!("crystal failed to load: {e}");
+                    ctx.resources.expect_mut::<Demo>().crystal = Crystal::Failed;
+                    return;
+                }
+                _ => return,
+            };
+            if let Some(model) = model {
+                let task = prepare_model_async(model, ModelUploadOptions::default());
+                ctx.resources.expect_mut::<Demo>().crystal = Crystal::Preparing(task);
+            }
+            return;
+        }
+        Crystal::Preparing(task) => match task.poll() {
+            Some(prepared) => prepared,
+            None => return,
+        },
+        Crystal::Spawned(_) | Crystal::Failed => return,
+    };
+    let render_model = prepared.upload(ctx.resources.expect_mut::<RenderAssets>());
+    let root = spawn_model(ctx.world, &render_model, Transform::from_xyz(0.0, 9.0, 0.0));
+    space3d::tracing::info!(
+        "crystal loaded ({} part(s), {} texture(s))",
+        render_model.parts.len(),
+        render_model.textures.len()
+    );
+    ctx.resources.expect_mut::<Demo>().crystal = Crystal::Spawned(root);
 }
 
 fn controls(ctx: &mut SystemCtx) {
@@ -128,9 +190,11 @@ fn controls(ctx: &mut SystemCtx) {
     // A tap (not the end of a drag) cycles the palette.
     if tapped && drag.length() < 1.0 && travelled.is_none_or(|d| d < 10.0) {
         demo.palette = (demo.palette + 1) % PALETTES.len();
+        space3d::tracing::info!("palette {}", demo.palette + 1);
     }
     if let Some(p) = pattern {
         demo.pattern = p as u32 + 1;
+        space3d::tracing::info!("pattern {}", demo.pattern);
     }
 }
 
@@ -145,10 +209,21 @@ fn wave(pattern: u32, x: f32, z: f32, t: f32) -> f32 {
 
 fn animate(ctx: &mut SystemCtx) {
     let t = ctx.time().elapsed_secs() as f32;
-    let (buffer, pattern, [low, high]) = {
+    let (buffer, pattern, [low, high], crystal) = {
         let d = ctx.resources.expect::<Demo>();
-        (d.buffer, d.pattern, PALETTES[d.palette])
+        let crystal = match d.crystal {
+            Crystal::Spawned(e) => Some(e),
+            _ => None,
+        };
+        (d.buffer, d.pattern, PALETTES[d.palette], crystal)
     };
+    if let Some(e) = crystal
+        && let Ok(mut transform) = ctx.world.get::<&mut Transform>(e)
+    {
+        *transform = Transform::from_xyz(0.0, 9.0 + (t * 1.3).sin(), 0.0)
+            .with_rotation(Quat::from_rotation_y(t * 0.8))
+            .with_scale(Vec3::splat(3.0));
+    }
     let Some(instances) = ctx
         .resources
         .expect_mut::<InstanceBuffers>()

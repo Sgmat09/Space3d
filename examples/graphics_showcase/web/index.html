@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <!-- No favicon request (a 404 in the console); replace with your icon. -->
+  <link rel="icon" href="data:,">
   <title>Space3d — graphics showcase</title>
   <style>
     html, body { margin: 0; height: 100%; background: #020306; color: #ccd; font: 14px system-ui, sans-serif; overflow: hidden; }
@@ -18,11 +20,8 @@
     // `space3d build --target web` runs wasm-bindgen with --out-name graphics_showcase.
     import init from "./graphics_showcase.js";
     const status = document.getElementById("status");
-    // `?webgl2`: hide WebGPU so wgpu falls back to WebGL2 (the Low tier's path) in a browser
-    // that has both.
-    if (new URLSearchParams(location.search).has("webgl2")) {
-      Object.defineProperty(navigator, "gpu", { value: undefined, configurable: true });
-    }
+    // `?webgl2` in the URL: the engine takes the WebGL2 path (the Low tier's) even where the
+    // browser has WebGPU.
     init()
       .then(() => { status.textContent = "Q quality · 1 bloom · 2 shadows · 3 IBL · 4 distortion · C follow · arrows pan · wheel zoom"; })
       .catch((e) => { status.textContent = "failed to start: " + e; console.error(e); });

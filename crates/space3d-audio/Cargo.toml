@@ -13,3 +13,9 @@ kira.workspace = true
 glam.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The Web Audio output (`src/web.rs`): kira's cpal backend kept resumable after a user gesture.
+send_wrapper.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["AudioContext", "AudioContextState", "BaseAudioContext", "Navigator", "UserActivation", "Window"] }

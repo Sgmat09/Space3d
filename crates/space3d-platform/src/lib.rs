@@ -12,7 +12,9 @@
 //!   and no drop for them.
 //! * [Keyboard layouts](#keyboard-layouts) — logical keys ([`KeyEvent`]) and key labels
 //!   ([`Input::key_label`]) that follow the player's layout; see [`layout`].
-//! * Web: `init_web_logging()` (wasm32 only), canvas attachment via [`WindowPlugin::canvas_id`].
+//! * Web: canvas attachment via [`WindowPlugin::canvas_id`]; browser-console logging at each
+//!   event's level ([`console_log`]: `init_web_logging()`, wasm32 only); `?webgl2` in the page
+//!   URL forces the WebGL2 backend (`?webgpu`: WebGPU only).
 //! * Mobile: `android_main_entry` (Android) and the iOS `start_app` pattern — see [`mobile`].
 //!
 //! ```no_run
@@ -55,6 +57,7 @@
 //! ```
 
 pub mod background;
+pub mod console_log;
 mod input;
 pub mod layout;
 pub mod mobile;
@@ -65,6 +68,8 @@ mod web;
 mod window;
 
 pub use background::{background_mode, set_background_mode};
+#[cfg(target_arch = "wasm32")]
+pub use console_log::{ConsoleLayer, init_web_logging, try_init_web_logging};
 pub use input::{
     ActionMap, ActionState, ActionValue, Binding, ButtonState, Gamepad, GamepadAxis, GamepadButton, Input, InputPlugin,
     KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchPhase,
@@ -76,8 +81,8 @@ pub use layout::{
 #[cfg(target_os = "android")]
 pub use mobile::{AndroidApp, android_main_entry};
 #[cfg(target_arch = "wasm32")]
-pub use web::{find_canvas, init_web_logging};
-pub use window::{PlatformEvent, WindowPlugin, WindowState};
+pub use web::find_canvas;
+pub use window::{PlatformEvent, WindowPlugin, WindowState, backends_from_query};
 
 pub use winit;
 

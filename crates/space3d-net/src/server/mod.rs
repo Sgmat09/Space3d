@@ -57,6 +57,13 @@ pub struct HttpServer {
     limits: ConnectionLimits,
 }
 
+/// Whether [`HttpServer::serve_spa`] answers a missing `path` with the app's `index.html`: page
+/// routes do, files (the last segment has an extension) don't.
+pub fn is_spa_route(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or_default();
+    !last.contains('.')
+}
+
 impl Default for HttpServer {
     fn default() -> Self {
         Self::new()
@@ -109,11 +116,26 @@ impl HttpServer {
         self
     }
 
-    /// Single-page-app hosting: files from `dir`, with `dir/index.html` for any unknown path.
+    /// Single-page-app hosting: files from `dir`, with `dir/index.html` for unknown page paths
+    /// (`/level/3`). A missing *file* — a path whose last segment has an extension, like
+    /// `/assets/ship.png` or `/favicon.ico` — is a 404, so a game's asset loader reports it as
+    /// not found instead of trying to decode the page.
     pub fn serve_spa(mut self, dir: impl AsRef<Path>) -> Self {
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
         let dir = dir.as_ref();
-        let svc = ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html")));
-        self.router = self.router.fallback_service(svc);
+        let index = ServeFile::new(dir.join("index.html"));
+        let fallback = tower::service_fn(move |req: axum::extract::Request| {
+            let index = index.clone();
+            async move {
+                if !is_spa_route(req.uri().path()) {
+                    return Ok::<_, std::convert::Infallible>(axum::http::StatusCode::NOT_FOUND.into_response());
+                }
+                let Ok(response) = index.oneshot(req).await;
+                Ok(response.into_response())
+            }
+        });
+        self.router = self.router.fallback_service(ServeDir::new(dir).fallback(fallback));
         self
     }
 
@@ -399,6 +421,21 @@ impl Drop for ServerHandle {
     fn drop(&mut self) {
         if !self.detached {
             self.token.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_spa_route;
+
+    #[test]
+    fn spa_routes_are_pages_not_files() {
+        for page in ["/", "/level/3", "/play", "/a.b/c"] {
+            assert!(is_spa_route(page), "{page}");
+        }
+        for file in ["/favicon.ico", "/assets/ship.png", "/game_bg.wasm", "/a/b.c"] {
+            assert!(!is_spa_route(file), "{file}");
         }
     }
 }

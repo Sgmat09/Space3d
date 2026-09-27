@@ -201,6 +201,7 @@ pub fn default_index_html(bin: &str) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <link rel="icon" href="data:,">
   <title>{bin}</title>
   <style>html,body{{margin:0;height:100%;background:#000;overflow:hidden}}canvas{{display:block;width:100vw!important;height:100vh!important;touch-action:none;outline:none}}</style>
 </head>

@@ -18,9 +18,6 @@ tracing-subscriber.workspace = true
 web-time.workspace = true
 parking_lot.workspace = true
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-tracing-wasm.workspace = true
-
 [dev-dependencies]
 pollster.workspace = true
 # tests/kinsoku.rs: the golden screenshot story and the Cargo.lock guard.

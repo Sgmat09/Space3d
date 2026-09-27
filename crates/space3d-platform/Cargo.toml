@@ -22,15 +22,17 @@ pollster.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
-web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlCanvasElement", "Navigator"] }
+web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlCanvasElement", "Navigator", "Location", "console"] }
 console_error_panic_hook.workspace = true
-tracing-wasm.workspace = true
+# The browser-console `tracing` layer (`console_log`).
+tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 image.workspace = true
+tracing-subscriber.workspace = true
 space3d-tasks.workspace = true
 
 # OS keyboard-layout tables, read on the main thread (macOS Text Input Sources are

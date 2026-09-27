@@ -4957,10 +4957,13 @@ name = "space3d-audio"
 version = "0.1.0"
 dependencies = [
  "glam 0.33.9",
+ "js-sys",
  "kira",
+ "send_wrapper",
  "space3d-core",
  "thiserror 2.0.21",
  "tracing",
+ "web-sys",
 ]
 
 [[package]]
@@ -5133,7 +5136,7 @@ dependencies = [
  "space3d-render",
  "space3d-tasks",
  "tracing",
- "tracing-wasm",
+ "tracing-subscriber",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -5302,7 +5305,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "tracing-wasm",
  "web-time",
 ]
 

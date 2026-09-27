@@ -141,8 +141,13 @@ impl RenderCapabilities {
                 .get_texture_format_features(DEPTH_FORMAT)
                 .flags
                 .sample_count_supported(4);
+        let mut info = adapter.get_info();
+        // Browsers don't name the WebGPU adapter (fingerprinting); logs and HUDs show this.
+        if info.name.is_empty() && info.backend == wgpu::Backend::BrowserWebGpu {
+            info.name = "WebGPU (browser)".into();
+        }
         Self {
-            adapter: adapter.get_info(),
+            adapter: info,
             compute,
             indirect,
             indirect_first_instance: ifi,

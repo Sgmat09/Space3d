@@ -2,18 +2,27 @@
 use crate::SoundId;
 use crate::spatial::{EmitterFrame, ListenerPose};
 use crate::volume::{Bus, Fade, MixerLevels, PlayParams, amplitude_to_db};
+#[cfg(not(target_arch = "wasm32"))]
+use kira::DefaultBackend;
 use kira::backend::mock::MockBackend;
 use kira::listener::ListenerHandle;
 use kira::sound::PlaybackState;
 use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 use kira::track::{SpatialTrackBuilder, SpatialTrackDistances, SpatialTrackHandle, TrackBuilder, TrackHandle};
-use kira::{AudioManager, AudioManagerSettings, DefaultBackend, Tween};
+use kira::{AudioManager, AudioManagerSettings, Tween};
 use space3d_core::glam::{Quat, Vec3};
 use space3d_core::hecs::Entity;
 use std::collections::{HashMap, HashSet};
 
+/// The output device backend: kira's cpal backend; on the web the same, resumable after a
+/// user gesture ([`crate::web`]).
+#[cfg(not(target_arch = "wasm32"))]
+type DeviceBackend = DefaultBackend;
+#[cfg(target_arch = "wasm32")]
+type DeviceBackend = crate::web::WebAudioBackend;
+
 pub(crate) enum Manager {
-    Device(Box<AudioManager<DefaultBackend>>),
+    Device(Box<AudioManager<DeviceBackend>>),
     Mock(Box<AudioManager<MockBackend>>),
 }
 
@@ -44,7 +53,7 @@ pub(crate) struct Backend {
 impl Backend {
     /// Open the default output device.
     pub fn device() -> Result<Self, String> {
-        let m = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default()).map_err(|e| e.to_string())?;
+        let m = AudioManager::<DeviceBackend>::new(AudioManagerSettings::default()).map_err(|e| e.to_string())?;
         Self::with_manager(Manager::Device(Box::new(m)))
     }
 
@@ -70,6 +79,14 @@ impl Backend {
             sounds: HashMap::new(),
             emitters: HashMap::new(),
         })
+    }
+
+    /// Once per frame: on the web, start the output after the page's first user gesture.
+    pub fn poll_output(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if let Manager::Device(m) = &mut self.manager {
+            m.backend_mut().poll();
+        }
     }
 
     pub fn is_mock(&self) -> bool {

@@ -1,4 +1,5 @@
-//! Web (wasm32) support: canvas attachment and logging setup.
+//! Web (wasm32) support: canvas attachment and the renderer backend override (logging:
+//! [`crate::console_log`]).
 //!
 //! ```ignore
 //! #[wasm_bindgen::prelude::wasm_bindgen(start)]
@@ -19,10 +20,14 @@ use web_sys::HtmlCanvasElement;
 use winit::platform::web::{WindowAttributesExtWebSys, WindowExtWebSys};
 use winit::window::{Window, WindowAttributes};
 
-/// Route panics to `console.error` and `tracing` to the browser console. Safe to call twice.
-pub fn init_web_logging() {
-    console_error_panic_hook::set_once();
-    let _ = tracing_wasm::try_set_as_global_default();
+/// [`crate::window::backends_from_query`] for this page's URL.
+pub(crate) fn backends_from_url() -> Option<space3d_render::wgpu::Backends> {
+    let search = web_sys::window()?.location().search().ok()?;
+    let backends = crate::window::backends_from_query(&search);
+    if let Some(b) = backends {
+        tracing::info!("renderer backends restricted to {b:?} by the page URL ({search})");
+    }
+    backends
 }
 
 /// Find `<canvas id=...>` in the document.

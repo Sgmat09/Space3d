@@ -125,6 +125,8 @@ js-sys = "0.3.105"
 # Windows keyboard layout labels (space3d-platform); latest stable, already locked via other deps.
 windows-sys = "0.61.2"
 console_error_panic_hook = "0.1.7"
+# Web Audio handles in `Send` resources (space3d-audio; the version kira uses).
+send_wrapper = "0.6.0"
 tracing-wasm = "0.2.1"
 
 # testing / bench

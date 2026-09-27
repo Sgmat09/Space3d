@@ -36,8 +36,8 @@ pub fn run(ctx: &Ctx, args: &ServeArgs) -> Result<()> {
     watch(ctx, &project, &build_args, &handle)
 }
 
-/// Start the static server used by `serve`: SPA fallback, COOP/COEP (so wasm threads can use
-/// `SharedArrayBuffer`) and `Cache-Control: no-store`.
+/// Start the static server used by `serve`: SPA fallback for page paths (missing files are
+/// 404s), COOP/COEP (so wasm threads can use `SharedArrayBuffer`) and `Cache-Control: no-store`.
 pub fn start(dir: &Path, addr: ([u8; 4], u16)) -> Result<ServerHandle> {
     anyhow::ensure!(
         dir.join("index.html").is_file(),
@@ -125,8 +125,10 @@ mod tests {
         assert!(index.header("cache-control").unwrap().contains("no-store"));
         let wasm = get("/game_bg.wasm");
         assert_eq!(wasm.header("content-type"), Some("application/wasm"));
-        // SPA fallback.
+        // SPA fallback for pages; a missing file is a 404 (an asset loader must not get the page).
         assert_eq!(get("/level/3").text(), "<html>game</html>");
+        assert_eq!(get("/assets/missing.png").status, 404);
+        assert_eq!(get("/favicon.ico").status, 404);
         handle.shutdown();
     }
 

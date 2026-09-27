@@ -199,7 +199,7 @@ Other commands: `space3d build --target desktop|web|android|ios [--release]`,
 | | Windows | macOS | Linux | Web | Android | iOS |
 |---|---|---|---|---|---|---|
 | graphics backend | DX12 / Vulkan | Metal | Vulkan / GLES | WebGPU / WebGL2 | Vulkan / GLES | Metal |
-| typical draw path | GPU multi-draw-count | GPU multi-draw | GPU multi-draw-count | GPU indirect / CPU | GPU / CPU | GPU multi-draw |
+| typical draw path | GPU multi-draw-count | GPU multi-draw | GPU multi-draw-count | GPU multi-draw (WebGPU) / CPU (WebGL2) | GPU / CPU | GPU multi-draw |
 | entry point (`main!`) | `fn main` | `fn main` | `fn main` | `#[wasm_bindgen(start)]` | `android_main` | `start_app()` |
 | build | `space3d build` | `space3d build` | `space3d build` | `space3d build -t web` | `space3d build -t android` | `space3d build -t ios` |
 | input | keyboard, mouse | keyboard, mouse | keyboard, mouse | keyboard, mouse, touch | touch | touch |
@@ -236,6 +236,8 @@ fn holding_right_moves_the_player() {
 * Without a GPU adapter, screenshot tests skip instead of failing (`SPACE3D_REQUIRE_GPU=1`
   makes them fail); CI uses a software Vulkan driver (lavapipe) so they run there too.
 * Determinism (`assert_deterministic`), frame budgets and allocation counts are assertions too.
+* Web builds run for real in headless Chrome on WebGPU and WebGL2: `scripts/web-smoke.sh`
+  (screenshots, console, input, assets over HTTP, audio; [docs/platforms.md](docs/platforms.md#smoke-test-in-headless-chrome)).
 
 More: [docs/testing.md](docs/testing.md).
 

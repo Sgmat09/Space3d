@@ -206,6 +206,9 @@ impl WinitRunner {
             height: size.y.max(1),
             msaa_samples: self.settings.msaa_samples,
             vsync: self.settings.vsync,
+            // `?webgl2` / `?webgpu` in the page URL.
+            #[cfg(target_arch = "wasm32")]
+            backends: crate::web::backends_from_url(),
             ..Default::default()
         }
     }

@@ -1,0 +1,5 @@
+# web_demo crystal material
+newmtl crystal
+Kd 1.0 1.0 1.0
+Ns 250
+map_Kd crystal.png

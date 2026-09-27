@@ -85,9 +85,9 @@ pub fn install_tracing(filter: &str) -> TracingInstall {
         let output = tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_filter(env_filter(filter));
+        // Each event at its console level (`console.error`, `.warn`, …).
         #[cfg(target_arch = "wasm32")]
-        let output =
-            tracing_wasm::WASMLayer::new(tracing_wasm::WASMLayerConfig::default()).with_filter(env_filter(filter));
+        let output = space3d_platform::ConsoleLayer.with_filter(env_filter(filter));
         let subscriber = Registry::default()
             .with(output)
             .with(ProfilerLayer::new().with_filter(profiler_filter()))

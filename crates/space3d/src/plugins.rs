@@ -23,18 +23,22 @@ fn env_var(name: &str) -> Option<String> {
 // LogPlugin
 
 /// Installs a global `tracing` subscriber: formatted stderr output filtered by `RUST_LOG`
-/// (falling back to [`LogPlugin::filter`]) on native, the browser console (plus a panic hook
-/// that prints Rust panics) on the web. Installing twice is harmless.
+/// (falling back to [`LogPlugin::filter`]) on native, the browser console filtered by
+/// [`LogPlugin::filter`] on the web (each event at its level: `console.error`, `.warn`, `.info`,
+/// `.debug` — see `space3d_platform::console_log`; plus a panic hook that prints Rust panics).
+/// Installing twice is harmless.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogPlugin {
-    /// `tracing_subscriber::EnvFilter` directives used when `RUST_LOG` is unset (native only).
+    /// `tracing_subscriber::EnvFilter` directives (natively only when `RUST_LOG` is unset).
     pub filter: String,
 }
 
 impl Default for LogPlugin {
     fn default() -> Self {
         Self {
-            filter: "info,wgpu_core=warn,wgpu_hal=warn,naga=warn".into(),
+            // `egui_wgpu=error`: it warns about sRGB targets, which the engine always uses and
+            // egui handles.
+            filter: "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error".into(),
         }
     }
 }
@@ -50,7 +54,9 @@ impl Plugin for LogPlugin {
                 .with_writer(std::io::stderr)
                 .try_init();
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", feature = "platform"))]
+        space3d_platform::try_init_web_logging(&self.filter);
+        #[cfg(all(target_arch = "wasm32", not(feature = "platform")))]
         {
             console_error_panic_hook::set_once();
             let _ = tracing_wasm::try_set_as_global_default();

@@ -79,7 +79,9 @@ A bare WebSocket server: `WsServer::new().listen(addr)?`. `WsServer` has `send`,
 `broadcast_except`, `disconnect`, `clients`. `ServerEvent::{Connected, Message, Disconnected}`
 arrive in order per client.
 
-`space3d serve` is built on the same `HttpServer` (`serve_spa` + `cross_origin_isolated` +
+`serve_spa` answers unknown page paths (`/level/3`) with `index.html`; a missing file (the last
+path segment has an extension: `/assets/ship.png`) is a 404, so asset loaders report it as not
+found. `space3d serve` is built on the same `HttpServer` (`serve_spa` + `cross_origin_isolated` +
 `no_cache`).
 
 ## Multiplayer architecture

@@ -46,7 +46,9 @@ What `space3d build --target web` does:
    `cargo install wasm-bindgen-cli --version <x.y.z> --locked` (or installs it with
    `--install-tools`).
 3. `wasm-bindgen --target web --no-typescript --out-name <game> --out-dir dist/web …`.
-4. Release builds: `wasm-opt -Oz` when binaryen is installed.
+4. Release builds: `wasm-opt -Oz` when binaryen is installed (`brew install binaryen`; about
+   1.5 minutes and −20 % for a 15 MB module such as `examples/web_demo`; `--no-wasm-opt` skips
+   it).
 5. Copies `web/` (your `index.html`, icons, …) and `assets/` into `dist/web`.
 
 The page loads the bundle with `import init from "./<game>.js"; init();`. Set
@@ -57,10 +59,24 @@ size from `WindowPlugin::width`/`height`; to let the page decide (e.g. fill the 
 (`canvas#space3d { width: 100vw !important; height: 100vh !important; }`) — the surface follows
 the canvas' real size.
 
-Web specifics: the renderer is created asynchronously (WebGPU when available, WebGL2 otherwise —
-WebGL2 uses the CPU draw path); assets are fetched over HTTP relative to the page; the database
-uses `localStorage` (KV, save slots, leaderboards; raw SQL returns `Unsupported`); WebSocket and
-HTTP clients use the browser APIs; servers are native-only; audio starts after a user gesture.
+Web specifics:
+
+* **Renderer**: created asynchronously — WebGPU when the browser has an adapter, WebGL2
+  otherwise (WebGL2 uses the CPU draw path). `?webgl2` in the page URL forces WebGL2 in a
+  browser that has WebGPU (`?webgpu`: WebGPU only), in any Space3d page — the quickest way to
+  see a game's WebGL2 path. The console says which one started:
+  `space3d renderer initialised … backend=BrowserWebGpu` (or `Gl`).
+* **Assets** are fetched over HTTP relative to the page (`assets/…`, copied next to it).
+* **Audio**: browsers keep a page's `AudioContext` suspended until its first user gesture
+  (click, tap, key press — the autoplay policy). The output starts on the first frame after one
+  (`audio output running` in the console); sounds started earlier (e.g. music at start-up)
+  begin then. Nothing to do in the game.
+* **Logging** goes to the browser console at each event's level (`console.error`, `.warn`,
+  `.info`, `.debug`), filtered by `LogPlugin::filter`; panics are printed with
+  `console.error`. `println!` output is lost on the web — log with `space3d::tracing`.
+* The database uses `localStorage` (KV, save slots, leaderboards; raw SQL returns
+  `Unsupported`); WebSocket and HTTP clients use the browser APIs; servers are native-only.
+* `spawn_compute` runs inline on the web (no threads): long jobs stall one frame.
 
 Graphics on the web ([graphics.md](graphics.md#webgl2-and-other-downlevel-devices)): WebGPU
 browsers get every feature as natively (`GraphicsQuality::recommended` picks Medium or High);
@@ -74,6 +90,44 @@ program when a pipeline is first built (50–150 ms): prewarm on loading screens
 (`cargo run -p space3d-cli -- serve` from its directory; `web/index.html`), and
 `DownlevelOverride::webgl2()` shows the WebGL2 look on a desktop GPU (the
 `Engine/Showcase/WebGL2 *` stories).
+
+### Smoke test in headless Chrome
+
+`scripts/web-smoke.sh` builds examples with `space3d build --target web --release`, serves each
+with `space3d serve --no-build` and runs it in headless Google Chrome (no window, no focus
+change), driven over the DevTools protocol by `scripts/web-smoke.mjs` (Node 22+, no npm
+packages):
+
+```sh
+scripts/web-smoke.sh                        # web_demo + graphics_showcase × webgpu, webgl2, webgl2-url
+scripts/web-smoke.sh web_demo               # one example
+BACKENDS=webgpu NO_BUILD=1 scripts/web-smoke.sh graphics_showcase
+```
+
+| backend | Chrome | expects |
+|---|---|---|
+| `webgpu` | default (`--enable-unsafe-webgpu`) | `backend=BrowserWebGpu` |
+| `webgl2` | no WebGPU adapter (`--disable-features=WebGPUService`): wgpu's automatic fallback | `backend=Gl` |
+| `webgl2-url` | WebGPU available, page opened with `?webgl2` | `backend=Gl` |
+
+Each run checks that the renderer starts on the expected backend; frames are drawn (two
+screenshots 0.5 s apart differ and are not blank); input reaches the game (a click and/or key
+press sent as real input events, then a log line the game prints in response — and for
+`web_demo` a colour change on screen); the `.wasm` is served as `application/wasm` (and with
+COOP/COEP); the assets arrive over HTTP (`web_demo` loads `assets/crystal.obj` → `.mtl` →
+`.png`); the `AudioContext` is suspended before the first gesture and running after it
+(`graphics_showcase`); and nothing throws, panics or logs an error. Chrome runs with its
+desktop autoplay policy and a throwaway profile (`CHROME_PROFILE`, removed afterwards).
+
+Output in `target/web-smoke/`: `<example>-<backend>-1.png`, `-2.png` (before the input), `-3.png`
+(after it), `.console.log` (browser console, engine logs, browser warnings) and `.json` (every
+measurement and the failures). The exit status is non-zero when any run failed. To check any
+other page, run the driver directly (`node scripts/web-smoke.mjs --help` lists the options):
+
+```sh
+node scripts/web-smoke.mjs --url 'http://127.0.0.1:8080/?webgl2' --backend webgl2 \
+  --click --expect-log 'palette 2' --name mygame
+```
 
 ## Android
 
