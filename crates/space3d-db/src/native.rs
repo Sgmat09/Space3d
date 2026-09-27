@@ -118,14 +118,30 @@ CREATE TABLE IF NOT EXISTS space3d_leaderboard (
 CREATE INDEX IF NOT EXISTS space3d_leaderboard_by_score ON space3d_leaderboard(board, score);
 ";
 
+/// Where the database file lives: `path`, except on iOS where a relative path is inside the
+/// app container's `Library/Application Support` — iOS apps start in `/` (not writable) and
+/// their bundle is read-only.
+fn file_path(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "ios")]
+    if path.is_relative()
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::Path::new(&home)
+            .join("Library/Application Support")
+            .join(path);
+    }
+    path.to_path_buf()
+}
+
 fn open(config: &DbConfig) -> Result<Connection> {
     let conn = if config.is_in_memory() {
         Connection::open_in_memory()?
     } else {
-        if let Some(parent) = config.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let path = file_path(&config.path);
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| DbError::Open(format!("{}: {e}", parent.display())))?;
         }
-        Connection::open(&config.path)?
+        Connection::open(&path)?
     };
     conn.set_prepared_statement_cache_capacity(config.statement_cache_capacity);
     conn.busy_timeout(config.busy_timeout)?;

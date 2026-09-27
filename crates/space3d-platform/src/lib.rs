@@ -13,7 +13,8 @@
 //! * [Keyboard layouts](#keyboard-layouts) — logical keys ([`KeyEvent`]) and key labels
 //!   ([`Input::key_label`]) that follow the player's layout; see [`layout`].
 //! * Web: `init_web_logging()` (wasm32 only), canvas attachment via [`WindowPlugin::canvas_id`].
-//! * Mobile: `android_main_entry` (Android) and the iOS `start_app` pattern — see [`mobile`].
+//! * Mobile: `android_main_entry` (Android); iOS runs the game binary's `main` (or `start_app`
+//!   from an Xcode project) with the UIScene life cycle — see [`mobile`].
 //!
 //! ```no_run
 //! use space3d_core::prelude::*;
@@ -56,6 +57,10 @@
 
 pub mod background;
 mod input;
+#[cfg(target_os = "ios")]
+mod ios;
+#[cfg(target_os = "ios")]
+pub mod ios_log;
 pub mod layout;
 pub mod mobile;
 mod os_buttons;
@@ -73,11 +78,12 @@ pub use layout::{
     KeyLabel, KeyLabelSource, KeyLocation, KeyboardLayout, LogicalKey, NamedKey, english_key_name,
     is_writing_system_key, us_qwerty_label, writing_system_keys,
 };
+pub use mobile::IOS_SCENE_DELEGATE_CLASS;
 #[cfg(target_os = "android")]
 pub use mobile::{AndroidApp, android_main_entry};
 #[cfg(target_arch = "wasm32")]
 pub use web::{find_canvas, init_web_logging};
-pub use window::{PlatformEvent, WindowPlugin, WindowState};
+pub use window::{PlatformEvent, SafeAreaInsets, WindowPlugin, WindowState};
 
 pub use winit;
 

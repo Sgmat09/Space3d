@@ -34,7 +34,11 @@ pub struct LogPlugin {
 impl Default for LogPlugin {
     fn default() -> Self {
         Self {
-            filter: "info,wgpu_core=warn,wgpu_hal=warn,naga=warn".into(),
+            // `egui_wgpu=error`: it warns about the sRGB targets the engine always uses.
+            // winit's iOS backend logs a warning or info line per frame about event order.
+            filter:
+                "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error,winit::platform_impl::ios::app_state=error"
+                    .into(),
         }
     }
 }
@@ -45,6 +49,14 @@ impl Plugin for LogPlugin {
         {
             use tracing_subscriber::EnvFilter;
             let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.filter));
+            // iOS: stderr and the unified log (`log stream`, Console.app), without colors.
+            #[cfg(all(target_os = "ios", feature = "platform"))]
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(space3d_platform::ios_log::IosLogWriter)
+                .try_init();
+            #[cfg(not(all(target_os = "ios", feature = "platform")))]
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)

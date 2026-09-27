@@ -14,7 +14,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 /// Default log directives (stderr / browser console and the in-game console).
 /// (`egui_wgpu=error`: it warns about sRGB targets, which the engine always uses and egui handles.)
-pub(crate) const DEFAULT_FILTER: &str = "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error";
+/// (`winit::platform_impl::ios::app_state=error`: winit's iOS backend logs a line per frame
+/// about its event order.)
+pub(crate) const DEFAULT_FILTER: &str =
+    "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error,winit::platform_impl::ios::app_state=error";
 
 /// How the UI `tracing` layers are installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +84,13 @@ pub fn install_tracing(filter: &str) -> TracingInstall {
         return TracingInstall::Global;
     }
     if !tracing::dispatcher::has_been_set() {
-        #[cfg(not(target_arch = "wasm32"))]
+        // iOS: stderr and the unified log (`log stream`, Console.app), without colors.
+        #[cfg(target_os = "ios")]
+        let output = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(space3d_platform::ios_log::IosLogWriter)
+            .with_filter(env_filter(filter));
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
         let output = tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_filter(env_filter(filter));

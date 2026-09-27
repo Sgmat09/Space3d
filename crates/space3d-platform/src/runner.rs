@@ -11,6 +11,12 @@
 //!   is recreated, at most once per `SurfaceRetry::INTERVAL`.
 //! * `about_to_wait` — request the next redraw (continuous rendering).
 //!
+//! iOS specifics: the window fills the screen and is moved into the app's UIScene
+//! (`crate::ios`); the event loop waits between frames (a redraw request is served once per
+//! display refresh); winit's `inner_size` there is the safe area (kept in
+//! [`crate::SafeAreaInsets`]) while the surface covers the whole window; an `AppExit` ends the
+//! process, as winit cannot leave `UIApplicationMain`.
+//!
 //! The keyboard layout's OS table ([`crate::layout`]) is read on the event-loop thread at the
 //! first resume and on focus gain, and its id is re-checked at most once per second (cheap:
 //! no per-frame OS calls).
@@ -87,6 +93,17 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     }
 }
 
+/// Size of the area the renderer draws: the window's inner size, except on iOS where winit's
+/// `inner_size` is the *safe area* while the view (and so the Metal layer) covers the whole
+/// window, as winit's `Resized` events report.
+fn surface_size(window: &Window) -> UVec2 {
+    #[cfg(target_os = "ios")]
+    let size = window.outer_size();
+    #[cfg(not(target_os = "ios"))]
+    let size = window.inner_size();
+    UVec2::new(size.width, size.height)
+}
+
 /// Throttles re-attaching a presentation surface after the renderer dropped it (a lost
 /// surface can only be replaced, and on a window that really cannot present every attempt
 /// fails). Also rate-limits a lose/recreate cycle, since a successful attempt counts too.
@@ -133,14 +150,20 @@ fn attach_surface(r: &mut Renderer, window: &Arc<Window>) -> Result<(), RenderEr
         Some(c) => r.set_surface(space3d_render::wgpu::SurfaceTarget::Canvas(c))?,
         None => return Err(RenderError::Surface("window has no canvas".into())),
     }
-    let size = window.inner_size();
-    r.resize(size.width.max(1), size.height.max(1));
+    let size = surface_size(window).max(UVec2::ONE);
+    r.resize(size.x, size.y);
     Ok(())
 }
 
 /// Runner installed by [`WindowPlugin`]. Falls back to the headless runner when no event loop
 /// can be created (e.g. CI without a display server).
 pub(crate) fn run(app: App, settings: WindowPlugin) {
+    // Before `UIApplicationMain` (in `run_app`) creates the scene that names it.
+    #[cfg(target_os = "ios")]
+    {
+        crate::ios::register_scene_delegate();
+        crate::ios_log::install_panic_hook();
+    }
     let event_loop = match build_event_loop() {
         Ok(el) => el,
         Err(e) => {
@@ -149,7 +172,14 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
             return;
         }
     };
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Continuous rendering: every `about_to_wait` requests the next redraw. On iOS a redraw
+    // request is `setNeedsDisplay`, which UIKit serves once per display refresh, so `Wait`
+    // renders just as often; `Poll` would spin the main thread between frames.
+    event_loop.set_control_flow(if cfg!(target_os = "ios") {
+        ControlFlow::Wait
+    } else {
+        ControlFlow::Poll
+    });
     let runner = WinitRunner {
         applied_title: settings.title.clone(),
         app,
@@ -215,8 +245,18 @@ impl WinitRunner {
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
             .with_title(s.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(s.width as f64, s.height as f64))
             .with_resizable(s.resizable);
+        // iOS windows fill their scene: winit would use the size as the UIWindow frame (larger or
+        // smaller than the screen). Games hide the status bar.
+        #[cfg(target_os = "ios")]
+        {
+            use winit::platform::ios::WindowAttributesExtIOS;
+            attrs = attrs.with_prefers_status_bar_hidden(true);
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(s.width as f64, s.height as f64));
+        }
         if crate::background::background_mode() {
             attrs = attrs.with_active(false);
         }
@@ -225,7 +265,12 @@ impl WinitRunner {
             attrs = crate::web::window_attributes(attrs, s.canvas_id.as_deref());
         }
         match event_loop.create_window(attrs) {
-            Ok(w) => Some(Arc::new(w)),
+            Ok(w) => {
+                // winit 0.30 creates a window outside any UIScene; put it into the app's scene.
+                #[cfg(target_os = "ios")]
+                crate::ios::attach_to_scene(&w);
+                Some(Arc::new(w))
+            }
             Err(e) => {
                 tracing::error!("failed to create window: {e}");
                 None
@@ -235,12 +280,38 @@ impl WinitRunner {
 
     fn on_resize(&mut self, size: UVec2) {
         let size = size.max(UVec2::ONE);
+        tracing::debug!("window size {}x{}", size.x, size.y);
+        #[cfg(target_os = "ios")]
+        self.update_safe_area();
         self.state().physical_size = size;
         self.input().set_window_size(size.as_vec2());
         if let Some(r) = self.app.resources.get_mut::<Renderer>() {
             r.resize(size.x, size.y);
         }
         self.send(PlatformEvent::Resized(size));
+    }
+
+    /// iOS: winit's inner rectangle is the safe area of the (full-screen) window.
+    #[cfg(target_os = "ios")]
+    fn update_safe_area(&mut self) {
+        let Some(w) = &self.window else {
+            return;
+        };
+        let (Ok(inner), Ok(outer)) = (w.inner_position(), w.outer_position()) else {
+            return;
+        };
+        let (inner_size, outer_size) = (w.inner_size(), w.outer_size());
+        let insets = crate::SafeAreaInsets::from_rects(
+            glam::IVec2::new(outer.x, outer.y),
+            UVec2::new(outer_size.width, outer_size.height),
+            glam::IVec2::new(inner.x, inner.y),
+            UVec2::new(inner_size.width, inner_size.height),
+        );
+        let current = self.app.resources.init::<crate::SafeAreaInsets>();
+        if *current != insets {
+            tracing::debug!("safe area insets {insets:?}");
+            *current = insets;
+        }
     }
 
     /// Create the renderer on first resume, or reattach the surface on later resumes.
@@ -255,8 +326,7 @@ impl WinitRunner {
         if self.renderer_requested {
             return;
         }
-        let size = window.inner_size();
-        let size = UVec2::new(size.width, size.height).max(UVec2::ONE);
+        let size = surface_size(window).max(UVec2::ONE);
         self.renderer_requested = true;
         let config = self.renderer_config(size);
         #[cfg(not(target_arch = "wasm32"))]
@@ -372,8 +442,29 @@ impl WinitRunner {
         self.apply_window_state();
         if self.app.should_exit() {
             self.exiting = true;
+            // winit ignores `exit()` on iOS (and warns about it).
+            #[cfg(target_os = "ios")]
+            {
+                let _ = event_loop;
+                self.exit_process();
+            }
+            #[cfg(not(target_os = "ios"))]
             event_loop.exit();
         }
+    }
+
+    /// iOS: winit ignores `exit()` (`UIApplicationMain` never returns), so an [`AppExit`] ends
+    /// the process here, after dropping the app (renderer, stores, audio) as desktop does when
+    /// the event loop returns. Apple discourages quit buttons in App Store apps; this exists
+    /// for `SPACE3D_EXIT_AFTER_FRAMES` smoke runs and games that end themselves.
+    ///
+    /// [`AppExit`]: space3d_core::AppExit
+    #[cfg(target_os = "ios")]
+    fn exit_process(&mut self) -> ! {
+        tracing::info!("app exit requested; ending the iOS process");
+        drop(std::mem::replace(&mut self.app, App::new()));
+        self.window = None;
+        std::process::exit(0)
     }
 
     /// Push game-side changes of [`WindowState`] to the OS window.
@@ -420,10 +511,10 @@ impl ApplicationHandler for WinitRunner {
             s.suspended = false;
             s.scale_factor = scale;
         }
+        tracing::debug!("resumed");
         self.ensure_renderer(event_loop, &window);
         self.poll_layout(Instant::now(), true);
-        let size = window.inner_size();
-        self.on_resize(UVec2::new(size.width, size.height));
+        self.on_resize(surface_size(&window));
         self.send(PlatformEvent::Resumed);
         // Avoid a huge dt after returning from background.
         self.last_frame = None;
@@ -433,6 +524,7 @@ impl ApplicationHandler for WinitRunner {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // Android destroys the native window while in background: drop the surface now and
         // recreate it in `resumed`. Harmless elsewhere.
+        tracing::debug!("suspended: dropping the presentation surface");
         if let Some(r) = self.app.resources.get_mut::<Renderer>() {
             r.remove_surface();
         }
@@ -450,6 +542,9 @@ impl ApplicationHandler for WinitRunner {
                     event_loop.exit();
                 }
             }
+            // winit's UIKit view reports a 0×0 size once while the window is set up; iOS
+            // windows are never minimized, so skip it rather than resize the surface to 1×1.
+            WindowEvent::Resized(size) if cfg!(target_os = "ios") && (size.width == 0 || size.height == 0) => {}
             WindowEvent::Resized(size) => self.on_resize(UVec2::new(size.width, size.height)),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.state().scale_factor = scale_factor;

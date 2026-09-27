@@ -230,15 +230,34 @@ impl std::fmt::Debug for MemorySource {
 }
 
 /// The platform's default source for `root`: [`FileSource`] on native, [`HttpSource`] on web.
+///
+/// On iOS a relative `root` is resolved against the app bundle (the directory of the
+/// executable): apps start with `/` as their working directory, and `space3d build --target
+/// ios` copies `assets/` into the bundle next to the executable.
 pub fn default_source(root: &str) -> Arc<dyn AssetSource> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        Arc::new(FileSource::new(root))
+        Arc::new(FileSource::new(platform_root(root)))
     }
     #[cfg(target_arch = "wasm32")]
     {
         Arc::new(HttpSource::new(root))
     }
+}
+
+/// Where a native asset root lives: `root` itself, except on iOS where a relative root is
+/// inside the app bundle (see [`default_source`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn platform_root(root: &str) -> PathBuf {
+    #[cfg(target_os = "ios")]
+    if std::path::Path::new(root).is_relative()
+        && let Some(bundle) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        return bundle.join(root);
+    }
+    PathBuf::from(root)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

@@ -13,7 +13,7 @@ use crate::overlay::EguiOverlay;
 use crate::{UiPlugin, UiTheme, UiThemeSync};
 use space3d_core::glam::Vec2;
 use space3d_core::{SystemCtx, Time};
-use space3d_platform::{Input, WindowState};
+use space3d_platform::{Input, SafeAreaInsets, WindowState};
 use space3d_render::{RenderOverlays, Renderer};
 use std::any::TypeId;
 use std::sync::{Arc, Mutex};
@@ -361,6 +361,16 @@ pub(crate) fn begin_frame(
         o.set_scale_factor(ppp);
     }
 
+    // Areas under the notch / Dynamic Island / home indicator (iOS): egui keeps its windows
+    // out of them (`Context::content_rect`).
+    let safe_area = sys.resources.get::<SafeAreaInsets>().filter(|s| !s.is_zero()).map(|s| {
+        egui::SafeAreaInsets(egui::epaint::MarginF32 {
+            left: s.left / ppp,
+            right: s.right / ppp,
+            top: s.top / ppp,
+            bottom: s.bottom / ppp,
+        })
+    });
     let e = sys.resources.expect_mut::<EguiContext>();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32 / ppp, size[1] as f32 / ppp));
     let mut raw = egui::RawInput {
@@ -374,6 +384,7 @@ pub(crate) fn begin_frame(
         },
         events,
         focused,
+        safe_area_insets: safe_area,
         ..Default::default()
     };
     raw.viewports.insert(

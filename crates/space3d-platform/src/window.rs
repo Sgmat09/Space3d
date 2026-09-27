@@ -14,9 +14,9 @@ use space3d_render::RenderPlugin;
 pub struct WindowPlugin {
     /// Window title (also settable at runtime via [`WindowState::title`]).
     pub title: String,
-    /// Initial logical width.
+    /// Initial logical width (iOS windows always fill the screen).
     pub width: u32,
-    /// Initial logical height.
+    /// Initial logical height (iOS windows always fill the screen).
     pub height: u32,
     /// Present with vsync.
     pub vsync: bool,
@@ -70,6 +70,7 @@ impl Plugin for WindowPlugin {
             cursor_visible: true,
             cursor_grab: false,
         });
+        app.init_resource::<SafeAreaInsets>();
         let settings = self.clone();
         app.set_runner(move |app| crate::runner::run(app, settings));
     }
@@ -95,6 +96,45 @@ pub struct WindowState {
     pub cursor_grab: bool,
 }
 
+/// Edges of the window covered by system UI, in physical pixels (resource): on iOS the status
+/// bar / notch / Dynamic Island, the home indicator and rounded corners, kept current by the
+/// window runner (they change with the orientation). Zero elsewhere. Render the scene into the
+/// whole window but keep text and touch controls inside these insets; the egui integration
+/// (`space3d-ui`) keeps its windows inside them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SafeAreaInsets {
+    /// Top inset.
+    pub top: f32,
+    /// Right inset.
+    pub right: f32,
+    /// Bottom inset.
+    pub bottom: f32,
+    /// Left inset.
+    pub left: f32,
+}
+
+impl SafeAreaInsets {
+    /// Insets of a safe area at `inner_pos` with `inner_size` inside a window at `outer_pos`
+    /// with `outer_size` (all physical pixels, screen coordinates).
+    pub fn from_rects(outer_pos: glam::IVec2, outer_size: UVec2, inner_pos: glam::IVec2, inner_size: UVec2) -> Self {
+        let left = (inner_pos.x - outer_pos.x).max(0) as f32;
+        let top = (inner_pos.y - outer_pos.y).max(0) as f32;
+        let right = (outer_size.x as f32 - inner_size.x as f32 - left).max(0.0);
+        let bottom = (outer_size.y as f32 - inner_size.y as f32 - top).max(0.0);
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
+    /// `true` when nothing is covered.
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Window/application lifecycle events (`Events<PlatformEvent>`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlatformEvent {
@@ -110,4 +150,38 @@ pub enum PlatformEvent {
     Suspended,
     /// App returned to foreground — surface recreated.
     Resumed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::IVec2;
+
+    #[test]
+    fn safe_area_from_rects() {
+        // iPhone 17 portrait: 402×874 pt at 3×, safe area 62 pt below the top, 34 pt above the bottom.
+        let insets = SafeAreaInsets::from_rects(
+            IVec2::ZERO,
+            UVec2::new(1206, 2622),
+            IVec2::new(0, 186),
+            UVec2::new(1206, 2622 - 186 - 102),
+        );
+        assert_eq!(
+            insets,
+            SafeAreaInsets {
+                top: 186.0,
+                right: 0.0,
+                bottom: 102.0,
+                left: 0.0
+            }
+        );
+        assert!(!insets.is_zero());
+        let full = SafeAreaInsets::from_rects(
+            IVec2::new(5, 5),
+            UVec2::new(10, 10),
+            IVec2::new(5, 5),
+            UVec2::new(10, 10),
+        );
+        assert!(full.is_zero());
+    }
 }

@@ -93,7 +93,7 @@ pub struct AssetsPlugin {
     /// ([`HttpSource`]). Default `"assets"`.
     pub root: String,
     /// Watch `root` and reload changed files. Only effective on native with the
-    /// `hot-reload` feature (default on there).
+    /// `hot-reload` feature (default on there, except iOS: the app bundle never changes).
     pub hot_reload: bool,
 }
 
@@ -101,7 +101,10 @@ impl Default for AssetsPlugin {
     fn default() -> Self {
         Self {
             root: "assets".into(),
-            hot_reload: cfg!(all(feature = "hot-reload", not(target_arch = "wasm32"))),
+            hot_reload: cfg!(all(
+                feature = "hot-reload",
+                not(any(target_arch = "wasm32", target_os = "ios"))
+            )),
         }
     }
 }

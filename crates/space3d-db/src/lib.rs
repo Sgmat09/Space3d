@@ -80,6 +80,7 @@ pub(crate) fn now_ms() -> i64 {
 #[derive(Clone, Debug)]
 pub struct DbPlugin {
     /// Database file (native) or `localStorage` namespace (web); `":memory:"` for in-memory.
+    /// On iOS a relative path is inside the app's `Library/Application Support`.
     pub path: PathBuf,
     /// Migrations applied (idempotently) at startup.
     pub migrations: Vec<Migration>,

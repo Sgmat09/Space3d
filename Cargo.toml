@@ -124,6 +124,12 @@ web-sys = "0.3.105"
 js-sys = "0.3.105"
 # Windows keyboard layout labels (space3d-platform); latest stable, already locked via other deps.
 windows-sys = "0.61.2"
+# iOS UIScene life cycle for winit's UIKit backend (space3d-platform); latest stable.
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSSet", "NSString"] }
+# iOS: log lines to the unified log (`log stream`, Console.app) next to stderr (space3d-platform).
+oslog = { version = "0.2.0", default-features = false }
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "UIApplication", "UIResponder", "UIScene", "UISceneOptions", "UISceneSession", "UIView", "UIWindow", "UIWindowScene"] }
 console_error_panic_hook = "0.1.7"
 tracing-wasm = "0.2.1"
 

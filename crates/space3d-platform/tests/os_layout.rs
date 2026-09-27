@@ -126,6 +126,8 @@ fn pinned_labels_survive_os_refreshes() {
     let mut input = Input::default();
     assert!(input.refresh_keyboard_layout());
     let os_id = input.keyboard_layout().os_layout_id().map(str::to_owned);
+    // What the OS table itself says ("ф" is KeyA on a Russian layout, nothing on Latin ones).
+    let os_ef = input.keyboard_layout().key_for_label("ф");
     let fake = [(KeyCode::KeyA, "ф".to_owned(), Some("Ф".to_owned()))];
     let layout = input.keyboard_layout_mut();
     // Unpinned, the OS replaces a table set by the app.
@@ -143,7 +145,7 @@ fn pinned_labels_survive_os_refreshes() {
     input.keyboard_layout_mut().set_pinned(false);
     assert!(input.refresh_keyboard_layout(), "unpinned: OS table back");
     assert_eq!(input.keyboard_layout().os_layout_id().map(str::to_owned), os_id);
-    assert_eq!(input.keyboard_layout().key_for_label("ф"), None);
+    assert_eq!(input.keyboard_layout().key_for_label("ф"), os_ef);
 }
 
 #[cfg(target_os = "macos")]
