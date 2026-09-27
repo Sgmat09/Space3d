@@ -263,6 +263,87 @@ Limitations:
   key `0x5E`); the runner reports it as `KeyCode::IntlRo` with its OS label.
 * A table set with `set_os_layout` lasts until the next OS check unless pinned (see above).
 
+## Mouse buttons, focus and the UI
+
+`Input` holds the mouse buttons (`mouse_pressed`, per-frame edges `mouse_just_pressed` /
+`mouse_just_released`) and also records this frame's presses and releases **in order**:
+`Input::mouse_button_events()` lists a `MouseButtonEvent` per change with the button, `pressed`,
+the cursor `position` at the time (`None`: outside the window) and a `cause`. The edges alone
+lose the order — a release and a new press in one frame (the second click of a fast double
+click) show both edges with the button held; the events say it went up first. Every injection
+records events (`inject_mouse_button_down` / `inject_mouse_button_up` as `Device` events), so
+tests and replays drive the same path as the window runner.
+
+**Releases without a release event.** A button normally comes up with its release event. Two
+more things release it, as **cancels** (`MouseButtonEvent::cancelled()`,
+`MouseButtonCause::is_cancel()`):
+
+* `MouseButtonCause::FocusLost` — the window lost the focus (or the app was suspended): the
+  runner calls `Input::release_all()`, which releases every held key and button so game state
+  never sticks.
+* `MouseButtonCause::OsReconciled` — the OS reports the button up although its release event
+  never arrived. On macOS the release goes elsewhere when the system takes the pointer between
+  press and release (Mission Control, App Exposé, a Spaces swipe, a hot corner, the screenshot
+  overlay) while the window stays key; nothing else would ever release the button. Before each
+  frame the runner asks the OS which buttons it holds — one call, only while a button is held —
+  and releases a button the OS showed held during this press and has shown up since, on
+  consecutive checks spanning at least 50 ms (two at least, with a frame's events delivered in
+  between: the OS state can be ahead of the event queue, and a real release event still on its
+  way stays a real release). A press the OS never showed held (a click
+  shorter than a frame, a synthetic or injected press) is left to its own release. It never
+  presses anything.
+
+| platform | OS button state | a lost release |
+|---|---|---|
+| macOS | `+[NSEvent pressedMouseButtons]` (window server state) | released as `OsReconciled` |
+| Windows | `GetAsyncKeyState` (physical buttons, swapped back for left-handed mice: `SM_SWAPBUTTON`) | released as `OsReconciled` |
+| Linux, web, Android, iOS | none | waits for the next click or a focus loss |
+
+Leaving the window releases nothing: macOS, Windows and X11 deliver the release of a drag that
+ends outside, and a drag may cross the window's edge (a slider, a window, hold-to-steer).
+
+**What the UI does with them.** `space3d-ui` sends egui the button events in order, each where
+the cursor was (egui's pointer moves there first, so a release after a move beyond egui's click
+distance is no click), then the cursor's current position. A button event while the cursor is
+outside the window goes to the last position egui saw, and the pointer is gone again right after
+(`PointerGone`), so nothing at the window's corner gets hovered. `Event::WindowFocused` is sent
+when `WindowState::focused` changes (egui then forgets the keys and modifiers it held).
+
+A cancelled release registers **neither a click nor a drop** in egui — like switching away from
+a native app mid-drag. Drags end (`Response::drag_stopped`), a dragged slider keeps its value,
+a button pressed before the focus loss does not fire, and egui's drag-and-drop payload is
+dropped without reaching any drop zone (`dnd_release_payload` returns `None`). Game code that
+implements its own drag-and-drop or "release over X" logic from `Input` should skip releases
+with `cancelled()`:
+
+```rust
+for e in ctx.resources.expect::<Input>().mouse_button_events() {
+    if e.button == MouseButton::Left && !e.pressed {
+        if e.cancelled() {
+            cancel_drag();           // focus lost / release only the OS saw: no drop
+        } else {
+            drop_here(e.position);   // a real release
+        }
+    }
+}
+```
+
+**egui plugins.** egui 0.36 runs its plugins' pass hooks (`Plugin::on_begin_pass` /
+`on_end_pass`) only from `Context::run_ui`; the engine's pass spans `Stage::PreUpdate` to
+`Stage::PostUpdate` (`begin_pass` / `end_pass`), so the engine runs the hooks itself, in
+`run_ui`'s order and with a top-level `Ui` like `run_ui`'s: the begin hooks before the UI systems,
+the end hooks after them. That covers egui's built-in plugins — label text selection (a drag to
+select ends with the release), drag-and-drop (a payload nobody took ends with the release or
+Esc) and `egui::debug_text` — and plugins added with `EguiContext::add_plugin(plugin)` (or made
+known with `EguiContext::register_pass_hooks::<P>()` when a library already added them with
+`egui::Context::add_plugin`). egui cannot list a context's plugins, so hooks of plugins the engine
+does not know about do not run, and `egui::Context::on_begin_pass` / `on_end_pass` callbacks
+(kept in a private egui plugin) never run: register a plugin instead.
+
+**Tests** drive all of this headless: `WindowState::focused = false` plus `Input::release_all()`
+is what the runner does on a focus loss, and `Input::release_mouse_button(b,
+MouseButtonCause::OsReconciled)` is what the OS check does.
+
 ## CI and releases
 
 `space3d ci init --targets desktop,web,android,ios` (also run by `space3d new`) writes

@@ -16,6 +16,9 @@
 //!   vertex-color paint), undo/redo and OBJ/glTF export.
 //! * [`run_editor`] — standalone editor app; [`run_storybook`] — storybook viewer (sidebar
 //!   tree + search, live story viewport, knobs, tick controls, screenshots), native and web.
+//!   Both insert `space3d_ui::UiTheme::compact()` (dense panels: property rows with a label
+//!   column, collapsible sections); [`EditorPlugin`] added to a game leaves the game's egui style
+//!   alone (insert the theme yourself to get the same density).
 //!
 //! Pausing works by controlling time: the runner keeps calling `App::update(dt)`, and while
 //! paused the fixed-step accumulator is emptied so `FixedUpdate` does not run; stepping sets
@@ -43,6 +46,7 @@ mod storybook;
 mod sub_app;
 mod texture_editor;
 pub mod viewport;
+mod widgets;
 
 pub use components::{EditorInternal, MeshSource, register_editor_components};
 pub use editor::{EditorPlugin, EditorState, camera_transform};
@@ -63,7 +67,7 @@ use space3d_core::{App, AppExit, Stage};
 use space3d_platform::{InputPlugin, PlatformPlugin, WindowPlugin};
 use space3d_render::RenderPlugin;
 use space3d_stories::Storybook;
-use space3d_ui::UiPlugin;
+use space3d_ui::{UiPlugin, UiTheme};
 use std::sync::Arc;
 
 /// Environment variable: run without a window (`1`/`true`, or `WIDTHxHEIGHT`).
@@ -206,6 +210,9 @@ fn host_app(title: &str, size: (u32, u32), headless: Option<(u32, u32)>, exit_af
         }
     }
     app.add_plugin(UiPlugin::default());
+    // The standalone tools opt into the compact density (an app adding `EditorPlugin` itself
+    // keeps its own style).
+    app.insert_resource(UiTheme::compact());
     if let Some(n) = exit_after {
         app.add_system_named(Stage::Last, "editor::auto_exit", move |sys| {
             if sys.time().frame >= n {

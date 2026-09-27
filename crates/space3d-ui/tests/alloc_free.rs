@@ -1,9 +1,12 @@
-//! `physical_key_for_egui_key` does not allocate in the steady state: a counting global
-//! allocator (per thread, since libtest runs tests and its own bookkeeping on several threads)
-//! sees no allocation while the keyboard layout's labels do not change.
+//! `physical_key_for_egui_key` and the theme sync do not allocate in the steady state: a
+//! counting global allocator (per thread, since libtest runs tests and its own bookkeeping on
+//! several threads) sees no allocation while the keyboard layout's labels do not change, and
+//! none while the `UiTheme` resource is unchanged or absent. The console's work per frame does
+//! not grow with its number of lines.
 
+use space3d_core::App;
 use space3d_platform::{Input, KeyCode, LogicalKey};
-use space3d_ui::physical_key_for_egui_key;
+use space3d_ui::{Console, LogLevel, UiPlugin, UiTheme, UiThemeSync, physical_key_for_egui_key};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -98,4 +101,60 @@ fn physical_key_for_egui_key_does_not_allocate_in_the_steady_state() {
         }
     });
     assert_eq!(again, 0);
+}
+
+#[test]
+fn theme_sync_does_not_allocate_in_the_steady_state() {
+    let ctx = egui::Context::default();
+    let theme = UiTheme::compact();
+    let mut sync = UiThemeSync::default();
+    let first = allocations(|| assert!(sync.sync(&ctx, Some(&theme))));
+    assert!(first > 0, "applying a theme restyles egui once");
+    let mut absent = UiThemeSync::default();
+    let steady = allocations(|| {
+        for _ in 0..1000 {
+            assert!(!sync.sync(&ctx, Some(&theme)), "unchanged theme");
+            assert!(!absent.sync(&ctx, None), "no theme");
+        }
+    });
+    assert_eq!(steady, 0, "no allocation while the theme is unchanged or absent");
+    assert_eq!(sync.applications(), 1);
+}
+
+/// Allocations per frame of a UI-only app with the console open, holding `lines` lines (some
+/// long enough to wrap), after it settled.
+fn console_allocations_per_frame(lines: usize) -> usize {
+    let mut app = App::new();
+    app.add_plugin(UiPlugin {
+        install_tracing: false,
+        fallback_size: (1280, 720),
+        ..UiPlugin::deterministic()
+    });
+    let console = app.resources.expect_mut::<Console>();
+    console.visible = true;
+    console.capture_logs = false;
+    for i in 0..lines {
+        let level = [LogLevel::Info, LogLevel::Warn, LogLevel::Error][i % 3];
+        let tail = if i % 5 == 0 {
+            " (a long line: it wraps under its message in the console)"
+        } else {
+            ""
+        };
+        console.print(level, format!("line {i}: 12 meshes loaded in 0.84 s{}", tail.repeat(4)));
+    }
+    app.step_ticks(30);
+    let frames = 20;
+    allocations(|| app.step_ticks(frames)) / frames as usize
+}
+
+/// Only the console lines in view are laid out: a console holding 1000 lines allocates per frame
+/// what one holding 40 does (it used to lay out every line, every frame).
+#[test]
+fn console_allocations_do_not_grow_with_its_lines() {
+    let few = console_allocations_per_frame(40);
+    let many = console_allocations_per_frame(1000);
+    assert!(
+        many <= few + few / 20,
+        "{many} allocations per frame with 1000 lines, {few} with 40"
+    );
 }

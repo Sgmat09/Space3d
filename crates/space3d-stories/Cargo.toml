@@ -13,6 +13,10 @@ default = ["engine"]
 engine = ["dep:space3d-physics", "particles"]
 ## Particle stories (`Engine/Particles/*`) in the engine storybook.
 particles = ["dep:space3d-particles"]
+## UI stories (`Engine/UI/Theme/*`, `Engine/UI/Tools/*`) in the engine storybook (pulls in
+## `space3d-ui` / egui). Not in `default`: the editor, which has egui anyway, turns it on, and so
+## does the facade's `stories` feature.
+ui = ["engine", "dep:space3d-ui"]
 
 [dependencies]
 space3d-core.workspace = true
@@ -22,6 +26,7 @@ space3d-assets = { workspace = true, features = ["render"] }
 space3d-test.workspace = true
 space3d-physics = { workspace = true, optional = true }
 space3d-particles = { workspace = true, optional = true }
+space3d-ui = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

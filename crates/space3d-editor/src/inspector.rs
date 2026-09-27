@@ -8,6 +8,9 @@ use crate::components::{
     names, remove_component, set_component_value,
 };
 use crate::history::{EditCommand, EditorHistory};
+use crate::widgets::{
+    fill_drag, fill_slider, icon_button, number_field, property, property_group, section, vec3_fields,
+};
 use space3d_core::glam::{EulerRot, Quat, Vec3, Vec4};
 use space3d_core::hecs::{Component, Entity, World};
 use space3d_core::{Name, Parent, Transform};
@@ -56,16 +59,6 @@ fn gesture_ended(r: &egui::Response) -> bool {
     r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus())
 }
 
-fn vec3_edit(ui: &mut egui::Ui, v: &mut Vec3, speed: f64) -> egui::Response {
-    ui.horizontal(|ui| {
-        let x = ui.add(egui::DragValue::new(&mut v.x).speed(speed).prefix("x ").max_decimals(4));
-        let y = ui.add(egui::DragValue::new(&mut v.y).speed(speed).prefix("y ").max_decimals(4));
-        let z = ui.add(egui::DragValue::new(&mut v.z).speed(speed).prefix("z ").max_decimals(4));
-        x | y | z
-    })
-    .inner
-}
-
 // egui's color buttons round-trip the value through HSVA every frame; writing that back
 // unconditionally would nudge colors (and record bogus undo steps) just by showing them.
 fn color3_edit(ui: &mut egui::Ui, c: &mut Vec3) -> egui::Response {
@@ -77,40 +70,60 @@ fn color3_edit(ui: &mut egui::Ui, c: &mut Vec3) -> egui::Response {
     r
 }
 
-/// A combo box over a `(value, name)` table; returns the response of the box.
+/// A [`property`] row choosing from a `(value, name)` table with a combo box filling the value
+/// column (the selected name truncated to it); returns the response of the box.
 fn choice_edit<T: PartialEq + Copy>(ui: &mut egui::Ui, label: &str, v: &mut T, table: &[(T, &str)]) -> egui::Response {
-    let current = table.iter().find(|(t, _)| *t == *v).map_or("(other)", |(_, n)| n);
-    let mut r = egui::ComboBox::from_label(label)
-        .selected_text(current)
-        .show_ui(ui, |ui| {
-            let mut changed: Option<egui::Response> = None;
-            for (t, n) in table {
-                let item = ui.selectable_label(*t == *v, *n);
-                if item.clicked() {
-                    *v = *t;
+    property(ui, label, |ui| {
+        let current = table.iter().find(|(t, _)| *t == *v).map_or("(other)", |(_, n)| n);
+        let mut r = egui::ComboBox::from_id_salt(("space3d_inspector_choice", label))
+            .width(ui.available_width())
+            .truncate()
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                let mut changed: Option<egui::Response> = None;
+                for (t, n) in table {
+                    let item = ui.selectable_label(*t == *v, *n);
+                    if item.clicked() {
+                        *v = *t;
+                    }
+                    changed = Some(match changed {
+                        Some(c) => c | item,
+                        None => item,
+                    });
                 }
-                changed = Some(match changed {
-                    Some(c) => c | item,
-                    None => item,
-                });
-            }
-            changed
-        });
-    if let Some(Some(inner)) = r.inner.take() {
-        r.response |= inner;
-    }
-    r.response
+                changed
+            });
+        if let Some(Some(inner)) = r.inner.take() {
+            r.response |= inner;
+        }
+        r.response
+    })
 }
 
-/// Yaw (degrees about +Y) of a rotation, edited as a slider.
+/// A "Yaw °" [`property`] row: the yaw (degrees about +Y) of a rotation, edited as a slider.
 fn yaw_edit(ui: &mut egui::Ui, q: &mut Quat) -> egui::Response {
     let (yaw, _, _) = q.to_euler(EulerRot::YXZ);
     let mut deg = yaw.to_degrees();
-    let r = ui.add(egui::Slider::new(&mut deg, -180.0..=180.0).text("yaw°"));
+    let r = property(ui, "Yaw °", |ui| {
+        fill_slider(ui, egui::Slider::new(&mut deg, -180.0..=180.0))
+    });
     if r.changed() {
         *q = Quat::from_rotation_y(deg.to_radians());
     }
     r
+}
+
+/// A [`property`] row with an on/off checkbox followed by a slider filling the rest of the line.
+fn toggle_slider(ui: &mut egui::Ui, label: &str, on: &mut bool, slider: egui::Slider<'_>) -> egui::Response {
+    property(ui, label, |ui| {
+        let r = ui.checkbox(on, "");
+        r | fill_slider(ui, slider)
+    })
+}
+
+/// A [`property`] row with a drag value filling the value column.
+fn drag_row(ui: &mut egui::Ui, label: &str, drag: egui::DragValue<'_>) -> egui::Response {
+    property(ui, label, |ui| fill_drag(ui, drag))
 }
 
 fn color4_edit(ui: &mut egui::Ui, c: &mut Vec4) -> egui::Response {
@@ -138,19 +151,19 @@ fn typed_section<T: Component + Clone + PartialEq>(
         return false;
     };
     let mut value = before.clone();
-    let mut remove = false;
     let mut ended = false;
-    egui::CollapsingHeader::new(title)
-        .id_salt(("space3d_inspector", title))
-        .default_open(true)
-        .show(ui, |ui| {
+    let (remove, _) = section(
+        ui,
+        ("space3d_inspector", title),
+        title,
+        true,
+        |ui| icon_button(ui, "×", &format!("Remove {title}")).clicked(),
+        |ui| {
             if let Some(r) = body(ui, &mut value) {
                 ended = gesture_ended(&r);
             }
-            if ui.small_button("Remove component").clicked() {
-                remove = true;
-            }
-        });
+        },
+    );
     if remove {
         history.execute(
             EditCommand::set::<T>(format!("Remove {title}"), id, Some(before), None),
@@ -192,20 +205,12 @@ pub fn inspector_ui(
         ui.label("entity no longer exists");
         return false;
     };
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(format!("Entity #{}", e.id())).strong());
-        ui.label(egui::RichText::new(id.to_string()).weak().small());
-    });
-
-    // Name.
+    // Name, id and parent.
     let before = world.get::<&Name>(e).ok().map(|n| n.0.clone());
     let mut text = before.clone().unwrap_or_default();
-    let r = ui
-        .horizontal(|ui| {
-            ui.label("Name");
-            ui.text_edit_singleline(&mut text)
-        })
-        .inner;
+    let r = property(ui, "Name", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY))
+    });
     if r.changed() {
         let after = (!text.is_empty()).then(|| Name(text.clone()));
         match &after {
@@ -221,25 +226,27 @@ pub fn inspector_ui(
     if r.lost_focus() {
         history.end_merge();
     }
-
-    // Parent.
+    property(ui, "Entity", |ui| {
+        ui.label(format!("#{}", e.id()));
+        ui.add(egui::Label::new(egui::RichText::new(id.to_string()).small()).truncate())
+            .on_hover_text(id.to_string());
+    });
     if let Ok(p) = world.get::<&Parent>(e).map(|p| p.0) {
         let pname = crate::components::display_name(world, p);
-        let mut unparent = false;
-        ui.horizontal(|ui| {
-            ui.label(format!("Parent: {pname}"));
-            unparent = ui.small_button("Unparent").clicked();
+        let unparent = property(ui, "Parent", |ui| {
+            let clicked = ui.button("Unparent").clicked();
+            ui.add(egui::Label::new(pname).truncate());
+            clicked
         });
         if unparent {
             let pid = ensure_stable_id(world, p);
             history.execute(EditCommand::reparent(id, pid, None), world, registry);
         }
     }
-    ui.separator();
+    ui.add_space(2.0);
 
     typed_section::<Transform>(ui, world, registry, history, e, id, "Transform", |ui, t| {
-        let mut r = ui.label("translation");
-        r |= vec3_edit(ui, &mut t.translation, 0.01);
+        let mut r = property(ui, "Position", |ui| vec3_fields(ui, &mut t.translation, 0.01));
         let euler = match state.euler {
             Some((ent, q, eu)) if ent == e && q == t.rotation => eu,
             _ => {
@@ -248,40 +255,34 @@ pub fn inspector_ui(
             }
         };
         let mut eu = euler;
-        ui.label("rotation (deg)");
-        let rr = vec3_edit(ui, &mut eu, 0.5);
+        let rr = property(ui, "Rotation °", |ui| vec3_fields(ui, &mut eu, 0.5));
         if eu != euler {
             t.rotation = Quat::from_euler(EulerRot::XYZ, eu.x.to_radians(), eu.y.to_radians(), eu.z.to_radians());
         }
         state.euler = Some((e, t.rotation, eu));
         r |= rr;
-        ui.label("scale");
-        r |= vec3_edit(ui, &mut t.scale, 0.01);
+        r |= property(ui, "Scale", |ui| vec3_fields(ui, &mut t.scale, 0.01));
         Some(r)
     });
 
     typed_section::<Material>(ui, world, registry, history, e, id, "Material", |ui, m| {
-        let mut r = ui
-            .horizontal(|ui| {
-                ui.label("base color");
-                color4_edit(ui, &mut m.base_color)
-            })
-            .inner;
-        r |= ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0).text("metallic"));
-        r |= ui.add(egui::Slider::new(&mut m.roughness, 0.0..=1.0).text("roughness"));
-        r |= ui
-            .horizontal(|ui| {
-                ui.label("emissive");
-                color3_edit(ui, &mut m.emissive)
-            })
-            .inner;
-        r |= ui.checkbox(&mut m.unlit, "unlit");
-        r |= ui.checkbox(&mut m.double_sided, "double sided");
-        r |= ui.checkbox(&mut m.alpha_blend, "alpha blend");
+        let mut r = property(ui, "Base color", |ui| color4_edit(ui, &mut m.base_color));
+        r |= property(ui, "Metallic", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut m.metallic, 0.0..=1.0))
+        });
+        r |= property(ui, "Roughness", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut m.roughness, 0.0..=1.0))
+        });
+        r |= property(ui, "Emissive", |ui| color3_edit(ui, &mut m.emissive));
+        r |= property_group(ui, "Flags", |ui| {
+            ui.checkbox(&mut m.unlit, "Unlit")
+                | ui.checkbox(&mut m.double_sided, "2-sided")
+                | ui.checkbox(&mut m.alpha_blend, "Blend")
+        });
         if let Some(t) = m.base_color_texture {
-            ui.horizontal(|ui| {
-                ui.label(format!("texture #{}", t.index()));
-                if ui.small_button("Clear").clicked() {
+            property(ui, "Texture", |ui| {
+                ui.label(format!("#{}", t.index()));
+                if ui.button("Clear").clicked() {
                     m.base_color_texture = None;
                 }
             });
@@ -290,46 +291,35 @@ pub fn inspector_ui(
     });
 
     typed_section::<DirectionalLight>(ui, world, registry, history, e, id, "Directional light", |ui, l| {
-        let mut r = ui
-            .horizontal(|ui| {
-                ui.label("color");
-                color3_edit(ui, &mut l.color)
-            })
-            .inner;
-        r |= ui.add(
-            egui::DragValue::new(&mut l.intensity)
-                .speed(0.05)
-                .range(0.0..=1000.0)
-                .prefix("intensity "),
-        );
+        let mut r = property(ui, "Color", |ui| color3_edit(ui, &mut l.color));
+        r |= property(ui, "Intensity", |ui| {
+            fill_drag(
+                ui,
+                egui::DragValue::new(&mut l.intensity).speed(0.05).range(0.0..=1000.0),
+            )
+        });
         Some(r)
     });
 
     typed_section::<PointLight>(ui, world, registry, history, e, id, "Point light", |ui, l| {
-        let mut r = ui
-            .horizontal(|ui| {
-                ui.label("color");
-                color3_edit(ui, &mut l.color)
-            })
-            .inner;
-        r |= ui.add(
-            egui::DragValue::new(&mut l.intensity)
-                .speed(0.05)
-                .range(0.0..=1000.0)
-                .prefix("intensity "),
-        );
-        r |= ui.add(
-            egui::DragValue::new(&mut l.range)
-                .speed(0.1)
-                .range(0.01..=10_000.0)
-                .prefix("range "),
-        );
+        let mut r = property(ui, "Color", |ui| color3_edit(ui, &mut l.color));
+        r |= property(ui, "Intensity", |ui| {
+            fill_drag(
+                ui,
+                egui::DragValue::new(&mut l.intensity).speed(0.05).range(0.0..=1000.0),
+            )
+        });
+        r |= property(ui, "Range", |ui| {
+            fill_drag(ui, egui::DragValue::new(&mut l.range).speed(0.1).range(0.01..=10_000.0))
+        });
         Some(r)
     });
 
     typed_section::<Camera3d>(ui, world, registry, history, e, id, "Camera", |ui, c| {
         let mut ortho = matches!(c.projection, Projection::Orthographic { .. });
-        let mut r = ui.checkbox(&mut ortho, "orthographic");
+        let mut r = property_group(ui, "Projection", |ui| {
+            ui.selectable_value(&mut ortho, false, "Perspective") | ui.selectable_value(&mut ortho, true, "Ortho")
+        });
         c.projection = match (ortho, c.projection) {
             (true, Projection::Perspective { near, far, .. }) => Projection::Orthographic {
                 height: 10.0,
@@ -346,38 +336,52 @@ pub fn inspector_ui(
         match &mut c.projection {
             Projection::Perspective { fov_y, near, far } => {
                 let mut deg = fov_y.to_degrees();
-                r |= ui.add(egui::Slider::new(&mut deg, 5.0..=170.0).text("fov°"));
+                r |= property(ui, "FOV °", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut deg, 5.0..=170.0))
+                });
                 *fov_y = deg.to_radians();
-                r |= ui.add(
-                    egui::DragValue::new(near)
-                        .speed(0.01)
-                        .range(0.0001..=100.0)
-                        .prefix("near "),
-                );
-                r |= ui.add(egui::DragValue::new(far).speed(1.0).range(0.01..=1e6).prefix("far "));
+                r |= property(ui, "Near / far", |ui| {
+                    pair(
+                        ui,
+                        egui::DragValue::new(near).speed(0.01).range(0.0001..=100.0),
+                        egui::DragValue::new(far).speed(1.0).range(0.01..=1e6),
+                        0,
+                    )
+                });
             }
             Projection::Orthographic { height, near, far } => {
-                r |= ui.add(
-                    egui::DragValue::new(height)
-                        .speed(0.1)
-                        .range(0.01..=1e5)
-                        .prefix("height "),
-                );
-                r |= ui.add(egui::DragValue::new(near).speed(0.01).prefix("near "));
-                r |= ui.add(egui::DragValue::new(far).speed(1.0).prefix("far "));
+                r |= property(ui, "Height", |ui| {
+                    fill_drag(ui, egui::DragValue::new(height).speed(0.1).range(0.01..=1e5))
+                });
+                r |= property(ui, "Near / far", |ui| {
+                    pair(
+                        ui,
+                        egui::DragValue::new(near).speed(0.01),
+                        egui::DragValue::new(far).speed(1.0),
+                        0,
+                    )
+                });
             }
         }
         let mut clear = c.clear_color.is_some();
-        r |= ui.checkbox(&mut clear, "clear");
+        r |= property(ui, "Clear", |ui| {
+            let mut r = ui.checkbox(&mut clear, "");
+            if let Some(col) = &mut c.clear_color
+                && clear
+            {
+                r |= color4_edit(ui, col);
+            }
+            r
+        });
         match (clear, &mut c.clear_color) {
-            (true, Some(col)) => r |= color4_edit(ui, col),
             (true, None) => c.clear_color = Some(Vec4::new(0.02, 0.02, 0.03, 1.0)),
             (false, _) => c.clear_color = None,
+            _ => {}
         }
-        r |= ui.add(egui::DragValue::new(&mut c.order).prefix("order "));
-        r |= ui.checkbox(&mut c.active, "active");
+        r |= property(ui, "Order", |ui| fill_drag(ui, egui::DragValue::new(&mut c.order)));
+        r |= property(ui, "Active", |ui| ui.checkbox(&mut c.active, ""));
         if let RenderTarget::Texture(t) = c.target {
-            ui.label(format!("renders to texture #{}", t.index()));
+            property(ui, "Target", |ui| ui.label(format!("texture #{}", t.index())));
         }
         Some(r)
     });
@@ -385,81 +389,116 @@ pub fn inspector_ui(
     typed_section::<CameraFrame>(ui, world, registry, history, e, id, "Camera frame", |ui, f| {
         let mut r = choice_edit(ui, "HDR", &mut f.hdr, &HDR_MODES);
         let mut own = f.render_scale.is_some();
-        r |= ui.checkbox(&mut own, "own render scale");
-        match (own, &mut f.render_scale) {
-            (true, Some(scale)) => r |= ui.add(egui::Slider::new(scale, 0.25..=1.0).text("render scale")),
+        r |= property(ui, "Render scale", |ui| {
+            let mut r = ui.checkbox(&mut own, "").on_hover_text("own render scale");
+            if let (true, Some(scale)) = (own, &mut f.render_scale) {
+                r |= fill_slider(ui, egui::Slider::new(scale, 0.25..=1.0));
+            }
+            r
+        });
+        match (own, f.render_scale) {
             (true, None) => f.render_scale = Some(1.0),
-            (false, _) => f.render_scale = None,
+            (false, Some(_)) => f.render_scale = None,
+            _ => {}
         }
         Some(r)
     });
 
     typed_section::<PostProcess>(ui, world, registry, history, e, id, "Post-processing", |ui, p| {
-        let mut r = ui.checkbox(&mut p.enabled, "enabled");
-        r |= ui.add(
-            egui::DragValue::new(&mut p.exposure)
-                .speed(0.05)
-                .range(-16.0..=16.0)
-                .prefix("exposure (EV) "),
+        let mut r = property(ui, "Enabled", |ui| ui.checkbox(&mut p.enabled, ""));
+        r |= drag_row(
+            ui,
+            "Exposure EV",
+            egui::DragValue::new(&mut p.exposure).speed(0.05).range(-16.0..=16.0),
         );
-        r |= ui.checkbox(&mut p.auto_exposure.enabled, "auto exposure");
-        r |= choice_edit(ui, "tonemapper", &mut p.tonemapper, &TONEMAPPERS);
-        r |= ui.checkbox(&mut p.bloom.enabled, "bloom");
-        r |= ui.add(egui::Slider::new(&mut p.bloom.intensity, 0.0..=2.0).text("bloom intensity"));
-        r |= ui.add(egui::Slider::new(&mut p.bloom.threshold, 0.0..=8.0).text("bloom threshold"));
-        r |= choice_edit(ui, "anti-aliasing", &mut p.anti_aliasing, &ANTI_ALIASING);
-        r |= ui.checkbox(&mut p.vignette.enabled, "vignette");
-        r |= ui.add(egui::Slider::new(&mut p.vignette.intensity, 0.0..=1.0).text("vignette intensity"));
+        r |= property(ui, "Auto exposure", |ui| ui.checkbox(&mut p.auto_exposure.enabled, ""));
+        r |= choice_edit(ui, "Tonemapper", &mut p.tonemapper, &TONEMAPPERS);
+        r |= toggle_slider(
+            ui,
+            "Bloom",
+            &mut p.bloom.enabled,
+            egui::Slider::new(&mut p.bloom.intensity, 0.0..=2.0),
+        );
+        r |= property(ui, "Bloom threshold", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut p.bloom.threshold, 0.0..=8.0))
+        });
+        r |= choice_edit(ui, "Anti-aliasing", &mut p.anti_aliasing, &ANTI_ALIASING);
+        r |= toggle_slider(
+            ui,
+            "Vignette",
+            &mut p.vignette.enabled,
+            egui::Slider::new(&mut p.vignette.intensity, 0.0..=1.0),
+        );
+        // One slider: 0 turns the effect off.
         let mut ca = if p.chromatic_aberration.enabled {
             p.chromatic_aberration.intensity
         } else {
             0.0
         };
-        let ca_r = ui.add(egui::Slider::new(&mut ca, 0.0..=1.0).text("chromatic aberration"));
+        let ca_r = property(ui, "Chromatic aberration", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut ca, 0.0..=1.0))
+        });
         if ca_r.changed() {
             p.chromatic_aberration.enabled = ca > 0.0;
             p.chromatic_aberration.intensity = ca;
         }
         r |= ca_r;
-        r |= ui.checkbox(&mut p.film_grain.enabled, "film grain");
-        r |= ui.add(egui::Slider::new(&mut p.film_grain.intensity, 0.0..=0.5).text("grain intensity"));
-        r |= ui.checkbox(&mut p.distortion.enabled, "distortion");
-        r |= ui.add(egui::Slider::new(&mut p.distortion.strength, 0.0..=4.0).text("distortion strength"));
-        r |= ui.add(egui::Slider::new(&mut p.color_grading.saturation, 0.0..=2.0).text("saturation"));
-        r |= ui.add(egui::Slider::new(&mut p.color_grading.contrast, 0.5..=2.0).text("contrast"));
-        r |= ui.add(egui::Slider::new(&mut p.color_grading.temperature, -1.0..=1.0).text("temperature"));
-        r |= ui.checkbox(&mut p.dither, "dither");
+        r |= toggle_slider(
+            ui,
+            "Film grain",
+            &mut p.film_grain.enabled,
+            egui::Slider::new(&mut p.film_grain.intensity, 0.0..=0.5),
+        );
+        r |= toggle_slider(
+            ui,
+            "Distortion",
+            &mut p.distortion.enabled,
+            egui::Slider::new(&mut p.distortion.strength, 0.0..=4.0),
+        );
+        r |= property(ui, "Saturation", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut p.color_grading.saturation, 0.0..=2.0))
+        });
+        r |= property(ui, "Contrast", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut p.color_grading.contrast, 0.5..=2.0))
+        });
+        r |= property(ui, "Temperature", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut p.color_grading.temperature, -1.0..=1.0))
+        });
+        r |= property(ui, "Dither", |ui| ui.checkbox(&mut p.dither, ""));
         if p.color_grading.lut.is_some() {
-            ui.label("grades through a 3D LUT (session-local: not saved)");
+            property(ui, "LUT", |ui| {
+                ui.add(egui::Label::new("3D LUT (session-local: not saved)").truncate())
+            });
         }
         Some(r)
     });
 
     typed_section::<Skybox>(ui, world, registry, history, e, id, "Skybox", |ui, sky| {
-        ui.label(format!("cubemap #{}", sky.cubemap.index()));
-        let mut r = ui.add(
-            egui::DragValue::new(&mut sky.intensity)
-                .speed(0.01)
-                .range(0.0..=100.0)
-                .prefix("intensity "),
+        property(ui, "Cubemap", |ui| ui.label(format!("#{}", sky.cubemap.index())));
+        let mut r = drag_row(
+            ui,
+            "Intensity",
+            egui::DragValue::new(&mut sky.intensity).speed(0.01).range(0.0..=100.0),
         );
         r |= yaw_edit(ui, &mut sky.rotation);
         Some(r)
     });
 
     typed_section::<EnvironmentLight>(ui, world, registry, history, e, id, "Environment light", |ui, env| {
-        ui.label(format!("cubemap #{}", env.cubemap.index()));
-        let mut r = ui.add(
+        property(ui, "Cubemap", |ui| ui.label(format!("#{}", env.cubemap.index())));
+        let mut r = drag_row(
+            ui,
+            "Diffuse",
             egui::DragValue::new(&mut env.diffuse_intensity)
                 .speed(0.01)
-                .range(0.0..=100.0)
-                .prefix("diffuse "),
+                .range(0.0..=100.0),
         );
-        r |= ui.add(
+        r |= drag_row(
+            ui,
+            "Specular",
             egui::DragValue::new(&mut env.specular_intensity)
                 .speed(0.01)
-                .range(0.0..=100.0)
-                .prefix("specular "),
+                .range(0.0..=100.0),
         );
         r |= yaw_edit(ui, &mut env.rotation);
         Some(r)
@@ -467,39 +506,37 @@ pub fn inspector_ui(
 
     typed_section::<DirectionalShadow>(ui, world, registry, history, e, id, "Directional shadow", |ui, sh| {
         let sizes = [(512u32, "512"), (1024, "1024"), (2048, "2048"), (4096, "4096")];
-        let mut r = choice_edit(ui, "map size", &mut sh.map_size, &sizes);
-        r |= choice_edit(ui, "filter", &mut sh.filter, &SHADOW_FILTERS);
-        r |= ui.add(egui::Slider::new(&mut sh.strength, 0.0..=1.0).text("strength"));
-        r |= ui.add(
-            egui::DragValue::new(&mut sh.depth_bias)
-                .speed(0.001)
-                .range(0.0..=10.0)
-                .prefix("depth bias "),
+        let mut r = choice_edit(ui, "Map size", &mut sh.map_size, &sizes);
+        r |= choice_edit(ui, "Filter", &mut sh.filter, &SHADOW_FILTERS);
+        r |= property(ui, "Strength", |ui| {
+            fill_slider(ui, egui::Slider::new(&mut sh.strength, 0.0..=1.0))
+        });
+        r |= drag_row(
+            ui,
+            "Depth bias",
+            egui::DragValue::new(&mut sh.depth_bias).speed(0.001).range(0.0..=10.0),
         );
-        r |= ui.add(
-            egui::DragValue::new(&mut sh.normal_bias)
-                .speed(0.01)
-                .range(0.0..=10.0)
-                .prefix("normal bias "),
+        r |= drag_row(
+            ui,
+            "Normal bias",
+            egui::DragValue::new(&mut sh.normal_bias).speed(0.01).range(0.0..=10.0),
         );
-        r |= ui.add(
-            egui::DragValue::new(&mut sh.slope_bias)
-                .speed(0.01)
-                .range(0.0..=10.0)
-                .prefix("slope bias "),
+        r |= drag_row(
+            ui,
+            "Slope bias",
+            egui::DragValue::new(&mut sh.slope_bias).speed(0.01).range(0.0..=10.0),
         );
-        r |= ui.add(
-            egui::DragValue::new(&mut sh.caster_depth)
-                .speed(1.0)
-                .range(0.0..=1e5)
-                .prefix("caster depth "),
+        r |= drag_row(
+            ui,
+            "Caster depth",
+            egui::DragValue::new(&mut sh.caster_depth).speed(1.0).range(0.0..=1e5),
         );
         Some(r)
     });
 
     typed_section::<Visibility>(ui, world, registry, history, e, id, "Visibility", |ui, v| {
         let mut visible = *v == Visibility::Visible;
-        let r = ui.checkbox(&mut visible, "visible");
+        let r = property(ui, "Visible", |ui| ui.checkbox(&mut visible, ""));
         *v = if visible {
             Visibility::Visible
         } else {
@@ -509,53 +546,55 @@ pub fn inspector_ui(
     });
 
     let mesh_changed = typed_section::<MeshSource>(ui, world, registry, history, e, id, "Mesh source", |ui, s| {
-        ui.label(format!("kind: {}", s.label()));
+        let kind = s.label();
         let r = match s {
-            MeshSource::Cube { size } | MeshSource::Plane { size } => ui.add(
-                egui::DragValue::new(size)
-                    .speed(0.01)
-                    .range(0.001..=1e4)
-                    .prefix("size "),
-            ),
+            MeshSource::Cube { size } | MeshSource::Plane { size } => property(ui, "Size", |ui| {
+                fill_drag(ui, egui::DragValue::new(size).speed(0.01).range(0.001..=1e4))
+            }),
             MeshSource::Sphere {
                 radius,
                 sectors,
                 stacks,
             } => {
-                let mut r = ui.add(
-                    egui::DragValue::new(radius)
-                        .speed(0.01)
-                        .range(0.001..=1e4)
-                        .prefix("radius "),
-                );
-                r |= ui.add(egui::DragValue::new(sectors).range(3..=256).prefix("sectors "));
-                r |= ui.add(egui::DragValue::new(stacks).range(2..=256).prefix("stacks "));
-                r
+                let r = property(ui, "Radius", |ui| {
+                    fill_drag(ui, egui::DragValue::new(radius).speed(0.01).range(0.001..=1e4))
+                });
+                r | property(ui, "Segments", |ui| {
+                    pair(
+                        ui,
+                        egui::DragValue::new(sectors).range(3..=256).suffix(" sec"),
+                        egui::DragValue::new(stacks).range(2..=256).suffix(" stk"),
+                        4,
+                    )
+                })
             }
-            MeshSource::Data(m) => ui.label(format!(
-                "{} vertices, {} triangles",
-                m.vertex_count(),
-                m.triangle_count()
-            )),
+            MeshSource::Data(m) => property(ui, "Data", |ui| {
+                ui.label(format!("{} verts · {} tris", m.vertex_count(), m.triangle_count()))
+            }),
         };
+        property(ui, "Kind", |ui| ui.label(kind));
         Some(r)
     });
 
     if let Ok(mesh) = world.get::<&Mesh3d>(e).map(|m| *m) {
-        egui::CollapsingHeader::new("Mesh")
-            .id_salt(("space3d_inspector", "Mesh3d"))
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(format!("handle #{}", mesh.0.index()));
+        section(
+            ui,
+            ("space3d_inspector", "Mesh3d"),
+            "Mesh",
+            false,
+            |_| {},
+            |ui| {
+                property(ui, "Handle", |ui| ui.label(format!("#{}", mesh.0.index())));
                 if let Some(a) = assets {
                     if let Some(t) = a.mesh_triangles(mesh.0) {
-                        ui.label(format!("{t} triangles"));
+                        property(ui, "Triangles", |ui| ui.label(t.to_string()));
                     }
                     if let Some(b) = a.mesh_aabb(mesh.0) {
-                        ui.label(format!("bounds {:.2} .. {:.2}", b.min, b.max));
+                        property(ui, "Bounds", |ui| ui.label(format!("{:.2} .. {:.2}", b.min, b.max)));
                     }
                 }
-            });
+            },
+        );
     }
 
     json_sections(ui, world, registry, history, state, e, id);
@@ -586,10 +625,19 @@ fn json_sections(
     }
     for name in names_shown {
         let current = values.get(&name).cloned();
-        egui::CollapsingHeader::new(&name)
-            .id_salt(("space3d_inspector_json", &name))
-            .default_open(true)
-            .show(ui, |ui| {
+        let editing = state.json_edits.contains_key(&name);
+        let (actions, _) = section(
+            ui,
+            ("space3d_inspector_json", &name),
+            &name,
+            true,
+            |ui| {
+                let remove =
+                    can_remove(&name) && current.is_some() && icon_button(ui, "×", &format!("Remove {name}")).clicked();
+                let edit = !editing && current.is_some() && ui.button("Edit JSON").clicked();
+                (remove, edit)
+            },
+            |ui| {
                 if let Some(text) = state.json_edits.get_mut(&name) {
                     ui.add(
                         egui::TextEdit::multiline(text)
@@ -631,25 +679,26 @@ fn json_sections(
                         ui.colored_label(ui.visuals().error_fg_color, err);
                     }
                 } else if let Some(v) = &current {
-                    let pretty = serde_json::to_string_pretty(v).unwrap_or_default();
-                    ui.label(egui::RichText::new(&pretty).monospace());
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Edit JSON").clicked() {
-                            state.json_edits.insert(name.clone(), pretty.clone());
-                        }
-                        if can_remove(&name) && ui.small_button("Remove").clicked() {
-                            remove_component(world, e, &name);
-                            history.push(EditCommand::set_json(
-                                format!("Remove {name}"),
-                                id,
-                                name.clone(),
-                                current.clone(),
-                                None,
-                            ));
-                        }
-                    });
+                    let compact = serde_json::to_string(v).unwrap_or_default();
+                    ui.add(egui::Label::new(egui::RichText::new(&compact).monospace()).wrap());
                 }
-            });
+            },
+        );
+        let (remove, edit) = actions;
+        if edit && let Some(v) = &current {
+            let pretty = serde_json::to_string_pretty(v).unwrap_or_default();
+            state.json_edits.insert(name.clone(), pretty);
+        }
+        if remove {
+            remove_component(world, e, &name);
+            history.push(EditCommand::set_json(
+                format!("Remove {name}"),
+                id,
+                name.clone(),
+                current.clone(),
+                None,
+            ));
+        }
     }
 }
 
@@ -690,33 +739,42 @@ fn add_component_ui(
     if options.is_empty() {
         return;
     }
-    ui.separator();
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
-        egui::ComboBox::from_id_salt("space3d_add_component")
-            .selected_text(if state.add_pick.is_empty() {
-                "Add component..."
-            } else {
-                &state.add_pick
-            })
-            .show_ui(ui, |ui| {
-                for o in &options {
-                    ui.selectable_value(&mut state.add_pick, o.clone(), o);
+        // "Add" at the right end, the combo box fills the rest of the row.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let add = ui.add_enabled(!state.add_pick.is_empty(), egui::Button::new("Add"));
+            egui::ComboBox::from_id_salt("space3d_add_component")
+                .width(ui.available_width())
+                .selected_text(if state.add_pick.is_empty() {
+                    "Add component..."
+                } else {
+                    &state.add_pick
+                })
+                .show_ui(ui, |ui| {
+                    for o in &options {
+                        ui.selectable_value(&mut state.add_pick, o.clone(), o);
+                    }
+                });
+            if add.clicked() {
+                let name = std::mem::take(&mut state.add_pick);
+                if insert_default(world, e, &name) {
+                    let after = component_values(world, registry, e).and_then(|v| v.get(&name).cloned());
+                    history.push(EditCommand::set_json(format!("Add {name}"), id, name, None, after));
+                } else {
+                    // Unknown type: let the user write its JSON value.
+                    state.json_edits.insert(name, "{}".into());
                 }
-            });
-        if ui
-            .add_enabled(!state.add_pick.is_empty(), egui::Button::new("Add"))
-            .clicked()
-        {
-            let name = std::mem::take(&mut state.add_pick);
-            if insert_default(world, e, &name) {
-                let after = component_values(world, registry, e).and_then(|v| v.get(&name).cloned());
-                history.push(EditCommand::set_json(format!("Add {name}"), id, name, None, after));
-            } else {
-                // Unknown type: let the user write its JSON value.
-                state.json_edits.insert(name, "{}".into());
             }
-        }
+        });
     });
+}
+
+/// Two drag values sharing the rest of the line in equal cells (`affix`: characters of the
+/// longer prefix / suffix).
+fn pair(ui: &mut egui::Ui, a: egui::DragValue<'_>, b: egui::DragValue<'_>, affix: usize) -> egui::Response {
+    let width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).floor();
+    number_field(ui, width, a, affix, None) | number_field(ui, width, b, affix, None)
 }
 
 #[cfg(test)]

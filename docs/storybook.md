@@ -45,9 +45,18 @@ pub fn storybook() -> Storybook {
 * `.tolerance(0.02)` loosens the screenshot comparison for one story.
 
 The engine ships its own book (`space3d::stories::engine_storybook()`: lighting, materials,
-instancing, textures, cameras, hierarchies, physics, and the graphics areas: `Engine/Frame/*`,
+instancing, textures, cameras, hierarchies, physics, the graphics areas `Engine/Frame/*`,
 `Engine/Materials/*`, `Engine/Environment/*`, `Engine/Lights/*`, `Engine/Post/*`,
-`Engine/Particles/*` and `Engine/Showcase/*`) — `book.extend(engine_storybook())` to browse both.
+`Engine/Particles/*` and `Engine/Showcase/*`, and the UI stories `Engine/UI/Theme/*` and
+`Engine/UI/Tools/*` — see [ui.md](ui.md)) — `book.extend(engine_storybook())` to browse both. The
+UI stories need egui, so they sit behind `space3d-stories`' `ui` feature (not a default): the
+editor's storybook viewer turns it on, and so does the facade's `stories` feature (which thus
+builds egui even without the facade's `ui`; `cargo test -p space3d-stories --features ui` checks
+their goldens alone; `cargo test --workspace` always does). The facade deliberately does not tie
+it to its `ui` feature with a weak `space3d-stories?/ui`: Cargo writes every package such a
+feature could reach into the lockfiles of downstream crates, so a game with `ui` but no `stories`
+would list the storybook's whole tree (physics, rapier, the test harness) without ever building
+it. The viewer itself uses the compact UI density.
 
 The **showcase** stories put every graphics feature together: `Engine/Showcase/SpaceCorps Look`
 (a close-up skirmish in the SpaceCorps top-down view: PBR hulls with all maps, the nebula skybox

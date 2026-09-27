@@ -17,7 +17,9 @@ full-frame lift, `TONE_LIFT`, bloom, FXAA), the graphics-quality setting drives
 exhaust, explosion, warp, hit and muzzle effects), and previews below 120 pt skip bloom. What
 M2 adds for it: material maps from glTF (step 3), the cubemap sky and image-based lighting
 (step 4), the sun's shadow (step 5), quality presets (step 2), and the M2 fixes to the game's
-M1 feedback (game#1–#15, marked below).
+M1 feedback (game#1–#15, marked below). Since then (game a7f7283) it pins main's `42adc4b` (the
+compact UI theme and tool docks, which `graphics` has merged too); it builds and its tests pass
+against `graphics` unchanged.
 
 **Step 0 changes nothing.** The game's code compiles unchanged against M2 and renders the same
 pixels, except where a fix changes behavior it asked for: particle emitters moved in
@@ -48,7 +50,7 @@ order (spec D19).
 ## 0. Update the engine
 
 ```toml
-# Cargo.toml (workspace): from rev 80ab72b (M1 + main) to the M2 merge
+# Cargo.toml (workspace): from rev 42adc4b (main; 80ab72b before it) to the M2 merge
 space3d = { git = "https://github.com/SpaceCorps/Space3d", rev = "<graphics M2 merge>", default-features = false,
             features = ["render", "platform", "assets", "audio", "net", "ui", "github", "particles"] }
 ```
@@ -527,7 +529,7 @@ signatures, every node's pipelines (particles, sky) and the post pipelines.
 
 | | done when |
 |---|---|
-| 0 | the game builds against M2 (from rev 80ab72b) and looks the same |
+| 0 | the game builds against M2 (from rev 42adc4b) and looks the same |
 | 1 | done at M1 (`PostProcess` on every camera); M2: `KhronosPbrNeutralNoToe` replaces Neutral + `TONE_LIFT` (or AgX + `ColorGrading::vivid()`) |
 | 2 | Settings › Graphics drives `GraphicsQuality::apply` + `ParticleSettings::for_quality_on` (render scale done at M1); the grow-only budget workaround removed |
 | 3 | ship materials get their maps (`apply_material_maps`, emissive factor seeded where there is a map) and tangents; the maps are no longer discarded |

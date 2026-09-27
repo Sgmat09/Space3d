@@ -170,8 +170,8 @@ let fx = ParticleEffect::new("sparks").layer(
 place; a changed structure restarts running instances (their old particles drain;
 `runtime::tests::hot_reload_structure_change_drains`).
 
-**Effect files.** With the crate's `assets` feature (the facade's `assets` + `particles` enable
-it) and an `AssetServer` (`AssetsPlugin` before `ParticlesPlugin`), `.pfx.ron` files load like any
+**Effect files.** With the crate's `assets` feature (the facade's `particles` enables it) and
+an `AssetServer` (`AssetsPlugin` before `ParticlesPlugin`), `.pfx.ron` files load like any
 asset and follow its hot reload:
 
 ```rust

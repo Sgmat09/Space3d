@@ -15,6 +15,28 @@
 //! egui (`key_pressed(egui::Key::M)`) therefore fire on the key labelled M; to compare them
 //! with physical-key bindings, translate with [`physical_key_for_egui_key`].
 //!
+//! **Pointer.** Mouse buttons are sent in the order they happened
+//! ([`Input::mouse_button_events`]), each where the cursor was at the time: egui's pointer first
+//! moves there (so a release after a move beyond egui's click distance is no click), then the
+//! button event; after the frame's buttons the pointer moves to where the cursor is now. A fast
+//! double click's release and second press in one frame therefore leave the button down, as in
+//! `Input`. A button event while the cursor is outside the window (the release of a drag that
+//! left it) is sent at the last position egui saw, and the pointer is gone again right after
+//! (`PointerGone`), so it re-enters no hover: nothing at (0, 0) reacts.
+//!
+//! **Focus.** `Event::WindowFocused` is sent when the window's focus changes; egui then forgets
+//! the keys and modifiers it holds.
+//!
+//! **Cancelled releases.** A release that no device event reported — the window lost the
+//! focus ([`Input::release_all`]) or the OS shows the button up although its release never
+//! arrived ([`space3d_platform::MouseButtonCause`]) — cancels the press, like switching away
+//! from a native app mid-drag: egui registers **no click and no drop**. The pointer first
+//! detours far off-screen (beyond any click distance, so egui's press can no longer be a click),
+//! comes back, and the button is released where the cursor is: drags end (`drag_stopped`), a
+//! dragged slider stays at its value. The drag-and-drop payload is cleared before the pass, so
+//! no drop zone receives it. Any button egui still holds that `Input` does not (egui was
+//! disabled meanwhile, `Input` was replaced) is released the same way.
+//!
 //! `Input` drops the OS's key repeats (a held key is simply "pressed"), but egui text fields
 //! only act on key *presses*, so held editing/navigation keys ([`REPEAT_KEYS`]: Backspace,
 //! Delete, arrows, Home/End, ...) get synthesized repeat presses: after [`REPEAT_DELAY`]
@@ -387,6 +409,10 @@ const BUTTONS: [(MouseButton, egui::PointerButton); 5] = [
     (MouseButton::Forward, egui::PointerButton::Extra2),
 ];
 
+/// Where egui's pointer detours before a cancelled release: far off-screen, beyond any click
+/// distance from a press, so the release that follows is no click.
+const CANCEL_DETOUR: egui::Pos2 = egui::pos2(-1.0e6, -1.0e6);
+
 /// Modifier state derived from held keys.
 pub(crate) fn modifiers(input: &Input) -> egui::Modifiers {
     use KeyCode as K;
@@ -417,10 +443,19 @@ fn printable(c: char) -> bool {
     !private_use && !c.is_control()
 }
 
-/// Per-frame translator (keeps the last pointer position, modifiers and key-repeat timers).
+/// Per-frame translator (keeps the pointer position, buttons, focus, modifiers and key-repeat
+/// timers egui was told about).
 #[derive(Default)]
 pub(crate) struct InputTranslator {
+    /// egui's pointer position as last sent (`None`: gone, `PointerGone` sent).
     last_pos: Option<egui::Pos2>,
+    /// The last position sent, kept through `PointerGone`: where button events outside the
+    /// window go.
+    known_pos: Option<egui::Pos2>,
+    /// Mouse buttons egui holds ([`BUTTONS`] order).
+    down: [bool; BUTTONS.len()],
+    /// egui was told the window has no focus (egui starts focused).
+    unfocused: bool,
     last_modifiers: egui::Modifiers,
     /// Touch that emulates the mouse pointer (first finger down).
     pointer_touch: Option<u64>,
@@ -431,8 +466,17 @@ pub(crate) struct InputTranslator {
 }
 
 impl InputTranslator {
+    /// `Event::WindowFocused` if the window's focus changed since egui was last told.
+    pub(crate) fn focus(&mut self, focused: bool, out: &mut Vec<egui::Event>) {
+        if focused == self.unfocused {
+            self.unfocused = !focused;
+            out.push(egui::Event::WindowFocused(focused));
+        }
+    }
+
     /// Append this frame's egui events for `input` (physical pixels → points with `ppp`).
-    /// `time` is the app time in seconds (drives key repeat).
+    /// `time` is the app time in seconds (drives key repeat). Returns whether a release was
+    /// cancelled (see the module docs): egui's drag-and-drop payload must go, undelivered.
     pub(crate) fn translate(
         &mut self,
         input: &Input,
@@ -440,7 +484,7 @@ impl InputTranslator {
         time: f64,
         clipboard: &str,
         out: &mut Vec<egui::Event>,
-    ) {
+    ) -> bool {
         let to_points = |p: Vec2| egui::pos2(p.x / ppp, p.y / ppp);
         let mods = modifiers(input);
         if mods != self.last_modifiers {
@@ -448,12 +492,34 @@ impl InputTranslator {
             self.last_modifiers = mods;
         }
 
-        // Pointer.
+        // Pointer: the frame's button events in order, each where the cursor was; then where
+        // the cursor is now.
         let pos = input.mouse_position().map(to_points);
+        let mut cancelled = false;
+        for e in input.mouse_button_events() {
+            let Some(i) = BUTTONS.iter().position(|(b, _)| *b == e.button) else {
+                continue;
+            };
+            if e.cancelled() {
+                self.detour(out);
+                cancelled = true;
+            }
+            self.pointer_button(i, e.pressed, e.position.map(to_points), mods, out);
+        }
+        // A button egui holds that `Input` does not (egui was disabled when it came up, `Input`
+        // was replaced): released as a cancel.
+        for (i, (b, _)) in BUTTONS.iter().enumerate() {
+            if self.down[i] && !input.mouse_pressed(*b) {
+                self.detour(out);
+                cancelled = true;
+                self.pointer_button(i, false, pos, mods, out);
+            }
+        }
         match pos {
             Some(p) if self.last_pos != Some(p) => {
                 out.push(egui::Event::PointerMoved(p));
                 self.last_pos = Some(p);
+                self.known_pos = Some(p);
             }
             None if self.last_pos.is_some() && self.pointer_touch.is_none() => {
                 out.push(egui::Event::PointerGone);
@@ -464,26 +530,6 @@ impl InputTranslator {
         let delta = input.mouse_delta();
         if delta != Vec2::ZERO {
             out.push(egui::Event::MouseMoved(egui::vec2(delta.x / ppp, delta.y / ppp)));
-        }
-        let at = self.last_pos.unwrap_or(egui::Pos2::ZERO);
-        for (b, pb) in BUTTONS {
-            let (down, up) = (input.mouse_just_pressed(b), input.mouse_just_released(b));
-            if down {
-                out.push(egui::Event::PointerButton {
-                    pos: at,
-                    button: pb,
-                    pressed: true,
-                    modifiers: mods,
-                });
-            }
-            if up {
-                out.push(egui::Event::PointerButton {
-                    pos: at,
-                    button: pb,
-                    pressed: false,
-                    modifiers: mods,
-                });
-            }
         }
 
         // Wheel (Input reports lines).
@@ -589,6 +635,7 @@ impl InputTranslator {
                         modifiers: mods,
                     });
                     self.last_pos = Some(p);
+                    self.known_pos = Some(p);
                 }
             }
         }
@@ -605,6 +652,7 @@ impl InputTranslator {
                 if self.pointer_touch == Some(t.id) {
                     out.push(egui::Event::PointerMoved(p));
                     self.last_pos = Some(p);
+                    self.known_pos = Some(p);
                 }
             }
         }
@@ -627,12 +675,64 @@ impl InputTranslator {
                 });
                 out.push(egui::Event::PointerGone);
                 self.last_pos = None;
+                self.known_pos = Some(p);
             }
         }
+        cancelled
     }
 }
 
 impl InputTranslator {
+    /// A button event at `at` (points; `None`: the cursor is outside the window). Inside, egui's
+    /// pointer moves there first. Outside, the event goes to the last position egui saw and the
+    /// pointer is gone again right after, so it re-enters no hover.
+    fn pointer_button(
+        &mut self,
+        i: usize,
+        pressed: bool,
+        at: Option<egui::Pos2>,
+        modifiers: egui::Modifiers,
+        out: &mut Vec<egui::Event>,
+    ) {
+        let button = BUTTONS[i].1;
+        match at {
+            Some(pos) => {
+                if self.last_pos != Some(pos) {
+                    out.push(egui::Event::PointerMoved(pos));
+                }
+                out.push(egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                });
+                self.last_pos = Some(pos);
+                self.known_pos = Some(pos);
+            }
+            None => {
+                out.push(egui::Event::PointerButton {
+                    pos: self.known_pos.unwrap_or(egui::Pos2::ZERO),
+                    button,
+                    pressed,
+                    modifiers,
+                });
+                out.push(egui::Event::PointerGone);
+                self.last_pos = None;
+            }
+        }
+        self.down[i] = pressed;
+    }
+
+    /// Before a cancelled release: egui's pointer moves far off-screen (not remembered as a
+    /// known position), so egui's press has moved beyond the click distance and the release
+    /// that follows is no click.
+    fn detour(&mut self, out: &mut Vec<egui::Event>) {
+        if self.last_pos != Some(CANCEL_DETOUR) {
+            out.push(egui::Event::PointerMoved(CANCEL_DETOUR));
+            self.last_pos = Some(CANCEL_DETOUR);
+        }
+    }
+
     /// Synthesized repeat presses for held [`REPEAT_KEYS`].
     fn key_repeats(&mut self, input: &Input, time: f64, mods: egui::Modifiers, out: &mut Vec<egui::Event>) {
         self.repeats
@@ -1021,6 +1121,201 @@ mod tests {
         input.inject_mouse_left();
         t.translate(&input, 2.0, 0.0, "", &mut ev);
         assert_eq!(ev, vec![egui::Event::PointerGone]);
+    }
+
+    /// The pointer events of `ev`: moves, gone, `(button, pressed)` at a position.
+    #[derive(Debug, PartialEq)]
+    enum P {
+        Moved(egui::Pos2),
+        Gone,
+        Button(egui::PointerButton, bool, egui::Pos2),
+        Focused(bool),
+    }
+
+    fn pointer(ev: &[egui::Event]) -> Vec<P> {
+        ev.iter()
+            .filter_map(|e| match *e {
+                egui::Event::PointerMoved(p) => Some(P::Moved(p)),
+                egui::Event::PointerGone => Some(P::Gone),
+                egui::Event::PointerButton {
+                    pos, button, pressed, ..
+                } => Some(P::Button(button, pressed, pos)),
+                egui::Event::WindowFocused(f) => Some(P::Focused(f)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const PRIMARY: egui::PointerButton = egui::PointerButton::Primary;
+
+    #[test]
+    fn button_events_are_sent_in_order_where_they_happened() {
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        let (a, b, c) = (egui::pos2(10.0, 10.0), egui::pos2(40.0, 10.0), egui::pos2(60.0, 30.0));
+        let at = |p: egui::Pos2| Vec2::new(p.x, p.y);
+        input.inject_mouse_move(at(a));
+        input.inject_mouse_button_down(MouseButton::Left);
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(pointer(&ev), [P::Moved(a), P::Button(PRIMARY, true, a)]);
+        // Released after a move, pressed again (double click), then dragged on: all in one frame.
+        input.inject_mouse_move(at(b));
+        input.inject_mouse_button_up(MouseButton::Left);
+        input.inject_mouse_button_down(MouseButton::Left);
+        input.inject_mouse_move(at(c));
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(
+            pointer(&ev),
+            [
+                P::Moved(b),
+                P::Button(PRIMARY, false, b),
+                P::Button(PRIMARY, true, b),
+                P::Moved(c),
+            ]
+        );
+        assert!(t.down[0], "egui holds the button, like Input");
+        // A tap within one frame.
+        input.inject_mouse_button_up(MouseButton::Left);
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(pointer(&ev), [P::Button(PRIMARY, false, c)]);
+        input.inject_mouse_button_down(MouseButton::Right);
+        input.inject_mouse_button_up(MouseButton::Right);
+        let ev = translate_frame(&mut t, &mut input, "");
+        let secondary = egui::PointerButton::Secondary;
+        assert_eq!(
+            pointer(&ev),
+            [P::Button(secondary, true, c), P::Button(secondary, false, c)]
+        );
+    }
+
+    #[test]
+    fn buttons_outside_the_window_go_to_the_last_known_position() {
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        let a = egui::pos2(5.0, 7.0);
+        input.inject_mouse_move(Vec2::new(10.0, 14.0));
+        input.inject_mouse_button_down(MouseButton::Left);
+        let mut ev = Vec::new();
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
+        input.end_frame();
+        assert_eq!(pointer(&ev), [P::Moved(a), P::Button(PRIMARY, true, a)]);
+        input.inject_mouse_left();
+        let mut ev = Vec::new();
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
+        input.end_frame();
+        assert_eq!(pointer(&ev), [P::Gone]);
+        // Released outside: where egui last saw the pointer, which is gone again right after.
+        input.inject_mouse_button_up(MouseButton::Left);
+        let mut ev = Vec::new();
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
+        input.end_frame();
+        assert_eq!(pointer(&ev), [P::Button(PRIMARY, false, a), P::Gone]);
+        let mut ev = Vec::new();
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
+        assert!(ev.is_empty(), "{ev:?}");
+        // Back inside.
+        input.inject_mouse_move(Vec2::new(20.0, 20.0));
+        let mut ev = Vec::new();
+        t.translate(&input, 2.0, 0.0, "", &mut ev);
+        assert_eq!(pointer(&ev), [P::Moved(egui::pos2(10.0, 10.0))]);
+    }
+
+    #[test]
+    fn cancelled_releases_detour_off_screen_first() {
+        use space3d_platform::MouseButtonCause;
+        for cause in [MouseButtonCause::FocusLost, MouseButtonCause::OsReconciled] {
+            let mut t = InputTranslator::default();
+            let mut input = Input::default();
+            let a = egui::pos2(30.0, 40.0);
+            input.inject_mouse_move(Vec2::new(a.x, a.y));
+            input.inject_mouse_button_down(MouseButton::Left);
+            input.inject_mouse_button_down(MouseButton::Middle);
+            translate_frame(&mut t, &mut input, "");
+            if cause == MouseButtonCause::FocusLost {
+                input.release_all();
+            } else {
+                input.release_mouse_button(MouseButton::Left, cause);
+                input.release_mouse_button(MouseButton::Middle, cause);
+            }
+            let mut ev = Vec::new();
+            assert!(t.translate(&input, 1.0, 0.0, "", &mut ev), "{cause:?}: a cancel");
+            input.end_frame();
+            let middle = egui::PointerButton::Middle;
+            assert_eq!(
+                pointer(&ev),
+                [
+                    P::Moved(CANCEL_DETOUR),
+                    P::Moved(a),
+                    P::Button(PRIMARY, false, a),
+                    P::Moved(CANCEL_DETOUR),
+                    P::Moved(a),
+                    P::Button(middle, false, a),
+                ],
+                "{cause:?}"
+            );
+            // Then nothing: the pointer is where it was.
+            let mut ev = Vec::new();
+            assert!(!t.translate(&input, 1.0, 0.0, "", &mut ev));
+            assert!(ev.is_empty(), "{ev:?}");
+        }
+        // The cursor outside: released at the last known position, gone again after.
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(3.0, 4.0));
+        input.inject_mouse_button_down(MouseButton::Left);
+        input.inject_mouse_left();
+        translate_frame(&mut t, &mut input, "");
+        input.release_all();
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(
+            pointer(&ev),
+            [
+                P::Moved(CANCEL_DETOUR),
+                P::Button(PRIMARY, false, egui::pos2(3.0, 4.0)),
+                P::Gone
+            ]
+        );
+        // Device releases are not cancels.
+        input.inject_mouse_button_down(MouseButton::Left);
+        input.inject_mouse_button_up(MouseButton::Left);
+        let mut ev = Vec::new();
+        assert!(!t.translate(&input, 1.0, 0.0, "", &mut ev));
+        assert!(!ev.contains(&egui::Event::PointerMoved(CANCEL_DETOUR)));
+    }
+
+    #[test]
+    fn buttons_egui_still_holds_are_released_as_cancels() {
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(8.0, 9.0));
+        input.inject_mouse_button_down(MouseButton::Left);
+        translate_frame(&mut t, &mut input, "");
+        // `Input` replaced mid-press (or egui was not told of the release).
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(8.0, 9.0));
+        let mut ev = Vec::new();
+        assert!(t.translate(&input, 1.0, 0.0, "", &mut ev));
+        let a = egui::pos2(8.0, 9.0);
+        assert_eq!(
+            pointer(&ev),
+            [P::Moved(CANCEL_DETOUR), P::Moved(a), P::Button(PRIMARY, false, a)]
+        );
+        assert!(!t.down[0]);
+    }
+
+    #[test]
+    fn focus_changes_reach_egui_once() {
+        let mut t = InputTranslator::default();
+        let mut ev = Vec::new();
+        t.focus(true, &mut ev);
+        assert!(ev.is_empty(), "egui starts focused");
+        t.focus(false, &mut ev);
+        t.focus(false, &mut ev);
+        assert_eq!(pointer(&ev), [P::Focused(false)]);
+        ev.clear();
+        t.focus(true, &mut ev);
+        t.focus(true, &mut ev);
+        assert_eq!(pointer(&ev), [P::Focused(true)]);
     }
 
     #[test]

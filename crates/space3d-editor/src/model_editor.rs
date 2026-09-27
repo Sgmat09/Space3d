@@ -10,6 +10,7 @@
 
 use crate::components::EditorInternal;
 use crate::files::{IoJobs, read_file_with, write_file_with};
+use crate::widgets::{fill_slider, property, property_group, section, vec3_fields};
 use space3d_assets::edit::mesh::{self as ops, MeshEditHistory, WeldOptions};
 use space3d_core::glam::{EulerRot, Mat4, Quat, Vec3, Vec4};
 use space3d_core::hecs::{Entity, World};
@@ -751,18 +752,39 @@ impl ModelEditor {
         self.mesh_dirty = true;
     }
 
-    /// Show the editor window.
+    /// Show the editor window. It sits on egui's foreground layer, with the engine tools (F3 /
+    /// F4 / console): clicking it brings it in front of them, clicking one of them brings that
+    /// one in front.
     pub fn show(&mut self, ctx: &egui::Context) {
+        self.show_window(ctx, None);
+    }
+
+    /// Show the editor window within `area` (screen points; e.g. the viewport left between an
+    /// editor's panels): it opens at its top-left corner and stays inside it, 6 pt clear of its
+    /// edges.
+    pub fn show_in(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        self.show_window(ctx, Some(area));
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context, area: Option<egui::Rect>) {
         self.poll_io();
         if !self.open {
             return;
         }
         let mut open = self.open;
-        egui::Window::new("Model editor")
+        // On the tools' layer (they are foreground windows so a game's windows never cover
+        // them): the one clicked last is in front.
+        let mut window = egui::Window::new("Model editor")
             .id(egui::Id::new("space3d_model_editor"))
+            .order(egui::Order::Foreground)
             .open(&mut open)
-            .default_size([900.0, 520.0])
-            .show(ctx, |ui| self.contents(ui));
+            .default_size([820.0, 480.0]);
+        if let Some(area) = area {
+            // 6 pt clear of the area's edges (the editor's panels), like the engine tools.
+            let area = area.shrink(crate::widgets::WINDOW_GAP);
+            window = window.default_pos(area.min + egui::vec2(2.0, 2.0)).constrain_to(area);
+        }
+        window.show(ctx, |ui| self.contents(ui));
         self.open = open;
     }
 
@@ -775,31 +797,28 @@ impl ModelEditor {
             }
         });
         let m = self.mesh();
+        let yes_no = |n: usize| if n == m.positions.len() { "✔" } else { "–" };
         let info = format!(
-            "{} vertices · {} triangles · normals {} · uvs {} · colors {} · {} faces selected",
+            "{} verts · {} tris · normals {} · uvs {} · colors {} · {} faces selected",
             m.vertex_count(),
             m.triangle_count(),
-            if m.normals.len() == m.positions.len() {
-                "yes"
-            } else {
-                "no"
-            },
-            if m.uvs.len() == m.positions.len() { "yes" } else { "no" },
-            if m.colors.len() == m.positions.len() {
-                "yes"
-            } else {
-                "no"
-            },
+            yes_no(m.normals.len()),
+            yes_no(m.uvs.len()),
+            yes_no(m.colors.len()),
             self.selected_faces.len(),
         );
-        ui.label(info);
-        if !self.status.is_empty() {
-            ui.label(egui::RichText::new(&self.status).weak());
-        }
+        ui.horizontal(|ui| {
+            ui.label(info);
+            if !self.status.is_empty() {
+                ui.separator();
+                ui.label(egui::RichText::new(&self.status).weak());
+            }
+        });
         ui.separator();
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.set_width(250.0);
+                ui.set_width(crate::widgets::tool_column_width(ui, 230.0));
+                crate::widgets::visible_scroll_bars(ui);
                 egui::ScrollArea::vertical().id_salt("model_ops").show(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| self.ops_panel(ui));
                 });
@@ -821,12 +840,12 @@ impl ModelEditor {
                 self.set_mesh(MeshData::plane(1.0));
             }
             ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(150.0));
+            ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(120.0));
             if ui.button("Open").clicked() {
                 self.open();
             }
             ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut self.export_path).desired_width(150.0));
+            ui.add(egui::TextEdit::singleline(&mut self.export_path).desired_width(120.0));
             if ui.button("Export").clicked() {
                 self.export();
             }
@@ -855,12 +874,16 @@ impl ModelEditor {
         let mut select: Option<Option<Axis>> = None;
         let selected = self.selected_faces.len();
         let p = &mut self.params;
-        egui::CollapsingHeader::new("Transform")
-            .default_open(true)
-            .show(ui, |ui| {
-                vec3_row(ui, "move", &mut p.translate, 0.01);
-                vec3_row(ui, "rotate°", &mut p.rotate_deg, 1.0);
-                vec3_row(ui, "scale", &mut p.scale, 0.01);
+        section(
+            ui,
+            "model_transform",
+            "Transform",
+            true,
+            |_| {},
+            |ui| {
+                property(ui, "Move", |ui| vec3_fields(ui, &mut p.translate, 0.01));
+                property(ui, "Rotate °", |ui| vec3_fields(ui, &mut p.rotate_deg, 1.0));
+                property(ui, "Scale", |ui| vec3_fields(ui, &mut p.scale, 0.01));
                 ui.horizontal(|ui| {
                     if ui.button("Apply").clicked() {
                         run = Some("transform");
@@ -869,12 +892,17 @@ impl ModelEditor {
                         run = Some("center");
                     }
                 });
-            });
-        egui::CollapsingHeader::new("Topology")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Smooth normals").clicked() {
+            },
+        );
+        section(
+            ui,
+            "model_topology",
+            "Topology",
+            true,
+            |_| {},
+            |ui| {
+                property_group(ui, "Normals", |ui| {
+                    if ui.button("Smooth").clicked() {
                         run = Some("smooth_normals");
                     }
                     if ui.button("Flat").clicked() {
@@ -884,16 +912,17 @@ impl ModelEditor {
                         run = Some("flip_normals");
                     }
                 });
-                ui.horizontal(|ui| {
+                property_group(ui, "Weld ε", |ui| {
                     ui.add(egui::DragValue::new(&mut p.weld_epsilon).speed(0.0001).range(0.0..=1.0));
                     if ui.button("Weld").clicked() {
                         run = Some("weld");
                     }
+                });
+                property(ui, "Subdivide", |ui| {
                     if ui.button("Subdivide").clicked() {
                         run = Some("subdivide");
                     }
                 });
-                ui.separator();
                 if ui
                     .checkbox(&mut self.select_mode, "select faces (click preview)")
                     .changed()
@@ -901,11 +930,10 @@ impl ModelEditor {
                 {
                     self.paint_mode = false;
                 }
-                ui.horizontal(|ui| {
-                    ui.label("facing");
+                property_group(ui, "Facing", |ui| {
                     egui::ComboBox::from_id_salt("extrude_axis")
                         .selected_text(p.select_axis.label())
-                        .width(50.0)
+                        .width(44.0)
                         .show_ui(ui, |ui| {
                             for a in Axis::ALL {
                                 ui.selectable_value(&mut p.select_axis, a, a.label());
@@ -918,93 +946,111 @@ impl ModelEditor {
                         select = Some(None);
                     }
                 });
-                ui.label(
-                    egui::RichText::new(if selected == 0 {
-                        "no faces selected: extrude uses the faces facing the axis".to_owned()
-                    } else {
-                        format!("{selected} faces selected")
-                    })
-                    .weak(),
-                );
-                ui.horizontal(|ui| {
+                property_group(ui, "Extrude", |ui| {
                     ui.add(egui::DragValue::new(&mut p.extrude_distance).speed(0.01));
-                    if ui.button("Extrude").clicked() {
+                    let hint = if selected == 0 {
+                        "No faces selected: extrudes the faces facing the axis".to_owned()
+                    } else {
+                        format!("Extrudes the {selected} selected faces")
+                    };
+                    if ui.button("Extrude").on_hover_text(hint).clicked() {
                         run = Some("extrude");
                     }
                 });
-                ui.separator();
-                ui.horizontal(|ui| {
+                property_group(ui, "Decimate", |ui| {
                     ui.add(egui::DragValue::new(&mut p.decimate_resolution).range(1..=256));
                     if ui.button("Decimate").clicked() {
                         run = Some("decimate");
                     }
                 });
-            });
-        egui::CollapsingHeader::new("UVs").show(ui, |ui| {
-            ui.add(
-                egui::Slider::new(&mut p.uv_scale, 0.01..=10.0)
-                    .logarithmic(true)
-                    .text("scale"),
-            );
-            if ui.button("Box projection").clicked() {
-                run = Some("uv_box");
-            }
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("uv_axis")
-                    .selected_text(p.uv_axis.label())
-                    .width(50.0)
-                    .show_ui(ui, |ui| {
-                        for a in Axis::ALL {
-                            ui.selectable_value(&mut p.uv_axis, a, a.label());
-                        }
-                    });
-                if ui.button("Planar projection").clicked() {
-                    run = Some("uv_planar");
+            },
+        );
+        section(
+            ui,
+            "model_uvs",
+            "UVs",
+            false,
+            |_| {},
+            |ui| {
+                property(ui, "Scale", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut p.uv_scale, 0.01..=10.0).logarithmic(true))
+                });
+                property(ui, "Box", |ui| {
+                    if ui.button("Project").clicked() {
+                        run = Some("uv_box");
+                    }
+                });
+                property_group(ui, "Planar", |ui| {
+                    egui::ComboBox::from_id_salt("uv_axis")
+                        .selected_text(p.uv_axis.label())
+                        .width(44.0)
+                        .show_ui(ui, |ui| {
+                            for a in Axis::ALL {
+                                ui.selectable_value(&mut p.uv_axis, a, a.label());
+                            }
+                        });
+                    if ui.button("Project").clicked() {
+                        run = Some("uv_planar");
+                    }
+                });
+            },
+        );
+        section(
+            ui,
+            "model_paint",
+            "Vertex paint",
+            false,
+            |_| {},
+            |ui| {
+                if ui.checkbox(&mut self.paint_mode, "paint on drag").changed() && self.paint_mode {
+                    self.select_mode = false;
                 }
-            });
-        });
-        egui::CollapsingHeader::new("Vertex paint").show(ui, |ui| {
-            if ui.checkbox(&mut self.paint_mode, "paint on drag").changed() && self.paint_mode {
-                self.select_mode = false;
-            }
-            ui.horizontal(|ui| {
-                ui.label("color");
-                let mut c = egui::Rgba::from_rgba_unmultiplied(
-                    p.paint_color[0],
-                    p.paint_color[1],
-                    p.paint_color[2],
-                    p.paint_color[3],
-                );
-                if egui::color_picker::color_edit_button_rgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend)
-                    .changed()
-                {
-                    p.paint_color = c.to_rgba_unmultiplied();
-                }
-            });
-            ui.add(
-                egui::Slider::new(&mut p.paint_radius, 0.01..=5.0)
-                    .logarithmic(true)
-                    .text("radius"),
-            );
-            ui.add(egui::Slider::new(&mut p.paint_strength, 0.0..=1.0).text("strength"));
-            ui.add(egui::Slider::new(&mut p.paint_hardness, 0.0..=1.0).text("hardness"));
-            if ui.button("Fill all").clicked() {
-                run = Some("fill_colors");
-            }
-        });
-        egui::CollapsingHeader::new("Preview").show(ui, |ui| {
-            ui.checkbox(&mut self.wireframe, "wireframe overlay");
-            ui.horizontal(|ui| {
-                ui.label("material");
-                let mut c =
-                    egui::Rgba::from_rgba_unmultiplied(self.color[0], self.color[1], self.color[2], self.color[3]);
-                if egui::color_picker::color_edit_button_rgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend)
-                    .changed()
-                {
-                    self.color = c.to_rgba_unmultiplied();
-                }
-            });
-        });
+                property_group(ui, "Color", |ui| {
+                    let mut c = egui::Rgba::from_rgba_unmultiplied(
+                        p.paint_color[0],
+                        p.paint_color[1],
+                        p.paint_color[2],
+                        p.paint_color[3],
+                    );
+                    if egui::color_picker::color_edit_button_rgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend)
+                        .changed()
+                    {
+                        p.paint_color = c.to_rgba_unmultiplied();
+                    }
+                    if ui.button("Fill all").clicked() {
+                        run = Some("fill_colors");
+                    }
+                });
+                property(ui, "Radius", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut p.paint_radius, 0.01..=5.0).logarithmic(true))
+                });
+                property(ui, "Strength", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut p.paint_strength, 0.0..=1.0))
+                });
+                property(ui, "Hardness", |ui| {
+                    fill_slider(ui, egui::Slider::new(&mut p.paint_hardness, 0.0..=1.0))
+                });
+            },
+        );
+        section(
+            ui,
+            "model_preview",
+            "Preview",
+            false,
+            |_| {},
+            |ui| {
+                ui.checkbox(&mut self.wireframe, "wireframe overlay");
+                property(ui, "Material", |ui| {
+                    let mut c =
+                        egui::Rgba::from_rgba_unmultiplied(self.color[0], self.color[1], self.color[2], self.color[3]);
+                    if egui::color_picker::color_edit_button_rgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend)
+                        .changed()
+                    {
+                        self.color = c.to_rgba_unmultiplied();
+                    }
+                });
+            },
+        );
         match select {
             Some(Some(axis)) => self.select_facing(axis),
             Some(None) => self.clear_selection(),
@@ -1023,6 +1069,8 @@ impl ModelEditor {
         } else {
             egui::vec2(avail.x, avail.x / aspect)
         };
+        // Centered in the space left of the window (no gutter on one side only).
+        ui.add_space(((ui.available_width() - size.x) / 2.0).floor().max(0.0));
         let response = match self.preview_texture() {
             Some(id) => {
                 ui.add(egui::Image::new(egui::load::SizedTexture::new(id, size)).sense(egui::Sense::click_and_drag()))
@@ -1139,15 +1187,6 @@ impl ModelEditor {
             "drag: orbit (or paint) · scroll: zoom"
         });
     }
-}
-
-fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut Vec3, speed: f64) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        ui.add(egui::DragValue::new(&mut v.x).speed(speed));
-        ui.add(egui::DragValue::new(&mut v.y).speed(speed));
-        ui.add(egui::DragValue::new(&mut v.z).speed(speed));
-    });
 }
 
 #[cfg(test)]

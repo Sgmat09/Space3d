@@ -1,7 +1,8 @@
 //! Built-in engine storybook: one story per major renderer/engine feature.
 //!
 //! One file per area (graphics spec §2.8): `basics` (the original stories), `frame`,
-//! `materials` + `lighting`, `post`, `particles` (feature `particles`) and `showcase`. Each exports
+//! `materials` + `lighting`, `post`, `particles` (feature `particles`), `showcase` and `ui`
+//! (feature `ui`: `Engine/UI/Theme/*` and `Engine/UI/Tools/*`). Each exports
 //! `pub(crate) fn stories() -> Vec<Story>`; [`engine_storybook`] concatenates them in that order.
 
 mod basics;
@@ -12,6 +13,8 @@ mod materials;
 mod particles;
 mod post;
 pub mod showcase;
+#[cfg(feature = "ui")]
+mod ui;
 
 use crate::Storybook;
 use space3d_core::prelude::*;
@@ -125,6 +128,12 @@ pub(super) fn ambient(app: &mut App, intensity: f32) {
 /// single material, 10k instanced cubes, textured checker plane, point lights, camera
 /// projections, transform hierarchy and a physics drop.
 ///
+/// With feature `ui` (off by default; the editor and the facade's `stories` feature turn it on)
+/// it also holds the UI stories: `Engine/UI/Theme/Default`
+/// and `Engine/UI/Theme/Compact` (the same tool panel under egui's default style and the opt-in
+/// compact density) and `Engine/UI/Tools/*` (debug overlay, profiler, console, and all three
+/// under a roomy game style).
+///
 /// Every story spawns its own camera and lights, uses only engine plugins, and is
 /// deterministic for a given tick count, so the whole book doubles as a golden screenshot
 /// suite (`crates/space3d-stories/tests/__screenshots__/Engine/`).
@@ -139,6 +148,8 @@ pub fn engine_storybook() -> Storybook {
         #[cfg(feature = "particles")]
         particles::stories(),
         showcase::stories(),
+        #[cfg(feature = "ui")]
+        ui::stories(),
     ];
     for story in areas.into_iter().flatten() {
         book.add(story.tag("engine"));

@@ -15,7 +15,7 @@ use space3d_core::hecs::{Entity, World};
 use space3d_core::{App, Name, Plugin, Stage, SystemCtx, TickRate, Time, Transform};
 use space3d_render::{Material, Mesh3d, RenderAssets, Renderer, TextureHandle};
 use space3d_scene::{ComponentRegistry, Scene, SceneFormat, ScenePlugin};
-use space3d_ui::{Console, DebugOverlay, EguiContext, Profiler, UiPlugin};
+use space3d_ui::{Console, DebugOverlay, EguiContext, Profiler, UiPlugin, set_tool_dock_area};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -437,7 +437,8 @@ impl Tools<'_> {
 }
 
 fn menu_bar(ui: &mut egui::Ui, sys: &mut SystemCtx, t: &mut Tools) {
-    egui::Panel::top("space3d_editor_menu").show(ui, |ui| {
+    let frame = crate::widgets::menu_bar_frame(ui.style());
+    egui::Panel::top("space3d_editor_menu").frame(frame).show(ui, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("New scene").clicked() {
@@ -616,10 +617,15 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                 menu_bar(ui, sys, &mut t);
                 if t.state.show_hierarchy {
                     let mut actions = Vec::new();
+                    let frame = crate::widgets::panel_frame(ui.style());
                     egui::Panel::left("space3d_editor_hierarchy")
-                        .default_size(230.0)
+                        .default_size(210.0)
+                        .size_range(160.0..=400.0)
+                        .frame(frame)
                         .show(ui, |ui| {
-                            ui.heading("Hierarchy");
+                            let count = crate::hierarchy::entity_count(sys.world);
+                            crate::widgets::panel_title(ui, "Hierarchy", &format!("{count} entities"));
+                            crate::widgets::visible_scroll_bars(ui);
                             actions = hierarchy_ui(ui, sys.world, t.state.selected, &mut t.state.hierarchy_filter);
                         });
                     for a in actions {
@@ -627,12 +633,18 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                     }
                 }
                 if t.state.show_inspector {
+                    let frame = crate::widgets::panel_frame(ui.style());
                     egui::Panel::right("space3d_editor_inspector")
-                        .default_size(300.0)
+                        .default_size(280.0)
+                        .size_range(220.0..=480.0)
+                        .frame(frame)
                         .show(ui, |ui| {
-                            ui.heading("Inspector");
+                            crate::widgets::panel_title(ui, "Inspector", "");
+                            crate::widgets::visible_scroll_bars(ui);
+                            // Full width whatever is selected: the panel keeps its width.
                             egui::ScrollArea::vertical()
                                 .id_salt("space3d_inspector_scroll")
+                                .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     match (t.state.selected, sys.resources.get::<ComponentRegistry>()) {
                                         (Some(e), Some(registry)) => {
@@ -656,8 +668,9 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
                 }
                 viewport = ui.available_rect_before_wrap();
             });
-            t.tex.show(&ctx);
-            t.model.show(&ctx);
+            // Over the viewport: never over the menu bar or the side panels.
+            t.tex.show_in(&ctx, viewport);
+            t.model.show_in(&ctx, viewport);
         } else {
             t.tex.poll_io();
             t.model.poll_io();
@@ -674,6 +687,10 @@ pub(crate) fn editor_ui_system(sys: &mut SystemCtx) {
             // Free the preview target and entities while the window is closed.
             t.model.destroy_preview(sys.world, sys.resources, &ctx);
         }
+
+        // The engine tools (F3 / F4 / console) dock inside the viewport, clear of the menu bar
+        // and the side panels (the whole screen while the editor UI is hidden).
+        set_tool_dock_area(sys.resources, viewport);
 
         // Viewport: gizmo + picking.
         if t.state.visible {

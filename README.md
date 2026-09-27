@@ -65,8 +65,10 @@ space3d::main!(build);
   thumbnails, leaderboards) with a `localStorage` fallback on the web.
 * **Physics, audio, scenes.** rapier rigid bodies/colliders/raycasts on the fixed tick; kira
   audio with spatial emitters; RON/JSON scenes, prefabs and world snapshots.
-* **UI and tools.** egui integration with a debug overlay (F3), profiler (F4) and console;
-  scene inspector, texture and model editors; a storybook for isolated, parameterized scenes.
+* **UI and tools.** egui integration with a compact debug overlay (F3), profiler (F4) and
+  console; an opt-in compact density (`app.insert_resource(UiTheme::compact())`, see
+  [docs/ui.md](docs/ui.md)); scene inspector, texture and model editors; a storybook for
+  isolated, parameterized scenes.
 * **Testing.** Headless `TestApp`, tick-accurate keyboard/mouse/touch/gamepad simulation and
   recorded input scripts, golden screenshots with diff images and an HTML report, determinism
   and performance assertions. GPU tests skip when there is no adapter.

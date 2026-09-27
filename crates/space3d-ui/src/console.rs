@@ -76,7 +76,7 @@ impl LogLevel {
             Self::Info => " INFO",
             Self::Warn => " WARN",
             Self::Error => "ERROR",
-            Self::Command => "   > ",
+            Self::Command => "    >",
             Self::Output => "     ",
         }
     }
@@ -198,7 +198,14 @@ pub struct Console {
     pub min_level: LogLevel,
     /// Case-insensitive text filter.
     pub filter: String,
+    /// Copy lines from the global log buffer ([`ConsoleLayer`]) every frame (default `true`).
+    /// Off, the console holds only its own lines: command output and [`Console::print`].
+    pub capture_logs: bool,
     lines: VecDeque<LogLine>,
+    /// Laid-out height of each of `lines` for `layout` (NaN until measured).
+    heights: VecDeque<f32>,
+    /// What the `heights` were measured for.
+    layout: Option<LogLayout>,
     last_seq: Option<u64>,
     local_seq: u64,
     input: String,
@@ -208,6 +215,25 @@ pub struct Console {
     pending: Vec<String>,
     focus_input: bool,
     input_focused: bool,
+    fit: LogFit,
+}
+
+/// How the console window's height follows from its log, as last drawn (for
+/// [`Console::drawn_height`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct LogFit {
+    /// Height of a log line (0 until drawn).
+    line: f32,
+    /// Height of the log (a whole number of lines) as last drawn.
+    log: f32,
+    /// Height the log had room for (before its 3-line minimum) as last drawn.
+    room: f32,
+    /// Height of the `Ui` the console was last drawn in.
+    ui: f32,
+    /// Height of the console window without its log (0 until drawn in its window).
+    around: f32,
+    /// Height of the console window's contents without the log's room (what the rest reserves).
+    reserved: f32,
 }
 
 impl std::fmt::Debug for Console {
@@ -226,7 +252,10 @@ impl Default for Console {
             visible: false,
             min_level: LogLevel::Info,
             filter: String::new(),
+            capture_logs: true,
             lines: VecDeque::new(),
+            heights: VecDeque::new(),
+            layout: None,
             last_seq: None,
             local_seq: u64::MAX / 2,
             input: String::new(),
@@ -236,6 +265,7 @@ impl Default for Console {
             pending: Vec::new(),
             focus_input: false,
             input_focused: false,
+            fit: LogFit::default(),
         }
     }
 }
@@ -276,14 +306,29 @@ impl Console {
                 t.dropped_ticks
             ))
         });
-        c.register("debug", "debug: toggle the debug overlay (F3)", |_, sys| {
-            let d = sys
-                .resources
-                .get_mut::<crate::DebugOverlay>()
-                .ok_or("no debug overlay")?;
-            d.visible = !d.visible;
-            Ok(format!("debug overlay {}", if d.visible { "on" } else { "off" }))
-        });
+        c.register(
+            "debug",
+            "debug [details]: toggle the debug overlay (F3), or its renderer details",
+            |args, sys| {
+                let d = sys
+                    .resources
+                    .get_mut::<crate::DebugOverlay>()
+                    .ok_or("no debug overlay")?;
+                let on_off = |b: bool| if b { "on" } else { "off" };
+                match args.first().copied() {
+                    None => {
+                        d.visible = !d.visible;
+                        Ok(format!("debug overlay {}", on_off(d.visible)))
+                    }
+                    Some("details") => {
+                        d.details = !d.details;
+                        d.visible = true;
+                        Ok(format!("debug overlay details {}", on_off(d.details)))
+                    }
+                    Some(other) => Err(format!("unknown argument `{other}` (usage: debug [details])")),
+                }
+            },
+        );
         c.register("profiler", "profiler: toggle the profiler (F4)", |_, sys| {
             let p = sys.resources.get_mut::<crate::Profiler>().ok_or("no profiler")?;
             p.visible = !p.visible;
@@ -357,8 +402,10 @@ impl Console {
     fn push_line(&mut self, line: LogLine) {
         if self.lines.len() == LOCAL_CAPACITY {
             self.lines.pop_front();
+            self.heights.pop_front();
         }
         self.lines.push_back(line);
+        self.heights.push_back(f32::NAN);
     }
 
     /// Lines currently held (captured logs and command output), oldest first.
@@ -369,6 +416,7 @@ impl Console {
     /// Remove all lines.
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.heights.clear();
     }
 
     /// Copy new lines from the global log buffer.
@@ -389,6 +437,9 @@ impl Console {
     /// Run queued commands (called by the plugin every frame; call it yourself when using
     /// the console without [`crate::UiPlugin`]).
     pub fn run_pending(sys: &mut SystemCtx) {
+        if sys.resources.get::<Console>().is_none_or(|c| c.pending.is_empty()) {
+            return;
+        }
         let Some(mut console) = sys.resources.remove::<Console>() else {
             return;
         };
@@ -444,11 +495,48 @@ impl Console {
         self.input_focused
     }
 
-    /// Draw the console into `ui` (log view + input line).
+    /// Outer height of the console window when it is given `height` (its log is a whole number
+    /// of lines, at least 3: it gives up the rest of a line, or grows in a tiny window), as last
+    /// drawn; before it was first drawn in its window, an estimate (the tools' density at 1x).
+    pub(crate) fn drawn_height(&self, height: f32) -> f32 {
+        let (line, around, reserved) = match self.fit {
+            fit if fit.line > 0.0 && fit.around > 0.0 => (fit.line, fit.around, fit.reserved),
+            _ => (ESTIMATED_LINE, ESTIMATED_AROUND, ESTIMATED_RESERVED),
+        };
+        // (A hair of tolerance: room for a whole number of lines keeps them all; errs on the
+        // tall side.)
+        let lines = ((height - reserved) / line + 0.01).floor().max(3.0);
+        around + lines * line
+    }
+
+    /// How much taller than it is drawn the console window must be given to be drawn as tall
+    /// again (see [`Self::drawn_height`]): what the rest of it reserves beyond what it takes as
+    /// drawn, and a hair (a height on a line boundary keeps the line).
+    pub(crate) fn height_slack(&self) -> f32 {
+        let (around, reserved) = match self.fit {
+            fit if fit.line > 0.0 && fit.around > 0.0 => (fit.around, fit.reserved),
+            _ => (ESTIMATED_AROUND, ESTIMATED_RESERVED),
+        };
+        (reserved - around).max(0.0) + 0.5
+    }
+
+    /// Lines shown with the current level and text filter (`filter` lowercased by the caller).
+    fn shown<'a>(&'a self, filter: &'a str) -> impl Iterator<Item = &'a LogLine> {
+        self.lines.iter().filter(move |l| is_shown(l, self.min_level, filter))
+    }
+
+    /// Draw the console into `ui`: a toolbar (level, a filter filling the row, clear), the log
+    /// and the input line. The log shows one dense monospace line per entry — the level tag in
+    /// a column of its own, then target and message; a long entry wraps under its message, the
+    /// tag column kept clear — and is a whole number of lines tall, so while it sticks to the
+    /// newest line the oldest shown is never cut. Only the entries in view are laid out: the
+    /// others take the height they were measured at (once per entry and log width).
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        self.fit.ui = ui.max_rect().height();
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("space3d_console_level")
                 .selected_text(format!("{:?}", self.min_level))
+                .width(64.0)
                 .show_ui(ui, |ui| {
                     for l in [
                         LogLevel::Trace,
@@ -460,37 +548,60 @@ impl Console {
                         ui.selectable_value(&mut self.min_level, l, format!("{l:?}"));
                     }
                 });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("filter")
-                    .desired_width(160.0),
-            );
-            if ui.button("Clear").clicked() {
-                self.clear();
-            }
-        });
-        let filter = self.filter.to_lowercase();
-        let visuals = ui.visuals().clone();
-        let input_height = 28.0;
-        egui::ScrollArea::vertical()
-            .max_height((ui.available_height() - input_height).max(60.0))
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for l in &self.lines {
-                    let shown = match l.level {
-                        LogLevel::Command | LogLevel::Output => true,
-                        lvl => lvl >= self.min_level,
-                    };
-                    if !shown || (!filter.is_empty() && !l.message.to_lowercase().contains(&filter)) {
-                        continue;
-                    }
-                    let text = match l.level {
-                        LogLevel::Command | LogLevel::Output => format!("{}{}", l.level.tag(), l.message),
-                        _ => format!("{} {}: {}", l.level.tag(), l.target, l.message),
-                    };
-                    ui.label(egui::RichText::new(text).monospace().color(l.level.color(&visuals)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Clear").clicked() {
+                    self.clear();
                 }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("filter")
+                        .desired_width(ui.available_width()),
+                );
+            });
+        });
+        let visuals = ui.visuals().clone();
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        // A one-line entry's height as laid out (galley rows are rounded to pixels) and the
+        // width of the level tag column.
+        let tag = ui.fonts_mut(|f| {
+            f.layout_no_wrap(LogLevel::Info.tag().to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+        });
+        let line = tag.y;
+        let input_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 2.0;
+        let filter = self.filter.to_lowercase();
+        egui::Frame::new()
+            .fill(visuals.extreme_bg_color)
+            .corner_radius(2)
+            .inner_margin(egui::Margin::symmetric(4, 2))
+            .show(ui, |ui| {
+                // A whole number of lines (the window, as tall as its contents, gives up the
+                // rest).
+                let room = ui.available_height() - input_height - 4.0;
+                let height = (room.max(3.0 * line) / line).floor() * line;
+                self.fit.line = line;
+                self.fit.log = height;
+                self.fit.room = room;
+                egui::ScrollArea::vertical()
+                    .id_salt("space3d_console_log")
+                    .max_height(height)
+                    .min_scrolled_height(height)
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show_viewport(ui, |ui, viewport| {
+                        crate::tool::derived_style(ui, "console_log", |style| {
+                            style.spacing.item_spacing.y = 0.0;
+                            // Long lines (paths, backtraces) wrap: the log never widens the window.
+                            style.wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        });
+                        let layout = LogLayout {
+                            font: font.clone(),
+                            wrap: (ui.available_width() - tag.x - ui.spacing().item_spacing.x).max(tag.x),
+                            line,
+                            pixels_per_point: ui.ctx().pixels_per_point(),
+                        };
+                        self.log_ui(ui, viewport, layout, &visuals, &filter);
+                    });
             });
         let edit = egui::TextEdit::singleline(&mut self.input)
             .hint_text("command (try `help`)")
@@ -526,26 +637,217 @@ impl Console {
         }
         self.input_focused = response.has_focus() || self.focus_input;
     }
+
+    /// The log's contents in its scroll area: as tall as all shown entries, with only those in
+    /// `viewport` (content coordinates) laid out and drawn.
+    fn log_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        viewport: egui::Rect,
+        layout: LogLayout,
+        visuals: &egui::Visuals,
+        filter: &str,
+    ) {
+        if self.layout.as_ref() != Some(&layout) {
+            self.heights.iter_mut().for_each(|h| *h = f32::NAN);
+            self.layout = Some(layout.clone());
+        }
+        let min_level = self.min_level;
+        let mut total = 0.0;
+        for (l, h) in self.lines.iter().zip(self.heights.iter_mut()) {
+            if is_shown(l, min_level, filter) {
+                if h.is_nan() {
+                    *h = layout.height(&entry_galley(ui, l, &layout, visuals));
+                }
+                total += *h;
+            }
+        }
+        ui.set_height(total);
+
+        // The first entry in view, how many shown entries come before it, and its top.
+        let (mut first, mut skipped, mut top) = (self.lines.len(), 0, 0.0);
+        for (i, (l, h)) in self.lines.iter().zip(&self.heights).enumerate() {
+            if !is_shown(l, min_level, filter) {
+                continue;
+            }
+            if top + h > viewport.min.y {
+                first = i;
+                break;
+            }
+            top += h;
+            skipped += 1;
+        }
+        let area = ui.max_rect();
+        let rect = egui::Rect::from_x_y_ranges(area.x_range(), area.top() + top..=area.top() + viewport.max.y.max(top));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            // The same ids for an entry whichever is first in view.
+            ui.skip_ahead_auto_ids(skipped);
+            let lines = self.lines.range(first..).zip(self.heights.range_mut(first..));
+            for (l, h) in lines.filter(|(l, _)| is_shown(l, min_level, filter)) {
+                if top >= viewport.max.y {
+                    break;
+                }
+                let galley = entry_galley(ui, l, &layout, visuals);
+                let height = layout.height(&galley);
+                if *h != height {
+                    // (The fonts changed.) Right from the next frame.
+                    *h = height;
+                    ui.ctx().request_repaint();
+                }
+                top += height;
+                ui.horizontal_top(|ui| {
+                    ui.label(egui::text::LayoutJob::single_section(
+                        l.level.tag().to_owned(),
+                        egui::TextFormat::simple(layout.font.clone(), l.level.color(visuals)),
+                    ));
+                    ui.label(galley);
+                });
+            }
+        });
+    }
+}
+
+/// Whether the log shows `l` with the level `min_level` and the (lowercase) text `filter`.
+fn is_shown(l: &LogLine, min_level: LogLevel, filter: &str) -> bool {
+    let level = match l.level {
+        LogLevel::Command | LogLevel::Output => true,
+        lvl => lvl >= min_level,
+    };
+    level && crate::tool::contains_ignore_case(&l.message, filter)
+}
+
+/// What the height of a laid-out log entry depends on.
+#[derive(Clone, Debug, PartialEq)]
+struct LogLayout {
+    /// The log's font.
+    font: egui::FontId,
+    /// Width the target and message wrap at (the log's, less the tag column).
+    wrap: f32,
+    /// Height of a one-line entry.
+    line: f32,
+    pixels_per_point: f32,
+}
+
+impl LogLayout {
+    /// Height of an entry laid out as `galley` (at least a line: the tag's).
+    fn height(&self, galley: &egui::Galley) -> f32 {
+        galley.size().y.max(self.line)
+    }
+}
+
+/// The target (normal text color) and message (the level's color) of `l`, wrapped at
+/// `layout.wrap`.
+fn entry_galley(
+    ui: &egui::Ui,
+    l: &LogLine,
+    layout: &LogLayout,
+    visuals: &egui::Visuals,
+) -> std::sync::Arc<egui::Galley> {
+    let format = |c| egui::TextFormat::simple(layout.font.clone(), c);
+    let target = !matches!(l.level, LogLevel::Command | LogLevel::Output);
+    let prefix = if target { l.target.len() + 2 } else { 0 };
+    let mut job = egui::text::LayoutJob {
+        text: String::with_capacity(prefix + l.message.len()),
+        sections: Vec::with_capacity(2),
+        wrap: egui::text::TextWrapping::wrap_at_width(layout.wrap),
+        ..Default::default()
+    };
+    if target {
+        job.append(&l.target, 0.0, format(visuals.text_color()));
+        job.append(": ", 0.0, format(visuals.text_color()));
+    }
+    job.append(&l.message, 0.0, format(l.level.color(visuals)));
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// Egui id of the console window.
+pub(crate) const CONSOLE_ID: &str = "space3d_console";
+
+/// Height of a log line under the tools' density at 1x (for [`Console::drawn_height`] before
+/// the console was drawn).
+const ESTIMATED_LINE: f32 = 13.0;
+
+/// Height of the console window around its log under the tools' density at 1x.
+const ESTIMATED_AROUND: f32 = 86.0;
+
+/// Height of the console window's contents without the log's room under the tools' density at
+/// 1x.
+const ESTIMATED_RESERVED: f32 = 92.0;
+
+/// Default place of the docked console window in the dock area `dock` in the stacked layout:
+/// bottom-left, 640 pt wide and 40 % of the area's height (140 to 360 pt), [`crate::tool::EDGE`]
+/// in from its edges. (In a short area it may dock beside the other tools instead:
+/// [`crate::dock`].)
+pub(crate) fn window_rect(dock: egui::Rect) -> egui::Rect {
+    let edge = crate::tool::EDGE;
+    let size = egui::vec2(
+        (dock.width() - 2.0 * edge).min(640.0),
+        (dock.height() * 0.4)
+            .clamp(140.0, crate::dock::MAX_CONSOLE_HEIGHT)
+            .min(dock.height() - 2.0 * edge),
+    );
+    egui::Rect::from_min_size(egui::pos2(dock.left() + edge, dock.bottom() - edge - size.y), size)
+}
+
+/// Where the console window is this frame (docked as `plan` says, or where the user moved it).
+pub(crate) fn placed_rect(ctx: &egui::Context, plan: &crate::dock::DockPlan) -> egui::Rect {
+    crate::tool::placed_rect(
+        ctx,
+        CONSOLE_ID,
+        egui::Align2::LEFT_BOTTOM,
+        plan.console_pos,
+        plan.console_size,
+        plan.bounds,
+        true,
+    )
 }
 
 /// `Stage::Update`: pull logs, run queued commands and draw the console window.
 pub(crate) fn console_system(sys: &mut SystemCtx) {
     let ctx = crate::EguiContext::active_context(sys);
-    if let Some(c) = sys.resources.get_mut::<Console>() {
+    if let Some(c) = sys.resources.get_mut::<Console>()
+        && c.capture_logs
+    {
         c.pull_logs();
     }
-    if let Some(ctx) = ctx
+    let plan = ctx.as_ref().map(|ctx| {
+        let dock = crate::tool::dock_rect(sys.resources, ctx);
+        crate::dock::plan(sys.resources, ctx, dock)
+    });
+    if let (Some(ctx), Some(plan)) = (ctx, plan)
         && let Some(c) = sys.resources.get_mut::<Console>()
         && c.visible
     {
         let mut open = true;
-        let screen = ctx.content_rect();
-        egui::Window::new("Console")
-            .id(egui::Id::new("space3d_console"))
-            .open(&mut open)
-            .default_pos([8.0, (screen.height() * 0.55).max(40.0)])
-            .default_size([screen.width().min(720.0) - 16.0, screen.height() * 0.4])
-            .show(&ctx, |ui| c.ui(ui));
+        let filter = c.filter.to_lowercase();
+        let (shown, total) = (c.shown(&filter).count(), c.lines.len());
+        crate::tool::window(
+            &ctx,
+            crate::tool::ToolWindow {
+                id: CONSOLE_ID,
+                title: "Console",
+                anchor: egui::Align2::LEFT_BOTTOM,
+                dock_pos: plan.console_pos,
+                bounds: plan.bounds,
+                size: plan.console_size,
+                fit_height: false,
+                max_width: plan.console_max_width,
+                height_slack: c.height_slack(),
+            },
+            &mut open,
+            |ui| {
+                ui.label(format!("{shown}/{total} lines"));
+            },
+            |ui, _| c.ui(ui),
+        );
+        // The window is as tall as its contents: the log and what is around it. The log gets
+        // the whole lines that fit in the window's height less what the rest reserves.
+        if let Some(rect) = ctx.memory(|m| m.area_rect(egui::Id::new(CONSOLE_ID)))
+            && c.fit.line > 0.0
+        {
+            c.fit.around = rect.height() - c.fit.log;
+            c.fit.reserved = c.fit.ui + crate::tool::chrome(&ctx).y - c.fit.room;
+        }
         if !open {
             c.visible = false;
         }
@@ -572,7 +874,9 @@ mod tests {
         c.submit("fail");
         c.submit("nope");
         c.submit("echo hello world");
+        c.submit("debug details");
         app.insert_resource(c);
+        app.insert_resource(crate::DebugOverlay::new(false));
         app.add_system(space3d_core::Stage::Update, Console::run_pending);
         app.step_ticks(1);
         assert_eq!(app.resources.expect::<TickRate>().hz, 30.0);
@@ -584,7 +888,51 @@ mod tests {
             msgs.iter()
                 .any(|(l, m)| *l == LogLevel::Error && m.contains("unknown command"))
         );
-        assert_eq!(c.history.len(), 4);
+        assert_eq!(c.history.len(), 5);
+        let overlay = app.resources.expect::<crate::DebugOverlay>();
+        assert!(overlay.visible && overlay.details, "`debug details` shows the details");
+    }
+
+    /// The console window's height for a given height, as the dock plan predicts it, is the
+    /// height it is drawn at (a whole number of log lines), and the estimate before it was first
+    /// drawn is that at 1x.
+    #[test]
+    fn drawn_height_is_the_height_the_console_is_drawn_at() {
+        for ppp in [1.0f32, 1.5, 2.0] {
+            let mut app = App::new();
+            app.add_plugin(crate::UiPlugin {
+                install_tracing: false,
+                fallback_size: ((1280.0 * ppp) as u32, (1000.0 * ppp) as u32),
+                ..crate::UiPlugin::deterministic().with_pixels_per_point(ppp)
+            });
+            let c = app.resources.expect_mut::<Console>();
+            c.visible = true;
+            c.capture_logs = false;
+            for i in 0..40 {
+                c.print(LogLevel::Info, format!("line {i}"));
+            }
+            for h in (60..380).step_by(11) {
+                let dock = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+                // The console's default height is 40 % of the dock area.
+                let area = egui::Rect::from_min_size(dock.min, egui::vec2(1000.0, h as f32 / 0.4));
+                app.insert_resource(crate::ToolDockArea(area));
+                app.step_ticks(3);
+                let ctx = app.resources.expect::<crate::EguiContext>().ctx().clone();
+                let drawn = ctx.memory(|m| m.area_rect(egui::Id::new(CONSOLE_ID))).expect("shown");
+                let asked = window_rect(area).height();
+                let predicted = app.resources.expect::<Console>().drawn_height(asked);
+                let label = format!(
+                    "{ppp}x, asked {asked}: drawn {drawn:?}, predicted {predicted}, fit {:?}",
+                    app.resources.expect::<Console>().fit
+                );
+                assert!((drawn.height() - predicted).abs() < 0.5, "{label}");
+                assert!(drawn.height() <= asked + 0.5 || asked < 130.0, "{label}");
+                if ppp == 1.0 {
+                    let estimate = Console::default().drawn_height(asked);
+                    assert_eq!(estimate, predicted, "the estimate at 1x: {label}");
+                }
+            }
+        }
     }
 
     #[test]

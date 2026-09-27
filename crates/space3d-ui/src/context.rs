@@ -1,13 +1,60 @@
 //! [`EguiContext`] resource and the per-frame begin/end systems.
+//!
+//! Each frame is one egui pass, begun in `Stage::PreUpdate` (`begin_frame`) and ended in
+//! `Stage::PostUpdate` (`end_frame`) with `egui::Context::begin_pass` / `end_pass`, so UI
+//! systems in between use the context directly. egui 0.36 calls its plugins' pass hooks
+//! (`Plugin::on_begin_pass` / `on_end_pass`) only from `Context::run_ui`, so the engine runs them
+//! itself in `run_ui`'s order: the begin hooks right after the pass begins, the end hooks right
+//! before it ends, both with the same top-level [`egui::Ui`] over the screen (id
+//! `(viewport_id, "__top_ui")`, like `run_ui`'s). See [`EguiContext::add_plugin`].
 
-use crate::UiPlugin;
 use crate::input::InputTranslator;
 use crate::overlay::EguiOverlay;
+use crate::{UiPlugin, UiTheme, UiThemeSync};
 use space3d_core::glam::Vec2;
 use space3d_core::{SystemCtx, Time};
 use space3d_platform::{Input, WindowState};
 use space3d_render::{RenderOverlays, Renderer};
+use std::any::TypeId;
 use std::sync::{Arc, Mutex};
+
+/// Which egui plugin pass hook to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassHook {
+    Begin,
+    End,
+}
+
+/// Runs one plugin's hook (if that plugin is registered with the context).
+type HookRunner = fn(&egui::Context, &mut egui::Ui, PassHook);
+
+fn run_hook<P: egui::Plugin>(ctx: &egui::Context, ui: &mut egui::Ui, hook: PassHook) {
+    ctx.with_plugin::<P, _>(|plugin| match hook {
+        PassHook::Begin => plugin.on_begin_pass(ui),
+        PassHook::End => plugin.on_end_pass(ui),
+    });
+}
+
+fn hook_of<P: egui::Plugin>() -> (TypeId, HookRunner) {
+    (TypeId::of::<P>(), run_hook::<P>)
+}
+
+/// egui's built-in plugins with pass hooks, in egui's registration order (`Context::default`).
+/// egui's first plugin, the private `CallbackPlugin` behind `Context::on_begin_pass` /
+/// `Context::on_end_pass`, cannot be reached from outside egui.
+fn builtin_hooks() -> Vec<(TypeId, HookRunner)> {
+    vec![
+        hook_of::<egui::debug_text::DebugTextPlugin>(),
+        hook_of::<egui::text_selection::LabelSelectionState>(),
+        hook_of::<egui::DragAndDrop>(),
+    ]
+}
+
+// The pass's top-level `Ui` lives in the resource between `begin_frame` and `end_frame`.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<egui::Ui>();
+};
 
 /// Statistics of the last finished egui pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -45,6 +92,10 @@ pub struct EguiContext {
     clipboard: String,
     cursor_icon: egui::CursorIcon,
     stats: UiFrameStats,
+    /// Plugins whose pass hooks the engine runs, in order.
+    plugin_hooks: Vec<(TypeId, HookRunner)>,
+    /// The pass's top-level `Ui`, handed to the plugins' begin and end hooks.
+    top_ui: Option<egui::Ui>,
 }
 
 impl std::fmt::Debug for EguiContext {
@@ -76,7 +127,55 @@ impl EguiContext {
             clipboard: String::new(),
             cursor_icon: egui::CursorIcon::Default,
             stats: UiFrameStats::default(),
+            plugin_hooks: builtin_hooks(),
+            top_ui: None,
         }
+    }
+
+    /// Add an egui [`egui::Plugin`] to the context (`egui::Context::add_plugin`) and run its
+    /// pass hooks every pass: `on_begin_pass` right after the pass begins (`Stage::PreUpdate`,
+    /// before UI systems), `on_end_pass` right before it ends (`Stage::PostUpdate`, after them),
+    /// both with the pass's top-level [`egui::Ui`], as `egui::Context::run_ui` does. Hooks run
+    /// in registration order, after egui's built-in plugins (debug text, label selection,
+    /// drag-and-drop). Adding a plugin type twice does nothing.
+    ///
+    /// Use this instead of `egui::Context::add_plugin`: egui runs pass hooks only from
+    /// `run_ui`, which the engine's pass does not use, and egui has no way to list the plugins
+    /// of a context, so the engine only runs the hooks of plugins it knows about. For a plugin
+    /// that is already registered with the context (e.g. by a library), see
+    /// [`Self::register_pass_hooks`]. egui's `Context::on_begin_pass` / `on_end_pass` callbacks
+    /// live in a private egui plugin and never run; register a plugin instead.
+    ///
+    /// The input and output hooks (`Plugin::input_hook`, `output_hook`) are run by egui itself.
+    pub fn add_plugin<P: egui::Plugin>(&mut self, plugin: P) {
+        self.ctx.add_plugin(plugin);
+        self.register_pass_hooks::<P>();
+    }
+
+    /// Run the pass hooks of plugin type `P` every pass, like [`Self::add_plugin`], for a plugin
+    /// registered with `egui::Context::add_plugin` (nothing runs while no `P` is registered).
+    /// Registering a type twice does nothing.
+    pub fn register_pass_hooks<P: egui::Plugin>(&mut self) {
+        let hook = hook_of::<P>();
+        if !self.plugin_hooks.iter().any(|(id, _)| *id == hook.0) {
+            self.plugin_hooks.push(hook);
+        }
+    }
+
+    /// Run every registered plugin's `hook` with `ui`.
+    fn run_pass_hooks(&self, ui: &mut egui::Ui, hook: PassHook) {
+        for (_, run) in &self.plugin_hooks {
+            run(&self.ctx, ui, hook);
+        }
+    }
+
+    /// End the running pass: the plugins' end hooks, then `egui::Context::end_pass`.
+    fn end_pass(&mut self) -> egui::FullOutput {
+        if let Some(mut top) = self.top_ui.take() {
+            self.run_pass_hooks(&mut top, PassHook::End);
+        }
+        self.in_pass = false;
+        self.ctx.end_pass()
     }
 
     /// The egui context (cheap to clone).
@@ -224,8 +323,14 @@ fn screen_info(sys: &SystemCtx, settings: &UiPlugin) -> ([u32; 2], f32, bool, us
 }
 
 /// `Stage::PreUpdate`: translate input and begin the egui pass.
-pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator, settings: &UiPlugin) {
+pub(crate) fn begin_frame(
+    sys: &mut SystemCtx,
+    translator: &mut InputTranslator,
+    theme: &mut UiThemeSync,
+    settings: &UiPlugin,
+) {
     let (size, native_ppp, focused, max_texture_side) = screen_info(sys, settings);
+    let ui_theme = sys.resources.get::<UiTheme>().copied();
     let (time, dt) = sys
         .resources
         .get::<Time>()
@@ -234,9 +339,9 @@ pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator,
         return;
     };
     if e.in_pass {
-        // The previous pass was never ended (e.g. PostUpdate was skipped): drop it.
-        let _ = e.ctx.end_pass();
-        e.in_pass = false;
+        // The previous pass was never ended (e.g. PostUpdate was skipped): drop it (its
+        // plugins still see it end).
+        let _ = e.end_pass();
     }
     if !e.enabled {
         return;
@@ -246,9 +351,11 @@ pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator,
     let injected = std::mem::take(&mut e.injected);
 
     let mut events = Vec::new();
-    if let Some(input) = sys.resources.get::<Input>() {
-        translator.translate(input, ppp, time, &clipboard, &mut events);
-    }
+    translator.focus(focused, &mut events);
+    let cancelled = sys
+        .resources
+        .get::<Input>()
+        .is_some_and(|input| translator.translate(input, ppp, time, &clipboard, &mut events));
     events.extend(injected);
     if let Some(o) = sys.resources.get_mut::<RenderOverlays>() {
         o.set_scale_factor(ppp);
@@ -282,8 +389,29 @@ pub(crate) fn begin_frame(sys: &mut SystemCtx, translator: &mut InputTranslator,
     e.screen_size_px = size;
     e.available_rect = screen;
     e.root_uis = 0;
+    if cancelled && e.ctx.plugin_opt::<egui::DragAndDrop>().is_some() {
+        // A release was cancelled (focus loss, a release only the OS saw): whatever was being
+        // dragged is dropped nowhere.
+        egui::DragAndDrop::clear_payload(&e.ctx);
+    }
+    // An inserted or changed `UiTheme` restyles egui once, between passes (no resource: the
+    // style is never touched).
+    theme.sync(&e.ctx, ui_theme.as_ref());
     e.ctx.begin_pass(raw);
     e.in_pass = true;
+    // `run_ui`'s top-level ui, handed to the plugins' begin hooks now and end hooks in
+    // `end_frame`. What they claim (a panel...) is not available to root-ui systems.
+    let ctx = e.ctx.clone();
+    let mut top = egui::Ui::new(
+        ctx.clone(),
+        egui::Id::new((ctx.viewport_id(), "__top_ui")),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+    e.run_pass_hooks(&mut top, PassHook::Begin);
+    e.available_rect = top.available_rect_before_wrap();
+    e.top_ui = Some(top);
 }
 
 /// `Stage::PostUpdate`: end the pass, tessellate and hand the frame to the render overlay.
@@ -299,7 +427,11 @@ pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) 
         }
         return;
     }
-    e.in_pass = false;
+    // The plugins' end hooks first (they may still show UI, end a drag-to-select, drop a
+    // drag-and-drop payload...), as in `run_ui`.
+    if let Some(mut top) = e.top_ui.take() {
+        e.run_pass_hooks(&mut top, PassHook::End);
+    }
     // Query interaction state while the pass state is still the current one.
     // (egui's own `is_pointer_over_egui` relies on `run_ui` bookkeeping, so the background
     // layer is tested against our root-ui available rect instead.)
@@ -312,7 +444,7 @@ pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) 
     let any_down = e.ctx.input(|i| i.pointer.any_down());
     e.wants_pointer = e.ctx.egui_is_using_pointer() || (e.pointer_over && !any_down);
     e.wants_keyboard = e.ctx.egui_wants_keyboard_input();
-    let output = e.ctx.end_pass();
+    let output = e.end_pass();
     for cmd in &output.platform_output.commands {
         if let egui::OutputCommand::CopyText(text) = cmd {
             e.clipboard.clone_from(text);

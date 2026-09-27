@@ -11,15 +11,35 @@
 //!   headless target — so UI shows up in `render_to_image` screenshots.
 //! * [`UiAppExt::add_ui_system`] registers `|ctx: &egui::Context, sys: &mut SystemCtx|` UI code;
 //!   [`UiAppExt::add_root_ui_system`] gets the frame's root [`egui::Ui`] for panels.
-//! * Debug overlay (**F3**, [`DebugOverlay`]): FPS, frame-time graph, tick / tick rate /
-//!   dropped ticks, [`space3d_render::RenderStats`] and entity count.
+//! * Pointer: mouse buttons reach egui in the order they happened
+//!   (`space3d_platform::Input::mouse_button_events`), each where the cursor was; a release
+//!   outside the window goes where egui last saw the pointer (no hover at the window's corner);
+//!   `egui::Event::WindowFocused` follows the window's focus. A release that no device event
+//!   reported — the window lost the focus, or the OS shows the button up with no release event —
+//!   is a cancel: egui registers neither a click nor a drop (see `docs/platforms.md`, "Mouse
+//!   buttons, focus and the UI").
+//! * egui plugins get their pass hooks (`on_begin_pass` before the UI systems, `on_end_pass`
+//!   after them), which egui itself only runs from `Context::run_ui`: the built-in ones (label
+//!   text selection, drag-and-drop, `egui::debug_text`) and those added with
+//!   [`EguiContext::add_plugin`].
+//! * Debug overlay (**F3**, [`DebugOverlay`]): FPS, frame-time sparkline, tick / tick rate /
+//!   dropped ticks, [`space3d_render::RenderStats`] and entity count in a small monospace grid.
 //! * Profiler (**F4**, [`Profiler`]): per-system timings aggregated from the core's `system`
 //!   trace spans by a `tracing` layer ([`ProfilerLayer`]), shown as a sorted table and a
 //!   flame-style frame timeline.
 //! * Console (**`**, [`Console`]): log lines captured from `tracing` ([`ConsoleLayer`]) and a
 //!   command registry.
+//! * The three tools are compact under any egui style: they size themselves (their own `Ui`
+//!   only) and never change the global style (see `docs/ui.md`). They dock to the corners of the
+//!   screen, or of the [`ToolDockArea`] a host with its own panels sets (the editor's viewport,
+//!   a band a game's HUD leaves free: side by side when it is too short to stack them), follow
+//!   it when it is resized, and stay above the game's windows.
 //! * [`UiTextures`] shows renderer render targets (e.g. a `Camera3d` rendering to a texture) as
 //!   egui images.
+//! * Opt-in density ([`theme`]): `app.insert_resource(UiTheme::compact())` applies the compact
+//!   preset's [`UiDensity`] tokens (spacing, control and text sizes, corner radii) to egui's
+//!   style once, before the next pass; without a [`UiTheme`] resource the engine never touches
+//!   egui's `Style`.
 //!
 //! Headless determinism: with [`UiPlugin::deterministic`] (fixed `pixels_per_point`, no
 //! animations, no dithering) and egui time taken from [`space3d_core::Time`], the same inputs
@@ -46,10 +66,13 @@
 pub mod console;
 mod context;
 pub mod debug;
+mod dock;
 mod input;
 mod overlay;
 pub mod profiler;
 mod textures;
+pub mod theme;
+mod tool;
 mod tracing_setup;
 
 pub use console::{Console, ConsoleCommand, ConsoleLayer, LogLevel, LogLine};
@@ -60,6 +83,10 @@ pub use egui_wgpu;
 pub use input::{REPEAT_DELAY, REPEAT_INTERVAL, REPEAT_KEYS, egui_key, egui_logical_key, physical_key_for_egui_key};
 pub use profiler::{FrameTimeline, Profiler, ProfilerLayer, SystemStats, TimelineSpan};
 pub use textures::UiTextures;
+pub use theme::{
+    ThemePreview, UiDensity, UiTheme, UiThemeSync, apply_density, apply_theme, compact_style, visible_scroll_bars,
+};
+pub use tool::{ToolDockArea, set_tool_dock_area};
 pub use tracing_setup::{TracingInstall, install_tracing, tracing_install_state};
 
 use overlay::EguiOverlay;
@@ -168,13 +195,17 @@ impl Plugin for UiPlugin {
         );
 
         let mut translator = input::InputTranslator::default();
+        let mut theme = UiThemeSync::default();
         let settings = self.clone();
         app.add_system_named(Stage::PreUpdate, "ui::begin_frame", move |sys| {
-            context::begin_frame(sys, &mut translator, &settings);
+            context::begin_frame(sys, &mut translator, &mut theme, &settings);
         });
         let keys = (self.debug_overlay_key, self.profiler_key, self.console_key);
         app.add_system_named(Stage::PreUpdate, "ui::hotkeys", move |sys| debug::hotkeys(sys, keys));
-        app.add_system_named(Stage::Update, "ui::debug_overlay", debug::debug_overlay_system);
+        let hint = debug::tool_keys_hint(self.profiler_key, self.console_key);
+        app.add_system_named(Stage::Update, "ui::debug_overlay", move |sys| {
+            debug::debug_overlay_system(sys, &hint);
+        });
         app.add_system_named(Stage::Update, "ui::profiler", profiler::profiler_system);
         app.add_system_named(Stage::Update, "ui::console", console::console_system);
         app.add_system_named(Stage::PostUpdate, "ui::end_frame", move |sys| {
@@ -219,5 +250,8 @@ impl UiAppExt for App {
 
 /// Common imports.
 pub mod prelude {
-    pub use crate::{Console, DebugOverlay, EguiContext, Profiler, UiAppExt, UiPlugin, UiTextures, egui};
+    pub use crate::{
+        Console, DebugOverlay, EguiContext, Profiler, ToolDockArea, UiAppExt, UiDensity, UiPlugin, UiTextures, UiTheme,
+        egui,
+    };
 }

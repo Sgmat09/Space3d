@@ -55,6 +55,14 @@ fn build_tree(world: &World) -> Tree {
     Tree { names, children, roots }
 }
 
+/// Entities the hierarchy lists (editor-internal ones are hidden).
+pub(crate) fn entity_count(world: &World) -> usize {
+    world
+        .iter()
+        .filter(|e| !world.satisfies::<&EditorInternal>(e.entity()))
+        .count()
+}
+
 /// Whether moving `child` under `parent` keeps the hierarchy acyclic.
 pub fn can_reparent(world: &World, child: Entity, parent: Option<Entity>) -> bool {
     match parent {
@@ -72,26 +80,29 @@ pub fn hierarchy_ui(
 ) -> Vec<HierarchyAction> {
     let mut actions = Vec::new();
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(filter)
-                .hint_text("search")
-                .desired_width(ui.available_width() - 30.0),
-        );
-        ui.menu_button("+", |ui| {
-            for kind in AddKind::ALL {
-                if ui.button(kind.label()).clicked() {
-                    actions.push(HierarchyAction::Add(kind, None));
-                    ui.close();
+        // "+" at the right end, the search field fills the rest of the row.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button("+", |ui| {
+                for kind in AddKind::ALL {
+                    if ui.button(kind.label()).clicked() {
+                        actions.push(HierarchyAction::Add(kind, None));
+                        ui.close();
+                    }
                 }
-            }
+            });
+            ui.add(
+                egui::TextEdit::singleline(filter)
+                    .hint_text("search")
+                    .desired_width(ui.available_width()),
+            );
         });
     });
-    ui.separator();
     let tree = build_tree(world);
+    let drop_height = ui.spacing().interact_size.y;
     egui::ScrollArea::vertical()
         .id_salt("space3d_hierarchy")
         .auto_shrink([false, false])
-        .max_height(ui.available_height() - 36.0)
+        .max_height(ui.available_height() - drop_height - ui.spacing().item_spacing.y)
         .show(ui, |ui| {
             let filter = filter.to_lowercase();
             if filter.is_empty() {
@@ -111,11 +122,11 @@ pub fn hierarchy_ui(
             }
         });
     // Drop zone: make root.
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), drop_height), egui::Sense::hover());
     let hovering = response.dnd_hover_payload::<Entity>().is_some();
     ui.painter().rect_stroke(
         rect,
-        4.0,
+        2.0,
         egui::Stroke::new(
             1.0,
             if hovering {
@@ -130,8 +141,8 @@ pub fn hierarchy_ui(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         "drop here to unparent",
-        egui::FontId::proportional(11.0),
-        egui::Color32::GRAY,
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().text_color(),
     );
     if let Some(child) = response.dnd_release_payload::<Entity>() {
         actions.push(HierarchyAction::Reparent {
@@ -177,7 +188,11 @@ fn entity_label(
     selected: Option<Entity>,
     actions: &mut Vec<HierarchyAction>,
 ) {
-    let response = ui.add(egui::Button::selectable(selected == Some(e), name).sense(egui::Sense::click_and_drag()));
+    let response = ui.add(
+        egui::Button::selectable(selected == Some(e), name)
+            .wrap_mode(egui::TextWrapMode::Truncate)
+            .sense(egui::Sense::click_and_drag()),
+    );
     if response.clicked() || response.drag_started() {
         actions.push(HierarchyAction::Select(e));
     }

@@ -6,6 +6,10 @@
 //!   suspend/resume (surface recreation).
 //! * [`Input`] — keyboard, mouse, multi-touch and (stub) gamepads, fully injectable for tests
 //!   (`Input::inject_*`); [`ActionMap`] + [`ActionState`] map named actions to bindings.
+//!   Mouse buttons keep their order within a frame ([`Input::mouse_button_events`]); releases
+//!   that no release event reported — a focus loss, or (macOS, Windows) the OS showing a held
+//!   button up once per frame — are cancels ([`MouseButtonCause`]): the UI registers no click
+//!   and no drop for them.
 //! * [Keyboard layouts](#keyboard-layouts) — logical keys ([`KeyEvent`]) and key labels
 //!   ([`Input::key_label`]) that follow the player's layout; see [`layout`].
 //! * Web: `init_web_logging()` (wasm32 only), canvas attachment via [`WindowPlugin::canvas_id`].
@@ -54,6 +58,7 @@ pub mod background;
 mod input;
 pub mod layout;
 pub mod mobile;
+mod os_buttons;
 mod runner;
 #[cfg(target_arch = "wasm32")]
 mod web;
@@ -62,7 +67,7 @@ mod window;
 pub use background::{background_mode, set_background_mode};
 pub use input::{
     ActionMap, ActionState, ActionValue, Binding, ButtonState, Gamepad, GamepadAxis, GamepadButton, Input, InputPlugin,
-    KeyCode, KeyEvent, MouseButton, Touch, TouchPhase,
+    KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchPhase,
 };
 pub use layout::{
     KeyLabel, KeyLabelSource, KeyLocation, KeyboardLayout, LogicalKey, NamedKey, english_key_name,

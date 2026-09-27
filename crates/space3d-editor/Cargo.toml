@@ -16,7 +16,8 @@ space3d-ui.workspace = true
 egui.workspace = true
 space3d-assets.workspace = true
 space3d-scene.workspace = true
-space3d-stories.workspace = true
+# The storybook viewer lists the engine's UI stories too.
+space3d-stories = { workspace = true, features = ["ui"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

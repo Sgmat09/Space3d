@@ -42,14 +42,14 @@
 //! | `assets` | asset server, loaders, hot reload, texture/mesh editing | `assets` (yes) |
 //! | `audio` | kira audio, spatial emitters | `audio` (yes) |
 //! | `physics` | rapier physics | `physics` (yes) |
-//! | `particles` | particle effects (own prelude: `space3d::particles::prelude`) | `particles` (no) |
+//! | `particles` | particle effects, `.pfx.ron` loader (own prelude: `space3d::particles::prelude`) | `particles` (no) |
 //! | `scene` | scenes, prefabs, snapshots | `scene` (yes) |
 //! | `net` | HTTP/WebSocket clients + native servers | `net` (yes) |
 //! | `db` | SQLite / localStorage stores | `db` (yes) |
 //! | `ui` | egui integration, debug overlay | `ui` (yes) |
 //! | `editor` | scene inspector, texture & model editors | `editor` (no) |
 //! | `github` | releases, update checker, crash reporter | `github` (no) |
-//! | `stories` | storybook | `stories` (no) |
+//! | `stories` | storybook, with the engine's UI stories (builds egui) | `stories` (no) |
 //! | `test` | test harness, input simulation, golden screenshots | `test` (no) |
 //!
 //! ## Environment variables understood by the plugin groups
