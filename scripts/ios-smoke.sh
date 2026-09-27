@@ -243,7 +243,7 @@ for EXAMPLE in "${EXAMPLES[@]}"; do
   STREAM_PID=$!
 
   # Run with the console attached (stderr: the engine's log lines), in the background.
-  SIMCTL_CHILD_RUST_LOG="info,space3d_platform=debug,winit::platform_impl::ios::app_state=error" \
+  SIMCTL_CHILD_RUST_LOG="info,space3d_platform=debug,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=error,winit::platform_impl::ios::app_state=error" \
     deadline 600 xcrun simctl launch --console-pty --terminate-running-process "$UDID" "$BUNDLE_ID" \
     > "$CONSOLE" 2>&1 &
   CONSOLE_PID=$!
