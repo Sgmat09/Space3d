@@ -234,10 +234,17 @@ def refresh():
 
 
 def run_tests():
-    run([
-        "cargo", "test", "--manifest-path", VENDORED / "Cargo.toml",
-        "--target-dir", ROOT / "target" / "third_party", "--lib", "text::",
-    ])
+    # A path dependency's warnings are not capped as a crates.io crate's are: CI's
+    # `-D warnings` applies to the vendored code, so check it here too (third_party/README.md).
+    rustflags = (os.environ.get("RUSTFLAGS", "") + " -D warnings").strip()
+    print(f"+ RUSTFLAGS={rustflags!r}", file=sys.stderr)
+    result = subprocess.run(
+        ["cargo", "test", "--manifest-path", str(VENDORED / "Cargo.toml"),
+         "--target-dir", str(ROOT / "target" / "third_party"), "--lib", "text::"],
+        cwd=ROOT, env={**os.environ, "RUSTFLAGS": rustflags}, check=False,
+    )
+    if result.returncode != 0:
+        fail("the vendored epaint's tests failed or it has warnings (third_party/README.md)")
     run(["cargo", "test", "-p", "space3d-ui", "--test", "kinsoku"])
 
 

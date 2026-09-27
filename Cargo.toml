@@ -156,7 +156,7 @@ panic = "unwind"
 # epaint with a small patch (third_party/README.md, third_party/epaint.kinsoku.patch). Every
 # Space3d app, test and example lays text out with it; games add the same line, see
 # docs/ui.md "Chinese and Japanese line breaking". Keep its version equal to `egui` above:
-# after an egui bump run scripts/update-epaint.sh (cargo only warns about an unused patch;
+# after an egui bump run scripts/update-epaint.py (cargo only warns about an unused patch;
 # `epaint_resolves_to_the_vendored_kinsoku_copy` in space3d-ui fails).
 [patch.crates-io]
 epaint = { path = "third_party/epaint" }

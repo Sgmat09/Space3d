@@ -151,9 +151,18 @@ licenses), rewrites the patch for the new line numbers and this file's "Vendored
 checks that cargo resolves epaint to the copy, and runs the kinsoku tests. Commit
 `third_party/` with `Cargo.lock`. If the patch doesn't apply, the script leaves the new crate
 with the rejected hunks (`*.rej`) in a temporary directory: copy it over `third_party/epaint`,
-port the hunks by hand (the hook is small: `RowBreakCandidates::{add, get,
-forget_before_idx}`), then `python3 scripts/update-epaint.py --refresh` and the tests. After
-any hand edit of `third_party/epaint`, run `--refresh` too, or the CI check fails.
+port the hunks by hand (the hook: the new fields of `RowBreakCandidates`, its `add`, `get` and
+`forget_before_idx`, and the call to `get` in `line_break`), then
+`python3 scripts/update-epaint.py --refresh` and the tests. After any hand edit of
+`third_party/epaint`, run `--refresh` too, or the CI check fails.
+
+Warnings: cargo caps lints (`--cap-lints allow`) only for crates from a registry or git, not
+for a path dependency like `third_party/epaint`. rustc's warnings in the vendored code show up
+in Space3d builds, and CI's `RUSTFLAGS: -D warnings` turns them into errors in every job, as
+for Space3d's own code (which the copy now is). epaint 0.36.2 builds without a warning
+(native, its tests, wasm32). The script runs the vendored tests with `-D warnings`, so a new
+epaint or a Rust update that brings a warning fails there, on the bump branch: fix it in the
+copy (or `#[allow]` it) and `--refresh`, which records the change in `epaint.kinsoku.patch`.
 
 Drop the copy (and the `[patch]`, the CLI template line and the docs) if egui ever ships
 equivalent rules; the space3d-ui tests say whether it does.
