@@ -572,7 +572,7 @@ each gate run alone, but the GPU was shared: another app kept it at 72–78 % de
 |---|---|---|---|
 | shadow 2048², 100k instanced casters ≤ 0.30 ms | `--test shadows -- --ignored shadow_map_gate` | ECS 0.277 / 0.277 / 0.278 ms (3 runs, `GpuMultiDraw`) | met |
 | forward full screen, all maps + IBL + PCF9 ≤ +0.20 ms | `--test environment -- --ignored forward_full_screen_gate` | legacy 0.181 → 0.298 ms, paired +0.121 ms | met |
-| IBL bake ≤ 3 ms (1024² faces) | `--test environment -- --ignored ibl_bake_gate` | compute 0.98 ms (upload 0.32 + bake 0.66); fragment path 5.5 ms (recorded) | met |
+| IBL bake ≤ 3 ms (1024² faces) | `--test environment -- --ignored ibl_bake_gate` | compute 0.98 ms (upload 0.32 + bake 0.66); fragment path 5.5 ms (recorded); HDR skies gated since the M2 final review (below) | met |
 | all post ≤ 0.60 ms | `cargo bench -p space3d-render --bench post -- post/gate` | 0.405 ms over Direct (throughput) | met |
 | particles 100k: sim + compaction ≤ 0.06 ms, draw ≤ 0.40 ms | `-p space3d-particles --lib -- --ignored gpu_100k_within_budget` | 0.048 ms; 0.382 ms into the HDR scene texture | met |
 | bloom 6 levels at 1080p ≤ 0.20 ms | `--lib -- --ignored bloom_gate_1080p` | best 0.193 ms in the first invocation; 0.211 and 0.232 ms (best of 3 runs each) in the next two | soft: the test's own note says 30–70 % device utilization from other apps reads 0.19–0.30 ms; the lane measured 0.15–0.17 ms on an idle GPU |
@@ -593,7 +593,7 @@ Integration builder, `graphics` after the M2 merges. The reference scene of spec
 `space3d_stories::showcase` (`spawn_battle` + `dress_battle`): 300 ships of three procedural
 hulls with base color, packed ORM, normal and emissive maps (one material per faction: 9
 instanced batches), 60 asteroids, the nebula sky as `Skybox` and `EnvironmentLight`, one sun with
-a `DirectionalShadow` (`ShadowFit::top_down`), the particle load of
+a `DirectionalShadow` (`ShadowFit::top_down`) and a shadowless fill light (M2 final review), the particle load of
 `space3d_particles::testing::battle` (900 engine exhausts, 64 ribbons, 16 beams, 30 explosions a
 second with their light flashes — 41 point lights —, hits, shield ripples, warps' shockwaves),
 `battle_look()` (AgX punchy, +0.5 EV, bloom, vignette) and two 256² render-target ship previews
@@ -769,3 +769,58 @@ met, their levers (a GPU strip builder with incremental uploads, the compute blo
 deferred (spec §4.4 amendment). Round 1 adds no per-frame work: the companion reservations run
 only when an instance or entry table grows, the velocity smoothing is a few multiplies per
 emitter per tick.
+
+### M2 final review — HDR sky bake, shadow fill, T3's particle budget
+
+Graphics maintainer, answering the M2 final review. Dev machine, release; load averages 14–40
+from other processes (a simulator app and a Python job at 100 % each), so pairs of runs are
+interleaved with the previous commit (8b324fe) built alongside.
+
+**IBL bake of HDR skies (spec §4.4: ≤ 3 ms one-time).** Round 1 made HDR radiance cubes
+`Rg11b10Ufloat` for the VRAM line, but core WebGPU cannot write that format from compute, so
+their conversion and mips fell back to a render pass per face and mip (66 for 1024² faces, after
+a copy through a temporary `Rgba16Float` cube). The review's probe (the showcase's 1024² sky with
+its environment, `ibl.bake` GPU scope, upload and bake in one frame) measured 9.6 ms at High, 74
+steps, against 1.1–1.2 ms and 18 steps before round 1; `ibl_bake_gate` measured LDR faces only. Where
+the adapter writes `Rg11b10Ufloat` from compute (`GraphicsCaps::compact_hdr_storage`, requested
+through `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`: Apple GPUs, most Vulkan and D3D12
+drivers) the compact cube is converted and mipmapped by one dispatch per mip again; elsewhere
+with compute (WebGPU) HDR skies stay `Rgba16Float` (`GraphicsCaps::hdr_sky_format`: +33.5 MB for a
+1024² sky rather than 66 render passes once; 8-bit skies are unaffected).
+
+| measurement | before | after |
+|---|---|---|
+| the review's probe, showcase sky 1024², High (steps, `ibl.bake`) | 74 steps, 9.6–9.7 ms | 19 steps, 1.46 ms |
+| the same at Low / Medium / Ultra | 8.5–8.9 / 9.0 / 9.9–10.4 ms | 0.42 / 0.55 / 1.92 ms |
+| `ibl_bake_gate`, 1024² LDR faces (upload + bake, medians of 5) | 0.98 ms | 0.55, 1.14 ms (two runs) |
+| `ibl_bake_gate`, 1024² HDR faces (`Rgba16Float` source, new) | — | 1.85, 1.82 ms (11 + 7 dispatches) |
+| `ibl_bake_gate`, 4096 × 2048 HDR panorama (new) | — | 2.15, 1.95 ms (12 + 7) |
+| fragment path (WebGL2's, recorded): LDR / HDR faces / HDR panorama | — | 4.0–8.3 / 8.8–9.4 / 7.4–9.6 ms |
+| Battle VRAM at High, 1080p (`battle_steady_state`) | 196.4 MB | 196.4 MB (sky + IBL 50.4 MB) |
+
+**Shadow fill.** The showcase lit shadowed sides with the nebula's irradiance (≈ 0.03) × 0.7 and
+a 0.015 ambient: 1.6 % of a sunlit top's light on a side facing away from the sun, 3 % on a top in
+a cast shadow — black after tonemapping. Diffuse IBL × 6 (`ENV_DIFFUSE`), a shadowless violet
+`DirectionalLight` at 0.35 against the 2.2 sun (`spawn_fill`) and ambient 0.03 give 15 %, 17 % in
+a cast shadow, 72 % on a side facing the sun (`showcase::tests::fill_keeps_shadowed_sides_readable`,
+Metal and ANGLE alike). Cost, with the Look's and Battle's asteroids now 64 × 40 spheres with rock
+detail maps: the Battle's GPU frame at High 1.52–1.55 ms against 1.46–1.48 ms for the previous
+commit in four interleaved pairs (+0.04–0.08 ms: the fill in the forward loop, the shadow pass
+0.049 → 0.071 ms); CPU `render_frame` 1.46–1.50 against 1.43–1.55 ms (unchanged; gate 1.5 ms,
+met in every pair at load 14–20; at load 30–40 both commits read 1.54–1.57 ms).
+
+**T3's particle budget.** The Battle at Low on the web (8 192, quality 0.125) held 5 s but not
+20: the load keeps setting small new peaks, and at 8b324fe it refused 393 layer instances in 20 s
+from 5.25 s in (seed 1), 307 from 3.1 s (seed 3), 562 from 1.1 s (seed 4), 4 from 16.2 s (seed 2)
+and 1 185 at 21:9 from the first tick, peaks 6 171–6 780 slots — engine plumes and afterburners
+among them. With the engines' sparks and heat haze left out below quality 0.3
+(`ParticleLayer::min_quality`), their plumes `Normal` in a `Low` effect and an explosion's smoke,
+embers and debris `Low` in a `High` one (`ParticleLayer::priority`), and quality 0.1 on the web:
+no refusal in 20 s at 16:9 with any of the four seeds, peaks 4 481–5 187 slots (84 % of the
+engines' 6 144 at most), every engine in view burning; at 21:9, 103 `Low` layer instances (engine
+details, combat's leftovers) refused, no plume (`tests/battle.rs::battle_fits_the_web_budget_at_low`). The 5 s table in
+[particles.md](graphics/particles.md) is re-measured with the ships on seven flight levels.
+
+**Other gates on this tree.** `battle_gpu_cost` passes (particle draws 0.300 ms);
+`battle_steady_state` and `battle_steady_state_low_and_medium`: no reallocations, no textures or
+render objects created in the steady state.
