@@ -50,6 +50,8 @@ pub(crate) struct WinitRunner {
     exiting: bool,
     applied_title: String,
     applied_cursor: (bool, bool),
+    /// Shape last passed to `Window::set_cursor` (`None`: not set yet).
+    applied_icon: Option<crate::window::CursorIcon>,
     surface_retry: SurfaceRetry,
     layout_watch: LayoutWatch,
     buttons: ButtonReconciler,
@@ -160,6 +162,7 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         raw_mouse_motion: false,
         exiting: false,
         applied_cursor: (true, false),
+        applied_icon: None,
         surface_retry: SurfaceRetry::default(),
         layout_watch: LayoutWatch::default(),
         buttons: ButtonReconciler::default(),
@@ -219,6 +222,19 @@ impl WinitRunner {
             .with_resizable(s.resizable);
         if crate::background::background_mode() {
             attrs = attrs.with_active(false);
+        }
+        if let Some(icon) = &s.icon {
+            match winit::window::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height) {
+                Ok(icon) => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        use winit::platform::windows::WindowAttributesExtWindows;
+                        attrs = attrs.with_taskbar_icon(Some(icon.clone()));
+                    }
+                    attrs = attrs.with_window_icon(Some(icon));
+                }
+                Err(e) => tracing::warn!("window icon ignored: {e}"),
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -381,9 +397,18 @@ impl WinitRunner {
         let Some(window) = self.window.clone() else {
             return;
         };
+        let requested = self
+            .app
+            .resources
+            .get::<crate::window::WindowCursor>()
+            .map_or(Some(crate::window::CursorIcon::Default), |c| c.icon);
         let (title, cursor) = {
             let s = self.state();
-            (s.title.clone(), (s.cursor_visible, s.cursor_grab))
+            // The pointer shows only while both the game and the UI want it.
+            (
+                s.title.clone(),
+                (s.cursor_visible && requested.is_some(), s.cursor_grab),
+            )
         };
         if title != self.applied_title {
             window.set_title(&title);
@@ -400,6 +425,25 @@ impl WinitRunner {
                 let _ = window.set_cursor_grab(CursorGrabMode::Confined);
             }
             self.applied_cursor = cursor;
+        }
+        // Through winit (not a one-off OS call): Windows re-applies the window's cursor on every
+        // WM_SETCURSOR and macOS resets it from the view's cursor rects.
+        if let Some(icon) = requested
+            && self.applied_icon != Some(icon)
+        {
+            window.set_cursor(icon);
+            self.applied_icon = Some(icon);
+        }
+        if let Some(icon) = self.applied_icon
+            && let Some(c) = self.app.resources.get_mut::<crate::window::WindowCursor>()
+        {
+            let applied = crate::window::AppliedCursor {
+                icon,
+                visible: cursor.0,
+            };
+            if c.applied() != Some(applied) {
+                c.set_applied(applied);
+            }
         }
     }
 }

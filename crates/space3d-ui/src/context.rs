@@ -91,6 +91,8 @@ pub struct EguiContext {
     injected: Vec<egui::Event>,
     clipboard: String,
     cursor_icon: egui::CursorIcon,
+    /// `cursor_icon` has been written to `space3d_platform::WindowCursor` at least once.
+    cursor_sent: bool,
     stats: UiFrameStats,
     /// Plugins whose pass hooks the engine runs, in order.
     plugin_hooks: Vec<(TypeId, HookRunner)>,
@@ -126,6 +128,7 @@ impl EguiContext {
             injected: Vec::new(),
             clipboard: String::new(),
             cursor_icon: egui::CursorIcon::Default,
+            cursor_sent: false,
             stats: UiFrameStats::default(),
             plugin_hooks: builtin_hooks(),
             top_ui: None,
@@ -450,7 +453,11 @@ pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) 
             e.clipboard.clone_from(text);
         }
     }
-    e.cursor_icon = output.platform_output.cursor_icon;
+    // Only a change of egui's cursor is passed on, so a cursor a game sets itself (e.g. a
+    // crosshair in flight) stays until egui asks for a different one.
+    let new_cursor = output.platform_output.cursor_icon;
+    let cursor_changed = new_cursor != e.cursor_icon || !e.cursor_sent;
+    e.cursor_icon = new_cursor;
     let ppp = output.pixels_per_point;
     let primitives = e.ctx.tessellate(output.shapes, ppp);
     let (mut vertices, mut indices) = (0, 0);
@@ -469,4 +476,53 @@ pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) 
         pixels_per_point: ppp,
     };
     crate::overlay::lock(overlay).set_frame(primitives, ppp, output.textures_delta, natives);
+    if cursor_changed && let Some(window_cursor) = sys.resources.get_mut::<space3d_platform::WindowCursor>() {
+        window_cursor.icon = winit_cursor(new_cursor);
+        if let Some(e) = sys.resources.get_mut::<EguiContext>() {
+            e.cursor_sent = true;
+        }
+    }
+}
+
+/// egui's cursor as the window's (`None` hides the pointer), as egui-winit maps it.
+pub fn winit_cursor(icon: egui::CursorIcon) -> Option<space3d_platform::CursorIcon> {
+    use egui::CursorIcon as E;
+    use space3d_platform::CursorIcon as W;
+    Some(match icon {
+        E::None => return None,
+        E::Default => W::Default,
+        E::ContextMenu => W::ContextMenu,
+        E::Help => W::Help,
+        E::PointingHand => W::Pointer,
+        E::Progress => W::Progress,
+        E::Wait => W::Wait,
+        E::Cell => W::Cell,
+        E::Crosshair => W::Crosshair,
+        E::Text => W::Text,
+        E::VerticalText => W::VerticalText,
+        E::Alias => W::Alias,
+        E::Copy => W::Copy,
+        E::Move => W::Move,
+        E::NoDrop => W::NoDrop,
+        E::NotAllowed => W::NotAllowed,
+        E::Grab => W::Grab,
+        E::Grabbing => W::Grabbing,
+        E::AllScroll => W::AllScroll,
+        E::ResizeHorizontal => W::EwResize,
+        E::ResizeNeSw => W::NeswResize,
+        E::ResizeNwSe => W::NwseResize,
+        E::ResizeVertical => W::NsResize,
+        E::ResizeEast => W::EResize,
+        E::ResizeSouthEast => W::SeResize,
+        E::ResizeSouth => W::SResize,
+        E::ResizeSouthWest => W::SwResize,
+        E::ResizeWest => W::WResize,
+        E::ResizeNorthWest => W::NwResize,
+        E::ResizeNorth => W::NResize,
+        E::ResizeNorthEast => W::NeResize,
+        E::ResizeColumn => W::ColResize,
+        E::ResizeRow => W::RowResize,
+        E::ZoomIn => W::ZoomIn,
+        E::ZoomOut => W::ZoomOut,
+    })
 }

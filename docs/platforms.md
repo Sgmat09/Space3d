@@ -344,6 +344,25 @@ does not know about do not run, and `egui::Context::on_begin_pass` / `on_end_pas
 is what the runner does on a focus loss, and `Input::release_mouse_button(b,
 MouseButtonCause::OsReconciled)` is what the OS check does.
 
+## The mouse cursor and the window icon
+
+The pointer shape over the window is the `WindowCursor` resource (inserted by `WindowPlugin`).
+`space3d-ui` writes egui's cursor into it whenever egui asks for a different one (the I-beam
+over text fields, resize arrows, a pointing hand where the game asks for it with
+`on_hover_cursor` or egui's `interact_cursor` style); a game may set `WindowCursor::icon`
+itself (a crosshair in flight, say), and that stays until egui's cursor changes. After every
+frame the runner applies it with winit's `Window::set_cursor`, so it survives Windows
+re-applying the window cursor on `WM_SETCURSOR` and macOS's cursor rects. `icon: None` (egui's
+`CursorIcon::None`) hides the pointer, as does `WindowState::cursor_visible = false`; grabbing
+(`cursor_grab`) is independent. `WindowCursor::applied()` reports what was last applied to a
+real window (shape and visibility; `None` headless), for tests that run a window in background
+mode.
+
+`WindowPlugin::icon` sets the window icon (title bar, Alt-Tab) from RGBA8 pixels
+(`WindowIcon { rgba, width, height }` or `WindowIcon::from_image`); on Windows it is also the
+taskbar icon, which Windows 11 otherwise shows blank for an exe without an embedded icon. macOS
+ignores it (the Dock shows the app bundle's icon); the web and mobile use their own manifests.
+
 ## CI and releases
 
 `space3d ci init --targets desktop,web,android,ios` (also run by `space3d new`) writes

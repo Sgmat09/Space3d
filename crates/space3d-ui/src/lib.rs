@@ -80,7 +80,7 @@ mod tool;
 mod tracing_setup;
 
 pub use console::{Console, ConsoleCommand, ConsoleLayer, LogLevel, LogLine};
-pub use context::{EguiContext, UiFrameStats};
+pub use context::{EguiContext, UiFrameStats, winit_cursor};
 pub use debug::DebugOverlay;
 pub use egui;
 pub use egui_wgpu;

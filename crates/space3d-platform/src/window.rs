@@ -29,6 +29,79 @@ pub struct WindowPlugin {
     pub canvas_id: Option<String>,
     /// Exit when the window is closed (otherwise only [`PlatformEvent::CloseRequested`] is sent).
     pub exit_on_close: bool,
+    /// Window icon (title bar, Alt-Tab) and, on Windows, the taskbar icon. `None` uses the
+    /// platform default. Ignored on macOS (the Dock shows the app bundle's icon), the web and
+    /// mobile.
+    pub icon: Option<WindowIcon>,
+}
+
+/// An RGBA8 window icon (see [`WindowPlugin::icon`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowIcon {
+    /// Row-major RGBA8 pixels, `width * height * 4` bytes.
+    pub rgba: Vec<u8>,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+impl WindowIcon {
+    /// An icon from an RGBA8 image.
+    pub fn from_image(image: &space3d_core::ImageData) -> Self {
+        Self {
+            rgba: image.pixels.clone(),
+            width: image.width,
+            height: image.height,
+        }
+    }
+}
+
+pub use winit::window::CursorIcon;
+
+/// The pointer shape shown over the window (resource, inserted by [`WindowPlugin`]).
+///
+/// `space3d-ui` writes egui's cursor here whenever egui asks for a different one (pointing hand
+/// over buttons, I-beam over text fields, resize arrows...); a game may write it too, and the
+/// last write wins. After every frame the runner applies it to the OS window with winit's
+/// `Window::set_cursor`, which Windows re-applies on `WM_SETCURSOR` and macOS keeps through its
+/// cursor rects. The pointer is visible only while [`Self::icon`] is `Some` and
+/// [`WindowState::cursor_visible`] is `true`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowCursor {
+    /// Requested shape; `None` hides the pointer (egui's `CursorIcon::None`).
+    pub icon: Option<CursorIcon>,
+    applied: Option<AppliedCursor>,
+}
+
+impl Default for WindowCursor {
+    fn default() -> Self {
+        Self {
+            icon: Some(CursorIcon::Default),
+            applied: None,
+        }
+    }
+}
+
+impl WindowCursor {
+    /// What the runner last applied to a real OS window; `None` before the first frame with a
+    /// window, and always without one (headless apps, tests without a window).
+    pub fn applied(&self) -> Option<AppliedCursor> {
+        self.applied
+    }
+
+    pub(crate) fn set_applied(&mut self, applied: AppliedCursor) {
+        self.applied = Some(applied);
+    }
+}
+
+/// A cursor the runner applied to the OS window (see [`WindowCursor::applied`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedCursor {
+    /// Shape set with `Window::set_cursor` (kept while hidden).
+    pub icon: CursorIcon,
+    /// Whether the pointer is shown.
+    pub visible: bool,
 }
 
 impl Default for WindowPlugin {
@@ -42,6 +115,7 @@ impl Default for WindowPlugin {
             msaa_samples: 4,
             canvas_id: None,
             exit_on_close: true,
+            icon: None,
         }
     }
 }
@@ -70,6 +144,7 @@ impl Plugin for WindowPlugin {
             cursor_visible: true,
             cursor_grab: false,
         });
+        app.init_resource::<WindowCursor>();
         let settings = self.clone();
         app.set_runner(move |app| crate::runner::run(app, settings));
     }
