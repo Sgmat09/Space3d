@@ -407,7 +407,7 @@ impl ParticleSettings {
     /// | | Low (WebGL2 / C-class) | Medium (iGPU, Apple, mobile) | High (dGPU) and Ultra |
     /// |---|---|---|---|
     /// | backend, budget | CPU, 16 384 (8 192 on the web) | GPU, 262 144 (65 536 on Android / iOS) | GPU, 262 144 |
-    /// | `quality` (spawn counts of `lod` layers, and their rings) | 0.25 (0.125 on the web) | 1 (0.75 mobile) | 1 |
+    /// | `quality` (spawn counts of `lod` layers, and their rings) | 0.25 (0.1 on the web) | 1 (0.75 mobile) | 1 |
     /// | `lod` (rate × `min_scale` from `far`) | 1000 → 2500, × 0.25 | 1200 → 3000, × 0.5 | off |
     /// | `offscreen_scale` | 0 (nothing off screen) | 0.5 (0.125 mobile) | 1 |
     /// | `max_ribbon_segments` | 16 384 | 65 536 | 65 536 |
@@ -416,22 +416,45 @@ impl ParticleSettings {
     /// Medium and up assume the GPU backend: on a device without compute (WebGL2, GLES 3.0)
     /// they fall back to the CPU backend's budget, which their loads do not fit. Use
     /// [`Self::for_quality_on`] with the device's capabilities (or
-    /// `GraphicsQuality::recommended`, which picks Low there).
+    /// `GraphicsQuality::recommended`, which picks Low there). [`Self::for_quality_web`] is the
+    /// web build's column on any target (tools and tests).
     ///
     /// The LOD distances are for a top-down camera 400–1000 units above the flight plane (the
     /// SpaceCorps2027 battle view): emitters on screen keep their full rate, those off screen or
-    /// far away thin out. With these, the Battle scene's 300 ships (900 engines, 30 explosions a
-    /// second, …) keep 100k+ particles at High and fit every tier's budget without refusing a
-    /// layer, every engine in view burning. Other tiers use the defaults.
+    /// far away thin out. Below quality 0.3 (Low) the built-ins leave their detail layers out
+    /// (`ParticleLayer::min_quality`: engine sparks and heat haze), and under a full budget
+    /// their essential layers outrank the details (`ParticleLayer::priority`: engine plumes
+    /// outlast an explosion's smoke and embers). With these, the Battle scene's 300 ships (900
+    /// engines, 30 explosions a second, …) keep 100k+ particles at High and fit every tier's
+    /// budget without refusing a layer, every engine in view burning — at Low on the web too, at
+    /// T3's 16:9 through the game's camera for 20 s and more (`tests/battle.rs`). Other tiers
+    /// use the defaults.
     pub fn for_quality(q: GraphicsQuality) -> Self {
-        let mobile = cfg!(any(target_os = "android", target_os = "ios"));
-        let web = cfg!(target_arch = "wasm32");
+        Self::tier(
+            q,
+            cfg!(target_arch = "wasm32"),
+            cfg!(any(target_os = "android", target_os = "ios")),
+        )
+    }
+
+    /// [`Self::for_quality`] as the web build (wasm32) gets it, on any target: the CPU
+    /// backend's 8 192 budget, and Low's spawn quality 0.1.
+    pub fn for_quality_web(q: GraphicsQuality) -> Self {
+        Self::tier(q, true, false)
+    }
+
+    fn tier(q: GraphicsQuality, web: bool, mobile: bool) -> Self {
+        let base = Self {
+            max_particles_cpu: if web { 8_192 } else { 16_384 },
+            ..Self::default()
+        };
         match q {
             GraphicsQuality::Low => Self {
                 backend: ParticleBackend::Cpu,
-                max_particles_cpu: if web { 8_192 } else { 16_384 },
                 max_ribbon_segments: 16_384,
-                quality: if web { 0.125 } else { 0.25 },
+                // The web's 8 192: 0.125 left the Battle's peaks within 3 % of the engines'
+                // 75 % (and over it with other seeds); 0.1 keeps 14 % below it.
+                quality: if web { 0.1 } else { 0.25 },
                 lod: ParticleLod {
                     near: 1000.0,
                     far: 2500.0,
@@ -439,7 +462,7 @@ impl ParticleSettings {
                 },
                 offscreen_scale: 0.0,
                 max_screen_size: 0.6,
-                ..Self::default()
+                ..base
             },
             GraphicsQuality::Medium => Self {
                 max_particles: if mobile { 65_536 } else { 262_144 },
@@ -450,9 +473,9 @@ impl ParticleSettings {
                     min_scale: 0.5,
                 },
                 offscreen_scale: if mobile { 0.125 } else { 0.5 },
-                ..Self::default()
+                ..base
             },
-            _ => Self::default(),
+            _ => base,
         }
     }
 

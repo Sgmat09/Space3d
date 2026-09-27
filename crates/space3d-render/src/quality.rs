@@ -303,6 +303,7 @@ mod tests {
             hdr_format: float.then_some(wgpu::TextureFormat::Rgba16Float),
             hdr_msaa: float,
             compact_hdr_format: None,
+            compact_hdr_storage: false,
             bloom_format: float.then_some(wgpu::TextureFormat::Rgba16Float),
             exposure_format: float.then_some(wgpu::TextureFormat::R32Float),
             read_only_depth: true,

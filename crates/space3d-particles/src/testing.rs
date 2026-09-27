@@ -78,7 +78,8 @@ pub fn gpu_pool_bytes(app: &App) -> Option<u64> {
 
 /// The particle load of graphics spec §4.4's "Battle" reference scene, scaled by its fields
 /// (used by the battle calibration test, the perf test and the `Engine/Particles/Stress/Battle`
-/// story): ships flying circles on the flight plane with three engine exhausts each (every 30th
+/// story): ships flying circles around the flight plane (on seven levels 10 units apart, so
+/// crossing ships pass over each other) with three engine exhausts each (every 30th
 /// boosting with two afterburners: ribbons), a laser bolt with its trail every tick, missiles
 /// with smoke trails ending in explosions, held lasers and repair beams between ships, and a
 /// stream of one-shots — explosions, hit sparks, shield ripples, debris, warps (distortion
@@ -159,8 +160,11 @@ pub fn battle(app: &mut App, b: Battle) {
             let s = mix(seed, k);
             let a = rnd(s, 1) * std::f32::consts::TAU;
             let d = b.radius * rnd(s, 2).sqrt();
+            // Seven flight levels 10 units apart (−30..30, more than a hull is tall): crossing
+            // circles pass over each other instead of through, but for one pair in seven.
+            let level = ((rnd(s, 7) * 7.0).floor().min(6.0) - 3.0) * 10.0;
             Orbit {
-                anchor: Vec3::new(a.cos() * d, 0.0, a.sin() * d),
+                anchor: Vec3::new(a.cos() * d, level, a.sin() * d),
                 r: 40.0 + 80.0 * rnd(s, 3),
                 w: (0.004 + 0.006 * rnd(s, 4)) * if rnd(s, 5) < 0.5 { 1.0 } else { -1.0 },
                 phase: rnd(s, 6) * std::f32::consts::TAU,

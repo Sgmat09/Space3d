@@ -769,13 +769,14 @@ impl Runtime {
             }
             // `lod` layers get rings for the instance's quality × LOD level (looping ones
             // restart with other rings when it moves past that level: `lod_rings_outgrown`);
-            // none at level 0 (they would emit nothing: off screen with `offscreen_scale` 0).
-            if layer.lod && ring <= 0.0 {
+            // none at level 0 (they would emit nothing: off screen with `offscreen_scale` 0),
+            // nor below the layer's `min_quality` (a detail the level leaves out).
+            if layer.lod && (ring <= 0.0 || ring < layer.min_quality) {
                 continue;
             }
             let q = if layer.lod { ring } else { 1.0 };
             let cap = layer::capacity_for(layer, q, ring_speed);
-            let Some((base, c)) = self.reserve(cap, effect.priority) else {
+            let Some((base, c)) = self.reserve(cap, layer.priority.unwrap_or(effect.priority)) else {
                 missing = true;
                 if retry {
                     continue;

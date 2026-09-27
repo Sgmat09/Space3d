@@ -63,20 +63,52 @@ pub fn spawn_sun(world: &mut World, fit: ShadowFit) -> Entity {
 /// brighter than the backdrop, or metal would reflect next to nothing.
 pub const ENV_SPECULAR: f32 = 2.5;
 
-/// The sky as `camera`'s `Skybox` and its image-based lighting (`EnvironmentLight`), and a
-/// faint blue ambient for the shadowed sides.
+/// Diffuse image-based lighting × the sky: the fill of what the sun does not reach. The
+/// nebula's irradiance is about 0.03 (the cosine-weighted mean radiance a side of a hull sees,
+/// the sun left out: a dark sky), so at 1 a shadowed side gets about 1.4 % of what the sun's
+/// 2.2 gives a lit top and reads as black. At 6 the nebula-tinted fill is about 0.18; with
+/// [`spawn_fill`] and the ambient a side facing away from the sun gets about 15 % of a sunlit
+/// top (20 % of a side facing the sun), a top in a cast shadow about 17 %: dark, but the hull's
+/// panels and colors stay readable (docs/graphics/materials.md, "Fill light").
+pub const ENV_DIFFUSE: f32 = 6.0;
+
+/// The sky as `camera`'s `Skybox` and its image-based lighting (`EnvironmentLight`: diffuse
+/// [`ENV_DIFFUSE`], specular [`ENV_SPECULAR`]), and a faint blue ambient for the shadowed sides
+/// (0.03: what reaches them before the environment is baked, and with the environment off).
 pub fn add_environment(world: &mut World, resources: &mut Resources, assets: &ShowcaseAssets, camera: Entity) {
     let _ = world.insert(
         camera,
         (
             Skybox::new(assets.sky),
-            EnvironmentLight::new(assets.sky).with_intensity(0.7, ENV_SPECULAR),
+            EnvironmentLight::new(assets.sky).with_intensity(ENV_DIFFUSE, ENV_SPECULAR),
         ),
     );
     resources.insert(AmbientLight {
         color: Vec3::new(0.45, 0.55, 1.0),
-        intensity: 0.015,
+        intensity: 0.03,
     });
+}
+
+/// Direction the fill light travels: up from the nebula below the flight plane and away from
+/// the sun, so it reaches the undersides and the sides the sun leaves in shadow.
+pub fn fill_direction() -> Vec3 {
+    let sun = sun_direction();
+    Vec3::new(-sun.x, 0.55, -sun.z).normalize()
+}
+
+/// The fill: a shadowless violet `DirectionalLight` (intensity 0.35, 16 % of the sun)
+/// along [`fill_direction`] — the nebula's glow bouncing up onto the hulls. Together with the
+/// sky's diffuse lighting ([`ENV_DIFFUSE`]) it keeps the shadowed side of a hull readable from
+/// the top-down camera.
+pub fn spawn_fill(world: &mut World) -> Entity {
+    world.spawn((
+        Name("fill".into()),
+        Transform::IDENTITY.looking_at(fill_direction(), Vec3::Y),
+        DirectionalLight {
+            color: Vec3::new(0.62, 0.5, 1.0),
+            intensity: 0.35,
+        },
+    ))
 }
 
 /// A ship of hull `kind` and `faction` at `t` (the root entity carries the mesh; effects
@@ -220,6 +252,7 @@ pub fn spawn_look(app: &mut App, assets: &ShowcaseAssets, look: &LookScene) -> E
         let _ = app.world.remove_one::<EnvironmentLight>(camera);
     }
     let sun = spawn_sun(&mut app.world, ShadowFit::top_down(-20.0, 60.0, 400.0));
+    spawn_fill(&mut app.world);
     if !look.shadows {
         let _ = app.world.remove_one::<DirectionalShadow>(sun);
     }
@@ -465,6 +498,7 @@ pub fn spawn_battle(app: &mut App, scene: &BattleScene) -> BattleHandles {
         battle_look(),
     ));
     let sun = spawn_sun(&mut app.world, ShadowFit::top_down(-30.0, 90.0, 900.0));
+    spawn_fill(&mut app.world);
     space3d_particles::testing::battle(
         app,
         Battle {
@@ -558,7 +592,7 @@ pub fn spawn_previews(world: &mut World, resources: &mut Resources, assets: &Sho
                         near: 1.0,
                         far: 300.0,
                     }),
-                EnvironmentLight::new(assets.sky).with_intensity(0.7, ENV_SPECULAR),
+                EnvironmentLight::new(assets.sky).with_intensity(ENV_DIFFUSE, ENV_SPECULAR),
             )),
         );
         quads.push(rt);

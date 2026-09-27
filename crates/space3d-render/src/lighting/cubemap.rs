@@ -5,23 +5,28 @@
 //! (a `TEXTURE_CUBE_MAP` on GL, which picks the target from the layer count), sampled through a
 //! `Cube` view by the skybox and by environment bakes.
 //! * Format: HDR sources (`Rgba16Float` and other float formats) become `Rg11b10Ufloat` where it
-//!   can be rendered and filtered (`GraphicsCaps::compact_hdr_format`: 4 bytes a texel, half of
-//!   `Rgba16Float`, 6- and 5-bit mantissas are plenty for a sky), else `Rgba16Float` where that
-//!   renders (`GraphicsCaps::hdr_format`), else `Rgba8UnormSrgb` (values clamp at 1, warned
-//!   once); `Rgba8Unorm` stays linear; everything else becomes `Rgba8UnormSrgb`.
+//!   can be rendered and filtered and compute shaders write it, or nothing is computed
+//!   (`GraphicsCaps::hdr_sky_format`: 4 bytes a texel, half of `Rgba16Float`, 6- and 5-bit
+//!   mantissas are plenty for a sky), else `Rgba16Float` where that renders
+//!   (`GraphicsCaps::hdr_format`), else `Rgba8UnormSrgb` (values clamp at 1, warned once);
+//!   `Rgba8Unorm` stays linear; everything else becomes `Rgba8UnormSrgb`.
 //! * Faces already in that format are uploaded straight into it; others (compressed, other
 //!   float formats, or HDR without float targets) are uploaded into a temporary cube and copied
 //!   face by face. A panorama is uploaded as a 2D texture (with GPU mips where it can be
 //!   rendered) and converted face by face ([`Entry::Equirect`]: longitude 0 looks down −Z, +X
 //!   is to its right, the top row is +Y), sampled at the mip matching the face resolution.
-//! * The remaining mips are rendered face by face from the previous one (2×2 average).
+//! * The remaining mips are computed from the previous one (2×2 average): one dispatch per mip
+//!   where compute shaders can write the cube's format (`Rgba16Float`, `Rgba8Unorm`, sRGB
+//!   through its linear view, and `Rg11b10Ufloat` with `GraphicsCaps::compact_hdr_storage`),
+//!   else a render pass per face and mip (WebGL2, and `Rg11b10Ufloat` skies where storage
+//!   cannot write it: 66 passes for a 1024² sky, several ms of GPU once).
 //!
 //! Every pass is recorded in the frame the cubemap is uploaded (never budgeted: the sky needs
 //! the whole cube). Re-uploads (`update_cubemap`) replace the texture in the frame they are
 //! uploaded; the old one stays in use until then.
 
 use super::api::{CubemapHandle, CubemapSource, EnvironmentState};
-use super::environment::{BakeParams, Baker, Entry, Job, Plan, Target, full_mips};
+use super::environment::{BakeParams, Baker, Entry, Job, Plan, Target, Writes, full_mips};
 use crate::assets::{RenderAssets, TextureSource};
 
 /// A registered cubemap.
@@ -237,17 +242,17 @@ pub(super) struct Upload {
 }
 
 /// Create the radiance cube of `source` (`hdr`: `Rgba16Float` renders, `compact`:
-/// `Rg11b10Ufloat` renders; [`radiance_format`]), write the pixels it
-/// takes directly and plan the conversion and mip steps (compute dispatches with `compute`,
-/// else fragment passes; panorama mips are always rendered, and only those the conversion
-/// samples).
+/// `Rg11b10Ufloat` renders; [`radiance_format`]), write the pixels it takes directly and plan
+/// the conversion and mip steps (compute dispatches where `writes` allows them for the cube's
+/// format, else fragment passes; panorama mips are always rendered, and only those the
+/// conversion samples).
 pub(super) fn plan_upload(
     baker: &mut Baker,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     source: &CubemapSource,
     (hdr, compact): (bool, bool),
-    compute: bool,
+    writes: Writes,
     id: u64,
 ) -> Result<Upload, String> {
     let max = device.limits().max_texture_dimension_2d;
@@ -274,7 +279,7 @@ pub(super) fn plan_upload(
             }
             let format = radiance_format(src.format, hdr, compact);
             let mips = full_mips(size);
-            let cube = Target::cube(device, "space3d cubemap", size, mips, format, compute);
+            let cube = Target::cube(device, "space3d cubemap", size, mips, format, writes);
             let provided = src.mip_level_count.clamp(1, mips);
             if format == src.format {
                 bytes += write_layers(queue, &cube.texture, src, provided)?;
@@ -317,7 +322,7 @@ pub(super) fn plan_upload(
             }
             let format = radiance_format(src.format, hdr, compact);
             let mips = full_mips(size);
-            let cube = Target::cube(device, "space3d cubemap", size, mips, format, compute);
+            let cube = Target::cube(device, "space3d cubemap", size, mips, format, writes);
             // A face texel spans 90°/size, a panorama texel 360°/width: the conversion samples
             // the panorama mip where they match, so only the mips up to it are needed.
             let lod = (src.width as f32 / (4.0 * size as f32)).log2().max(0.0);

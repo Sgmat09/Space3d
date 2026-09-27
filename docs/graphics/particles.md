@@ -194,7 +194,7 @@ nothing (its emitters finish, warned) — `tests/assets.rs`. A `SpriteTexture::P
 | motion | `direction`: `Shape`, `Fixed(v)`, `Random`, `Inward`, `Tangent`; `spread` (cone half-angle); `speed`; `speed_scale_exponent`; `inherit_velocity`; `drag` (1/s, exact exponential); `gravity`; `forces` (≤ 4: `Attractor`, `Vortex`, `Turbulence`); `world_forces` (mask of `ParticleAttractor` entities, ≤ 8 per tick); `space`: `World` (stay where emitted) or `Local` (move with the emitter) |
 | life | `lifetime`, `particle_delay` (appear later, staggered bursts) |
 | look | `size` + `size_over_life`, `aspect`, `rotation` + `angular_velocity`, `random_mirror`, `color_over_life` (linear HDR gradient), `start_color` (random between two), `alpha_over_life`, `coverage` + `coverage_over_life` (premultiplied), `intensity`, `flicker`, `tinted` |
-| quality | `lod` (quality and distance LOD may reduce counts; bursts keep ≥ 1) |
+| quality | `lod` (quality and distance LOD may reduce counts; bursts keep ≥ 1), `min_quality` (a detail layer left out of instances whose quality × LOD level is below it; default 0), `priority` (the layer's budget priority; default the effect's) |
 | throttle | `throttle: ThrottleResponse { rate, speed, size, intensity }`: with the emitter's throttle `t` (`rate_scale`, clamped to `max_rate_scale`) the rates scale by `t^rate` (default 1: linear), initial speeds by `t^speed`, sprite sizes by `t^size` and brightness by `t^intensity` (default 0: no response). `t = 0` emits nothing. A flame keeps its density and gets shorter and dimmer instead: `ENGINE_EXHAUST`'s plume has `(rate: 0.25, speed: 0.6, size: 0.3, intensity: 0.5)`, so partial throttle never breaks it into puffs |
 | render | `SpriteRender { shape, flipbook, blend, facing, soft_distance, near_fade, order, sort, target, max_screen_size }` |
 
@@ -211,7 +211,9 @@ the vertex shader reads, so the CPU never evaluates them per particle.
   into a flat disc — unchanged up to 1×), `Streak { core, taper }`
   (a capsule whose width and brightness taper toward its tail, with a hot head; pair it with
   `VelocityStretched`), `Ring { thickness, focus, fill }` (focus sharpens it toward the sprite's
-  +X: shield arcs; the band sits inside the rim, which fades over 1.5 pixels),
+  +X: shield arcs; the band sits inside the rim, which fades over 1.5 pixels; a small ring —
+  an expanding shockwave's first frames, a distant one — keeps a band at least 2.5 pixels wide,
+  its light spread over it, never a crisp hairline circle),
   `Smoke { breakup, hot_core }` (four noise octaves for the outline; inside, the light follows
   a billow field with a cheap bump light from the sprite's upper left, so a fireball reads as a
   rolling volume rather than a flat disc), `Vortex { arms, twist }`, and `Texture(...)` (see
@@ -271,8 +273,10 @@ needed), with a round end there:
   (a soft glow, a hard band, a white-hot center line).
 * **Along it**: `uv: Stretch` (0 at the tail … 1 at the head) or `Tile { length }` (fixed to the
   path: a texture stays where it was laid); `scroll` moves the texture and the `noise` breakup
-  toward the head at that many units of `u` per second; `texture` multiplies the color (layer 0
-  of an array).
+  toward the head at that many units of `u` per second (two octaves of value noise whose
+  lattices are sheared against each other across the strip, so no diamond-shaped cells; where
+  the breakup would drop below 0.3 of the color it eases toward 0 exponentially — thin patches,
+  never hard-edged holes); `texture` multiplies the color (layer 0 of an array).
 * `blend` as sprites (additive ribbons of a layer share one draw; alpha and premultiplied ones
   draw one each, back to front with the emitters), `soft_distance`, `order`, `tinted`.
 * A stopped, hidden or orphaned emitter's ribbon drains (no head); the effect finishes once its
@@ -632,7 +636,11 @@ when run by tools):
   design); over the budget rings shrink to 1/8 before a layer instance is refused
   (`ParticleStats::{shrunk, refused}`, logged once per effect; a looping instance retries a
   refused layer every 15 ticks). `EffectPriority::Low` stops at 75 % of the pool, `Normal` at
-  90 %, `High` may use it all (the engines are `Low`, explosions and EMPs `High`). Slots a
+  90 %, `High` may use it all (the engines are `Low`, explosions and EMPs `High`); a layer's
+  `priority` overrides its effect's, so an effect's essential layers outrank the details of
+  others: the engines' and afterburners' plumes (and the afterburner's core) are `Normal`, an
+  explosion's lingering smoke and embers and all of `DEBRIS_SPARKS`' debris `Low` — under a
+  full budget the leftovers of combat are refused before a ship's flame. Slots a
   built-in reserves per instance at quality 1 (`runtime::tests::builtin_slots`; ribbon points in
   parentheses): `EXPLOSION` 82, `HIT_SPARK` 16, `SHIELD_RIPPLE` 8, `WARP_IN` / `WARP_OUT` 29,
   `ENGINE_EXHAUST` 171 (its rates at the afterburner's `max_rate_scale` 2: the plume's
@@ -681,7 +689,7 @@ Battle scene, `tests/battle.rs`):
 | | Low (WebGL2 / C-class) | Medium (iGPU, Apple, mobile) | High (dGPU) |
 |---|---|---|---|
 | backend, budget | CPU, 16 384 (8 192 on the web) | GPU, 262 144 (65 536 on Android / iOS) | GPU, 262 144 |
-| `quality` | 0.25 (0.125 on the web) | 1 (0.75 on mobile) | 1 |
+| `quality` | 0.25 (0.1 on the web) | 1 (0.75 on mobile) | 1 |
 | `lod` (distance from the primary camera) | 1000 → 2500, × 0.25 | 1200 → 3000, × 0.5 | off |
 | `offscreen_scale` | 0 (off-screen engines emit nothing) | 0.5 (0.125 on mobile) | 1 |
 | `max_ribbon_segments` | 16 384 | 65 536 | 65 536 |
@@ -699,21 +707,38 @@ Battle scene, `tests/battle.rs`):
   ones when it falls two levels below (its old particles drain meanwhile; the margin around the
   view puts the restart off screen). A thinned layer draws its fewer particles `(1/level)^¼`
   bigger and brighter, so a sparse plume stays continuous (at quality 0.25 an exhaust looks
-  close to full; at 0.125 it just starts to bead).
+  close to full; at 0.125 it just starts to bead, and the web's 0.1 is close to that).
+* **Details first.** A `lod` layer with `min_quality` is left out of instances whose level is
+  below it (not reserved, not counted as refused): the built-in engines' and afterburners'
+  sparks and heat haze have 0.3, so Low (0.25; 0.1 on the web) and far or off-screen emitters
+  at Medium spend their share on the flame. `ParticleSettings::for_quality_web(q)` is the web
+  column on any target.
 * **Visible first.** Under a LOD, the emitters new in a tick start the most visible first, so a
   full budget refuses what is least seen.
 
-The Battle scene (`testing::battle`: 300 ships with three engine exhausts each, 20 boosting,
-64 ribbons, 16 beams, 30 explosions a second plus the missiles', 120 hits a second with shield
-ripples, debris, warps and EMPs; the game's battle camera at 640 × 360), 5 s in:
+The Battle scene (`testing::battle`: 300 ships flying circles on seven levels 10 units apart,
+with three engine exhausts each, 20 boosting, 64 ribbons, 16 beams, 30 explosions a second plus
+the missiles', 120 hits a second with shield ripples, debris, warps and EMPs; the game's battle
+camera at 640 × 360), 5 s in:
 
 | tier | alive | reserved / budget | refused, shrunk | engines in view burning | explosions playing |
 |---|---|---|---|---|---|
-| High | 101 976 | 169 814 / 262 144 | 0, 0 | 119 of 119 | 188 of 188 |
-| Medium | 60 674 | 108 054 / 262 144 | 0, 0 | 119 of 119 | 188 of 188 |
-| Medium (mobile) | 22 084 | 45 114 / 65 536 | 0, 0 | 119 of 119 | 188 of 188 |
-| Low | 4 931 | 9 784 / 16 384 | 0, 0 | 119 of 119 | 188 of 188 |
-| Low (web) | 2 663 | 5 624 / 8 192 | 0, 0 | 119 of 119 | 188 of 188 |
+| High | 101 863 | 175 953 / 262 144 | 0, 0 | 118 of 118 | 188 of 188 |
+| Medium | 61 456 | 113 173 / 262 144 | 0, 0 | 118 of 118 | 188 of 188 |
+| Medium (mobile) | 22 039 | 43 706 / 65 536 | 0, 0 | 118 of 118 | 188 of 188 |
+| Low | 4 512 | 9 012 / 16 384 | 0, 0 | 118 of 118 | 188 of 188 |
+| Low (web) | 1 973 | 4 353 / 8 192 | 0, 0 | 118 of 118 | 188 of 188 |
+
+**T3 (the web at Low) over time** (`battle_fits_the_web_budget_at_low`). Five seconds hid the
+problem the M2 final review found: the load keeps setting small new peaks (explosions by tick
+hash), and with quality 0.125, every engine layer reserved and the plumes as `Low` as the rest
+of the engine, the Battle refused layer instances from 5.2 s in (393 in 20 s; with other seeds
+from the first seconds, at 21:9 at once) — engine plumes and afterburners were dropped. With the
+details left out, the plumes `Normal` and quality 0.1, four seeds run 20 s at 16:9 without a
+refusal; the busiest tick reserves 4 481–5 187 slots (seed 4: 84 % of the engines' 6 144). At
+21:9 more engines are in view and the budget binds (103 `Low` layer instances refused in 20 s:
+nozzle glows, shock diamonds, combat's smoke, embers and debris), but no plume: every engine in
+view burns.
 
 Story `Engine/Particles/Stress/Battle` renders it (knob `quality`).
 
@@ -850,6 +875,6 @@ and stories within the perceptual tolerance of Metal (`tests/gl.rs`).
 | lasers drawn in the egui overlay | `builtin::LASER_SHOT` per hitscan shot (`EffectSpawn::at(muzzle).beam_to(BeamEnd::World(hit)).tint(color)`, it despawns itself), or `LASER_BEAM` for a held laser (`beam_to(BeamEnd::Entity(..))`, looping: stop or despawn it); they are HDR particles now, so they bloom and sit in the scene's depth |
 | missiles, heavy hits, EMPs, repairs | `MISSILE_TRAIL` (follow the missile), `DEBRIS_SPARKS`, `EMP`, `REPAIR_BEAM` |
 | `1 − e^−x` soft clip in the overlay | `direct_soft_clip` in Direct mode and at render scales below 1 without post; with `PostProcess` the tonemapper and bloom take over |
-| the game's graphics quality setting | `ParticleSettings::for_quality(GraphicsQuality::…)` (Low on WebGL2: the CPU backend, 16k / 8k on the web, quality 0.25 / 0.125, off-screen engines culled) |
+| the game's graphics quality setting | `ParticleSettings::for_quality(GraphicsQuality::…)` (Low on WebGL2: the CPU backend, 16k / 8k on the web, quality 0.25 / 0.1, off-screen engines culled, detail layers left out) |
 | heat haze, shockwaves (none in the game today) | built in: `EXPLOSION`, `WARP_IN` / `WARP_OUT`, `EMP`, `ENGINE_EXHAUST`, `ENGINE_AFTERBURNER` bend the image behind them through `PostProcess` (distortion on by default); custom ones with `SpriteRender::distortion(strength)` or `DistortionMaterial` meshes |
 | the battle camera's look | choose it explicitly (frame.md, "Choose the look explicitly"): `AgXPunchy` + 0.5 EV keeps faction exhaust, lasers and fire saturated but skews dim saturated nebulae toward their strongest channel; plain `AgX` with `ColorGrading::vivid()` keeps both; `KhronosPbrNeutralNoToe` passes display-authored art unchanged |

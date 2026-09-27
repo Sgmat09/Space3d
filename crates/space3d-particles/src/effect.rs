@@ -119,6 +119,12 @@ impl ParticleEffect {
                     reason: "lifetime must be a non-negative range".into(),
                 });
             }
+            if !(0.0..=1.0).contains(&l.min_quality) {
+                return Err(EffectError::Invalid {
+                    layer: l.name.clone(),
+                    reason: format!("min_quality {} (0 to 1)", l.min_quality),
+                });
+            }
         }
         for r in &self.ribbons {
             if !(2..=MAX_RIBBON_POINTS).contains(&r.max_points) {
@@ -261,6 +267,18 @@ pub struct ParticleLayer {
     pub tinted: bool,
     /// Quality / LOD may reduce counts. Default true.
     pub lod: bool,
+    /// `lod` layers only: the layer is left out of instances whose quality × LOD level (the
+    /// ring level, `ParticleSettings::quality` halved per LOD step) is below this — a detail
+    /// (sparks, heat haze, embers) that low tiers and distant emitters drop instead of
+    /// spending the budget on it. Default 0: always kept. The built-in engines' sparks and
+    /// heat haze use 0.3 (dropped at `GraphicsQuality::Low`'s 0.25, 0.1 on the web).
+    pub min_quality: f32,
+    /// Budget priority of this layer's ring; `None` (default): the effect's
+    /// `ParticleEffect::priority`. An effect's essential layer can outrank its details and
+    /// another effect's leftovers: the built-in engine plumes are `Normal` in a `Low` effect
+    /// (they outlast an explosion's smoke and embers, `Low` in a `High` one, when the budget
+    /// runs out).
+    pub priority: Option<EffectPriority>,
     /// Override the computed ring size: the most particles of one layer instance alive at
     /// once (older ones are overwritten). Computed by default from the rates at
     /// `max_rate_scale`, the bursts and the life window, with `rate_per_distance` taken at
@@ -356,6 +374,8 @@ impl Default for ParticleLayer {
             render: SpriteRender::default(),
             tinted: true,
             lod: true,
+            min_quality: 0.0,
+            priority: None,
             capacity: None,
             throttle: ThrottleResponse::default(),
         }

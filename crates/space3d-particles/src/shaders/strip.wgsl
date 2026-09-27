@@ -181,11 +181,18 @@ fn fs_strip(in: S3dpStripOut) -> @location(0) vec4<f32> {
     }
     if (p.z > 0.0) {
         // Scrolling breakup: value noise along the strip (2 and 4 cells per unit of u: whole
-        // periods of the wrapped noise over the CPU's 128-unit rebase) and across it.
+        // periods of the wrapped noise over the CPU's 128-unit rebase) and across it. The
+        // octaves' lattices are sheared against each other across the strip (u + v·k keeps the
+        // periods), so their cells never line up into diamonds.
         let seed = f32(in.bits & 0xffu);
-        let n = s3dp_noise_wrap(vec2<f32>(in.uvl.x * 2.0, in.uvl.y * 1.2 + seed)) * 0.65
-            + s3dp_noise_wrap(vec2<f32>(in.uvl.x * 4.0 + 17.0, in.uvl.y * 2.6 + seed * 1.7)) * 0.35;
-        let k = max(1.0 + p.z * (2.0 * n - 1.0) * 1.6, 0.0);
+        let v = in.uvl.y;
+        let n = s3dp_noise_wrap(vec2<f32>(in.uvl.x * 2.0 + v * 0.7, v * 1.2 + seed)) * 0.65
+            + s3dp_noise_wrap(vec2<f32>(in.uvl.x * 4.0 + 17.0 - v * 1.3, v * 2.6 + seed * 1.7)) * 0.35;
+        // Thin patches, never holes: below 0.3 the breakup eases toward 0 exponentially
+        // (continuous in value and slope) instead of clamping at 0 — a hard-edged gap where the
+        // noise dipped (M2 final review).
+        let x = 1.0 + p.z * (2.0 * n - 1.0) * 1.6;
+        let k = select(0.3 * exp((x - 0.3) / 0.3), x, x >= 0.3);
         body = body * k;
         core = core * k;
     }

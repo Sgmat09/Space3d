@@ -258,7 +258,7 @@ render-target previews — `space3d_stories::showcase::{spawn_battle, dress_batt
 | particles 100k: sim + compaction / draw | ≤ 0.06 / 0.40 ms | 0.048 / 0.382 ms |
 | shadow 2048², 100k casters | ≤ 0.30 ms | 0.28 ms |
 | full-screen lit pixels, all maps + IBL + PCF9, over the old shader | ≤ +0.20 ms | +0.12 ms |
-| IBL bake | ≤ 3 ms | 0.98 ms |
+| IBL bake (LDR faces / HDR faces / HDR panorama) | ≤ 3 ms | 0.5–1.3 / 1.8 / 2.0–2.2 ms |
 
 Per-tier Battle figures and the history of every gate: [performance.md](performance.md). Design
 targets for other devices (T1 dGPU ≈ 5.8 ms, T2 Apple M1 ≈ 11 ms, T3 WebGL2 iGPU at Low ≈ 12.8

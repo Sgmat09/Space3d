@@ -285,7 +285,16 @@ or build it from the six images the game already loads:
   default, pixel-identical to the old shader) keeps working with IBL, approximately.
 * **Brightness.** An LDR sky is radiance ≤ 1: `Skybox::intensity` scales the background,
   `EnvironmentLight::with_intensity(diffuse, specular)` the lighting. Lower `FLIGHT_LIGHTS`'
-  ambient (the environment's irradiance replaces most of it). The backdrop variant
+  ambient (the environment's irradiance replaces most of it).
+* **Shadows need a fill.** A dark nebula lights little: at diffuse 1 the sides the sun misses
+  and every cast shadow get 1–2 % of a sunlit surface's light and read as black (the M2 final
+  review's finding in the showcase). Aim for 10–20 % on a side facing away from the sun: raise
+  the diffuse intensity until `irradiance × intensity` is 7–10 % of the sun (a sky whose
+  irradiance is about 0.03 needs about 6), and add a shadowless `DirectionalLight` from the side
+  opposite the sun and a little from below, in the nebula's hue, at about 15 % of the sun — the
+  showcase's rig (`space3d_stories::showcase::{add_environment, spawn_fill}`: diffuse 6,
+  specular 2.5, a 0.35 violet fill against a 2.2 sun) gives 15 %. Keep the ambient faint.
+  [`materials.md`](materials.md#fill-light-dark-skies) explains the ratio. The backdrop variant
   (`spawn_backdrop_sky`, softened highlights under the station panels) becomes a second cubemap
   built from softened images, or the same one with a lower `Skybox::intensity`.
 * **Orientation.** `Skybox::rotation` / `EnvironmentLight::rotation` turn the sky if a sector's
@@ -295,8 +304,10 @@ or build it from the six images the game already loads:
 * **Memory.** An 8-bit 1024² sky is 25 MB of faces and 33.5 MB with its mips (six faces × 1024²
   × 4 B × 4/3); the environment bake adds about 4.2 MB, so one sector's sky costs about 38 MB
   (`RenderStats::lighting_bytes`: 37.8 MB for the game's M-1 sky loaded from its `.skybox`
-  manifest). An HDR sky costs the same where the device renders `Rg11b10Ufloat` (desktop Metal,
-  Vulkan, D3D12) and twice as much where it is kept `Rgba16Float` (GL, WebGL2: 67 MB at 1024²).
+  manifest). An HDR sky costs the same where the device renders `Rg11b10Ufloat` and compute
+  shaders write it (`GraphicsCaps::hdr_sky_format`: desktop Metal, most Vulkan and D3D12
+  drivers; its conversion and mips take about 1–2 ms of GPU once) and twice as much where it is
+  kept `Rgba16Float` (GL, WebGL2 and WebGPU: 67 MB at 1024²).
   The presets' recommended face sizes: 512 (Low, 8.4 MB with mips) / 1024 / 2048.
 
 `Engine/Environment/Skybox`, `Engine/Environment/IBL Spheres`, `Engine/Showcase/*`.
@@ -486,8 +497,14 @@ signatures, every node's pipelines (particles, sky) and the post pipelines.
 
 * WebGL2 gets `GraphicsQuality::Low` (`recommended`): render scale 0.75, FXAA, a 4-level bloom
   (off where the browser has no float color buffers: the Ldr fallback tonemaps per fragment), a
-  1024² PCF4 shadow, the CPU particle backend with 8 192 particles and thinner spawns, the IBL bake
-  spread over frames. WebGPU browsers get Medium or High.
+  1024² PCF4 shadow, the CPU particle backend with 8 192 particles and thinner spawns (quality
+  0.1 on the web; the built-ins leave their engines' sparks and heat haze out below 0.3, and
+  under a full budget the plumes outrank the explosions' smoke and embers: the Battle holds the
+  budget at 16:9 without dropping a plume), the IBL bake spread over frames. WebGPU browsers get
+  Medium or High.
+* The game's own effects can do the same: `ParticleLayer::min_quality` (a detail layer left out
+  below that quality × LOD level) and `ParticleLayer::priority` (a layer's budget priority,
+  overriding the effect's) are new, both defaulting to the old behavior.
 * Settings › Graphics can still offer every tier; clamp to Low on WebGL2 (`tier` above).
 * Try the web look on the desktop: `FrameSettings::downlevel = DownlevelOverride::webgl2()` and
   `RenderSettings::draw_path = Some(DrawPath::CpuDirect)`.
@@ -512,7 +529,7 @@ signatures, every node's pipelines (particles, sky) and the post pipelines.
 | 1 | done at M1 (`PostProcess` on every camera); M2: `KhronosPbrNeutralNoToe` replaces Neutral + `TONE_LIFT` (or AgX + `ColorGrading::vivid()`) |
 | 2 | Settings › Graphics drives `GraphicsQuality::apply` + `ParticleSettings::for_quality_on` (render scale done at M1); the grow-only budget workaround removed |
 | 3 | ship materials get their maps (`apply_material_maps`, emissive factor seeded where there is a map) and tangents; the maps are no longer discarded |
-| 4 | the sky is a `Skybox` cubemap and an `EnvironmentLight`; `ShadingModel::Standard` |
+| 4 | the sky is a `Skybox` cubemap and an `EnvironmentLight`; `ShadingModel::Standard`; shadowed sides get a 10–20 % fill |
 | 5 | the key light has a `DirectionalShadow` (`ShadowFit::top_down`); grid and walls opt out |
 | 6 | done at M1 (particles, the overlay in `HdrScene`); M2: `follow_world` for hits on moving ships, `velocity_smoothing: 0.1` in the game's exhaust effects |
 | 8 | previews use MSAA render targets and post; bloom only above ~240 px (`Bloom::min_rect_height`) |

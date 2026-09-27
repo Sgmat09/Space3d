@@ -78,16 +78,12 @@ fn battle_steady_state() {
     // targets (S, its MSAA copy, depth, bloom, distortion, previews) and the shadow map
     // (`target_bytes`: 146 MB at High, 1080p), the sky cubemap and the baked image-based
     // lighting (`lighting_bytes`: the 1024² HDR sky is `Rg11b10Ufloat` with mips where that
-    // renders, 33.5 MB, the 512² specular cube 17 MB), and the particle pool (≈ 23 MB at
-    // 262 144). The driver memory each render pass holds while its frame is in flight comes
-    // on top (spec §4.4, M1.1 amendment). Without `Rg11b10Ufloat` (GL) the sky is
-    // `Rgba16Float`, 67 MB: the parts are pinned instead.
-    let compact = app
-        .resources
-        .expect::<Renderer>()
-        .graphics_caps()
-        .compact_hdr_format
-        .is_some();
+    // renders and compute writes it, 33.5 MB, the 512² specular cube 17 MB), and the particle
+    // pool (≈ 23 MB at 262 144). The driver memory each render pass holds while its frame is in
+    // flight comes on top (spec §4.4, M1.1 amendment). Elsewhere (GL, `GraphicsCaps::
+    // hdr_sky_format`) the sky is `Rgba16Float`, 67 MB: the parts are pinned instead.
+    let compact = app.resources.expect::<Renderer>().graphics_caps().hdr_sky_format()
+        == Some(space3d_render::wgpu::TextureFormat::Rg11b10Ufloat);
     eprintln!(
         "VRAM textures: targets + shadow {:.1} MB, sky + IBL {:.1} MB",
         s.target_bytes as f64 / 1e6,

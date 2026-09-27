@@ -37,7 +37,7 @@ use crate::node::{RenderNodes, ViewInfo};
 use crate::pipeline::GpuView;
 use crate::stats::RenderStats;
 use api::{CubemapHandle, EnvironmentLight, EnvironmentState, LightingSettings, Skybox};
-use environment::{Baker, Env, EnvKey, Job};
+use environment::{Baker, Env, EnvKey, Job, Writes};
 use glam::{Mat3, Mat4, Quat};
 use space3d_core::{Entity, World};
 
@@ -230,12 +230,16 @@ impl Lighting {
         self.frame += 1;
         let frame = self.frame;
         let hdr = cx.graphics.hdr_format == Some(wgpu::TextureFormat::Rgba16Float);
-        // HDR skies in `Rg11b10Ufloat` where it renders: half the memory of `Rgba16Float` (a
-        // 1024² sky with mips: 33.5 MB instead of 67).
-        let compact = cx.graphics.compact_hdr_format == Some(wgpu::TextureFormat::Rg11b10Ufloat);
+        // HDR skies in `Rg11b10Ufloat` where it renders and compute writes it (or nothing is
+        // computed): half the memory of `Rgba16Float` (a 1024² sky with mips: 33.5 MB instead
+        // of 67; `GraphicsCaps::hdr_sky_format`).
+        let compact = cx.graphics.hdr_sky_format() == Some(wgpu::TextureFormat::Rg11b10Ufloat);
         // Compute dispatches (one compute pass) where compute shaders can write storage
-        // textures; fragment passes elsewhere (WebGL2, `DownlevelOverride::no_compute`).
+        // textures; fragment passes elsewhere (WebGL2, `DownlevelOverride::no_compute`). The
+        // compact HDR sky is written by compute where storage takes `Rg11b10Ufloat` (a 1024²
+        // sky: 11 dispatches instead of 66 render passes).
         let compute = cx.graphics.compute && cx.device.limits().max_storage_textures_per_shader_stage > 0;
+        let writes = Writes::new(compute, cx.graphics.compact_hdr_storage);
         let capacities = (
             self.uploads.capacity(),
             self.camera_envs.capacity(),
@@ -254,7 +258,7 @@ impl Lighting {
             };
             let id = self.next_id();
             let baker = self.baker.get_or_insert_with(|| Baker::new(cx.device));
-            match cubemap::plan_upload(baker, cx.device, cx.queue, &source, (hdr, compact), compute, id) {
+            match cubemap::plan_upload(baker, cx.device, cx.queue, &source, (hdr, compact), writes, id) {
                 Ok(upload) => {
                     let format = match &source {
                         api::CubemapSource::Faces(t) | api::CubemapSource::Equirect { texture: t, .. } => t.format,
@@ -323,7 +327,7 @@ impl Lighting {
                     self.next_id += 1;
                     let baker = self.baker.get_or_insert_with(|| Baker::new(cx.device));
                     self.envs
-                        .push(Env::new(baker, cx.device, light.cubemap, cube, key, compute, id, frame));
+                        .push(Env::new(baker, cx.device, light.cubemap, cube, key, writes, id, frame));
                     cx.stats.textures_created += 2;
                     self.envs.len() - 1
                 }

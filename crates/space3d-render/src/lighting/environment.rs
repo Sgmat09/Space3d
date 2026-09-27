@@ -205,13 +205,38 @@ impl Entry {
     }
 }
 
+/// How bake steps may write their targets (from the frame's capabilities).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Writes {
+    /// Compute dispatches write storage textures (else every step is a render pass).
+    pub compute: bool,
+    /// `Rg11b10Ufloat` is a write-only storage format (`GraphicsCaps::compact_hdr_storage`).
+    pub rg11b10: bool,
+}
+
+impl Writes {
+    /// Compute dispatches where they can write storage textures (`rg11b10`: HDR skies too).
+    pub fn new(compute: bool, rg11b10: bool) -> Self {
+        Self {
+            compute,
+            rg11b10: compute && rg11b10,
+        }
+    }
+}
+
 /// The storage format a compute step writes a texture of `format` through, and whether it
-/// encodes sRGB itself: `Rgba16Float` and `Rgba8Unorm` directly, `Rgba8UnormSrgb` through its
-/// `Rgba8Unorm` view (sRGB formats cannot be storage textures). `None`: rendered only.
-pub(super) fn storage_format(format: wgpu::TextureFormat) -> Option<(wgpu::TextureFormat, bool)> {
+/// encodes sRGB itself: `Rgba16Float`, `Rgba8Unorm` and (with `writes.rg11b10`)
+/// `Rg11b10Ufloat` directly, `Rgba8UnormSrgb` through its `Rgba8Unorm` view (sRGB formats
+/// cannot be storage textures). `None`: rendered only (no compute, or the format cannot be
+/// written by it).
+pub(super) fn storage_format(format: wgpu::TextureFormat, writes: Writes) -> Option<(wgpu::TextureFormat, bool)> {
     use wgpu::TextureFormat as F;
+    if !writes.compute {
+        return None;
+    }
     match format {
         F::Rgba16Float | F::Rgba8Unorm => Some((format, false)),
+        F::Rg11b10Ufloat if writes.rg11b10 => Some((format, false)),
         F::Rgba8UnormSrgb => Some((F::Rgba8Unorm, true)),
         _ => None,
     }
@@ -245,17 +270,18 @@ impl Target {
         texture_bytes(self.format, (self.size, self.size), 6, self.mips)
     }
 
-    /// A cube of `format`; with `compute` (and a storage-capable format), written by compute
-    /// dispatches — an `Rgba8UnormSrgb` cube is then an `Rgba8Unorm` texture viewed as sRGB.
+    /// A cube of `format`; written by compute dispatches where `writes` allows it for the
+    /// format ([`storage_format`]) — an `Rgba8UnormSrgb` cube is then an `Rgba8Unorm` texture
+    /// viewed as sRGB — else by render passes.
     pub fn cube(
         device: &wgpu::Device,
         label: &'static str,
         size: u32,
         mips: u32,
         format: wgpu::TextureFormat,
-        compute: bool,
+        writes: Writes,
     ) -> Self {
-        let storage = storage_format(format).filter(|_| compute);
+        let storage = storage_format(format, writes);
         let texture_format = storage.map_or(format, |(f, _)| f);
         let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -607,6 +633,7 @@ fn pipeline_layout(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> wgpu::
 fn storage_wgsl(format: wgpu::TextureFormat) -> &'static str {
     match format {
         wgpu::TextureFormat::Rgba16Float => "rgba16float",
+        wgpu::TextureFormat::Rg11b10Ufloat => "rg11b10ufloat",
         _ => "rgba8unorm",
     }
 }
@@ -958,7 +985,7 @@ impl Env {
     }
 
     /// Plan the bake of `cube` with `key` (textures and every step; nothing recorded yet), by
-    /// compute dispatches with `compute`, else by fragment passes.
+    /// compute dispatches where `writes` allows, else by fragment passes.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         baker: &mut Baker,
@@ -966,7 +993,7 @@ impl Env {
         cubemap: CubemapHandle,
         cube: &GpuCubemap,
         key: EnvKey,
-        compute: bool,
+        writes: Writes,
         id: u64,
         frame: u64,
     ) -> Self {
@@ -978,7 +1005,7 @@ impl Env {
             spec_size,
             spec_mips,
             key.format,
-            compute,
+            writes,
         );
         let irradiance = Target::cube(
             device,
@@ -986,7 +1013,7 @@ impl Env {
             key.irradiance_size,
             1,
             key.format,
-            compute,
+            writes,
         );
         let mut plan = Plan::default();
         let src = plan.source(cube.view.clone());

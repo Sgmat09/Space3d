@@ -13,7 +13,8 @@
 //! * a nebula sky ([`sky_faces`]: an HDR cubemap with violet and teal clouds below the flight
 //!   plane, the galactic band, stars up to 12× white and the sun) used as `Skybox` and
 //!   `EnvironmentLight`;
-//! * asteroids ([`asteroid_mesh`]) below the flight plane, where the ships' shadows fall.
+//! * asteroids ([`asteroid_mesh`]: mottled vertex albedo, tiling rock detail maps from
+//!   [`rock_maps`]) below the flight plane, where the ships' shadows fall.
 //!
 //! Scenes: [`spawn_look`] (a close-up skirmish: the SpaceCorps look) and the Battle reference
 //! scene of graphics spec §4.4 ([`spawn_battle`] + [`dress_battle`]), with the recommended post
@@ -25,14 +26,15 @@ mod perf;
 mod scenes;
 
 pub use content::{
-    ContentOptions, FACTIONS, Faction, HULL_NAMES, HULL_TILE, HullMaps, ShowcaseAssets, ShowcaseContent, asteroid_mesh,
-    hull_maps, hull_mesh, sky_faces, sky_panorama, sun_direction,
+    ContentOptions, FACTIONS, Faction, HULL_NAMES, HULL_TILE, HullMaps, RockMaps, ShowcaseAssets, ShowcaseContent,
+    asteroid_mesh, hull_maps, hull_mesh, rock_maps, sky_faces, sky_panorama, sun_direction,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use perf::{BattleReport, headless_battle, measure_battle};
 pub use scenes::{
-    BattleHandles, BattleScene, LookScene, SPACE, add_environment, battle_look, dress_battle, particle_settings,
-    spawn_asteroids, spawn_battle, spawn_engines, spawn_look, spawn_previews, spawn_ship, spawn_sun, turn_previews,
+    BattleHandles, BattleScene, ENV_DIFFUSE, ENV_SPECULAR, LookScene, SPACE, add_environment, battle_look,
+    dress_battle, fill_direction, particle_settings, spawn_asteroids, spawn_battle, spawn_engines, spawn_fill,
+    spawn_look, spawn_previews, spawn_ship, spawn_sun, turn_previews,
 };
 
 use crate::Story;
@@ -95,8 +97,9 @@ fn look_story(webgl2: bool) -> Story {
          top-down camera. Procedural hulls with all four maps (base color, packed ORM, normal, \
          emissive — window rows and faction stripes glowing in the faction's color), the nebula \
          sky as skybox and image-based lighting (metal panels mirror it), a sun whose shadows \
-         fall on the ships and the asteroids below, engines with afterburners, a laser beam \
-         with hit sparks and shield ripples, a repair beam, orange bolts, a missile's smoke \
+         fall on the ships and the textured asteroids below, lifted by the nebula's diffuse \
+         light and a violet fill so shadowed sides stay readable, engines with afterburners, a \
+         laser beam with hit sparks and shield ripples, a repair beam, orange bolts, a missile's smoke \
          ribbon, an explosion with debris, a light flash and a shockwave, a ship warping in \
          (distortion), bloom, AgX punchy +0.5 EV and a vignette (`battle_look`), all under a \
          `GraphicsQuality` preset (knob `quality`; High by default: MSAA 4, 7-level bloom, a \
@@ -192,6 +195,101 @@ mod tests {
     use super::*;
     use space3d_particles::ParticleSettings;
     use space3d_test::TestApp;
+
+    /// The showcase's lighting rig keeps the sides the sun does not reach readable (M2 final
+    /// review: with the sky's diffuse lighting at 0.7 and no fill they got about 1.6 % of a
+    /// sunlit top and read as black): a gray quad facing away from the sun (horizontally) gets
+    /// 12–30 % of the light of one facing up, the sun's own direction 0 % of its light — the
+    /// rest is the nebula-tinted fill of [`add_environment`] and [`spawn_fill`] — and a top in
+    /// a cast shadow (the sun's light taken away) 8–30 %. Direct output (no post), linear
+    /// luminance of the center pixel.
+    #[test]
+    fn fill_keeps_shadowed_sides_readable() {
+        use space3d_render::{Camera3d, EnvironmentLight, Material, Mesh3d, Projection, srgb_to_linear};
+        if !space3d_test::gpu_available() {
+            eprintln!("skipping GPU test: no adapter available");
+            return;
+        }
+        let content = ShowcaseContent::generate(ContentOptions {
+            texture_size: 16,
+            sky_face_size: 32,
+        });
+        // The horizontal normal facing away from the sun (along the light's travel).
+        let sun = sun_direction();
+        let away = Vec3::new(sun.x, 0.0, sun.z).normalize();
+        let luminance = |n: Vec3, rig: bool, sunlit: bool| -> f32 {
+            let mut t = TestApp::headless(8, 8);
+            let app = t.app_mut();
+            let assets = content.upload(app.resources.init::<RenderAssets>());
+            let plane = app
+                .resources
+                .expect_mut::<RenderAssets>()
+                .add_mesh(space3d_core::MeshData::plane(4.0));
+            app.world.spawn((
+                Transform::IDENTITY.with_rotation(Quat::from_rotation_arc(Vec3::Y, n)),
+                Mesh3d(plane),
+                Material::srgb(0.5, 0.5, 0.5).with_metallic_roughness(0.0, 1.0),
+            ));
+            let up = if n.y.abs() > 0.9 { Vec3::Z } else { Vec3::Y };
+            let camera = app.world.spawn((
+                Transform::from_xyz(n.x * 5.0, n.y * 5.0, n.z * 5.0).looking_at(Vec3::ZERO, up),
+                Camera3d::default().with_projection(Projection::Orthographic {
+                    height: 1.0,
+                    near: 0.1,
+                    far: 20.0,
+                }),
+            ));
+            let sun = spawn_sun(&mut app.world, space3d_render::ShadowFit::default());
+            let _ = app.world.remove_one::<space3d_render::DirectionalShadow>(sun);
+            if !sunlit {
+                // What a cast shadow leaves: everything but the sun's direct light.
+                let _ = app.world.despawn(sun);
+            }
+            if rig {
+                add_environment(&mut app.world, &mut app.resources, &assets, camera);
+                spawn_fill(&mut app.world);
+            } else {
+                // Before the M2 final review.
+                let _ = app.world.insert_one(
+                    camera,
+                    EnvironmentLight::new(assets.sky).with_intensity(0.7, ENV_SPECULAR),
+                );
+                app.resources.insert(space3d_render::AmbientLight {
+                    color: Vec3::new(0.45, 0.55, 1.0),
+                    intensity: 0.015,
+                });
+            }
+            t.screenshot().unwrap();
+            let img = t.screenshot().unwrap();
+            let [r, g, b, _] = img.get(4, 4);
+            let lin = |c: u8| srgb_to_linear(c as f32 / 255.0);
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        };
+        let top = luminance(Vec3::Y, true, true);
+        let side = luminance(away, true, true);
+        let toward = luminance(-away, true, true);
+        let shadowed_top = luminance(Vec3::Y, true, false);
+        let (old_top, old_side) = (luminance(Vec3::Y, false, true), luminance(away, false, true));
+        let old_shadowed_top = luminance(Vec3::Y, false, false);
+        eprintln!(
+            "fill: side away / top {side:.4} / {top:.4} = {:.3} (before: {:.3}); side toward the sun / top {:.3}; \
+             shadowed top / top {:.3} (before: {:.3})",
+            side / top,
+            old_side / old_top,
+            toward / top,
+            shadowed_top / top,
+            old_shadowed_top / old_top
+        );
+        assert!(top > 0.2 && top < 0.9, "a sunlit top in range: {top}");
+        assert!((0.12..=0.3).contains(&(side / top)), "side / top {}", side / top);
+        assert!(toward > side, "the sun's side is brighter: {toward} / {side}");
+        assert!(
+            (0.08..=0.3).contains(&(shadowed_top / top)),
+            "shadowed top / top {}",
+            shadowed_top / top
+        );
+        assert!(old_side / old_top < 0.04, "the old rig: {}", old_side / old_top);
+    }
 
     /// The WebGL2 stories get the CPU particle backend's settings whatever the tier, and the
     /// native ones the tier's.

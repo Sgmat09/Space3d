@@ -1863,6 +1863,19 @@ size):
 * bloom; MSAA 4× on T1/T2 and FXAA Low on T3;
 * two 256² RT previews; an egui HUD (windowed runs only).
 
+*(Amended at the M2 final review.)* The ships fly circles on seven levels 10 units apart (crossing ships pass over
+each other instead of through), and the sun has a shadowless violet fill `DirectionalLight` (0.35 against its 2.2)
+with the sky's diffuse IBL at 6: shadowed sides get about 15 % of a sunlit top's light instead of 1.6 % (black after
+tonemapping; `docs/graphics/materials.md`, "Fill light").
+
+*(Amended at the M2 final review.)* T3's 8k: the Battle at Low refused layer instances from about 5 s in (engine
+plumes and afterburners dropped on the web; the calibration test stopped at 5 s). On the web
+`ParticleSettings::for_quality(Low)` now uses quality 0.1 (0.125), the built-ins leave their detail layers out below
+quality 0.3 (`ParticleLayer::min_quality`: engine sparks and heat haze) and their plumes outrank combat leftovers
+under a full budget (`ParticleLayer::priority`: plumes `Normal`, an explosion's smoke and embers `Low`).
+`tests/battle.rs::battle_fits_the_web_budget_at_low` holds 20 s at 16:9 with four seeds without a refusal (the
+busiest tick at 84 % of the engines' 75 % share); at 21:9 details are refused, never a plume.
+
 **GPU budget per phase** (design targets per tier; `GpuTimings` labels in brackets):
 
 | phase | T1 | T2 | T3 (Low) | owner |
@@ -1956,6 +1969,18 @@ more. Record those figures for reference; they are not the gate.
   Dev: 146.0 MB of targets and shadow + 50.4 MB of sky (33.5 MB) and IBL = 196.4 MB of textures, 219.4 MB with
   the 23 MB particle pool: **met**. `battle_steady_state` asserts the line where the compact format exists and
   pins the parts elsewhere (GL: the sky stays `Rgba16Float`, 83.9 MB of sky and IBL).
+  *(Amended at the M2 final review.)* `Rg11b10Ufloat` is no storage format in core WebGPU, so round 1 converted and
+  mipmapped the compact sky with a render pass per face and mip (66 for 1024² faces, after a copy through a
+  temporary `Rgba16Float` cube): its upload took 7.1–7.3 ms of GPU, 7.6–7.7 ms with the bake, against the IBL
+  bake's 3 ms — and `ibl_bake_gate` measured LDR faces only. Compute now writes the compact format where the
+  adapter can (`GraphicsCaps::compact_hdr_storage`, through `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`:
+  Apple GPUs, most Vulkan and D3D12 drivers): 1.8 ms for 1024² HDR faces and 2.0–2.2 ms for a 4096 × 2048 HDR
+  panorama on Dev, upload and bake (LDR faces 0.5–1.3 ms; the review's probe, the showcase sky at High: 9.6 → 1.5 ms,
+  74 → 19 steps), with the VRAM line kept. A device with compute but without that
+  ability (WebGPU) keeps HDR skies `Rgba16Float`, written by compute (`GraphicsCaps::hdr_sky_format`): twice the
+  memory (+33.5 MB for a 1024² sky) rather than 66 render passes once (7.6–9.6 ms of GPU on Dev). The trade
+  touches HDR skies on WebGPU only: 8-bit skies (the game's) stay `Rgba8UnormSrgb` everywhere, and the web's
+  recommended 512² faces cost 16.8 MB as `Rgba16Float` with mips. `ibl_bake_gate` gates all three skies.
 * *(Amended at M1.1, measured on Dev: `docs/performance.md` "F7 / F8 and M1.1".)* The figures above are textures.
   With the half-rect prefilter the bloom chain's textures are 2.8 MB at 1080p (`Rg11b10Ufloat`), 11.1 MB at 4K
   and, for T3's Low chain at 1440 × 810, 1.9 MB (`Rg11b10Ufloat`) or 3.7 MB (`Rgba16Float`, the format ANGLE and

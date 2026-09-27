@@ -352,6 +352,59 @@ fn compute_bake_matches_fragment_bake() {
     assert!(worst <= 1, "compute vs fragment bake: {worst}");
 }
 
+/// An HDR sky (`Rgba16Float` faces) becomes a radiance cube of `GraphicsCaps::hdr_sky_format`:
+/// `Rg11b10Ufloat` converted and mipmapped by one dispatch per mip where compute writes it
+/// (the review of 102c034: a render pass per face and mip made the 1024² sky's upload 7 ms),
+/// `Rgba16Float` (the faces written straight into mip 0) mipmapped by dispatches where compute
+/// cannot write the compact format, a render pass per face and step without compute (the
+/// compact cube on Metal with `no_compute`, `Rgba16Float` on GL).
+#[test]
+fn hdr_sky_upload_steps_and_format() {
+    for no_compute in [false, true] {
+        let Some(mut app) = headless_app(8, 8) else { return };
+        if no_compute {
+            force_fragment_path(&mut app);
+        }
+        let sky = hdr_faces(64, |face, x, _| 0.5 + face as f32 + x as f32 / 16.0);
+        let cube = app.resources.expect_mut::<RenderAssets>().add_cubemap(sky);
+        app.world
+            .spawn((Transform::IDENTITY, crate::Camera3d::default(), api::Skybox::new(cube)));
+        crate::render_to_image(&mut app).unwrap();
+        let r = app.resources.expect::<Renderer>();
+        let caps = r.graphics_caps().masked(crate::DownlevelOverride {
+            no_compute,
+            ..Default::default()
+        });
+        let format = caps.hdr_sky_format();
+        let s = app.resources.expect::<crate::RenderStats>();
+        // 64²: 6 mips below mip 0, and a conversion into mip 0 unless the cube keeps the faces'
+        // `Rgba16Float` (GL, WebGPU: they are written into it directly).
+        use wgpu::TextureFormat as F;
+        let conversion = if format == Some(F::Rgba16Float) { 0 } else { 1 };
+        let computed = compute_path(&app, no_compute) && (format != Some(F::Rg11b10Ufloat) || caps.compact_hdr_storage);
+        let steps = if computed { conversion + 6 } else { 6 * (conversion + 6) };
+        if format.is_some() {
+            assert_eq!(s.ibl_bake_passes, steps, "no_compute {no_compute}: {caps:?}");
+        }
+        let texel = if format == Some(wgpu::TextureFormat::Rgba16Float) {
+            8
+        } else {
+            4
+        };
+        let texels: u64 = (0..7).map(|m| (64u64 >> m).pow(2)).sum();
+        assert_eq!(
+            s.lighting_bytes,
+            texels * 6 * texel,
+            "no_compute {no_compute}: {format:?}"
+        );
+        if r.capabilities().adapter.backend == wgpu::Backend::Metal && r.capabilities().adapter.name.contains("Apple") {
+            assert_eq!(format, Some(wgpu::TextureFormat::Rg11b10Ufloat));
+            assert_eq!(caps.compact_hdr_storage, !no_compute);
+        }
+        assert_eq!(r.gpu_error_count(), 0);
+    }
+}
+
 /// Skybox-only cubemaps never bake; an environment unused for `ENV_IDLE_FRAMES` is dropped.
 #[test]
 fn environments_are_lazy_and_evicted() {

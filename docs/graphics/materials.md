@@ -152,15 +152,20 @@ world.spawn((Transform::IDENTITY, Camera3d::default(), Skybox::new(nebula).with_
   rotation of the sky, e.g. `Quat::from_rotation_y(a)`).
 * **Upload.** The renderer uploads a cubemap in the frame after `add_cubemap` / `update_cubemap`
   into one *radiance cube*: a 6-layer texture with a full mip chain (a `TEXTURE_CUBE_MAP` on GL).
-  HDR sources become `Rg11b10Ufloat` where the device renders and filters it
-  (`GraphicsCaps::compact_hdr_format`: half the memory of `Rgba16Float`; its 6- and 5-bit
-  mantissas change a sky's pixels by at most 3–4 levels of 255 after tonemapping), else
-  `Rgba16Float` where that renders (`GraphicsCaps::hdr_format`; GL and WebGL2 without
-  `RG11B10UFLOAT_RENDERABLE`); without float targets they become `Rgba8UnormSrgb` (radiance above
-  1 clamps; warned once); LDR ones are `Rgba8UnormSrgb`. Panoramas are converted face by face, sampling the panorama mip that matches
-  the face resolution; the mips are rendered from each other (a 2×2 average). All of it runs in
-  that frame (not budgeted: the sky needs the whole cube) — compute dispatches where compute shaders
-  can write storage textures, render passes elsewhere (see [WebGL2](#webgl2-and-gles)).
+  HDR sources become `GraphicsCaps::hdr_sky_format()`: `Rg11b10Ufloat` where the device renders
+  and filters it and compute shaders can write it (`compact_hdr_storage`: Apple GPUs, most
+  desktop Vulkan and D3D12 drivers, through `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`)
+  or nothing is computed — half the memory of `Rgba16Float`; its 6- and 5-bit mantissas change a
+  sky's pixels by at most 3–4 levels of 255 after tonemapping — else `Rgba16Float` where that
+  renders (`GraphicsCaps::hdr_format`; GL and WebGL2 without `RG11B10UFLOAT_RENDERABLE`, and
+  WebGPU, whose compute cannot write `Rg11b10Ufloat`: there the sky's conversion and mips stay
+  one compute pass at twice the memory, rather than 66 render passes); without float targets
+  they become `Rgba8UnormSrgb` (radiance above 1 clamps; warned once); LDR ones are
+  `Rgba8UnormSrgb`. Panoramas are converted face by face, sampling the panorama mip that matches
+  the face resolution; the mips are computed from each other (a 2×2 average). All of it runs in
+  that frame (not budgeted: the sky needs the whole cube) — compute dispatches (one per mip, all
+  six faces) where compute shaders can write the cube's format, render passes (one per face and
+  mip) elsewhere (see [WebGL2](#webgl2-and-gles)).
 * **Skybox** (camera component): drawn by the built-in render node `"space3d/skybox"` in the
   Skybox phase, after the opaque and alpha-masked meshes and before transparent ones, at the far
   plane (`LessEqual`, no depth write), so it covers only what nothing opaque drew. It writes linear
@@ -215,6 +220,40 @@ on top of `AmbientLight` and the lights:
 Stories: `Engine/Environment/IBL Spheres` (gold and red rows, roughness 0 → 1, in a procedural
 photo studio or the nebula) and `Engine/Environment/Nebula Ship` (the test ship lit by the nebula it
 flies in: metal panels reflect the nebula's core, bloom on the engines).
+
+### Fill light (dark skies)
+
+A space sky is dark: away from the sun and its corona, a nebula's cosine-weighted mean radiance
+(what the irradiance cube stores) is a few hundredths. With `EnvironmentLight` at intensity 1 the
+sides the sun does not reach — and everything in a cast shadow — get 1–2 % of the light of a
+sunlit surface (a sun of intensity 2, `DirectionalLight` intensity being the light a white
+surface facing it reflects), which after tonemapping is black: the hull's shape and colors are
+lost in every shadow. Plan the fill as a ratio of the key light:
+
+* **Fill ratio.** `irradiance × diffuse_intensity + ambient + fill lights` on a side facing away
+  from the sun, over `sun intensity × cos` on a lit top. 10–20 % keeps a top-down space scene's
+  shadows dark but readable; below 5 % they read as holes. Measure the sky's irradiance (the
+  mean radiance of a hemisphere, cosine-weighted, sun excluded) or read it back from the baked
+  environment.
+* **Diffuse image-based lighting** carries the fill's color: raise
+  `EnvironmentLight::diffuse_intensity` until `irradiance × intensity` is about 7–10 % of the sun
+  (the showcase's nebula, irradiance ≈ 0.03: `ENV_DIFFUSE = 6`). The specular intensity is tuned
+  on its own (reflections of a dark zenith: `ENV_SPECULAR = 2.5`).
+* **A fill light** gives the shadowed sides shape: a shadowless `DirectionalLight` from the side
+  opposite the sun and a little from below (the nebula's glow bouncing up), in the nebula's hue,
+  at about 15 % of the sun (the showcase: 0.35 violet against a 2.2 sun; `spawn_fill`,
+  `fill_direction`). It costs one light in the forward loop.
+* **`AmbientLight`** stays faint (0.03 in the showcase): it is flat, and what lights a scene
+  before its environment is baked.
+
+The showcase's rig (`space3d_stories::showcase::{add_environment, spawn_sun, spawn_fill}`) gives
+a side facing away from the sun 15 % of a sunlit top's light, a side facing the sun 72 % and a
+top in a cast shadow 17 % (`showcase::tests::fill_keeps_shadowed_sides_readable`; before the M2
+final review 1.6 % and 3 %).
+
+`EnvironmentLight::new` keeps both intensities at 1: radiance-true, right for a bright sky (a
+studio or daylight HDR, whose irradiance already fills the shadows). The dark-sky tuning above
+is the game's choice, per sky.
 
 ## Directional shadow
 
@@ -397,10 +436,12 @@ the prewarm builds no pipeline for them (`prewarm_builds_what_materials_draw_wit
   (`forward_full_screen_gate`, gate +0.20 ms). The shadow map of 100k cube entities costs
   0.28 ms at 2048² (`shadow_map_gate`, gate 0.30 ms; the same cubes from an explicit instance
   buffer cost the same); the depth view adds 0.1 ms of CPU at 100k entities on GPU draw paths and
-  0.4 ms on `CpuDirect` (`materials/shadow_view/*`). A bake is one-time: 1024² LDR faces → 256² specular + 32² irradiance
-  in about 1 ms of GPU on the dev machine with compute (`ibl_bake_gate`, gate ≤ 3 ms), a few ms
-  with render passes (each pass has a fixed cost of tens of µs on Metal: 102 of them for this
-  cubemap, 17 dispatches in one compute pass instead).
+  0.4 ms on `CpuDirect` (`materials/shadow_view/*`). A bake is one-time: 1024² faces → 256² specular + 32² irradiance
+  in about 1–2 ms of GPU on the dev machine with compute (`ibl_bake_gate`, gate ≤ 3 ms for LDR
+  faces, HDR faces and an HDR panorama: 0.5–1.3, 1.8 and 2.0–2.2 ms), many ms with render passes (each
+  pass has a fixed cost of tens of µs to a few hundred on Metal, and holds driver memory while its
+  frame is in flight: 102 of them for LDR faces, 108 for an `Rg11b10Ufloat` sky, against 17–18
+  dispatches in one compute pass).
 * Memory: a radiance cube is `faces² × 6 × 4/3` texels (4 bytes in sRGB and `Rg11b10Ufloat`, 8 in
   `Rgba16Float`: a 1024² sky ≈ 34 MB, 67 MB as `Rgba16Float`; 512² ≈ 8 MB — use 512² faces on the
   web), an environment ≈ 4.2 MB at

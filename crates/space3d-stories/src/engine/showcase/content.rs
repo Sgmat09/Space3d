@@ -415,17 +415,78 @@ pub fn hull_mesh(kind: usize) -> MeshData {
     b.m
 }
 
-/// An asteroid of unit radius: a sphere displaced by value noise with craters, smooth normals.
+/// An asteroid of unit radius: a sphere (64 × 40) displaced by value noise with craters and a
+/// fine octave (no faceted silhouette at the showcase's close-ups), smooth normals, per-vertex
+/// albedo (linear, multiplying the material: mottled rock, darker crater floors, paler dust on
+/// the high ground) and UVs tiling the rock detail maps ([`rock_maps`]) 4 × 2 times around it.
 pub fn asteroid_mesh(seed: u32) -> MeshData {
-    let mut m = MeshData::sphere(1.0, 32, 20);
+    let mut m = MeshData::sphere(1.0, 64, 40);
+    let mut colors = Vec::with_capacity(m.positions.len());
     for p in &mut m.positions {
         let d = Vec3::from_array(*p);
         let bumps = fbm3(d * 1.7 + Vec3::splat(seed as f32 * 3.7), seed, 5) - 0.5;
-        let craters = (noise3(d * 3.1, seed + 40) - 0.62).max(0.0) * 1.2;
-        *p = (d * (1.0 + 0.6 * bumps - craters)).to_array();
+        let crater = (noise3(d * 3.1, seed + 40) - 0.62).max(0.0);
+        let fine = fbm3(d * 7.3 + Vec3::splat(5.0), seed + 70, 3) - 0.5;
+        *p = (d * (1.0 + 0.6 * bumps - 1.2 * crater + 0.06 * fine)).to_array();
+        let mottle = fbm3(d * 4.3 + Vec3::splat(11.0), seed + 90, 4);
+        let floor = smoothstep(0.0, 0.1, crater);
+        let dust = smoothstep(0.08, 0.28, bumps);
+        let a = ((0.62 + 0.55 * (mottle - 0.5)) * (1.0 - 0.3 * floor) * (1.0 + 0.25 * dust)).clamp(0.2, 1.0);
+        // Warmer where the rock is dusty, cooler in the crater floors.
+        let warm = 0.5 + 0.5 * dust - 0.3 * floor;
+        colors.push([a, a * (0.95 + 0.02 * warm), a * (0.88 + 0.06 * (1.0 - warm)), 1.0]);
+    }
+    m.colors = colors;
+    for uv in &mut m.uvs {
+        *uv = [uv[0] * 4.0, uv[1] * 2.0];
     }
     space3d_assets::edit::mesh::recalculate_smooth_normals(&mut m);
     m
+}
+
+/// The asteroids' tiling detail maps ([`rock_maps`]).
+#[derive(Clone, Debug)]
+pub struct RockMaps {
+    /// Base color (sRGB, near white: it multiplies the material and the vertex albedo): grain
+    /// and pale mineral flecks.
+    pub base_color: ImageData,
+    /// Tangent-space normals (linear, +Y green up): grain and small pits.
+    pub normal: ImageData,
+}
+
+/// Generate the tiling rock detail maps at `n`² texels (at least 64).
+pub fn rock_maps(n: u32) -> RockMaps {
+    let n = n.max(64);
+    let mut height = vec![0f32; (n * n) as usize];
+    let mut base_color = ImageData::new(n, n);
+    let srgb = |c: f32| (linear_to_srgb(c.clamp(0.0, 1.0)) * 255.0).round() as u8;
+    for y in 0..n {
+        for x in 0..n {
+            let (u, v) = ((x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32);
+            let grain = fbm2(u, v, 8, 131, 5);
+            let pits = (0.38 - fbm2(u, v, 16, 137, 3)).max(0.0);
+            let flecks = (fbm2(u, v, 32, 139, 2) - 0.68).max(0.0) * 3.0;
+            height[(y * n + x) as usize] = grain - 1.6 * pits;
+            let c = (0.72 + 0.35 * (grain - 0.5) - 0.8 * pits + flecks).clamp(0.3, 1.0);
+            base_color.set(x, y, [srgb(c), srgb(c * 0.98), srgb(c * 0.95), 255]);
+        }
+    }
+    let mut normal = ImageData::new(n, n);
+    let strength = n as f32 / 64.0;
+    let at = |x: i64, y: i64| {
+        let (n, x, y) = (n as i64, x.rem_euclid(n as i64), y.rem_euclid(n as i64));
+        height[(y * n + x) as usize]
+    };
+    let e = |c: f32| ((c * 0.5 + 0.5) * 255.0).round() as u8;
+    for y in 0..n as i64 {
+        for x in 0..n as i64 {
+            let dx = (at(x + 1, y) - at(x - 1, y)) * 0.5 * strength;
+            let dy = -(at(x, y + 1) - at(x, y - 1)) * 0.5 * strength;
+            let nrm = Vec3::new(-dx, -dy, 1.0).normalize();
+            normal.set(x as u32, y as u32, [e(nrm.x), e(nrm.y), e(nrm.z), 255]);
+        }
+    }
+    RockMaps { base_color, normal }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -879,8 +940,10 @@ pub struct ShowcaseContent {
     pub hulls: [(MeshData, Vec<[f32; 4]>); 3],
     /// The hull maps.
     pub maps: HullMaps,
-    /// Three asteroids (unit radius).
-    pub asteroids: [MeshData; 3],
+    /// Three asteroids (unit radius, [`asteroid_mesh`]) with their MikkTSpace tangents.
+    pub asteroids: [(MeshData, Vec<[f32; 4]>); 3],
+    /// The asteroids' detail maps ([`rock_maps`], half the hull maps' size).
+    pub rock: RockMaps,
     /// The sky ([`sky_faces`]).
     pub sky: CubemapSource,
 }
@@ -893,7 +956,9 @@ impl ShowcaseContent {
         Self {
             hulls: [hull(0), hull(1), hull(2)],
             maps: hull_maps(options.texture_size),
-            asteroids: [asteroid_mesh(3), asteroid_mesh(8), asteroid_mesh(13)],
+            asteroids: [3, 8, 13]
+                .map(|seed| space3d_assets::edit::mesh::compute_mikktspace_tangents(&asteroid_mesh(seed))),
+            rock: rock_maps(options.texture_size / 2),
             sky: sky_faces(options.sky_face_size),
         }
     }
@@ -918,12 +983,21 @@ impl ShowcaseContent {
                 .with_normal_map(normal, 1.0)
                 .with_emissive_map(emissive, f.glow)
         });
-        let asteroids = std::array::from_fn(|k| assets.add_mesh(self.asteroids[k].clone()));
+        let asteroids = std::array::from_fn(|k| {
+            let (mesh, tangents) = &self.asteroids[k];
+            assets.add_mesh_with(mesh.clone(), MeshExtras::new().with_tangents(tangents.clone()))
+        });
+        let rock = assets.add_image(self.rock.base_color.clone());
+        let rock_normal = assets.add_image_linear(self.rock.normal.clone());
         ShowcaseAssets {
             hulls,
             hull_materials,
             asteroids,
-            asteroid_material: Material::srgb(0.3, 0.27, 0.25).with_metallic_roughness(0.0, 0.88),
+            // The maps and the vertex albedo multiply it (about 0.55 on average).
+            asteroid_material: Material::srgb(0.4, 0.36, 0.33)
+                .with_metallic_roughness(0.0, 0.9)
+                .with_texture(rock)
+                .with_normal_map(rock_normal, 1.0),
             sky: assets.add_cubemap(self.sky.clone()),
             quad: assets.add_mesh(MeshData::plane(1.0)),
         }

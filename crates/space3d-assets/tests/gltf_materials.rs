@@ -478,17 +478,39 @@ fn ship_maps() -> [ImageData; 4] {
     [base, normal, orm, emissive]
 }
 
+/// Texels of the atlas per world unit on the ship's hull and canopy faces: the same on every
+/// face (a side is not squeezed into the texels of a top), the fuselage's 3-unit length filling
+/// the regions' 128 rows.
+const TEXELS_PER_UNIT: f32 = MAP as f32 / 3.0;
+
 /// A box of the ship: `center`, `size`, the UV region of each face (in `MeshData::cube`'s face
-/// order: +X, −X, +Y, −Y, +Z, −Z).
+/// order: +X, −X, +Y, −Y, +Z, −Z). Hull and canopy faces take the part of their region their
+/// size needs at [`TEXELS_PER_UNIT`], their longer side along the region's rows (v); the engine
+/// glow fills its region.
 fn part(mesh: &mut MeshData, center: [f32; 3], size: [f32; 3], regions: [[f32; 4]; 6]) {
     let cube = MeshData::cube(1.0);
     let base = mesh.positions.len() as u32;
     for (i, p) in cube.positions.iter().enumerate() {
         let r = regions[i / 4];
         let [u, v] = cube.uvs[i];
+        // The face's extent along its u and v axes (the cube's corners differ by 1 there).
+        let face = &cube.positions[i / 4 * 4..i / 4 * 4 + 4];
+        let extent = |a: usize, b: usize| (0..3).map(|k| (face[a][k] - face[b][k]).abs() * size[k]).sum::<f32>();
+        let (eu, ev) = (extent(0, 1), extent(1, 2));
+        let uv = if r == GLOW {
+            [r[0] + u * (r[2] - r[0]), r[1] + v * (r[3] - r[1])]
+        } else {
+            // Longer side along v; fractions of the region at the fixed density.
+            let (u, v, eu, ev) = if eu > ev { (v, u, ev, eu) } else { (u, v, eu, ev) };
+            let w = (r[2] - r[0]) * MAP as f32;
+            let h = (r[3] - r[1]) * MAP as f32;
+            let fu = (eu * TEXELS_PER_UNIT / w).min(1.0);
+            let fv = (ev * TEXELS_PER_UNIT / h).min(1.0);
+            [r[0] + u * (r[2] - r[0]) * fu, r[1] + v * (r[3] - r[1]) * fv]
+        };
         mesh.positions.push([0, 1, 2].map(|k| center[k] + p[k] * size[k]));
         mesh.normals.push(cube.normals[i]);
-        mesh.uvs.push([r[0] + u * (r[2] - r[0]), r[1] + v * (r[3] - r[1])]);
+        mesh.uvs.push(uv);
     }
     mesh.indices.extend(cube.indices.iter().map(|i| i + base));
 }
@@ -547,6 +569,33 @@ fn ship_glb() -> Vec<u8> {
 
 fn ship_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../space3d-stories/assets/ship.glb")
+}
+
+/// Every hull and canopy face of the test ship has the same texel density along both of its
+/// sides (M2 final review: the fuselage's and wings' sides squeezed the whole hull region into
+/// a thin strip, 3–10× denser across than along); the engine glow fills its region.
+#[test]
+fn test_ship_texel_density_is_uniform() {
+    let m = ship_mesh();
+    let mut faces = 0;
+    for f in m.positions.chunks(4).zip(m.uvs.chunks(4)) {
+        let (p, uv) = f;
+        let world = |a: usize, b: usize| glam::Vec3::from(p[a]).distance(glam::Vec3::from(p[b]));
+        let texels = |a: usize, b: usize| (glam::Vec2::from(uv[a]) - glam::Vec2::from(uv[b])).length() * MAP as f32;
+        let glow = uv.iter().all(|t| t[0] >= GLOW[0] - 1e-6);
+        if glow {
+            continue;
+        }
+        for (a, b) in [(0, 1), (1, 2)] {
+            let density = texels(a, b) / world(a, b);
+            assert!(
+                (density - TEXELS_PER_UNIT).abs() < 0.01 * TEXELS_PER_UNIT,
+                "face {faces}: {density} texels per unit"
+            );
+        }
+        faces += 1;
+    }
+    assert_eq!(faces, 6 * 6 - 2, "every box face but the two engine glows");
 }
 
 /// The checked-in ship is what the generator writes (regenerate with the ignored test below).

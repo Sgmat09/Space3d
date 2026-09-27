@@ -228,16 +228,19 @@ fn s3dp_shape(uv: vec2<f32>, stretch: f32, b: vec4<f32>, bits: u32, peak: f32) -
         case 2u: {
             // Ring of thickness p.x (fraction of the radius), focused toward +x by p.y, filled
             // faintly by p.z. The band sits 1.5 thicknesses inside the rim (0.4 % of its peak
-            // there) and the rim fades over 1.5 pixels: no hard, stair-stepped outer edge.
+            // there) and the rim fades over 1.5 pixels: no hard, stair-stepped outer edge. A
+            // small ring (an expanding shockwave's first frames, a distant one) keeps a band of
+            // at least 2.5 pixels, its light spread over it: never a crisp hairline circle.
             let r = length(uv);
             if (r >= 1.0) {
                 return vec3<f32>(0.0);
             }
-            let th = max(p.x, 0.004);
+            let th0 = max(p.x, 0.004);
+            let th = max(th0, min(2.5 / max(px, 1e-3), 0.3));
             let x = (r - (1.0 - 1.5 * th)) / th;
             let aa = clamp(1.5 / max(px, 1e-3), 0.0, 1.0);
             let rim = 1.0 - smoothstep(1.0 - aa, 1.0, r);
-            var ring = (exp(-x * x * 2.5) + p.z * r * r * (1.0 - smoothstep(0.85, 1.0, r))) * rim;
+            var ring = (exp(-x * x * 2.5) * (th0 / th) + p.z * r * r * (1.0 - smoothstep(0.85, 1.0, r))) * rim;
             if (p.y > 0.0) {
                 let c = uv.x / max(r, 1e-4) * 0.5 + 0.5;
                 ring = ring * pow(max(c, 0.0), p.y);

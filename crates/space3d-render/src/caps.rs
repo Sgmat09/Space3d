@@ -17,6 +17,12 @@ pub struct GraphicsCaps {
     pub hdr_msaa: bool,
     /// `Rg11b10Ufloat` with the same abilities (`Features::RG11B10UFLOAT_RENDERABLE`).
     pub compact_hdr_format: Option<wgpu::TextureFormat>,
+    /// `compact_hdr_format` and `compute`, and compute shaders can write `Rg11b10Ufloat` as a
+    /// write-only storage texture (an adapter-specific ability, granted through
+    /// `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`: Apple GPUs, most desktop Vulkan and
+    /// D3D12 drivers; not WebGPU). HDR skies are converted and mipmapped by compute dispatches
+    /// then; without it, by a render pass per face and mip.
+    pub compact_hdr_storage: bool,
     /// Bloom chain format: compact, else hdr, else `None` (no bloom).
     pub bloom_format: Option<wgpu::TextureFormat>,
     /// 1×1 exposure texture format: `R32Float` if renderable, else `R16Float`, else `None`.
@@ -44,8 +50,9 @@ pub struct GraphicsCaps {
 
 /// The features every area asks for on top of the renderer's own; optional, intersected with
 /// the adapter's.
-pub(crate) const WANTED_FEATURES: wgpu::Features =
-    wgpu::Features::TIMESTAMP_QUERY.union(wgpu::Features::RG11B10UFLOAT_RENDERABLE);
+pub(crate) const WANTED_FEATURES: wgpu::Features = wgpu::Features::TIMESTAMP_QUERY
+    .union(wgpu::Features::RG11B10UFLOAT_RENDERABLE)
+    .union(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
 
 impl GraphicsCaps {
     /// Probe `adapter`/`device` (the device's granted features and limits decide).
@@ -84,10 +91,19 @@ impl GraphicsCaps {
             .flags
             .sample_count_supported(4);
         let compute = caps.compute && caps.indirect;
+        let compact_hdr_storage = compact_hdr_format.is_some()
+            && compute
+            && limits.max_storage_textures_per_shader_stage > 0
+            && features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+            && {
+                let f = adapter.get_texture_format_features(F::Rg11b10Ufloat);
+                f.allowed_usages.contains(U::STORAGE_BINDING) && f.flags.contains(Flags::STORAGE_WRITE_ONLY)
+            };
         Self {
             hdr_format,
             hdr_msaa: hdr_format.is_some_and(msaa),
             compact_hdr_format,
+            compact_hdr_storage,
             bloom_format: compact_hdr_format.or(hdr_format),
             exposure_format,
             read_only_depth,
@@ -105,6 +121,21 @@ impl GraphicsCaps {
         }
     }
 
+    /// The format of HDR radiance cubes (skies and HDR cubemaps, every mip): `Rg11b10Ufloat`
+    /// (4 bytes a texel) where it renders and either compute shaders write it
+    /// (`compact_hdr_storage`: the conversion and mips are one compute pass) or nothing is
+    /// computed (every bake step is a render pass either way); else `hdr_format`
+    /// (`Rgba16Float`, 8 bytes: a device with compute but without `Rg11b10Ufloat` storage —
+    /// WebGPU, some mobile drivers — keeps the sky's conversion and mips in one compute pass
+    /// instead of a render pass per face and mip, about 7 ms of GPU once for a 1024² sky on
+    /// Dev); `None` without float targets (HDR skies become `Rgba8UnormSrgb`).
+    pub fn hdr_sky_format(&self) -> Option<wgpu::TextureFormat> {
+        match self.compact_hdr_format {
+            Some(f) if self.compact_hdr_storage || !self.compute => Some(f),
+            _ => self.hdr_format,
+        }
+    }
+
     /// These capabilities with `downlevel`'s pretended absences removed (never adds any).
     pub(crate) fn masked(&self, downlevel: DownlevelOverride) -> Self {
         let mut c = self.clone();
@@ -112,12 +143,14 @@ impl GraphicsCaps {
             c.hdr_format = None;
             c.hdr_msaa = false;
             c.compact_hdr_format = None;
+            c.compact_hdr_storage = false;
             c.bloom_format = None;
             c.exposure_format = None;
         }
         if downlevel.no_compute {
             c.compute = false;
             c.compute_histogram = false;
+            c.compact_hdr_storage = false;
         }
         if downlevel.no_read_only_depth {
             c.read_only_depth = false;
@@ -136,6 +169,7 @@ mod tests {
             hdr_format: Some(wgpu::TextureFormat::Rgba16Float),
             hdr_msaa: true,
             compact_hdr_format: Some(wgpu::TextureFormat::Rg11b10Ufloat),
+            compact_hdr_storage: true,
             bloom_format: Some(wgpu::TextureFormat::Rg11b10Ufloat),
             exposure_format: Some(wgpu::TextureFormat::R32Float),
             read_only_depth: true,
@@ -157,6 +191,27 @@ mod tests {
         let gl = caps.masked(DownlevelOverride::webgl2());
         assert_eq!((gl.hdr_format, gl.bloom_format, gl.exposure_format), (None, None, None));
         assert!(!gl.compute && !gl.compute_histogram && !gl.read_only_depth && !gl.msaa_depth_resolve);
+        assert!(!gl.compact_hdr_storage);
+        let no_compute = caps.masked(DownlevelOverride {
+            no_compute: true,
+            ..Default::default()
+        });
+        assert!(no_compute.compact_hdr_format.is_some() && !no_compute.compact_hdr_storage);
+        use wgpu::TextureFormat as F;
+        assert_eq!(caps.hdr_sky_format(), Some(F::Rg11b10Ufloat), "compute writes it");
+        assert_eq!(
+            no_compute.hdr_sky_format(),
+            Some(F::Rg11b10Ufloat),
+            "render passes either way"
+        );
+        let mut no_storage = caps.clone();
+        no_storage.compact_hdr_storage = false;
+        assert_eq!(
+            no_storage.hdr_sky_format(),
+            Some(F::Rgba16Float),
+            "compute writes Rgba16Float"
+        );
+        assert_eq!(gl.hdr_sky_format(), None);
         assert!(gl.timestamps && gl.depth_bias_clamp, "unrelated caps stay");
         let mut none = gl.clone();
         none.timestamps = false;
@@ -181,9 +236,14 @@ mod tests {
         if r.capabilities().adapter.backend == wgpu::Backend::Gl {
             assert!(!caps.read_only_depth, "GL has no read-only depth-stencil");
         }
+        assert!(!caps.compact_hdr_storage || (caps.compact_hdr_format.is_some() && caps.compute));
         if r.capabilities().adapter.backend == wgpu::Backend::Metal {
             assert_eq!(caps.hdr_format, Some(wgpu::TextureFormat::Rgba16Float));
             assert!(caps.read_only_depth && caps.msaa_depth_resolve);
+            // Apple GPUs write `Rg11b10Ufloat` from compute shaders (wgpu-hal `format_rg11b10_all`).
+            if r.capabilities().adapter.name.contains("Apple") {
+                assert!(caps.compact_hdr_storage, "{caps:?}");
+            }
         }
     }
 }

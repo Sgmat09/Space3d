@@ -366,6 +366,65 @@ fn budget_shrinks_then_refuses() {
     assert_eq!(h.rt.pool.reserved(), 90);
 }
 
+/// A layer's `min_quality` leaves it out of instances whose quality × LOD level is below it
+/// (neither reserved nor refused: a detail the tier drops), and its `priority` overrides the
+/// effect's: a `Normal` layer of a `Low` effect is still reserved past 75 % of the pool, where
+/// the effect's other layer is refused (M2 final review: engine plumes outlast the details).
+#[test]
+fn layer_min_quality_and_priority() {
+    use crate::effect::EffectPriority;
+    let ring = |capacity: u32| {
+        let mut l = ParticleLayer::burst(1, 1.0);
+        l.capacity = Some(capacity);
+        l
+    };
+    let mut h = Harness::new();
+    let detail = ParticleLayer {
+        min_quality: 0.3,
+        ..ring(10)
+    };
+    let fx = h.add(ParticleEffect::new("engine").layer(ring(10)).layer(detail));
+    h.settings.quality = 0.25;
+    let low = h.world.spawn_effect(fx, Vec3::ZERO);
+    h.tick();
+    assert_eq!(h.rt.state(low).unwrap().reserved, 3, "10 × 0.25, the detail left out");
+    assert_eq!((h.rt.refused, h.rt.shrunk), (0, 0));
+    h.settings.quality = 1.0;
+    let full = h.world.spawn_effect(fx, Vec3::ZERO);
+    h.tick();
+    assert_eq!(h.rt.state(full).unwrap().reserved, 20, "both layers at quality 1");
+
+    let mut h = Harness::new();
+    h.settings.max_particles_cpu = 100;
+    let filler = h.add(ParticleEffect {
+        priority: EffectPriority::High,
+        ..ParticleEffect::new("filler").layer(ring(80))
+    });
+    let plume = ParticleLayer {
+        priority: Some(EffectPriority::Normal),
+        ..ring(5)
+    };
+    let engine = h.add(ParticleEffect {
+        priority: EffectPriority::Low,
+        ..ParticleEffect::new("engine").layer(plume).layer(ring(5))
+    });
+    h.world.spawn_effect(filler, Vec3::ZERO);
+    h.tick();
+    let e = h.world.spawn_effect(engine, Vec3::ZERO);
+    h.tick();
+    assert_eq!(h.rt.state(e).unwrap().reserved, 5, "the Normal layer, to 85 %");
+    assert_eq!(h.rt.refused, 1, "the Low layer, past 75 %");
+    assert!(
+        ParticleEffect::new("bad")
+            .layer(ParticleLayer {
+                min_quality: 1.5,
+                ..ring(1)
+            })
+            .validate()
+            .is_err()
+    );
+}
+
 /// Restarting (bumping `restart`) or stopping and playing again start the effect over; the old
 /// particles drain.
 #[test]
