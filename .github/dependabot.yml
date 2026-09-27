@@ -6,6 +6,10 @@ updates:
     schedule: { interval: weekly }
     open-pull-requests-limit: 20
     groups:
+      # An egui bump moves epaint, which Space3d patches (third_party/epaint, kinsoku line
+      # breaking): cargo then only warns that the [patch] is unused. On the bump's branch run
+      # `python3 scripts/update-epaint.py` and commit third_party/ + Cargo.lock; until then the
+      # lint job's epaint check and space3d-ui's kinsoku test fail. See third_party/README.md.
       egui-wgpu-winit:
         patterns: ["egui*", "wgpu*", "naga", "winit"]
   - package-ecosystem: github-actions

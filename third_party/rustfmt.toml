@@ -1,0 +1,2 @@
+# rustfmt defaults (what egui uses) for the vendored crates, instead of Space3d's max_width.
+# They are not workspace members: `cargo fmt --all` does not format them.

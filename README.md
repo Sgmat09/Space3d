@@ -66,9 +66,9 @@ space3d::main!(build);
 * **Physics, audio, scenes.** rapier rigid bodies/colliders/raycasts on the fixed tick; kira
   audio with spatial emitters; RON/JSON scenes, prefabs and world snapshots.
 * **UI and tools.** egui integration with a compact debug overlay (F3), profiler (F4) and
-  console; an opt-in compact density (`app.insert_resource(UiTheme::compact())`, see
-  [docs/ui.md](docs/ui.md)); scene inspector, texture and model editors; a storybook for
-  isolated, parameterized scenes.
+  console; an opt-in compact density (`app.insert_resource(UiTheme::compact())`); Chinese and
+  Japanese line breaking (kinsoku) in egui's text layout (both in [docs/ui.md](docs/ui.md));
+  scene inspector, texture and model editors; a storybook for isolated, parameterized scenes.
 * **Testing.** Headless `TestApp`, tick-accurate keyboard/mouse/touch/gamepad simulation and
   recorded input scripts, golden screenshots with diff images and an HTML report, determinism
   and performance assertions. GPU tests skip when there is no adapter.
@@ -315,7 +315,9 @@ SPACE3D_HEADLESS=1 cargo run -p graphics_showcase --release   # writes graphics_
 Every dependency is pinned to its newest **stable** release (no alpha/beta/rc) in
 `[workspace.dependencies]` of the root `Cargo.toml`; crates use `foo.workspace = true`. Before
 adding a crate, check `cargo search --limit 1 <crate>`. (Example: winit stays on 0.30.x because
-0.31 is still a beta.)
+0.31 is still a beta.) One crate is patched: egui's `epaint`, vendored in `third_party/` with
+the kinsoku patch; an egui bump needs `python3 scripts/update-epaint.py`
+([third_party/README.md](third_party/README.md)).
 
 ## Contributing
 

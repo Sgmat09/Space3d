@@ -318,6 +318,89 @@ viewport, so F3 / F4 / the console dock there too. `EditorPlugin` added to a gam
 insert the theme: the game's style stays as it is (insert the theme yourself to get the same
 density), and its panels still keep their width.
 
+## Fonts for Chinese, Japanese and Korean
+
+egui's built-in fonts have no Han characters, kana or Hangul: add a font that has them, e.g.
+right after the Latin font so that it also draws the full-width punctuation (，。！（）), which
+egui's emoji fonts would otherwise draw:
+
+```rust
+use space3d::ui::egui::{self, FontData, FontDefinitions, FontFamily};
+use std::sync::Arc;
+
+let mut fonts = FontDefinitions::default();
+fonts.font_data.insert("cjk".into(), Arc::new(FontData::from_static(CJK_FONT_BYTES)));
+for family in [FontFamily::Proportional, FontFamily::Monospace] {
+    let faces = fonts.families.entry(family).or_default();
+    faces.insert(faces.len().min(1), "cjk".into());
+}
+ctx.set_fonts(fonts); // `EguiContext::ctx()`, or in a UI system
+```
+
+## Chinese and Japanese line breaking (kinsoku)
+
+Space3d's egui breaks Chinese and Japanese text by the kinsoku (禁則処理) rules of JIS X 4051
+and the W3C JLREQ/CLREQ: no line starts with a closing bracket or quote, a comma or full stop
+(、。，．), a colon, ?, !, a middle dot, a small kana (ッ ャ ェ), the prolonged sound mark ー, an
+iteration mark (々), a postfixed sign (％ ℃), an ellipsis or a Bopomofo tone mark (ㄏㄠˇ); no
+line ends with an opening bracket or quote (「（【“) or ￥, also not across spaces (「　重要　」);
+"——" and "……" stay whole; Latin words and numbers inside CJK text stay whole and get breaks
+around them. A run the rules keep together that is wider than the row breaks where the row is
+full, never inside "——" "……" that fit a row, and the rules never make a row wider than the
+wrap width, also in a label after another widget in `horizontal_wrapped` (egui indents its
+first row; only that row can be left empty, when the label's first run doesn't fit after the
+widget). Upstream egui starts lines with "，" "？" "）" "、" and ends them with "「". Text
+without Chinese or Japanese characters lays out as with upstream egui (German „…“ quotes
+included), except around ellipses and doubled dashes, in every script: no line starts with "…"
+after a word, and "——" "……" are not split, so at narrow widths such text can wrap differently
+("ove" | "r……" where upstream has "over" | "……"). Laying text out takes about 5 % longer for
+Latin text and 8–11 % for Chinese or Japanese than with upstream egui; egui caches laid-out
+text, so this is paid only when a text or its width changes. The rules and their limits are in
+`third_party/README.md`; games that lay text out themselves can use them directly:
+`egui::epaint::text::kinsoku::{line_break, Break, is_line_start_prohibited,
+is_line_end_prohibited}`.
+
+The rules live in a patched copy of egui's text layout crate, `epaint`, in
+`third_party/epaint`. Cargo applies a `[patch]` only from the **root** `Cargo.toml` of the
+workspace being built, so Space3d's own patch covers Space3d's apps, examples and tests, and a
+game needs the same entry in its root `Cargo.toml`, pointing at the **same Space3d revision** as
+its `space3d` dependency:
+
+```toml
+[dependencies]
+space3d = { git = "https://github.com/SpaceCorps/Space3d", rev = "<rev>" }
+
+# Chinese and Japanese line breaking (kinsoku) for egui: Space3d's patched epaint.
+[patch.crates-io]
+epaint = { git = "https://github.com/SpaceCorps/Space3d", rev = "<rev>" }  # same rev as space3d
+```
+
+Cargo finds the `epaint` package inside the Space3d repository by its name
+(`third_party/epaint`); with the same `rev` both come from one checkout. With a local engine
+checkout, use `epaint = { path = "../Space3d/third_party/epaint" }` next to
+`space3d = { path = "../Space3d/crates/space3d" }`. `space3d new` writes the entry for you.
+
+When the entry is missing, or points at a Space3d revision whose egui differs from the one
+`space3d` uses, cargo only warns (`Patch 'epaint v… (…)' was not used in the crate graph`) and
+builds crates.io's epaint, without kinsoku. Check with:
+
+* `space3d doctor` — the `ui` line warns and prints the entry to add when epaint comes from
+  crates.io, from another Space3d revision than `space3d`, or from a path without Space3d's
+  kinsoku module (a game's own older copy), and says when `space3d`'s revision predates
+  `third_party/epaint` (update `space3d` first);
+* `cargo tree -i epaint` — shows `epaint v0.36.2 (https://github.com/SpaceCorps/Space3d?rev=…)`
+  (or the local path), not a bare version;
+* a test in the game that only compiles with the patched epaint:
+  `const _: u32 = space3d::ui::egui::epaint::text::kinsoku::VERSION;`.
+
+When updating Space3d, bump the `rev` of both lines together. A game that carried its own
+`third_party/epaint` (as SpaceCorps did) replaces its `[patch.crates-io]` path with the git
+entry above and deletes the copy; its kinsoku tests keep passing.
+
+Space3d itself: `third_party/README.md` explains the patch, its tests and the egui upgrade
+procedure (`scripts/update-epaint.py`); `crates/space3d-ui/tests/kinsoku.rs` lays out Japanese
+and Chinese paragraphs at many widths and holds the golden story `UI/Text/Kinsoku`.
+
 ## Stories and tests
 
 The engine storybook (`space3d_stories::engine_storybook`, feature `ui`: not a default feature, since

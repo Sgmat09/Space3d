@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "examples/*"]
-exclude = ["target"]
+# third_party/: patched copies of crates.io crates (third_party/README.md), not members.
+exclude = ["target", "third_party"]
 
 [workspace.package]
 version = "0.1.0"
@@ -151,3 +152,12 @@ debug = true
 [profile.server]
 inherits = "release"
 panic = "unwind"
+
+# egui's text layout with kinsoku (禁則処理) line breaking for Chinese and Japanese: a copy of
+# epaint with a small patch (third_party/README.md, third_party/epaint.kinsoku.patch). Every
+# Space3d app, test and example lays text out with it; games add the same line, see
+# docs/ui.md "Chinese and Japanese line breaking". Keep its version equal to `egui` above:
+# after an egui bump run scripts/update-epaint.py (cargo only warns about an unused patch;
+# `epaint_resolves_to_the_vendored_kinsoku_copy` in space3d-ui fails).
+[patch.crates-io]
+epaint = { path = "third_party/epaint" }
