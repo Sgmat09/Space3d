@@ -4,10 +4,10 @@ See third_party/README.md. Applied to the published crate with `git apply -p1` f
 
 diff --git b/src/text/kinsoku.rs b/src/text/kinsoku.rs
 new file mode 100644
-index 0000000..2984de0
+index 0000000..f2a9ad8
 --- /dev/null
 +++ b/src/text/kinsoku.rs
-@@ -0,0 +1,938 @@
+@@ -0,0 +1,1079 @@
 +//! Kinsoku shori (禁則処理): where a line of Chinese or Japanese text may break.
 +//!
 +//! **Space3d patch**, not part of upstream epaint: see `third_party/README.md` in the Space3d
@@ -53,7 +53,7 @@ index 0000000..2984de0
 +
 +/// Revision of these rules, bumped whenever they change. Its presence tells a program or a
 +/// test that epaint is Space3d's patched copy (`egui::epaint::text::kinsoku::VERSION`).
-+pub const VERSION: u32 = 2;
++pub const VERSION: u32 = 3;
 +
 +/// Kinsoku's ruling on a line break between two characters, see [`line_break`].
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,12 +172,16 @@ index 0000000..2984de0
 +        | '゛' | '゜' | 'ﾞ' | 'ﾟ'
 +        // Postfixed signs.
 +        | '%' | '％' | '‰' | '°' | '′' | '″' | '℃' | '℉' | '¢' | '￠'
++        // Bopomofo tone marks, written after their syllable (ㄏㄠˇ), and the light-tone dot.
++        | 'ˉ' | 'ˊ' | 'ˇ' | 'ˋ' | '˪' | '˫' | '˙'
 +    ) || is_ellipsis(c)
 +}
 +
-+/// Characters that may not end a line of Chinese or Japanese text (行末禁則): opening
-+/// brackets and quotes (JIS X 4051 cl-01) and the full-width prefixed signs, which stay with
-+/// the number after them.
++/// Characters that may not end a line of Chinese or Japanese text (行末禁則).
++///
++/// Opening brackets and quotes (JIS X 4051 cl-01), the full-width prefixed signs, which stay
++/// with the number after them, and the Bopomofo light-tone dot, which Taiwan's standard writes
++/// before its syllable (˙ㄇㄚ) and much text after it (so it may neither start nor end a line).
 +pub fn is_line_end_prohibited(c: char) -> bool {
 +    matches!(
 +        c,
@@ -188,6 +192,8 @@ index 0000000..2984de0
 +        | '︗' | '︵' | '︷' | '︹' | '︻' | '︽' | '︿' | '﹁' | '﹃' | '﹇' | '﹙' | '﹛' | '﹝'
 +        // Prefixed signs.
 +        | '￥' | '＄' | '￡' | '＃'
++        // The Bopomofo light-tone dot.
++        | '˙'
 +    )
 +}
 +
@@ -250,10 +256,22 @@ index 0000000..2984de0
 +        let Some(next) = glyphs.get(1) else {
 +            return Break::Upstream;
 +        };
++        if let Some(ruling) = common_pair(glyph, next) {
++            // Neither is a space: no bracket to keep across spaces.
++            (self.after_opener, self.before_closer) = (false, false);
++            return ruling;
++        }
++        self.rules(glyphs)
++    }
++
++    /// [`Scan::next`] without the shortcut for common pairs.
++    fn rules(&mut self, glyphs: &[Glyph]) -> Break {
++        let (glyph, next) = (&glyphs[0], &glyphs[1]);
 +        if !glyph.chr.is_whitespace() {
-+            self.after_opener = is_cjk(glyph.chr) && is_line_end_prohibited(glyph.chr);
 +            // Before a run of spaces, look past it once.
-+            self.before_closer = next.chr.is_whitespace()
++            let spaces = next.chr.is_whitespace();
++            self.after_opener = spaces && is_cjk(glyph.chr) && is_line_end_prohibited(glyph.chr);
++            self.before_closer = spaces
 +                && glyphs[1..]
 +                    .iter()
 +                    .find(|g| !g.chr.is_whitespace())
@@ -268,6 +286,25 @@ index 0000000..2984de0
 +            line_break(glyph.chr, next.chr)
 +        }
 +    }
++}
++
++/// The ruling on the most common pairs of characters, found quickly (`None` for the others):
++/// two characters before U+2000 that aren't spaces (Latin, Cyrillic, Greek, Arabic… text; the
++/// rules have no characters there, so egui decides), and a Han character or kana after one,
++/// unless it may not start a line or is a combining mark. [`Scan::rules`] rules the same.
++fn common_pair(glyph: &Glyph, next: &Glyph) -> Option<Break> {
++    let (before, after) = (glyph.chr, next.chr);
++    if (before as u32) < 0x2000 && (after as u32) < 0x2000 {
++        return (!before.is_whitespace() && !after.is_whitespace()).then_some(Break::Upstream);
++    }
++    let han = |c| matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}');
++    let kana = |c| matches!(c, '\u{3040}'..='\u{30FF}');
++    let letter_after = han(after)
++        || (kana(after)
++            && !matches!(after, '\u{3099}' | '\u{309A}')
++            && !is_line_start_prohibited(after));
++    ((han(before) || kana(before)) && letter_after && next.advance_width > 0.0)
++        .then_some(Break::Allowed)
 +}
 +
 +/// `next` continues the cluster of `glyph`, a Chinese or Japanese character: it has no width
@@ -323,13 +360,36 @@ index 0000000..2984de0
 +    true
 +}
 +
++/// Whether a row of `paragraph` (from `row_start` to the glyph that overflowed it) may be left
++/// empty, egui's way to start a paragraph after a first-row indentation (its `leading_space`,
++/// as for a label after another widget in a `horizontal_wrapped` layout) when the row has no
++/// good place to break: the text moves to the next row, which has the full width.
++///
++/// egui asks at every row of such a paragraph, although only an empty first row helps: further
++/// down it adds a blank line and lets the next row overflow the width by the indentation. Its
++/// own rules rarely leave a row without a word boundary (a Latin word wider than the row);
++/// kinsoku often does (a run it keeps together). So in a paragraph with Chinese or Japanese
++/// (`has_cjk`, found out the first time it matters) only the first row may be empty, and only
++/// if its text fits on the next row (or is a single glyph); otherwise the row breaks as it would
++/// without the indentation. Other paragraphs keep egui's behaviour.
++pub(crate) fn may_leave_row_empty(
++    paragraph: &[Glyph],
++    row_start: usize,
++    overflowing: usize,
++    width: f32,
++    has_cjk: &mut Option<bool>,
++) -> bool {
++    (row_start == 0 && (overflowing == 0 || fits(&paragraph[..=overflowing], width)))
++        || !*has_cjk.get_or_insert_with(|| paragraph.iter().any(|glyph| is_cjk(glyph.chr)))
++}
++
 +#[cfg(test)]
 +mod tests {
 +    use std::sync::Arc;
 +
 +    use super::{
-+        Break, Scan, is_cjk, is_inseparable, is_line_end_prohibited, is_line_start_prohibited,
-+        line_break,
++        Break, Scan, common_pair, is_cjk, is_inseparable, is_line_end_prohibited,
++        is_line_start_prohibited, line_break,
 +    };
 +    use crate::text::{
 +        FontDefinitions, FontId, FontsImpl, LayoutJob, TextFormat, TextOptions,
@@ -366,12 +426,13 @@ index 0000000..2984de0
 +    }
 +
 +    /// Kinsoku violations in `rows`: a break that [`line_break`] prohibits, a row (after the
-+    /// first) starting with one of the closing marks egui used to put there, or one (before the
++    /// first) starting with one of the closing marks egui used to put there or a Bopomofo tone
++    /// mark (the light-tone dot may start a line after a space: "˙ㄇㄚ"), or one (before the
 +    /// last) ending with an opening bracket.
 +    fn violations(rows: &[String]) -> Vec<String> {
 +        const NOT_FIRST: &str =
-+            "，．：；？！）］｝〕〉》」』】、。・ーっゃゅょァィゥェォッャュョ々～％…”’";
-+        const NOT_LAST: &str = "（［｛〔〈《「『【“‘";
++            "，．：；？！）］｝〕〉》」』】、。・ーっゃゅょァィゥェォッャュョ々～％…”’ˉˊˇˋ";
++        const NOT_LAST: &str = "（［｛〔〈《「『【“‘˙";
 +        let mut bad = Vec::new();
 +        for (i, pair) in rows.windows(2).enumerate() {
 +            let (Some(last), Some(first)) = (pair[0].chars().last(), pair[1].chars().next()) else {
@@ -395,6 +456,7 @@ index 0000000..2984de0
 +        "星门还差三个部件：星门完成后扫描即停止，只按实际进行的扫描收费。你确定吗？是的！（请注意）继续吧，好的；完成。",
 +        "按「确认」锁定（冻结）传送缓存：锁定后无法放入或取出物品，【注意】解锁后可再次修改。",
 +        "连接中断……正在重新连接，请稍候。服务器没有响应……请检查网络。他说：“你好！”——然后走了。",
++        "注音符號：ㄓㄨˋ ㄧㄣ ㄈㄨˊ ㄏㄠˋ。ㄋㄧˇㄏㄠˇㄇㄚ˙？˙ㄇㄚ ˙ㄇㄚ，ㄨㄛˇㄏㄣˇㄏㄠˇ！",
 +    ];
 +
 +    /// Japanese and Chinese with Latin words and numbers (from the `SpaceCorps` help texts).
@@ -508,6 +570,23 @@ index 0000000..2984de0
 +            &["か\u{3099}", "葛\u{E0100}", "字\u{2060}", "\u{2060}字"],
 +        );
 +        expect(Break::Allowed, &["\u{3099}き"]);
++    }
++
++    /// Bopomofo (zhuyin) tone marks are spacing letters, not combining marks: they stay with
++    /// the syllable before them, and the light-tone dot, which comes before or after its
++    /// syllable, with both neighbours. A line may break after a tone mark, between syllables.
++    #[test]
++    fn bopomofo_tone_marks_stay_with_their_syllable() {
++        assert_class("ˉˊˇˋ˪˫˙", is_line_start_prohibited, "line-start prohibited");
++        expect(
++            Break::Prohibited,
++            &[
++                "ㄣˉ", "ㄨˊ", "ㄠˇ", "ㄨˋ", "ㄠ˪", "ㄠ˫", "ㄚ˙", "˙ㄇ", "字ˋ", "ˋ，", "ˇ。",
++            ],
++        );
++        expect(Break::Allowed, &["ˋㄧ", "ˇㄏ", "ˉ字", "ㄓㄨ"]);
++        // Next to other characters they are egui's.
++        expect(Break::Upstream, &["aˇ", "ˇb", "a˙", "˙b", "ˇ˙"]);
 +    }
 +
 +    /// Every mark in egui's own list still may not start a line after a Han character or kana:
@@ -797,6 +876,51 @@ index 0000000..2984de0
 +        widest
 +    }
 +
++    /// The shortcut for common pairs rules as the full rules do (and leaves no bracket to keep
++    /// across spaces), for the characters below U+0300 and a sample of the rest below U+2000,
++    /// the CJK punctuation, Hiragana and Katakana blocks, some Han characters and the rules'
++    /// own characters, with and without width.
++    #[test]
++    fn common_pairs_are_ruled_as_by_the_full_rules() {
++        let mut fonts = fonts();
++        let template = glyphs(&mut fonts, "字")[0];
++        let glyph = |chr, advance_width| crate::text::Glyph {
++            chr,
++            advance_width,
++            ..template
++        };
++        let mut chars: Vec<char> = (0..0x300)
++            .chain((0x300..0x2000).step_by(7))
++            .chain(0x3000..0x3100)
++            .chain([
++                0x3400, 0x4DBF, 0x4E00, 0x5B57, 0x9FFF, 0xA0, 0x1680, 0xFE0F, 0xE0100,
++            ])
++            .filter_map(char::from_u32)
++            .collect();
++        chars.extend("）」。、，！？（「“‘”’«»…‥——〳〵￥％\u{2060}\u{200D}\u{3000}ˇˋ˙".chars());
++        let mut shortcuts = 0;
++        for &before in &chars {
++            for &after in &chars {
++                for width in [0.0, 7.0] {
++                    let pair = [glyph(before, 7.0), glyph(after, width)];
++                    if let Some(ruling) = common_pair(&pair[0], &pair[1]) {
++                        shortcuts += 1;
++                        let mut scan = Scan {
++                            after_opener: true,
++                            before_closer: true,
++                        };
++                        assert_eq!(scan.rules(&pair), ruling, "{before:?} {after:?}, {width}");
++                        assert!(
++                            !scan.after_opener && !scan.before_closer,
++                            "{before:?} {after:?}"
++                        );
++                    }
++                }
++            }
++        }
++        assert!(shortcuts > 500_000, "{shortcuts}");
++    }
++
 +    /// Spaces between brackets and their text, as Japanese sometimes has: at every width that
 +    /// holds the widest run kept together, no row starts with a closing mark after its leading
 +    /// spaces or ends with an opening one before its trailing spaces.
@@ -823,13 +947,20 @@ index 0000000..2984de0
 +        }
 +    }
 +
-+    /// Row widths of `text` wrapped at `width` points, with the number of glyphs with a width
-+    /// in each row.
-+    fn row_widths(fonts: &mut FontsImpl, text: &str, width: f32) -> Vec<(String, f32, usize)> {
++    /// Row widths of `text` wrapped at `width` points after a first-row indentation of
++    /// `leading_space` points (as egui gives a label after another widget in a
++    /// `horizontal_wrapped` layout), with the number of glyphs with a width in each row.
++    fn row_widths(
++        fonts: &mut FontsImpl,
++        text: &str,
++        width: f32,
++        leading_space: f32,
++    ) -> Vec<(String, f32, usize)> {
 +        let mut job = LayoutJob::single_section(
 +            text.to_owned(),
 +            TextFormat::simple(FontId::proportional(14.0), crate::Color32::WHITE),
 +        );
++        job.sections[0].leading_space = leading_space;
 +        job.wrap.max_width = width;
 +        let galley = layout(fonts, 1.0, Arc::new(job));
 +        galley
@@ -845,7 +976,10 @@ index 0000000..2984de0
 +    /// Chinese and Japanese rows never overflow the width (egui's rounding allows half a point)
 +    /// unless a single glyph is wider, also where a run kinsoku keeps together is wider than a
 +    /// row and must break: it breaks where the row is full, and a run moved to the next row
-+    /// whole fits there.
++    /// whole fits there. The same after a first-row indentation (egui's `leading_space`), where
++    /// only the first row may be empty (when what fits after the indentation ends inside a run
++    /// kinsoku keeps together): an empty row further down would add a blank line and let the
++    /// row after it overflow by the indentation.
 +    #[test]
 +    fn cjk_rows_never_overflow() {
 +        let mut fonts = fonts();
@@ -855,15 +989,22 @@ index 0000000..2984de0
 +            "。。。。。。、、、、、，，，，！！！？？？：：；；・・・ーーーーッッッ",
 +        ]);
 +        for text in texts {
-+            let mut width = 1.0;
-+            while width <= 240.0 {
-+                for (row, row_width, visible) in row_widths(&mut fonts, text, width) {
-+                    assert!(
-+                        row_width <= width + 0.5 + 1e-3 || visible <= 1,
-+                        "{width}: {row:?} is {row_width} wide"
-+                    );
++            for leading_space in [0.0, 8.0, 37.0] {
++                let mut width = 1.0;
++                while width <= 240.0 {
++                    let rows = row_widths(&mut fonts, text, width, leading_space);
++                    for (i, (row, row_width, visible)) in rows.iter().enumerate() {
++                        assert!(
++                            *row_width <= width + 0.5 + 1e-3 || *visible <= 1,
++                            "{width}, indented {leading_space}: {row:?} is {row_width} wide"
++                        );
++                        assert!(
++                            i == 0 || !row.is_empty(),
++                            "{width}, indented {leading_space}: empty row {i}: {rows:?}"
++                        );
++                    }
++                    width += 0.5;
 +                }
-+                width += 0.5;
 +            }
 +        }
 +    }
@@ -959,7 +1100,7 @@ index 9bae95a..9938599 100644
  mod text_layout_types;
  
 diff --git a/src/text/text_layout.rs b/src/text/text_layout.rs
-index 06ddc3b..ad9eccf 100644
+index 06ddc3b..b586ad2 100644
 --- a/src/text/text_layout.rs
 +++ b/src/text/text_layout.rs
 @@ -12,6 +12,7 @@ use crate::{
@@ -970,7 +1111,31 @@ index 06ddc3b..ad9eccf 100644
      },
  };
  
-@@ -682,7 +683,8 @@ fn line_break(
+@@ -653,6 +654,7 @@ fn line_break(
+     let mut first_row_indentation = paragraph.glyphs[0].pos.x;
+     let mut row_start_x = 0.0;
+     let mut row_start_idx = 0;
++    let mut has_cjk = None; // Space3d patch (kinsoku): see `kinsoku::may_leave_row_empty`.
+ 
+     for i in 0..paragraph.glyphs.len() {
+         if job.wrap.max_rows <= out_rows.len() {
+@@ -667,6 +669,15 @@ fn line_break(
+ 
+             if first_row_indentation > 0.0
+                 && !row_break_candidates.has_good_candidate(job.wrap.break_anywhere)
++                // Space3d patch (kinsoku): with Chinese or Japanese, only the first row, if its
++                // text fits on the next one.
++                && kinsoku::may_leave_row_empty(
++                    &paragraph.glyphs,
++                    row_start_idx,
++                    i,
++                    wrap_width,
++                    &mut has_cjk,
++                )
+             {
+                 // Allow the first row to be completely empty, because we know there will be more space on the next row:
+                 // TODO(emilk): this records the height of this first row as zero, though that is probably fine since first_row_indentation usually comes with a first_row_min_height.
+@@ -682,7 +693,8 @@ fn line_break(
                  });
                  row_start_x += first_row_indentation;
                  first_row_indentation = 0.0;
@@ -980,7 +1145,7 @@ index 06ddc3b..ad9eccf 100644
              {
                  let glyphs: Vec<Glyph> = paragraph.glyphs[row_start_idx..=last_kept_index]
                      .iter()
-@@ -1276,11 +1278,37 @@ struct RowBreakCandidates {
+@@ -1276,11 +1288,37 @@ struct RowBreakCandidates {
      /// Breaking after just random character is some
      /// times necessary.
      any: Option<usize>,
@@ -1018,7 +1183,7 @@ index 06ddc3b..ad9eccf 100644
          const NON_BREAKING_SPACE: char = '\u{A0}';
          if chr.is_whitespace() && chr != NON_BREAKING_SPACE {
              self.space = Some(index);
-@@ -1311,14 +1339,39 @@ impl RowBreakCandidates {
+@@ -1311,14 +1349,39 @@ impl RowBreakCandidates {
          }
      }
  
@@ -1062,7 +1227,7 @@ index 06ddc3b..ad9eccf 100644
          }
      }
  
-@@ -1330,6 +1383,9 @@ impl RowBreakCandidates {
+@@ -1330,6 +1393,9 @@ impl RowBreakCandidates {
              dash,
              punctuation,
              any,
@@ -1072,7 +1237,7 @@ index 06ddc3b..ad9eccf 100644
          } = self;
          if space.is_some_and(|s| s < index) {
              *space = None;
-@@ -1349,6 +1405,12 @@ impl RowBreakCandidates {
+@@ -1349,6 +1415,12 @@ impl RowBreakCandidates {
          if any.is_some_and(|s| s < index) {
              *any = None;
          }

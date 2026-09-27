@@ -154,6 +154,74 @@ fn cjk_paragraphs_wrap_by_kinsoku_at_every_width() {
     assert!(bad.is_empty(), "{} kinsoku violations:\n{}", bad.len(), bad.join("\n"));
 }
 
+/// A label after another widget in a `horizontal_wrapped` layout starts on that widget's row
+/// and wraps below it (egui indents the label's first row). At every column width from two
+/// characters: only the label's first row may be empty (when the first run the rules keep
+/// together doesn't fit after the widget), no row with Chinese or Japanese is wider than the
+/// column (the rest of a Latin word may be, by less than a glyph, as with upstream egui), no
+/// character is lost, and from the widest unbreakable run on, the rules hold.
+#[test]
+fn a_label_after_a_widget_wraps_by_kinsoku() {
+    let ctx = cjk_context();
+    let font = FontId::proportional(14.0);
+    let mut bad = Vec::new();
+    let mut layouts = 0;
+    for text in JAPANESE.iter().chain(TRADITIONAL_CHINESE).chain(SIMPLIFIED_CHINESE) {
+        let chars: Vec<char> = text.chars().collect();
+        let min_width = ctx.fonts_mut(|fonts| widest_unit(fonts, text, &font)).ceil() + 2.0;
+        for width in (30..=320).step_by(2).map(|w| w as f32) {
+            let mut galley = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::Area::new(egui::Id::new("kinsoku label"))
+                    .fixed_pos([0.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.set_width(width);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Tip:");
+                            let label = egui::Label::new(RichText::new(*text).font(font.clone()));
+                            galley = Some(label.layout_in_ui(ui).1);
+                        });
+                    });
+            });
+            output.textures_delta.clear(); // Nothing uploads the font atlas here.
+            let galley = galley.expect("the label was laid out");
+            let wrap_width = galley.job.wrap.max_width;
+            let rows: Vec<String> = galley.rows.iter().map(|row| row.text()).collect();
+            layouts += 1;
+            assert!(galley.job.sections[0].leading_space > 0.0, "{width}: not indented");
+            assert_eq!(rows.concat(), *text, "{width}");
+            for (i, row) in galley.rows.iter().enumerate() {
+                if i > 0 && row.glyphs.is_empty() {
+                    bad.push(format!("{width}: empty row {i}: {rows:?}"));
+                }
+                let cjk = row
+                    .text()
+                    .chars()
+                    .any(|c| matches!(c, '\u{3000}'..='\u{9FFF}' | '\u{FF00}'..='\u{FFEF}'));
+                if cjk && row.size.x > wrap_width + 0.5 {
+                    bad.push(format!(
+                        "{width}: {:?} is {} wide, over {wrap_width}: {rows:?}",
+                        row.text(),
+                        row.size.x
+                    ));
+                }
+            }
+            if width >= min_width {
+                let mut end = 0;
+                for (i, row) in rows.iter().enumerate().take(rows.len() - 1) {
+                    end += row.chars().count();
+                    if end > 0 && !is_breakable(&chars, end - 1) {
+                        let (last, first) = (chars[end - 1], chars[end]);
+                        bad.push(format!("{width}: {last:?} | {first:?} after row {i}: {rows:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(layouts > 1000, "{layouts} layouts");
+    assert!(bad.is_empty(), "{} problems:\n{}", bad.len(), bad.join("\n"));
+}
+
 /// The test font has every glyph of the Japanese and Traditional Chinese paragraphs (the story
 /// below shows real glyphs, not replacement boxes).
 #[test]

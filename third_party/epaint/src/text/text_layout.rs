@@ -654,6 +654,7 @@ fn line_break(
     let mut first_row_indentation = paragraph.glyphs[0].pos.x;
     let mut row_start_x = 0.0;
     let mut row_start_idx = 0;
+    let mut has_cjk = None; // Space3d patch (kinsoku): see `kinsoku::may_leave_row_empty`.
 
     for i in 0..paragraph.glyphs.len() {
         if job.wrap.max_rows <= out_rows.len() {
@@ -668,6 +669,15 @@ fn line_break(
 
             if first_row_indentation > 0.0
                 && !row_break_candidates.has_good_candidate(job.wrap.break_anywhere)
+                // Space3d patch (kinsoku): with Chinese or Japanese, only the first row, if its
+                // text fits on the next one.
+                && kinsoku::may_leave_row_empty(
+                    &paragraph.glyphs,
+                    row_start_idx,
+                    i,
+                    wrap_width,
+                    &mut has_cjk,
+                )
             {
                 // Allow the first row to be completely empty, because we know there will be more space on the next row:
                 // TODO(emilk): this records the height of this first row as zero, though that is probably fine since first_row_indentation usually comes with a first_row_min_height.

@@ -43,8 +43,9 @@ that games don't maintain a copy. It was reviewed and rewritten as a self-contai
   `egui::epaint::text::kinsoku`): the character classes and `line_break(before, after)`, which
   answers `Prohibited`, `Allowed` or `Upstream` for every position between two characters;
   crate-private, the glyph-level part the hook uses (`Scan`, which walks a paragraph and also
-  looks past spaces and into clusters, and the fit checks of the fallbacks); the unit tests.
-* **`src/text/text_layout.rs`**, `RowBreakCandidates` (the hook, ~60 lines): `add` asks
+  looks past spaces and into clusters, with a shortcut for the most common pairs; the fit
+  checks of the fallbacks; `may_leave_row_empty`, below); the unit tests.
+* **`src/text/text_layout.rs`**, `RowBreakCandidates` (the hook, ~70 lines): `add` asks
   `kinsoku::Scan` first. `Prohibited` records the position only for the fallbacks (below);
   `Allowed` makes it a word-boundary candidate (`pre_cjk`); otherwise egui's own rules run
   unchanged. `get` (called when a glyph overflows the row) takes egui's word-boundary, dash
@@ -53,7 +54,8 @@ that games don't maintain a copy. It was reviewed and rewritten as a self-contai
   kinsoku doesn't prohibit, if the run kinsoku keeps together after it fits on the next row
   whole (so even a word wider than the row doesn't break right before its "、"), and
   `any_separable`, the last position not inside "——" "……" or a cluster; `any` itself never
-  splits a cluster.
+  splits a cluster. In `line_break`, egui's empty first row (for a first-row indentation, see
+  below) asks `kinsoku::may_leave_row_empty` too.
 * **`src/text/mod.rs`**: `pub mod kinsoku;` (one line).
 
 `font.rs` (egui's `is_cjk_break_allowed` list) is untouched: kinsoku's list is a superset.
@@ -68,8 +70,8 @@ JLREQ/CLREQ ("strict" line breaking):
 
 | rule | characters |
 |---|---|
-| may not start a line (行頭禁則) | closing brackets and quotes `）］｝〕〉》」』】〙〗〛〞〟｠｣’”»)]}'"`; hyphens `‐–゠〜～`; `？！‼⁇⁈⁉?!`; middle dots, colons, semicolons `・･·‧：；:;`; full stops `。．｡.`; commas `、，､,`; iteration marks `ヽヾゝゞ々〻`; prolonged sound mark `ーｰ`; small kana `ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶㇰ-ㇿｧ-ｯ` (and the small kana extension); sound marks `゛゜ﾞﾟ`; postfixed signs `％%‰°′″℃℉¢￠`; ellipses `…‥⋯` (plus the vertical and small forms) |
-| may not end a line (行末禁則) | opening brackets and quotes `（［｛〔〈《「『【〘〖〚〝｟｢‘“«([{`; prefixed signs `￥＄￡＃` |
+| may not start a line (行頭禁則) | closing brackets and quotes `）］｝〕〉》」』】〙〗〛〞〟｠｣’”»)]}'"`; hyphens `‐–゠〜～`; `？！‼⁇⁈⁉?!`; middle dots, colons, semicolons `・･·‧：；:;`; full stops `。．｡.`; commas `、，､,`; iteration marks `ヽヾゝゞ々〻`; prolonged sound mark `ーｰ`; small kana `ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶㇰ-ㇿｧ-ｯ` (and the small kana extension); sound marks `゛゜ﾞﾟ`; postfixed signs `％%‰°′″℃℉¢￠`; ellipses `…‥⋯` (plus the vertical and small forms); Bopomofo tone marks `ˉˊˇˋ˪˫˙` (spacing letters written after their syllable, ㄏㄠˇ) |
+| may not end a line (行末禁則) | opening brackets and quotes `（［｛〔〈《「『【〘〖〚〝｟｢‘“«([{`; prefixed signs `￥＄￡＃`; the Bopomofo light-tone dot `˙`, which Taiwan's standard writes before its syllable (˙ㄇㄚ) and much text after it |
 | inseparable (分離禁止) | `——` `――` `……` `‥‥` `⋯⋯`, `〳〵` `〴〵` |
 | also kept together | a Chinese or Japanese character and its combining mark or variation selector (か + ゙, 葛 + VS17, 字 + U+FE0F) — as characters, and as glyphs: the shaper gives a selector the font has no glyph for the base's character and no width, and no row starts with such a glyph, even in a row narrower than one glyph; word joiners; a straight quote `"` `'` with the CJK text on both sides (it may open or close a quote, Unicode class QU) |
 | across spaces | spaces between a bracket and its text (「　重要　」, （ 注意 ）): no line ends with the opening bracket and its spaces or starts with the spaces and the closing mark (as Unicode's `OP SP* ×` and `× CL` after spaces) |
@@ -85,9 +87,18 @@ still breaks, where the row is full, as upstream egui breaks a word wider than t
 not inside "——" or "……" while such a pair fits on a row, and never inside a cluster. No break
 kinsoku chooses or rules out makes a row of Chinese or Japanese text wider than the wrap width
 (plus the half point egui's rounding allows) unless one glyph is wider; the unit test
-`cjk_rows_never_overflow` checks paragraphs at every half point from 1 to 240 pt. As with
-upstream egui, the rest of a Latin word can still overflow a row by less than a glyph in
-columns only two or three characters wide.
+`cjk_rows_never_overflow` checks paragraphs at every half point from 1 to 240 pt, with and
+without a first-row indentation. As with upstream egui, the rest of a Latin word can still
+overflow a row by less than a glyph in columns only two or three characters wide.
+
+A first-row indentation (egui's `leading_space`: a label after another widget in a
+`horizontal_wrapped` layout starts on that widget's row) gets egui's answer for a row without
+a word boundary — leave the row empty and move its text to the next, full-width row — only
+for the first row of a paragraph with Chinese or Japanese, and only if the text fits there.
+egui asks at every row, which further down adds a blank line and lets the next row overflow
+by the indentation; its own rules rarely leave a row without a word boundary (a Latin word
+wider than the row), kinsoku often (a run it keeps together, in a narrow column). Paragraphs
+without Chinese or Japanese keep egui's behaviour.
 
 **Text without Chinese or Japanese characters lays out as with upstream egui**: every such
 pair gets `Upstream`, so `RowBreakCandidates` behaves as before (the unit test
@@ -111,21 +122,33 @@ test corpus above the game's patch has 370 violations, this one 0. Not done
 (egui can't): hanging punctuation (ぶら下げ), justification, and pushing a character back to
 the previous line (追い込み) instead of forward.
 
+**Cost.** Kinsoku rules on every position of a paragraph that wraps; `Scan` answers the most
+common pairs (two characters below U+2000, a Han character or kana after one) without the
+full rules, and nothing allocates. A whole `epaint::text::layout` call (release build, warm
+glyph cache, 400 pt wide, Apple M4 Max) takes about 5 % longer than with upstream epaint for
+40 kB of English or Latin and Cyrillic text and 8–11 % for 20,000 characters of Chinese or
+Japanese: 0.1–0.2 ms more. Text that doesn't wrap costs the same. egui caches laid-out text,
+so this is paid only when a text or its width changes.
+
 ### Tests
 
 * `epaint/src/text/kinsoku.rs` unit tests (in the vendored crate; CI runs them): every class
   and rule, egui's list included, Latin words and numbers, Chinese and straight quotes, spaces
   next to brackets (pairs, and paragraphs at every width), the million-pair "no CJK, no change"
   check, German quotes at every width, runs of prohibited marks, a word wider than the row,
-  rows that never overflow, dashes and ellipses kept whole in any script, clusters kept whole,
-  and upstream's own `test_cjk`/`test_pre_cjk` rows. With the hook removed, 1084 violations
-  and six failing tests. Run:
+  rows that never overflow (also after a first-row indentation, where only the first row may
+  be empty), dashes and ellipses kept whole in any script, clusters kept whole, Bopomofo tone
+  marks, the shortcut for common pairs against the full rules, and upstream's own
+  `test_cjk`/`test_pre_cjk` rows. With the hook removed, 1188 violations and six failing
+  tests. Run:
   `cargo test --manifest-path third_party/epaint/Cargo.toml --target-dir target/third_party --lib text::`
   (all of epaint's own tests pass too).
 * `crates/space3d-ui/tests/kinsoku.rs`: Japanese, Traditional and Simplified Chinese paragraphs
   (and one with spaces around brackets) with a CJK test font (a Noto Sans JP subset,
   `crates/space3d-ui/tests/fonts/`) at three sizes and every fourth width, checked against the
-  test's own lists, which look past spaces; the golden story
+  test's own lists, which look past spaces; a label after another widget in
+  `horizontal_wrapped` at every other width from 30 to 320 pt (egui indents its first row:
+  no empty row after it, no overflowing row); the golden story
   `UI/Text/Kinsoku` (`tests/__screenshots__/UI/Text/Kinsoku.png`); and
   `epaint_resolves_to_the_vendored_kinsoku_copy`, which fails when `Cargo.lock` shows epaint
   from crates.io or the patch unused.
