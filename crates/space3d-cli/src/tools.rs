@@ -1,7 +1,7 @@
 //! Detecting external tools and SDKs (versions are parsed by pure, unit-tested functions).
 
-use crate::process::{Cmd, Exec, which};
-use std::path::{Path, PathBuf};
+use crate::process::{Cmd, Exec};
+use std::path::Path;
 
 /// Oldest supported Rust (the workspace `rust-version`).
 pub const MIN_RUST: (u64, u64, u64) = (1, 98, 0);
@@ -12,7 +12,7 @@ pub const WASM_TARGET: &str = "wasm32-unknown-unknown";
 pub const IOS_TARGET: &str = "aarch64-apple-ios";
 /// iOS simulator target (Apple silicon).
 pub const IOS_SIM_TARGET: &str = "aarch64-apple-ios-sim";
-/// Android target built by default.
+/// Android target built by default (`android::Abi::Arm64`).
 pub const ANDROID_TARGET: &str = "aarch64-linux-android";
 
 /// Parse `rustc 1.98.1 (48a229cea 2026-09-01)` → `(1, 98, 1)`.
@@ -68,40 +68,6 @@ pub fn wasm_bindgen_cli_version(exec: &Exec) -> Option<String> {
 pub fn wasm_opt_version(exec: &Exec) -> Option<String> {
     exec.probe(&Cmd::new("wasm-opt").arg("--version"))
         .map(|s| first_line(&s))
-}
-
-/// Path of the `cargo-apk` subcommand binary, if installed.
-pub fn cargo_apk() -> Option<PathBuf> {
-    which("cargo-apk")
-}
-
-/// Android NDK directory from `ANDROID_NDK_ROOT` / `ANDROID_NDK_HOME` / `NDK_HOME`, or the
-/// newest `ndk/<version>` inside the SDK.
-pub fn android_ndk() -> Option<PathBuf> {
-    ["ANDROID_NDK_ROOT", "ANDROID_NDK_HOME", "NDK_HOME"]
-        .iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .find(|p| p.is_dir())
-        .or_else(|| {
-            let ndk_dir = android_sdk()?.join("ndk");
-            let mut versions: Vec<PathBuf> = std::fs::read_dir(ndk_dir)
-                .ok()?
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.is_dir())
-                .collect();
-            versions.sort();
-            versions.pop()
-        })
-}
-
-/// Android SDK directory from `ANDROID_HOME` / `ANDROID_SDK_ROOT`.
-pub fn android_sdk() -> Option<PathBuf> {
-    ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
-        .iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .find(|p| p.is_dir())
 }
 
 /// `xcodebuild -version` first line when a full Xcode is selected (not just the CLT).

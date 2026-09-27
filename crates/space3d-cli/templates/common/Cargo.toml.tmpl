@@ -13,7 +13,8 @@ default-run = "{{name}}"
 #   src/bin/stories.rs  storybook viewer / headless gallery (`space3d stories`)
 #   src/bin/editor.rs   scene editor with the game loaded (`space3d editor`)
 #   tests/              input-simulation and golden-screenshot tests (`space3d test`)
-#   mobile/             Android (`cargo apk`) + iOS (Xcode) library — see android/ and ios/
+#   mobile/             Android + iOS library (same `build`); android/ is its Gradle project,
+#                       ios/ its Xcode project — see their README.md
 
 [dependencies]
 # Default engine features + the storybook and editor (dev tools; drop "editor" and delete

@@ -39,10 +39,13 @@ pub fn run_web(build: impl FnOnce(&mut App)) {
     run(build);
 }
 
-/// Android start (NativeActivity): stash the `AndroidApp` for the winit event loop, build and
-/// run the app. See `space3d_platform::mobile`.
+/// Android start (NativeActivity): the asset server reads the APK's `assets/` (`assets`
+/// feature), then `space3d_platform::android_main_entry` routes logs and panics to logcat,
+/// builds and runs the app, and ends the process when it exits. See `space3d_platform::mobile`.
 #[cfg(all(target_os = "android", feature = "platform"))]
 pub fn run_android(android_app: space3d_platform::AndroidApp, build: impl FnOnce(&mut App)) {
+    #[cfg(feature = "assets")]
+    space3d_assets::set_android_asset_manager(android_app.asset_manager());
     space3d_platform::android_main_entry(android_app, build);
 }
 
@@ -62,17 +65,21 @@ pub fn run_ios(build: impl FnOnce(&mut App)) {
 /// |---|---|---|
 /// | desktop (Windows, macOS, Linux) | `pub fn main()` | `App::new()` → `build(&mut app)` → `app.run()` |
 /// | web (`wasm32`) | `#[wasm_bindgen(start)] pub fn __space3d_wasm_start()` (+ a no-op `main`) | panic hook (`console.error`), then the same as desktop (`DefaultPlugins` logs to the browser console); `run()` returns and the browser drives frames |
-/// | Android | `#[no_mangle] fn android_main(AndroidApp)` | `space3d_platform::android_main_entry` (NativeActivity, e.g. via `cargo apk`) |
+/// | Android | `#[no_mangle] fn android_main(AndroidApp)` | `space3d_platform::android_main_entry` (NativeActivity; `space3d build --target android`); logs and panics go to logcat (`adb logcat -s space3d`), assets are read from the APK |
 /// | iOS | `#[no_mangle] pub extern "C" fn start_app()` (+ `main` also runs the app) | call `start_app()` from the Xcode project's `main.m`; never returns |
 ///
 /// Use it **once per final artifact**:
 ///
 /// * **Desktop + web**: put it in the binary, `src/main.rs`.
-/// * **Android/iOS**: those platforms load a *library* (`cdylib` for `cargo apk`, `staticlib`
+/// * **Android/iOS**: those platforms load a *library* (`cdylib` for Android, `staticlib`
 ///   for Xcode). Keep the game in a library crate and invoke the macro once more in a small
 ///   crate with `crate-type = ["cdylib", "staticlib"]` — the layout `space3d new` generates
 ///   (`src/main.rs` + `mobile/src/lib.rs`, both `space3d::main!(my_game::build);`), so desktop
-///   and web builds never link the mobile library types.
+///   and web builds never link the mobile library types. For Android alone a package's own
+///   library works too: `space3d build --target android` builds it as a `cdylib`
+///   (`cargo rustc --crate-type cdylib`). The examples' `src/lib.rs` is just
+///   `#![cfg(target_os = "android")] #[path = "main.rs"] mod example;` — the binary's
+///   `space3d::main!` then exports `android_main` from the library.
 ///
 /// ```no_run
 /// use space3d::prelude::*;

@@ -72,7 +72,7 @@ space3d::main!(build);
 * **Testing.** Headless `TestApp`, tick-accurate keyboard/mouse/touch/gamepad simulation and
   recorded input scripts, golden screenshots with diff images and an HTML report, determinism
   and performance assertions. GPU tests skip when there is no adapter.
-* **Shipping.** `space3d` CLI for desktop, web (wasm-bindgen), Android (cargo-apk) and iOS
+* **Shipping.** `space3d` CLI for desktop, web (wasm-bindgen), Android (cargo-ndk + Gradle) and iOS
   (Xcode via XcodeGen) builds, a local web server with cross-origin isolation, GitHub Actions
   generation and GitHub releases; in-game update checker and opt-in crash reporter.
 

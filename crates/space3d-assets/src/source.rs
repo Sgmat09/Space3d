@@ -229,8 +229,105 @@ impl std::fmt::Debug for MemorySource {
     }
 }
 
-/// The platform's default source for `root`: [`FileSource`] on native, [`HttpSource`] on web.
+/// Reads the files packaged in the APK's `assets/` (Android) through the `AAssetManager`.
+///
+/// `space3d build --target android` packages the project's `assets/` directory there, so
+/// `assets/textures/a.png` of the project is `textures/a.png` in the APK. [`default_source`]
+/// returns this source on Android once [`set_android_asset_manager`] was called (the
+/// `space3d::main!` entry point does that before the game's `build` runs).
+#[cfg(target_os = "android")]
+#[derive(Clone, Debug)]
+pub struct ApkSource {
+    manager: Arc<ndk::asset::AssetManager>,
+    prefix: String,
+}
+
+#[cfg(target_os = "android")]
+impl ApkSource {
+    /// Serve the APK's assets below `prefix` (`""`: all of them).
+    pub fn new(manager: ndk::asset::AssetManager, prefix: impl Into<String>) -> Self {
+        Self {
+            manager: Arc::new(manager),
+            prefix: prefix.into(),
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl AssetSource for ApkSource {
+    fn read(&self, path: &AssetPath) -> BoxedFuture<Result<Vec<u8>, AssetError>> {
+        if path.escapes_root() || path.path().is_empty() {
+            return ready(Err(AssetError::InvalidPath(path.to_string())));
+        }
+        let name = apk_asset_name(&self.prefix, path.path());
+        let (manager, display) = (self.manager.clone(), path.to_string());
+        Box::pin(async move {
+            // AAsset reads may decompress: off the async workers, like `tokio::fs`.
+            let task_display = display.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let c_name = std::ffi::CString::new(name).map_err(|_| AssetError::InvalidPath(task_display.clone()))?;
+                let mut asset = manager
+                    .open(&c_name)
+                    .ok_or_else(|| AssetError::NotFound(task_display.clone()))?;
+                let mut bytes = Vec::with_capacity(asset.length());
+                asset
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| AssetError::io(task_display, e))?;
+                Ok(bytes)
+            })
+            .await
+            .map_err(|e| AssetError::io(display, e.to_string()))?
+        })
+    }
+}
+
+/// The asset manager behind [`default_source`] on Android.
+#[cfg(target_os = "android")]
+static ANDROID_ASSET_MANAGER: std::sync::OnceLock<Arc<ndk::asset::AssetManager>> = std::sync::OnceLock::new();
+
+/// Make [`default_source`] read the APK's assets ([`ApkSource`]) on Android. Called by the
+/// `space3d::main!` entry point with the application's asset manager (it stays valid for the
+/// process lifetime); later calls are ignored.
+#[cfg(target_os = "android")]
+pub fn set_android_asset_manager(manager: ndk::asset::AssetManager) {
+    let _ = ANDROID_ASSET_MANAGER.set(Arc::new(manager));
+}
+
+/// Path inside the APK's `assets/` of `path` below the asset root `prefix`.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn apk_asset_name(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{prefix}/{path}")
+    }
+}
+
+/// The APK prefix of an asset root: the project's `assets/` directory is the APK's `assets/`,
+/// so a root of `assets` (the default) maps to the whole of it and `assets/levels` to
+/// `levels`; other roots are taken as directories inside the APK's `assets/`.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn apk_prefix(root: &str) -> String {
+    let root = AssetPath::new(root).path().to_string();
+    match root.strip_prefix("assets") {
+        Some("") => String::new(),
+        Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/').to_owned(),
+        _ => root,
+    }
+}
+
+/// The platform's default source for `root`: [`FileSource`] on native, [`HttpSource`] on web,
+/// [`ApkSource`] on Android (the APK's packaged `assets/`) once
+/// [`set_android_asset_manager`] was called, else a `FileSource`.
 pub fn default_source(root: &str) -> Arc<dyn AssetSource> {
+    #[cfg(target_os = "android")]
+    if let Some(manager) = ANDROID_ASSET_MANAGER.get() {
+        return Arc::new(ApkSource {
+            manager: manager.clone(),
+            prefix: apk_prefix(root),
+        });
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         Arc::new(FileSource::new(root))
@@ -244,6 +341,17 @@ pub fn default_source(root: &str) -> Arc<dyn AssetSource> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apk_paths_follow_the_packaged_assets_directory() {
+        assert_eq!(apk_prefix("assets"), "");
+        assert_eq!(apk_prefix("./assets/"), "");
+        assert_eq!(apk_prefix("assets/levels"), "levels");
+        assert_eq!(apk_prefix("data"), "data");
+        assert_eq!(apk_prefix("assetsx"), "assetsx");
+        assert_eq!(apk_asset_name("", "textures/a.png"), "textures/a.png");
+        assert_eq!(apk_asset_name("levels", "one.ron"), "levels/one.ron");
+    }
 
     #[test]
     fn memory_source_reads() {

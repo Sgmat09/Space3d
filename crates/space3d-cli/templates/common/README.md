@@ -28,6 +28,7 @@ Controls: {{controls}}
 | `assets/` | textures, models, sounds |
 | `web/index.html` | page for the web build |
 | `mobile/` | Android/iOS library crate (same `build` function) |
+| `android/` | Gradle project that packages `mobile/` as an APK / App Bundle |
 
 ```sh
 space3d test                        # all tests + screenshot report (target/space3d-report/index.html)

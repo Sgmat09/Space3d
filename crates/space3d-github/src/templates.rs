@@ -7,7 +7,7 @@
 //! | `test` | always | fmt, clippy, `cargo test` incl. golden screenshot tests on a software GPU; uploads `*.actual.png`/`*.diff.png` on failure |
 //! | `desktop` | any desktop [`Target`] | release build matrix (linux / windows / macos), zipped |
 //! | `web` + `deploy-pages` | [`Target::Web`] | wasm32 build + `wasm-bindgen` bundle; deployed to GitHub Pages from `main` and tags |
-//! | `android` | [`Target::Android`] | `.apk` via `cargo-apk` |
+//! | `android` | [`Target::Android`] | `.apk`: cargo-ndk + Gradle (the project's `android/`) |
 //! | `ios` | [`Target::Ios`] | unsigned `.ipa` via `xcodebuild` on a macOS runner |
 //! | `release` | tags `v*` | GitHub Release with every build attached |
 //!
@@ -243,7 +243,12 @@ pub fn github_actions_with(targets: &[Target], opts: &TemplateOptions) -> String
         .replace("__IOS_PROJECT__", &ios_project)
         .replace("__IOS_SCHEME__", &ios_scheme)
         .replace("__MAIN__", &opts.main_branch)
+        .replace("__GRADLE__", GRADLE_VERSION)
 }
+
+/// Gradle of the Android job (latest stable; the Android Gradle Plugin of `space3d new`'s
+/// `android/` project runs on it).
+pub const GRADLE_VERSION: &str = "9.8.0";
 
 /// Write the workflow into `project_dir/.github/workflows/space3d.yml` (native only).
 #[cfg(not(target_arch = "wasm32"))]
@@ -419,7 +424,8 @@ const PAGES_JOB: &str = r#"
 const ANDROID_JOB: &str = r#"
   android:
     name: Android (apk)
-    # Needs `[lib] crate-type = ["cdylib"]` and `[package.metadata.android]` in Cargo.toml.
+    # The game's library (cargo-ndk) packaged by the Gradle project in android/, which
+    # `space3d new` writes; `space3d build --target android --release` does the same locally.
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -429,25 +435,26 @@ const ANDROID_JOB: &str = r#"
           toolchain: __TOOLCHAIN__
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "17"
-      - uses: nttld/setup-ndk@v1
-        id: ndk
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v6
         with:
-          ndk-version: r28
-      - run: cargo install cargo-apk --locked
+          gradle-version: "__GRADLE__"
+      - run: cargo install cargo-ndk --locked
       - name: Build APK
-        env:
-          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo apk build --release --lib --target aarch64-linux-android
+        run: |
+          # The runner's newest NDK: r28+ links the 16 KB-aligned libraries Google Play requires.
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          cargo ndk -t arm64-v8a -P 28 -o target/android/__BIN__/jniLibs build --release --lib
+          gradle -p android assembleRelease --console=plain \
+            -Pspace3d.jniLibs="$PWD/target/android/__BIN__/jniLibs" \
+            -Pspace3d.buildDir="$PWD/target/android/__BIN__/build"
       - name: Collect
         run: |
           mkdir -p dist
-          apk="$(find target -path '*release*' -name '*.apk' | head -n 1)"
-          cp "$apk" dist/__BIN__-android.apk
+          cp target/android/__BIN__/build/outputs/apk/release/*.apk dist/__BIN__-android.apk
       - uses: actions/upload-artifact@v4
         with:
           name: __BIN__-android
@@ -585,7 +592,9 @@ mod tests {
             Some("write")
         );
         assert_eq!(doc["jobs"]["ios"]["runs-on"].as_str(), Some("macos-latest"));
-        assert!(yaml.contains("cargo apk build"));
+        assert!(yaml.contains("cargo ndk -t arm64-v8a -P 28 -o target/android/game/jniLibs build --release --lib"));
+        assert!(yaml.contains("gradle -p android assembleRelease"));
+        assert!(yaml.contains(&format!("gradle-version: \"{GRADLE_VERSION}\"")));
         assert!(yaml.contains("xcodebuild"));
         assert!(yaml.contains("wasm-bindgen-cli@0.2.128"));
     }

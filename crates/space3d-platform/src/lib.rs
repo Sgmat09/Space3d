@@ -13,7 +13,8 @@
 //! * [Keyboard layouts](#keyboard-layouts) — logical keys ([`KeyEvent`]) and key labels
 //!   ([`Input::key_label`]) that follow the player's layout; see [`layout`].
 //! * Web: `init_web_logging()` (wasm32 only), canvas attachment via [`WindowPlugin::canvas_id`].
-//! * Mobile: `android_main_entry` (Android) and the iOS `start_app` pattern — see [`mobile`].
+//! * Mobile: `android_main_entry` (Android; logs go to logcat, tag [`LOGCAT_TAG`]) and the iOS
+//!   `start_app` pattern — see [`mobile`].
 //!
 //! ```no_run
 //! use space3d_core::prelude::*;
@@ -74,7 +75,8 @@ pub use layout::{
     is_writing_system_key, us_qwerty_label, writing_system_keys,
 };
 #[cfg(target_os = "android")]
-pub use mobile::{AndroidApp, android_main_entry};
+pub use mobile::{AndroidApp, android_app, android_main_entry};
+pub use mobile::{ENV_PROPERTIES, LOGCAT_TAG};
 #[cfg(target_arch = "wasm32")]
 pub use web::{find_canvas, init_web_logging};
 pub use window::{PlatformEvent, WindowPlugin, WindowState};

@@ -10,3 +10,9 @@ publish = false
 # `stories`: the showcase content and scenes (`space3d::stories::showcase`); `test`: the
 # headless PNG.
 space3d = { workspace = true, features = ["particles", "stories", "test"] }
+
+# `space3d build --target android` (APK in dist/android/; see src/lib.rs, docs/platforms.md).
+[package.metadata.space3d.android]
+application_id = "dev.space3d.examples.graphics_showcase"
+label = "Space3d Showcase"
+orientation = "sensorLandscape"

@@ -8,7 +8,8 @@
 //! | [`args`] | clap definitions of every subcommand |
 //! | [`template`] | embedded project templates, rendering, `space3d new` scaffolding, CI workflow |
 //! | [`project`] | `cargo metadata` / `Cargo.lock` reading: packages, binaries, locked versions |
-//! | [`tools`] | toolchain / SDK detection (rustc, targets, wasm-bindgen, cargo-apk, NDK, Xcode, gh) |
+//! | [`tools`] | toolchain detection (rustc, targets, wasm-bindgen, Xcode, gh) |
+//! | [`android`] | Android SDK/NDK/JDK/Gradle/cargo-ndk detection, packaging settings, Gradle project |
 //! | [`process`] | command echo, dry-run, probes |
 //! | [`commands`] | one function per subcommand |
 //!
@@ -19,13 +20,14 @@
 //! space3d serve                          # web build + local server with COOP/COEP
 //! space3d test                           # tests + golden screenshots + HTML report
 //! space3d stories --headless --out shots # storybook gallery
-//! space3d build --target android         # cargo apk (prints setup steps if the NDK is missing)
+//! space3d build --target android         # APK: cargo-ndk + Gradle (prints setup steps if tools are missing)
 //! space3d publish --tag v0.1.0 --dry-run # GitHub release with desktop + web builds
 //! space3d doctor                         # what is missing, and how to fix it
 //! ```
 
 #![warn(missing_docs)]
 
+pub mod android;
 pub mod args;
 pub mod commands;
 pub mod process;

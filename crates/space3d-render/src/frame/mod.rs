@@ -672,10 +672,13 @@ impl Renderer {
         // Depth views (shadow maps) before every camera view (spec §1.4 step 11).
         self.encode_depth_views(&mut encoder);
 
-        // Acquire the surface only when something presents.
+        // Acquire the surface only when something presents — and not after the device was
+        // lost: a surface whose configuration failed on the lost device has no error sink, and
+        // wgpu panics on its `get_current_texture`.
         let mut surface_tex = None;
         let mut lost = false;
-        if let Some(s) = &mut self.surface {
+        let device_lost = self.device_lost.load(std::sync::atomic::Ordering::Acquire);
+        if let Some(s) = self.surface.as_mut().filter(|_| !device_lost) {
             match SurfaceAcquire::from_current(s.surface.get_current_texture()) {
                 SurfaceAcquire::Present(t) => {
                     s.presented = true;

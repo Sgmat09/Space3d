@@ -756,7 +756,8 @@ pub(crate) fn macos_virtual_key_of_key(key: KeyCode, iso: bool) -> Option<u16> {
 
 /// The window runner's physical key of a winit key event: winit's, corrected where winit 0.30
 /// leaves a key unidentified or reports two keys as one (macOS ISO and JIS keys, see
-/// [`MACOS_KEYS`]). Call on the event-loop thread while the event is dispatched.
+/// [`MACOS_KEYS`]; Android's Back key, see [`android_physical_key`]). Call on the event-loop
+/// thread while the event is dispatched.
 pub(crate) fn physical_key(key: PhysicalKey) -> PhysicalKey {
     #[cfg(target_os = "macos")]
     {
@@ -764,7 +765,23 @@ pub(crate) fn physical_key(key: PhysicalKey) -> PhysicalKey {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        key
+        android_physical_key(key)
+    }
+}
+
+/// Android's `KEYCODE_BACK` (the Back button / back gesture).
+const ANDROID_KEYCODE_BACK: u32 = 4;
+
+/// winit 0.30 leaves Android's Back key unidentified (it only gives it the logical key
+/// `BrowserBack`) and marks it handled, so the activity never sees it either: report it as
+/// `KeyCode::BrowserBack` so games can bind it (`Input::just_pressed(KeyCode::BrowserBack)`).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn android_physical_key(key: PhysicalKey) -> PhysicalKey {
+    match key {
+        PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(ANDROID_KEYCODE_BACK)) => {
+            PhysicalKey::Code(KeyCode::BrowserBack)
+        }
+        other => other,
     }
 }
 
@@ -950,6 +967,20 @@ impl LayoutWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn android_back_key_is_browser_back() {
+        use winit::keyboard::NativeKeyCode;
+        assert_eq!(
+            android_physical_key(PhysicalKey::Unidentified(NativeKeyCode::Android(4))),
+            PhysicalKey::Code(KeyCode::BrowserBack)
+        );
+        // Other unidentified Android keys (here KEYCODE_MENU) and identified keys are unchanged.
+        let menu = PhysicalKey::Unidentified(NativeKeyCode::Android(82));
+        assert_eq!(android_physical_key(menu), menu);
+        let a = PhysicalKey::Code(KeyCode::KeyA);
+        assert_eq!(android_physical_key(a), a);
+    }
 
     #[test]
     fn writing_keys_and_names_do_not_overlap() {

@@ -18,6 +18,7 @@ pub fn run(ctx: &Ctx, args: &ServeArgs) -> Result<()> {
         install_tools: args.install_tools,
         sim: false,
         no_wasm_opt: !args.cargo.release,
+        aab: false,
     };
     let dist = project.dist_dir(Platform::Web.name());
     if !args.no_build {

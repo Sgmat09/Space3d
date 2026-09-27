@@ -65,6 +65,10 @@ fn new_writes_a_complete_project() {
         "mobile/Cargo.toml",
         "ios/project.yml",
         "android/README.md",
+        "android/build.gradle.kts",
+        "android/settings.gradle.kts",
+        "android/gradle.properties",
+        "android/src/main/AndroidManifest.xml",
         ".github/workflows/space3d.yml",
         ".gitignore",
         "README.md",
@@ -80,8 +84,15 @@ fn new_writes_a_complete_project() {
     let main = std::fs::read_to_string(dir.join("src/main.rs")).unwrap();
     assert!(main.contains("space3d::main!(hello_game::build);"));
     let mobile = std::fs::read_to_string(dir.join("mobile/Cargo.toml")).unwrap();
-    assert!(mobile.contains("[package.metadata.android]"));
     assert!(mobile.contains("crate-type = [\"cdylib\", \"staticlib\"]"));
+    // Android packaging lives in the Gradle project, which loads the mobile crate's library.
+    let manifest = std::fs::read_to_string(dir.join("android/src/main/AndroidManifest.xml")).unwrap();
+    assert!(manifest.contains("android:value=\"hello_game_mobile\""), "{manifest}");
+    let gradle = std::fs::read_to_string(dir.join("android/build.gradle.kts")).unwrap();
+    assert!(
+        gradle.contains("applicationId = \"com.example.hello_game\""),
+        "{gradle}"
+    );
 
     // Refuses to overwrite.
     let again = space3d()
@@ -155,9 +166,15 @@ fn project_commands_work_in_a_generated_project() {
         .current_dir(&dir)
         .args(["--dry-run", "build", "--target", "android"]));
     assert!(
-        out.contains("apk build -p cmd_game-mobile --lib --target aarch64-linux-android"),
+        out.contains("ndk -t arm64-v8a -P 28 build -p cmd_game-mobile --lib"),
         "{out}"
     );
+    // The project's own Gradle project packages the library into dist/android/cmd_game.apk.
+    // (Its own `android/`: nothing is generated into target/android/cmd_game/gradle.)
+    assert!(out.contains("--project-cache-dir"), "{out}");
+    assert!(!out.contains("write the Gradle project"), "{out}");
+    assert!(out.contains("assembleDebug"), "{out}");
+    assert!(out.contains("dist/android/cmd_game.apk"), "{out}");
     let out = run(space3d().current_dir(&dir).args([
         "--dry-run",
         "publish",
@@ -204,6 +221,20 @@ fn doctor_reports() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("rustc"), "{text}");
     assert!(text.contains("wasm-bindgen CLI"), "{text}");
+    // Android: every tool of the build is reported (found or with a fix), whatever is installed.
+    let out = space3d().args(["doctor", "--platforms", "android"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    for what in [
+        "target aarch64-linux-android",
+        "cargo-ndk",
+        "Android SDK",
+        "Android NDK",
+        "Java",
+        "Gradle",
+    ] {
+        assert!(text.contains(what), "{what}: {text}");
+    }
+    assert!(!text.contains("cargo-apk"), "{text}");
 }
 
 fn cargo_check(dir: &Path) {

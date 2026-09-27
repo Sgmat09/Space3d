@@ -414,10 +414,45 @@ pub fn scaffold(dest: &Path, opts: &ScaffoldOptions) -> Result<Vec<PathBuf>> {
         std::fs::write(&path, &file.contents).with_context(|| format!("writing {}", path.display()))?;
         written.push(file.path);
     }
+    for (rel, contents) in android_project(&opts.name, &vars) {
+        let rel = Path::new("android").join(rel);
+        crate::android::write_files(dest, &[(rel.clone(), contents)])?;
+        written.push(rel);
+    }
     if let Some(targets) = &opts.ci_targets {
         written.push(write_workflow(dest, &opts.name, targets)?);
     }
     Ok(written)
+}
+
+/// The Gradle project in `android/` that packages the `mobile/` crate (`space3d build --target
+/// android` uses it; the game owns and edits it). Paths relative to `android/`.
+pub fn android_project(name: &str, vars: &TemplateVars) -> Vec<(PathBuf, String)> {
+    use crate::android::{self, Abi, AndroidConfig, GradleDefaults};
+    let cfg = AndroidConfig {
+        application_id: vars.get("android_package").unwrap_or_default().to_owned(),
+        label: vars.get("title").unwrap_or(name).to_owned(),
+        apk_name: name.to_owned(),
+        version_name: "0.1.0".into(),
+        version_code: android::version_code("0.1.0"),
+        min_sdk: android::DEFAULT_MIN_SDK,
+        target_sdk: android::DEFAULT_TARGET_SDK,
+        orientation: "sensorLandscape".into(),
+        permissions: vec!["android.permission.INTERNET".into()],
+        abis: vec![Abi::Arm64],
+        assets: None,
+        icon: None,
+    };
+    let crate_name = vars.get("crate_name").unwrap_or(name);
+    android::gradle_project(
+        &cfg,
+        &format!("{crate_name}_mobile"),
+        name,
+        &GradleDefaults {
+            jni_libs: format!("../target/android/{name}/jniLibs"),
+            assets: Some("../assets".into()),
+        },
+    )
 }
 
 /// Write `.github/workflows/space3d.yml` with [`write_github_actions`], adapted to the
@@ -469,8 +504,8 @@ fn package_name(manifest: &Path) -> Result<String> {
 /// `ios/project.yml` into the Xcode project.
 pub fn patch_workflow_for_mobile_crate(yaml: &str, mobile_package: &str) -> String {
     yaml.replace(
-        "cargo apk build --release --lib --target aarch64-linux-android",
-        &format!("cargo apk build --release -p {mobile_package} --lib --target aarch64-linux-android"),
+        " build --release --lib\n",
+        &format!(" build --release -p {mobile_package} --lib\n"),
     )
     .replace(
         "      - run: cargo build --release --lib --target aarch64-apple-ios\n",
@@ -709,9 +744,19 @@ mod tests {
         assert!(dest.join("src/lib.rs").is_file());
         let yaml = std::fs::read_to_string(dest.join(WORKFLOW_PATH)).unwrap();
         assert!(
-            yaml.contains("cargo apk build --release -p arena-mobile --lib"),
+            yaml.contains("-o target/android/arena/jniLibs build --release -p arena-mobile --lib\n"),
             "{yaml}"
         );
+        // The Gradle project that packages it.
+        let gradle = std::fs::read_to_string(dest.join("android/build.gradle.kts")).unwrap();
+        assert!(gradle.contains("applicationId = \"com.example.arena\""), "{gradle}");
+        assert!(
+            gradle.contains("getOrElse(\"../target/android/arena/jniLibs\")"),
+            "{gradle}"
+        );
+        let manifest = std::fs::read_to_string(dest.join("android/src/main/AndroidManifest.xml")).unwrap();
+        assert!(manifest.contains("android:value=\"arena_mobile\""), "{manifest}");
+        assert!(written.contains(&PathBuf::from("android/settings.gradle.kts")));
         assert!(yaml.contains("cargo build --release -p arena-mobile --lib --target aarch64-apple-ios"));
         assert!(yaml.contains("xcodegen generate"));
         assert!(yaml.contains("--bin arena"));

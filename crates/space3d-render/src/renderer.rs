@@ -481,6 +481,10 @@ async fn create_instance(backends: Option<wgpu::Backends>, display: Option<Displ
     if let Some(b) = backends {
         desc.backends = b;
     }
+    #[cfg(target_os = "android")]
+    if backends.is_none() && std::env::var_os("WGPU_BACKEND").is_none() {
+        desc.backends = android_backend().await;
+    }
     #[cfg(target_arch = "wasm32")]
     {
         wgpu::util::new_instance_with_webgpu_detection(desc).await
@@ -488,6 +492,27 @@ async fn create_instance(backends: Option<wgpu::Backends>, display: Option<Displ
     #[cfg(not(target_arch = "wasm32"))]
     {
         wgpu::Instance::new(desc)
+    }
+}
+
+/// Android: Vulkan when the device has a usable Vulkan adapter, else OpenGL ES — never both.
+/// A surface for every backend would not work: Android's Vulkan loader connects the native
+/// window when the Vulkan surface is created, and EGL then cannot create its window surface
+/// (`BadAlloc`), so a GL adapter chosen next to Vulkan never presents. `WGPU_BACKEND` (or
+/// `RendererConfig::backends`) still picks explicitly.
+#[cfg(target_os = "android")]
+async fn android_backend() -> wgpu::Backends {
+    let mut probe = wgpu::InstanceDescriptor::new_without_display_handle();
+    probe.backends = wgpu::Backends::VULKAN;
+    let vulkan = !wgpu::Instance::new(probe)
+        .enumerate_adapters(wgpu::Backends::VULKAN)
+        .await
+        .is_empty();
+    if vulkan {
+        wgpu::Backends::VULKAN
+    } else {
+        tracing::info!("no usable Vulkan adapter: rendering with OpenGL ES");
+        wgpu::Backends::GL
     }
 }
 

@@ -2,10 +2,11 @@
 
 use super::{cargo_flags, profile_dir};
 use crate::Ctx;
+use crate::android::{self, AndroidConfig, GradleDefaults};
 use crate::args::{BuildArgs, CargoSel, Platform};
 use crate::process::{Cmd, which};
 use crate::project::Project;
-use crate::tools::{self, ANDROID_TARGET, IOS_SIM_TARGET, IOS_TARGET, WASM_TARGET};
+use crate::tools::{self, IOS_SIM_TARGET, IOS_TARGET, WASM_TARGET};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,7 @@ pub fn build(ctx: &Ctx, project: &Project, args: &BuildArgs) -> Result<PathBuf> 
     match args.target {
         Platform::Desktop => desktop(ctx, project, &args.cargo, &out),
         Platform::Web => web(ctx, project, args, &out),
-        Platform::Android => android(ctx, project, &args.cargo, &out),
+        Platform::Android => android(ctx, project, args, &out),
         Platform::Ios => ios(ctx, project, &args.cargo, args.sim, &out),
     }?;
     Ok(out)
@@ -214,62 +215,223 @@ pub fn default_index_html(bin: &str) -> String {
 
 // ------------------------------------------------------------------------------------ android
 
-/// Setup instructions printed when Android tooling is missing.
-pub const ANDROID_SETUP: &str = "\
-Android builds need:
-  1. Android SDK + NDK (Android Studio > SDK Manager > SDK Tools > NDK), then
-       export ANDROID_HOME=$HOME/Library/Android/sdk        # or ~/Android/Sdk on Linux
-       export ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/<version>
-  2. Java 17+ (e.g. `brew install openjdk@17`, or the JDK bundled with Android Studio)
-  3. cargo install cargo-apk --locked
-  4. rustup target add aarch64-linux-android
-Then: space3d build --target android [--release]  (install with `adb install dist/android/*.apk`)";
+/// The library Android loads: `package`'s lib target `lib_name`, built as a `cdylib` either
+/// because its manifest says so (`space3d new`'s `mobile/` crate) or with
+/// `cargo rustc --crate-type cdylib` (a game whose own library calls `space3d::main!`).
+#[derive(Clone, Debug)]
+pub struct AndroidLib<'a> {
+    /// The package.
+    pub package: &'a crate::project::PackageInfo,
+    /// Its library's crate name (`lib<name>.so`).
+    pub lib_name: String,
+    /// Build with `cargo rustc --crate-type cdylib` (the manifest does not ask for one).
+    pub force_cdylib: bool,
+}
 
-fn android(ctx: &Ctx, project: &Project, sel: &CargoSel, out: &Path) -> Result<()> {
-    let Some(pkg) = project.mobile_package("cdylib") else {
-        bail!(
-            "no package builds a `cdylib` for Android.\n\
-             Projects created by `space3d new` have `mobile/` (package `{0}-mobile`); otherwise add\n\
-             [lib] crate-type = [\"lib\", \"cdylib\"] and `space3d::main!` to your library.",
-            project.package().name
-        );
-    };
+/// Find the library to build for Android (see [`AndroidLib`]).
+pub fn android_lib(project: &Project) -> Result<AndroidLib<'_>> {
+    if let Some(pkg) = project.mobile_package("cdylib") {
+        let lib_name = pkg.lib().map_or_else(|| pkg.name.replace('-', "_"), |l| l.name.clone());
+        return Ok(AndroidLib {
+            package: pkg,
+            lib_name,
+            force_cdylib: false,
+        });
+    }
+    let pkg = project.package();
+    match pkg.lib() {
+        Some(lib) => Ok(AndroidLib {
+            package: pkg,
+            lib_name: lib.name.clone(),
+            force_cdylib: true,
+        }),
+        None => bail!(
+            "package `{}` has no library for Android to load.\n\
+             Projects created by `space3d new` have `mobile/` (package `{0}-mobile`). A single-binary game can add\n\
+             src/lib.rs with `#![cfg(target_os = \"android\")] #[path = \"main.rs\"] mod game;` (its `space3d::main!`\n\
+             exports `android_main`; see examples/hello_cube/src/lib.rs)",
+            pkg.name
+        ),
+    }
+}
+
+fn android(ctx: &Ctx, project: &Project, args: &BuildArgs, out: &Path) -> Result<()> {
+    let sel = &args.cargo;
+    let game = project.package();
+    let lib = android_lib(project)?;
+    let cfg = AndroidConfig::from_packages(lib.package, game)?;
+
+    // Tools: report everything missing at once.
+    let sdk = android::sdk();
+    let ndk = android::ndk(sdk.as_ref().map(|s| s.dir.as_path()));
+    let java = android::java();
+    let own_project = android::own_gradle_project(game.dir());
+    let gradle_dir = own_project
+        .clone()
+        .unwrap_or_else(|| project.target_dir.join("android").join(&game.name).join("gradle"));
+    let gradle = android::gradle_program(&gradle_dir);
     let mut missing = Vec::new();
-    if tools::cargo_apk().is_none() {
-        missing.push("cargo-apk");
+    if android::cargo_ndk_version(&ctx.exec).is_none() {
+        missing.push("cargo-ndk".to_owned());
     }
-    if tools::android_sdk().is_none() {
-        missing.push("Android SDK (ANDROID_HOME)");
+    if sdk.is_none() {
+        missing.push("Android SDK (ANDROID_HOME)".to_owned());
     }
-    if tools::android_ndk().is_none() {
-        missing.push("Android NDK (ANDROID_NDK_ROOT)");
+    if ndk.is_none() {
+        missing.push("Android NDK".to_owned());
     }
-    if !tools::has_target(&ctx.exec, project.dir(), ANDROID_TARGET) {
-        missing.push("rust target aarch64-linux-android");
+    match &java {
+        None => missing.push(format!("Java {}+ (JDK)", android::MIN_JAVA)),
+        Some(j) if j.version < android::MIN_JAVA => missing.push(format!(
+            "Java {}+ (found {} at {})",
+            android::MIN_JAVA,
+            j.version,
+            j.source
+        )),
+        Some(_) => {}
+    }
+    if gradle.is_none() {
+        missing.push("Gradle".to_owned());
+    }
+    for abi in &cfg.abis {
+        if !tools::has_target(&ctx.exec, project.dir(), abi.rust_target()) {
+            missing.push(format!("rust target {}", abi.rust_target()));
+        }
     }
     if !missing.is_empty() {
-        let msg = format!("missing: {}\n\n{ANDROID_SETUP}", missing.join(", "));
+        let msg = format!("missing: {}\n\n{}", missing.join(", "), android::setup_instructions());
         if !ctx.exec.dry_run {
             bail!(msg);
         }
         eprintln!("[dry-run] {msg}");
     }
-    let cmd = Cmd::cargo("apk")
-        .cwd(project.dir())
-        .arg("build")
+    let sdk_dir = sdk.map_or_else(|| PathBuf::from("<android sdk>"), |s| s.dir);
+    let ndk_dir = ndk.unwrap_or_else(|| sdk_dir.join("ndk").join("<version>"));
+    let java_home = java.and_then(|j| j.home);
+    // Only Gradle gets JAVA_HOME: build scripts that watch it would rebuild otherwise.
+    let with_env = |cmd: Cmd| cmd.env("ANDROID_HOME", &sdk_dir).env("ANDROID_NDK_HOME", &ndk_dir);
+
+    // 1. The native library for every ABI: target/<triple>/<profile>/lib<name>.so.
+    let work = project.target_dir.join("android").join(&game.name);
+    let mut cargo = Cmd::cargo("ndk").cwd(project.dir());
+    for abi in &cfg.abis {
+        cargo = cargo.args(["-t", abi.name()]);
+    }
+    cargo = cargo
+        .args(["-P", &cfg.min_sdk.to_string()])
+        .arg(if lib.force_cdylib { "rustc" } else { "build" })
+        .args(["-p", &lib.package.name, "--lib"])
         .arg_if(sel.release, "--release")
-        .args(["-p", &pkg.name, "--lib", "--target", ANDROID_TARGET])
         .opt("--features", sel.features.as_deref());
-    ctx.exec.run(&cmd)?;
+    if lib.force_cdylib {
+        cargo = cargo.args(["--crate-type", "cdylib"]);
+    }
+    ctx.exec.run(&with_env(cargo))?;
+
+    // 2. jniLibs/<abi>/lib<name>.so for Gradle (only the current libraries).
+    let jni_libs = work.join("jniLibs");
+    let so_name = format!("lib{}.so", lib.lib_name);
+    if !ctx.exec.dry_run && jni_libs.exists() {
+        std::fs::remove_dir_all(&jni_libs).with_context(|| format!("cleaning {}", jni_libs.display()))?;
+    }
+    for abi in &cfg.abis {
+        let built = project
+            .target_dir
+            .join(abi.rust_target())
+            .join(profile_dir(sel.release))
+            .join(&so_name);
+        stage(ctx, &built, &jni_libs.join(abi.name()).join(&so_name))?;
+    }
+
+    // 3. The Gradle project: the package's own `android/`, else generated from the metadata.
+    if own_project.is_none() {
+        let files = android::gradle_project(
+            &cfg,
+            &lib.lib_name,
+            &cfg.apk_name,
+            &GradleDefaults {
+                jni_libs: "../jniLibs".into(),
+                assets: cfg.assets.as_ref().map(|p| p.display().to_string()),
+            },
+        );
+        if ctx.exec.dry_run {
+            eprintln!("[dry-run] write the Gradle project to {}", gradle_dir.display());
+        } else {
+            android::write_files(&gradle_dir, &files)?;
+            let icon_dest = gradle_dir.join("src/main/res/mipmap/ic_launcher.png");
+            match &cfg.icon {
+                Some(icon) => stage(ctx, icon, &icon_dest)?,
+                None => {
+                    let _ = std::fs::remove_file(&icon_dest);
+                }
+            }
+        }
+    }
+
+    // 4. Gradle: APK or App Bundle, all output below target/android/<package>/.
+    let task = android::gradle_task(sel.release, args.aab);
+    let build_dir = work.join("build");
+    let (kind, extension) = if args.aab { ("bundle", "aab") } else { ("apk", "apk") };
+    let variant = if sel.release { "release" } else { "debug" };
+    let outputs_dir = build_dir.join("outputs").join(kind).join(variant);
+    // AGP updates an existing APK in place and never shrinks it (a replaced library leaves its
+    // old bytes behind): start from scratch so the APK is only as large as its contents.
     if !ctx.exec.dry_run {
-        let apk_dir = project.target_dir.join(profile_dir(sel.release)).join("apk");
-        let apks: Vec<PathBuf> = std::fs::read_dir(&apk_dir)
-            .with_context(|| format!("no APKs in {}", apk_dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "apk"))
-            .collect();
-        for apk in apks {
-            stage(ctx, &apk, &out.join(apk.file_name().unwrap_or_default()))?;
+        for old in android::outputs(&outputs_dir, extension) {
+            std::fs::remove_file(&old).with_context(|| format!("removing {}", old.display()))?;
+        }
+    }
+    let mut gradle_cmd = Cmd::new(gradle.unwrap_or_else(|| PathBuf::from("gradle")))
+        .arg("-p")
+        .arg(&gradle_dir)
+        .arg("--project-cache-dir")
+        .arg(work.join("gradle-cache"))
+        .args(["--console=plain", "--warn"])
+        .arg(&task)
+        .arg(format!("-Pspace3d.jniLibs={}", jni_libs.display()))
+        .arg(format!("-Pspace3d.buildDir={}", build_dir.display()))
+        .arg(format!("-Pspace3d.ndkPath={}", ndk_dir.display()));
+    if let Some(version) = android::ndk_version(&ndk_dir) {
+        gradle_cmd = gradle_cmd.arg(format!("-Pspace3d.ndkVersion={version}"));
+    }
+    if let Some(assets) = &cfg.assets {
+        gradle_cmd = gradle_cmd.arg(format!("-Pspace3d.assets={}", assets.display()));
+    }
+    if let Some(home) = &java_home {
+        gradle_cmd = gradle_cmd.env("JAVA_HOME", home);
+    }
+    ctx.exec.run(&with_env(gradle_cmd))?;
+
+    // 5. dist/android/<apk_name>.apk (or .aab).
+    let artifact = out.join(format!("{}.{extension}", cfg.apk_name));
+    if ctx.exec.dry_run {
+        stage(ctx, &outputs_dir.join(format!("<built>.{extension}")), &artifact)?;
+    } else {
+        let built = android::outputs(&outputs_dir, extension);
+        let Some(built) = built.first() else {
+            bail!("Gradle produced no .{extension} in {}", outputs_dir.display());
+        };
+        stage(ctx, built, &artifact)?;
+        let signing = if !sel.release {
+            "debug key"
+        } else if std::env::var_os("SPACE3D_ANDROID_KEYSTORE").is_some() {
+            "release key from SPACE3D_ANDROID_KEYSTORE"
+        } else {
+            "debug key: set SPACE3D_ANDROID_KEYSTORE for store builds"
+        };
+        eprintln!(
+            "{}: {} (application id {}, {}, signed with the {signing})",
+            if args.aab { "App Bundle" } else { "APK" },
+            artifact.display(),
+            cfg.application_id,
+            cfg.abis.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "),
+        );
+        if !args.aab {
+            eprintln!(
+                "install and start it:\n  adb install -r '{}'\n  adb shell am start -n {}/android.app.NativeActivity\n  adb logcat -s space3d   # the game's log",
+                artifact.display(),
+                cfg.application_id
+            );
         }
     }
     finish(ctx, "android", out);

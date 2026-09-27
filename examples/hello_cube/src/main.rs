@@ -4,8 +4,10 @@
 //! cargo run -p hello_cube
 //! SPACE3D_EXIT_AFTER_FRAMES=120 cargo run -p hello_cube   # smoke test: quit after 120 frames
 //! SPACE3D_HEADLESS=1 SPACE3D_EXIT_AFTER_FRAMES=60 cargo run -p hello_cube   # no window (CI)
+//! # Android (from this directory): an APK in dist/android/ (see src/lib.rs, docs/platforms.md)
+//! cargo run -p space3d-cli -- build --target android
 //! ```
-//! Controls: `Esc` quits, `Space` pauses the rotation.
+//! Controls: `Esc` (Android: Back) quits, `Space` (Android: a tap) pauses the rotation.
 
 use space3d::prelude::*;
 
@@ -83,7 +85,8 @@ fn setup(ctx: &mut SystemCtx) {
 
 fn controls(ctx: &mut SystemCtx) {
     let input = ctx.resources.expect::<Input>();
-    let (quit, toggle) = (input.just_pressed(KeyCode::Escape), input.just_pressed(KeyCode::Space));
+    let quit = input.just_pressed(KeyCode::Escape) || input.just_pressed(KeyCode::BrowserBack);
+    let toggle = input.just_pressed(KeyCode::Space) || !input.just_ended_touches().is_empty();
     if toggle {
         let paused = ctx.resources.expect_mut::<Paused>();
         paused.0 = !paused.0;
@@ -136,6 +139,23 @@ mod tests {
 
         assert!(!app.should_exit());
         app.resources.expect_mut::<Input>().inject_key_tap(KeyCode::Escape);
+        app.step_ticks(1);
+        assert!(app.should_exit());
+    }
+
+    #[test]
+    fn a_tap_pauses_and_back_quits() {
+        let mut app = headless();
+        app.step_ticks(5);
+        let input = app.resources.expect_mut::<Input>();
+        input.inject_touch(1, TouchPhase::Started, Vec2::new(10.0, 10.0));
+        input.inject_touch(1, TouchPhase::Ended, Vec2::new(10.0, 10.0));
+        app.step_ticks(1);
+        let paused = cube_rotation(&app);
+        app.step_ticks(10);
+        assert_eq!(cube_rotation(&app), paused);
+
+        app.resources.expect_mut::<Input>().inject_key_tap(KeyCode::BrowserBack);
         app.step_ticks(1);
         assert!(app.should_exit());
     }

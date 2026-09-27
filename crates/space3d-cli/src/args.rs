@@ -152,7 +152,7 @@ pub enum Platform {
     Desktop,
     /// Browser: wasm32 + wasm-bindgen bundle in `dist/web`.
     Web,
-    /// Android `.apk` via `cargo apk`.
+    /// Android `.apk` (cargo-ndk + Gradle).
     Android,
     /// iOS static library + Xcode project (XcodeGen) / `xcodebuild`.
     Ios,
@@ -191,6 +191,9 @@ pub struct BuildArgs {
     /// Web: skip `wasm-opt` even when it is installed.
     #[arg(long)]
     pub no_wasm_opt: bool,
+    /// Android: build an App Bundle (`.aab`, for Google Play) instead of an APK.
+    #[arg(long)]
+    pub aab: bool,
 }
 
 /// `space3d serve`.

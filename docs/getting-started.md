@@ -36,7 +36,7 @@ my_game/
 ├── assets/               textures, models, sounds
 ├── web/index.html        page for the web build
 ├── mobile/               cdylib/staticlib crate for Android and iOS
-├── android/README.md     cargo-apk setup
+├── android/              Gradle project that packages mobile/ (APK / App Bundle), README
 ├── ios/                  XcodeGen project.yml, main.m, README
 └── .github/workflows/space3d.yml
 ```

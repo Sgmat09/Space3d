@@ -48,6 +48,10 @@ rayon.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["rayon"] }
 notify = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+# The APK's packaged assets (`ApkSource`, AAssetManager): the ndk of winit's android-activity.
+ndk.workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true

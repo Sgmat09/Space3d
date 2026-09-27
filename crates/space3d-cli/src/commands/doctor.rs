@@ -59,6 +59,175 @@ pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
     Ok(i32::from(checks.iter().any(|c| c.level == Level::Error)))
 }
 
+/// Android: Rust target, cargo-ndk, SDK (+ platform, build-tools, adb), NDK, JDK, Gradle.
+fn android_checks(
+    exec: &crate::process::Exec,
+    target_check: &dyn Fn(&'static str, &str, Level) -> Check,
+) -> Vec<Check> {
+    use crate::android as a;
+    let mut checks = vec![target_check("android", ANDROID_TARGET, Level::Warn)];
+    checks.push(match a::cargo_ndk_version(exec) {
+        Some(v) => Check::new("android", "cargo-ndk", Level::Ok, v),
+        None => Check::new("android", "cargo-ndk", Level::Warn, "not found").fix("cargo install cargo-ndk --locked"),
+    });
+    let sdk = a::sdk();
+    let sdkmanager = |packages: &str| match &sdk {
+        Some(s) => format!("sdkmanager --sdk_root={} {packages}", s.dir.display()),
+        None => format!("sdkmanager {packages}"),
+    };
+    checks.push(match &sdk {
+        Some(s) => Check::new(
+            "android",
+            "Android SDK",
+            Level::Ok,
+            format!("{} ({})", s.dir.display(), s.source),
+        ),
+        None => Check::new(
+            "android",
+            "Android SDK",
+            Level::Warn,
+            "not found (ANDROID_HOME unset, no SDK in the default location)",
+        )
+        .fix(format!(
+            "install the command-line tools{}, then {}",
+            if cfg!(target_os = "macos") {
+                " (brew install --cask android-commandlinetools)"
+            } else {
+                " or Android Studio"
+            },
+            sdkmanager(a::SDK_PACKAGES)
+        )),
+    });
+    if let Some(s) = &sdk {
+        checks.push(match a::newest_platform(&s.dir) {
+            Some(p) => Check::new("android", "SDK platform", Level::Ok, p),
+            None => Check::new(
+                "android",
+                "SDK platform",
+                Level::Warn,
+                "none installed (Gradle downloads it when the licenses are accepted)",
+            )
+            .fix(sdkmanager(&format!("\"platforms;android-{}.0\"", a::COMPILE_SDK))),
+        });
+        checks.push(match a::newest_version_dir(&s.dir.join("build-tools")) {
+            Some((_, v)) => Check::new("android", "SDK build-tools", Level::Ok, v),
+            None => Check::new(
+                "android",
+                "SDK build-tools",
+                Level::Warn,
+                "none installed (Gradle downloads them when the licenses are accepted)",
+            )
+            .fix(sdkmanager("\"build-tools;37.0.0\"")),
+        });
+        let adb = s
+            .dir
+            .join("platform-tools")
+            .join(if cfg!(windows) { "adb.exe" } else { "adb" });
+        checks.push(if adb.is_file() {
+            Check::new("android", "adb (optional)", Level::Ok, adb.display().to_string())
+        } else {
+            Check::new(
+                "android",
+                "adb (optional)",
+                Level::Warn,
+                "not found — needed to install and debug on devices",
+            )
+            .fix(sdkmanager("\"platform-tools\""))
+        });
+    }
+    let ndk = a::ndk(sdk.as_ref().map(|s| s.dir.as_path()));
+    checks.push(match &ndk {
+        Some(dir) => {
+            let version = a::ndk_version(dir).unwrap_or_else(|| "unknown version".into());
+            let major = crate::project::version_key(&version).0;
+            if major >= a::MIN_NDK_MAJOR {
+                Check::new(
+                    "android",
+                    "Android NDK",
+                    Level::Ok,
+                    format!("{version} ({})", dir.display()),
+                )
+            } else {
+                Check::new(
+                    "android",
+                    "Android NDK",
+                    Level::Warn,
+                    format!(
+                        "{version} — r{} or newer links the 16 KB-aligned libraries Google Play requires",
+                        a::MIN_NDK_MAJOR
+                    ),
+                )
+                .fix(sdkmanager("\"ndk;30.0.16248370\""))
+            }
+        }
+        None => Check::new("android", "Android NDK", Level::Warn, "not found").fix(sdkmanager("\"ndk;30.0.16248370\"")),
+    });
+    let java = a::java();
+    let java_fix = if cfg!(target_os = "macos") {
+        "brew install openjdk@21 (found automatically), or set JAVA_HOME"
+    } else {
+        "install a JDK 17+ (e.g. Temurin 21) and set JAVA_HOME"
+    };
+    checks.push(match &java {
+        Some(j) if j.version >= a::MIN_JAVA => {
+            Check::new("android", "Java", Level::Ok, format!("{} ({})", j.version, j.source))
+        }
+        Some(j) => Check::new(
+            "android",
+            "Java",
+            Level::Warn,
+            format!("{} at {} — Gradle needs {}+", j.version, j.source, a::MIN_JAVA),
+        )
+        .fix(java_fix),
+        None => Check::new(
+            "android",
+            "Java",
+            Level::Warn,
+            if cfg!(target_os = "macos") {
+                "no JDK found (/usr/bin/java is only a stub without one)"
+            } else {
+                "no JDK found"
+            },
+        )
+        .fix(java_fix),
+    });
+    let gradle_fix = if cfg!(target_os = "macos") {
+        "brew install gradle"
+    } else {
+        "install Gradle 9 (https://gradle.org/install/)"
+    };
+    let min = a::MIN_GRADLE;
+    checks.push(match which("gradle") {
+        None => Check::new("android", "Gradle", Level::Warn, "not found").fix(gradle_fix),
+        Some(program) => {
+            let home = java.as_ref().and_then(|j| j.home.as_deref());
+            match a::gradle_version(exec, &program, home) {
+                Some(v) if v >= min => Check::new("android", "Gradle", Level::Ok, fmt_version(v)),
+                Some(v) => Check::new(
+                    "android",
+                    "Gradle",
+                    Level::Warn,
+                    format!(
+                        "{} — the Android Gradle Plugin {} needs {}+",
+                        fmt_version(v),
+                        a::AGP_VERSION,
+                        fmt_version(min)
+                    ),
+                )
+                .fix(gradle_fix),
+                None => Check::new(
+                    "android",
+                    "Gradle",
+                    Level::Warn,
+                    format!("{} does not run (needs Java)", program.display()),
+                )
+                .fix(java_fix),
+            }
+        }
+    });
+    checks
+}
+
 /// Gather checks for `platforms` (empty = all).
 pub fn collect(ctx: &Ctx, platforms: &[Platform]) -> Vec<Check> {
     let wants = |p: Platform| platforms.is_empty() || platforms.contains(&p);
@@ -129,29 +298,7 @@ pub fn collect(ctx: &Ctx, platforms: &[Platform]) -> Vec<Check> {
 
     // Android.
     if wants(Platform::Android) {
-        checks.push(target_check("android", ANDROID_TARGET, Level::Warn));
-        checks.push(match tools::cargo_apk() {
-            Some(p) => Check::new("android", "cargo-apk", Level::Ok, p.display().to_string()),
-            None => {
-                Check::new("android", "cargo-apk", Level::Warn, "not found").fix("cargo install cargo-apk --locked")
-            }
-        });
-        checks.push(match tools::android_sdk() {
-            Some(p) => Check::new("android", "Android SDK", Level::Ok, p.display().to_string()),
-            None => Check::new("android", "Android SDK", Level::Warn, "ANDROID_HOME not set")
-                .fix("install Android Studio, then export ANDROID_HOME=<sdk dir>"),
-        });
-        checks.push(match tools::android_ndk() {
-            Some(p) => Check::new("android", "Android NDK", Level::Ok, p.display().to_string()),
-            None => Check::new("android", "Android NDK", Level::Warn, "not found")
-                .fix("SDK Manager > SDK Tools > NDK, then export ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/<version>"),
-        });
-        checks.push(match which("java") {
-            Some(_) => Check::new("android", "Java", Level::Ok, "found"),
-            None => {
-                Check::new("android", "Java", Level::Warn, "not found").fix("install JDK 17+ (brew install openjdk@17)")
-            }
-        });
+        checks.extend(android_checks(exec, &target_check));
     }
 
     // iOS.

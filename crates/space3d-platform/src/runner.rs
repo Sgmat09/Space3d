@@ -1,8 +1,9 @@
 //! The winit 0.30 `ApplicationHandler` runner shared by desktop, web, Android and iOS.
 //!
 //! Lifecycle:
-//! * `resumed` — create the window once; create the [`Renderer`] (blocking on native,
-//!   asynchronously on the web) or, on mobile resume, recreate its surface.
+//! * `resumed` — create the window once; create the [`Renderer`] (blocking on desktop and iOS,
+//!   asynchronously on the web, on a background thread on Android) or, on mobile resume,
+//!   recreate its surface.
 //! * `suspended` — drop the surface (Android destroys the native window in background).
 //! * `window_event` — feed [`Input`] (keyboard events with their logical keys; physical keys
 //!   winit 0.30 misses or conflates are corrected: macOS ISO `IntlBackslash`, JIS `IntlRo`),
@@ -55,19 +56,22 @@ pub(crate) struct WinitRunner {
     buttons: ButtonReconciler,
     #[cfg(target_arch = "wasm32")]
     pending: std::rc::Rc<std::cell::RefCell<Option<Result<Renderer, space3d_render::RenderError>>>>,
+    /// Android: the renderer being created on a background thread (see `ensure_renderer`).
+    #[cfg(target_os = "android")]
+    pending_native: Option<std::sync::mpsc::Receiver<Result<Renderer, RenderError>>>,
 }
 
-fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
+fn build_event_loop() -> Result<EventLoop<()>, String> {
     #[cfg(target_os = "android")]
     {
         use winit::platform::android::EventLoopBuilderExtAndroid;
         let Some(android_app) = crate::mobile::android_app() else {
-            tracing::error!("Android: start the app through space3d_platform::android_main_entry");
-            return Err(winit::error::EventLoopError::NotSupported(
-                winit::error::NotSupportedError::new(),
-            ));
+            return Err("Android: start the app through space3d_platform::android_main_entry".into());
         };
-        EventLoop::builder().with_android_app(android_app).build()
+        EventLoop::builder()
+            .with_android_app(android_app)
+            .build()
+            .map_err(|e| e.to_string())
     }
     #[cfg(target_os = "macos")]
     {
@@ -79,11 +83,11 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
                 .with_activation_policy(ActivationPolicy::Accessory)
                 .with_activate_ignoring_other_apps(false);
         }
-        builder.build()
+        builder.build().map_err(|e| e.to_string())
     }
     #[cfg(not(any(target_os = "android", target_os = "macos")))]
     {
-        EventLoop::new()
+        EventLoop::new().map_err(|e| e.to_string())
     }
 }
 
@@ -165,6 +169,8 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         buttons: ButtonReconciler::default(),
         #[cfg(target_arch = "wasm32")]
         pending: Default::default(),
+        #[cfg(target_os = "android")]
+        pending_native: None,
     };
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -259,7 +265,31 @@ impl WinitRunner {
         let size = UVec2::new(size.width, size.height).max(UVec2::ONE);
         self.renderer_requested = true;
         let config = self.renderer_config(size);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_os = "android")]
+        {
+            // Creating the device and compiling the built-in pipelines takes a moment (minutes on
+            // software GPUs), and android-activity holds the Java UI thread in lifecycle
+            // callbacks (onPause, surface changes) until this thread handles them: build the
+            // renderer off the event loop so the app never stops responding (ANR).
+            let display: space3d_render::DisplayHandle = Box::new(event_loop.owned_display_handle());
+            let window = window.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("space3d-renderer-init".into())
+                .spawn(move || {
+                    let result =
+                        pollster::block_on(Renderer::new_with_surface_and_display(window, Some(display), config));
+                    let _ = tx.send(result);
+                });
+            match spawned {
+                Ok(_) => self.pending_native = Some(rx),
+                Err(e) => {
+                    tracing::error!("failed to start the renderer thread: {e}");
+                    event_loop.exit();
+                }
+            }
+        }
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         {
             let display: space3d_render::DisplayHandle = Box::new(event_loop.owned_display_handle());
             match pollster::block_on(Renderer::new_with_surface_and_display(
@@ -351,9 +381,43 @@ impl WinitRunner {
         }
     }
 
+    /// Android: install the renderer once its background creation finished. While suspended
+    /// its surface (made for the native window of that time) is dropped; `resumed` attaches a
+    /// new one.
+    #[cfg(target_os = "android")]
+    fn poll_pending_native(&mut self, event_loop: &ActiveEventLoop) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = &self.pending_native else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(RenderError::Device("the renderer thread panicked".into())),
+        };
+        self.pending_native = None;
+        match result {
+            Ok(mut r) => {
+                if self.state().suspended {
+                    r.remove_surface();
+                } else if let Some(w) = &self.window {
+                    let s = w.inner_size();
+                    r.resize(s.width.max(1), s.height.max(1));
+                }
+                self.app.insert_resource(r);
+            }
+            Err(e) => {
+                tracing::error!("failed to create renderer: {e}");
+                event_loop.exit();
+            }
+        }
+    }
+
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_arch = "wasm32")]
         self.poll_pending_renderer();
+        #[cfg(target_os = "android")]
+        self.poll_pending_native(event_loop);
         if self.exiting || self.state().suspended {
             return;
         }
@@ -424,18 +488,23 @@ impl ApplicationHandler for WinitRunner {
         self.poll_layout(Instant::now(), true);
         let size = window.inner_size();
         self.on_resize(UVec2::new(size.width, size.height));
+        tracing::debug!("resumed");
         self.send(PlatformEvent::Resumed);
         // Avoid a huge dt after returning from background.
         self.last_frame = None;
+        event_loop.set_control_flow(ControlFlow::Poll);
         window.request_redraw();
     }
 
-    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         // Android destroys the native window while in background: drop the surface now and
         // recreate it in `resumed`. Harmless elsewhere.
         if let Some(r) = self.app.resources.get_mut::<Renderer>() {
             r.remove_surface();
         }
+        // Nothing renders while suspended: sleep until the next event instead of spinning.
+        event_loop.set_control_flow(ControlFlow::Wait);
+        tracing::debug!("suspended");
         self.state().suspended = true;
         self.input().release_all();
         self.send(PlatformEvent::Suspended);
@@ -542,6 +611,19 @@ impl ApplicationHandler for WinitRunner {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         #[cfg(target_arch = "wasm32")]
         self.poll_pending_renderer();
+        #[cfg(target_os = "android")]
+        {
+            self.poll_pending_native(_event_loop);
+            // Android wakes the (waiting) loop for each lifecycle event; once the activity is
+            // being destroyed, `onDestroy` waits for this loop to end.
+            if self.state().suspended && !self.exiting && crate::mobile::activity_destroyed() {
+                tracing::info!("the activity is being destroyed; exiting");
+                self.send(PlatformEvent::CloseRequested);
+                self.exiting = true;
+                _event_loop.exit();
+                return;
+            }
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }

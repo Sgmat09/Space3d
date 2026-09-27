@@ -66,6 +66,10 @@ egui-wgpu = { version = "0.36.2", features = ["winit"] }
 egui-winit = "0.36.2"
 egui_extras = "0.36.2"
 raw-window-handle = "0.6.2"
+# Android NDK bindings (AAssetManager for the APK's assets); the version android-activity uses.
+ndk = { version = "0.9.0", default-features = false }
+# JNI (Android activity state); the version android-activity uses.
+jni = "0.22.4"
 
 # assets
 image = "0.25.10"

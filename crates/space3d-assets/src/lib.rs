@@ -70,6 +70,8 @@ pub use model::{
 pub use par::PAR_ROW_THRESHOLD;
 pub use path::AssetPath;
 pub use server::{AssetServer, LoadState};
+#[cfg(target_os = "android")]
+pub use source::{ApkSource, set_android_asset_manager};
 pub use source::{AssetSource, BoxedFuture, FileSource, HttpSource, MemorySource, default_source};
 
 use space3d_core::{App, Events, ImageData, MeshData, Plugin, Stage, SystemCtx};
@@ -89,11 +91,12 @@ pub mod prelude {
 /// feature) the file watcher.
 #[derive(Clone, Debug)]
 pub struct AssetsPlugin {
-    /// Asset root: a directory on native ([`FileSource`]) or a base URL on the web
-    /// ([`HttpSource`]). Default `"assets"`.
+    /// Asset root: a directory on native ([`FileSource`]), a base URL on the web
+    /// ([`HttpSource`]), the APK's packaged `assets/` on Android (`ApkSource`; `"assets"` is
+    /// all of it). Default `"assets"`.
     pub root: String,
     /// Watch `root` and reload changed files. Only effective on native with the
-    /// `hot-reload` feature (default on there).
+    /// `hot-reload` feature (default on there, except Android).
     pub hot_reload: bool,
 }
 
@@ -101,7 +104,12 @@ impl Default for AssetsPlugin {
     fn default() -> Self {
         Self {
             root: "assets".into(),
-            hot_reload: cfg!(all(feature = "hot-reload", not(target_arch = "wasm32"))),
+            // Android reads the APK's assets: nothing on disk to watch.
+            hot_reload: cfg!(all(
+                feature = "hot-reload",
+                not(target_arch = "wasm32"),
+                not(target_os = "android")
+            )),
         }
     }
 }

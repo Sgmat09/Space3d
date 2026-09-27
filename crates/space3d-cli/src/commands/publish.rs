@@ -34,6 +34,7 @@ pub fn run(ctx: &Ctx, args: &PublishArgs) -> Result<()> {
             install_tools: false,
             sim: false,
             no_wasm_opt: false,
+            aab: false,
         };
         let out = if args.no_build {
             project.dist_dir(platform.name())
