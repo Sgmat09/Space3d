@@ -314,10 +314,12 @@ outside the window goes to the last position egui saw, and the pointer is gone a
 (`PointerGone`), so nothing at the window's corner gets hovered. `Event::WindowFocused` is sent
 when `WindowState::focused` changes (egui then forgets the keys and modifiers it held).
 
-* **A release outside the window is never a click**, even in the frame the pointer leaves, on a
-  widget at the window's edge: it is delivered at the last position egui saw, after egui's
+* **A release outside the window is not a click on a widget at the window's edge**, even in
+  the frame the pointer leaves: it is delivered at the last position egui saw, after egui's
   pointer detoured off-screen (as for a cancel), so the widget under that position sees a
-  release but no click. A drag-and-drop payload is dropped nowhere.
+  release but no click. A drag-and-drop payload is dropped nowhere. (The one exception is the
+  case described under "A cancel only concerns its own button": when egui has no press in
+  progress for the button, it has nothing to withhold a click from.)
 * **No pointer position yet.** A button event before any pointer position is known (nothing has
   moved the cursor into the window; a test that presses first) is *dropped*, not sent to
   (0, 0): the press is ignored and so is its release, whenever it comes (a release after the

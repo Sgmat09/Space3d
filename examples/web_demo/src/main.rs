@@ -110,12 +110,19 @@ fn controls(ctx: &mut SystemCtx) {
         drag = touches[0].delta;
     }
     let pinch_now = (touches.len() == 2).then(|| touches[0].position.distance(touches[1].position));
-    let tapped = input.mouse_just_released(MouseButton::Left) || !input.just_ended_touches().is_empty();
+    // A touch the system cancelled (an incoming call, a palm) ended, but it was no tap.
+    let cancelled = input.just_cancelled_touches();
+    let ended: Vec<_> = input
+        .just_ended_touches()
+        .iter()
+        .filter(|t| !cancelled.iter().any(|c| c.id == t.id))
+        .collect();
+    let tapped = input.mouse_just_released(MouseButton::Left) || !ended.is_empty();
     let pattern = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3]
         .iter()
         .position(|k| input.just_pressed(*k));
     let wheel = input.wheel_delta().y;
-    let travelled = input.just_ended_touches().first().map(|t| t.position.distance(t.start));
+    let travelled = ended.first().map(|t| t.position.distance(t.start));
 
     let demo = ctx.resources.expect_mut::<Demo>();
     demo.yaw -= drag.x * 0.005;

@@ -848,8 +848,8 @@ impl InputTranslator {
     }
 
     /// A button release at `at`; `cause`: why it was cancelled (no click, no drop). A release
-    /// outside the window (`at` is `None`) is never a click either: egui only sees the pointer
-    /// where it last was, which may still be over a widget at the window's edge. Both detour
+    /// outside the window (`at` is `None`) is no click on a widget at the window's edge either: egui
+    /// only sees the pointer where it last was, which may still be over such a widget. Both detour
     /// egui's pointer off-screen first. Returns whether egui's drag-and-drop payload must go:
     /// a cancel, or a release outside the window (nothing is dropped there).
     fn button_release(
