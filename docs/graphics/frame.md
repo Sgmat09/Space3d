@@ -213,6 +213,13 @@ and `unproject_ray(view, proj, ndc)` (a ray's origin on the near plane and its u
 `f64` inside; the editor's `ViewCamera::ray` and the model editor's picking ray use it, and the
 shadow fit builds its frustum corners as `camera_pos + inv_proj_rot · ndc`).
 
+**The camera's rotation is taken as the `Transform` holds it.** `Transform::looking_at(target)`
+derives it from the `f32` difference of two absolute positions, which far from the origin is
+quantized: the positions round to 0.008 at 85 000 units, so a target 50 units away moves the
+direction by up to ~1.6e-4 rad in steps (~0.3 px at 3456 × 2234) as the eye drifts, and the sky
+follows that rotation faithfully. For a camera far from the origin build the rotation from
+yaw/pitch (as `tests/sky_precision.rs` does) or from an offset relative to a local origin.
+
 **What this does not fix: depth.** Geometry is still transformed in absolute `f32` world space
 (`clip = view_proj · model · position` in `forward.wgsl` and `depth.wgsl`), so at ~430 000 units
 the product carries ~0.03 clip units of rounding that changes with every camera pose, and the
@@ -246,6 +253,11 @@ GL backend. Mean residual, px (Metal; 63 frame pairs; 2x doubles the pixel numbe
 | (85000, 0, 85000) near 2, yaw | 2.04 (max 5.8, 40) | 3.34 (max 9.3, 41) | 0.006 | 0.005 |
 | y = −430000 near 10, translate | 0.69 (max 2.1, 12) | 1.37 (max 4.3, 23) | 0.000 | 0.000 |
 | y = −430000 near 10, yaw | 1.71 (max 5.8, 19) | 3.86 (max 10.9, 29) | 0.006 | 0.005 |
+
+On the GL backend (ANGLE, GLES 3.0, 640 × 360, Direct and Ldr-fallback HDR alike) the same runs
+gave, before: 1.62 px at 85 000 (translate; 2.04 turning, 47 and 40 reversals) and 0.70 px at
+y = −430 000 (translate; 1.73 turning); now 0.000 (translate) and 0.006 (turning), like the
+origin control. `webgl2()` on Metal gave the default backend's numbers to the digit.
 
 The origin rows are the noise floor of the method (the yaw residual is registration bias, not
 the renderer); the far rows equal them: the sky rendered far from the origin is bit-identical to

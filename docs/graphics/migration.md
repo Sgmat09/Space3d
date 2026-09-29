@@ -545,7 +545,11 @@ different precision problems. The engine fixes them in two steps.
   the sake of its skybox, and the flight map's far corners (absolute coordinates up to ~32 000: 4 px
   of star shimmer at the far corner at 3456 × 2234) no longer shimmer. Nothing to change in the game
   to get it: the fix is in the engine's sky pass; every existing custom shader, render node and
-  overlay keeps working (`View` only gained a member at its end, 1312 → 1376 bytes).
+  overlay keeps working (`View` only gained a member at its end, 1312 → 1376 bytes). One caller-side
+  caveat: the sky follows the camera's rotation exactly as the `Transform` holds it, and
+  `Transform::looking_at` far from the origin derives that rotation from `f32` absolute positions
+  (quantized by 0.008 units at 85 000: up to ~0.3 px of sky wobble at 3456 × 2234 for a target 50
+  units away). Build the camera's rotation from yaw/pitch (or from a local offset) instead.
 * **Depth: not yet.** Vertex transforms are still done in absolute `f32` world space
   (`forward.wgsl` and `depth.wgsl`: `clip = view_proj · (model · position)`), so at |world| ~ 430 000
   the rounding of each product (~0.03 clip units, different for every camera pose) still costs
