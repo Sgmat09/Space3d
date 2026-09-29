@@ -26,6 +26,17 @@ use token::KeyRing;
 /// Dev-only fleet token (refused in production).
 pub const DEV_FLEET_TOKEN: &str = "space3d-dev-fleet-token";
 
+/// Text a value copied from a template still carries (`deploy/k8s/secret.example.yaml` says
+/// `REPLACE-WITH-...`), compared case-insensitively. Random hex / base64 tokens cannot contain
+/// them (the `-` and `_` are not in hex, and `-` is not in standard base64).
+const PLACEHOLDER_MARKERS: &[&str] = &["replace-with", "replace_with", "change-me", "changeme"];
+
+/// Whether `token` is a placeholder someone forgot to replace.
+fn is_placeholder(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    PLACEHOLDER_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// Secrets resolved from env vars / files named by `[security]` (never from the config file).
 #[derive(Clone)]
 pub struct Secrets {
@@ -59,7 +70,7 @@ fn read_secret_file(path: &std::path::Path, key: &str) -> Result<String, ConfigE
 impl Secrets {
     /// Resolve secrets for `config` using `env` for variable lookups. In `env = "dev"` missing
     /// secrets fall back to public dev values (with a warning); `env = "production"` refuses
-    /// missing, short or dev-default secrets.
+    /// missing, short, dev-default or template-placeholder (`REPLACE-WITH-...`) secrets.
     pub fn load(config: &ServerConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let s = &config.security;
         let prod = config.env == Env::Production;
@@ -108,6 +119,12 @@ impl Secrets {
                 "fleet token must be ≥ 16 characters and not the dev default".into(),
             ));
         }
+        if prod && config.role != Role::AllInOne && is_placeholder(&fleet_token) {
+            return Err(invalid(
+                "security.fleet_token_env",
+                "fleet token is still the placeholder from the secret template: generate a random one".into(),
+            ));
+        }
         let admin_raw = match &s.admin_token_file {
             Some(path) => Some(read_secret_file(path, "security.admin_token_file")?),
             None => env(&s.admin_token_env),
@@ -130,6 +147,12 @@ impl Secrets {
             return Err(invalid(
                 "security.admin_token_env",
                 "every admin token must be ≥ 16 characters in production".into(),
+            ));
+        }
+        if prod && admin_tokens.iter().any(|t| is_placeholder(t)) {
+            return Err(invalid(
+                "security.admin_token_env",
+                "an admin token is still the placeholder from the secret template: generate a random one".into(),
             ));
         }
         Ok(Self {
@@ -212,5 +235,57 @@ mod tests {
             .is_err(),
             "dev fleet token refused in production"
         );
+    }
+
+    /// Regression: the secret template's placeholders (`REPLACE-WITH-24-RANDOM-BYTES-AS-HEX`, 35
+    /// characters) are longer than the 16-character minimum, so an operator who replaced only the
+    /// signing key ran production with publicly known fleet and admin tokens.
+    #[test]
+    fn production_refuses_the_secret_templates_placeholder_tokens() {
+        let prod = ServerConfig {
+            env: Env::Production,
+            role: Role::GameServer,
+            ..ServerConfig::default()
+        };
+        let load = |fleet: &str, admin: &str| {
+            let vars = [
+                ("SPACE3D_KEYS", "k1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="),
+                ("SPACE3D_FLEET_TOKEN", fleet),
+                ("SPACE3D_ADMIN_TOKENS", admin),
+            ];
+            Secrets::load(&prod, &|k| {
+                vars.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+            })
+        };
+        const REAL: &str = "0123456789abcdef0123456789abcdef";
+        const PLACEHOLDER: &str = "REPLACE-WITH-24-RANDOM-BYTES-AS-HEX";
+        load(REAL, REAL).expect("real tokens are accepted");
+        for (fleet, admin, which) in [
+            (PLACEHOLDER, REAL, "fleet"),
+            (REAL, PLACEHOLDER, "admin"),
+            (
+                REAL,
+                "0123456789abcdef0123456789abcdef, replace-with-a-token-of-your-own",
+                "second admin",
+            ),
+            ("please_Change-Me_before_use_1", REAL, "fleet, other spelling"),
+        ] {
+            let err = load(fleet, admin).expect_err(which).to_string();
+            assert!(err.contains("placeholder"), "{which}: {err}");
+        }
+        // Not a production check: dev keeps running with whatever it is given.
+        let dev = ServerConfig::default();
+        let env = env_of(&[("SPACE3D_FLEET_TOKEN", PLACEHOLDER)]);
+        Secrets::load(&dev, &env).expect("dev is not affected");
+        // The placeholder key of the template is not valid base64.
+        let key = env_of(&[
+            ("SPACE3D_KEYS", "k1:REPLACE-WITH-BASE64-OF-32-RANDOM-BYTES"),
+            ("SPACE3D_FLEET_TOKEN", REAL),
+            ("SPACE3D_ADMIN_TOKENS", REAL),
+        ]);
+        assert!(Secrets::load(&prod, &key).is_err());
+        // A random token never trips the check.
+        assert!(!is_placeholder(REAL));
+        assert!(!is_placeholder("Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg=="));
     }
 }

@@ -9,6 +9,14 @@
 #    its own Service (selected by the StatefulSet's pod-name label) and its own host. Repeat the
 #    Service + rule for every replica (or generate them with your templating), or give the pods
 #    hostPort / a LoadBalancer each instead.
+#    These Services set publishNotReadyAddresses: true, on purpose. A draining game server is
+#    NotReady (/readyz answers 503) and then Terminating for up to drain_timeout, and Kubernetes
+#    drops such a pod from a Service's endpoints, so the ingress would answer 503 to every new
+#    WebSocket. But a draining server still serves the players it has: it accepts a resume after
+#    a link blip (resume_window, 20 s) and a rejoin into a match that finishes there (docs/server.md
+#    §6). Keeping the pod routable costs nothing else: the player service stops allocating to it
+#    at once, and the server answers a ticket that would open a new room with Reject(ServerDraining).
+#    Do the same for a LoadBalancer or hostPort front.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -40,6 +48,8 @@ metadata:
     app.kubernetes.io/component: game-server
     app.kubernetes.io/part-of: space3d
 spec:
+  # Keep the pod routable while it drains (see the note at the top of this file).
+  publishNotReadyAddresses: true
   selector:
     statefulset.kubernetes.io/pod-name: space3d-gs-0
   ports:
@@ -55,6 +65,8 @@ metadata:
     app.kubernetes.io/component: game-server
     app.kubernetes.io/part-of: space3d
 spec:
+  # Keep the pod routable while it drains (see the note at the top of this file).
+  publishNotReadyAddresses: true
   selector:
     statefulset.kubernetes.io/pod-name: space3d-gs-1
   ports:

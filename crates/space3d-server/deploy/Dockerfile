@@ -13,7 +13,8 @@
 #   `--network=none` from the cargo registry cache, so the compile step is hermetic.
 # * Dependencies stay cached across builds on one builder (BuildKit cache mounts for the cargo
 #   registry and `target/`): after a source edit only the changed crates and their dependents
-#   recompile. A fresh builder (CI) starts cold; export the cache (`--cache-to`) to keep it.
+#   recompile. A fresh builder (CI) starts cold: `--cache-to` exports layers, not the contents of
+#   cache mounts, so keep a persistent builder or save / restore the mounts (docs/server.md §3).
 # * RUST_VERSION must equal `channel` in rust-toolchain.toml (checked below), so the image is
 #   built with the toolchain the repository pins and never downloads another one.
 # * `--platform linux/amd64` / `linux/arm64` CROSS-COMPILES on the build machine's native
@@ -52,9 +53,14 @@ RUN want="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"; have="$
     [ "$want" = "$have" ] || { echo "rust-toolchain.toml pins $want but the image has $have: set --build-arg RUST_VERSION=$want" >&2; exit 1; }
 ARG BIN=space3d-server
 ARG CARGO_ARGS=""
-# 1. download (the only network use of the compile stage; a no-op when the registry cache is warm)
-RUN --mount=type=cache,id=${CACHE_ID}-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=${CACHE_ID}-cargo-git,target=/usr/local/cargo/git \
+# 1. download (the only network use of the compile stage; a no-op when the registry cache is warm).
+#    `sharing=locked`: `docker compose build` builds several images (player service, game server) at
+#    once and they share these mounts, but cargo's package-cache lock files live in
+#    /usr/local/cargo, outside the mounts, so each container has its own lock and two cold fetches
+#    unpack the same crate at the same time ("failed to unpack package ... File exists"). The
+#    compile step below needs no such lock (cargo locks `target/` itself and only reads the registry).
+RUN --mount=type=cache,id=${CACHE_ID}-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=${CACHE_ID}-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')" --target "$(cat /rust-target)"
 # 2. compile offline; `target/` lives in a cache mount, the binary is copied out of it
 RUN --network=none \

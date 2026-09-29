@@ -76,6 +76,8 @@ const COMPOSE: &str = include_str!("../deploy/compose.yaml");
 const K8S_CONFIGMAP: &str = include_str!("../deploy/k8s/configmap.yaml");
 const K8S_GAME_SERVER: &str = include_str!("../deploy/k8s/game-server.yaml");
 const K8S_PLAYER_SERVICE: &str = include_str!("../deploy/k8s/player-service.yaml");
+const K8S_INGRESS: &str = include_str!("../deploy/k8s/ingress.example.yaml");
+const K8S_SECRET: &str = include_str!("../deploy/k8s/secret.example.yaml");
 const TOOLCHAIN: &str = include_str!("../../../rust-toolchain.toml");
 
 /// The text of a block scalar (`key: |`) in a manifest, un-indented.
@@ -136,6 +138,60 @@ fn the_dockerfile_builds_with_the_pinned_toolchain() {
     assert!(
         DOCKERFILE.contains("ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}"),
         "rustup does not follow rust-toolchain.toml's components / targets (they would be downloaded)"
+    );
+}
+
+/// The instruction of a Dockerfile that contains `needle`, continuation lines joined.
+fn dockerfile_instruction(needle: &str) -> String {
+    let mut lines = DOCKERFILE.lines();
+    while let Some(line) = lines.next() {
+        let mut text = line.trim_end().to_owned();
+        while text.ends_with('\\') {
+            text.pop();
+            match lines.next() {
+                Some(next) => {
+                    text.push(' ');
+                    text.push_str(next.trim());
+                }
+                None => break,
+            }
+        }
+        if !text.trim_start().starts_with('#') && text.contains(needle) {
+            return text;
+        }
+    }
+    panic!("no Dockerfile instruction with `{needle}`");
+}
+
+/// Regression: `docker compose build` builds the player service and the game server at the same
+/// time, both running `cargo fetch` against the same cache mounts. Cargo's package-cache lock
+/// files live in /usr/local/cargo, outside the mounted `registry` and `git` directories, so each
+/// container has its own lock and two cold fetches unpacked the same crate at once (`failed to
+/// unpack package ... File exists`): the documented `up --build` failed on a cold builder. The
+/// fetch step must hold every cache mount it uses with `sharing=locked`.
+#[test]
+fn the_dockerfile_fetch_step_locks_its_cache_mounts() {
+    let fetch = dockerfile_instruction("cargo fetch");
+    let mounts: Vec<&str> = fetch
+        .split_whitespace()
+        .filter(|w| w.starts_with("--mount=type=cache"))
+        .collect();
+    assert!(
+        mounts.iter().any(|m| m.contains("cargo-registry")) && mounts.iter().any(|m| m.contains("cargo-git")),
+        "the fetch step mounts the registry and git caches: {mounts:?}"
+    );
+    for m in &mounts {
+        assert!(
+            m.contains("sharing=locked"),
+            "{m}: concurrent cold fetches race without it"
+        );
+    }
+    // The compile step reads the registry offline and cargo locks `target/` itself: it must not
+    // be serialised across builds (a lock held for the whole compile).
+    let compile = dockerfile_instruction("cargo build");
+    assert!(
+        !compile.contains("sharing=locked"),
+        "the compile step stays concurrent: {compile}"
     );
 }
 
@@ -256,4 +312,94 @@ fn the_kubernetes_config_restates_every_key_of_the_example() {
         .unwrap();
     assert_eq!(value["env"].as_str(), Some("production"));
     assert_eq!(value["game"]["allow_dev_auth"].as_bool(), Some(false));
+}
+
+/// Documents of a multi-document manifest.
+fn documents(yaml: &str) -> Vec<&str> {
+    yaml.split("\n---\n").collect()
+}
+
+/// Regression: a draining game server is NotReady (`/readyz` 503) and Terminating, and Kubernetes
+/// drops such a pod from a Service's endpoints unless the Service sets
+/// `publishNotReadyAddresses: true`. The per-pod Services behind the ingress lacked it, so for the
+/// whole drain (up to `drain_timeout`) the ingress answered 503 to every WebSocket, including a
+/// resume after a link blip and a rejoin into a match still running on the draining server, both
+/// of which the server accepts (docs/server.md §6).
+#[test]
+fn the_per_pod_services_stay_routable_while_the_pod_drains() {
+    let per_pod: Vec<&str> = documents(K8S_INGRESS)
+        .into_iter()
+        .filter(|d| d.contains("kind: Service") && d.contains("statefulset.kubernetes.io/pod-name"))
+        .collect();
+    assert!(per_pod.len() >= 2, "the example has a Service per game-server pod");
+    for doc in per_pod {
+        assert!(
+            doc.lines().any(|l| l.trim() == "publishNotReadyAddresses: true"),
+            "a per-pod Service without publishNotReadyAddresses: true drops the draining pod:\n{doc}"
+        );
+    }
+    // The headless Service is not used by players, and its DNS entries follow readiness.
+    assert!(
+        K8S_GAME_SERVER
+            .lines()
+            .any(|l| l.trim() == "publishNotReadyAddresses: false"),
+        "the headless Service keeps readiness"
+    );
+}
+
+/// Regression: the production image refused only the template's placeholder key (not valid
+/// base64); with a real key and the template's 35-character fleet and admin tokens (above the
+/// 16-character minimum) `check-config` passed, so an operator who replaced only the key ran with
+/// publicly known tokens. Each placeholder of `secret.example.yaml` has to be refused on its own.
+#[test]
+fn every_placeholder_of_the_secret_template_is_refused_in_production() {
+    let placeholders: BTreeMap<String, String> = K8S_SECRET
+        .lines()
+        .skip_while(|l| l.trim() != "stringData:")
+        .skip(1)
+        .filter_map(|l| {
+            let (k, v) = l.trim().split_once(": ")?;
+            Some((k.to_owned(), v.trim_matches('"').to_owned()))
+        })
+        .collect();
+    let keys = ["SPACE3D_KEYS", "SPACE3D_FLEET_TOKEN", "SPACE3D_ADMIN_TOKENS"];
+    for key in keys {
+        assert!(
+            placeholders.contains_key(key),
+            "{key} in the template: {placeholders:?}"
+        );
+    }
+    let real: BTreeMap<String, String> = [
+        ("SPACE3D_KEYS", "k1:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="),
+        ("SPACE3D_FLEET_TOKEN", "0123456789abcdef0123456789abcdef"),
+        ("SPACE3D_ADMIN_TOKENS", "fedcba9876543210fedcba9876543210"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let toml = block_scalar(K8S_CONFIGMAP, "server.toml");
+    let config_for = |role: &str| {
+        let overlay = vec![
+            ("SPACE3D__ENV".to_owned(), "production".to_owned()),
+            ("SPACE3D__ROLE".to_owned(), role.to_owned()),
+            ("SPACE3D__SERVER_ID".to_owned(), "space3d-gs-0".to_owned()),
+            (
+                "SPACE3D__GAME__PUBLIC_URL".to_owned(),
+                "wss://{server_id}.play.example.com/play".to_owned(),
+            ),
+        ];
+        ServerConfig::load_layered(Some(&toml), None, overlay).expect("loads")
+    };
+    for role in ["game-server", "player-service"] {
+        let config = config_for(role);
+        Secrets::load(&config, &|k| real.get(k).cloned()).expect("real secrets are accepted");
+        for replaced in keys {
+            let mut env = real.clone();
+            env.insert(replaced.to_owned(), placeholders[replaced].clone());
+            assert!(
+                Secrets::load(&config, &|k| env.get(k).cloned()).is_err(),
+                "{role}: the template's placeholder {replaced} is accepted in production"
+            );
+        }
+    }
 }

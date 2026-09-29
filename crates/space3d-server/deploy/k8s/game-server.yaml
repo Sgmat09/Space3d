@@ -5,10 +5,14 @@
 #
 # Drain (docs/server.md §6, "Draining and upgrades"). A pod that is deleted (rollout, scale-in,
 # node drain) gets, in this order:
-#   1. preStop: sleep 5 s, so the ingress stops routing new WebSockets to it;
-#   2. SIGTERM: /readyz turns 503, the player service stops allocating to the pod, matches run to
-#      completion within drain_timeout (game.drain_timeout in configmap.yaml), persistent rooms
-#      hand off, the final checkpoints are uploaded, the process exits 0;
+#   1. preStop: sleep 5 s, so whatever routes through a Service that honours readiness (the
+#      headless Service below, a shared Service you add) sees the pod leave before SIGTERM. The
+#      per-pod Services of ingress.example.yaml deliberately keep routing to a draining pod
+#      (publishNotReadyAddresses): it still serves resumes and rejoins into its matches;
+#   2. SIGTERM: /readyz turns 503, the player service stops allocating to the pod, new tickets get
+#      Reject(ServerDraining) (resumes are still accepted), matches run to completion within
+#      drain_timeout (game.drain_timeout in configmap.yaml), persistent rooms hand off, the final
+#      checkpoints are uploaded, the process exits 0;
 #   3. SIGKILL when terminationGracePeriodSeconds is over.
 # The grace period includes the preStop sleep, so it must be drain_timeout + 5 s + 30 s, plus slack
 # (crates/space3d-server/tests/deploy.rs checks that the numbers stay consistent).

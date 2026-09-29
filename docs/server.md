@@ -256,9 +256,17 @@ docker build -f crates/space3d-server/deploy/Dockerfile -t space3d-player-servic
   the changed crates and their dependents recompile (a one-line change in `space3d-server`
   recompiles that crate alone and relinks: about 70 s on 8 cores, dominated by the thin-LTO
   link). A cold builder compiles everything once (about 2 min for the player service on 8
-  cores). The cache lives on the builder: a CI runner that starts empty every time should export
-  it (`--cache-to type=gha` or `type=registry`). `--build-arg CACHE_ID=other` selects a private
-  cache.
+  cores, and about another minute for the game server on top of that). The cache lives on the
+  builder, in cache mounts, and **`--cache-to` does not export it**: BuildKit's exported cache
+  carries image layers, not the contents of `RUN --mount=type=cache`. A CI runner that starts
+  empty every time therefore compiles cold on every run. Keep a persistent builder (a
+  self-hosted runner, or a remote BuildKit daemon with a volume), or save and restore the two
+  cargo mounts and `target/` between runs yourself (for example with a cache-dance step in the
+  workflow; this was not tried here). `--build-arg CACHE_ID=other` selects a private cache.
+  `docker compose build` builds the player service and the game server at once: the
+  `cargo fetch` step holds the registry mounts with `sharing=locked` so that two cold fetches
+  do not unpack the same crate at the same time (without it a cold `up --build` failed with
+  `failed to unpack package ... File exists`).
 - *Architectures.* The image is `linux/<the build machine's arch>`. `--platform linux/amd64` and
   `--platform linux/arm64` **cross-compile** with the native toolchain (a cross gcc as linker),
   so an Apple Silicon machine builds an amd64 image for a cluster without emulation. (Running
@@ -351,7 +359,7 @@ Bind-mounted `/data` ownership on a native Linux host was not tested.
 | `player-service.yaml` | PVC, `Deployment` (1 replica, `Recreate`), `Service` |
 | `game-server.yaml` | headless `Service`, `StatefulSet` (2 replicas, PVC per pod), `PodDisruptionBudget` |
 | `secret.example.yaml` | template for `SPACE3D_KEYS`, `SPACE3D_FLEET_TOKEN`, `SPACE3D_ADMIN_TOKENS` (placeholders the production image rejects) |
-| `ingress.example.yaml` | optional: `/v1` for the player service (never `/internal`), one host and Service per game-server pod |
+| `ingress.example.yaml` | optional: `/v1` for the player service (never `/internal`), one host and Service (`publishNotReadyAddresses: true`) per game-server pod |
 | `networkpolicy.yaml` | optional: default deny, then only the flows the stack needs |
 
 ```sh
@@ -374,8 +382,15 @@ kubectl apply -k crates/space3d-server/deploy/k8s
 - **Drain semantics.** The manifests encode §6, "Draining and upgrades":
   1. `readinessProbe` on `/readyz`: 503 until the pod registered, and again as soon as it drains.
      `startupProbe` and `livenessProbe` use `/healthz`.
-  2. `preStop` sleeps 5 s (`sleep` action, Kubernetes 1.30+; the image has no shell), so the
-     ingress stops sending new WebSockets before SIGTERM.
+  2. `preStop` sleeps 5 s (`sleep` action, Kubernetes 1.30+; the image has no shell), so anything
+     routed through a Service that honours readiness sees the pod leave before SIGTERM. The
+     per-pod Services of `ingress.example.yaml` do **not** honour it: they set
+     `publishNotReadyAddresses: true`, because a draining game server is NotReady and then
+     Terminating, Kubernetes removes such a pod from a Service's endpoints, and the ingress would
+     then answer 503 to a resume after a link blip or a rejoin into a match that is still running
+     on it (§6: both are accepted while draining). New players stay away from the pod because the
+     player service stops allocating to it and the pod refuses tickets that would open a room
+     (`Reject(ServerDraining)`). Give a `LoadBalancer` or `hostPort` front the same property.
   3. SIGTERM starts the drain: matches finish within `game.drain_timeout` (15 min in the ConfigMap),
      persistent rooms hand off, checkpoints upload, the process exits 0.
   4. `terminationGracePeriodSeconds: 960` = 900 s drain + 5 s preStop + 30 s final checkpoints +
@@ -407,9 +422,13 @@ kubectl apply -k crates/space3d-server/deploy/k8s
 - **Validation.** All manifests pass `kubeconform -strict` (v0.8.0) against the Kubernetes 1.30 and
   1.34 schemas, `kustomize build` (v5.8.1) renders the eight resources of the kustomization and the
   output validates too, and the ConfigMap's `server.toml` is accepted by `check-config` of the built
-  images with production secrets (and the placeholder Secret is refused). **They have not been run
+  images with production secrets (and each placeholder of the Secret template is refused: the key as invalid base64, the tokens by name). **They have not been run
   on a cluster**: probes, the PVCs, the ingress example, the NetworkPolicy and the actual drain
-  behaviour under `kubectl delete pod` are unverified.
+  behaviour under `kubectl delete pod` are unverified. In particular the claim that a Service with
+  `publishNotReadyAddresses: true` keeps routing to a NotReady, Terminating pod (so a draining game
+  server still receives resumes) comes from Kubernetes' endpoint semantics, not from a cluster
+  run. The drain itself (`/readyz` 503, exit 0) was run in Docker, and that a draining server accepts a
+  rejoin into its running match is tested in `tests/cluster.rs` (`rejoin_during_a_drain_returns_to_the_running_match`).
 
 ---
 
@@ -514,7 +533,7 @@ Tools:
 | `security.signing_kid` | `"k1"` | Key that signs tokens. Every listed key verifies. |
 | `security.keys_env` / `keys_file` | `SPACE3D_KEYS` / none | `k2:<b64>,k1:<b64>` or a TOML file `{ k1 = "<b64>" }`. Rotate by adding k2 everywhere, switching `signing_kid`, and dropping k1 after 30 days. |
 | `security.fleet_token_env` / `_file` | `SPACE3D_FLEET_TOKEN` | Shared by the PS and the GSs. The fleet WebSocket requires it in the upgrade (`Authorization: Bearer …`) and closes connections that do not register within 10 s; `/internal/v1/*` checks it (and the per-IP rate) before reading a request body. |
-| `security.admin_token_env` / `_file` | `SPACE3D_ADMIN_TOKENS` | Comma-separated. With no tokens the admin API is open on a loopback bind (only to requests with a loopback `Host` and, if any, a loopback `Origin`: web pages cannot drive it) and locked otherwise. In production every token must be ≥ 16 characters. |
+| `security.admin_token_env` / `_file` | `SPACE3D_ADMIN_TOKENS` | Comma-separated. With no tokens the admin API is open on a loopback bind (only to requests with a loopback `Host` and, if any, a loopback `Origin`: web pages cannot drive it) and locked otherwise. In production every token must be ≥ 16 characters and not a template placeholder (`REPLACE-WITH-...`, `change-me`). |
 | `security.trusted_proxies` | `[]` | CIDRs whose `X-Forwarded-For` is honoured (every header line, joined in order; the right-most address that is not a trusted proxy is the client). Per-address limits and strikes key IPv4 addresses as is and IPv6 addresses by /64. |
 | `persistence.data_dir` | `data` | Game-server outbox and local checkpoints |
 | `persistence.checkpoint_interval` | 10 s | Rooms also checkpoint on phase change, drain and admin request |

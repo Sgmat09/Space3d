@@ -139,7 +139,7 @@
 
 - **`crates/space3d-server/deploy/Dockerfile`:**
   - Build stage: `rust:${RUST_VERSION}-slim-bookworm`. `RUST_VERSION` equals the `rust-toolchain.toml` channel (the Dockerfile refuses a mismatch and `tests/deploy.rs` checks it), so the build never downloads another toolchain.
-  - `cargo fetch --locked` is the only network use of the compile stage; `cargo build --locked --offline --profile server` runs under `RUN --network=none`. The cargo registry and `target/` live in BuildKit cache mounts, so after a source edit only the changed crates and their dependents recompile.
+  - `cargo fetch --locked` is the only network use of the compile stage; `cargo build --locked --offline --profile server` runs under `RUN --network=none`. The cargo registry and `target/` live in BuildKit cache mounts, so after a source edit only the changed crates and their dependents recompile. The `cargo fetch` step holds the registry mounts with `sharing=locked`: `docker compose build` builds two images at once, and cargo's package-cache lock lives outside the mounts, so two cold fetches unpacked the same crate concurrently and failed. `--cache-to` exports layers, not cache-mount contents, so an empty CI runner compiles cold (docs/server.md §3).
   - Runtime stage: `gcr.io/distroless/cc-debian12:nonroot` (about 71 MB with the binary), `/data` prepared and owned by `nonroot`, `SPACE3D_CONFIG=/etc/space3d/server.toml`, `EXPOSE 7777 8080 9090`, `VOLUME /data`, `STOPSIGNAL SIGTERM`.
   - Distroless has no curl, so probes use `server healthcheck [--ready]` (or HTTP probes on the admin port).
   - The workspace-root `.dockerignore` keeps the build context to the sources (about 9 MB instead of the multi-GB `target/`).
