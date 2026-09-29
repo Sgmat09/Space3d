@@ -473,6 +473,107 @@ fn a_parent_follows_its_parent_back_into_scope() {
     }
 }
 
+/// Decodes of `Watch` values, an `Aim` that counts them (for the cost test below only: no other
+/// test uses `Watch`, so nothing else moves the counter).
+static WATCH_DECODES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Watch(Entity);
+
+struct WatchProtocol;
+
+impl Plugin for WatchProtocol {
+    fn build(&self, app: &mut App) {
+        app.add_plugin(ReplicationPlugin::default()).replicate_with::<Watch>(
+            "test.watch",
+            ComponentRule::mapped(
+                |w: &Watch, ctx: &EncodeCtx<'_>| ctx.net_id(w.0).map_or(0, |n| n.0),
+                |id: u32, ctx: &mut DecodeCtx<'_>| {
+                    WATCH_DECODES.fetch_add(1, Ordering::Relaxed);
+                    ctx.entity(NetId(id)).map(Watch)
+                },
+            ),
+        );
+    }
+}
+
+/// Cost regression: the client decoded every parked value again in each snapshot that spawned
+/// anything (and applying a newer reference value scanned all of them), so the work per snapshot
+/// grew with the number of parked values, whatever was spawned. A parked value is now indexed by
+/// the entities it asked for: spawning something else decodes nothing, and the target's arrival
+/// decodes each value that waited for it once.
+#[test]
+fn unrelated_spawns_do_not_decode_parked_references() {
+    const HOLDERS: usize = 40;
+    let mut h = NetHarness::new(HarnessConfig::default(), |app| {
+        app.add_plugin(WatchProtocol);
+    });
+    let a = h.add_client(ClientSpec::named("alice"), |app| {
+        app.add_plugin(WatchProtocol);
+    });
+    assert!(h.run_until(600, |h| h.client_net(a).is_connected()));
+    let player = h.player(a);
+    let (target, holders) = {
+        let w = &mut h.server_mut().world;
+        let target = w.spawn((Replicated, Transform::default()));
+        let holders: Vec<Entity> = (0..HOLDERS)
+            .map(|_| w.spawn((Replicated, Transform::default())))
+            .collect();
+        (target, holders)
+    };
+    h.server_mut()
+        .resources
+        .expect_mut::<NetServer>()
+        .set_visibility(player, target, Visibility::Hidden);
+    assert!(h.run_until(900, |h| holders.iter().all(|e| h.client_entity(a, *e).is_some())));
+    assert!(h.client_entity(a, target).is_none(), "the target is hidden");
+    for e in &holders {
+        h.server_mut().world.insert_one(*e, Watch(target)).unwrap();
+    }
+    assert!(h.run_until(900, |h| h.client_net(a).reference_stats().parked == HOLDERS));
+    h.step_ticks(30);
+
+    let before = WATCH_DECODES.load(Ordering::Relaxed);
+    for i in 0..10 {
+        h.server_mut()
+            .world
+            .spawn((Replicated, Transform::from_xyz(i as f32, 0.0, 0.0)));
+        h.step_ticks(6);
+    }
+    let unrelated = WATCH_DECODES.load(Ordering::Relaxed) - before;
+    assert_eq!(unrelated, 0, "10 unrelated spawns decoded {unrelated} parked values");
+    assert_eq!(h.client_net(a).reference_stats().parked, HOLDERS);
+
+    // The target arrives: every value that waited for it resolves, each decoded about once.
+    h.server_mut()
+        .resources
+        .expect_mut::<NetServer>()
+        .set_visibility(player, target, Visibility::Default);
+    let watch_of = |h: &NetHarness, e: Entity| {
+        let ce = h.client_entity(a, e)?;
+        h.client(a).world.get::<&Watch>(ce).ok().map(|w| w.0)
+    };
+    assert!(
+        h.run_until(900, |h| {
+            let t = h.client_entity(a, target);
+            t.is_some() && holders.iter().all(|e| watch_of(h, *e) == t)
+        }),
+        "every parked value resolved"
+    );
+    let resolving = WATCH_DECODES.load(Ordering::Relaxed) - before;
+    assert!(
+        (HOLDERS..=2 * HOLDERS).contains(&resolving),
+        "resolving {HOLDERS} values decoded {resolving} times"
+    );
+    assert_eq!(
+        h.client_net(a).reference_stats(),
+        space3d_replication::client::receive::ReferenceStats {
+            parked: 0,
+            bound: HOLDERS
+        }
+    );
+}
+
 // ---- 2. room-level enforcement (fake link) ---------------------------------------------------
 
 #[derive(Default)]
