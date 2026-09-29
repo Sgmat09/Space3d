@@ -276,7 +276,9 @@ pub enum TouchPhase {
     Moved,
     /// Finger lifted.
     Ended,
-    /// System cancelled the touch.
+    /// System cancelled the touch (an incoming call, the palm rejected, a system gesture took
+    /// the finger): it ends like [`Ended`](Self::Ended) but is no tap, no click — see
+    /// [`Input::just_cancelled_touches`].
     Cancelled,
 }
 
@@ -441,6 +443,7 @@ pub struct Input {
     touches: Vec<Touch>,
     started_touches: Vec<u64>,
     ended_touches: Vec<Touch>,
+    cancelled_touches: Vec<Touch>,
     text: String,
     gamepads: HashMap<u32, Gamepad>,
     window_size: Vec2,
@@ -448,6 +451,8 @@ pub struct Input {
     logical_keys: HashMap<KeyCode, LogicalKey>,
     layout: KeyboardLayout,
     mouse_button_events: Vec<MouseButtonEvent>,
+    /// Buttons whose current press the window runner delivered from the OS (not injected).
+    os_pressed: HashSet<MouseButton>,
 }
 
 impl Input {
@@ -485,6 +490,13 @@ impl Input {
     pub fn mouse_just_released(&self, b: MouseButton) -> bool {
         self.mouse.just_released(b)
     }
+    /// The held button `b` went down through an event of the OS window (the window runner),
+    /// not through an injection ([`Self::inject_mouse_button_down`]: tests, replays, scripted
+    /// input). Only such a press can be checked against the OS's button state (see
+    /// [`MouseButtonCause::OsReconciled`]): the OS never held an injected one.
+    pub(crate) fn mouse_press_from_os(&self, b: MouseButton) -> bool {
+        self.mouse.pressed(b) && self.os_pressed.contains(&b)
+    }
     /// This frame's mouse button presses and releases in order, each with the cursor position
     /// at the time and its cause (a release the focus loss or the OS state caused is a cancel:
     /// [`MouseButtonEvent::cancelled`]). Only changes are recorded: a press of a held button or
@@ -520,9 +532,17 @@ impl Input {
     pub fn just_started_touches(&self) -> &[u64] {
         &self.started_touches
     }
-    /// Touches that ended this frame (last known state).
+    /// Touches that ended this frame (last known state): lifted fingers and touches the system
+    /// cancelled ([`Self::just_cancelled_touches`]).
     pub fn just_ended_touches(&self) -> &[Touch] {
         &self.ended_touches
+    }
+    /// The touches of [`Self::just_ended_touches`] that the system cancelled
+    /// ([`TouchPhase::Cancelled`]) rather than the player lifting the finger: not taps, and
+    /// games should not fire on their release. The UI sends them as cancelled releases too (no
+    /// click). Cleared in `end_frame`.
+    pub fn just_cancelled_touches(&self) -> &[Touch] {
+        &self.cancelled_touches
     }
     /// Text typed this frame.
     pub fn text(&self) -> &str {
@@ -685,10 +705,23 @@ impl Input {
             .learn(event.physical, unshifted.as_deref(), shifted.as_deref());
     }
     /// Mouse button down (recorded in [`Self::mouse_button_events`] at the cursor position).
+    /// An injected press: the window runner's OS button check never releases it (the OS does
+    /// not hold it; see [`MouseButtonCause::OsReconciled`]).
     pub fn inject_mouse_button_down(&mut self, b: MouseButton) {
         if !self.mouse.pressed(b) {
             self.mouse.press(b);
             self.record_mouse_button(b, true, MouseButtonCause::Device);
+        }
+    }
+    /// A mouse button event of the OS window, as the window runner feeds it: like
+    /// [`Self::inject_mouse_button_down`] / [`Self::inject_mouse_button_up`], and a press is
+    /// remembered as the OS's ([`Self::mouse_press_from_os`]).
+    pub(crate) fn os_mouse_button(&mut self, b: MouseButton, pressed: bool) {
+        if !pressed {
+            self.release_mouse_button(b, MouseButtonCause::Device);
+        } else if !self.mouse.pressed(b) {
+            self.inject_mouse_button_down(b);
+            self.os_pressed.insert(b);
         }
     }
     /// Mouse button up (recorded in [`Self::mouse_button_events`] at the cursor position).
@@ -703,6 +736,7 @@ impl Input {
     pub fn release_mouse_button(&mut self, b: MouseButton, cause: MouseButtonCause) {
         if self.mouse.pressed(b) {
             self.mouse.release(b);
+            self.os_pressed.remove(&b);
             self.record_mouse_button(b, false, cause);
         }
     }
@@ -764,6 +798,9 @@ impl Input {
                     let mut t = self.touches.remove(i);
                     t.delta += position - t.position;
                     t.position = position;
+                    if phase == TouchPhase::Cancelled {
+                        self.cancelled_touches.push(t);
+                    }
                     self.ended_touches.push(t);
                 }
             }
@@ -820,6 +857,7 @@ impl Input {
         self.wheel = Vec2::ZERO;
         self.started_touches.clear();
         self.ended_touches.clear();
+        self.cancelled_touches.clear();
         self.text.clear();
         self.key_events.clear();
         self.mouse_button_events.clear();
@@ -839,10 +877,13 @@ pub enum Binding {
     Key(KeyCode),
     /// Mouse button.
     Mouse(MouseButton),
-    /// Any finger on the screen.
+    /// Any finger on the screen. The released edge also comes when the system cancelled the
+    /// touch ([`TouchPhase::Cancelled`]; the value goes to zero either way): an action that must
+    /// not fire on a cancel checks [`Input::just_cancelled_touches`] too.
     TouchAny,
     /// A finger inside a normalized screen rectangle (`min`/`max` in 0..1, origin top-left):
-    /// virtual buttons on mobile.
+    /// virtual buttons on mobile. The released edge is the same as [`Binding::TouchAny`]'s for a
+    /// cancelled touch.
     TouchRegion {
         /// Top-left corner.
         min: Vec2,
@@ -1274,6 +1315,35 @@ mod tests {
     }
 
     #[test]
+    fn only_presses_of_the_os_window_are_the_os_s() {
+        let mut i = Input::default();
+        i.inject_mouse_button_down(MouseButton::Left);
+        i.os_mouse_button(MouseButton::Right, true);
+        assert!(i.mouse_pressed(MouseButton::Left) && i.mouse_pressed(MouseButton::Right));
+        assert!(!i.mouse_press_from_os(MouseButton::Left), "injected");
+        assert!(i.mouse_press_from_os(MouseButton::Right), "the window's");
+        // The same events either way.
+        assert_eq!(i.mouse_button_events().len(), 2);
+        assert!(i.mouse_button_events().iter().all(|e| e.pressed && !e.cancelled()));
+        // A held button stays what its press was, whoever repeats the press.
+        i.os_mouse_button(MouseButton::Left, true);
+        i.inject_mouse_button_down(MouseButton::Right);
+        assert!(!i.mouse_press_from_os(MouseButton::Left) && i.mouse_press_from_os(MouseButton::Right));
+        // Any release ends it: the next press is judged on its own.
+        i.inject_mouse_button_up(MouseButton::Right);
+        assert!(!i.mouse_press_from_os(MouseButton::Right));
+        i.inject_mouse_button_down(MouseButton::Right);
+        assert!(!i.mouse_press_from_os(MouseButton::Right), "injected now");
+        i.os_mouse_button(MouseButton::Left, false);
+        i.os_mouse_button(MouseButton::Left, true);
+        assert!(i.mouse_press_from_os(MouseButton::Left));
+        i.release_all();
+        assert!(!i.mouse_press_from_os(MouseButton::Left), "released by a cancel");
+        i.os_mouse_button(MouseButton::Left, true);
+        assert!(i.mouse_press_from_os(MouseButton::Left));
+    }
+
+    #[test]
     fn multi_touch() {
         let mut i = Input::default();
         i.inject_touch(1, TouchPhase::Started, Vec2::new(0.0, 0.0));
@@ -1286,6 +1356,27 @@ mod tests {
         i.inject_touch(2, TouchPhase::Ended, Vec2::new(100.0, 0.0));
         assert_eq!(i.touches().len(), 1);
         assert_eq!(i.just_ended_touches()[0].id, 2);
+        assert!(i.just_cancelled_touches().is_empty(), "lifted, not cancelled");
+    }
+
+    #[test]
+    fn a_cancelled_touch_ends_but_is_told_apart() {
+        let mut i = Input::default();
+        i.inject_touch(1, TouchPhase::Started, Vec2::new(0.0, 0.0));
+        i.inject_touch(2, TouchPhase::Started, Vec2::new(10.0, 0.0));
+        i.end_frame();
+        i.inject_touch(1, TouchPhase::Cancelled, Vec2::new(3.0, 0.0));
+        i.inject_touch(2, TouchPhase::Ended, Vec2::new(10.0, 0.0));
+        i.inject_touch(3, TouchPhase::Cancelled, Vec2::ONE); // never started: nothing
+        assert!(i.touches().is_empty());
+        let ended: Vec<u64> = i.just_ended_touches().iter().map(|t| t.id).collect();
+        assert_eq!(ended, [1, 2], "both end");
+        let cancelled = i.just_cancelled_touches();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!((cancelled[0].id, cancelled[0].position), (1, Vec2::new(3.0, 0.0)));
+        assert_eq!(cancelled[0].start, Vec2::ZERO);
+        i.end_frame();
+        assert!(i.just_ended_touches().is_empty() && i.just_cancelled_touches().is_empty());
     }
 
     #[test]

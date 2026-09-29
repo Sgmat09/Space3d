@@ -237,6 +237,26 @@ impl EguiContext {
         self.pointer_over
     }
 
+    /// Whether a pointer release in this frame's pass was a **cancel**: the window lost the
+    /// focus mid-press, the OS showed the button up with no release event, or the system
+    /// cancelled a touch (see `docs/platforms.md`, "Mouse buttons, focus and the UI"). egui
+    /// registers no click and no drop for it, but it still ends the press, so
+    /// `Response::drag_stopped()` and `hovered()` + `any_released()` are `true` in that frame:
+    /// code that decides a drop or a commit from them should skip a frame for which this is
+    /// `true` (or [`Self::button_cancelled_this_frame`] for its button) and undo instead.
+    /// Valid from `Stage::PreUpdate` of the frame (the pass begins) until the next frame's.
+    /// [`crate::pointer_cancelled_this_frame`] is the same for code with only an
+    /// [`egui::Context`].
+    pub fn pointer_cancelled_this_frame(&self) -> bool {
+        crate::input::pointer_cancelled_this_frame(&self.ctx)
+    }
+
+    /// Like [`Self::pointer_cancelled_this_frame`] for one pointer button (a cancelled touch is
+    /// the primary button's).
+    pub fn button_cancelled_this_frame(&self, button: egui::PointerButton) -> bool {
+        crate::input::pointer_cancel_cause(&self.ctx, button).is_some()
+    }
+
     /// Queue a raw egui event for the next pass (tests, custom platforms, IME...).
     pub fn push_event(&mut self, event: egui::Event) {
         self.injected.push(event);
@@ -347,6 +367,8 @@ pub(crate) fn begin_frame(
         let _ = e.end_pass();
     }
     if !e.enabled {
+        // No pass, so no release is a cancel of this frame's.
+        crate::input::publish_pointer_cancels(&e.ctx, Default::default());
         return;
     }
     let ppp = native_ppp * e.ctx.zoom_factor();
@@ -355,10 +377,13 @@ pub(crate) fn begin_frame(
 
     let mut events = Vec::new();
     translator.focus(focused, &mut events);
-    let cancelled = sys
-        .resources
-        .get::<Input>()
-        .is_some_and(|input| translator.translate(input, ppp, time, &clipboard, &mut events));
+    let (cancelled, cancels) = match sys.resources.get::<Input>() {
+        Some(input) => {
+            let cancelled = translator.translate(input, ppp, time, &clipboard, &mut events);
+            (cancelled, translator.cancelled_buttons())
+        }
+        None => (false, Default::default()),
+    };
     events.extend(injected);
     if let Some(o) = sys.resources.get_mut::<RenderOverlays>() {
         o.set_scale_factor(ppp);
@@ -388,6 +413,7 @@ pub(crate) fn begin_frame(
             ..Default::default()
         },
     );
+    crate::input::publish_pointer_cancels(&e.ctx, cancels);
     e.pixels_per_point = ppp;
     e.screen_size_px = size;
     e.available_rect = screen;

@@ -35,7 +35,22 @@
 //! comes back, and the button is released where the cursor is: drags end (`drag_stopped`), a
 //! dragged slider stays at its value. The drag-and-drop payload is cleared before the pass, so
 //! no drop zone receives it. Any button egui still holds that `Input` does not (egui was
-//! disabled meanwhile, `Input` was replaced) is released the same way.
+//! disabled meanwhile, `Input` was replaced) is released the same way. A system-cancelled touch
+//! ([`space3d_platform::TouchPhase::Cancelled`]) is a cancelled release of the primary button,
+//! not a tap. A cancel only concerns its own button: it is ordered ahead of the other buttons'
+//! clicks of its frame, so it cannot end one of them. A release outside the window is no click
+//! and drops nothing either (egui's pointer detours off-screen first, as for a cancel).
+//!
+//! Game code that decides drops or "release over X" from egui (`Response::drag_stopped`,
+//! `hovered()` / `contains_pointer()` with `any_released()`, ...) sees a cancelled release as an ordinary one, since
+//! egui knows no other: ask [`pointer_cancelled_this_frame`] /
+//! [`pointer_cancel_cause`] (or the same on `EguiContext`) whether this frame's release was a
+//! cancel.
+//!
+//! **No pointer position yet.** A button event before any pointer position is known (nothing
+//! moved the cursor into the window yet, e.g. a test that presses first) is dropped rather than
+//! sent to (0, 0): a press is ignored and so is its release, whenever it comes. Buttons work as
+//! soon as one position was seen.
 //!
 //! `Input` drops the OS's key repeats (a held key is simply "pressed"), but egui text fields
 //! only act on key *presses*, so held editing/navigation keys ([`REPEAT_KEYS`]: Backspace,
@@ -44,7 +59,9 @@
 //! deterministic under `App::step_ticks`.
 
 use space3d_core::glam::Vec2;
-use space3d_platform::{Input, KeyCode, LogicalKey, MouseButton, NamedKey, is_writing_system_key};
+use space3d_platform::{
+    Input, KeyCode, LogicalKey, MouseButton, MouseButtonCause, MouseButtonEvent, NamedKey, is_writing_system_key,
+};
 
 /// Map a logical (layout) key to an egui key — the mapping egui-winit uses: characters by
 /// [`egui::Key::from_name`] (`"z"` → `Z`, `"?"` → `Questionmark`), named keys (Enter, arrows,
@@ -413,6 +430,55 @@ const BUTTONS: [(MouseButton, egui::PointerButton); 5] = [
 /// distance from a press, so the release that follows is no click.
 const CANCEL_DETOUR: egui::Pos2 = egui::pos2(-1.0e6, -1.0e6);
 
+/// The pointer releases of the last egui pass that were cancels, by button (kept in egui's
+/// temporary data by `ui::begin_frame`, so code that only has an [`egui::Context`] can read
+/// them: [`pointer_cancel_cause`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PointerCancels([Option<MouseButtonCause>; BUTTONS.len()]);
+
+fn pointer_cancels_id() -> egui::Id {
+    egui::Id::new("space3d_ui::pointer_cancels")
+}
+
+/// Record which releases of the pass that begins now are cancels.
+pub(crate) fn publish_pointer_cancels(ctx: &egui::Context, cancels: [Option<MouseButtonCause>; BUTTONS.len()]) {
+    ctx.data_mut(|d| d.insert_temp(pointer_cancels_id(), PointerCancels(cancels)));
+}
+
+/// Why `button`'s release in this frame's egui pass was cancelled ([`MouseButtonCause`]:
+/// [`FocusLost`](MouseButtonCause::FocusLost) or [`OsReconciled`](MouseButtonCause::OsReconciled)),
+/// or `None`: it was not released this frame, or it was released by the device.
+///
+/// A cancelled release is registered by egui as no click and no drop, but it still ends the
+/// press: `Response::drag_stopped`, `PointerState::button_released` and `any_released` are
+/// `true` in that frame. Logic that acts on the end of a drag or press should check this and
+/// undo instead:
+///
+/// ```no_run
+/// # use space3d_ui::{egui, pointer_cancelled_this_frame};
+/// # fn drop_item_here() {}
+/// # fn ui(ctx: &egui::Context, zone: &egui::Response) {
+/// if zone.contains_pointer() && ctx.input(|i| i.pointer.any_released()) && !pointer_cancelled_this_frame(ctx) {
+///     drop_item_here();
+/// }
+/// # }
+/// ```
+///
+/// Valid from `Stage::PreUpdate` (`ui::begin_frame`) of the frame until the next one's; a
+/// system-cancelled touch counts as the primary button, cause `FocusLost` (the app lost the
+/// finger to the system). Nothing is cancelled without a running `UiPlugin`.
+pub fn pointer_cancel_cause(ctx: &egui::Context, button: egui::PointerButton) -> Option<MouseButtonCause> {
+    let cancels = ctx.data(|d| d.get_temp::<PointerCancels>(pointer_cancels_id()))?;
+    cancels.0[button as usize]
+}
+
+/// Whether any pointer button's release in this frame's egui pass was a cancel
+/// ([`pointer_cancel_cause`]).
+pub fn pointer_cancelled_this_frame(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<PointerCancels>(pointer_cancels_id()))
+        .is_some_and(|c| c.0.iter().any(Option::is_some))
+}
+
 /// Modifier state derived from held keys.
 pub(crate) fn modifiers(input: &Input) -> egui::Modifiers {
     use KeyCode as K;
@@ -454,6 +520,15 @@ pub(crate) struct InputTranslator {
     known_pos: Option<egui::Pos2>,
     /// Mouse buttons egui holds ([`BUTTONS`] order).
     down: [bool; BUTTONS.len()],
+    /// Buttons whose press was dropped because no pointer position was known yet: their release
+    /// is dropped too ([`BUTTONS`] order).
+    ignored: [bool; BUTTONS.len()],
+    /// Buttons whose release was cancelled in the last translated frame, and why ([`BUTTONS`]
+    /// order; the primary one also for a cancelled pointer touch).
+    cancels: [Option<MouseButtonCause>; BUTTONS.len()],
+    /// The order the last frame's button events went to egui (indices into
+    /// `Input::mouse_button_events`; reused, so a steady state allocates nothing).
+    order: Vec<usize>,
     /// egui was told the window has no focus (egui starts focused).
     unfocused: bool,
     last_modifiers: egui::Modifiers,
@@ -475,8 +550,10 @@ impl InputTranslator {
     }
 
     /// Append this frame's egui events for `input` (physical pixels → points with `ppp`).
-    /// `time` is the app time in seconds (drives key repeat). Returns whether a release was
-    /// cancelled (see the module docs): egui's drag-and-drop payload must go, undelivered.
+    /// `time` is the app time in seconds (drives key repeat). Returns whether egui's
+    /// drag-and-drop payload must go, undelivered: a release was cancelled (see the module
+    /// docs) or a button came up outside the window. [`Self::cancelled_buttons`] tells which
+    /// releases were cancels.
     pub(crate) fn translate(
         &mut self,
         input: &Input,
@@ -492,19 +569,25 @@ impl InputTranslator {
             self.last_modifiers = mods;
         }
 
-        // Pointer: the frame's button events in order, each where the cursor was; then where
-        // the cursor is now.
+        // Pointer: the frame's button events in order (cancels early: `button_order`), each
+        // where the cursor was; then where the cursor is now.
         let pos = input.mouse_position().map(to_points);
         let mut cancelled = false;
-        for e in input.mouse_button_events() {
+        self.cancels = [None; BUTTONS.len()];
+        let events = input.mouse_button_events();
+        self.button_order(events);
+        for k in 0..self.order.len() {
+            let e = &events[self.order[k]];
             let Some(i) = BUTTONS.iter().position(|(b, _)| *b == e.button) else {
                 continue;
             };
-            if e.cancelled() {
-                self.detour(out);
-                cancelled = true;
+            let at = e.position.map(to_points);
+            if e.pressed {
+                self.button_press(i, at, mods, out);
+            } else {
+                let cause = e.cancelled().then_some(e.cause);
+                cancelled |= self.button_release(i, cause, at, mods, out);
             }
-            self.pointer_button(i, e.pressed, e.position.map(to_points), mods, out);
         }
         // A button egui holds that `Input` does not (egui was disabled when it came up, `Input`
         // was replaced): released as a cancel.
@@ -512,6 +595,7 @@ impl InputTranslator {
             if self.down[i] && !input.mouse_pressed(*b) {
                 self.detour(out);
                 cancelled = true;
+                self.cancels[i] = Some(MouseButtonCause::FocusLost);
                 self.pointer_button(i, false, pos, mods, out);
             }
         }
@@ -658,15 +742,26 @@ impl InputTranslator {
         }
         for t in input.just_ended_touches() {
             let p = to_points(t.position);
+            // A touch the system cancelled is no tap: the pointer's release is a cancel.
+            let cancel = input.just_cancelled_touches().iter().any(|c| c.id == t.id);
             out.push(egui::Event::Touch {
                 device_id,
                 id: egui::TouchId(t.id),
-                phase: egui::TouchPhase::End,
+                phase: if cancel {
+                    egui::TouchPhase::Cancel
+                } else {
+                    egui::TouchPhase::End
+                },
                 pos: p,
                 force: None,
             });
             if self.pointer_touch == Some(t.id) {
                 self.pointer_touch = None;
+                if cancel {
+                    self.detour(out);
+                    cancelled = true;
+                    self.cancels[0] = Some(MouseButtonCause::FocusLost);
+                }
                 out.push(egui::Event::PointerButton {
                     pos: p,
                     button: egui::PointerButton::Primary,
@@ -683,6 +778,100 @@ impl InputTranslator {
 }
 
 impl InputTranslator {
+    /// The buttons whose release the last [`Self::translate`] sent as a cancel, and why
+    /// ([`BUTTONS`] order: primary, secondary, middle, extra 1, extra 2).
+    pub(crate) fn cancelled_buttons(&self) -> [Option<MouseButtonCause>; BUTTONS.len()] {
+        self.cancels
+    }
+
+    /// Sets [`Self::order`], the order this frame's button events go to egui: `Input`'s order,
+    /// except that a **cancel goes as early as it can**, so it does not land inside another
+    /// button's click. egui follows one press at a time and any release ends the click in
+    /// progress, so a cancel between another button's press and release would swallow that
+    /// click. A cancel therefore moves before the presses and clicks of other buttons in its
+    /// frame, but stays after its own button's earlier events, after other cancels, and after
+    /// the release that closes a click begun in an earlier frame (that click is complete when
+    /// the cancel comes: egui's one shared press is over by then, so it judges the cancelled
+    /// release alone, and may count it as a click, which the detour cannot prevent).
+    fn button_order(&mut self, events: &[MouseButtonEvent]) {
+        self.order.clear();
+        self.order.extend(0..events.len());
+        if !events.iter().any(MouseButtonEvent::cancelled) {
+            return;
+        }
+        // The first event of a button egui holds is its release: it closes an earlier click.
+        let down = self.down;
+        let closes_a_click = |j: usize| {
+            let e = &events[j];
+            !e.pressed
+                && BUTTONS
+                    .iter()
+                    .position(|(b, _)| *b == e.button)
+                    .is_some_and(|i| down[i])
+                && events[..j].iter().all(|o| o.button != e.button)
+        };
+        let order = &mut self.order;
+        for (k, e) in events.iter().enumerate() {
+            if !e.cancelled() {
+                continue;
+            }
+            let from = order.iter().position(|&o| o == k).unwrap_or(k);
+            let mut to = from;
+            while to > 0 {
+                let before = order[to - 1];
+                let o = &events[before];
+                if o.button == e.button || o.cancelled() || closes_a_click(before) {
+                    break;
+                }
+                to -= 1;
+            }
+            order[to..=from].rotate_right(1);
+        }
+    }
+
+    /// A button press at `at` (see [`Self::pointer_button`]). With no pointer position known
+    /// yet (`at` is `None`, and egui has never seen one) the press is dropped, and its release
+    /// with it: nothing can tell what was pressed, and (0, 0) is not it.
+    fn button_press(
+        &mut self,
+        i: usize,
+        at: Option<egui::Pos2>,
+        modifiers: egui::Modifiers,
+        out: &mut Vec<egui::Event>,
+    ) {
+        if at.is_none() && self.known_pos.is_none() {
+            self.ignored[i] = true;
+            return;
+        }
+        self.ignored[i] = false;
+        self.pointer_button(i, true, at, modifiers, out);
+    }
+
+    /// A button release at `at`; `cause`: why it was cancelled (no click, no drop). A release
+    /// outside the window (`at` is `None`) is no click on a widget at the window's edge either: egui
+    /// only sees the pointer where it last was, which may still be over such a widget. Both detour
+    /// egui's pointer off-screen first. Returns whether egui's drag-and-drop payload must go:
+    /// a cancel, or a release outside the window (nothing is dropped there).
+    fn button_release(
+        &mut self,
+        i: usize,
+        cause: Option<MouseButtonCause>,
+        at: Option<egui::Pos2>,
+        modifiers: egui::Modifiers,
+        out: &mut Vec<egui::Event>,
+    ) -> bool {
+        if std::mem::take(&mut self.ignored[i]) || (at.is_none() && self.known_pos.is_none()) {
+            return false;
+        }
+        let drops_nothing = cause.is_some() || at.is_none();
+        if drops_nothing {
+            self.detour(out);
+        }
+        self.cancels[i] = self.cancels[i].or(cause);
+        self.pointer_button(i, false, at, modifiers, out);
+        drops_nothing
+    }
+
     /// A button event at `at` (points; `None`: the cursor is outside the window). Inside, egui's
     /// pointer moves there first. Outside, the event goes to the last position egui saw and the
     /// pointer is gone again right after, so it re-enters no hover.
@@ -711,7 +900,7 @@ impl InputTranslator {
             }
             None => {
                 out.push(egui::Event::PointerButton {
-                    pos: self.known_pos.unwrap_or(egui::Pos2::ZERO),
+                    pos: self.known_pos.unwrap_or(egui::Pos2::ZERO), // callers drop it before
                     button,
                     pressed,
                     modifiers,
@@ -1204,12 +1393,17 @@ mod tests {
         t.translate(&input, 2.0, 0.0, "", &mut ev);
         input.end_frame();
         assert_eq!(pointer(&ev), [P::Gone]);
-        // Released outside: where egui last saw the pointer, which is gone again right after.
+        // Released outside: where egui last saw the pointer, which is gone again right after,
+        // and never a click there (egui's pointer detours first): not a cancel either.
         input.inject_mouse_button_up(MouseButton::Left);
         let mut ev = Vec::new();
-        t.translate(&input, 2.0, 0.0, "", &mut ev);
+        assert!(t.translate(&input, 2.0, 0.0, "", &mut ev), "drops what is dragged");
+        assert_eq!(t.cancelled_buttons(), [None; 5], "a device release");
         input.end_frame();
-        assert_eq!(pointer(&ev), [P::Button(PRIMARY, false, a), P::Gone]);
+        assert_eq!(
+            pointer(&ev),
+            [P::Moved(CANCEL_DETOUR), P::Button(PRIMARY, false, a), P::Gone]
+        );
         let mut ev = Vec::new();
         t.translate(&input, 2.0, 0.0, "", &mut ev);
         assert!(ev.is_empty(), "{ev:?}");
@@ -1222,7 +1416,6 @@ mod tests {
 
     #[test]
     fn cancelled_releases_detour_off_screen_first() {
-        use space3d_platform::MouseButtonCause;
         for cause in [MouseButtonCause::FocusLost, MouseButtonCause::OsReconciled] {
             let mut t = InputTranslator::default();
             let mut input = Input::default();
@@ -1275,12 +1468,157 @@ mod tests {
                 P::Gone
             ]
         );
-        // Device releases are not cancels.
+        // Device releases inside the window are not cancels.
+        input.inject_mouse_move(Vec2::new(3.0, 4.0));
         input.inject_mouse_button_down(MouseButton::Left);
         input.inject_mouse_button_up(MouseButton::Left);
         let mut ev = Vec::new();
         assert!(!t.translate(&input, 1.0, 0.0, "", &mut ev));
         assert!(!ev.contains(&egui::Event::PointerMoved(CANCEL_DETOUR)));
+        assert_eq!(t.cancelled_buttons(), [None; 5]);
+    }
+
+    /// Which buttons a frame cancelled is told apart (a cancel of one is no cancel of another),
+    /// and the flags are those of the last translated frame only.
+    #[test]
+    fn cancelled_buttons_tell_which_button() {
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(30.0, 40.0));
+        input.inject_mouse_button_down(MouseButton::Left);
+        input.inject_mouse_button_down(MouseButton::Right);
+        input.inject_mouse_button_down(MouseButton::Middle);
+        translate_frame(&mut t, &mut input, "");
+        assert_eq!(t.cancelled_buttons(), [None; 5]);
+        input.release_mouse_button(MouseButton::Right, MouseButtonCause::OsReconciled);
+        input.inject_mouse_button_up(MouseButton::Left);
+        let mut ev = Vec::new();
+        assert!(t.translate(&input, 1.0, 0.0, "", &mut ev));
+        input.end_frame();
+        assert_eq!(
+            t.cancelled_buttons(),
+            [None, Some(MouseButtonCause::OsReconciled), None, None, None]
+        );
+        // The next frame: the middle button by a focus loss.
+        input.release_all();
+        translate_frame(&mut t, &mut input, "");
+        assert_eq!(
+            t.cancelled_buttons(),
+            [None, None, Some(MouseButtonCause::FocusLost), None, None]
+        );
+        translate_frame(&mut t, &mut input, "");
+        assert_eq!(t.cancelled_buttons(), [None; 5], "nothing this frame");
+        // A cancelled pointer touch is the primary button's.
+        let mut input2 = Input::default();
+        input2.inject_touch(1, space3d_platform::TouchPhase::Started, Vec2::new(5.0, 5.0));
+        let mut t2 = InputTranslator::default();
+        translate_frame(&mut t2, &mut input2, "");
+        input2.inject_touch(1, space3d_platform::TouchPhase::Cancelled, Vec2::new(5.0, 5.0));
+        let mut ev = Vec::new();
+        assert!(t2.translate(&input2, 1.0, 0.0, "", &mut ev));
+        assert_eq!(
+            t2.cancelled_buttons(),
+            [Some(MouseButtonCause::FocusLost), None, None, None, None]
+        );
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            egui::Event::Touch {
+                phase: egui::TouchPhase::Cancel,
+                ..
+            }
+        )));
+    }
+
+    /// A cancel goes ahead of other buttons' clicks in its frame but keeps its place after its
+    /// own button's events, other cancels, and the release that closes an earlier click.
+    #[test]
+    fn a_cancel_is_ordered_before_other_buttons_clicks() {
+        let (l, r, m) = (MouseButton::Left, MouseButton::Right, MouseButton::Middle);
+        let order = |t: &mut InputTranslator, input: &Input| {
+            t.button_order(input.mouse_button_events());
+            t.order.clone()
+        };
+        let cancel = MouseButtonCause::OsReconciled;
+        // Left held from an earlier frame; right clicks; left cancelled (index 2 of 3).
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(10.0, 10.0));
+        input.inject_mouse_button_down(l);
+        translate_frame(&mut t, &mut input, "");
+        input.inject_mouse_button_down(r);
+        input.inject_mouse_button_up(r);
+        input.release_mouse_button(l, cancel);
+        assert_eq!(order(&mut t, &input), [2, 0, 1], "cancel first");
+        // Its own button's earlier events stay before it.
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(10.0, 10.0));
+        input.inject_mouse_button_down(m);
+        input.inject_mouse_button_down(l);
+        input.inject_mouse_button_down(r);
+        input.release_mouse_button(l, cancel);
+        input.inject_mouse_button_up(r);
+        assert_eq!(order(&mut t, &input), [0, 1, 3, 2, 4], "after its own press only");
+        // The release that closes a click begun in an earlier frame comes first.
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(10.0, 10.0));
+        input.inject_mouse_button_down(l);
+        input.inject_mouse_button_down(r);
+        translate_frame(&mut t, &mut input, "");
+        input.inject_mouse_button_up(r);
+        input.release_mouse_button(l, cancel);
+        assert_eq!(order(&mut t, &input), [0, 1], "right's click is complete");
+        // Two cancels keep their order, both ahead of another button's click.
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(10.0, 10.0));
+        input.inject_mouse_button_down(l);
+        input.inject_mouse_button_down(m);
+        translate_frame(&mut t, &mut input, "");
+        input.inject_mouse_button_down(r);
+        input.inject_mouse_button_up(r);
+        input.release_mouse_button(m, cancel);
+        input.release_mouse_button(l, cancel);
+        assert_eq!(order(&mut t, &input), [2, 3, 0, 1]);
+        // Nothing to move: the frame's own order.
+        input.end_frame();
+        input.inject_mouse_button_down(l);
+        input.inject_mouse_button_up(l);
+        assert_eq!(order(&mut t, &input), [0, 1]);
+    }
+
+    /// Before any pointer position is known a button event is dropped, its release with it.
+    #[test]
+    fn buttons_before_a_position_is_known_are_dropped_as_a_pair() {
+        let mut t = InputTranslator::default();
+        let mut input = Input::default();
+        input.inject_mouse_button_down(MouseButton::Left);
+        input.inject_mouse_button_down(MouseButton::Right);
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert!(pointer(&ev).is_empty(), "{ev:?}");
+        assert_eq!(t.down, [false; 5]);
+        // The position becomes known while both are held: the release of a dropped press goes
+        // nowhere, a new press works.
+        input.inject_mouse_move(Vec2::new(4.0, 4.0));
+        input.inject_mouse_button_up(MouseButton::Left);
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(pointer(&ev), [P::Moved(egui::pos2(4.0, 4.0))], "no release, no press");
+        input.inject_mouse_button_up(MouseButton::Right);
+        input.inject_mouse_button_down(MouseButton::Left);
+        input.inject_mouse_button_up(MouseButton::Left);
+        let ev = translate_frame(&mut t, &mut input, "");
+        let at = egui::pos2(4.0, 4.0);
+        assert_eq!(
+            pointer(&ev),
+            [P::Button(PRIMARY, true, at), P::Button(PRIMARY, false, at)]
+        );
+        // A press before the pointer is known but after egui saw one is not dropped (outside the
+        // window: at the last position).
+        input.inject_mouse_left();
+        input.inject_mouse_button_down(MouseButton::Left);
+        let ev = translate_frame(&mut t, &mut input, "");
+        assert_eq!(pointer(&ev), [P::Button(PRIMARY, true, at), P::Gone]);
     }
 
     #[test]

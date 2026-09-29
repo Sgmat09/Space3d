@@ -9,7 +9,8 @@
 //!   Mouse buttons keep their order within a frame ([`Input::mouse_button_events`]); releases
 //!   that no release event reported — a focus loss, or (macOS, Windows) the OS showing a held
 //!   button up once per frame — are cancels ([`MouseButtonCause`]): the UI registers no click
-//!   and no drop for them.
+//!   and no drop for them. A touch the system cancelled ([`TouchPhase::Cancelled`]) is no tap
+//!   either ([`Input::just_cancelled_touches`]).
 //! * [Keyboard layouts](#keyboard-layouts) — logical keys ([`KeyEvent`]) and key labels
 //!   ([`Input::key_label`]) that follow the player's layout; see [`layout`].
 //! * Web: `init_web_logging()` (wasm32 only), canvas attachment via [`WindowPlugin::canvas_id`].
