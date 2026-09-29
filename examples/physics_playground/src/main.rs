@@ -196,12 +196,14 @@ fn cursor_ray(ctx: &SystemCtx, cursor: Vec2, window: Vec2) -> Option<(Vec3, Vec3
     let mut query = ctx.world.query::<(&Transform, &Camera3d)>();
     let (transform, camera) = query.iter().next()?;
     let window = window.max(Vec2::ONE);
-    let view_proj = camera.projection.matrix(window.x / window.y) * transform.matrix().inverse();
-    let inverse = view_proj.inverse();
     let ndc = Vec2::new(2.0 * cursor.x / window.x - 1.0, 1.0 - 2.0 * cursor.y / window.y);
-    let near = inverse.project_point3(ndc.extend(0.0));
-    let far = inverse.project_point3(ndc.extend(1.0));
-    Some((near, (far - near).normalize_or_zero()))
+    // (`unproject_ray` inverts the projection and the view in f64: the f32 inverse of
+    // `proj * view` is off by units far from the origin.)
+    Some(space3d::render::unproject_ray(
+        transform.matrix().inverse(),
+        camera.projection.matrix(window.x / window.y),
+        ndc,
+    ))
 }
 
 fn controls(ctx: &mut SystemCtx) {

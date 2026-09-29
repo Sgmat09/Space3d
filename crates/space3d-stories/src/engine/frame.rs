@@ -1,6 +1,6 @@
 //! Frame stories (`Engine/Frame/*`): HDR and tonemapping, render scale, multiple cameras, the LDR
-//! fallback, node phases, scene depth, overlay stages and (feature `particles`) particles feeding
-//! bloom.
+//! fallback, node phases, scene depth, overlay stages, the sky far from the origin and (feature
+//! `particles`) particles feeding bloom.
 //!
 //! Owner: F (graphics spec §3.6).
 
@@ -8,14 +8,16 @@ mod demo;
 #[cfg(feature = "particles")]
 mod particle_bloom;
 
+use super::lighting::{cubemap, faces, nebula_clouds, nebula_stars};
 use super::{ambient, mesh, palette, screen_target, sun};
 use crate::{KnobValues, Story};
 use demo::{AdditiveSprites, Band, BandKind, Particle, PhaseBands, SoftParticles, Sprite};
+use space3d_core::glam::EulerRot;
 use space3d_core::prelude::*;
 use space3d_render::{
     Camera3d, CameraFrame, DownlevelOverride, FrameSettings, HdrMode, Material, Mesh3d, PhaseSlot, PointLight,
     PostProcess, Projection, RenderAssets, RenderNodes, RenderOverlays, RenderPhase, RenderTarget, RenderTargetDesc,
-    SceneReads, Tonemapper,
+    SceneReads, Skybox, Tonemapper,
 };
 
 /// This area's stories, in registry order.
@@ -29,6 +31,7 @@ pub(crate) fn stories() -> Vec<Story> {
         node_phases(),
         soft_depth(),
         overlay_stages(),
+        sky_far_from_origin(),
     ];
     #[cfg(feature = "particles")]
     stories.push(particle_bloom::particles_bloom());
@@ -581,4 +584,76 @@ fn overlay_stages() -> Story {
     .knob_f32("exposure", 0.0, -3.0..=3.0)
     .tag("graphics")
     .size(320, 180)
+}
+
+/// Where the "Sky Far From Origin" story puts its camera: the position and the near plane
+/// (the game's login backdrops and its Skylab stage).
+const FAR_POSITIONS: [(Vec3, f32); 3] = [
+    (Vec3::ZERO, 2.0),
+    (Vec3::new(85_000.0, 0.0, 85_000.0), 2.0),
+    (Vec3::new(1_200.0, -430_000.0, 900.0), 10.0),
+];
+
+/// The nebula sky behind three planets, seen from the origin, from 85 000 units out or from
+/// 430 000 below it. The camera's rotation is set directly (a `looking_at` far from the origin
+/// would round the direction) and the planets sit at fixed offsets from the camera, so the
+/// picture is the same from every position: the sky depends on the camera's rotation only.
+fn sky_far_from_origin() -> Story {
+    Story::new("Engine/Frame/Sky Far From Origin", |app, k| {
+        let (eye, near) = FAR_POSITIONS[k.choice("position").min(FAR_POSITIONS.len() - 1)];
+        let sky = cubemap(app, faces(512, nebula_clouds, nebula_stars));
+        let planet = mesh(app, MeshData::sphere(1.0, 48, 24));
+        let rotation = Quat::from_euler(EulerRot::YXZ, k.f32("yaw").to_radians(), 0.12, 0.0);
+        // Offsets in the camera's frame (x right, y up, -z ahead): all in the lower half of the view.
+        for (offset, radius, color) in [
+            (Vec3::new(-7.0, -6.5, -26.0), 3.5, [0.55, 0.42, 0.35]),
+            (Vec3::new(6.5, -8.0, -22.0), 2.2, [0.3, 0.45, 0.6]),
+            (Vec3::new(0.5, -13.0, -38.0), 5.5, [0.5, 0.5, 0.48]),
+        ] {
+            app.world.spawn((
+                Name("planet".into()),
+                Transform {
+                    translation: eye + rotation * offset,
+                    rotation: Quat::IDENTITY,
+                    scale: Vec3::splat(radius),
+                },
+                Mesh3d(planet),
+                Material::srgb(color[0], color[1], color[2]).with_metallic_roughness(0.0, 0.85),
+            ));
+        }
+        sun(app, Vec3::new(-0.8, -0.2, -0.55), 2.2);
+        ambient(app, 0.02);
+        app.world.spawn((
+            Name("camera".into()),
+            Transform {
+                translation: eye,
+                rotation,
+                scale: Vec3::ONE,
+            },
+            Camera3d::default()
+                .with_clear_color(super::CLEAR)
+                .with_projection(Projection::Perspective {
+                    fov_y: 70f32.to_radians(),
+                    near,
+                    far: 300_000.0,
+                }),
+            Skybox::new(sky),
+            PostProcess::default(),
+        ));
+    })
+    .description(
+        "A nebula skybox behind three planets, seen from the origin, from (85 000, 0, 85 000) with near \
+         2, or from y = -430 000 with near 10 (far 300 000): the same picture. The sky is built from \
+         the inverse projection and the view's rotation only (`View::inv_proj_rot`, in f64), so it does \
+         not depend on where the camera is; it used to land several pixels off, differently for every \
+         camera pose, far from the origin (the textures flickered when the camera moved). \
+         `tests/sky_precision.rs` in space3d-render measures it. Knobs: position, camera yaw.",
+    )
+    .knob_choice(
+        "position",
+        &["origin", "(85000, 0, 85000), near 2", "y = -430000, near 10"],
+        1,
+    )
+    .knob_f32("yaw", 25.0, -180.0..=180.0)
+    .size(320, 200)
 }

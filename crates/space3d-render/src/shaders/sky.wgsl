@@ -8,6 +8,11 @@
 // and near points (perspective and orthographic alike; an orthographic camera sees one
 // direction), rotated into the cubemap by `view.sky_rotation` and scaled by
 // `view.sky_params.x` (the `Skybox` intensity: linear radiance, above 1 feeds bloom).
+//
+// The points are unprojected with `view.inv_proj_rot`, the inverse of the projection times the
+// view's *rotation* only, computed in f64 on the CPU: the camera position never enters the
+// direction, so the sky is the same to ~0.01 px anywhere (the f32 `inv_view_proj` is badly
+// conditioned far from the origin and made the sky jitter by several pixels).
 
 // `OutputEncoding::id` of the pass (how the color is written; see `s3d_output`).
 override S3D_OUTPUT: u32 = 0u;
@@ -32,8 +37,8 @@ fn vs_sky(@builtin(vertex_index) vertex_index: u32) -> SkyOut {
 
 @fragment
 fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
-    let near = view.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
-    let far = view.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    let near = view.inv_proj_rot * vec4<f32>(in.ndc, 0.0, 1.0);
+    let far = view.inv_proj_rot * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = far.xyz / far.w - near.xyz / near.w;
     let d = view.sky_rotation * dir;
     let c = textureSample(s3d_sky_cube, s3d_sky_sampler, d).rgb * view.sky_params.x;

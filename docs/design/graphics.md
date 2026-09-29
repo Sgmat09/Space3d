@@ -1651,7 +1651,9 @@ struct View {
     env_rotation: mat3x3<f32>,
     sky_rotation: mat3x3<f32>,
     sky_params: vec4<f32>,     // intensity, enabled, 0, 0
-}   // 1312 B → stride 1536 at 256-B alignment (1344 at 64)
+    inv_proj_rot: mat4x4<f32>, // (proj · view rotation)⁻¹ in f64: clip → world offset from the camera, no
+                               // camera position in it (added after F3, appended: nothing above moved)
+}   // 1376 B → stride 1536 at 256-B alignment (1408 at 64); the F3 layout above it is 1312 B
 ```
 
 * It contains **no per-frame-varying data**. A still camera with static lights uploads 0 bytes (`TrackedBuffer`
@@ -1673,7 +1675,7 @@ struct View {
 
 WebGL2 limits hold everywhere: ≤ 4 bind groups, ≤ 16 sampled textures per stage (forward uses 9; particles use
 ≤ 4 in their own groups plus up to 6 declared in group 0 layouts), uniforms ≤ 16 KiB per binding (`View` binds
-1312 B), no storage buffers outside compute, ≤ 15 varyings (forward uses 8).
+1376 B), no storage buffers outside compute, ≤ 15 varyings (forward uses 8).
 
 ### 3.5 Pipeline keys and prewarm
 

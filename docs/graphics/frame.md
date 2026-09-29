@@ -168,6 +168,105 @@ let rt = assets.add_render_target_with(512, 512, RenderTargetDesc::hdr().with_sa
   composite un-premultiplies before tonemapping and re-premultiplies after, so no haze appears
   where nothing was drawn.
 
+## The sky does not depend on the camera's position
+
+A `Skybox` looks the same wherever the camera is: 85 000 or 430 000 units from the origin, the
+sky moves only when the camera *turns* (~0.01 px of error, measured below), never when it
+translates.
+
+The sky pass gets each pixel's world direction from `View::inv_proj_rot`, the inverse of the
+projection times the view's *rotation* only (the view matrix with its translation dropped),
+computed in `f64` on the CPU and rounded to `f32` once. With `R` the upper-left 3×3 of the view
+matrix and `P` the projection as drawn (viewport fit included):
+
+```text
+inv_proj_rot   = [R⁻¹ 0; 0 1] · P⁻¹                          (f64, then to f32)
+unproject(z)   = (inv_proj_rot · (ndc.x, ndc.y, z, 1)).xyz / w
+direction      = unproject(1) − unproject(0)                  (world space; perspective and
+                                                               orthographic alike)
+cube lookup    = view.sky_rotation · direction
+```
+
+Nothing in it depends on where the camera is: `R` and `P` have the same entries anywhere. The
+pass used to multiply by `inv_view_proj`, the `f32` inverse of `proj · view`, whose translation
+column is the camera position; that inverse is badly conditioned far from the origin (its
+entries carry ~0.01 of rounding at 85 000 units) and a pixel's direction came out up to 8 mrad
+off (~3 px at 640 wide, ~10 px at 3456) with near 2 and far 300 000, differently for every
+camera pose: a still camera was fine, every small move shifted the nebula and stars by several
+pixels ("the textures flicker when the camera moves"). `inv_view_proj` is still filled, unchanged.
+
+**Custom shaders, nodes and overlays.** `View` (in `VIEW_WGSL`) has a new last member,
+`inv_proj_rot: mat4x4<f32>` (1312 → 1376 bytes); every older member keeps its offset, so shaders
+written before still compile and read the same values. Rebuild a pixel's world *direction* or
+offset from the camera with it, not with `inv_view_proj`:
+
+```wgsl
+let near = view.inv_proj_rot * vec4<f32>(ndc, 0.0, 1.0);
+let far = view.inv_proj_rot * vec4<f32>(ndc, 1.0, 1.0);
+let dir = far.xyz / far.w - near.xyz / near.w;                // world direction (not normalised)
+let world = view.camera_pos.xyz + near.xyz / near.w;          // the pixel's point on the near plane
+```
+
+(`view.inv_proj`, which reconstructs *view-space* positions from depth, has no translation in it
+and is unaffected.) On the CPU the same math is `space3d_render::inverse_proj_rot(view, proj)`
+and `unproject_ray(view, proj, ndc)` (a ray's origin on the near plane and its unit direction,
+`f64` inside; the editor's `ViewCamera::ray` and the model editor's picking ray use it, and the
+shadow fit builds its frustum corners as `camera_pos + inv_proj_rot · ndc`).
+
+**The camera's rotation is taken as the `Transform` holds it.** `Transform::looking_at(target)`
+derives it from the `f32` difference of two absolute positions, which far from the origin is
+quantized: the positions round to 0.008 at 85 000 units, so a target 50 units away moves the
+direction by up to ~1.6e-4 rad in steps (worst case ~0.3 px at 3456 × 2234; measured ~0.05 px
+on average for an eye drifting 0.03 units per frame) as the eye drifts, and the sky
+follows that rotation faithfully. For a camera far from the origin build the rotation from
+yaw/pitch (as `tests/sky_precision.rs` does) or from an offset relative to a local origin.
+
+**What this does not fix: depth.** Geometry is still transformed in absolute `f32` world space
+(`clip = view_proj · model · position` in `forward.wgsl` and `depth.wgsl`), so at ~430 000 units
+the product carries ~0.03 clip units of rounding that changes with every camera pose, and the
+Depth32Float compare picks different winners for surfaces a few units apart (z-fighting of thin
+plates, station pops). Camera-relative rendering (subtracting the camera position from model
+translations in `f64`/split floats) is planned next; until it lands, scenes that need fine depth
+resolution should still sit near the origin (`migration.md` §12).
+
+**How it is guarded.** `crates/space3d-render/tests/sky_precision.rs` renders a high-frequency
+procedural star/nebula cubemap (512² faces: nebula noise, grain and single-texel stars, so there
+is detail down to the pixel) behind a sphere for 64 frames, capturing each with
+`render_to_image`, with the camera at `(85000, 0, 85000)` (near 2), at `(1200, −430000, 900)`
+(near 10) and, as a control, at the origin, far 300 000, moving 0.03 units per frame. The sky
+patch (128² pixels at 1x, 256² at 2x, in the top of the view) of each consecutive pair of frames
+is registered to sub-pixel accuracy (`tests/common/subpixel.rs`: both frames Gaussian-blurred
+σ 1.2 px, phase correlation for the integer shift, then Gauss-Newton on a bicubic resampling for
+the fraction, ~0.005 px noise at 8-bit) and compared with the shift the camera's rotation
+predicts: **translate**, constant rotation (the sky must not move: 0 px) and **yaw**, a slow turn
+(0.06 px per frame; the truth is a fixed world direction projected through both rotations).
+A run passes with a mean residual < 0.1 px, no frame beyond 0.3 px and no *reversal* (two
+consecutive residuals of opposite x sign, both above 0.05 px: the sky jumping back and forth).
+It runs at 1x (640 × 360) and 2x (1280 × 720), in Direct and HDR (passthrough post) frame modes,
+under `DownlevelOverride::webgl2()` and, where wgpu's ANGLE is available (see `gl.rs`), on the
+GL backend. Mean residual, px (Metal; 63 frame pairs; 2x doubles the pixel numbers):
+
+| camera, motion | before (73cc7da), 1x | before, 2x | now, 1x | now, 2x |
+|---|---|---|---|---|
+| origin (control), translate | 0.000 | 0.000 | 0.000 | 0.000 |
+| origin (control), yaw | 0.006 | 0.005 | 0.006 | 0.005 |
+| (85000, 0, 85000) near 2, translate | 1.63 (max 5.5, 47 reversals) | 3.27 (max 10.9, 47) | 0.000 | 0.000 |
+| (85000, 0, 85000) near 2, yaw | 2.04 (max 5.8, 40) | 3.34 (max 9.3, 41) | 0.006 | 0.005 |
+| y = −430000 near 10, translate | 0.69 (max 2.1, 12) | 1.37 (max 4.3, 23) | 0.000 | 0.000 |
+| y = −430000 near 10, yaw | 1.71 (max 5.8, 19) | 3.86 (max 10.9, 29) | 0.006 | 0.005 |
+
+On the GL backend (ANGLE, GLES 3.0, 640 × 360, Direct and Ldr-fallback HDR alike) the same runs
+gave, before: 1.62 px at 85 000 (translate; 2.04 turning, 47 and 40 reversals) and 0.70 px at
+y = −430 000 (translate; 1.73 turning); now 0.000 (translate) and 0.006 (turning), like the
+origin control. `webgl2()` on Metal gave the default backend's numbers to the digit.
+
+The origin rows are the noise floor of the method (the yaw residual is registration bias, not
+the renderer); the far rows equal them: the sky rendered far from the origin is bit-identical to
+the one rendered at the origin for the same camera rotation and clip planes (a different near
+plane changes the last bit of the `f32` direction: at most one level of 8-bit output).
+`Engine/Frame/Sky Far From Origin` shows it: the same picture at the origin, at 85 000 and at
+430 000 units.
+
 ## Render nodes: drawing into the frame's passes
 
 A `RenderNode` draws into passes the frame owns — the view's scene pass, its scene-depth pass,
