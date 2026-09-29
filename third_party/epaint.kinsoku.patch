@@ -1,13 +1,15 @@
-Space3d patch to epaint 0.36.2: kinsoku (禁則処理) line breaking for Chinese and Japanese.
-See third_party/README.md. Applied to the published crate with `git apply -p1` from its root
-(scripts/update-epaint.py does it); regenerate with `scripts/update-epaint.py --refresh`.
+Space3d patch to epaint 0.36.2: kinsoku (禁則処理) line breaking for Chinese and Japanese,
+and two rules of Unicode line breaking (UAX #14) for every script: no break before a no-break
+space, none after an ASCII opening bracket. See third_party/README.md. Applied to the published
+crate with `git apply -p1` from its root (scripts/update-epaint.py does it); regenerate with
+`scripts/update-epaint.py --refresh`.
 
 diff --git b/src/text/kinsoku.rs b/src/text/kinsoku.rs
 new file mode 100644
-index 0000000..f2a9ad8
+index 0000000..cc886e1
 --- /dev/null
 +++ b/src/text/kinsoku.rs
-@@ -0,0 +1,1079 @@
+@@ -0,0 +1,1449 @@
 +//! Kinsoku shori (禁則処理): where a line of Chinese or Japanese text may break.
 +//!
 +//! **Space3d patch**, not part of upstream epaint: see `third_party/README.md` in the Space3d
@@ -33,9 +35,16 @@ index 0000000..f2a9ad8
 +//!   that follows a Latin word or a mark ("Skylab" | "「", "！" | "（").
 +//! * [`Break::Upstream`]: egui's own rules decide. This is the answer for every pair of
 +//!   characters without a Chinese or Japanese character in it (apart from the ellipses and
-+//!   dashes below), so Latin, Cyrillic, Greek, Korean… text lays out exactly as upstream, and
-+//!   “ ‘ « — which open a quote in Chinese and English but close one in German („Tor“) — only
-+//!   count as opening brackets next to Chinese or Japanese characters.
++//!   dashes below and the two Unicode rules after this list), so Latin, Cyrillic, Greek,
++//!   Korean… text lays out as upstream, and “ ‘ « — which open a quote in Chinese and English
++//!   but close one in German („Tor“) — only count as opening brackets next to Chinese or
++//!   Japanese characters.
++//!
++//! Two rules of Unicode line breaking (UAX #14) hold in every script, because egui lacks them
++//! and they show in ordinary Latin text (a chat line's "[T] name:" wrapped as "[T]" | " name"
++//! and "[" | "T] name"): no break just before a no-break space U+00A0 (class GL, LB12a) unless
++//! a space comes before it, and no break after an ASCII opening bracket `(` `[` `{` (class OP,
++//! LB14), also across the spaces after it ("[ x"). See [`line_break`].
 +//!
 +//! Row breaking uses [`line_break`] through a paragraph-level scan (crate-private), which also
 +//! looks past spaces: a space between a bracket and its text ("「　重要　」") doesn't let the
@@ -53,7 +62,7 @@ index 0000000..f2a9ad8
 +
 +/// Revision of these rules, bumped whenever they change. Its presence tells a program or a
 +/// test that epaint is Space3d's patched copy (`egui::epaint::text::kinsoku::VERSION`).
-+pub const VERSION: u32 = 3;
++pub const VERSION: u32 = 4;
 +
 +/// Kinsoku's ruling on a line break between two characters, see [`line_break`].
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,13 +79,21 @@ index 0000000..f2a9ad8
 +
 +/// May a line break between `before` and `after`?
 +///
-+/// Text without Chinese or Japanese characters gets [`Break::Upstream`] (except that no line
-+/// starts with an ellipsis after a non-space, and "——" "……" stay together), so it lays out
-+/// as with upstream egui. A space decides for itself — a line breaks after it as egui does —
-+/// except that next to Chinese or Japanese no line starts with a closing mark after it or ends
-+/// with an opening one before it ("字　」", "（\u{3000}").
++/// Text without Chinese or Japanese characters gets [`Break::Upstream`], so it lays out as
++/// with upstream egui, except that in every script
++///
++/// * no line starts with an ellipsis after a non-space, and "——" "……" stay together;
++/// * no line ends with an ASCII opening bracket `(` `[` `{` (UAX #14 class OP, rule LB14;
++///   upstream broke after it as after any ASCII mark, "[" | "T] name");
++/// * no line starts with a no-break space U+00A0 (class GL, LB12a) unless a space comes
++///   before it (upstream broke before it after a mark or a letter, "[T]" | "\u{a0}name"). Only
++///   the break before it is ruled on: after it egui decides as before.
++///
++/// A space decides for itself — a line breaks after it as egui does — except that no line ends
++/// with an opening bracket before it and next to Chinese or Japanese no line starts with a
++/// closing mark after it or ends with an opening one before it ("字　」", "（\u{3000}").
 +pub fn line_break(before: char, after: char) -> Break {
-+    if is_inseparable(before, after) {
++    if is_inseparable(before, after) || is_unicode_glue(before, after) {
 +        return Break::Prohibited;
 +    }
 +    if before.is_whitespace() || after.is_whitespace() {
@@ -204,6 +221,24 @@ index 0000000..f2a9ad8
 +        || (matches!(before, '〳' | '〴') && after == '〵')
 +}
 +
++/// The two rules of Unicode line breaking (UAX #14) that [`line_break`] applies in every
++/// script: no break after an ASCII opening bracket (LB14), and none before a no-break space
++/// (LB12a) that doesn't follow a space. A hyphen or another break-after character before it
++/// doesn't lift the rule, as it does in UAX #14: no row should start with the blank.
++fn is_unicode_glue(before: char, after: char) -> bool {
++    is_ascii_opening_bracket(before)
++        || (after == NO_BREAK_SPACE && (!before.is_whitespace() || before == NO_BREAK_SPACE))
++}
++
++/// The ASCII opening brackets `(` `[` `{` (Unicode line breaking class OP), which stay with
++/// what follows them in every script.
++fn is_ascii_opening_bracket(c: char) -> bool {
++    matches!(c, '(' | '[' | '{')
++}
++
++/// Class GL: glues the characters on both sides (which egui doesn't treat as a space).
++const NO_BREAK_SPACE: char = '\u{A0}';
++
 +/// `"` and `'` open and close quotes (Unicode line breaking class QU): next to Chinese or
 +/// Japanese no line breaks on either side of them.
 +fn is_straight_quote(c: char) -> bool {
@@ -240,7 +275,7 @@ index 0000000..f2a9ad8
 +/// selector the base's character (see [`continues`]).
 +#[derive(Clone, Copy, Debug, Default)]
 +pub(crate) struct Scan {
-+    /// In a run of spaces after an opening bracket of Chinese or Japanese text.
++    /// In a run of spaces after an opening bracket of Chinese or Japanese text, or an ASCII one.
 +    after_opener: bool,
 +
 +    /// In (or right before) a run of spaces that a closing mark of Chinese or Japanese text
@@ -270,7 +305,9 @@ index 0000000..f2a9ad8
 +        if !glyph.chr.is_whitespace() {
 +            // Before a run of spaces, look past it once.
 +            let spaces = next.chr.is_whitespace();
-+            self.after_opener = spaces && is_cjk(glyph.chr) && is_line_end_prohibited(glyph.chr);
++            self.after_opener = spaces
++                && (is_ascii_opening_bracket(glyph.chr)
++                    || (is_cjk(glyph.chr) && is_line_end_prohibited(glyph.chr)));
 +            self.before_closer = spaces
 +                && glyphs[1..]
 +                    .iter()
@@ -290,12 +327,16 @@ index 0000000..f2a9ad8
 +
 +/// The ruling on the most common pairs of characters, found quickly (`None` for the others):
 +/// two characters before U+2000 that aren't spaces (Latin, Cyrillic, Greek, Arabic… text; the
-+/// rules have no characters there, so egui decides), and a Han character or kana after one,
-+/// unless it may not start a line or is a combining mark. [`Scan::rules`] rules the same.
++/// rules have no characters there but the ASCII opening brackets, so egui decides), and a Han
++/// character or kana after one, unless it may not start a line or is a combining mark.
++/// [`Scan::rules`] rules the same.
 +fn common_pair(glyph: &Glyph, next: &Glyph) -> Option<Break> {
 +    let (before, after) = (glyph.chr, next.chr);
 +    if (before as u32) < 0x2000 && (after as u32) < 0x2000 {
-+        return (!before.is_whitespace() && !after.is_whitespace()).then_some(Break::Upstream);
++        return (!before.is_whitespace()
++            && !after.is_whitespace()
++            && !is_ascii_opening_bracket(before))
++        .then_some(Break::Upstream);
 +    }
 +    let han = |c| matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}');
 +    let kana = |c| matches!(c, '\u{3040}'..='\u{30FF}');
@@ -697,9 +738,10 @@ index 0000000..f2a9ad8
 +    }
 +
 +    /// No Chinese or Japanese character in the pair: egui's own rules, so text without them
-+    /// lays out exactly as upstream (`RowBreakCandidates` records every other break as egui
-+    /// does). The only exceptions are an ellipsis after a non-space and "——" "……", which
-+    /// Unicode line breaking keeps together in every script.
++    /// lays out as upstream (`RowBreakCandidates` records every other break as egui does). The
++    /// only exceptions are the rules of Unicode line breaking that egui lacks, in every script:
++    /// an ellipsis after a non-space, "——" "……", an ASCII opening bracket before anything, and
++    /// a no-break space after anything but a space.
 +    #[test]
 +    fn text_without_cjk_is_left_to_egui() {
 +        let mut sample: Vec<char> = (' '..='~').collect();
@@ -717,8 +759,12 @@ index 0000000..f2a9ad8
 +            assert!(!is_cjk(a), "{a:?}");
 +            for &b in &sample {
 +                let ellipsis = matches!(b, '…' | '‥' | '⋯');
++                let opening_bracket = matches!(a, '(' | '[' | '{');
++                let before_nbsp = b == '\u{A0}' && !(a.is_whitespace() && a != '\u{A0}');
 +                let expected = if is_inseparable(a, b)
 +                    || (ellipsis && !a.is_whitespace() && !b.is_whitespace())
++                    || opening_bracket
++                    || before_nbsp
 +                {
 +                    Break::Prohibited
 +                } else {
@@ -729,6 +775,332 @@ index 0000000..f2a9ad8
 +            }
 +        }
 +        assert!(checked > 1_000_000, "only {checked} pairs");
++    }
++
++    // ---- Unicode line breaking rules that hold in every script -----------------------------
++
++    /// No break just before a no-break space (UAX #14 class GL): not after a mark, a letter, a
++    /// digit, Chinese or Japanese text or another no-break space; after a space egui breaks as
++    /// always. Only the break before it is ruled on: after it egui decides.
++    #[test]
++    fn no_break_before_a_no_break_space() {
++        expect(
++            Break::Prohibited,
++            &[
++                "]\u{a0}",
++                ")\u{a0}",
++                "a\u{a0}",
++                "5\u{a0}",
++                ".\u{a0}",
++                ",\u{a0}",
++                "-\u{a0}",
++                ":\u{a0}",
++                "!\u{a0}",
++                "…\u{a0}",
++                "П\u{a0}",
++                "한\u{a0}",
++                "”\u{a0}",
++                "\u{a0}\u{a0}",
++                "字\u{a0}",
++                "。\u{a0}",
++                "」\u{a0}",
++                "（\u{a0}",
++            ],
++        );
++        expect(
++            Break::Upstream,
++            &[
++                " \u{a0}",
++                "\t\u{a0}",
++                "\u{2003}\u{a0}",
++                "\u{3000}\u{a0}",
++                "\u{a0} ",
++                "\u{a0}a",
++                "\u{a0}]",
++                "\u{a0}-",
++                "\u{a0}5",
++                "\u{a0}字",
++            ],
++        );
++        // Closing Chinese and Japanese marks stay off the start of a line after it (as before).
++        expect(Break::Prohibited, &["\u{a0}）", "\u{a0}。"]);
++    }
++
++    /// No break after an ASCII opening bracket (UAX #14 class OP), before any character,
++    /// spaces and the other brackets included: upstream broke after it as after any ASCII mark.
++    #[test]
++    fn no_break_after_an_ascii_opening_bracket() {
++        for bracket in "([{".chars() {
++            let pairs: Vec<String> = [
++                "a", "G", "1", ".", "-", "П", "字", " ", "\t", "\u{a0}", "\u{3000}", "(", "[", "{",
++                ")", "“", "…",
++            ]
++            .iter()
++            .map(|after| format!("{bracket}{after}"))
++            .collect();
++            expect(
++                Break::Prohibited,
++                &pairs.iter().map(String::as_str).collect::<Vec<_>>(),
++            );
++        }
++        // Nested and adjacent brackets: only an opening one holds the break back.
++        expect(
++            Break::Prohibited,
++            &["([", "[(", "{[", "((", "[[", "{{", "[{"],
++        );
++        expect(
++            Break::Upstream,
++            &[
++                ")(", "](", "][", "}{", ")[", "))", "]]", "}}", "])", "a(", "a[", "a{", "5(", "-(",
++            ],
++        );
++        // Not class OP: closing brackets, and before an opening one after a space.
++        expect(
++            Break::Upstream,
++            &[")a", "]G", "}1", " (", " [", " {", "\u{a0}(", "\u{a0}["],
++        );
++    }
++
++    /// German quotes and the other typographic quotes are not touched: „Tor“, ‚Mehr‘, »Flotte«
++    /// (“ ‘ « only count as opening brackets next to Chinese or Japanese characters).
++    #[test]
++    fn typographic_quotes_are_left_to_egui() {
++        expect(
++            Break::Upstream,
++            &[
++                "„T", "‚M", "»F", "“ ", "‘ ", "« ", "r“", "e‘", "e«", "“T", "‘M", "«F", "“(",
++            ],
++        );
++        // Except that "(" holds back the break after it as any opening bracket does.
++        expect(Break::Prohibited, &["(“", "(„", "(»"]);
++    }
++
++    /// Every position of a paragraph (after each of its characters but the last) that its
++    /// [`Scan`] prohibits a break at, as character indices.
++    fn prohibited_positions(fonts: &mut FontsImpl, text: &str) -> Vec<usize> {
++        let glyphs = glyphs(fonts, text);
++        assert_eq!(glyphs.len(), text.chars().count(), "{text:?}");
++        let mut scan = Scan::default();
++        (0..glyphs.len())
++            .filter(|&i| scan.next(&glyphs[i..]) == Break::Prohibited)
++            .collect()
++    }
++
++    /// Spaces between an ASCII opening bracket and its text don't let a break in either: as
++    /// with Unicode's OP SP* × (LB14), as with the brackets of Chinese and Japanese text.
++    #[test]
++    fn spaces_after_an_ascii_opening_bracket_keep_the_text_with_it() {
++        let mut fonts = fonts();
++        // Positions: a0 ␣1 (2 ␣3 b4 ␣5 )6 ␣7 c8
++        assert_eq!(prohibited_positions(&mut fonts, "a ( b ) c"), [2, 3]);
++        // Any number of spaces, of any kind, and no-break spaces.
++        assert_eq!(
++            prohibited_positions(&mut fonts, "x [  \u{a0} y"),
++            [2, 3, 4, 5, 6]
++        );
++        // Brackets after brackets, the bracket alone, and none at the end (nothing to keep).
++        assert_eq!(prohibited_positions(&mut fonts, "([ { x"), [0, 1, 2, 3, 4]);
++        assert_eq!(prohibited_positions(&mut fonts, "b ( "), [2]);
++        assert_eq!(prohibited_positions(&mut fonts, "b ("), Vec::<usize>::new());
++        // Closing brackets and spaces elsewhere: no change.
++        assert_eq!(
++            prohibited_positions(&mut fonts, "a ) b ] c"),
++            Vec::<usize>::new()
++        );
++        // The state doesn't leak past the text after the spaces.
++        assert_eq!(prohibited_positions(&mut fonts, "( a b"), [0, 1]);
++    }
++
++    /// Rows of `text` at every whole width from the widest run the rules keep together
++    /// (`min_width`, plus a point) to `max_width`.
++    fn rows_at_every_width(
++        fonts: &mut FontsImpl,
++        text: &str,
++        max_width: usize,
++    ) -> Vec<(usize, Vec<String>)> {
++        let min_width = widest_scanned_unit(fonts, text).ceil() as usize + 1;
++        assert!(min_width < 120, "{min_width}: {text}");
++        (min_width..=max_width)
++            .map(|width| (width, rows(fonts, text, width as f32)))
++            .collect()
++    }
++
++    /// Text with brackets of every kind, nested, adjacent, with and without spaces, and inside
++    /// tokens without spaces (a URL, a formula), the way chat lines and help texts have them.
++    const BRACKETED: &[&str] = &[
++        "Open the hatch (deck 4, port side) and check [the seal] before {launch}: nothing else (really) matters.",
++        "Nested (calls [with {braces}] inside (parentheses)) and [[double]] ((pairs)) {{x}} ([{mixed}]) end",
++        "Adjacent: a(b)c[d]e{f}g (a)(b)[c][d]{e}{f} )( ][ }{ done (a)[b]{c}",
++        "Spaces after them: ( inside ) [ inside ] { inside } and ( ( x ) ) [ [ y ] ] more (  wide  ) text",
++        "No spaces at all: f(x)+g[y]*h{z}=k(l(m[n{o}]))-p(q) https://example.com/a(b)/c[d]?e={f}",
++        "Long_token(with_brackets)[and_more]{and_even_more}(((deep(nesting(here))))) done",
++        "(start of the text and the end of it)[",
++    ];
++
++    /// No row ends with an ASCII opening bracket (and its spaces) at any width that holds the
++    /// widest run kept together: there is always a break before it instead. Upstream broke
++    /// after it at most widths: "[" | "G] …".
++    #[test]
++    fn no_row_ends_with_an_ascii_opening_bracket() {
++        let mut fonts = fonts();
++        let mut layouts = 0;
++        for text in BRACKETED {
++            for (width, rows) in rows_at_every_width(&mut fonts, text, 300) {
++                layouts += 1;
++                for row in &rows[..rows.len() - 1] {
++                    let last = row.trim_end_matches(char::is_whitespace).chars().last();
++                    assert!(
++                        !last.is_some_and(|c| matches!(c, '(' | '[' | '{')),
++                        "{width}: {rows:?}"
++                    );
++                }
++            }
++        }
++        assert!(layouts > 1000, "{layouts}");
++    }
++
++    /// The same at widths narrower than the widest run kept together, down to a single
++    /// character, where a break inside the run can't be avoided: nothing is lost (`rows` checks
++    /// that), and no row overflows by a whole glyph or more (as upstream, a row can overflow by
++    /// less than a glyph in columns a few characters wide), also for a run of brackets wider
++    /// than the row: no break is allowed in it, yet it wraps at the row's width.
++    #[test]
++    fn brackets_wrap_at_any_width() {
++        let mut fonts = fonts();
++        for text in BRACKETED.iter().copied().chain([
++            "((((((((((((((((((((((((((((((((((((((((((((((((((((",
++            "[ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ [ x",
++            "([{([{([{([{([{([{([{([{([{([{([{([{([{([{([{([{x",
++        ]) {
++            for width in 1..=200 {
++                let width = width as f32;
++                let rows = row_widths(&mut fonts, text, width, 0.0);
++                for (i, (row, row_width, _)) in rows.iter().enumerate() {
++                    if *row_width <= width + 0.5 + 1e-3 {
++                        continue;
++                    }
++                    // Wider than the row: the row without its last glyph fits.
++                    let last = row.chars().last().expect("a row that overflows has glyphs");
++                    let last_width = self::width(&mut fonts, &last.to_string());
++                    assert!(
++                        *row_width - last_width <= width + 0.5 + 1e-3,
++                        "{width}: row {i} {row:?} overflows by a glyph or more: {rows:?}"
++                    );
++                }
++                let text_again: String = rows.iter().map(|(row, ..)| row.as_str()).collect();
++                assert_eq!(text_again, text, "characters lost at {width}");
++            }
++        }
++    }
++
++    /// A company tag joined to the name with a no-break space ("[T]\u{a0}nova:") stays with it:
++    /// at every width that holds "[T]\u{a0}nova:" the row with the tag has the whole name, and
++    /// whatever the width, no row starts with the no-break space and the row with the tag holds
++    /// the start of the name (also for a name wider than the row). Upstream left "[T]" alone
++    /// ("[T]" | " nova:") or split the tag ("[" | "T] nova:").
++    #[test]
++    fn a_tag_stays_with_its_name() {
++        let mut fonts = fonts();
++        let names = ["nova", "Commander_Starfighter_Alpha27", &"W".repeat(32)];
++        for tag in ["[T]", "[G]", "(M)", "{X}"] {
++            // Narrower than the tag and one letter, they can't share a row.
++            let both = width(&mut fonts, &format!("{tag}\u{a0}W")).ceil() as usize + 1;
++            for name in names {
++                let text = format!("19:42  {tag}\u{a0}{name}: anyone for the gate run?");
++                let whole = format!("{tag}\u{a0}{name}:");
++                let whole_width = width(&mut fonts, &whole).ceil() as usize + 1;
++                for max_width in both..=600 {
++                    let rows = rows(&mut fonts, &text, max_width as f32);
++                    assert!(
++                        rows.iter().all(|r| !r.starts_with('\u{a0}')),
++                        "{max_width}: starts with the gap: {rows:?}"
++                    );
++                    let with_name = rows
++                        .iter()
++                        .find_map(|r| r.split_once(tag))
++                        .is_some_and(|(_, rest)| !rest.trim().is_empty());
++                    assert!(with_name, "{max_width}: the tag is alone: {rows:?}");
++                    if max_width >= whole_width {
++                        assert!(
++                            rows.iter().any(|r| r.contains(&whole)),
++                            "{max_width}: {whole:?} was split: {rows:?}"
++                        );
++                    }
++                }
++            }
++        }
++    }
++
++    /// A plain space between tag and name may still break (a space is egui's): the tag's own
++    /// bracket doesn't, and the closing one never starts a row here.
++    #[test]
++    fn a_tag_with_a_plain_space_may_leave_its_name_but_never_splits() {
++        let mut fonts = fonts();
++        let text = "19:42  [T] Commander_Starfighter_Alpha27: anyone for the gate run?";
++        let mut alone = 0;
++        for width in 60..=600 {
++            let rows = rows(&mut fonts, text, width as f32);
++            assert!(
++                rows.iter().all(|r| !r.trim_end().ends_with('[')),
++                "{width}: {rows:?}"
++            );
++            alone += rows.iter().any(|r| r.trim_end().ends_with("[T]")) as usize;
++        }
++        assert!(alone > 0, "a plain space never let the tag end a row");
++    }
++
++    /// Text without brackets, no-break spaces, ellipses or doubled dashes wraps as upstream:
++    /// egui's rules prefer a space, then a dash, then a mark, then any character. The rows are
++    /// those upstream epaint 0.36.2 gives (recorded from it).
++    #[test]
++    fn text_without_the_rules_characters_keeps_its_rows() {
++        let mut fonts = fonts();
++        let text = "Plain words, dash-separated-words, a URL www.example.com/a/b_c and some_snake_case \
++                    names: 12,345.67 and “quoted” or „German“ text; the end.";
++        assert_eq!(
++            rows(&mut fonts, text, 60.0),
++            [
++                "Plain ",
++                "words, ",
++                "dash-",
++                "separate",
++                "d-words, ",
++                "a URL ",
++                "www.",
++                "example.",
++                "com/a/b_",
++                "c and ",
++                "some_",
++                "snake_",
++                "case ",
++                "names: ",
++                "12,345.",
++                "67 and ",
++                "“quoted” ",
++                "or ",
++                "„German“",
++                " text; the ",
++                "end.",
++            ],
++            "60 pt"
++        );
++        assert_eq!(
++            rows(&mut fonts, text, 100.0),
++            [
++                "Plain words, ",
++                "dash-separated-",
++                "words, a URL ",
++                "www.example.",
++                "com/a/b_c and ",
++                "some_snake_",
++                "case names: ",
++                "12,345.67 and ",
++                "“quoted” or ",
++                "„German“ text; ",
++                "the end.",
++            ],
++            "100 pt"
++        );
 +    }
 +
 +    // ---- Layout ----------------------------------------------------------------------------

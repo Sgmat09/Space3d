@@ -2,10 +2,11 @@
 """Maintain Space3d's patched copy of epaint (egui's text layout) in third_party/epaint.
 
 third_party/epaint is the crates.io epaint crate plus the kinsoku patch in
-third_party/epaint.kinsoku.patch (Chinese and Japanese line breaking, see
-third_party/README.md). The root Cargo.toml applies it with `[patch.crates-io]`, which only
-takes effect while the copy has the version egui asks for: after an egui bump, cargo warns
-"patch `epaint` was not used" and silently builds crates.io's epaint, without kinsoku.
+third_party/epaint.kinsoku.patch (Chinese and Japanese line breaking and two rules of Unicode
+line breaking for every script, see third_party/README.md). The root Cargo.toml applies it with
+`[patch.crates-io]`, which only takes effect while the copy has the version egui asks for: after
+an egui bump, cargo warns "patch `epaint` was not used" and silently builds crates.io's epaint,
+without kinsoku.
 
     scripts/update-epaint.py              # re-vendor epaint at the egui version of Cargo.toml
     scripts/update-epaint.py 0.37.0       # ... at this version
@@ -44,9 +45,11 @@ README = ROOT / "third_party" / "README.md"
 OWN_FILES = {"LICENSE-MIT", "LICENSE-APACHE"}
 IGNORED = {"target", ".cargo-ok"}
 PATCH_HEADER = """\
-Space3d patch to epaint {version}: kinsoku (禁則処理) line breaking for Chinese and Japanese.
-See third_party/README.md. Applied to the published crate with `git apply -p1` from its root
-(scripts/update-epaint.py does it); regenerate with `scripts/update-epaint.py --refresh`.
+Space3d patch to epaint {version}: kinsoku (禁則処理) line breaking for Chinese and Japanese,
+and two rules of Unicode line breaking (UAX #14) for every script: no break before a no-break
+space, none after an ASCII opening bracket. See third_party/README.md. Applied to the published
+crate with `git apply -p1` from its root (scripts/update-epaint.py does it); regenerate with
+`scripts/update-epaint.py --refresh`.
 
 """
 
@@ -245,7 +248,7 @@ def run_tests():
     )
     if result.returncode != 0:
         fail("the vendored epaint's tests failed or it has warnings (third_party/README.md)")
-    run(["cargo", "test", "-p", "space3d-ui", "--test", "kinsoku"])
+    run(["cargo", "test", "-p", "space3d-ui", "--test", "kinsoku", "--test", "line_breaks"])
 
 
 def update(version, test):
