@@ -448,6 +448,8 @@ pub struct Input {
     logical_keys: HashMap<KeyCode, LogicalKey>,
     layout: KeyboardLayout,
     mouse_button_events: Vec<MouseButtonEvent>,
+    /// Buttons whose current press the window runner delivered from the OS (not injected).
+    os_pressed: HashSet<MouseButton>,
 }
 
 impl Input {
@@ -484,6 +486,13 @@ impl Input {
     /// Mouse button went up this frame.
     pub fn mouse_just_released(&self, b: MouseButton) -> bool {
         self.mouse.just_released(b)
+    }
+    /// The held button `b` went down through an event of the OS window (the window runner),
+    /// not through an injection ([`Self::inject_mouse_button_down`]: tests, replays, scripted
+    /// input). Only such a press can be checked against the OS's button state (see
+    /// [`MouseButtonCause::OsReconciled`]): the OS never held an injected one.
+    pub(crate) fn mouse_press_from_os(&self, b: MouseButton) -> bool {
+        self.mouse.pressed(b) && self.os_pressed.contains(&b)
     }
     /// This frame's mouse button presses and releases in order, each with the cursor position
     /// at the time and its cause (a release the focus loss or the OS state caused is a cancel:
@@ -685,10 +694,23 @@ impl Input {
             .learn(event.physical, unshifted.as_deref(), shifted.as_deref());
     }
     /// Mouse button down (recorded in [`Self::mouse_button_events`] at the cursor position).
+    /// An injected press: the window runner's OS button check never releases it (the OS does
+    /// not hold it; see [`MouseButtonCause::OsReconciled`]).
     pub fn inject_mouse_button_down(&mut self, b: MouseButton) {
         if !self.mouse.pressed(b) {
             self.mouse.press(b);
             self.record_mouse_button(b, true, MouseButtonCause::Device);
+        }
+    }
+    /// A mouse button event of the OS window, as the window runner feeds it: like
+    /// [`Self::inject_mouse_button_down`] / [`Self::inject_mouse_button_up`], and a press is
+    /// remembered as the OS's ([`Self::mouse_press_from_os`]).
+    pub(crate) fn os_mouse_button(&mut self, b: MouseButton, pressed: bool) {
+        if !pressed {
+            self.release_mouse_button(b, MouseButtonCause::Device);
+        } else if !self.mouse.pressed(b) {
+            self.inject_mouse_button_down(b);
+            self.os_pressed.insert(b);
         }
     }
     /// Mouse button up (recorded in [`Self::mouse_button_events`] at the cursor position).
@@ -703,6 +725,7 @@ impl Input {
     pub fn release_mouse_button(&mut self, b: MouseButton, cause: MouseButtonCause) {
         if self.mouse.pressed(b) {
             self.mouse.release(b);
+            self.os_pressed.remove(&b);
             self.record_mouse_button(b, false, cause);
         }
     }
@@ -1271,6 +1294,35 @@ mod tests {
             i.inject_mouse_button_up(MouseButton::Left);
         }
         assert_eq!(i.mouse_button_events().len(), MAX_MOUSE_BUTTON_EVENTS);
+    }
+
+    #[test]
+    fn only_presses_of_the_os_window_are_the_os_s() {
+        let mut i = Input::default();
+        i.inject_mouse_button_down(MouseButton::Left);
+        i.os_mouse_button(MouseButton::Right, true);
+        assert!(i.mouse_pressed(MouseButton::Left) && i.mouse_pressed(MouseButton::Right));
+        assert!(!i.mouse_press_from_os(MouseButton::Left), "injected");
+        assert!(i.mouse_press_from_os(MouseButton::Right), "the window's");
+        // The same events either way.
+        assert_eq!(i.mouse_button_events().len(), 2);
+        assert!(i.mouse_button_events().iter().all(|e| e.pressed && !e.cancelled()));
+        // A held button stays what its press was, whoever repeats the press.
+        i.os_mouse_button(MouseButton::Left, true);
+        i.inject_mouse_button_down(MouseButton::Right);
+        assert!(!i.mouse_press_from_os(MouseButton::Left) && i.mouse_press_from_os(MouseButton::Right));
+        // Any release ends it: the next press is judged on its own.
+        i.inject_mouse_button_up(MouseButton::Right);
+        assert!(!i.mouse_press_from_os(MouseButton::Right));
+        i.inject_mouse_button_down(MouseButton::Right);
+        assert!(!i.mouse_press_from_os(MouseButton::Right), "injected now");
+        i.os_mouse_button(MouseButton::Left, false);
+        i.os_mouse_button(MouseButton::Left, true);
+        assert!(i.mouse_press_from_os(MouseButton::Left));
+        i.release_all();
+        assert!(!i.mouse_press_from_os(MouseButton::Left), "released by a cancel");
+        i.os_mouse_button(MouseButton::Left, true);
+        assert!(i.mouse_press_from_os(MouseButton::Left));
     }
 
     #[test]
