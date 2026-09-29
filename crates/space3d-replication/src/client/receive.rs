@@ -6,9 +6,12 @@
 //!   `RemoteDespawned` then despawn. `FULL_RESET` → despawn every mapped entity not listed.
 //! * Per-entity `last_applied_tick`: a record older than or equal to it is skipped (safe under
 //!   reordering thanks to the snapshot invariant).
-//! * Component values with unresolved entity references are parked in [`PendingRefs`] and
-//!   retried after each snapshot (dropped after 1 s, when the holder despawns, or when a newer
-//!   value or a removal of the same component arrives).
+//! * Component values that hold entity references are kept in [`PendingRefs`]: a value whose
+//!   target is not known yet is *parked*, an applied one is *bound* to the `NetId`s it
+//!   resolved. Both are decoded again whenever one of those entities is spawned, so a target
+//!   that arrives late, or that left the client's scope and came back as a new local entity,
+//!   is picked up without the server resending anything (design doc §8.2). A newer
+//!   value, a removal of the component or the despawn of the holder drops the kept value.
 
 use super::connection::{Connection, lost};
 use super::{ConnectionEvent, ConnectionState, FailReason, Mispredicted, NetClient, RemoteDespawned};
@@ -19,24 +22,171 @@ use crate::protocol::snapshot::{SnapshotView, flags as sflags, op};
 use crate::protocol::{AckField, ChannelId, DataPacket, Packet, WireLimits, decode_packet};
 use crate::registry::{ClientMode, ReplicationRegistry};
 use crate::wire::{DecodeError, Reader};
-use crate::{Controlled, Interpolated, NetEntity, NetId, Predicted, Remote, Simulated, Tick};
+use crate::{Controlled, FastMap, Interpolated, NetEntity, NetId, Predicted, Remote, Simulated, Tick};
+use smallvec::SmallVec;
 use space3d_core::{Entity, Events, Resources, SystemCtx, TickRate, World};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-/// Parked component values waiting for referenced entities. At most one value per
-/// `(holder, kind)`: a newer value (applied, parked or removed) replaces it, so a parked value
-/// is always the newest the server sent for that component.
+/// An applied component value that holds entity references (see [`PendingRefs`]).
+#[derive(Clone, Debug)]
+struct BoundRef {
+    kind: u16,
+    /// The value as the server sent it.
+    bytes: SmallVec<[u8; 16]>,
+    /// The `NetId`s decoding asked for.
+    targets: SmallVec<[NetId; 2]>,
+}
+
+/// What the client keeps of component values that hold entity references, at most one value
+/// per `(holder, kind)`: the newest the server sent, so a kept value is never older than what
+/// the world shows (a newer value applied, parked or removed replaces it).
+///
+/// * **Parked** (`entries`): a target is not known yet; retried whenever a snapshot spawns
+///   an entity, however long that takes (an entity that is out of the client's scope is
+///   simply not there yet). A value that asked for no entity at all (its wire form holds no
+///   reference the client could ever resolve) is dropped with a warning.
+/// * **Bound**: applied; remembers which `NetId`s it resolved. When one of them is spawned
+///   again (its entity left the client's scope and returned as a new local entity, so the
+///   component still points at the old, despawned one) the value is decoded again and
+///   rewritten.
+///
+/// Memory is bounded by the number of holders times reference components; nothing outlives
+/// its holder.
 #[derive(Default)]
 pub struct PendingRefs {
-    /// `(holder, kind, bytes, first seen)`.
+    /// Parked values: `(holder, kind, bytes, tick first seen)`.
     pub entries: Vec<(NetId, u16, Vec<u8>, Tick)>,
+    /// Applied values that hold references, per holder.
+    bound: FastMap<NetId, SmallVec<[BoundRef; 1]>>,
+    /// `(target, holder, kind)` of every bound value: which values to decode again when
+    /// `target` is spawned.
+    watchers: BTreeSet<(NetId, NetId, u16)>,
+}
+
+/// Counts of the reference values a client keeps ([`NetClient::reference_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReferenceStats {
+    /// Values waiting for an entity the client does not have.
+    pub parked: usize,
+    /// Applied values that hold references (decoded again when a target is spawned).
+    pub bound: usize,
 }
 
 impl PendingRefs {
-    /// Drop the parked value of `(holder, kind)`, if any.
+    /// Drop the parked or bound value of `(holder, kind)`, if any.
     pub fn forget(&mut self, holder: NetId, kind: u16) {
         if !self.entries.is_empty() {
             self.entries.retain(|(h, k, _, _)| !(*h == holder && *k == kind));
+        }
+        self.unbind(holder, kind);
+    }
+
+    /// Drop everything kept for `holder` (it despawned).
+    pub(crate) fn forget_holder(&mut self, holder: NetId) {
+        if !self.entries.is_empty() {
+            self.entries.retain(|(h, _, _, _)| *h != holder);
+        }
+        if let Some(values) = self.bound.remove(&holder) {
+            for v in values {
+                self.unwatch(holder, &v);
+            }
+        }
+    }
+
+    /// Drop the values of `holder` whose kind is not in `present` (a spawn record lists the
+    /// components the entity has now).
+    pub(crate) fn retain_present(&mut self, holder: NetId, present: u64) {
+        self.entries
+            .retain(|(h, k, _, _)| *h != holder || present & (1u64 << *k) != 0);
+        if let Some(values) = self.bound.get(&holder) {
+            let gone: SmallVec<[u16; 4]> = values
+                .iter()
+                .map(|v| v.kind)
+                .filter(|k| present & (1u64 << *k) == 0)
+                .collect();
+            for kind in gone {
+                self.unbind(holder, kind);
+            }
+        }
+    }
+
+    /// Park a value (replacing whatever was kept for `(holder, kind)`).
+    pub(crate) fn park(&mut self, holder: NetId, kind: u16, bytes: Vec<u8>, first: Tick) {
+        self.forget(holder, kind);
+        self.entries.push((holder, kind, bytes, first));
+    }
+
+    /// Remember an applied value and the entities it resolved (replacing what was kept).
+    pub(crate) fn bind(&mut self, holder: NetId, kind: u16, bytes: &[u8], targets: &[NetId]) {
+        self.forget(holder, kind);
+        self.bind_new(holder, kind, bytes, targets);
+    }
+
+    /// [`Self::bind`] for a `(holder, kind)` that has no parked value (skips the scan).
+    fn bind_new(&mut self, holder: NetId, kind: u16, bytes: &[u8], targets: &[NetId]) {
+        self.unbind(holder, kind);
+        if targets.is_empty() {
+            return;
+        }
+        for t in targets {
+            self.watchers.insert((*t, holder, kind));
+        }
+        self.bound.entry(holder).or_default().push(BoundRef {
+            kind,
+            bytes: SmallVec::from_slice(bytes),
+            targets: SmallVec::from_slice(targets),
+        });
+    }
+
+    fn unbind(&mut self, holder: NetId, kind: u16) {
+        let Some(values) = self.bound.get_mut(&holder) else {
+            return;
+        };
+        let Some(i) = values.iter().position(|v| v.kind == kind) else {
+            return;
+        };
+        let v = values.swap_remove(i);
+        if values.is_empty() {
+            self.bound.remove(&holder);
+        }
+        self.unwatch(holder, &v);
+    }
+
+    fn unwatch(&mut self, holder: NetId, v: &BoundRef) {
+        for t in &v.targets {
+            self.watchers.remove(&(*t, holder, v.kind));
+        }
+    }
+
+    /// The bound values that resolved `target`: `(holder, kind)`.
+    fn watching(&self, target: NetId) -> SmallVec<[(NetId, u16); 4]> {
+        self.watchers
+            .range((target, NetId(0), 0)..=(target, NetId(u32::MAX), u16::MAX))
+            .map(|(_, h, k)| (*h, *k))
+            .collect()
+    }
+
+    fn bound_bytes(&self, holder: NetId, kind: u16) -> Option<SmallVec<[u8; 16]>> {
+        self.bound
+            .get(&holder)?
+            .iter()
+            .find(|v| v.kind == kind)
+            .map(|v| v.bytes.clone())
+    }
+
+    /// Forget everything (session reset).
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.bound.clear();
+        self.watchers.clear();
+    }
+
+    /// Counts.
+    pub fn stats(&self) -> ReferenceStats {
+        ReferenceStats {
+            parked: self.entries.len(),
+            bound: self.bound.values().map(SmallVec::len).sum(),
         }
     }
 }
@@ -412,6 +562,9 @@ fn apply_snapshot(
         std::cmp::Ordering::Equal => net.prev_snapshot_tick,
         std::cmp::Ordering::Less => Tick::ZERO,
     };
+    // Entities this snapshot mapped anew: the values that hold references to them are decoded
+    // again after it.
+    let mut spawned: SmallVec<[NetId; 8]> = SmallVec::new();
     for rec in &view.entities {
         let existing = net.map.entity(rec.net_id);
         let entity = match existing {
@@ -432,6 +585,7 @@ fn apply_snapshot(
                 let e = world.spawn((NetEntity(rec.net_id), Remote));
                 net.map.insert(rec.net_id, e);
                 net.metas.insert(rec.net_id, EntityMeta::default());
+                spawned.push(rec.net_id);
                 e
             }
         };
@@ -447,11 +601,8 @@ fn apply_snapshot(
                     entry.ops.remove(world, entity);
                 }
             }
-            // Parked values of components this full state does not list are gone too.
-            let present = rec.present;
-            net.pending_refs
-                .entries
-                .retain(|(h, k, _, _)| *h != rec.net_id || present & (1u64 << *k) != 0);
+            // Kept reference values of components this full state does not list are gone too.
+            net.pending_refs.retain_present(rec.net_id, rec.present);
         }
         let mut removed = rec.removed;
         while removed != 0 {
@@ -461,7 +612,7 @@ fn apply_snapshot(
                 entry.ops.remove(world, entity);
             }
             net.prediction.forget_kind(rec.net_id, kind);
-            // A parked (older) value must not re-insert a removed component.
+            // A kept (older) value must not re-insert a removed component.
             net.pending_refs.forget(rec.net_id, kind);
         }
         // Markers.
@@ -491,7 +642,10 @@ fn apply_snapshot(
                 tracing::warn!(kind, "unknown component kind from server");
                 continue;
             };
-            let mut ctx = DecodeCtx::new(&net.map);
+            let mut ctx = DecodeCtx::tracking(&net.map);
+            // Whether the value was written to the world (a predicted component's confirmed
+            // value is only compared with the prediction).
+            let mut written = true;
             let result = if predicted && entry.mode.is_predicted() {
                 net.prediction.confirm(rec.net_id, tick, *kind, bytes);
                 let has = entry.ops.contains(world, entity);
@@ -503,8 +657,10 @@ fn apply_snapshot(
                     r
                 } else if !net.prediction.compares(tick) {
                     // History before a snap is stale; the confirmed value is stored above.
+                    written = false;
                     entry.ops.check(bytes, &mut ctx)
                 } else {
+                    written = false;
                     // Compare with what we predicted for that tick.
                     let differs = match super::prediction::history_bytes(world, entity, tick, *kind) {
                         Some(h) => entry.ops.differs(&h, bytes, &mut DecodeCtx::new(&net.map)),
@@ -532,12 +688,10 @@ fn apply_snapshot(
                 }
             };
             match result {
-                // A newer value supersedes any parked one (it must never be re-applied later).
+                // A newer value supersedes any kept one (it must never be re-applied later).
+                Ok(()) if written => net.pending_refs.bind(rec.net_id, *kind, bytes, ctx.requested()),
                 Ok(()) => net.pending_refs.forget(rec.net_id, *kind),
-                Err(DecodeError::Unresolved) => {
-                    net.pending_refs.forget(rec.net_id, *kind);
-                    net.pending_refs.entries.push((rec.net_id, *kind, bytes.to_vec(), tick));
-                }
+                Err(DecodeError::Unresolved) => park(&mut net.pending_refs, rec.net_id, *kind, bytes, tick, &ctx),
                 Err(e) => tracing::warn!(%e, component = entry.name, "bad component from server"),
             }
         }
@@ -579,7 +733,7 @@ fn apply_snapshot(
             net.events.push(ConnectionEvent::Synced);
         }
     }
-    retry_pending(net, registry, world, tick);
+    resolve_refs(net, registry, world, tick, &spawned);
 }
 
 /// How long a despawned `NetId` is remembered (reordered / duplicated spawn records older than
@@ -591,7 +745,7 @@ fn despawn_remote(net: &mut NetClient, id: NetId, e: Entity, out_of_scope: bool,
     net.map.remove(id);
     net.metas.remove(&id);
     net.prediction.forget(id);
-    net.pending_refs.entries.retain(|(h, _, _, _)| *h != id);
+    net.pending_refs.forget_holder(id);
     net.despawn_queue.push(e);
     net.pending_despawn_events.push(RemoteDespawned {
         net_id: id,
@@ -600,26 +754,81 @@ fn despawn_remote(net: &mut NetClient, id: NetId, e: Entity, out_of_scope: bool,
     });
 }
 
-fn retry_pending(net: &mut NetClient, registry: &ReplicationRegistry, world: &mut World, tick: Tick) {
-    if net.pending_refs.entries.is_empty() {
+/// Park a value that could not be decoded for an unresolved reference, or drop it (with a
+/// warning) when its decoder asked for no entity at all: nothing that is spawned later can
+/// resolve it, only a newer value.
+fn park(refs: &mut PendingRefs, holder: NetId, kind: u16, bytes: &[u8], tick: Tick, ctx: &DecodeCtx<'_>) {
+    if ctx.requested().is_empty() {
+        refs.forget(holder, kind);
+        warn_unresolvable(holder, kind);
+    } else {
+        refs.park(holder, kind, bytes.to_vec(), tick);
+    }
+}
+
+fn warn_unresolvable(holder: NetId, kind: u16) {
+    tracing::warn!(
+        ?holder,
+        kind,
+        "dropping value with an unresolved entity reference (it names no entity the server replicates)"
+    );
+}
+
+/// After a snapshot: decode again the values that hold references to entities it spawned. A
+/// parked value waits for any spawn; a bound one, whose component still points at the local
+/// entity the target had before it left the client's scope, is rewritten with the new one.
+fn resolve_refs(net: &mut NetClient, registry: &ReplicationRegistry, world: &mut World, tick: Tick, spawned: &[NetId]) {
+    if spawned.is_empty() {
         return;
     }
-    let hz = net.prediction.nominal_hz.max(1.0) as u32;
-    let entries = std::mem::take(&mut net.pending_refs.entries);
-    for (holder, kind, bytes, first) in entries {
-        let Some(e) = net.map.entity(holder) else { continue };
-        if tick.0.saturating_sub(first.0) > hz {
-            tracing::warn!(?holder, kind, "dropping value with an unresolved entity reference");
-            continue;
+    if !net.pending_refs.entries.is_empty() {
+        let parked = std::mem::take(&mut net.pending_refs.entries);
+        let mut still_parked = Vec::new();
+        for (holder, kind, bytes, first) in parked {
+            // Not mapped any more (its holder despawned): gone.
+            let Some(e) = net.map.entity(holder) else { continue };
+            let Some(entry) = registry.component(kind) else {
+                continue;
+            };
+            let mut ctx = DecodeCtx::tracking(&net.map);
+            match entry.ops.apply(world, e, &bytes, &mut ctx) {
+                Ok(()) => net.pending_refs.bind_new(holder, kind, &bytes, ctx.requested()),
+                Err(DecodeError::Unresolved) if !ctx.requested().is_empty() => {
+                    still_parked.push((holder, kind, bytes, first));
+                }
+                Err(DecodeError::Unresolved) => warn_unresolvable(holder, kind),
+                Err(err) => tracing::warn!(%err, component = entry.name, "bad pending component"),
+            }
         }
-        let Some(entry) = registry.component(kind) else {
-            continue;
-        };
-        let mut ctx = DecodeCtx::new(&net.map);
-        match entry.ops.apply(world, e, &bytes, &mut ctx) {
-            Err(DecodeError::Unresolved) => net.pending_refs.entries.push((holder, kind, bytes, first)),
-            Err(err) => tracing::warn!(%err, "bad pending component"),
-            Ok(()) => {}
+        net.pending_refs.entries = still_parked;
+    }
+    for &target in spawned {
+        for (holder, kind) in net.pending_refs.watching(target) {
+            let Some(bytes) = net.pending_refs.bound_bytes(holder, kind) else {
+                continue;
+            };
+            let Some(e) = net.map.entity(holder) else { continue };
+            let Some(entry) = registry.component(kind) else {
+                continue;
+            };
+            // The server confirms a controlled entity's predicted components every snapshot.
+            if entry.mode.is_predicted() && world.satisfies::<&Predicted>(e) {
+                continue;
+            }
+            if entry.mode.is_interpolated() || entry.mode == ClientMode::Delayed {
+                // Buffered samples hold the stale entity; the value is written directly.
+                entry.ops.clear_buffers(world, e);
+            }
+            let mut ctx = DecodeCtx::tracking(&net.map);
+            match entry.ops.apply(world, e, &bytes, &mut ctx) {
+                Ok(()) => net.pending_refs.bind(holder, kind, &bytes, ctx.requested()),
+                // Another target of the value is missing now: wait for it like a new value.
+                Err(DecodeError::Unresolved) => park(&mut net.pending_refs, holder, kind, &bytes, tick, &ctx),
+                Err(err) => {
+                    net.pending_refs.forget(holder, kind);
+                    tracing::warn!(%err, component = entry.name, "bad bound component");
+                }
+            }
         }
     }
 }
@@ -740,6 +949,47 @@ mod tests {
                 net.state
             );
         }
+    }
+
+    #[test]
+    fn kept_references_are_indexed_by_target_and_forgotten_with_their_holder() {
+        let (h1, h2) = (NetId(1), NetId(2));
+        let (t1, t2) = (NetId(10), NetId(11));
+        let mut refs = PendingRefs::default();
+        refs.bind(h1, 3, &[1, 2], &[t1]);
+        refs.bind(h1, 4, &[9], &[t1, t2]);
+        refs.bind(h2, 3, &[7], &[t2]);
+        refs.park(h2, 5, vec![8], Tick(4));
+        assert_eq!(refs.stats(), ReferenceStats { parked: 1, bound: 3 });
+        assert_eq!(refs.watching(t1).as_slice(), &[(h1, 3), (h1, 4)]);
+        assert_eq!(refs.watching(t2).as_slice(), &[(h1, 4), (h2, 3)]);
+        assert_eq!(refs.bound_bytes(h1, 4).unwrap().as_slice(), &[9]);
+        // A newer value replaces the kept one, including which targets it watches.
+        refs.bind(h1, 4, &[6], &[t2]);
+        assert_eq!(refs.watching(t1).as_slice(), &[(h1, 3)]);
+        assert_eq!(refs.watching(t2).as_slice(), &[(h1, 4), (h2, 3)]);
+        // A value that names no entity is not kept, and drops what was kept.
+        refs.bind(h1, 3, &[5], &[]);
+        assert!(refs.watching(t1).is_empty() && refs.bound_bytes(h1, 3).is_none());
+        // A parked value is replaced by an applied one, and the other way round.
+        refs.bind(h2, 5, &[8], &[t1]);
+        assert_eq!(refs.stats(), ReferenceStats { parked: 0, bound: 3 });
+        refs.park(h2, 5, vec![8], Tick(9));
+        assert_eq!(refs.stats(), ReferenceStats { parked: 1, bound: 2 });
+        assert!(refs.watching(t1).is_empty());
+        // A spawn record lists the components the entity has now.
+        refs.bind(h2, 6, &[1], &[t1]);
+        refs.retain_present(h2, 1 << 3);
+        assert_eq!(refs.stats(), ReferenceStats { parked: 0, bound: 2 });
+        assert_eq!(refs.watching(t2).as_slice(), &[(h1, 4), (h2, 3)]);
+        // A despawned holder leaves nothing behind.
+        refs.park(h1, 7, vec![], Tick(1));
+        refs.forget_holder(h1);
+        assert_eq!(refs.stats(), ReferenceStats { parked: 0, bound: 1 });
+        assert_eq!(refs.watching(t2).as_slice(), &[(h2, 3)]);
+        refs.clear();
+        assert_eq!(refs.stats(), ReferenceStats::default());
+        assert!(refs.watchers.is_empty() && refs.bound.is_empty());
     }
 
     #[test]

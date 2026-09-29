@@ -555,7 +555,11 @@ app.add_plugin(ReplicationPlugin::default())        // core.transform (Transform
 
 - **`NetId(u32)`** comes from a per-room counter and is **never reused within an epoch**; varints keep it at 1–3 B.
 - **Server:** `NetIdMap` (`Entity ↔ NetId`). **Client:** `EntityMap` (`NetId ↔ Entity`), plus a `NetEntity` component.
-- **Entity references** encode through `EncodeCtx::net_id` and decode through `DecodeCtx::entity`. An unknown target makes the value **pending** (`PendingRefs`): it is retried after each snapshot and dropped after 1 s or when the holder despawns.
+- **Entity references** encode through `EncodeCtx::net_id` and decode through `DecodeCtx::entity`. The client keeps the **newest value of every component that holds references** (`PendingRefs`; a `DecodeCtx::tracking` records which `NetId`s the decoder asked for, so any codec is covered, `MappedCodec` or hand-written) and decodes it again whenever a snapshot spawns one of those entities:
+  - a value whose target is unknown is **parked**, however long the target takes (a target outside the client's scope is simply not there yet); it is dropped only by a newer value, a removal of the component, the despawn of the holder, or (with a warning) because its decoder asked for no entity at all, which nothing can ever resolve;
+  - an applied value is **bound** to the targets it resolved. When a target leaves the client's scope its local entity is despawned and the component still names it; when the target returns as a new local entity, the value is decoded again and written (the value does not change on the server, so nothing is resent). Buffered interpolation / delayed samples of that component are dropped first, and a predicted component of a predicting client is left to the server's per-snapshot confirmation;
+  - `NetClient::reference_stats` counts both kinds (bounded by holders in view; nothing outlives its holder).
+  - *Why on the client, not a server resend when the target's scope epoch changes* (the earlier plan): the client is the only party that knows what it can resolve. A server-side resend needs, per client and holder, a model of which stay of each target the client's copy was decoded against; under datagram loss the ack of the resent holder record says nothing about whether the target's spawn had arrived, so the resend would have to wait for the target's acked spawn and repeat on every flap, costs bytes per flap, and does not cover a target that arrives later than the parking window. The client-side rule depends only on applied state (already loss- and reorder-safe through `last_applied` and the despawn tombstones), changes no wire format and works against old servers.
 - **Hierarchy:** children inherit their root's interest, so `Parent` never dangles.
 - **`StableId`** (scene) remains the persistent identity in checkpoints.
 
@@ -1093,7 +1097,6 @@ All additive to the §18.1 contract except the snapshot op bit (protocol version
 - **Rooms and fleet:** room migration between shards and servers; work stealing (needs `Runner: Send` in core); Agones or k8s operator.
 - **Player service:** Postgres `PlayerStore` plus an HA matchmaker; OAuth and platform auth (Steam, Apple, Google, Discord) via an `ExternalAuthVerifier`; email verification; parties, friends, presence, chat; Glicko-2; WS push for matchmaking.
 - **Other:** in-process TLS; replay recording (inputs plus checkpoints); a proc-macro `#[derive(NetCodec)]`.
-- **Known limitation, entity references across scope:** an entity-reference component (e.g. `core.parent`) whose target leaves a client's scope and later re-enters it is not re-sent, so that client's reference can stay unresolved until the referencing component changes again. Planned fix: re-send a record's entity references when their target's scope epoch changes.
 - **CLI and facade:** `space3d-cli` integration (`space3d server run|docker`) and `space3d` facade re-exports, because those crates are being built elsewhere. Planned: `space3d::net` re-exports `space3d_replication::prelude`.
 
 ## 20. Risks
