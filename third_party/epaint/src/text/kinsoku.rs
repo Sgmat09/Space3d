@@ -29,7 +29,7 @@
 //!   Japanese characters.
 //!
 //! Two rules of Unicode line breaking (UAX #14) hold in every script, because egui lacks them
-//! and they show in ordinary Latin text (a chat line's "[T] name:" wrapped as "[T]" | " name"
+//! and they show in ordinary Latin text (a chat line's "\[T\] name:" wrapped as "\[T\]" | " name"
 //! and "[" | "T] name"): no break just before a no-break space U+00A0 (class GL, LB12a) unless
 //! a space comes before it, and no break after an ASCII opening bracket `(` `[` `{` (class OP,
 //! LB14), also across the spaces after it ("[ x"). See [`line_break`].
@@ -74,7 +74,7 @@ pub enum Break {
 /// * no line ends with an ASCII opening bracket `(` `[` `{` (UAX #14 class OP, rule LB14;
 ///   upstream broke after it as after any ASCII mark, "[" | "T] name");
 /// * no line starts with a no-break space U+00A0 (class GL, LB12a) unless a space comes
-///   before it (upstream broke before it after a mark or a letter, "[T]" | "\u{a0}name"). Only
+///   before it (upstream broke before it after a mark or a letter, "\[T\]" | "\u{a0}name"). Only
 ///   the break before it is ruled on: after it egui decides as before.
 ///
 /// A space decides for itself — a line breaks after it as egui does — except that no line ends

@@ -114,7 +114,14 @@ kinsoku chooses or rules out makes a row of Chinese or Japanese text wider than 
 (plus the half point egui's rounding allows) unless one glyph is wider; the unit test
 `cjk_rows_never_overflow` checks paragraphs at every half point from 1 to 240 pt, with and
 without a first-row indentation. As with upstream egui, the rest of a Latin word can still
-overflow a row by less than a glyph in columns only two or three characters wide.
+overflow a row in columns only two or three characters wide (by up to about two glyphs below ~45 pt, as upstream does; fewer layouts overflow than upstream).
+
+One consequence of "no break after `(` `[` `{`, not even across the spaces after it": in a
+`horizontal_wrapped` label that starts after another widget (first-row indentation), a row
+whose only word boundary was a space after an opening bracket now gets egui's empty row
+(egui inserts one when a row has no acceptable break) where upstream would have broken after
+the bracket. It only shows for text like "( x" placed at the end of a row; the alternative is
+a row ending in an opening bracket, which the rule exists to prevent.
 
 A first-row indentation (egui's `leading_space`: a label after another widget in a
 `horizontal_wrapped` layout starts on that widget's row) gets egui's answer for a row without
