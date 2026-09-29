@@ -570,6 +570,12 @@ impl ModelEditor {
 
     /// Model-space eye position and view-projection of the orbit camera.
     fn camera(&self) -> (Vec3, Vec3, Mat4) {
+        let (eye, center, view, proj) = self.camera_matrices();
+        (eye, center, proj * view)
+    }
+
+    /// Model-space eye, orbit center, view and projection matrices of the orbit camera.
+    fn camera_matrices(&self) -> (Vec3, Vec3, Mat4, Mat4) {
         let (center, radius) = match ops::bounding_sphere(self.mesh()) {
             Some(s) => (s.center, s.radius.max(0.01)),
             None => (Vec3::ZERO, 1.0),
@@ -588,15 +594,15 @@ impl ModelEditor {
             far: 100.0 * radius * self.zoom.max(1.0),
         }
         .matrix(aspect);
-        (eye, center, proj * view)
+        (eye, center, view, proj)
     }
 
     /// Model-space ray through a point of the preview image (`uv` in 0..1, y down).
     fn preview_ray(&self, uv: [f32; 2]) -> (Vec3, Vec3) {
-        let (eye, _, view_proj) = self.camera();
-        let ndc = Vec3::new(uv[0] * 2.0 - 1.0, 1.0 - uv[1] * 2.0, 1.0);
-        let far = view_proj.inverse().project_point3(ndc);
-        (eye, (far - eye).normalize_or_zero())
+        let (eye, _, view, proj) = self.camera_matrices();
+        let ndc = space3d_core::glam::Vec2::new(uv[0] * 2.0 - 1.0, 1.0 - uv[1] * 2.0);
+        // (The f32 inverse of `proj * view` is off by units far from the origin.)
+        (eye, space3d_render::unproject_ray(view, proj, ndc).1)
     }
 
     fn opened(&mut self, path: &str, mesh: MeshData) {

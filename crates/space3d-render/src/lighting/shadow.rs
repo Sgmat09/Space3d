@@ -181,13 +181,16 @@ pub(crate) fn slice_corners(view: &ViewInfo, max_distance: f32) -> Option<[Vec3;
     if far.partial_cmp(&near) != Some(std::cmp::Ordering::Greater) {
         return None;
     }
-    let inv = view.view_proj.inverse();
+    // Offsets from the camera through the f64 inverse of the projection and of the view's
+    // rotation, plus the camera's own position: the f32 inverse of `view_proj` carries the
+    // position in its translation column and is off by units far from the origin.
+    let inv = crate::unproject::inverse_proj_rot(view.view, view.proj);
     let (zn, zf) = (ndc_depth(view, near), ndc_depth(view, far));
     let xy = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
     let mut out = [Vec3::ZERO; 8];
     for (i, z) in [zn, zf].into_iter().enumerate() {
         for (j, &(x, y)) in xy.iter().enumerate() {
-            out[i * 4 + j] = inv.project_point3(Vec3::new(x, y, z));
+            out[i * 4 + j] = view.camera_pos + inv.project_point3(Vec3::new(x, y, z));
         }
     }
     out.iter().all(|p| p.is_finite()).then_some(out)
@@ -543,6 +546,44 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The frustum slice's corners are the same offsets from the camera wherever the camera is:
+    /// built from the f64 inverse projection and view rotation (not the f32 inverse of
+    /// `view_proj`, off by units at 85 000).
+    #[test]
+    fn slice_corners_do_not_depend_on_the_camera_position() {
+        let base = camera(
+            Vec3::new(3.0, 40.0, 7.0),
+            Vec3::new(2.0, 39.0, 6.0),
+            50.0,
+            16.0 / 9.0,
+            0.5,
+            400.0,
+        );
+        let rotation = glam::Quat::from_mat3(&glam::Mat3::from_mat4(base.view).transpose());
+        let at = |eye: Vec3| {
+            let mut v = base;
+            v.view = Mat4::from_rotation_translation(rotation, eye).inverse();
+            v.view_proj = v.proj * v.view;
+            v.camera_pos = eye;
+            slice_corners(&v, 300.0).expect("corners")
+        };
+        let eye0 = Vec3::new(3.0, 40.0, 7.0);
+        let reference = at(eye0);
+        for eye in [
+            Vec3::new(85_000.0, 0.0, 85_000.0),
+            Vec3::new(1_200.0, -430_000.0, 900.0),
+        ] {
+            let far = at(eye);
+            for (a, b) in far.iter().zip(&reference) {
+                // (The corners are stored in f32: 0.004 of rounding at 430 000.)
+                assert!(
+                    ((*a - eye) - (*b - eye0)).abs().max_element() < 0.05,
+                    "{eye}: {a} vs {b}"
+                );
+            }
+        }
     }
 
     #[test]

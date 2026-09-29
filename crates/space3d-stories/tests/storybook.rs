@@ -95,6 +95,43 @@ fn knob_overrides_change_the_output() {
     assert!(early.stats.is_some_and(|s| s.draw_calls > 0));
 }
 
+/// The sky depends on the camera's rotation only: `Engine/Frame/Sky Far From Origin` from 85 000
+/// and 430 000 units out shows the same sky as at the origin (a camera far from the origin used
+/// to shift the stars by several pixels, differently for every pose). The top 60 of the 200 rows
+/// are sky only; the planets below are geometry in absolute `f32` coordinates and may differ by
+/// rounding.
+#[test]
+fn sky_far_from_origin_matches_the_origin() {
+    require_gpu!();
+    let book = engine_storybook();
+    let story = book.get("Engine/Frame/Sky Far From Origin").unwrap();
+    let render = |position: usize| {
+        let knobs = KnobValues::default().with("position", KnobValue::Choice(position));
+        run_story_headless(story, &knobs, Some((320, 200))).unwrap()
+    };
+    let origin = render(0);
+    for position in [1, 2] {
+        let far = render(position);
+        let worst = (0..60u32)
+            .flat_map(|y| (0..320u32).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let (a, b) = (origin.get(x, y), far.get(x, y));
+                (0..4).map(|c| a[c].abs_diff(b[c])).max().unwrap()
+            })
+            .max()
+            .unwrap();
+        // Same clip planes (position 1): identical bits. A different near plane (position 2)
+        // changes the last bit of the f32 direction: at most one level at a texel edge.
+        assert!(
+            worst <= 1,
+            "position {position}: the sky differs from the origin's by {worst} levels"
+        );
+        if position == 1 {
+            assert_eq!(worst, 0, "same clip planes and rotation: the sky is bit-identical");
+        }
+    }
+}
+
 #[test]
 fn screenshot_all_writes_gallery_files() {
     let tmp = tempfile::tempdir().unwrap();
