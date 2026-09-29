@@ -216,7 +216,8 @@ shadow fit builds its frustum corners as `camera_pos + inv_proj_rot · ndc`).
 **The camera's rotation is taken as the `Transform` holds it.** `Transform::looking_at(target)`
 derives it from the `f32` difference of two absolute positions, which far from the origin is
 quantized: the positions round to 0.008 at 85 000 units, so a target 50 units away moves the
-direction by up to ~1.6e-4 rad in steps (~0.3 px at 3456 × 2234) as the eye drifts, and the sky
+direction by up to ~1.6e-4 rad in steps (worst case ~0.3 px at 3456 × 2234; measured ~0.05 px
+on average for an eye drifting 0.03 units per frame) as the eye drifts, and the sky
 follows that rotation faithfully. For a camera far from the origin build the rotation from
 yaw/pitch (as `tests/sky_precision.rs` does) or from an offset relative to a local origin.
 

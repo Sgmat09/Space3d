@@ -31,9 +31,10 @@ fn engine_goldens_are_exact() {
     let options = StorybookTestOptions {
         compare: CompareOptions::exact(),
         filter: None,
+        // Missing goldens fail here; `SPACE3D_UPDATE_SNAPSHOTS=1` re-blesses (review the PNGs).
         policy: GoldenPolicy {
             ci: true,
-            ..GoldenPolicy::default()
+            ..GoldenPolicy::from_env()
         },
     };
     assert_storybook_in(&book, &golden, &options);

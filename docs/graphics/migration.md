@@ -548,8 +548,8 @@ different precision problems. The engine fixes them in two steps.
   overlay keeps working (`View` only gained a member at its end, 1312 → 1376 bytes). One caller-side
   caveat: the sky follows the camera's rotation exactly as the `Transform` holds it, and
   `Transform::looking_at` far from the origin derives that rotation from `f32` absolute positions
-  (quantized by 0.008 units at 85 000: up to ~0.3 px of sky wobble at 3456 × 2234 for a target 50
-  units away). Build the camera's rotation from yaw/pitch (or from a local offset) instead.
+  (quantized by 0.008 units at 85 000: worst case ~0.3 px of sky wobble at 3456 × 2234 for a target 50
+  units away; measured with the eye drifting 0.03 units per frame it is ~0.05 px on average). Build the camera's rotation from yaw/pitch (or from a local offset) instead.
 * **Depth: not yet.** Vertex transforms are still done in absolute `f32` world space
   (`forward.wgsl` and `depth.wgsl`: `clip = view_proj · (model · position)`), so at |world| ~ 430 000
   the rounding of each product (~0.03 clip units, different for every camera pose) still costs
