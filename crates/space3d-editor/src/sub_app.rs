@@ -380,6 +380,15 @@ impl LiveView {
             )
         });
         let buttons = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
+        // A release the host's UI cancelled (its window lost the focus, the OS showed the button
+        // up, the system took the touch) ends the press in the sub-app as a cancel too, with the
+        // same cause: its game sees no click and no drop there either.
+        let cancels = [
+            egui::PointerButton::Primary,
+            egui::PointerButton::Secondary,
+            egui::PointerButton::Middle,
+        ]
+        .map(|b| space3d_ui::pointer_cancel_cause(ui.ctx(), b));
         let dragging = response.dragged();
         let was_hovered = self.hovered;
         self.hovered = hover.is_some() || dragging;
@@ -407,7 +416,10 @@ impl LiveView {
             }
             for (i, b) in buttons.into_iter().enumerate() {
                 if released[i] && input.mouse_pressed(b) {
-                    input.inject_mouse_button_up(b);
+                    match cancels[i] {
+                        Some(cause) => input.release_mouse_button(b, cause),
+                        None => input.inject_mouse_button_up(b),
+                    }
                 }
             }
         });
@@ -488,5 +500,78 @@ mod tests {
         assert_eq!(view.error(), Some("story exploded"));
         // Further updates are ignored instead of panicking again.
         view.update(Duration::from_millis(16));
+    }
+
+    /// A release the host UI cancelled (focus loss, OS state) is a cancelled release in the
+    /// sub-app too, with the same cause; a device release stays a plain one.
+    #[test]
+    fn a_cancelled_release_in_the_host_ui_cancels_in_the_sub_app() {
+        use space3d_platform::{InputPlugin, MouseButtonCause};
+        use space3d_ui::{UiAppExt, UiPlugin};
+        use std::sync::{Arc, Mutex};
+
+        let mut sub = App::new();
+        sub.add_plugin(InputPlugin);
+        let view = LiveView {
+            app: SubApp::new(sub),
+            size: (64, 64),
+            renderer: None,
+            capture: None,
+            texture: None,
+            image: None,
+            error: None,
+            frames: 0,
+            hovered: false,
+        };
+        let shown = Arc::new(Mutex::new((view, egui::Rect::NOTHING)));
+        let mut app = App::new();
+        app.add_plugin(UiPlugin::deterministic());
+        let host = shown.clone();
+        app.add_root_ui_system(move |ui: &mut egui::Ui, _| {
+            let mut host = host.lock().unwrap();
+            let response = host.0.show(ui, egui::vec2(64.0, 64.0));
+            host.1 = response.rect;
+        });
+        app.step_ticks(2);
+        let center = shown.lock().unwrap().1.center();
+        let last_button_event = |shown: &Mutex<(LiveView, egui::Rect)>| {
+            shown
+                .lock()
+                .unwrap()
+                .0
+                .app()
+                .with(|a| a.resources.expect::<Input>().mouse_button_events().last().copied())
+                .unwrap()
+        };
+        app.resources
+            .expect_mut::<Input>()
+            .inject_mouse_move(Vec2::new(center.x, center.y));
+        app.step_ticks(1);
+        for cause in [
+            MouseButtonCause::FocusLost,
+            MouseButtonCause::OsReconciled,
+            MouseButtonCause::Device,
+        ] {
+            app.resources
+                .expect_mut::<Input>()
+                .inject_mouse_button_down(MouseButton::Left);
+            app.step_ticks(1);
+            let pressed = last_button_event(&shown).expect("the press reached the sub-app");
+            assert!(pressed.pressed && pressed.button == MouseButton::Left, "{cause:?}");
+            if cause == MouseButtonCause::Device {
+                app.resources
+                    .expect_mut::<Input>()
+                    .inject_mouse_button_up(MouseButton::Left);
+            } else {
+                app.resources
+                    .expect_mut::<Input>()
+                    .release_mouse_button(MouseButton::Left, cause);
+            }
+            app.step_ticks(1);
+            let released = last_button_event(&shown).unwrap();
+            assert!(!released.pressed, "{cause:?}: released");
+            assert_eq!(released.cause, cause, "the cause is the host's");
+            assert_eq!(released.cancelled(), cause.is_cancel(), "{cause:?}");
+        }
     }
 }
