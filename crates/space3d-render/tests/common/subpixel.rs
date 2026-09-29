@@ -36,7 +36,9 @@ impl Gray {
         let (w, h) = (img.width as usize, img.height as usize);
         let v = img
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| (0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64) / 255.0)
             .collect();
         Self { w, h, v }

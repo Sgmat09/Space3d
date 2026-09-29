@@ -565,7 +565,7 @@ fn estimator_recovers_known_shifts() {
             [
                 next() * 0.6 - 0.3,
                 next() * 0.6 - 0.3,
-                next() * 6.28,
+                next() * std::f64::consts::TAU,
                 0.04 + next() * 0.08,
             ]
         })
