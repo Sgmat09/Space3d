@@ -1,45 +1,76 @@
-# Split-mode local stack: one player service + two game servers.
+# Split-mode local stack: one player service + two game servers (built from the workspace root).
 # The image runs with SPACE3D__ENV=production: tokens must be ≥ 16 characters (see docs/server.md §3).
 #   SPACE3D_KEYS=k1:$(openssl rand -base64 32) SPACE3D_FLEET_TOKEN=$(openssl rand -hex 24) SPACE3D_ADMIN_TOKENS=$(openssl rand -hex 24) \
 #   docker compose -f crates/space3d-server/deploy/compose.yaml up --build
+# The game servers run examples/arena-server. To play with the multiplayer_arena example's bots
+# and clients instead, build its server (no windowed client, no GPU dependencies):
+#   GAME_BIN=server GAME_CARGO_ARGS="-p multiplayer_arena --no-default-features" docker compose ... up --build
+#   cargo run -p multiplayer_arena --bin client -- --headless --bot --ps http://127.0.0.1:8080 --name bot-1 --seconds 10
+# Everything listens on 127.0.0.1 only (player service :8080, game servers :7777 / :7778, admin
+# and /metrics :9090 / :9091 / :9092). `docker compose stop` drains the game servers: the grace
+# period is drain_timeout + 30 s (docs/server.md §6).
+
+name: space3d-srv
+
+x-secrets: &secrets
+  SPACE3D_KEYS: ${SPACE3D_KEYS:?set SPACE3D_KEYS (k1:<base64 32 bytes>), see the header of this file}
+  SPACE3D_FLEET_TOKEN: ${SPACE3D_FLEET_TOKEN:?set SPACE3D_FLEET_TOKEN, see the header of this file}
+  SPACE3D_ADMIN_TOKENS: ${SPACE3D_ADMIN_TOKENS:?set SPACE3D_ADMIN_TOKENS, see the header of this file}
+
+# Nothing but /data is written (SQLite uses tmpfs for temp files); no capabilities, no setuid.
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  tmpfs: ["/tmp"]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
 x-game: &game
-  build: { context: ../../.., dockerfile: crates/space3d-server/deploy/Dockerfile, args: { BIN: arena-server } }
+  <<: *hardening
+  image: space3d-srv-game:local
+  depends_on:
+    players: { condition: service_healthy }
+  stop_grace_period: 90s
+  healthcheck: &probe { test: ["CMD", "/usr/local/bin/server", "healthcheck", "--ready"], interval: 5s, timeout: 5s, retries: 3, start_period: 10s }
   environment: &genv
+    <<: *secrets
     SPACE3D__ROLE: game-server
     SPACE3D__FLEET__PLAYER_SERVICE_URL: ws://players:8080/internal/v1/fleet
     SPACE3D__FLEET__PLAYER_SERVICE_HTTP: http://players:8080
     SPACE3D__ADMIN__BIND: 0.0.0.0:9090
-    SPACE3D__PERSISTENCE__DATA_DIR: /data
-    SPACE3D_KEYS: ${SPACE3D_KEYS}
-    SPACE3D_FLEET_TOKEN: ${SPACE3D_FLEET_TOKEN}
-    SPACE3D_ADMIN_TOKENS: ${SPACE3D_ADMIN_TOKENS}
-  healthcheck: { test: ["CMD", "/usr/local/bin/server", "healthcheck", "--ready"], interval: 5s }
+    SPACE3D__GAME__DRAIN_TIMEOUT: 60s
+
 services:
   players:
+    <<: *hardening
     build: { context: ../../.., dockerfile: crates/space3d-server/deploy/Dockerfile, args: { BIN: space3d-server } }
+    image: space3d-srv-players:local
+    healthcheck: *probe
     environment:
+      <<: *secrets
       SPACE3D__ROLE: player-service
-      SPACE3D__PLAYER_SERVICE__DB_PATH: /data/players.db
       SPACE3D__ADMIN__BIND: 0.0.0.0:9090
-      SPACE3D_KEYS: ${SPACE3D_KEYS}
-      SPACE3D_FLEET_TOKEN: ${SPACE3D_FLEET_TOKEN}
-      SPACE3D_ADMIN_TOKENS: ${SPACE3D_ADMIN_TOKENS}
-    ports: ["8080:8080"]
+    ports: ["127.0.0.1:8080:8080", "127.0.0.1:9090:9090"]
     volumes: ["players:/data"]
   gs-1:
     <<: *game
+    build:
+      context: ../../..
+      dockerfile: crates/space3d-server/deploy/Dockerfile
+      args: { BIN: "${GAME_BIN:-arena-server}", CARGO_ARGS: "${GAME_CARGO_ARGS:-}" }
     environment:
       <<: *genv
       SPACE3D__SERVER_ID: gs-1
       SPACE3D__GAME__PUBLIC_URL: ws://127.0.0.1:7777/play
-    ports: ["7777:7777"]
+    ports: ["127.0.0.1:7777:7777", "127.0.0.1:9091:9090"]
     volumes: ["gs1:/data"]
   gs-2:
     <<: *game
+    pull_policy: never   # the image is gs-1's build (same tag), built once
     environment:
       <<: *genv
       SPACE3D__SERVER_ID: gs-2
       SPACE3D__GAME__PUBLIC_URL: ws://127.0.0.1:7778/play
-    ports: ["7778:7777"]
+    ports: ["127.0.0.1:7778:7777", "127.0.0.1:9092:9090"]
     volumes: ["gs2:/data"]
 volumes: { players: {}, gs1: {}, gs2: {} }

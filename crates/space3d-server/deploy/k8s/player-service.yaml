@@ -1,0 +1,125 @@
+# Player service: accounts, sessions, matchmaking, the fleet registry and room checkpoints.
+# ONE instance: state is SQLite on a ReadWriteOnce volume, so the Deployment recreates the pod
+# instead of overlapping two (docs/server.md §6, "Limits of v1"). While it restarts, rooms keep
+# playing and game servers queue results in their outbox; logins and matchmaking pause.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: space3d-players-data
+  namespace: space3d
+  labels:
+    app.kubernetes.io/name: space3d-players
+    app.kubernetes.io/component: player-service
+    app.kubernetes.io/part-of: space3d
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: space3d-players
+  namespace: space3d
+  labels:
+    app.kubernetes.io/name: space3d-players
+    app.kubernetes.io/component: player-service
+    app.kubernetes.io/part-of: space3d
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: space3d-players
+  ports:
+    # /v1/* (clients, through the ingress) and /internal/v1/* (game servers, in-cluster only:
+    # block /internal at the ingress, see ingress.example.yaml).
+    - { name: http, port: 8080, targetPort: http, protocol: TCP }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: space3d-players
+  namespace: space3d
+  labels:
+    app.kubernetes.io/name: space3d-players
+    app.kubernetes.io/component: player-service
+    app.kubernetes.io/part-of: space3d
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space3d-players
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: space3d-players
+        app.kubernetes.io/component: player-service
+        app.kubernetes.io/part-of: space3d
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      # SIGTERM stops accepting logins and flushes; it does not wait for matches.
+      terminationGracePeriodSeconds: 45
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: server
+          # The stock player service (crates/space3d-server/deploy/Dockerfile, BIN=space3d-server).
+          image: registry.example.com/space3d/player-service:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: SPACE3D__ROLE, value: player-service }
+            - name: SPACE3D__SERVER_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: SPACE3D_KEYS
+              valueFrom: { secretKeyRef: { name: space3d-server-secrets, key: SPACE3D_KEYS } }
+            - name: SPACE3D_FLEET_TOKEN
+              valueFrom: { secretKeyRef: { name: space3d-server-secrets, key: SPACE3D_FLEET_TOKEN } }
+            - name: SPACE3D_ADMIN_TOKENS
+              valueFrom: { secretKeyRef: { name: space3d-server-secrets, key: SPACE3D_ADMIN_TOKENS } }
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: admin, containerPort: 9090 }
+          # /healthz: the supervisor ticks. /readyz: not draining, database up.
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests: { cpu: 250m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: config, mountPath: /etc/space3d/server.toml, subPath: server.toml, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: space3d-players-data }
+        - name: config
+          configMap: { name: space3d-server-config }
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 64Mi }

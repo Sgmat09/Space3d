@@ -1,0 +1,31 @@
+# Docker build context = the workspace root (crates/space3d-server/deploy/Dockerfile).
+# Keep it to what `cargo build --locked` needs: sources, manifests, Cargo.lock,
+# rust-toolchain.toml, third_party/ (the [patch.crates-io] epaint) and the deploy config.
+# Without this the multi-GB target/ directory is sent to the daemon on every build.
+
+# VCS, CI, agent and editor state
+.git
+.gitignore
+.github
+.claude
+.idea
+.vscode
+.DS_Store
+
+# build output and local run data (any depth)
+target
+**/target
+dist
+pkg
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.sqlite3
+
+# not needed to compile the server
+docs
+scripts
+**/__screenshots__
+AGENTS.md
+README.md
+LICENSE
