@@ -46,6 +46,7 @@ order (spec D19).
 | [9](#9-loading-screens-prewarm) | map loading | `GraphicsQuality::prewarm_request` |
 | [10](#10-web) | `web/`, settings | Low on WebGL2 |
 | [11](#11-tests-and-performance) | `client/tests` | goldens per backend, `DownlevelOverride::webgl2()`, `GpuTimings` |
+| [12](#12-far-from-the-origin-the-sky-no-longer-cares-depth-still-does) | `docs/DEVELOPMENT.md` layout rule, stage placement | `View::inv_proj_rot` (sky independent of position); depth still needs the origin until camera-relative rendering |
 
 ## 0. Update the engine
 
@@ -303,6 +304,8 @@ or build it from the six images the game already loads:
   built from softened images, or the same one with a lower `Skybox::intensity`.
 * **Orientation.** `Skybox::rotation` / `EnvironmentLight::rotation` turn the sky if a sector's
   sun ends up in the wrong place.
+* **Position.** The sky depends on the camera's rotation only, never on where it is: no need to
+  keep sky scenes near the origin for the sky's sake (§12).
 * **What stays.** The nebula veils, star layers, planet, debris and grid are geometry in the scene
   (parallax): keep them. Remove the six `SkyFace` quads and the `SKYBOX_HALF` constraint on `FAR`.
 * **Memory.** An 8-bit 1024² sky is 25 MB of faces and 33.5 MB with its mips (six faces × 1024²
@@ -525,6 +528,39 @@ signatures, every node's pipelines (particles, sky) and the post pipelines.
   100k particles, every feature) costs ~1.5 ms GPU at 1080p on an M4 Max
   ([`../performance.md`](../performance.md)).
 
+## 12. Far from the origin: the sky no longer cares, depth still does
+
+The game's rule "scenes with a sky stay near the origin" (`docs/DEVELOPMENT.md`; login,
+landing and Skylab backdrops kept near the origin with fitted near planes) was a workaround for two
+different precision problems. The engine fixes them in two steps.
+
+* **The sky: fixed.** The skybox pass builds each pixel's direction from the inverse projection
+  and the view's *rotation* only (`View::inv_proj_rot`, computed in `f64`), so a `Skybox` is
+  independent of the camera's position: at `(85000, 0, 85000)` with near 2 / far 300 000, and at
+  y = −430 000 with near 10, the sky moves 0.000 px when the camera translates (the old pass
+  jittered by 1.6–3.3 px per frame at 640–1280 px wide, ~10 px at the game's 3456 × 2234, with the
+  nebula flipping back and forth) and by the true amount when it turns
+  ([`frame.md`](frame.md#the-sky-does-not-depend-on-the-cameras-position): the math, the guard tests,
+  before/after). The *sky* half of the layout rule is no longer needed: a scene may sit anywhere for
+  the sake of its skybox, and the flight map's far corners (absolute coordinates up to ~32 000: 4 px
+  of star shimmer at the far corner at 3456 × 2234) no longer shimmer. Nothing to change in the game
+  to get it: the fix is in the engine's sky pass; every existing custom shader, render node and
+  overlay keeps working (`View` only gained a member at its end, 1312 → 1376 bytes). One caller-side
+  caveat: the sky follows the camera's rotation exactly as the `Transform` holds it, and
+  `Transform::looking_at` far from the origin derives that rotation from `f32` absolute positions
+  (quantized by 0.008 units at 85 000: worst case ~0.3 px of sky wobble at 3456 × 2234 for a target 50
+  units away; measured with the eye drifting 0.03 units per frame it is ~0.05 px on average). Build the camera's rotation from yaw/pitch (or from a local offset) instead.
+* **Depth: not yet.** Vertex transforms are still done in absolute `f32` world space
+  (`forward.wgsl` and `depth.wgsl`: `clip = view_proj · (model · position)`), so at |world| ~ 430 000
+  the rounding of each product (~0.03 clip units, different for every camera pose) still costs
+  ~4 world units of depth at 1 500 units with near 10, and thin plates a few centimetres above a
+  hull still swap depth winners frame to frame. Until camera-relative rendering lands, keep what
+  needs fine depth resolution (stations with detail plates, the Skylab, anything with coplanar-ish
+  surfaces) near the origin with a near plane fitted to the scene, exactly as the layout rule says.
+  **Camera-relative rendering is planned next** (subtract the camera position from model
+  translations, in `f64` or split floats on the CPU and/or a hi/lo pair on the GPU, with reversed
+  Z as an option); when it lands the rest of the rule can be dropped and this section will say so.
+
 ## Checklist
 
 | | done when |
@@ -539,3 +575,4 @@ signatures, every node's pipelines (particles, sky) and the post pipelines.
 | 8 | previews use MSAA render targets and post; bloom only above ~240 px (`Bloom::min_rect_height`) |
 | 9 | map loads prewarm |
 | 11 | goldens re-blessed; GL variants where needed |
+| 12 | sky scenes no longer need to sit near the origin; scenes with fine depth detail still do until camera-relative rendering lands |

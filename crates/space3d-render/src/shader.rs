@@ -28,8 +28,12 @@
 ///
 /// The `view` uniform is the shared `View` of [`crate::VIEW_WGSL`]: besides `view_proj`,
 /// `camera_pos`, `ambient` and the lights it has `view`, `proj`, `inv_view_proj`, `inv_proj`,
-/// `viewport` (pixels of the target), `target_size` (w, h, 1/w, 1/h), `depth` (near, far,
-/// orthographic), `output` and `exposure`. The output helpers of [`crate::OUTPUT_WGSL`]
+/// `inv_proj_rot` (the inverse of `proj` times the view's rotation only, computed in `f64`:
+/// unproject `(ndc.xy, 1, 1)` and `(ndc.xy, 0, 1)` with it, divide each by `w` and subtract to
+/// get a pixel's world direction exactly at any distance from the origin, where
+/// `inv_view_proj`, the `f32` inverse of `view_proj`, jitters by pixels), `viewport` (pixels of
+/// the target), `target_size` (w, h, 1/w, 1/h), `depth` (near, far, orthographic), `output`
+/// and `exposure`. The output helpers of [`crate::OUTPUT_WGSL`]
 /// (`s3d_tonemap`, `s3d_luma`, `s3d_linear_to_srgb`, …) are in scope too. The color returned by
 /// `fragment_hook` is linear: the template encodes it for the pass (`s3d_output` with the
 /// pipeline override `S3D_OUTPUT`). `MANUAL_SRGB` — true when the target needs sRGB encoded in

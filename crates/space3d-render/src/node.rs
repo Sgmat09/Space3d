@@ -958,8 +958,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
     }
 
-    /// `View` in `VIEW_WGSL` is the 1312-byte layout of graphics spec §3.3 (its first 752 bytes
-    /// are today's forward `View`).
+    /// `View` in `VIEW_WGSL` is the 1376-byte layout of graphics spec §3.3 (its first 752 bytes
+    /// are today's forward `View`, the first 1312 the layout frozen at F3; `inv_proj_rot` is
+    /// appended after them).
     #[test]
     fn view_wgsl_layout() {
         let module = wgpu::naga::front::wgsl::parse_str(VIEW_WGSL).unwrap();
@@ -971,11 +972,12 @@ mod tests {
         let wgpu::naga::TypeInner::Struct { members, span } = &view.inner else {
             panic!("View is a struct")
         };
-        assert_eq!(*span, 1312);
+        assert_eq!(*span, 1376);
         let offset = |name: &str| members.iter().find(|m| m.name.as_deref() == Some(name)).unwrap().offset;
         assert_eq!(offset("view"), 752, "the forward prefix is unchanged");
         assert_eq!(offset("viewport"), 1008);
         assert_eq!(offset("shadow_view_proj"), 1088);
         assert_eq!(offset("sky_params"), 1296);
+        assert_eq!(offset("inv_proj_rot"), 1312, "appended after the frozen layout");
     }
 }
