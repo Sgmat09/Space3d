@@ -138,16 +138,19 @@
 ### 2.3 Docker and orchestration
 
 - **`crates/space3d-server/deploy/Dockerfile`:**
-  - Build stage: `rust:1.98-slim-bookworm`, `cargo build --locked --profile server --bin ${BIN}`.
-  - Runtime stage: `gcr.io/distroless/cc-debian12:nonroot`.
-  - `EXPOSE 7777 8080 9090`, `VOLUME /data`, `STOPSIGNAL SIGTERM`.
-  - Distroless has no curl, so probes use `server healthcheck [--ready]`.
-- **`deploy/compose.yaml`:** one PS and two GSs for split mode.
-- **Kubernetes (documented; manifests come later):**
-  - PS: `StatefulSet` with 1 replica and a PVC; ingress with TLS; `/internal/*` blocked at the ingress.
-  - GS: `StatefulSet` so names are stable (`server_id = POD_NAME`) and the outbox and checkpoint PVC is durable. Add a headless Service plus a per-pod ingress host (`gs-N.play.example.com`) or `hostPort`.
-  - Set `terminationGracePeriodSeconds ≥ drain_timeout + 30`, add `preStop: sleep 5`, and a PDB with `maxUnavailable: 1`.
-  - `space3d_fleet_free_seats{region}` drives HPA or KEDA scaling.
+  - Build stage: `rust:${RUST_VERSION}-slim-bookworm`. `RUST_VERSION` equals the `rust-toolchain.toml` channel (the Dockerfile refuses a mismatch and `tests/deploy.rs` checks it), so the build never downloads another toolchain.
+  - `cargo fetch --locked` is the only network use of the compile stage; `cargo build --locked --offline --profile server` runs under `RUN --network=none`. The cargo registry and `target/` live in BuildKit cache mounts, so after a source edit only the changed crates and their dependents recompile.
+  - Runtime stage: `gcr.io/distroless/cc-debian12:nonroot` (about 71 MB with the binary), `/data` prepared and owned by `nonroot`, `SPACE3D_CONFIG=/etc/space3d/server.toml`, `EXPOSE 7777 8080 9090`, `VOLUME /data`, `STOPSIGNAL SIGTERM`.
+  - Distroless has no curl, so probes use `server healthcheck [--ready]` (or HTTP probes on the admin port).
+  - The workspace-root `.dockerignore` keeps the build context to the sources (about 9 MB instead of the multi-GB `target/`).
+- **`deploy/compose.yaml`:** one PS and two GSs for split mode, loopback ports, read-only root filesystem, no capabilities, `stop_grace_period` = drain timeout + 30 s. `GAME_BIN` / `GAME_CARGO_ARGS` pick the game server.
+- **Kubernetes (`deploy/k8s/`, `docs/server.md` §3.1):**
+  - PS: a `Deployment` (`replicas: 1`, `Recreate`, because SQLite is a single writer on a ReadWriteOnce volume) with a PVC and a `Service`.
+  - GS: a `StatefulSet` so names are stable (`server_id` = the pod name) and the outbox and checkpoint PVC is durable, plus a headless `Service` and a `PodDisruptionBudget` (`maxUnavailable: 1`). Per-pod ingress hosts (`gs-N.play.example.com`) are in `ingress.example.yaml`.
+  - The drain contract in manifest form: `readinessProbe` on `/readyz`, `preStop` sleep 5 s, `terminationGracePeriodSeconds = drain_timeout + 5 + 30 + slack`.
+  - Config in a `ConfigMap` that restates every key of `server.example.toml` (a game's built-in defaults sit under the file and are dev-oriented), secrets in a `Secret` that is created out of band.
+  - The manifests are schema-validated (kubeconform, `kustomize build`) and checked against the production config validation in `tests/deploy.rs`; they have not been run on a cluster.
+  - `space3d_fleet_free_seats{region}` drives HPA or KEDA scaling (note in `docs/server.md` §6).
 
 ### 2.4 Health, readiness and graceful shutdown
 
@@ -558,7 +561,7 @@ app.add_plugin(ReplicationPlugin::default())        // core.transform (Transform
 - **Entity references** encode through `EncodeCtx::net_id` and decode through `DecodeCtx::entity`. The client keeps the **newest value of every component that holds references** (`PendingRefs`; a `DecodeCtx::tracking` records which `NetId`s the decoder asked for, so any codec is covered, `MappedCodec` or hand-written) and decodes it again whenever a snapshot spawns one of those entities:
   - a value whose target is unknown is **parked**, however long the target takes (a target outside the client's scope is simply not there yet); it is dropped only by a newer value, a removal of the component, the despawn of the holder, or (with a warning) because its decoder asked for no entity at all, which nothing can ever resolve;
   - an applied value is **bound** to the targets it resolved. When a target leaves the client's scope its local entity is despawned and the component still names it; when the target returns as a new local entity, the value is decoded again and written (the value does not change on the server, so nothing is resent). Buffered interpolation / delayed samples of that component are dropped first, and a predicted component of a predicting client is left to the server's per-snapshot confirmation;
-  - `NetClient::reference_stats` counts both kinds (bounded by holders in view; nothing outlives its holder).
+  - `NetClient::reference_stats` counts both kinds (bounded by holders in view; nothing outlives its holder). Cost: a snapshot that spawns entities decodes each parked value once more (a decoder stops at its first unknown entity) and each bound value that named a spawned entity, found through the `(target, holder, kind)` index.
   - *Why on the client, not a server resend when the target's scope epoch changes* (the earlier plan): the client is the only party that knows what it can resolve. A server-side resend needs, per client and holder, a model of which stay of each target the client's copy was decoded against; under datagram loss the ack of the resent holder record says nothing about whether the target's spawn had arrived, so the resend would have to wait for the target's acked spawn and repeat on every flap, costs bytes per flap, and does not cover a target that arrives later than the parking window. The client-side rule depends only on applied state (already loss- and reorder-safe through `last_applied` and the despawn tombstones), changes no wire format and works against old servers.
 - **Hierarchy:** children inherit their root's interest, so `Parent` never dangles.
 - **`StableId`** (scene) remains the persistent identity in checkpoints.
@@ -1048,7 +1051,7 @@ All additive to the §18.1 contract.
 - **Replication:** `ChangeCache::collect` adopts restored entities (above); `NetIdMap::retain`; `full_state` checkpoints the `Simulated` marker (`META_SIMULATED`), so a restored room keeps simulating its pawns; client replay starts from the newest confirmation and fills resync gaps with repeated inputs (§9.3). New scenario: `snapshot_burst_after_a_stall_replays_from_the_newest_confirmation`.
 - **Server:** `ServerConfig::load_layered` + `config::merge_tables`, `ServerMain::from_env_with_defaults` (game-supplied defaults under file and env; `--print-default-config` shows them); fleet seat counting with presence and room-bound reservations (§11.2), `ServerRecord::{present, players()}`; `PlayerService::quick_play_room` finds an open room or allocates one under a single fleet lock (concurrent quick plays used to open a room each); the load-test report gained `server: Option<ServerSample>` (tick mean / p50 / p99, ticks, skipped ticks, rooms, server bytes/s from two `/metrics` scrapes) and `loadtest::metric_value`; the Dockerfile takes `CARGO_ARGS` (package / features).
 - **Examples and tests:** `examples/multiplayer_arena` (§3.3); `crates/space3d-server/tests/acceptance.rs` (§15.3).
-- **Still deferred:** predicted spawns, rayon packet building above 32 clients, the datagram `loss` stat, `select_nth_unstable` priority selection, Postgres, QUIC, Kubernetes manifests.
+- **Still deferred:** predicted spawns, rayon packet building above 32 clients, the datagram `loss` stat, `select_nth_unstable` priority selection, Postgres, QUIC (`what it would take`: §19).
 
 ### 18.5 Review fixes
 
@@ -1098,6 +1101,31 @@ All additive to the §18.1 contract except the snapshot op bit (protocol version
 - **Player service:** Postgres `PlayerStore` plus an HA matchmaker; OAuth and platform auth (Steam, Apple, Google, Discord) via an `ExternalAuthVerifier`; email verification; parties, friends, presence, chat; Glicko-2; WS push for matchmaking.
 - **Other:** in-process TLS; replay recording (inputs plus checkpoints); a proc-macro `#[derive(NetCodec)]`.
 - **CLI and facade:** `space3d-cli` integration (`space3d server run|docker`) and `space3d` facade re-exports, because those crates are being built elsewhere. Planned: `space3d::net` re-exports `space3d_replication::prelude`.
+
+### What it would take
+
+Three deferred items are large enough to need the owner's go-ahead. What each would involve, from the code as it is:
+
+**Predicted spawns** (a projectile that appears at once on the firing client). Today a client only draws an entity once a snapshot `Spawn` record maps its `NetId` (`client/receive.rs`, `apply_snapshot` spawns `(NetEntity, Remote)`); `Predicted` covers components of entities the server already replicated (`client/prediction.rs`, `PredictionHistory` keyed by `NetId`).
+1. *A spawn key both sides derive.* The sim system runs on the server and in prediction, so it can spawn through a helper (working name `spawn_keyed`, next to the `SimTime` handling in `sim.rs`) that computes `(owner slot, tick, counter within the tick)`. Roughly 150 lines.
+2. *Wire.* The server writes the key into the `Spawn` record for the owner (a new `op` bit and one varint triple, so `PROTOCOL_VERSION` 2 → 3; the doc's additive rule cannot cover an op bit), and `full_state.rs` does the same for resyncs. Other clients get the plain record.
+3. *Client adoption.* The client keeps `PredictedSpawns { key → local entity }`. A keyed spawn record binds the `NetId` to that entity (`EntityMap::insert`) instead of spawning a new one; the entity's `PredictionHistory` moves from the temporary id to the `NetId`. A key that the acked tick passes with no record despawns the entity and emits a `SpawnRejected` event; a rollback replay that spawns the same key again reuses the entity, and one that no longer spawns it despawns it.
+4. *Edge cases that need their own tests:* despawn before confirmation, a reordered or lost spawn record on datagrams (the `spawned` bookkeeping in `apply_snapshot` and the despawn tombstones already fence duplicates), interest (the owner must not also draw the plain record), and lag compensation (`server/lagcomp.rs` records the confirmed entity, not the predicted one).
+5. *Tests:* `NetHarness` scenarios for adopt, reject, replay and resync over `Stream` and `Datagram`, plus a proptest next to `prop_references_follow_their_targets_through_scope_changes`. About 1 200 lines with tests; the arena example is the template.
+
+**QUIC / WebTransport.** The netcode already runs over true datagrams: `Semantics::Datagram` in `transport/conditioner.rs` exercises acks, baselines, presumed-lost records and packet splitting. What is missing is I/O.
+1. *Client transport.* `transport::{ClientTransport, Connector}` are the seam (`Connector::connect(url)`; `NetClient` never reconnects on its own). Add `transport/quic.rs` (native, `quinn`, `TransportCaps::datagram(≈1150, …)`) and `transport/webtransport.rs` (wasm, `web-sys` `WebTransport`, which is behind `web_sys_unstable_apis`), and let `NetClient` choose the connector by URL scheme. UDP is blocked on some networks, so a `ConnectTarget` with a WebSocket fallback list is needed as well.
+2. *Server transport.* `gs/transport_ws.rs` turns a `WsServer` into `LinkEvent`s; `gs/ingress.rs` holds a concrete `WsServerTransport`, so it becomes a merge of several event streams (or an enum). A `gs/transport_quic.rs` with the same event shape is added; `PeerInfo::transport` already names `"quic"`. The gatekeeper is transport-agnostic and needs no change, but the WebSocket-only guards (`AdmissionPolicy` origin checks, `X-Forwarded-For`) have QUIC counterparts: per-IP caps on the UDP socket, retry tokens against amplification, 0-RTT off.
+3. *Config and discovery.* `game.quic_bind`, `game.tls_cert` / `tls_key` (files, reloadable), ALPN, and an additive `public_urls` list in `ServerRegistration` (sent in `FleetUp::Register`) and in the assignment (`serde(default)`; today there is a single `public_url`).
+4. *Ops.* Ingress controllers do not carry UDP: a per-pod `LoadBalancer` or `hostPort` UDP Service in `deploy/k8s/`, UDP in the compose file and NetworkPolicies, a `transport` label on `space3d_bytes_total`, and TLS certificates for WebTransport (a CA-issued certificate or `serverCertificateHashes`).
+5. *Build.* `quinn` needs a rustls crypto provider; the graph already builds `aws-lc-sys` for `reqwest`'s rustls, which is why the Dockerfile installs `cmake`, `clang` and `perl`. Every dependency is pinned to its newest stable release first (AGENTS.md rule 1). Native loopback tests through the `Connector` trait, the existing harness for loss, `cargo check --target wasm32-unknown-unknown` for the web transport. About 2 000 lines with tests.
+
+**Postgres.** The seam is `ps::store::PlayerStore` (28 methods returning `space3d_tasks::Task`, `ps/store.rs`); only `PlayerService::open` names `SqliteStore` (`ps/mod.rs`).
+1. *`PostgresStore`* behind a cargo feature (`tokio-postgres` with `deadpool-postgres`, or `sqlx`), translating each method; `schema.rs` becomes a second migration set (`INTEGER PRIMARY KEY` ids as `BIGINT`, blobs as `BYTEA`, `WITHOUT ROWID` dropped, `INSERT … ON CONFLICT` for the idempotent `applied_ops`, `SELECT … FOR UPDATE` where SQLite relies on its single writer: `rotate_refresh`, `apply_writes`, `put_checkpoint`'s newer-key check). `backup()` (`VACUUM INTO`) becomes `pg_dump` guidance and returns `Unsupported`.
+2. *Coupling to remove.* `PlayerService` also holds a `space3d_db::Db` for backups and `db_queue_depth`, `lib.rs` opens one SQLite file that the all-in-one role shares with the game server (migrations 100–199 and 200–299), and `space3d_db::Leaderboard` is SQLite-only. The game server's outbox and rescue checkpoints stay local SQLite on purpose (`gs/outbox.rs`, `gs/checkpoint.rs`: they must survive a player-service outage).
+3. *Config and readiness.* `player_service.database_url` (a secret: env or file), pool sizes, `db_ready` / `space3d_db_queue_depth` from the pool, and the compose and k8s manifests gain a database.
+4. *Not solved by Postgres alone.* The fleet registry, matchmaker queues, lobbies, rate limiters and revocation cache are in-process state of the single PS, so a second PS instance still needs leader election or that state moved into the database. That is the HA matchmaker item.
+5. *Tests:* the store's existing test suite (`ps/store.rs`) run against both backends (a `testcontainers`-style Postgres in CI), and a migration test that applies 101–102 to an empty database. Roughly 1 800 lines including migrations.
 
 ## 20. Risks
 

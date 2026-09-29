@@ -224,8 +224,9 @@ Also:
 
 ## 3. Docker
 
-The image is distroless, runs as non-root, stops on SIGTERM, and uses a `/data` volume. Build
-from the workspace root:
+The image is distroless, runs as non-root (uid 65532), stops on SIGTERM, and keeps its state in a
+`/data` volume. Build from the workspace root (that is the build context; `.dockerignore` keeps
+it to the sources, about 9 MB):
 
 ```sh
 # the example's dedicated server (without the windowed client and its GPU dependencies)
@@ -234,35 +235,181 @@ docker build -f crates/space3d-server/deploy/Dockerfile \
   -t multiplayer-arena-server .
 
 # the stock player service
-docker build -f crates/space3d-server/deploy/Dockerfile --build-arg BIN=space3d-server -t space3d-player-service .
+docker build -f crates/space3d-server/deploy/Dockerfile -t space3d-player-service .
 ```
 
-The image starts `server --config /etc/space3d/server.toml`, which is a copy of
-`deploy/server.example.toml`, with `SPACE3D__ENV=production` and JSON logs. Production
-refuses to start without real secrets:
+**The build.**
+
+- *Toolchain.* The build stage is `rust:${RUST_VERSION}-slim-bookworm`. `RUST_VERSION` must
+  equal the `channel` in `rust-toolchain.toml`: the Dockerfile stops with a message when it
+  does not, and `tests/deploy.rs` checks it. The stage sets `RUSTUP_TOOLCHAIN`, so rustup never
+  follows the toolchain file's `components` and `targets` (rustfmt, clippy, wasm32), which it
+  would otherwise download at the first `cargo` call.
+- *Network.* It is needed by the two base-image pulls (`rust`, `gcr.io/distroless/cc-debian12`),
+  `apt-get` (`cmake clang perl pkg-config`, which `aws-lc-sys` needs, plus a cross gcc for a
+  foreign `--platform`), `rustup target add` (a no-op for the native target) and `cargo fetch
+  --locked` (crates.io). Nothing else: the compile step runs under `RUN --network=none` from the
+  fetched registry, so it is hermetic. The repository does not vendor its dependencies. For an
+  air-gapped build, mirror the base images and point `apt` and cargo (a `.cargo/config.toml` source
+  replacement, e.g. from `cargo vendor`) at internal mirrors; that was not tried here.
+- *Caching.* The cargo registry and `target/` are BuildKit cache mounts. After a source edit only
+  the changed crates and their dependents recompile (a one-line change in `space3d-server`
+  recompiles that crate alone and relinks: about 70 s on 8 cores, dominated by the thin-LTO
+  link). A cold builder compiles everything once (about 2 min for the player service on 8
+  cores). The cache lives on the builder: a CI runner that starts empty every time should export
+  it (`--cache-to type=gha` or `type=registry`). `--build-arg CACHE_ID=other` selects a private
+  cache.
+- *Architectures.* The image is `linux/<the build machine's arch>`. `--platform linux/amd64` and
+  `--platform linux/arm64` **cross-compile** with the native toolchain (a cross gcc as linker),
+  so an Apple Silicon machine builds an amd64 image for a cluster without emulation. (Running
+  the compiler under qemu was tried and is not usable: the build fails intermittently with
+  `cc` segfaults.)
+- *Size.* About 71 MB: the distroless base, the binary (about 17 MB) and the config.
+
+The image starts `server` with `SPACE3D_CONFIG=/etc/space3d/server.toml`, a copy of
+`deploy/server.example.toml`, and `SPACE3D__ENV=production`, JSON logs, `/data` as the data
+directory and `/data/players.db` as the player database. Production refuses to start without real secrets:
 
 ```sh
-docker run --rm -p 7777:7777 -p 8080:8080 -v arena-data:/data \
+# --stop-timeout: docker kills after 10 s by default; a drain may take drain_timeout (15 min) + 30 s
+docker run --rm --stop-timeout 930 -p 7777:7777 -p 8080:8080 -v arena-data:/data \
   -e SPACE3D_KEYS="k1:$(openssl rand -base64 32)" \
+  -e SPACE3D_FLEET_TOKEN="$(openssl rand -hex 24)" \
   -e SPACE3D_ADMIN_TOKENS="$(openssl rand -hex 24)" \
   -e SPACE3D__SERVER_ID=arena-1 \
   -e SPACE3D__GAME__PUBLIC_URL=wss://arena-1.play.example.com/play \
   multiplayer-arena-server
 ```
 
-- **Probes:** the image has no shell and no curl. Use
-  `server healthcheck` for liveness and `server healthcheck --ready` for readiness. The
-  compose file already does this.
-- **Split stack:** one player service and two game servers.
+- **Volume permissions.** `/data` belongs to uid 65532. A named volume copies that when it is
+  first used. A bind mount keeps the host's ownership: on Linux `chown 65532:65532` the
+  directory first (or run with `--user`).
+- **Read-only root filesystem.** The server writes only under `/data`, so
+  `docker run --read-only` works (verified for the player service alone with the image's own
+  `/data` volume; the compose stack runs all three services read-only). The compose file also
+  mounts a `tmpfs` on `/tmp` as a precaution for SQLite temporary files, drops every capability
+  and sets `no-new-privileges`.
+- **Ports.** `7777` game WebSocket, `8080` player service, `9090` admin, `/metrics`, `/healthz`,
+  `/readyz`. The example config binds admin to `127.0.0.1`; set `SPACE3D__ADMIN__BIND=0.0.0.0:9090`
+  to reach it from outside the container (compose does), and publish it on a private interface only.
+- **Probes.** The image has no shell and no curl. Use `server healthcheck` for liveness and
+  `server healthcheck --ready` for readiness (they read `SPACE3D_CONFIG`, so they follow a
+  mounted config). The compose file already does this.
+- **Stopping.** `docker stop` sends SIGTERM and then SIGKILL after 10 s by default. A game server
+  that hosts matches drains for up to `game.drain_timeout`, so give it `--stop-timeout` (or
+  `stop_grace_period` in compose) of `drain_timeout + 30 s`. A server with no players exits within
+  a second with code 0; one whose room still holds players, or players who dropped less than
+  `resume_window` (20 s) ago, waits for them, up to `drain_timeout` (a container stopped with docker's
+  default 10 s was killed while it waited: exit 137). `docker start` afterwards re-registers with the player service; persistent rooms are
+  restored from their checkpoints when a player rejoins.
+- **Split stack.** One player service and two game servers (loopback ports 8080, 7777, 7778; admin
+  9090 to 9092; read-only root filesystems; game servers wait for a healthy player service):
   ```sh
   SPACE3D_KEYS=k1:$(openssl rand -base64 32) SPACE3D_FLEET_TOKEN=$(openssl rand -hex 24) \
     SPACE3D_ADMIN_TOKENS=$(openssl rand -hex 24) \
     docker compose -f crates/space3d-server/deploy/compose.yaml up --build
   ```
-  `compose.yaml` builds the arena game server. Set `BIN: server` and `CARGO_ARGS` in its
-  build args to use the example instead.
+  `compose.yaml` builds `examples/arena-server` for the game servers (one image for both). Build the
+  `multiplayer_arena` example's server instead with
+  `GAME_BIN=server GAME_CARGO_ARGS="-p multiplayer_arena --no-default-features"`, then drive it with
+  the headless bots:
+  ```sh
+  cargo run -p multiplayer_arena --bin client -- --headless --bot --ps http://127.0.0.1:8080 --name bot-1 --seconds 10
+  ```
+  Its rooms are not persistent by default. To see a room move when you `docker stop` its game server,
+  set a persistent queue in the environment of the three services (as the process tests do):
+  `SPACE3D__MATCHMAKING__QUEUES='[{ name = "arena", mode = "arena", teams = 1, team_size = 16, min_players = 1, max_wait = "5s", backfill = true, params = { persistent = "true" } }]'`.
 - **TLS:** terminate TLS at your ingress or load balancer. Browsers on an https page need
   `wss://`.
+
+**What was verified in containers** (Docker 29 on a Colima aarch64 VM, the compose stack with the
+`multiplayer_arena` server and two headless bots from the host):
+`/healthz`, `/readyz` and `/metrics` answer on all three services; the admin API returns 401
+without a token or with a wrong one and 200 with a token, and never prints the secrets in
+`/admin/v1/config`; the containers run as uid 65532 with a read-only root filesystem; bots
+connect through the player service and play (RTT about 20 ms); `POST /admin/v1/rooms/{id}/checkpoint` answers 202
+and `space3d_checkpoint_seconds_count` advances; `docker stop` of the game server hosting a persistent
+room exits 0 in about 1 s, the room moves to the other game server with the same id and both bots play on;
+stopping both game servers and starting them again restores the room from the player service's
+checkpoint (its tick continues) and the bot rejoins; stopping the player service exits 0 in under 1 s, its
+volume keeps accounts and player data across the restart, and game servers re-register on their own.
+The amd64 image (62 MB) was cross-built on the arm64 machine in under 3 minutes; the binary is an
+x86-64 ELF, and under qemu emulation the container answers `--help`, `check-config` and `/readyz` and
+exits 0 on SIGTERM. It was not load-tested, and the compose stack was only run natively (arm64).
+A warm rebuild with crates.io, static.crates.io, github.com and static.rust-lang.org unreachable
+succeeds (`cargo fetch` finds everything in the registry cache, then the offline compile runs).
+Bind-mounted `/data` ownership on a native Linux host was not tested.
+
+### 3.1 Kubernetes
+
+`crates/space3d-server/deploy/k8s/` has plain manifests (and a `kustomization.yaml`):
+
+| file | what |
+|---|---|
+| `namespace.yaml` | `space3d`, restricted Pod Security |
+| `configmap.yaml` | `server.toml`: every key of `server.example.toml`, production values |
+| `player-service.yaml` | PVC, `Deployment` (1 replica, `Recreate`), `Service` |
+| `game-server.yaml` | headless `Service`, `StatefulSet` (2 replicas, PVC per pod), `PodDisruptionBudget` |
+| `secret.example.yaml` | template for `SPACE3D_KEYS`, `SPACE3D_FLEET_TOKEN`, `SPACE3D_ADMIN_TOKENS` (placeholders the production image rejects) |
+| `ingress.example.yaml` | optional: `/v1` for the player service (never `/internal`), one host and Service per game-server pod |
+| `networkpolicy.yaml` | optional: default deny, then only the flows the stack needs |
+
+```sh
+# 1. secrets, created out of band (never commit them)
+kubectl create namespace space3d
+kubectl -n space3d create secret generic space3d-server-secrets \
+  --from-literal=SPACE3D_KEYS="k1:$(openssl rand -base64 32)" \
+  --from-literal=SPACE3D_FLEET_TOKEN="$(openssl rand -hex 24)" \
+  --from-literal=SPACE3D_ADMIN_TOKENS="$(openssl rand -hex 24)"
+# 2. images: push the two images and point kustomization.yaml (`images:`) at them
+# 3. apply
+kubectl apply -k crates/space3d-server/deploy/k8s
+```
+
+- **Roles.** The player service is one pod: its state is SQLite on a ReadWriteOnce volume, so the
+  `Deployment` uses `Recreate`. Game servers are a `StatefulSet`: `server_id` is the pod name
+  (stable across restarts, as join tickets require) and each pod keeps its `/data` volume with the outbox and the
+  local checkpoint rescue store. The game server dials the player service (`space3d-players:8080`);
+  it needs no inbound internal port.
+- **Drain semantics.** The manifests encode §6, "Draining and upgrades":
+  1. `readinessProbe` on `/readyz`: 503 until the pod registered, and again as soon as it drains.
+     `startupProbe` and `livenessProbe` use `/healthz`.
+  2. `preStop` sleeps 5 s (`sleep` action, Kubernetes 1.30+; the image has no shell), so the
+     ingress stops sending new WebSockets before SIGTERM.
+  3. SIGTERM starts the drain: matches finish within `game.drain_timeout` (15 min in the ConfigMap),
+     persistent rooms hand off, checkpoints upload, the process exits 0.
+  4. `terminationGracePeriodSeconds: 960` = 900 s drain + 5 s preStop + 30 s final checkpoints +
+     25 s slack. The grace period includes the preStop hook. `tests/deploy.rs` fails when the
+     ConfigMap's `drain_timeout` and the StatefulSet's numbers stop adding up.
+  5. `PodDisruptionBudget` `maxUnavailable: 1`: node drains and cluster upgrades evict one game server at a
+     time; each eviction is a full drain, so a rolling update of N pods takes up to N times the drain
+     timeout. Lower `drain_timeout` (and the grace period with it) for games with short matches.
+- **Config and secrets.** The ConfigMap is mounted over `/etc/space3d/server.toml`. It restates
+  every key of the example on purpose: a game binary's built-in defaults (the arena example turns
+  dev auth on and relaxes the per-IP limits) sit under the file, and a key the file omits would
+  leak through. What differs per pod comes from the environment (`SPACE3D__ROLE`, `SPACE3D__SERVER_ID`
+  from `metadata.name`, `SPACE3D__GAME__PUBLIC_URL`). Set `security.trusted_proxies` to your
+  ingress controller's pod CIDR: without it every client shares the ingress address and the per-IP
+  limits. The Secret holds the three keys; key rotation is in §4.
+- **Reaching a game server.** Clients connect straight to the pod the player service assigned, at
+  `game.public_url` (`wss://{server_id}.play.example.com/play`), so each pod needs its own host or
+  address: `ingress.example.yaml` (one `Service` per pod selected by `statefulset.kubernetes.io/pod-name`, one
+  ingress host each), a `LoadBalancer` per pod, or `hostPort`. Block `/internal/*` of the player
+  service at the ingress; only game servers use it, inside the cluster.
+- **Autoscaling (note).** The player service does not scale out (§6, "Limits of v1"). Game servers
+  scale on the player service's `space3d_fleet_free_seats{region}` gauge. It falls as players
+  arrive, and an HPA scales *up* when its metric rises above the target, so feed it an inverted
+  signal (a Prometheus recording rule such as "seats wanted minus free seats", exposed through
+  prometheus-adapter as an External metric with an `AverageValue` of the seats per pod), or use KEDA's
+  Prometheus scaler. Scale-in removes the highest ordinal, which drains for up to the grace period:
+  use a long `behavior.scaleDown.stabilizationWindowSeconds` and one pod per step. No HPA manifest is
+  shipped because it depends on your metrics pipeline.
+- **Validation.** All manifests pass `kubeconform -strict` (v0.8.0) against the Kubernetes 1.30 and
+  1.34 schemas, `kustomize build` (v5.8.1) renders the eight resources of the kustomization and the
+  output validates too, and the ConfigMap's `server.toml` is accepted by `check-config` of the built
+  images with production secrets (and the placeholder Secret is refused). **They have not been run
+  on a cluster**: probes, the PVCs, the ingress example, the NetworkPolicy and the actual drain
+  behaviour under `kubectl delete pod` are unverified.
 
 ---
 
@@ -446,7 +593,7 @@ clients per room.
 
 - Run N `game-server` processes behind one `player-service`.
 - Each game server needs a stable `server_id` and its own public URL. For example, a
-  Kubernetes StatefulSet with `gs-N.play.example.com` per pod, or `hostPort`.
+  Kubernetes StatefulSet with `gs-N.play.example.com` per pod, or `hostPort` (§3.1).
 - Allocation picks the least-loaded ready server in the requested region: players plus
   reserved seats over capacity, plus tick p99 over the budget. Only servers of the client's
   build qualify: quick play, matchmaking and lobby requests carry `game_id` and
@@ -490,7 +637,7 @@ clients per room.
 - When the drain completes the server deregisters (the PS stops counting it at once) and closes
   its fleet link cleanly (the PS logs `fleet link closed (server left the fleet)` at INFO; a
   WARN `fleet link closed` means a server went away without draining).
-- Set `terminationGracePeriodSeconds ≥ drain_timeout + 30 s`.
+- Set `terminationGracePeriodSeconds ≥ drain_timeout + 30 s` (plus the `preStop` sleep: the grace period includes it; §3.1 has the numbers, and `docker stop -t` / compose `stop_grace_period` follow the same rule).
 
 **Failures.**
 
@@ -518,7 +665,7 @@ clients per room.
 | Replication unit tests and proptests, harness scenarios (prediction, interpolation, interest, budget, resume, bursts after stalls) | `crates/space3d-replication/{src,tests}` | `cargo test -p space3d-replication` |
 | Full stack in process: PS, GSs, gatekeeper, tickets, rooms and clients over the conditioned memory network, with manual clocks (`TestCluster`) | `crates/space3d-server/tests/{cluster,acceptance}.rs` | `cargo test -p space3d-server` |
 | Real sockets: all-in-one; split with lease expiry and restore; separate PS and GS Apps with ticket then connect | `crates/space3d-server/tests/{e2e,split,acceptance}.rs` | same |
-| Abuse over real sockets: idle / slow / excess sockets, trickled bodies, `X-Forwarded-For` lines, login lockout, cross-site admin requests, lobby limits, audit actor; the deployment files' documented commands | `crates/space3d-server/tests/{abuse,deploy}.rs` | same |
+| Abuse over real sockets: idle / slow / excess sockets, trickled bodies, `X-Forwarded-For` lines, login lockout, cross-site admin requests, lobby limits, audit actor; the deployment files (documented compose command; the Dockerfile's pinned toolchain; the Kubernetes ConfigMap under production validation and restating every example key; grace periods that cover the drain) | `crates/space3d-server/tests/{abuse,deploy}.rs` | same |
 | Example: WASD through the `ActionMap` in the harness; the shipped `server` plus 2 `client --headless --bot` processes; the split drain handoff with real processes (player service, 2 game servers, 2 bots, SIGTERM the hosting game server mid-play: the room moves, both bots play on; 2 more bots that quick play while it moves join it there, one world); the split crash (SIGKILL the hosting game server: with a 4 s lease both bots are back in the restored room within 12 s). Every process's stdout and stderr is captured and must hold no ERROR line (`SPACE3D_PROCESS_TEST_LOGS=<dir>` keeps them) | `examples/multiplayer_arena/tests/{netcode,processes}.rs` | `cargo test -p multiplayer_arena` |
 | Load: 200 bots | `examples/multiplayer_arena/tests/load.rs` (`#[ignore]`), `loadtest` binary | see §7.3 |
 
