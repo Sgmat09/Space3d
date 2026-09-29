@@ -40,6 +40,44 @@ fn server_and_two_headless_bot_clients_over_localhost() {
     server.proc.assert_no_errors();
 }
 
+/// Regression: `client --help` (and any option it did not know) printed `unknown option` and went
+/// on to start the windowed client: renderer, window and a connection attempt, on a developer's
+/// machine when an agent only wanted to read the options. It now answers and exits before
+/// anything is initialised. Should this ever regress, the environment keeps the stray client
+/// in the background and ends it after two frames instead of leaving it open.
+#[test]
+fn client_help_and_bad_options_exit_before_starting_anything() {
+    let run = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_client"));
+        cmd.args(args)
+            .env("SPACE3D_BACKGROUND", "1")
+            .env("SPACE3D_EXIT_AFTER_FRAMES", "2")
+            .env("RUST_LOG", "info");
+        let mut client = Proc::spawn("client", cmd);
+        let status = client.wait(Duration::from_secs(20)).expect("exits at once");
+        let out = client.output();
+        assert!(
+            !out.contains("renderer initialised") && !out.contains("state="),
+            "{args:?} started the client:\n{out}"
+        );
+        (status.code(), out)
+    };
+    for flag in ["--help", "-h"] {
+        let (code, out) = run(&[flag]);
+        assert_eq!(code, Some(0), "{flag}:\n{out}");
+        assert!(out.contains("usage: client") && out.contains("--ps"), "{flag}:\n{out}");
+    }
+    for (args, why) in [
+        (&["--bogus"][..], "unknown option"),
+        (&["--ps"], "needs a value"),
+        (&["--seconds", "soon"], "--seconds"),
+    ] {
+        let (code, out) = run(args);
+        assert_eq!(code, Some(2), "{args:?}:\n{out}");
+        assert!(out.contains(why) && out.contains("usage: client"), "{args:?}:\n{out}");
+    }
+}
+
 /// Regression (test harness): the process tests piped stderr only and looked for "ERROR" there,
 /// but every tracing line — ERROR included — goes to stdout, so a process logging errors
 /// passed. The harness now captures both streams; this checks it sees an error the server
