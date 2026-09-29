@@ -276,7 +276,9 @@ pub enum TouchPhase {
     Moved,
     /// Finger lifted.
     Ended,
-    /// System cancelled the touch.
+    /// System cancelled the touch (an incoming call, the palm rejected, a system gesture took
+    /// the finger): it ends like [`Ended`](Self::Ended) but is no tap, no click — see
+    /// [`Input::just_cancelled_touches`].
     Cancelled,
 }
 
@@ -441,6 +443,7 @@ pub struct Input {
     touches: Vec<Touch>,
     started_touches: Vec<u64>,
     ended_touches: Vec<Touch>,
+    cancelled_touches: Vec<Touch>,
     text: String,
     gamepads: HashMap<u32, Gamepad>,
     window_size: Vec2,
@@ -529,9 +532,17 @@ impl Input {
     pub fn just_started_touches(&self) -> &[u64] {
         &self.started_touches
     }
-    /// Touches that ended this frame (last known state).
+    /// Touches that ended this frame (last known state): lifted fingers and touches the system
+    /// cancelled ([`Self::just_cancelled_touches`]).
     pub fn just_ended_touches(&self) -> &[Touch] {
         &self.ended_touches
+    }
+    /// The touches of [`Self::just_ended_touches`] that the system cancelled
+    /// ([`TouchPhase::Cancelled`]) rather than the player lifting the finger: not taps, and
+    /// games should not fire on their release. The UI sends them as cancelled releases too (no
+    /// click). Cleared in `end_frame`.
+    pub fn just_cancelled_touches(&self) -> &[Touch] {
+        &self.cancelled_touches
     }
     /// Text typed this frame.
     pub fn text(&self) -> &str {
@@ -787,6 +798,9 @@ impl Input {
                     let mut t = self.touches.remove(i);
                     t.delta += position - t.position;
                     t.position = position;
+                    if phase == TouchPhase::Cancelled {
+                        self.cancelled_touches.push(t);
+                    }
                     self.ended_touches.push(t);
                 }
             }
@@ -843,6 +857,7 @@ impl Input {
         self.wheel = Vec2::ZERO;
         self.started_touches.clear();
         self.ended_touches.clear();
+        self.cancelled_touches.clear();
         self.text.clear();
         self.key_events.clear();
         self.mouse_button_events.clear();
@@ -862,10 +877,13 @@ pub enum Binding {
     Key(KeyCode),
     /// Mouse button.
     Mouse(MouseButton),
-    /// Any finger on the screen.
+    /// Any finger on the screen. The released edge also comes when the system cancelled the
+    /// touch ([`TouchPhase::Cancelled`]; the value goes to zero either way): an action that must
+    /// not fire on a cancel checks [`Input::just_cancelled_touches`] too.
     TouchAny,
     /// A finger inside a normalized screen rectangle (`min`/`max` in 0..1, origin top-left):
-    /// virtual buttons on mobile.
+    /// virtual buttons on mobile. The released edge is the same as [`Binding::TouchAny`]'s for a
+    /// cancelled touch.
     TouchRegion {
         /// Top-left corner.
         min: Vec2,
@@ -1338,6 +1356,27 @@ mod tests {
         i.inject_touch(2, TouchPhase::Ended, Vec2::new(100.0, 0.0));
         assert_eq!(i.touches().len(), 1);
         assert_eq!(i.just_ended_touches()[0].id, 2);
+        assert!(i.just_cancelled_touches().is_empty(), "lifted, not cancelled");
+    }
+
+    #[test]
+    fn a_cancelled_touch_ends_but_is_told_apart() {
+        let mut i = Input::default();
+        i.inject_touch(1, TouchPhase::Started, Vec2::new(0.0, 0.0));
+        i.inject_touch(2, TouchPhase::Started, Vec2::new(10.0, 0.0));
+        i.end_frame();
+        i.inject_touch(1, TouchPhase::Cancelled, Vec2::new(3.0, 0.0));
+        i.inject_touch(2, TouchPhase::Ended, Vec2::new(10.0, 0.0));
+        i.inject_touch(3, TouchPhase::Cancelled, Vec2::ONE); // never started: nothing
+        assert!(i.touches().is_empty());
+        let ended: Vec<u64> = i.just_ended_touches().iter().map(|t| t.id).collect();
+        assert_eq!(ended, [1, 2], "both end");
+        let cancelled = i.just_cancelled_touches();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!((cancelled[0].id, cancelled[0].position), (1, Vec2::new(3.0, 0.0)));
+        assert_eq!(cancelled[0].start, Vec2::ZERO);
+        i.end_frame();
+        assert!(i.just_ended_touches().is_empty() && i.just_cancelled_touches().is_empty());
     }
 
     #[test]
