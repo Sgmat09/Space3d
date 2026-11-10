@@ -583,6 +583,7 @@ impl Renderer {
     /// Extract the world, cull, upload and draw one frame. Normally called by the
     /// `Stage::Render` system of [`crate::RenderPlugin`].
     pub fn render_frame(&mut self, world: &World, resources: &mut Resources) {
+        use crate::timing::part;
         self.frame_index += 1;
         self.ensure_offscreen();
         // GPU-culling counts of earlier frames whose copies the GPU has finished.
@@ -656,21 +657,30 @@ impl Renderer {
             let gone = SourceBuffer::Explicit(h.index());
             self.frame.cull_bgs.retain(|(b, _), _| *b != gone);
         }
-        self.prepare(
-            world,
-            resources,
-            &assets,
-            &mut buffers,
-            ambient,
-            &settings,
-            &frame_settings,
-            &lighting_settings,
-            &mut encoder,
-        );
-        self.encode_compute(&mut encoder);
-        self.apply_gpu_cull_counts();
+        {
+            let _part = part("render.prepare");
+            self.prepare(
+                world,
+                resources,
+                &assets,
+                &mut buffers,
+                ambient,
+                &settings,
+                &frame_settings,
+                &lighting_settings,
+                &mut encoder,
+            );
+        }
+        {
+            let _part = part("render.compute");
+            self.encode_compute(&mut encoder);
+            self.apply_gpu_cull_counts();
+        }
         // Depth views (shadow maps) before every camera view (spec §1.4 step 11).
-        self.encode_depth_views(&mut encoder);
+        {
+            let _part = part("render.depth_views");
+            self.encode_depth_views(&mut encoder);
+        }
 
         // Acquire the surface only when something presents.
         let mut surface_tex = None;
@@ -709,10 +719,17 @@ impl Renderer {
                 ..Default::default()
             })
         });
-        self.encode_views(&mut encoder, surface_view.as_ref(), false);
-        self.encode_frame_overlays(&mut encoder, surface_view.as_ref());
+        {
+            let _part = part("render.views");
+            self.encode_views(&mut encoder, surface_view.as_ref(), false);
+        }
+        {
+            let _part = part("render.overlays");
+            self.encode_frame_overlays(&mut encoder, surface_view.as_ref());
+        }
         self.timer.end_frame(&mut encoder);
 
+        let submit = part("render.submit");
         self.uploader.finish();
         let submission = self.queue.submit([encoder.finish()]);
         self.timer.submitted(&self.queue);
@@ -720,9 +737,14 @@ impl Renderer {
         if let Some(t) = surface_tex {
             self.queue.present(t);
         }
-        if !self.pace_frames(submission) {
-            // Non-blocking: fires staging-chunk recycling and capture callbacks.
-            let _ = self.device.poll(wgpu::PollType::Poll);
+        drop(submit);
+        {
+            // (with the GPU behind, this is where the frame waits for it)
+            let _part = part("render.pace");
+            if !self.pace_frames(submission) {
+                // Non-blocking: fires staging-chunk recycling and capture callbacks.
+                let _ = self.device.poll(wgpu::PollType::Poll);
+            }
         }
 
         self.post.end_frame(&mut self.stats);
@@ -898,6 +920,7 @@ impl Renderer {
                     .count() as u32;
             }
         }
+        let span = crate::timing::part("render.prepare.extract");
         f.extract(
             world,
             assets,
@@ -911,6 +934,8 @@ impl Renderer {
             stats,
             &mut cpu_reallocs,
         );
+        drop(span);
+        let span = crate::timing::part("render.prepare.views");
         let mut out_cursor = 0;
         let mut visible_overflow = false;
         f.prepare_views(
@@ -938,7 +963,9 @@ impl Renderer {
         );
         f.finish_views(visible_overflow);
         f.write_view_uniforms(world, lighting, &mut cpu_reallocs);
+        drop(span);
         // Render nodes (spec §1.4 steps 7–8): `prepare`, then `prepare_view` per camera view.
+        let span = crate::timing::part("render.prepare.nodes");
         f.prepare_nodes(nodes::NodePrepare {
             device,
             queue,
@@ -956,6 +983,8 @@ impl Renderer {
             frame_index,
             timing: timer,
         });
+        drop(span);
+        let span = crate::timing::part("render.prepare.upload");
         // Post groups (spec §1.4 step 6): their composite parameters, in plan order, and the
         // distortion buffers of the groups whose Distortion phase runs (created here only).
         for pg in &f.post_groups {
@@ -985,6 +1014,8 @@ impl Renderer {
         let wg_word = f.prepare_dispatches(&mut cpu_reallocs);
         f.upload(device, encoder, up, out_cursor, wg_word, &mut cpu_reallocs);
         post.flush(device, encoder, up);
+        drop(span);
+        let _span = crate::timing::part("render.prepare.bind_groups");
 
         // Custom-shader pipelines whose (asynchronous, browser) validation failed since the
         // last frame fall back to the built-in shader before anything is drawn with them.

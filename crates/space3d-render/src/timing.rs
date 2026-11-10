@@ -358,3 +358,10 @@ mod tests {
         assert!(t.span("post.bloom", None).is_none());
     }
 }
+
+/// A part of the frame's CPU work, timed while the returned guard lives: a trace span of the
+/// kind the schedule opens round every system (`"system"`, with a `name`), so the profiler
+/// lists it beside them ("render.prepare"). Costs nothing while no subscriber takes trace spans.
+pub(crate) fn part(name: &'static str) -> tracing::span::EnteredSpan {
+    tracing::trace_span!("system", name = name).entered()
+}
