@@ -43,6 +43,7 @@ mod gpu;
 mod handles;
 mod instance;
 mod lighting;
+pub mod lod;
 mod material;
 mod node;
 mod output;
@@ -87,6 +88,7 @@ pub use stats::{DrawPath, RenderStats};
 // Graphics API hubs (graphics spec §2.1): each area adds items to its hub, never to this file.
 pub use caps::GraphicsCaps;
 pub use lighting::api::*;
+pub use lod::{LodSettings, MeshLod};
 pub use material::*;
 pub use node::{
     DepthAccess, DrawContext, FULLSCREEN_WGSL, FrameInfo, FrameKind, FrameLayouts, FrameMode, MESH_VERTEX_LAYOUT,
@@ -141,6 +143,10 @@ impl Plugin for RenderPlugin {
         let nodes = app.resources.expect_mut::<RenderNodes>();
         lighting::Lighting::register_nodes(nodes);
         post::PostState::register_nodes(nodes);
+        // Before the frame is extracted: the meshes it draws are the levels picked here.
+        app.add_system_named(Stage::Render, "render::select_lods", |ctx| {
+            lod::select_lods(ctx.world, ctx.resources)
+        });
         app.add_system_named(Stage::Render, "render::render_frame", render_system);
         if let Some((w, h)) = self.headless {
             #[cfg(not(target_arch = "wasm32"))]
