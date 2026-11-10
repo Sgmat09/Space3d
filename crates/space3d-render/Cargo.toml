@@ -24,6 +24,7 @@ ahash.workspace = true
 tracing.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+web-time.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon.workspace = true

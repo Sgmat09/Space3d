@@ -595,10 +595,14 @@ impl Renderer {
         self.stats.reset(self.frame_index, path);
         self.uploader.reset_counters();
         self.frame.path = path;
-        let frame_settings = resources
+        let mut frame_settings = resources
             .get::<crate::settings::FrameSettings>()
             .cloned()
             .unwrap_or_default();
+        // Dynamic resolution scales the scene on top of the app's own setting.
+        if let Some(d) = resources.get::<crate::DynamicResolution>() {
+            frame_settings.render_scale *= d.scale();
+        }
         self.frame_graphics = self.graphics.masked(frame_settings.downlevel);
         // GPU timings (spec §2.2.6): publish the newest finished frame's, then time this one.
         let changed = self.timer.collect(&mut self.gpu_timings);

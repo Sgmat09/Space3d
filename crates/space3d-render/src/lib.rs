@@ -38,6 +38,7 @@ mod caps;
 mod components;
 mod culling;
 mod dirty;
+mod dynamic_resolution;
 mod frame;
 mod gpu;
 mod handles;
@@ -68,6 +69,7 @@ pub use components::{
 };
 pub use culling::{Aabb, Frustum, Sphere, max_axis_scale};
 pub use dirty::DirtyRanges;
+pub use dynamic_resolution::DynamicResolution;
 pub use frame::RenderSettings;
 pub use handles::{InstanceBufferHandle, MeshHandle, ShaderHandle, TextureHandle};
 pub use instance::{
@@ -139,10 +141,15 @@ impl Plugin for RenderPlugin {
             .init_resource::<FrameSettings>()
             .init_resource::<LightingSettings>()
             .init_resource::<RenderNodes>()
-            .init_resource::<GpuTimings>();
+            .init_resource::<GpuTimings>()
+            .init_resource::<DynamicResolution>()
+            .init_resource::<dynamic_resolution::FrameClock>();
         let nodes = app.resources.expect_mut::<RenderNodes>();
         lighting::Lighting::register_nodes(nodes);
         post::PostState::register_nodes(nodes);
+        app.add_system_named(Stage::Render, "render::dynamic_resolution", |ctx| {
+            dynamic_resolution::dynamic_resolution_system(ctx.resources)
+        });
         // Before the frame is extracted: the meshes it draws are the levels picked here.
         app.add_system_named(Stage::Render, "render::select_lods", |ctx| {
             lod::select_lods(ctx.world, ctx.resources)
