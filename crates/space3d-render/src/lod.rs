@@ -190,25 +190,43 @@ pub(crate) fn select_lods(world: &mut World, resources: &Resources) {
 
 /// A coarser copy of a mesh by vertex clustering: the vertices inside each cube of side `cell`
 /// (in the mesh's units) become one, the one nearest their middle, with the normals of all of
-/// them averaged; triangles that collapse are dropped, and so are doubles. Cheap and robust
-/// (it needs no manifold mesh), and good for meshes drawn small: seams and hard edges closer
-/// than `cell` are welded.
+/// them averaged; triangles that collapse are dropped, and so are repeats of a triangle (the
+/// same three vertices in the same winding). Cheap and robust (it needs no manifold mesh), and
+/// good for meshes drawn small.
 ///
-/// Vertices are only joined where their texture coordinates are close too (within
-/// [`UV_REACH`] cells' worth of texture, by how much texture the mesh lays over a unit of
-/// space): the two sides of a seam lie at one place in space and far apart in the texture, and
-/// a triangle between vertices of two islands would be painted with whatever lies between them
-/// in the atlas.
+/// Not everything inside a cell is joined:
+///
+/// - Vertices are only joined where their texture coordinates are close too (within
+///   [`UV_REACH`] cells' worth of texture, by how much texture the mesh lays over a unit of
+///   space): the two sides of a seam lie at one place in space and far apart in the texture,
+///   and a triangle between vertices of two islands would be painted with whatever lies between
+///   them in the atlas.
+/// - Vertices are only joined where their normals face the same way: along the same axis, in
+///   the same direction (the largest component of the normal and its sign, six ways in all).
+///   The two sides of a thin sheet (a wing, a fin: a face and a reversed copy of it at the same
+///   place) so stay two sheets, each with its own normal and winding, and a hard edge between
+///   faces that look along different axes keeps its two normals. A reversed copy of a triangle
+///   is a triangle of its own, not a repeat: with back faces culled it is the only one seen
+///   from its side.
+///
+/// So seams, the two sides of a sheet and such hard edges are not welded, however large the
+/// cell: a mesh that is mostly these gets less simple than its cell alone would make it, and a
+/// closed mesh with normals never gets simpler than one vertex for each way it faces.
+///
+/// A stream (normals, UVs, colours, tangents, second UVs) counts only when it has a value for
+/// every position; one of any other length is left out of the result, as an empty one is.
 pub fn simplify(data: &MeshData, extras: &MeshExtras, cell: f32) -> (MeshData, MeshExtras) {
     let n = data.positions.len();
+    // A stream shorter than the positions cannot be read by a position's index: it is not there.
+    let (has_normals, has_uvs) = (data.normals.len() == n, data.uvs.len() == n);
     let (min, _) = data.aabb();
     let inv = 1.0 / cell.max(1e-9);
-    let mut ids: HashMap<[i32; 5], u32> = HashMap::with_capacity(n / 4 + 1);
+    let mut ids: HashMap<[i32; 6], u32> = HashMap::with_capacity(n / 4 + 1);
     // How much texture a unit of space is given, over the whole mesh: a cell of space is that much texture across.
     let uv_inv = {
         let (mut space, mut texture) = (0.0f64, 0.0f64);
-        if data.uvs.len() == n {
-            for t in data.indices.chunks_exact(3) {
+        if has_uvs {
+            for t in data.indices.as_chunks::<3>().0 {
                 for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
                     let (a, b) = (a as usize, b as usize);
                     space += f64::from(Vec3::from(data.positions[a]).distance(Vec3::from(data.positions[b])));
@@ -229,18 +247,24 @@ pub fn simplify(data: &MeshData, extras: &MeshExtras, cell: f32) -> (MeshData, M
     for (i, p) in data.positions.iter().enumerate() {
         let p = Vec3::from(*p);
         let [x, y, z] = ((p - min) * inv).floor().as_ivec3().to_array();
-        let [u, v] = data
-            .uvs
-            .get(i)
-            .map_or([0, 0], |uv| uv.map(|c| (c * uv_inv).floor() as i32));
-        let key = [x, y, z, u, v];
+        let [u, v] = if has_uvs {
+            data.uvs[i].map(|c| (c * uv_inv).floor() as i32)
+        } else {
+            [0, 0]
+        };
+        let normal = if has_normals {
+            Vec3::from(data.normals[i])
+        } else {
+            Vec3::ZERO
+        };
+        let key = [x, y, z, u, v, if has_normals { facing(normal) } else { 0 }];
         let id = *ids.entry(key).or_insert_with(|| {
             sums.push((Vec3::ZERO, Vec3::ZERO, 0));
             sums.len() as u32 - 1
         });
         let s = &mut sums[id as usize];
         s.0 += p;
-        s.1 += data.normals.get(i).map_or(Vec3::ZERO, |n| Vec3::from(*n));
+        s.1 += normal;
         s.2 += 1;
         cluster.push(id);
     }
@@ -253,19 +277,20 @@ pub fn simplify(data: &MeshData, extras: &MeshExtras, cell: f32) -> (MeshData, M
             nearest[c] = (d, i as u32);
         }
     }
-    fn pick<T: Copy>(nearest: &[(f32, u32)], from: &[T], to: &mut Vec<T>) {
-        if !from.is_empty() {
+    // Copy a stream that has a value for each of the `n` positions; any other is left out.
+    fn pick<T: Copy>(nearest: &[(f32, u32)], n: usize, from: &[T], to: &mut Vec<T>) {
+        if from.len() == n {
             to.extend(nearest.iter().map(|(_, i)| from[*i as usize]));
         }
     }
     let mut out = MeshData::default();
     let mut out_extras = MeshExtras::new();
-    pick(&nearest, &data.positions, &mut out.positions);
-    pick(&nearest, &data.uvs, &mut out.uvs);
-    pick(&nearest, &data.colors, &mut out.colors);
-    pick(&nearest, &extras.tangents, &mut out_extras.tangents);
-    pick(&nearest, &extras.uvs1, &mut out_extras.uvs1);
-    if !data.normals.is_empty() {
+    pick(&nearest, n, &data.positions, &mut out.positions);
+    pick(&nearest, n, &data.uvs, &mut out.uvs);
+    pick(&nearest, n, &data.colors, &mut out.colors);
+    pick(&nearest, n, &extras.tangents, &mut out_extras.tangents);
+    pick(&nearest, n, &extras.uvs1, &mut out_extras.uvs1);
+    if has_normals {
         out.normals.extend(nearest.iter().zip(&sums).map(|((_, i), s)| {
             let mean = s.1.normalize_or_zero();
             if mean == Vec3::ZERO {
@@ -276,18 +301,38 @@ pub fn simplify(data: &MeshData, extras: &MeshExtras, cell: f32) -> (MeshData, M
         }));
     }
     let mut seen: HashSet<[u32; 3]> = HashSet::with_capacity(data.indices.len() / 6 + 1);
-    for t in data.indices.chunks_exact(3) {
+    for t in data.indices.as_chunks::<3>().0 {
         let (a, b, c) = (cluster[t[0] as usize], cluster[t[1] as usize], cluster[t[2] as usize]);
         if a == b || b == c || a == c {
             continue;
         }
-        let mut key = [a, b, c];
-        key.sort_unstable();
+        // The same triangle whichever corner it starts at, and not its reverse: the key keeps the winding.
+        let key = if a < b && a < c {
+            [a, b, c]
+        } else if b < c {
+            [b, c, a]
+        } else {
+            [c, a, b]
+        };
         if seen.insert(key) {
             out.indices.extend([a, b, c]);
         }
     }
     (out, out_extras)
+}
+
+/// Which way a normal faces, for [`simplify`]'s clusters: its largest component and that
+/// component's sign (1..=6 for +x, -x, +y, -y, +z, -z). Opposite normals never share a value.
+fn facing(normal: Vec3) -> i32 {
+    let a = normal.abs();
+    let axis = if a.x >= a.y && a.x >= a.z {
+        0
+    } else if a.y >= a.z {
+        1
+    } else {
+        2
+    };
+    1 + axis * 2 + i32::from(normal[axis as usize] < 0.0)
 }
 
 /// How far apart in the texture [`simplify`] still joins two vertices of one cell of space:
@@ -384,18 +429,18 @@ mod tests {
         }
         let ((min, max), (full_min, full_max)) = (coarse.aabb(), full.aabb());
         assert!((min - full_min).abs().max_element() < 0.25 && (max - full_max).abs().max_element() < 0.25);
-        // no triangle twice, none collapsed
+        // no triangle twice in the same winding (a triangle and its reverse are two), none collapsed
         let mut seen = HashSet::new();
-        for t in coarse.indices.chunks_exact(3) {
+        for t in coarse.indices.as_chunks::<3>().0 {
             assert!(t[0] != t[1] && t[1] != t[2] && t[0] != t[2]);
-            let mut key = [t[0], t[1], t[2]];
-            key.sort_unstable();
-            assert!(seen.insert(key));
+            let first = (0..3).min_by_key(|i| t[*i]).unwrap();
+            assert!(seen.insert([t[first], t[(first + 1) % 3], t[(first + 2) % 3]]));
         }
     }
 
-    /// Two sheets at one place with their own islands of the texture (a hull's two sides, a seam) are not welded into each other: no
-    /// triangle of the simpler mesh reaches from one island to the other.
+    /// Two sheets at one place with their own islands of the texture (a hull's two sides, a
+    /// seam) are not welded into each other, however large the cell: no triangle of the simpler
+    /// mesh reaches from one island to the other.
     #[test]
     fn a_seam_is_not_welded() {
         let mut m = MeshData::default();
@@ -420,7 +465,7 @@ mod tests {
         }
         let (coarse, _) = simplify(&m, &MeshExtras::new(), 0.2);
         assert!(coarse.triangle_count() > 20 && coarse.triangle_count() * 4 < m.triangle_count());
-        for t in coarse.indices.chunks_exact(3) {
+        for t in coarse.indices.as_chunks::<3>().0 {
             let u: Vec<f32> = t.iter().map(|i| coarse.uvs[*i as usize][0]).collect();
             let island = |u: f32| u >= 0.45;
             assert!(island(u[0]) == island(u[1]) && island(u[1]) == island(u[2]), "{u:?}");
@@ -433,14 +478,124 @@ mod tests {
         }
     }
 
+    /// A thin two-sided part as the game makes it: a face and a reversed copy of it a hair
+    /// behind, with the same UVs. Both sides survive, each with its own winding and normal.
     #[test]
-    fn a_tiny_cell_keeps_the_mesh_and_a_huge_one_nothing() {
+    fn both_sides_of_a_thin_sheet_are_kept() {
+        let mut m = MeshData::default();
+        let n = 24u32;
+        for back in [false, true] {
+            for y in 0..=n {
+                for x in 0..=n {
+                    let (fx, fy) = (x as f32 / n as f32, y as f32 / n as f32);
+                    m.positions.push([fx, fy, if back { -0.001 } else { 0.0 }]);
+                    m.normals.push([0.0, 0.0, if back { -1.0 } else { 1.0 }]);
+                    m.uvs.push([fx, fy]);
+                }
+            }
+            let base = u32::from(back) * (n + 1) * (n + 1);
+            for y in 0..n {
+                for x in 0..n {
+                    let a = base + y * (n + 1) + x;
+                    let b = a + n + 1;
+                    if back {
+                        m.indices.extend([a, b, a + 1, a + 1, b, b + 1]);
+                    } else {
+                        m.indices.extend([a, a + 1, b, a + 1, b + 1, b]);
+                    }
+                }
+            }
+        }
+        let (coarse, _) = simplify(&m, &MeshExtras::new(), 0.2);
+        assert!(coarse.triangle_count() > 20 && coarse.triangle_count() * 4 < m.triangle_count());
+        let (mut front, mut back) = (0, 0);
+        for t in coarse.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| Vec3::from(coarse.positions[i as usize]));
+            // the way the triangle faces by its winding is the way its vertices' normals point
+            let faces = (b - a).cross(c - a).z;
+            assert!(faces != 0.0);
+            for i in t {
+                let z = coarse.normals[*i as usize][2];
+                assert!(
+                    z.abs() > 0.99 && (z > 0.0) == (faces > 0.0),
+                    "normal {z}, facing {faces}"
+                );
+            }
+            if faces > 0.0 {
+                front += 1;
+            } else {
+                back += 1;
+            }
+        }
+        assert!(front > 10 && back > 10, "{front} front, {back} back");
+        assert!(
+            front * 4 >= back * 3 && back * 4 >= front * 3,
+            "{front} front, {back} back"
+        );
+    }
+
+    /// A stream with fewer values than there are positions is not read (it would be read past
+    /// its end): it is left out, as if it were empty.
+    #[test]
+    fn a_short_stream_is_left_out() {
+        let full = sphere(16);
+        let n = full.positions.len();
+        let whole = MeshExtras::new()
+            .with_tangents(vec![[1.0, 0.0, 0.0, 1.0]; n])
+            .with_uvs1(vec![[0.5, 0.5]; n]);
+        let short = |len: usize| {
+            let mut m = full.clone();
+            m.colors = vec![[1.0; 4]; n];
+            let mut e = whole.clone();
+            m.normals.truncate(len);
+            m.uvs.truncate(len);
+            m.colors.truncate(len);
+            e.tangents.truncate(len);
+            e.uvs1.truncate(len);
+            simplify(&m, &e, 0.3)
+        };
+        let (coarse, extras) = short(n);
+        let v = coarse.positions.len();
+        assert!(coarse.triangle_count() > 20);
+        assert_eq!([coarse.normals.len(), coarse.uvs.len(), coarse.colors.len()], [v, v, v]);
+        assert_eq!([extras.tangents.len(), extras.uvs1.len()], [v, v]);
+        for len in [n - 1, n / 2, 1] {
+            let (coarse, extras) = short(len);
+            assert!(coarse.triangle_count() > 20 && coarse.positions.len() > 10);
+            assert!(coarse.indices.iter().all(|i| (*i as usize) < coarse.positions.len()));
+            assert!(coarse.normals.is_empty() && coarse.uvs.is_empty() && coarse.colors.is_empty());
+            assert!(extras.tangents.is_empty() && extras.uvs1.is_empty());
+        }
+        // one short stream alone goes; the others stay
+        let mut m = full.clone();
+        m.uvs.truncate(3);
+        let (coarse, extras) = simplify(&m, &whole, 0.3);
+        assert!(coarse.uvs.is_empty());
+        assert_eq!(
+            [coarse.normals.len(), extras.tangents.len()],
+            [coarse.positions.len(); 2]
+        );
+    }
+
+    #[test]
+    fn a_tiny_cell_keeps_the_mesh_and_a_huge_one_next_to_nothing() {
         let full = sphere(12);
         let (same, _) = simplify(&full, &MeshExtras::new(), 1e-5);
-        // (the seam's and the poles' doubled vertices weld; the triangles at the poles that were slivers go)
-        assert!(same.triangle_count() >= full.triangle_count() - 2 * 24);
-        let (none, _) = simplify(&full, &MeshExtras::new(), 100.0);
-        assert_eq!(none.triangle_count(), 0);
+        // (nothing welds: the doubled vertices of the seam and the poles lie at one place in
+        // space and apart in the texture, so even the slivers at the poles stay)
+        assert_eq!(same.triangle_count(), full.triangle_count());
+        // One cell for the whole sphere: a vertex for each of the six ways its normals face is
+        // all that is not joined, an octahedron
+        let (least, _) = simplify(&full, &MeshExtras::new(), 100.0);
+        assert_eq!((least.positions.len(), least.triangle_count()), (6, 8));
+        // and without normals nothing at all
+        let bare = MeshData {
+            positions: full.positions.clone(),
+            indices: full.indices.clone(),
+            ..MeshData::default()
+        };
+        let (none, _) = simplify(&bare, &MeshExtras::new(), 100.0);
+        assert_eq!((none.positions.len(), none.triangle_count()), (1, 0));
     }
 
     #[test]
@@ -460,9 +615,11 @@ mod tests {
             0
         );
         // a single triangle cannot get smaller: it stays
-        let mut one = MeshData::default();
-        one.positions = vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
-        one.indices = vec![0, 1, 2];
+        let one = MeshData {
+            positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            indices: vec![0, 1, 2],
+            ..MeshData::default()
+        };
         assert_eq!(simplify_to(&one, &MeshExtras::new(), 0.1).0.triangle_count(), 1);
     }
 

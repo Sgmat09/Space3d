@@ -27,7 +27,7 @@ fn settings(backend: ParticleBackend) -> ParticleSettings {
     }
 }
 
-/// Every emission shape and direction, spread, flatten, delays, drag and gravity, the three
+/// Every emission shape and direction, spread, flatten, delays, drag and gravity, the four
 /// layer forces and a world attractor, local and world space, bursts with cycles, rates, rate
 /// per distance on a moving emitter, inherited velocity, emitter-plane facing, flicker, a
 /// prewarmed effect and an `OnRemove::Clear` removal, all driven by the tick number.

@@ -794,7 +794,7 @@ fn forces_pull_swirl_and_stir() {
     assert_eq!(a, b);
     let moved: f32 = a.iter().zip(&still).map(|(p, q)| (p.pos() - q.pos()).length()).sum();
     assert!(moved > 1.0, "{moved}");
-    // Curl noise stirs them too, deterministically, and keeps them spread: the cloud's size holds where a pull would shrink it.
+    // Curl noise stirs them too, deterministically: two runs agree and the particles have moved.
     let curl = || {
         run(
             vec![Force::Curl {

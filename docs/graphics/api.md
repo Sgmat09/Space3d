@@ -83,6 +83,8 @@ the game.
 | `material.rs` | P-MAT | `BlendMode`, `ShadowMode`, `MapMask`, `TextureTransform`, `MeshExtras` |
 | `lighting/api.rs` | P-MAT | cubemaps, `Skybox`, `EnvironmentLight`, `DirectionalShadow`, `LightingSettings` |
 | `post/api.rs` | P-POST | `PostProcess` and every post type, `DISTORTION_WGSL` |
+| `lod.rs` | F | `MeshLod`, `LodSettings`, the `lod` module (`simplify`, `simplify_to`, `UV_REACH`, `MAX_LOD_LEVELS`) |
+| `dynamic_resolution.rs` | F | `DynamicResolution` |
 
 Crate-internal contracts between the frame and the areas (spec §2.6) have fixed signatures:
 `lighting::Lighting` (+ `DepthViewRequest`, `ViewResources`, `LightingPrepare`),
@@ -194,6 +196,24 @@ Additions made by the foundation since F2 (additive):
   * `space3d-editor`: scene reprs and inspector sections for `CameraFrame`, `PostProcess`,
     `DirectionalShadow` (saved), `Skybox`, `EnvironmentLight` (snapshot-only: session-local
     cubemap handles); the `Material` repr gains the scalar map and blend fields.
+
+* Performance (all additive; nothing changes for an app that uses none of it):
+  * Levels of detail: the `MeshLod` component, the `LodSettings` resource (the defaults apply
+    without it) and the public module `space3d_render::lod` with `simplify(&MeshData,
+    &MeshExtras, cell)` and `simplify_to(&MeshData, &MeshExtras, ratio)`, both returning
+    `(MeshData, MeshExtras)`. `RenderPlugin` adds the system `render::select_lods` to the Render
+    stage before `render::render_frame`; it writes `Mesh3d` of entities that have a `MeshLod`
+    and of no other. `simplify` does not weld across texture seams or between vertices whose
+    normals face different ways, and keeps a triangle and its reverse as two.
+    ([frame.md](frame.md#levels-of-detail))
+  * Dynamic resolution: the `DynamicResolution` resource (`enabled`, `target_fps`, `min_scale`,
+    `probe_secs`; `on(fps)`, `scale()`, `frame(ms)`), inserted by `RenderPlugin`, off by
+    default, with the system `render::dynamic_resolution` in the Render stage. On, it
+    multiplies `FrameSettings::render_scale` for the frame (the resource itself is not
+    written), so it reaches the Primary target's cameras only.
+    ([frame.md](frame.md#dynamic-resolution))
+  * The frame's CPU parts are `tracing` spans named `render.*`
+    ([frame.md](frame.md#cpu-spans)). No API.
 
 ## Ownership map (spec §3.6)
 
