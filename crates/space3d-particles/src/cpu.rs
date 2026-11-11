@@ -187,6 +187,25 @@ fn pre_age(x: Vec3, v: Vec3, gravity: Vec3, drag: f32, t: f32) -> (Vec3, Vec3) {
     }
 }
 
+/// The step of [`curl_noise`]'s differences, in lattice cells.
+const CURL_STEP: f32 = 0.1;
+
+/// The curl of the vector field whose three components are [`value_noise`] of the three seeds
+/// [`Force::Turbulence`] uses, by central differences [`CURL_STEP`] apart: a flow without
+/// divergence. Each component is within ±3 (the noise's slope is at most 1.5 a cell).
+/// `simulate.wgsl`'s `s3dp_curl_noise` is the same sum in the same order.
+fn curl_noise(p: Vec3) -> Vec3 {
+    const SEEDS: [u32; 3] = [0x1f12_3bb5, 0x9e37_79b9, 0x7feb_352d];
+    let (dx, dy, dz) = (Vec3::X * CURL_STEP, Vec3::Y * CURL_STEP, Vec3::Z * CURL_STEP);
+    // d(component `c`) along `d`, times twice the step
+    let diff = |c: usize, d: Vec3| value_noise(p + d, SEEDS[c]) - value_noise(p - d, SEEDS[c]);
+    Vec3::new(
+        diff(2, dy) - diff(1, dz),
+        diff(0, dz) - diff(2, dx),
+        diff(1, dx) - diff(0, dy),
+    ) * (0.5 / CURL_STEP)
+}
+
 /// Value noise in 0..1 on the integer lattice (smoothstep-blended corners).
 fn value_noise(p: Vec3, seed: u32) -> f32 {
     let i = p.floor();
@@ -273,6 +292,11 @@ fn forces(s: &LayerSim, x: Vec3, row: &XformRow, time: f32, world: &[WorldAttrac
                 ) * (2.0 * strength)
                     - Vec3::splat(strength)
             }
+            Force::Curl {
+                strength,
+                frequency,
+                speed,
+            } => curl_noise(x * frequency + Vec3::splat(time * speed)) * strength,
         };
     }
     if s.world_forces != 0 {
@@ -902,6 +926,42 @@ pub(crate) fn pack_bridges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The curl-noise flow has no sources or sinks: what flows into a small box flows out of it, where the noise the turbulence
+    /// uses does not balance. And it stays within its bound.
+    #[test]
+    fn curl_noise_has_no_divergence() {
+        let h = 0.05;
+        let turbulence = |p: Vec3| {
+            Vec3::new(
+                value_noise(p, 0x1f12_3bb5),
+                value_noise(p, 0x9e37_79b9),
+                value_noise(p, 0x7feb_352d),
+            )
+        };
+        let divergence = |field: &dyn Fn(Vec3) -> Vec3, p: Vec3| {
+            ((field(p + Vec3::X * h).x - field(p - Vec3::X * h).x)
+                + (field(p + Vec3::Y * h).y - field(p - Vec3::Y * h).y)
+                + (field(p + Vec3::Z * h).z - field(p - Vec3::Z * h).z))
+                / (2.0 * h)
+        };
+        let (mut curl, mut plain, mut largest) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..400 {
+            // (points inside lattice cells, away from their faces, where the differences of both span one cell)
+            let cell = Vec3::new((i % 7) as f32, (i % 11) as f32, (i % 5) as f32);
+            let p = cell
+                + Vec3::new(
+                    0.3 + 0.4 * (i as f32 * 0.37).fract(),
+                    0.3 + 0.4 * (i as f32 * 0.61).fract(),
+                    0.5,
+                );
+            curl += divergence(&curl_noise, p).abs();
+            plain += divergence(&turbulence, p).abs();
+            largest = largest.max(curl_noise(p).abs().max_element());
+        }
+        assert!(curl < plain * 0.2, "curl {curl}, the plain noise {plain}");
+        assert!(largest > 0.5 && largest <= 3.0, "{largest}");
+    }
 
     /// `sin_cos_turns` agrees with the f64 reference within 2.5e-7 (2 ulp of 1) over the turn,
     /// and its quadrants are exact at the quarter turns.

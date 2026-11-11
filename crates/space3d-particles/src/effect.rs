@@ -624,6 +624,18 @@ pub enum Force {
         /// Time scroll speed.
         speed: f32,
     },
+    /// Curl-noise flow: the curl of a noise field, which has no sources or sinks, so the
+    /// particles swirl in eddies and stay spread out where [`Force::Turbulence`] gathers them
+    /// into clumps and thins them elsewhere. For smoke, plasma, dust and anything that should
+    /// look like it is carried by a fluid. About four times the cost of turbulence a particle.
+    Curl {
+        /// Strength.
+        strength: f32,
+        /// Spatial frequency: the eddies are about `1 / frequency` across.
+        frequency: f32,
+        /// Time scroll speed.
+        speed: f32,
+    },
 }
 
 /// Force falloff with distance.

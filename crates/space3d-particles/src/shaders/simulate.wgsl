@@ -103,6 +103,22 @@ fn s3dp_attract(center: vec3<f32>, x: vec3<f32>, strength: f32, radius: f32, fal
     return d * (strength * k / dist);
 }
 
+// `cpu::curl_noise`: the curl of the three value noises, by central differences 0.1 apart.
+fn s3dp_curl_diff(p: vec3<f32>, d: vec3<f32>, seed: u32) -> f32 {
+    return s3dp_value_noise(p + d, seed) - s3dp_value_noise(p - d, seed);
+}
+
+fn s3dp_curl_noise(p: vec3<f32>) -> vec3<f32> {
+    let dx = vec3<f32>(0.1, 0.0, 0.0);
+    let dy = vec3<f32>(0.0, 0.1, 0.0);
+    let dz = vec3<f32>(0.0, 0.0, 0.1);
+    return vec3<f32>(
+        s3dp_curl_diff(p, dy, 0x7feb352du) - s3dp_curl_diff(p, dz, 0x9e3779b9u),
+        s3dp_curl_diff(p, dz, 0x1f123bb5u) - s3dp_curl_diff(p, dx, 0x7feb352du),
+        s3dp_curl_diff(p, dx, 0x9e3779b9u) - s3dp_curl_diff(p, dy, 0x1f123bb5u),
+    ) * (0.5 / 0.1);
+}
+
 // `cpu::forces`: the layer's forces and the world attractors at `x`.
 fn s3dp_forces(e: u32, flags: u32, x: vec3<f32>, row: S3dpXform, time: f32) -> vec3<f32> {
     var a = vec3<f32>(0.0);
@@ -134,7 +150,7 @@ fn s3dp_forces(e: u32, flags: u32, x: vec3<f32>, row: S3dpXform, time: f32) -> v
                 let out = rp / d;
                 a += cross(ax, out) * p.w - out * bitcast<f32>(q.x);
             }
-        } else {
+        } else if (q.w == 2u) {
             // Turbulence: strength, frequency, scroll speed.
             let s = x * p.y + vec3<f32>(time * p.z);
             a += vec3<f32>(
@@ -142,6 +158,9 @@ fn s3dp_forces(e: u32, flags: u32, x: vec3<f32>, row: S3dpXform, time: f32) -> v
                 s3dp_value_noise(s, 0x9e3779b9u),
                 s3dp_value_noise(s, 0x7feb352du),
             ) * (2.0 * p.x) - vec3<f32>(p.x);
+        } else {
+            // Curl noise: strength, frequency, scroll speed.
+            a += s3dp_curl_noise(x * p.y + vec3<f32>(time * p.z)) * p.x;
         }
     }
     let mask = s3dp_word(e, 1u).w;

@@ -90,7 +90,11 @@ fn scene(app: &mut App) {
             frequency: 0.3,
             speed: 1.5,
         }],
-        vec![],
+        vec![Force::Curl {
+            strength: 10.0,
+            frequency: 0.3,
+            speed: 1.5,
+        }],
         vec![],
         vec![],
     ];

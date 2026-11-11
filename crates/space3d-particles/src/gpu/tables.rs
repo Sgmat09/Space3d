@@ -101,6 +101,11 @@ pub(crate) fn entry_words(e: &Entry, out: &mut [Word]) {
                 frequency,
                 speed,
             }) => (f([*strength, *frequency, *speed, 0.0]), [0, 0, 0, 2]),
+            Some(Force::Curl {
+                strength,
+                frequency,
+                speed,
+            }) => (f([*strength, *frequency, *speed, 0.0]), [0, 0, 0, 3]),
             None => ([0; 4], [0; 4]),
         };
         out[9 + 2 * i] = a;
