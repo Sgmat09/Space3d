@@ -89,6 +89,14 @@ pub struct RenderStats {
     pub meshes_uploaded: u32,
     /// Textures uploaded this frame.
     pub textures_uploaded: u32,
+    /// Meshes still waiting for upload after this frame's uploads (see [`crate::UploadBudget`];
+    /// 0 without a budget).
+    pub pending_meshes: u32,
+    /// Textures still waiting for upload after this frame's uploads.
+    pub pending_textures: u32,
+    /// Bytes of mesh and texture data still waiting for upload after this frame's uploads
+    /// ([`crate::RenderAssets::pending_upload_bytes`]).
+    pub pending_upload_bytes: u64,
     /// Render passes recorded by the graphics features (0 in Direct mode without them).
     pub render_passes: u32,
     /// Compute passes recorded by the graphics features (particles, auto exposure, …); render

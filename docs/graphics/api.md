@@ -74,7 +74,7 @@ the game.
 
 | hub | area | contents |
 |---|---|---|
-| `settings.rs` | frame (F) | `FrameSettings`, `CameraFrame`, `HdrMode`, `DownlevelOverride`, `RenderTargetDesc`, `RenderTargetFormat` |
+| `settings.rs` | frame (F) | `FrameSettings`, `CameraFrame`, `HdrMode`, `DownlevelOverride`, `RenderTargetDesc`, `RenderTargetFormat`, `UploadBudget` |
 | `caps.rs` | F | `GraphicsCaps` |
 | `output.rs` | F | `OutputEncoding`, `Tonemapper`, `OUTPUT_WGSL` |
 | `node.rs` | F | the render-node API (`RenderNode`, `RenderNodes`, contexts, `PassTarget`, `FrameLayouts`, `VIEW_WGSL`, `scene_wgsl`, `FULLSCREEN_WGSL`) |
@@ -206,6 +206,19 @@ Additions made by the foundation since F2 (additive):
     and of no other. `simplify` does not weld across texture seams or between vertices whose
     normals face different ways, and keeps a triangle and its reverse as two.
     ([frame.md](frame.md#levels-of-detail))
+  * Levels that draw nothing: `MeshHandle::NONE` (with `MeshHandle::is_none()`), the handle of no
+    mesh, which no view draws, and `MeshLod::from_levels(radius, &[Option<MeshHandle>])`.
+    `MeshLod` keeps the level last asked for, and its `PartialEq` compares the levels and the
+    sphere only. With a renderer, `render::select_lods` draws the nearest uploaded level in
+    place of one whose mesh is not on the GPU yet.
+    ([frame.md](frame.md#levels-that-draw-nothing))
+  * Upload budget: the `UploadBudget` resource (`bytes`, `headless`; `per_frame(bytes)`),
+    inserted by `RenderPlugin` with no limit. `RenderAssets::is_texture_uploaded(handle)` and
+    `pending_upload_bytes()` beside `is_mesh_uploaded`;
+    `RenderStats::{pending_meshes, pending_textures, pending_upload_bytes}`. Behaviour-only: the
+    ECS path draws an entity while its mesh has a GPU copy, the test the `InstancedMesh` path
+    already made; a mesh or texture replaced before its upload is queued once, at its first
+    place. ([frame.md](frame.md#asset-uploads-and-the-upload-budget))
   * Dynamic resolution: the `DynamicResolution` resource (`enabled`, `target_fps`, `min_scale`,
     `probe_secs`; `on(fps)`, `scale()`, `frame(ms)`), inserted by `RenderPlugin`, off by
     default, with the system `render::dynamic_resolution` in the Render stage. On, it

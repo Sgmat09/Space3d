@@ -635,13 +635,19 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d frame"),
         });
-        self.upload_assets_into(&mut encoder, &mut assets);
+        // A headless renderer uploads everything at once unless the budget asks otherwise: its
+        // frames are captures, which must not show a scene half loaded.
+        let headless = self.surface.is_none();
+        let upload_budget = resources
+            .get::<crate::settings::UploadBudget>()
+            .filter(|b| b.headless || !headless)
+            .and_then(|b| b.bytes);
+        self.upload_assets_into(&mut encoder, &mut assets, upload_budget);
         // Cubemap conversion and image-based-lighting bakes (spec §1.4 step 4).
         let lighting_settings = resources
             .get::<crate::lighting::api::LightingSettings>()
             .cloned()
             .unwrap_or_default();
-        let headless = self.surface.is_none();
         self.lighting.prepare(&mut crate::lighting::LightingPrepare {
             device: &self.device,
             queue: &self.queue,

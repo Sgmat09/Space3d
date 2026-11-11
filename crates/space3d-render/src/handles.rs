@@ -49,6 +49,22 @@ define_handle!(
     /// Handle to a mesh stored in [`crate::RenderAssets`].
     MeshHandle
 );
+impl MeshHandle {
+    /// No mesh: a handle no mesh ever has. An entity whose [`crate::Mesh3d`] is this is not
+    /// drawn, in any view (the extraction skips it as it skips a mesh that is not uploaded), and
+    /// its `Visibility` is left alone. A [`crate::MeshLod`] level holds it to draw nothing at
+    /// that level ([`crate::MeshLod::from_levels`]).
+    pub const NONE: Self = Self {
+        index: u32::MAX,
+        generation: u32::MAX,
+    };
+
+    /// Whether this is [`Self::NONE`].
+    pub fn is_none(self) -> bool {
+        self == Self::NONE
+    }
+}
+
 define_handle!(
     /// Handle to a texture stored in [`crate::RenderAssets`].
     TextureHandle
@@ -192,5 +208,10 @@ mod tests {
         });
         assert_eq!((h.index(), h.generation()), (3, 7));
         assert_eq!(format!("{h:?}"), "MeshHandle(3v7)");
+        // The handle of no mesh is never a live one, however many meshes were made and removed.
+        let mut m = SlotMap::default();
+        let live = MeshHandle::from_raw(m.insert(1));
+        assert!(MeshHandle::NONE.is_none() && !live.is_none());
+        assert_eq!(m.get(MeshHandle::NONE.raw()), None);
     }
 }

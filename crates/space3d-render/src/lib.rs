@@ -139,6 +139,7 @@ impl Plugin for RenderPlugin {
             .init_resource::<RenderSettings>()
             .init_resource::<RenderOverlays>()
             .init_resource::<FrameSettings>()
+            .init_resource::<UploadBudget>()
             .init_resource::<LightingSettings>()
             .init_resource::<RenderNodes>()
             .init_resource::<GpuTimings>()

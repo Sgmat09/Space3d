@@ -12,6 +12,9 @@
 //! let low = assets.add_mesh_with(coarse, extras);
 //! world.spawn((Transform::default(), Mesh3d(full), material, MeshLod::new(radius, &[full, low])));
 //! ```
+//!
+//! A level can also be no mesh at all ([`MeshLod::from_levels`]): a model of many parts then
+//! draws one merged mesh far away, on one entity, while its parts draw nothing.
 
 use crate::assets::RenderAssets;
 use crate::components::{Camera3d, Mesh3d, Projection, RenderTarget};
@@ -28,16 +31,33 @@ pub const MAX_LOD_LEVELS: usize = 4;
 
 /// The levels of detail of an entity's mesh. The renderer sets the entity's [`Mesh3d`] to one
 /// of `meshes` each frame; an entity without this component keeps the mesh it has.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Two of them are equal when they list the same levels over the same sphere: the level the
+/// renderer last picked is not compared.
+#[derive(Clone, Copy, Debug)]
 pub struct MeshLod {
     meshes: [MeshHandle; MAX_LOD_LEVELS],
     count: u8,
+    /// The level the size on screen last asked for (`UNKNOWN` before the first frame). Kept
+    /// apart from the mesh that is drawn: while the wanted mesh is not uploaded another level
+    /// is drawn in its place, and the hysteresis must not start from that one.
+    wanted: u8,
     /// Radius of the sphere that is measured on screen, in the entity's own units (it is
     /// scaled by the entity's `GlobalTransform`). For a model of several parts give every part
     /// the whole model's radius, so the parts change level together.
     pub radius: f32,
     /// Where the sphere's centre is, in the entity's own units.
     pub center: Vec3,
+}
+
+/// `MeshLod::wanted` of a component the renderer has not seen yet: its level is then the one
+/// of the mesh the entity has.
+const UNKNOWN: u8 = u8::MAX;
+
+impl PartialEq for MeshLod {
+    fn eq(&self, other: &Self) -> bool {
+        self.meshes() == other.meshes() && self.radius == other.radius && self.center == other.center
+    }
 }
 
 impl MeshLod {
@@ -54,6 +74,42 @@ impl MeshLod {
         Self {
             meshes: all,
             count: count as u8,
+            wanted: UNKNOWN,
+            radius,
+            center: Vec3::ZERO,
+        }
+    }
+
+    /// As [`Self::new`], with levels that may be no mesh: at a `None` level the entity is not
+    /// drawn (its [`Mesh3d`] is set to [`MeshHandle::NONE`], which no view draws; its
+    /// `Visibility` is not touched). At most [`MAX_LOD_LEVELS`] levels (the rest is left out).
+    ///
+    /// For a model of many parts that should cost one draw far away: give every part
+    /// `[Some(full), Some(simpler), None]` and one more entity, with the model's merged mesh and
+    /// its own material, `[None, None, Some(merged)]`, all with the same `radius` and centre
+    /// and the same number of levels, so they change level in the same frame. A part with no
+    /// simpler mesh repeats its full one (`[Some(full), Some(full), None]`). With levels of
+    /// detail off every entity draws its first level: the parts, not the merged mesh.
+    ///
+    /// The renderer cannot tell that such entities belong together. When the level asked for
+    /// has a mesh that is not uploaded yet it draws another level of the same entity, never a
+    /// `None` one, and an entity with no uploaded mesh at all is not drawn: have every mesh of
+    /// the model uploaded ([`RenderAssets::is_mesh_uploaded`]) before the entities are spawned,
+    /// or the parts can draw nothing while the merged mesh is still on its way.
+    ///
+    /// # Panics
+    /// With no level at all.
+    pub fn from_levels(radius: f32, levels: &[Option<MeshHandle>]) -> Self {
+        assert!(!levels.is_empty(), "a MeshLod needs a level");
+        let count = levels.len().min(MAX_LOD_LEVELS);
+        let mut all = [levels[0].unwrap_or(MeshHandle::NONE); MAX_LOD_LEVELS];
+        for (to, from) in all.iter_mut().zip(&levels[..count]) {
+            *to = from.unwrap_or(MeshHandle::NONE);
+        }
+        Self {
+            meshes: all,
+            count: count as u8,
+            wanted: UNKNOWN,
             radius,
             center: Vec3::ZERO,
         }
@@ -65,14 +121,28 @@ impl MeshLod {
         self
     }
 
-    /// The meshes, most detailed first.
+    /// The meshes, most detailed first ([`MeshHandle::NONE`] for a level that draws nothing).
     pub fn meshes(&self) -> &[MeshHandle] {
         &self.meshes[..self.count as usize]
     }
 
     /// Which level `mesh` is (0: the full mesh); `None` for a mesh that is not one of them.
+    /// The first of them when several levels hold the same mesh.
     pub fn level_of(&self, mesh: MeshHandle) -> Option<usize> {
         self.meshes().iter().position(|m| *m == mesh)
+    }
+
+    /// The mesh to draw while the one of `level` is not uploaded: of the levels that have an
+    /// uploaded mesh the nearest to `level`, the simpler one of two equally near (it is the
+    /// cheaper to draw until the wanted one arrives). `None` when no level has one.
+    fn nearest_uploaded(&self, level: usize, assets: &RenderAssets) -> Option<MeshHandle> {
+        let count = self.count as usize;
+        (1..count)
+            .flat_map(|d| [level.checked_add(d), level.checked_sub(d)])
+            .flatten()
+            .filter(|l| *l < count)
+            .map(|l| self.meshes[l])
+            .find(|m| assets.is_mesh_drawable(*m))
     }
 }
 
@@ -136,10 +206,19 @@ const MAX_CAMERAS: usize = 16;
 
 /// Set every [`MeshLod`] entity's [`Mesh3d`] to the level its size on screen asks for. Runs in
 /// the Render stage before the frame is extracted; allocates nothing.
+///
+/// With a renderer, a level whose mesh is not on the GPU yet is not drawn while another level
+/// of the entity is: the nearest uploaded level is drawn in its place, and the wanted one from
+/// the frame after it arrives (this runs before the frame's uploads). The level asked for is
+/// remembered in the [`MeshLod`], so the hysteresis goes on from it and not from the stand-in.
+/// Without a renderer or [`RenderAssets`] nothing is ever uploaded, and the level asked for is
+/// set as it is.
 pub(crate) fn select_lods(world: &mut World, resources: &Resources) {
     let settings = resources.get::<LodSettings>().copied().unwrap_or_default();
-    let primary = resources.get::<Renderer>().map_or((1280, 720), Renderer::size);
+    let renderer = resources.get::<Renderer>();
+    let primary = renderer.map_or((1280, 720), Renderer::size);
     let assets = resources.get::<RenderAssets>();
+    let uploads = renderer.and(assets);
     let mut cameras = [Scale::Orthographic(0.0); MAX_CAMERAS];
     let mut count = 0;
     let mut overflow = false;
@@ -166,10 +245,14 @@ pub(crate) fn select_lods(world: &mut World, resources: &Resources) {
     }
     let cameras = &cameras[..count];
     let full = !settings.enabled || overflow || cameras.is_empty();
-    for (lod, mesh, at) in world.query_mut::<(&MeshLod, &mut Mesh3d, &GlobalTransform)>() {
+    for (lod, mesh, at) in world.query_mut::<(&mut MeshLod, &mut Mesh3d, &GlobalTransform)>() {
         let level = if full {
             0
         } else {
+            let current = match lod.wanted {
+                UNKNOWN => lod.level_of(mesh.0).unwrap_or(0),
+                level => level as usize,
+            };
             let center = at.0.transform_point3(lod.center);
             let radius = lod.radius * max_axis_scale(&at.0);
             let px = cameras
@@ -179,11 +262,22 @@ pub(crate) fn select_lods(world: &mut World, resources: &Resources) {
                     Scale::Orthographic(k) => radius * k,
                 })
                 .fold(0.0, f32::max);
-            settings.pick(px, lod.level_of(mesh.0).unwrap_or(0))
+            settings.pick(px, current)
         };
-        let wanted = lod.meshes[level.min(lod.count as usize - 1)];
-        if mesh.0 != wanted {
-            mesh.0 = wanted;
+        let level = level.min(lod.count as usize - 1);
+        if lod.wanted != level as u8 {
+            lod.wanted = level as u8;
+        }
+        let mut drawn = lod.meshes[level];
+        if let Some(assets) = uploads
+            && !drawn.is_none()
+            && !assets.is_mesh_drawable(drawn)
+            && let Some(uploaded) = lod.nearest_uploaded(level, assets)
+        {
+            drawn = uploaded;
+        }
+        if mesh.0 != drawn {
+            mesh.0 = drawn;
         }
     }
 }
@@ -708,5 +802,178 @@ mod tests {
         select_lods(&mut world, &Resources::default());
         assert_eq!(world.get::<&Mesh3d>(e).unwrap().0, mid);
         assert_eq!(MeshLod::new(1.0, &[full, mid]).meshes(), [full, mid]);
+    }
+
+    #[test]
+    fn a_level_can_be_no_mesh() {
+        let [full, mid, merged] = handles();
+        let part = MeshLod::from_levels(2.0, &[Some(full), Some(mid), None]);
+        assert_eq!(part.meshes(), [full, mid, MeshHandle::NONE]);
+        assert_eq!((part.radius, part.level_of(MeshHandle::NONE)), (2.0, Some(2)));
+        let carrier = MeshLod::from_levels(2.0, &[None, None, Some(merged)]);
+        assert_eq!(carrier.meshes(), [MeshHandle::NONE, MeshHandle::NONE, merged]);
+        // the same levels are the same component, whatever level each was last drawn at
+        assert_eq!(
+            MeshLod::from_levels(1.0, &[Some(full), Some(mid)]),
+            MeshLod::new(1.0, &[full, mid])
+        );
+        assert_ne!(part, carrier);
+        // more levels than there can be: the rest is left out
+        let many = MeshLod::from_levels(1.0, &[None, Some(full), None, Some(mid), Some(merged)]);
+        assert_eq!(many.meshes(), [MeshHandle::NONE, full, MeshHandle::NONE, mid]);
+    }
+
+    /// A model of two parts and a carrier of its merged mesh: far away the carrier alone is
+    /// drawn, nearer the parts alone, and at no distance both or neither, going out and coming
+    /// back (the two directions change at different distances: the hysteresis).
+    #[test]
+    fn siblings_swap_parts_for_the_merged_mesh_in_the_same_frame() {
+        let [full, mid, merged] = handles();
+        let mut world = World::new();
+        let resources = Resources::default();
+        // 720 px tall, 60 degrees: a radius-1 sphere at distance d is 624 / d px, so the far
+        // level (under 20 px) starts near d = 31; with the hysteresis at 34.3 going out and at
+        // 28.4 coming back
+        world.spawn((Camera3d::default(), GlobalTransform(Mat4::IDENTITY)));
+        let at = |z: f32| GlobalTransform(Transform::from_xyz(0.0, 0.0, -z).matrix());
+        let part = MeshLod::from_levels(1.0, &[Some(full), Some(mid), None]);
+        // a part too simple to have a simpler mesh repeats its full one
+        let plain_part = MeshLod::from_levels(1.0, &[Some(full), Some(full), None]);
+        let carrier = MeshLod::from_levels(1.0, &[None, None, Some(merged)]);
+        let entities = [
+            world.spawn((part, Mesh3d(full), at(5.0))),
+            world.spawn((plain_part, Mesh3d(full), at(5.0))),
+            world.spawn((carrier, Mesh3d(MeshHandle::NONE), at(5.0))),
+        ];
+        let step = |world: &mut World, d: f32| {
+            for e in entities {
+                *world.get::<&mut GlobalTransform>(e).unwrap() = at(d);
+            }
+            select_lods(world, &resources);
+            let [a, b, c] = entities.map(|e| world.get::<&Mesh3d>(e).unwrap().0);
+            let far = c == merged;
+            assert_eq!(
+                c.is_none(),
+                !far,
+                "the carrier draws the merged mesh or nothing (at {d})"
+            );
+            assert_eq!(
+                (a.is_none(), b.is_none()),
+                (far, far),
+                "parts and carrier disagree at {d}"
+            );
+            assert!(far || (b == full && (a == full || a == mid)), "at {d}");
+            far
+        };
+        assert!(!step(&mut world, 5.0));
+        let distances: Vec<f32> = (0..=400).map(|i| 5.0 + i as f32 * 0.1).collect();
+        let out = distances.iter().copied().find(|d| step(&mut world, *d)).unwrap();
+        assert!((34.0..35.0).contains(&out), "merged from {out}");
+        assert!(step(&mut world, 45.0));
+        let back = distances.iter().rev().copied().find(|d| !step(&mut world, *d)).unwrap();
+        assert!((27.5..28.5).contains(&back), "parts again from {back}");
+        assert!(!step(&mut world, 5.0));
+        // levels of detail off: the parts, never the merged mesh
+        let mut off = Resources::default();
+        off.insert(LodSettings {
+            enabled: false,
+            ..LodSettings::default()
+        });
+        for e in entities {
+            *world.get::<&mut GlobalTransform>(e).unwrap() = at(100.0);
+        }
+        select_lods(&mut world, &resources);
+        assert_eq!(world.get::<&Mesh3d>(entities[2]).unwrap().0, merged);
+        select_lods(&mut world, &off);
+        let [a, b, c] = entities.map(|e| world.get::<&Mesh3d>(e).unwrap().0);
+        assert_eq!((a, b, c), (full, full, MeshHandle::NONE));
+    }
+
+    /// With a renderer, a level whose mesh is not uploaded is not drawn while another level
+    /// is: the nearest uploaded one stands in, and the wanted one takes over when it arrives,
+    /// also inside the hysteresis band, where a level read back from the stand-in would stick.
+    #[test]
+    fn a_level_that_is_not_uploaded_is_stood_in_for_by_the_nearest_that_is() {
+        let renderer = match pollster::block_on(Renderer::new_headless(1280, 720)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping GPU test: no adapter available ({e})");
+                return;
+            }
+        };
+        let mut resources = Resources::default();
+        resources.insert(renderer);
+        resources.insert(RenderAssets::default());
+        let upload = |resources: &mut Resources| {
+            let mut assets = std::mem::take(resources.get_mut::<RenderAssets>().unwrap());
+            resources.get_mut::<Renderer>().unwrap().upload_assets(&mut assets);
+            *resources.get_mut::<RenderAssets>().unwrap() = assets;
+        };
+        let add = |resources: &mut Resources| {
+            resources
+                .get_mut::<RenderAssets>()
+                .unwrap()
+                .add_mesh(MeshData::cube(1.0))
+        };
+        // only the simplest level is on the GPU
+        let low = add(&mut resources);
+        upload(&mut resources);
+        let (full, mid) = (add(&mut resources), add(&mut resources));
+        let merged = add(&mut resources);
+
+        let mut world = World::new();
+        world.spawn((Camera3d::default(), GlobalTransform(Mat4::IDENTITY)));
+        let at = |z: f32| GlobalTransform(Transform::from_xyz(0.0, 0.0, -z).matrix());
+        let lod = MeshLod::new(1.0, &[full, mid, low]);
+        // 624 / d px: 5 is well inside the full level, 11.5 (54 px) inside the band under its
+        // threshold, where the full mesh is kept and the second level is not left for the
+        // first, and 20 inside the second level
+        let near = world.spawn((lod, Mesh3d(full), at(5.0)));
+        let band = world.spawn((lod, Mesh3d(full), at(11.5)));
+        let middle = world.spawn((lod, Mesh3d(full), at(20.0)));
+        // a carrier whose only mesh is not uploaded has nothing to stand in: a level that
+        // draws nothing is never chosen in place of a mesh
+        let carrier = world.spawn((
+            MeshLod::from_levels(1.0, &[None, None, Some(merged)]),
+            Mesh3d(MeshHandle::NONE),
+            at(100.0),
+        ));
+        // and a part far away draws nothing because that is its level, uploaded or not
+        let part = world.spawn((
+            MeshLod::from_levels(1.0, &[Some(full), Some(mid), None]),
+            Mesh3d(full),
+            at(100.0),
+        ));
+        let mesh = |world: &World, e| world.get::<&Mesh3d>(e).unwrap().0;
+        for _ in 0..2 {
+            select_lods(&mut world, &resources);
+            assert_eq!([near, band, middle].map(|e| mesh(&world, e)), [low, low, low]);
+            assert_eq!((mesh(&world, carrier), mesh(&world, part)), (merged, MeshHandle::NONE));
+        }
+        // everything arrives: each draws the level its size asks for, the one in the band its
+        // full mesh (from the stand-in, the third level, it would have stopped at the second)
+        upload(&mut resources);
+        select_lods(&mut world, &resources);
+        assert_eq!([near, band, middle].map(|e| mesh(&world, e)), [full, full, mid]);
+        assert_eq!(mesh(&world, carrier), merged);
+
+        // of two levels equally near the simpler one stands in; a nearer one wins over both
+        let wanted = add(&mut resources);
+        let lod = MeshLod::new(1.0, &[full, wanted, low]);
+        let e = world.spawn((lod, Mesh3d(full), at(20.0)));
+        select_lods(&mut world, &resources);
+        assert_eq!(mesh(&world, e), low);
+        let far = world.spawn((MeshLod::new(1.0, &[full, mid, wanted]), Mesh3d(full), at(100.0)));
+        select_lods(&mut world, &resources);
+        assert_eq!(mesh(&world, far), mid);
+        // a mesh whose update waits still has its previous copy: it is drawn, not stood in for
+        let assets = resources.get_mut::<RenderAssets>().unwrap();
+        assert!(assets.update_mesh(mid, MeshData::cube(2.0)) && !assets.is_mesh_uploaded(mid));
+        select_lods(&mut world, &resources);
+        assert_eq!((mesh(&world, middle), mesh(&world, far)), (mid, mid));
+        upload(&mut resources);
+        select_lods(&mut world, &resources);
+        assert_eq!((mesh(&world, e), mesh(&world, far)), (wanted, wanted));
+        assert_eq!(resources.get::<Renderer>().unwrap().gpu_error_count(), 0);
     }
 }

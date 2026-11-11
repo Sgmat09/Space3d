@@ -218,7 +218,102 @@ draws that mesh, the shadow maps included. An entity without `MeshLod` keeps its
   (above 1 simpler meshes come sooner); `enabled: false` draws every full mesh. An entity with
   fewer meshes than the level asked for draws its last.
 * **Hysteresis.** A level changes only once the size is 10 % past its threshold, so a model
-  whose size sits on a threshold does not flicker between two meshes.
+  whose size sits on a threshold does not flicker between two meshes. The level last asked for
+  is kept in the `MeshLod` (it is not part of its equality).
+* **A level that is not uploaded yet.** With a renderer, a level whose mesh has no copy on the
+  GPU is not drawn while another level of the entity has one: the nearest such level is drawn
+  in its place (of two equally near, the simpler), and the level asked for from the frame after
+  its mesh arrives (the selection runs before the frame's uploads). The stand-in does not move
+  the hysteresis: it goes on from the level asked for. An entity none of whose meshes is
+  uploaded keeps the level asked for and is not drawn, as before. Without a renderer or
+  `RenderAssets` (simulation-only apps, tests) the level asked for is set as it is.
+
+### Levels that draw nothing
+
+```rust
+// every part of the model, with the model's radius and centre
+MeshLod::from_levels(radius, &[Some(full), Some(simpler), None]);
+// a part with no simpler mesh repeats its full one
+MeshLod::from_levels(radius, &[Some(full), Some(full), None]);
+// one more entity: the whole model merged into one mesh, with its own material
+world.spawn((transform, Mesh3d(MeshHandle::NONE), material,
+             MeshLod::from_levels(radius, &[None, None, Some(merged)])));
+```
+
+`MeshLod::from_levels` takes `Option<MeshHandle>` per level. At a `None` level the entity's
+`Mesh3d` is set to `MeshHandle::NONE`, the handle of no mesh, and the entity is not drawn: the
+extraction skips it as it skips a mesh that is not uploaded, so it is in no batch, on no draw
+path, in no camera view and in no shadow map. Its `Visibility` is not touched (an app's own
+`Hidden` still hides it at every level), and entities without `MeshLod` pay nothing for it.
+`MeshLod::meshes()` lists `MeshHandle::NONE` for such a level, and `Mesh3d(MeshHandle::NONE)`
+on any entity draws nothing.
+
+A model of P parts so costs one batch entry far away instead of P: the parts draw nothing at
+the far level and one sibling entity draws the merged mesh there and nothing nearer.
+
+* Give all of them the same `radius`, centre and number of levels, so they change level in the
+  same frame: each picks its level from the same sphere and keeps its own hysteresis state,
+  which then stays the same for all.
+* With levels of detail off, without an active camera or with more than 16, every entity is at
+  its first level: the parts are drawn and the merged mesh is not.
+* The renderer does not know that the entities belong together. A `None` level never stands in
+  for a mesh that is not uploaded, so a merged mesh still on its way is not drawn while the
+  parts already draw nothing. Spawn the entities once every mesh of the model is uploaded
+  (`RenderAssets::is_mesh_uploaded`).
+* The entity count is unchanged: every entity still passes through `select_lods` and transform
+  propagation. What shrinks is the batches' instances and the extraction's work.
+
+## Asset uploads and the upload budget
+
+```rust
+app.insert_resource(UploadBudget::per_frame(4 << 20));          // 4 MiB of meshes and textures a frame
+let ready = assets.is_mesh_uploaded(mesh) && assets.is_texture_uploaded(texture);
+let left = assets.pending_upload_bytes();                       // or RenderStats::pending_upload_bytes
+```
+
+`RenderAssets::add_mesh`, `add_texture` and their relatives only queue. The renderer uploads
+the queues at the start of each frame, on the frame's encoder, meshes before textures. Without
+a budget (`UploadBudget::default()`, which `RenderPlugin` inserts) everything queued uploads in
+that one frame.
+
+* **`UploadBudget { bytes, headless }`** (resource). `bytes: Some(n)` limits the mesh and
+  texture data uploaded in one frame. The queues are uploaded in the order they were filled,
+  as one sequence (the mesh queue, then the texture queue), and the frame stops at the first
+  item that does not fit in what is left of `n`; that item and everything after it wait for the
+  next frames. The first item of a frame is uploaded whatever its size, so an item larger than
+  the budget takes a frame alone. An item is a whole mesh (vertices, indices and its extension
+  vertices: 36 bytes a vertex, 4 an index, 16 an extension vertex) or a whole texture (the
+  bytes of its source, every provided mip and layer): it is uploaded entirely in one frame or
+  not at all, and its mip chain is generated in that same frame. So a texture is never sampled
+  half written, and a frame's uploads can exceed the budget only by a single item.
+* **What does not wait.**
+  * Render targets hold no data and are created (or recreated after `resize_render_target`)
+    in the next frame.
+  * A mesh replaced with `update_mesh` while it has a GPU copy is uploaded in the next frame,
+    so geometry that is being drawn changes when it did before. Its bytes count against the
+    frame's budget.
+* **What waits, and what is drawn meanwhile.**
+  * A new mesh: its entities are not drawn until it is uploaded.
+  * A new texture: materials draw without that map (base colour white, no normal map) until
+    it is uploaded, then rebind by themselves.
+  * A texture replaced with `update_texture`: its previous contents stay bound until the new
+    ones are uploaded. A small texture can so be shown first and its full version queued behind.
+  * A mesh or texture replaced again while it waits keeps its place in the queue.
+* **Headless.** A headless renderer ignores the budget unless `headless: true`, so
+  `render_to_image` and captures show the whole scene.
+* **`Renderer::upload_assets`** uploads everything now, whatever the budget.
+* **Residency.** `RenderAssets::is_mesh_uploaded(handle)` and `is_texture_uploaded(handle)` are
+  true once the current data is on the GPU and nothing of it waits (for a render target: once
+  it is created). `pending_upload_bytes()` is the data still queued, in one pass over the
+  queues. `RenderStats::{pending_meshes, pending_textures, pending_upload_bytes}` are the same
+  counts as of the end of the last frame's uploads; all three are 0 without a budget.
+* **What is drawn.** An entity is drawn while its mesh has a GPU copy, on the ECS path as on
+  the `InstancedMesh` path; `is_mesh_uploaded` is the stricter test (false from `update_mesh`
+  until the upload).
+
+The budget bounds the copies the renderer makes. It does not bound what `add_mesh` itself
+does on the caller's thread (bounds, extension vertices), nor pipelines built at first draw
+(`Renderer::prewarm`).
 
 `lod::simplify(&data, &extras, cell)` makes the coarser mesh by vertex clustering: the vertices
 inside each cube of side `cell` become one (the one nearest their middle, with their normals

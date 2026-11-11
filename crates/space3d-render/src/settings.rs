@@ -5,6 +5,51 @@
 //! Config structs are plain `pub`-field structs with `Default` (functional record update:
 //! `FrameSettings { post: false, ..Default::default() }`); enums are `#[non_exhaustive]`.
 
+/// How much mesh and texture data the renderer uploads in one frame (resource, inserted by
+/// [`crate::RenderPlugin`]; the default is no limit, so everything queued uploads in the next
+/// frame).
+///
+/// A model that arrives during play is tens of megabytes of vertices and texels, and copying
+/// them all in one frame is a long frame. With a budget the renderer uploads what was queued
+/// first ([`crate::RenderAssets`]: `add_mesh`, `add_texture`, `update_texture`, ...), meshes
+/// before textures, and stops at the first item that no longer fits in the frame's bytes; the
+/// rest waits for the next frames, in the order it was queued. An item is uploaded whole or not
+/// at all, and the first item of a frame is uploaded whatever its size, so one item larger than
+/// the budget takes a frame of its own.
+///
+/// Until its mesh arrives an entity is not drawn; until a texture arrives its material draws
+/// without that map ([`crate::RenderAssets::is_mesh_uploaded`],
+/// [`crate::RenderAssets::is_texture_uploaded`]). What is already drawn stays drawn:
+///
+/// * A texture replaced with `update_texture` keeps its previous contents until the new ones
+///   are uploaded, and the replacement waits its turn like a new texture.
+/// * A mesh replaced with `update_mesh` while it has a GPU copy is uploaded in the next frame
+///   whatever the budget (its bytes count against the frame, so new items wait longer).
+/// * Render targets hold no data and are created in the next frame whatever the budget.
+///
+/// [`crate::Renderer::upload_assets`] uploads everything at once whatever the budget.
+/// [`crate::RenderStats`] reports what is still waiting (`pending_meshes`,
+/// `pending_textures`, `pending_upload_bytes`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadBudget {
+    /// Bytes of mesh and texture data uploaded in one frame at most (a single larger item
+    /// aside). `None`: no limit.
+    pub bytes: Option<u64>,
+    /// Apply the budget on a headless renderer too. Off, a headless renderer uploads everything
+    /// at once, so a capture never shows a scene half loaded.
+    pub headless: bool,
+}
+
+impl UploadBudget {
+    /// At most `bytes` a frame, on windowed renderers.
+    pub fn per_frame(bytes: u64) -> Self {
+        Self {
+            bytes: Some(bytes),
+            headless: false,
+        }
+    }
+}
+
 /// Global frame options (resource, inserted by [`crate::RenderPlugin`]). Changes apply to the
 /// next frame.
 #[derive(Clone, Debug, PartialEq)]
