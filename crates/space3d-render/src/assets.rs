@@ -570,7 +570,9 @@ impl RenderAssets {
     /// render target: it is created) and nothing of it waits. False for a texture still queued
     /// (materials draw without it until it arrives), for one replaced with
     /// [`Self::update_texture`] until the new contents are uploaded (the previous contents are
-    /// drawn meanwhile), and for one whose upload failed.
+    /// drawn meanwhile), and for a new texture whose upload failed (logged). A replacement whose
+    /// upload failed is dropped: the texture keeps its previous contents and reports them as
+    /// uploaded, while [`Self::texture_size`] already gives the size of the failed replacement.
     pub fn is_texture_uploaded(&self, handle: TextureHandle) -> bool {
         self.textures
             .get(handle.raw())

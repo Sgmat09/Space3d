@@ -251,15 +251,21 @@ on any entity draws nothing.
 A model of P parts so costs one batch entry far away instead of P: the parts draw nothing at
 the far level and one sibling entity draws the merged mesh there and nothing nearer.
 
-* Give all of them the same `radius`, centre and number of levels, so they change level in the
-  same frame: each picks its level from the same sphere and keeps its own hysteresis state,
-  which then stays the same for all.
+* Give all of them the same `radius`, centre and number of levels, and spawn them in the same
+  frame, so they change level in the same frame: each picks its level from the same sphere and
+  keeps its own hysteresis state, which then stays the same for all. The state starts at the
+  level of the entity's `Mesh3d`. An entity added to the model later, or given a new `MeshLod`,
+  starts again: inside the 10 % band around a threshold it can be one level away from the
+  others (a part drawn together with the merged mesh, or neither drawn) until the model leaves
+  the band. `MeshLod::from_levels(..).with_level_of(&sibling_lod)` starts it at the level the
+  sibling was last asked for instead.
 * With levels of detail off, without an active camera or with more than 16, every entity is at
   its first level: the parts are drawn and the merged mesh is not.
 * The renderer does not know that the entities belong together. A `None` level never stands in
-  for a mesh that is not uploaded, so a merged mesh still on its way is not drawn while the
-  parts already draw nothing. Spawn the entities once every mesh of the model is uploaded
-  (`RenderAssets::is_mesh_uploaded`).
+  for a mesh that is not uploaded, so with the merged mesh still on its way the parts draw
+  nothing at the far level and the whole model is not drawn until it arrives. Spawn the
+  entities only once `RenderAssets::is_mesh_uploaded` is true for every mesh of the model, the
+  merged one included.
 * The entity count is unchanged: every entity still passes through `select_lods` and transform
   propagation. What shrinks is the batches' instances and the extraction's work.
 
@@ -272,13 +278,13 @@ let left = assets.pending_upload_bytes();                       // or RenderStat
 ```
 
 `RenderAssets::add_mesh`, `add_texture` and their relatives only queue. The renderer uploads
-the queues at the start of each frame, on the frame's encoder, meshes before textures. Without
+the queues at the start of each frame, on the frame's encoder, textures before meshes. Without
 a budget (`UploadBudget::default()`, which `RenderPlugin` inserts) everything queued uploads in
 that one frame.
 
 * **`UploadBudget { bytes, headless }`** (resource). `bytes: Some(n)` limits the mesh and
   texture data uploaded in one frame. The queues are uploaded in the order they were filled,
-  as one sequence (the mesh queue, then the texture queue), and the frame stops at the first
+  as one sequence (the texture queue, then the mesh queue), and the frame stops at the first
   item that does not fit in what is left of `n`; that item and everything after it wait for the
   next frames. The first item of a frame is uploaded whatever its size, so an item larger than
   the budget takes a frame alone. An item is a whole mesh (vertices, indices and its extension
@@ -286,16 +292,26 @@ that one frame.
   bytes of its source, every provided mip and layer): it is uploaded entirely in one frame or
   not at all, and its mip chain is generated in that same frame. So a texture is never sampled
   half written, and a frame's uploads can exceed the budget only by a single item.
+* **Textures first.** An entity is drawn as soon as its mesh is uploaded, and a material draws
+  without a map that is not uploaded. Because the texture queue goes first and the frame stops
+  at the first item that does not fit, no new mesh is uploaded while a texture still waits: a
+  model whose textures were queued no later than the frame its meshes upload in is first drawn
+  with all of them. Textures queued after that frame (decoded later than the meshes) are not
+  covered: spawn such a model once `is_mesh_uploaded` is true for its meshes and
+  `is_texture_uploaded` for its maps. While textures keep being queued, new meshes wait.
 * **What does not wait.**
   * Render targets hold no data and are created (or recreated after `resize_render_target`)
     in the next frame.
   * A mesh replaced with `update_mesh` while it has a GPU copy is uploaded in the next frame,
     so geometry that is being drawn changes when it did before. Its bytes count against the
-    frame's budget.
+    frame's budget, but the upload itself is not spread: to bring a full mesh in behind a
+    placeholder without a long frame, `add_mesh` it as a new mesh and switch the entity's
+    `Mesh3d` (or its `MeshLod`) to it once `is_mesh_uploaded` is true.
 * **What waits, and what is drawn meanwhile.**
   * A new mesh: its entities are not drawn until it is uploaded.
-  * A new texture: materials draw without that map (base colour white, no normal map) until
-    it is uploaded, then rebind by themselves.
+  * A new texture: materials draw without that map (the factor alone: base colour white, no
+    normal map, the emissive factor unmasked) until it is uploaded, then rebind by themselves.
+    This is seen only where the texture was queued after its mesh was uploaded (above).
   * A texture replaced with `update_texture`: its previous contents stay bound until the new
     ones are uploaded. A small texture can so be shown first and its full version queued behind.
   * A mesh or texture replaced again while it waits keeps its place in the queue.
@@ -304,7 +320,9 @@ that one frame.
 * **`Renderer::upload_assets`** uploads everything now, whatever the budget.
 * **Residency.** `RenderAssets::is_mesh_uploaded(handle)` and `is_texture_uploaded(handle)` are
   true once the current data is on the GPU and nothing of it waits (for a render target: once
-  it is created). `pending_upload_bytes()` is the data still queued, in one pass over the
+  it is created). A new texture whose upload failed stays false; a replacement whose upload
+  failed is dropped, and the texture goes on reporting its previous contents as uploaded.
+  `pending_upload_bytes()` is the data still queued, in one pass over the
   queues. `RenderStats::{pending_meshes, pending_textures, pending_upload_bytes}` are the same
   counts as of the end of the last frame's uploads; all three are 0 without a budget.
 * **What is drawn.** An entity is drawn while its mesh has a GPU copy, on the ECS path as on

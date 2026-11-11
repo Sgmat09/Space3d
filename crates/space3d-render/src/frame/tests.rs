@@ -2745,10 +2745,11 @@ fn upload_queue_scene(
     ((first, red, drawn), meshes, textures)
 }
 
-/// Under a budget the queued meshes and textures upload over several frames, the first queued
-/// first, and the picture is whole in every one of them: what was drawn stays drawn (a texture
-/// being replaced with its previous contents), a cube appears once its mesh is there (white
-/// until its texture is), and no pixel shows anything else.
+/// Under a budget the queued textures and then the queued meshes upload over several frames,
+/// the first queued first, and the picture is whole in every one of them: what was drawn stays
+/// drawn (a texture being replaced with its previous contents), a cube appears once its mesh is
+/// there, with its texture from its first frame (no mesh is uploaded while a texture waits), and
+/// no pixel shows anything else.
 #[test]
 fn a_budgeted_queue_drains_in_order_and_what_is_drawn_stays_drawn() {
     use crate::{RenderStats, UploadBudget};
@@ -2759,14 +2760,14 @@ fn a_budgeted_queue_drains_in_order_and_what_is_drawn_stays_drawn() {
     let assets = app.resources.expect_mut::<RenderAssets>();
     assert!(assets.update_image(red, ImageData::filled(16, 16, [0, 255, 0, 255])));
     // A cube is 24 vertices of 36 bytes and 36 indices: 1008 bytes; a texture 1024. Two cubes
-    // fit a frame; a cube and a texture do not, and neither do two textures.
+    // fit a frame; a texture and a cube do not, and neither do two textures.
     let (cube, texture) = (1008u64, 1024u64);
     app.insert_resource(UploadBudget {
         bytes: Some(2 * cube),
         headless: true,
     });
     // Meshes and textures (the replaced one included) uploaded after each frame.
-    let frames: [(u32, u32); 7] = [(2, 0), (4, 0), (5, 0), (5, 1), (5, 2), (5, 3), (5, 4)];
+    let frames: [(u32, u32); 7] = [(0, 1), (0, 2), (0, 3), (0, 4), (2, 4), (4, 4), (5, 4)];
     let mut before = (0, 0);
     for (frame, (done_meshes, done_textures)) in frames.into_iter().enumerate() {
         let img = crate::render_to_image(&mut app).expect("capture");
@@ -2807,15 +2808,13 @@ fn a_budgeted_queue_drains_in_order_and_what_is_drawn_stays_drawn() {
         assert_eq!((reds, greens), expected, "frame {frame}");
         // A cube whose mesh is uploaded is drawn from that frame on.
         assert_eq!(stats.instances, 1 + done_meshes as u64, "frame {frame}");
-        // Each of them is white until its texture arrives and blue after: no texel of a texture
-        // that is not wholly uploaded is ever sampled.
-        let textured = (0..done_meshes as usize)
-            .filter(|i| i % 3 < done_textures as usize)
-            .count();
+        // Each of them is blue from its first frame, never white (the colour without the
+        // texture): the textures were all there before the first of the meshes, and no texel
+        // of a texture that is not wholly uploaded is ever sampled.
         let (whites, blues) = (count_px(&img, [255, 255, 255]), count_px(&img, [0, 0, 255]));
         assert_eq!(
-            (whites > 0, blues > 0),
-            (textured < done_meshes as usize, textured > 0),
+            (whites, blues > 0),
+            (0, done_meshes > 0),
             "frame {frame}: {whites} white, {blues} blue"
         );
         let black = count_px(&img, [0, 0, 0]);
@@ -2880,11 +2879,12 @@ fn mesh_updates_and_render_targets_do_not_wait_behind_the_queue() {
     let img = crate::render_to_image(&mut app).expect("capture");
     let stats = app.resources.expect::<RenderStats>().clone();
     let assets = app.resources.expect_mut::<RenderAssets>();
-    // One new mesh a frame at this budget, and no texture yet.
-    assert_eq!((stats.pending_meshes, stats.pending_textures), (4, 3));
-    assert_eq!((stats.meshes_uploaded, stats.textures_uploaded), (2, 1));
-    assert!(assets.is_mesh_uploaded(first) && assets.is_mesh_uploaded(meshes[0]));
-    assert!(!assets.is_mesh_uploaded(meshes[1]) && !assets.is_texture_uploaded(textures[0]));
+    // One new item a frame at this budget, the textures first: the first texture, and no new
+    // mesh yet. The replaced mesh and the render target come on top of it.
+    assert_eq!((stats.pending_meshes, stats.pending_textures), (5, 2));
+    assert_eq!((stats.meshes_uploaded, stats.textures_uploaded), (1, 2));
+    assert!(assets.is_mesh_uploaded(first) && assets.is_texture_uploaded(textures[0]));
+    assert!(!assets.is_mesh_uploaded(meshes[0]) && !assets.is_texture_uploaded(textures[1]));
     assert!(assets.is_texture_uploaded(target));
     let grown = count_px(&img, [255, 0, 0]);
     assert!(
@@ -2894,13 +2894,14 @@ fn mesh_updates_and_render_targets_do_not_wait_behind_the_queue() {
     // Resized, the target is created again in the next frame; replaced while it waits, a
     // texture keeps its place in the queue.
     assert!(assets.resize_render_target(target, 48, 48) && !assets.is_texture_uploaded(target));
-    assert!(assets.update_image(textures[0], ImageData::filled(16, 16, [0, 0, 255, 255])));
+    assert!(assets.update_image(textures[2], ImageData::filled(16, 16, [0, 0, 255, 255])));
+    assert_eq!(assets.pending_textures, [textures[1], textures[2], target]);
     crate::render_to_image(&mut app).expect("capture");
     let stats = app.resources.expect::<RenderStats>().clone();
-    assert_eq!((stats.pending_meshes, stats.pending_textures), (3, 3));
+    assert_eq!((stats.pending_meshes, stats.pending_textures), (5, 1));
     let mut assets = std::mem::take(app.resources.expect_mut::<RenderAssets>());
-    assert!(assets.is_texture_uploaded(target) && assets.is_mesh_uploaded(meshes[1]));
-    assert_eq!(assets.pending_textures[0], textures[0]);
+    assert!(assets.is_texture_uploaded(target) && assets.is_texture_uploaded(textures[1]));
+    assert_eq!(assets.pending_textures, [textures[2]]);
     // The explicit flush is not budgeted.
     app.resources.expect_mut::<Renderer>().upload_assets(&mut assets);
     assert_eq!(assets.pending_uploads(), (0, 0, 0));

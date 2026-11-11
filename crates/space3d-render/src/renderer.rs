@@ -910,7 +910,7 @@ impl Renderer {
         self.uploader.recall();
     }
 
-    /// Encode pending asset uploads (mesh arena + textures): everything queued, or with a
+    /// Encode pending asset uploads (textures, then the mesh arena): everything queued, or with a
     /// `budget` in bytes the first of it (see [`crate::UploadBudget`]). What is left stays in
     /// the queues in its order, and the stats say how much that is.
     pub(crate) fn upload_assets_into(
@@ -924,62 +924,15 @@ impl Renderer {
         for a in assets.freed_allocs.drain(..) {
             assets.arena.free(a);
         }
+        // Textures before meshes: an entity is drawn as soon as its mesh is uploaded, so a mesh
+        // must not arrive ahead of the maps queued with it (its material would draw without
+        // them meanwhile). The frame stops at the first item that does not fit, so no new mesh
+        // is uploaded while a texture still waits.
+        if !assets.pending_textures.is_empty() {
+            self.upload_textures(encoder, assets, &mut allowance);
+        }
         if !assets.pending_meshes.is_empty() {
             self.upload_meshes(encoder, assets, &mut allowance);
-        }
-        if !assets.pending_textures.is_empty() {
-            let mut pending = std::mem::take(&mut assets.pending_textures);
-            for h in &pending {
-                let Some(entry) = assets.textures.get_mut(h.raw()) else {
-                    continue;
-                };
-                if entry.render_target {
-                    // A render target holds no data, and cameras that draw into it are skipped
-                    // until it exists: it never waits behind queued images.
-                    entry.queued = false;
-                    if entry.gpu.is_some() {
-                        continue;
-                    }
-                } else {
-                    // Until its turn the texture keeps what it has: nothing for a new one (its
-                    // materials draw without it), the previous contents for a replaced one.
-                    if entry.source.is_some() && !allowance.admit(entry.pending_bytes()) {
-                        assets.pending_textures.push(*h);
-                        continue;
-                    }
-                    entry.queued = false;
-                    if entry.source.is_none() {
-                        continue;
-                    }
-                }
-                let targets = crate::texture::TargetCaps {
-                    hdr_format: self.frame_graphics.hdr_format,
-                    hdr_msaa: self.frame_graphics.hdr_msaa,
-                    max_msaa: self.caps.max_msaa,
-                    msaa_depth_binding: self.graphics.msaa_depth_resolve,
-                };
-                match create_gpu_texture(
-                    &self.adapter,
-                    &self.device,
-                    &self.queue,
-                    encoder,
-                    &mut self.pipelines,
-                    &mut self.samplers,
-                    targets,
-                    entry,
-                ) {
-                    Ok(bytes) => {
-                        self.uploader.bytes += bytes;
-                        self.stats.textures_uploaded += 1;
-                    }
-                    Err(e) => tracing::error!(texture = ?h, "texture upload failed: {e}"),
-                }
-            }
-            if assets.pending_textures.is_empty() {
-                // Nothing waits: keep the queue's memory for the next uploads.
-                pending.clear();
-                assets.pending_textures = pending;
-            }
         }
         let (meshes, textures, bytes) = assets.pending_uploads();
         self.stats.pending_meshes = meshes;
@@ -987,6 +940,69 @@ impl Renderer {
         self.stats.pending_upload_bytes = bytes;
     }
 
+    /// Create the queued textures the frame's allowance admits, and every queued render target.
+    fn upload_textures(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        assets: &mut RenderAssets,
+        allowance: &mut UploadAllowance,
+    ) {
+        let mut pending = std::mem::take(&mut assets.pending_textures);
+        for h in &pending {
+            let Some(entry) = assets.textures.get_mut(h.raw()) else {
+                continue;
+            };
+            if entry.render_target {
+                // A render target holds no data, and cameras that draw into it are skipped
+                // until it exists: it never waits behind queued images.
+                entry.queued = false;
+                if entry.gpu.is_some() {
+                    continue;
+                }
+            } else {
+                // Until its turn the texture keeps what it has: nothing for a new one (its
+                // materials draw without it), the previous contents for a replaced one.
+                if entry.source.is_some() && !allowance.admit(entry.pending_bytes()) {
+                    assets.pending_textures.push(*h);
+                    continue;
+                }
+                entry.queued = false;
+                if entry.source.is_none() {
+                    continue;
+                }
+            }
+            let targets = crate::texture::TargetCaps {
+                hdr_format: self.frame_graphics.hdr_format,
+                hdr_msaa: self.frame_graphics.hdr_msaa,
+                max_msaa: self.caps.max_msaa,
+                msaa_depth_binding: self.graphics.msaa_depth_resolve,
+            };
+            match create_gpu_texture(
+                &self.adapter,
+                &self.device,
+                &self.queue,
+                encoder,
+                &mut self.pipelines,
+                &mut self.samplers,
+                targets,
+                entry,
+            ) {
+                Ok(bytes) => {
+                    self.uploader.bytes += bytes;
+                    self.stats.textures_uploaded += 1;
+                }
+                Err(e) => tracing::error!(texture = ?h, "texture upload failed: {e}"),
+            }
+        }
+        if assets.pending_textures.is_empty() {
+            // Nothing waits: keep the queue's memory for the next uploads.
+            pending.clear();
+            assets.pending_textures = pending;
+        }
+    }
+
+    /// Upload the queued meshes the frame's allowance admits, and every replaced mesh that has
+    /// a GPU copy.
     fn upload_meshes(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,

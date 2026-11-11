@@ -210,10 +210,12 @@ Additions made by the foundation since F2 (additive):
     mesh, which no view draws, and `MeshLod::from_levels(radius, &[Option<MeshHandle>])`.
     `MeshLod` keeps the level last asked for, and its `PartialEq` compares the levels and the
     sphere only. With a renderer, `render::select_lods` draws the nearest uploaded level in
-    place of one whose mesh is not on the GPU yet.
+    place of one whose mesh is not on the GPU yet. `MeshLod::with_level_of(&other)` starts an
+    entity added later at the level a sibling was last asked for.
     ([frame.md](frame.md#levels-that-draw-nothing))
   * Upload budget: the `UploadBudget` resource (`bytes`, `headless`; `per_frame(bytes)`),
-    inserted by `RenderPlugin` with no limit. `RenderAssets::is_texture_uploaded(handle)` and
+    inserted by `RenderPlugin` with no limit; textures upload before meshes, so no new mesh
+    arrives while a texture waits. `RenderAssets::is_texture_uploaded(handle)` and
     `pending_upload_bytes()` beside `is_mesh_uploaded`;
     `RenderStats::{pending_meshes, pending_textures, pending_upload_bytes}`. Behaviour-only: the
     ECS path draws an entity while its mesh has a GPU copy, the test the `InstancedMesh` path

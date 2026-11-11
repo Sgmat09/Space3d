@@ -91,11 +91,18 @@ impl MeshLod {
     /// simpler mesh repeats its full one (`[Some(full), Some(full), None]`). With levels of
     /// detail off every entity draws its first level: the parts, not the merged mesh.
     ///
-    /// The renderer cannot tell that such entities belong together. When the level asked for
-    /// has a mesh that is not uploaded yet it draws another level of the same entity, never a
-    /// `None` one, and an entity with no uploaded mesh at all is not drawn: have every mesh of
-    /// the model uploaded ([`RenderAssets::is_mesh_uploaded`]) before the entities are spawned,
-    /// or the parts can draw nothing while the merged mesh is still on its way.
+    /// The renderer cannot tell that such entities belong together, so two rules are the app's
+    /// to keep:
+    ///
+    /// * Have every mesh of the model uploaded ([`RenderAssets::is_mesh_uploaded`], the merged
+    ///   one included) before the entities are spawned. When the level asked for has a mesh that
+    ///   is not uploaded yet the renderer draws another level of the same entity, never a `None`
+    ///   one, and an entity with no uploaded mesh at all is not drawn: with the merged mesh
+    ///   still on its way the parts draw nothing at the far level and the model is not drawn.
+    /// * Spawn all of them in the same frame. Each keeps its own hysteresis state, which starts
+    ///   at the level of the entity's [`Mesh3d`]; one added later, or given a new `MeshLod`,
+    ///   starts again and can sit one level away from the others until the model leaves the
+    ///   band around a threshold. Give such a one [`Self::with_level_of`] a sibling's `MeshLod`.
     ///
     /// # Panics
     /// With no level at all.
@@ -118,6 +125,16 @@ impl MeshLod {
     /// With the measured sphere's centre moved (a part whose own origin is not the model's).
     pub fn with_center(mut self, center: Vec3) -> Self {
         self.center = center;
+        self
+    }
+
+    /// Starting from the level `other` was last asked for, instead of the level of the entity's
+    /// [`Mesh3d`]: for an entity added to a model whose other entities are already drawn (or a
+    /// `MeshLod` that replaces one), so that it is at their level from its first frame, also
+    /// inside the hysteresis band where its own start would pick the neighbouring level. Read
+    /// `other` from a sibling in the world; both need the same sphere and number of levels.
+    pub fn with_level_of(mut self, other: &MeshLod) -> Self {
+        self.wanted = other.wanted;
         self
     }
 
@@ -887,6 +904,54 @@ mod tests {
         select_lods(&mut world, &off);
         let [a, b, c] = entities.map(|e| world.get::<&Mesh3d>(e).unwrap().0);
         assert_eq!((a, b, c), (full, full, MeshHandle::NONE));
+    }
+
+    /// An entity added to a model that sits inside the hysteresis band starts from its own mesh
+    /// and lands one level away from its siblings; started from a sibling's level it is with
+    /// them from its first frame.
+    #[test]
+    fn a_late_sibling_starts_at_the_level_of_the_others() {
+        let [full, mid, merged] = handles();
+        let mut world = World::new();
+        let resources = Resources::default();
+        world.spawn((Camera3d::default(), GlobalTransform(Mat4::IDENTITY)));
+        let at = |z: f32| GlobalTransform(Transform::from_xyz(0.0, 0.0, -z).matrix());
+        let part = MeshLod::from_levels(1.0, &[Some(full), Some(mid), None]);
+        let carrier_lod = MeshLod::from_levels(1.0, &[None, None, Some(merged)]);
+        let first = world.spawn((part, Mesh3d(full), at(45.0)));
+        let carrier = world.spawn((carrier_lod, Mesh3d(MeshHandle::NONE), at(45.0)));
+        let mesh = |world: &World, e| world.get::<&Mesh3d>(e).unwrap().0;
+        select_lods(&mut world, &resources);
+        // back to 31: 20.1 px, inside the band of the 20 px threshold, so the far level stays
+        for e in [first, carrier] {
+            *world.get::<&mut GlobalTransform>(e).unwrap() = at(31.0);
+        }
+        select_lods(&mut world, &resources);
+        assert_eq!((mesh(&world, first), mesh(&world, carrier)), (MeshHandle::NONE, merged));
+        // a part added now picks the middle level by itself: drawn on top of the merged mesh
+        let alone = world.spawn((part, Mesh3d(full), at(31.0)));
+        // started from a sibling's level it draws nothing, as they do; and a carrier made
+        // again goes on drawing the merged mesh
+        let sibling = *world.get::<&MeshLod>(first).unwrap();
+        let late = world.spawn((part.with_level_of(&sibling), Mesh3d(full), at(31.0)));
+        *world.get::<&mut MeshLod>(carrier).unwrap() = carrier_lod.with_level_of(&sibling);
+        select_lods(&mut world, &resources);
+        assert_eq!(mesh(&world, alone), mid);
+        assert_eq!((mesh(&world, late), mesh(&world, carrier)), (MeshHandle::NONE, merged));
+        // from there it changes with the others
+        for e in [first, carrier, late] {
+            *world.get::<&mut GlobalTransform>(e).unwrap() = at(27.0);
+        }
+        select_lods(&mut world, &resources);
+        assert_eq!(
+            [first, late, carrier].map(|e| mesh(&world, e)),
+            [mid, mid, MeshHandle::NONE]
+        );
+        // a component the renderer has not seen has no level to give: the entity starts from
+        // its own mesh, as without it
+        let unseen = world.spawn((part.with_level_of(&part), Mesh3d(full), at(31.0)));
+        select_lods(&mut world, &resources);
+        assert_eq!(mesh(&world, unseen), mid);
     }
 
     /// With a renderer, a level whose mesh is not uploaded is not drawn while another level

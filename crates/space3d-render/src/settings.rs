@@ -11,20 +11,26 @@
 ///
 /// A model that arrives during play is tens of megabytes of vertices and texels, and copying
 /// them all in one frame is a long frame. With a budget the renderer uploads what was queued
-/// first ([`crate::RenderAssets`]: `add_mesh`, `add_texture`, `update_texture`, ...), meshes
-/// before textures, and stops at the first item that no longer fits in the frame's bytes; the
+/// first ([`crate::RenderAssets`]: `add_mesh`, `add_texture`, `update_texture`, ...), textures
+/// before meshes, and stops at the first item that no longer fits in the frame's bytes; the
 /// rest waits for the next frames, in the order it was queued. An item is uploaded whole or not
 /// at all, and the first item of a frame is uploaded whatever its size, so one item larger than
 /// the budget takes a frame of its own.
 ///
 /// Until its mesh arrives an entity is not drawn; until a texture arrives its material draws
 /// without that map ([`crate::RenderAssets::is_mesh_uploaded`],
-/// [`crate::RenderAssets::is_texture_uploaded`]). What is already drawn stays drawn:
+/// [`crate::RenderAssets::is_texture_uploaded`]). Textures go first so that a new mesh is never
+/// uploaded while a texture still waits: a model whose maps were queued no later than the frame
+/// its meshes upload in is first drawn with all of them. Maps queued after that (decoded
+/// later) are drawn without until they arrive, so an app that loads them late spawns the model
+/// only once both queries are true. What is already drawn stays drawn:
 ///
 /// * A texture replaced with `update_texture` keeps its previous contents until the new ones
 ///   are uploaded, and the replacement waits its turn like a new texture.
 /// * A mesh replaced with `update_mesh` while it has a GPU copy is uploaded in the next frame
-///   whatever the budget (its bytes count against the frame, so new items wait longer).
+///   whatever the budget (its bytes count against the frame, so new items wait longer). The
+///   budget so does not spread a large replacement: to stream a full mesh in behind a
+///   placeholder, add it as a new mesh and switch to it once it is uploaded.
 /// * Render targets hold no data and are created in the next frame whatever the budget.
 ///
 /// [`crate::Renderer::upload_assets`] uploads everything at once whatever the budget.
