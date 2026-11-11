@@ -193,17 +193,47 @@ pub(crate) fn select_lods(world: &mut World, resources: &Resources) {
 /// them averaged; triangles that collapse are dropped, and so are doubles. Cheap and robust
 /// (it needs no manifold mesh), and good for meshes drawn small: seams and hard edges closer
 /// than `cell` are welded.
+///
+/// Vertices are only joined where their texture coordinates are close too (within
+/// [`UV_REACH`] cells' worth of texture, by how much texture the mesh lays over a unit of
+/// space): the two sides of a seam lie at one place in space and far apart in the texture, and
+/// a triangle between vertices of two islands would be painted with whatever lies between them
+/// in the atlas.
 pub fn simplify(data: &MeshData, extras: &MeshExtras, cell: f32) -> (MeshData, MeshExtras) {
     let n = data.positions.len();
     let (min, _) = data.aabb();
     let inv = 1.0 / cell.max(1e-9);
-    let mut ids: HashMap<[i32; 3], u32> = HashMap::with_capacity(n / 4 + 1);
+    let mut ids: HashMap<[i32; 5], u32> = HashMap::with_capacity(n / 4 + 1);
+    // How much texture a unit of space is given, over the whole mesh: a cell of space is that much texture across.
+    let uv_inv = {
+        let (mut space, mut texture) = (0.0f64, 0.0f64);
+        if data.uvs.len() == n {
+            for t in data.indices.chunks_exact(3) {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let (a, b) = (a as usize, b as usize);
+                    space += f64::from(Vec3::from(data.positions[a]).distance(Vec3::from(data.positions[b])));
+                    texture += f64::from(glam::Vec2::from(data.uvs[a]).distance(glam::Vec2::from(data.uvs[b])));
+                }
+            }
+        }
+        let density = if space > 0.0 { (texture / space) as f32 } else { 0.0 };
+        if density > 0.0 {
+            1.0 / (cell.max(1e-9) * density * UV_REACH)
+        } else {
+            0.0
+        }
+    };
     let mut cluster = Vec::with_capacity(n);
     // Per cluster: the sum of its positions and normals, and how many they are.
     let mut sums: Vec<(Vec3, Vec3, u32)> = Vec::new();
     for (i, p) in data.positions.iter().enumerate() {
         let p = Vec3::from(*p);
-        let key = ((p - min) * inv).floor().as_ivec3().to_array();
+        let [x, y, z] = ((p - min) * inv).floor().as_ivec3().to_array();
+        let [u, v] = data
+            .uvs
+            .get(i)
+            .map_or([0, 0], |uv| uv.map(|c| (c * uv_inv).floor() as i32));
+        let key = [x, y, z, u, v];
         let id = *ids.entry(key).or_insert_with(|| {
             sums.push((Vec3::ZERO, Vec3::ZERO, 0));
             sums.len() as u32 - 1
@@ -259,6 +289,10 @@ pub fn simplify(data: &MeshData, extras: &MeshExtras, cell: f32) -> (MeshData, M
     }
     (out, out_extras)
 }
+
+/// How far apart in the texture [`simplify`] still joins two vertices of one cell of space:
+/// this many times the texture a cell of space is across, on average over the mesh.
+pub const UV_REACH: f32 = 3.0;
 
 /// [`simplify`] with the smallest cell that leaves at most `ratio` of the mesh's triangles
 /// (0.25: a quarter), found by halving. A mesh that cannot be brought that low without
@@ -333,7 +367,7 @@ mod tests {
         let extras = MeshExtras::new().with_tangents(vec![[1.0, 0.0, 0.0, 1.0]; full.positions.len()]);
         let (coarse, coarse_extras) = simplify(&full, &extras, 0.25);
         assert!(coarse.triangle_count() > 50, "{}", coarse.triangle_count());
-        assert!(coarse.triangle_count() * 8 < full.triangle_count());
+        assert!(coarse.triangle_count() * 4 < full.triangle_count());
         // every stream has a value for every vertex, and every index a vertex
         let n = coarse.positions.len();
         assert_eq!(
@@ -357,6 +391,45 @@ mod tests {
             let mut key = [t[0], t[1], t[2]];
             key.sort_unstable();
             assert!(seen.insert(key));
+        }
+    }
+
+    /// Two sheets at one place with their own islands of the texture (a hull's two sides, a seam) are not welded into each other: no
+    /// triangle of the simpler mesh reaches from one island to the other.
+    #[test]
+    fn a_seam_is_not_welded() {
+        let mut m = MeshData::default();
+        let n = 24u32;
+        for (sheet, u0) in [(0u32, 0.0f32), (1, 0.6)] {
+            for y in 0..=n {
+                for x in 0..=n {
+                    let (fx, fy) = (x as f32 / n as f32, y as f32 / n as f32);
+                    m.positions.push([fx, fy, 0.0]);
+                    m.normals.push([0.0, 0.0, if sheet == 0 { 1.0 } else { -1.0 }]);
+                    m.uvs.push([u0 + 0.3 * fx, 0.3 * fy]);
+                }
+            }
+            let base = sheet * (n + 1) * (n + 1);
+            for y in 0..n {
+                for x in 0..n {
+                    let a = base + y * (n + 1) + x;
+                    let b = a + n + 1;
+                    m.indices.extend([a, b, a + 1, a + 1, b, b + 1]);
+                }
+            }
+        }
+        let (coarse, _) = simplify(&m, &MeshExtras::new(), 0.2);
+        assert!(coarse.triangle_count() > 20 && coarse.triangle_count() * 4 < m.triangle_count());
+        for t in coarse.indices.chunks_exact(3) {
+            let u: Vec<f32> = t.iter().map(|i| coarse.uvs[*i as usize][0]).collect();
+            let island = |u: f32| u >= 0.45;
+            assert!(island(u[0]) == island(u[1]) && island(u[1]) == island(u[2]), "{u:?}");
+            // and the two sides keep their own normals
+            let z: Vec<f32> = t.iter().map(|i| coarse.normals[*i as usize][2]).collect();
+            assert!(
+                z.iter().all(|z| z.abs() > 0.99) && z[0] == z[1] && z[1] == z[2],
+                "{z:?}"
+            );
         }
     }
 
