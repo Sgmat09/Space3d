@@ -139,6 +139,33 @@ taps, which matters where the scene texture is large. A compute prefilter (each 
 once through workgroup memory) is the follow-up with the compute chain (see "Cost"). The
 composite's B-spline lookup takes 4 bilinear taps of level 0 instead of 1.
 
+### The low tiers' cheap filters (`Bloom::fast`)
+
+On an integrated GPU those two exact filters are a visible share of the frame: at 1080p on an
+AMD Radeon iGPU (Vulkan) the 9-load prefilter is about 0.6 ms of the chain's 1.65 ms and the
+B-spline lookup 0.15 to 0.35 ms of the composite's 1.9 ms. `Bloom::fast` (off by default;
+`PostProcess::with_quality` sets it for Low and Medium and clears it for High and Ultra) trades
+them:
+
+* the prefilter takes 4 bilinear taps half a pixel around scene pixel 2i (the same
+  [1 2 1] / 4 tent per axis) and applies exposure, threshold and firefly limit once, to their
+  mean. A source of 1–2 px is averaged with its dark neighbours before the threshold: it glows
+  less, and by an amount that depends on where it sits on the pixel grid (measured in
+  `the_fast_prefilter_keeps_large_sources_and_dims_small_ones`: a 32 px source keeps its glow,
+  smaller ones lose part of it, none gains). At the rect's edge the taps repeat the edge pixels;
+* the composite reads level 0 with one bilinear tap: at 720p and 1440p (2.67×) texels weigh up
+  to 3 % apart, so a small moving glow can pulse by that much; at 1080p level 0 is exactly half
+  size and the difference is smallest.
+
+Measured on that iGPU at Medium, 1080p (interleaved pairs against the build before): the
+chain 1.65 → 1.05 ms, the composite 1.88 → 1.55 ms in an empty scene and 1.92 → 1.77 ms in a
+busy one. On a discrete GPU both passes are under 0.1 ms either way.
+
+(Tried and dropped in the same pass: FXAA reading its luma from the LDR intermediate's alpha,
+with the centre and its four neighbours from two `textureGather` calls. On the same iGPU the
+FXAA pass went from 1.83 to 2.11 ms in an empty scene and from 1.93 to 2.33 ms in a busy one,
+two pairs each: gathers are no cheaper than bilinear fetches there.)
+
 ### Resolution independence
 
 A level's blur spans a fixed number of its own texels, so the halo keeps its size relative to
