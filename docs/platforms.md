@@ -77,14 +77,15 @@ program when a pipeline is first built (50–150 ms): prewarm on loading screens
 
 ## Android
 
-One-time setup:
+One-time setup (the exact commands for a Windows PC without Android Studio are in
+SpaceCorps2027's `docs/MOBILE.md`):
 
 ```sh
-# Android Studio → SDK Manager → SDK Tools → NDK (Side by side)
+# SDK: platform-tools, a platform, build-tools, the NDK (sdkmanager or Android Studio)
 export ANDROID_HOME="$HOME/Library/Android/sdk"        # Linux: $HOME/Android/Sdk
 export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/<version>"
 cargo install cargo-apk --locked
-rustup target add aarch64-linux-android
+# rust-toolchain.toml already lists aarch64-linux-android (phones) and x86_64-linux-android (PC emulators)
 ```
 
 Build and install:
@@ -95,11 +96,38 @@ adb install -r dist/android/<game>.apk
 adb logcat -s RustStdoutStderr
 ```
 
+The engine's own proof is `examples/hello_cube_mobile` (first run on a device: 2026-11-12, the
+Android 16 x86_64 emulator, cargo-apk 0.10.0, NDK 30):
+
+```sh
+cargo apk build -p hello_cube_mobile --lib --target x86_64-linux-android
+adb install -r target/debug/apk/hello_cube.apk
+adb shell am start -n org.spacecorps.space3d.hellocube/android.app.NativeActivity
+```
+
 Packaging metadata (application id, SDK levels, orientation, permissions, bundled `assets/`)
-lives in `[package.metadata.android]` of `mobile/Cargo.toml`. Rendering uses Vulkan (GLES
-fallback); touch input arrives as multi-touch `Touch`es and `Binding::TouchRegion` maps screen
-areas to actions. When the app is backgrounded the surface is dropped and recreated on resume —
-meshes and textures survive.
+lives in `[package.metadata.android]` of `mobile/Cargo.toml`; add `strip = "strip"` there, or a
+debug build's library carries hundreds of MB of debug info into the APK. What the engine does
+on Android:
+
+- **Entry**: `space3d::main!` generates `android_main` (NativeActivity; no Java code).
+  `space3d::platform::android_app()` is the activity's handle from the game's `build` on, and
+  `space3d::platform::mobile::data_dir()` the folder the app may write in.
+- **Assets**: the default asset source is `AndroidAssetSource`, the APK's `assets/` read through
+  the activity's asset manager (they are zip entries, not files). Hot reload is off.
+- **Rendering**: Vulkan (GLES fallback). wgpu's debug flags are off even in a debug build: the
+  emulator's Vulkan driver crashes when objects are named (set `WGPU_DEBUG=1` to ask for them).
+- **Lifecycle**: in the background the surface is dropped and the loop sleeps (no frames, no
+  systems); on resume the surface is recreated, meshes and textures survive.
+- **Input**: multi-touch `Touch`es, `Binding::TouchRegion`; `WindowPlugin::touch_as_mouse` makes
+  the first finger the mouse too, for controls written for one. While a `space3d-ui` text field
+  has the focus (`TextInput::wanted`) the on-screen keyboard is up.
+- **HTTPS**: `space3d_net::http_client_builder()` checks certificates against the compiled-in
+  Mozilla roots (reqwest's platform verifier needs a Java class a NativeActivity app has not).
+
+Not done: safe-area insets (UI under cutouts and the gesture bar), moving the view when the
+keyboard covers a text field, pausing audio in the background, compressed textures (ASTC), and
+`space3d build --target android` still builds arm64 only.
 
 ## iOS
 
