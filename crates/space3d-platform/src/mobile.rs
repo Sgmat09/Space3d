@@ -43,13 +43,28 @@ pub use winit::platform::android::activity::AndroidApp;
 static ANDROID_APP: std::sync::OnceLock<AndroidApp> = std::sync::OnceLock::new();
 
 /// Android entry: stash the [`AndroidApp`] for the event loop, build the [`space3d_core::App`]
-/// with `build`, then run it.
+/// with `build`, run it, and end the process when it returns.
+///
+/// The app returns when the activity is destroyed (Back, a task swiped away, a re-creation
+/// the manifest's `configChanges` does not cover) or after the game's own exit has finished
+/// the activity. The process must end then: Java's `onDestroy` waits for this thread, and a
+/// second `android_main` in the same process would find the first activity's handle here and
+/// in the statics of everything it was given to.
 #[cfg(target_os = "android")]
 pub fn android_main_entry(android_app: AndroidApp, build: impl FnOnce(&mut space3d_core::App)) {
     let _ = ANDROID_APP.set(android_app);
     let mut app = space3d_core::App::new();
     build(&mut app);
     app.run();
+    tracing::info!("Android: the activity is gone, the process ends");
+    // `_exit`, not `exit`: the C library's exit handlers destroy statics that Android's own
+    // threads (the UI's render threads) still use, and the process would end with an abort
+    // (seen: "pthread_mutex_lock called on a destroyed mutex", SIGABRT in hwuiTask).
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    // SAFETY: ends the process at once; nothing of this thread's is used after it.
+    unsafe { _exit(0) }
 }
 
 /// The activity's handle, once [`android_main_entry`] has it (so: from the game's `build` on).

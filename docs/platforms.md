@@ -118,22 +118,48 @@ on Android:
 - **Rendering**: Vulkan (GLES fallback). wgpu's debug flags are off even in a debug build: the
   emulator's Vulkan driver crashes when objects are named (set `WGPU_DEBUG=1` to ask for them).
 - **Lifecycle**: in the background the surface is dropped and the loop sleeps (no frames, no
-  systems); on resume the surface is recreated, meshes and textures survive.
+  systems); on resume the surface is recreated, meshes and textures survive. What must stop at
+  once hangs on `space3d_core::BackgroundHooks` (no frame runs to read an event):
+  `AudioPlugin` pauses everything that plays there and resumes it on return.
+- **The activity's end**: when the activity is destroyed (Back, the task swiped away, a
+  re-creation `configChanges` does not cover) the runner leaves the loop and
+  `android_main_entry` ends the process with `_exit`. winit 0.30 only logs `onDestroy`, whose
+  Java side waits for `android_main` to return: without this the process stayed and the next
+  start hung (seen on the emulator; `platform/src/android.rs` asks `Activity.isDestroyed()`
+  through JNI while the app is in the background). A game that exits by itself finishes the
+  activity first (`Activity.finish()`), then the same happens. List every change the game
+  handles itself in the manifest's `configChanges` (the example's `Cargo.toml` has the list),
+  or a split screen, a keyboard plugged in or a new system language restarts the process.
 - **Input**: multi-touch `Touch`es, `Binding::TouchRegion`; `WindowPlugin::touch_as_mouse` makes
   fingers the mouse too, for controls and a UI written for one (`platform::touch_pointer`): a
   tap is a left click whose press comes a frame after the pointer (so a UI knows whose click it
   is), a drag a left drag, a long press (0.5 s, still) a right click, a two-finger pinch the
-  wheel, and the pointer leaves when the finger lifts. While a `space3d-ui` text field
-  has the focus (`TextInput::wanted`) the on-screen keyboard is up.
+  wheel, and the pointer leaves when the finger lifts. The lift after a long press is no left
+  click. Going to the background or losing the focus forgets every finger
+  (`TouchPointer::reset`, `Input::clear_touches`). While a `space3d-ui` text field
+  has the focus (`TextInput::wanted`) the on-screen keyboard is up; it is asked for again a
+  few frames after every finger lift and after a resume, because nothing tells the app that
+  the player put it away.
+- **Typing is ASCII only.** A NativeActivity has no `InputConnection`, and winit 0.30's
+  Android backend sends no `Ime` events: text arrives only as key events, which is what a
+  keyboard sends for Latin letters, digits and punctuation. Cyrillic, CJK, swipe typing and
+  autocorrect text do not arrive (read in winit's and android-activity's source; only ASCII
+  was typed on the emulator). The way out is GameActivity (winit's `android-game-activity`,
+  which has GameTextInput) and a Gradle build, or a Java activity with an `InputConnection`.
 - **HTTPS**: `space3d_net::http_client_builder()` checks certificates against the compiled-in
   Mozilla roots (reqwest's platform verifier needs a Java class a NativeActivity app has not).
 
-- **`SafeArea`** (resource): what the status bar, the navigation bar and a cutout leave of the
-  window, from the activity's content rectangle; `UiPlugin::inside_safe_area` lays the UI out
-  inside it. An edge-to-edge window (Android 15 on) is told its whole size, and then only 24 dp at the bottom are kept (the gesture bar): a cutout and the three-button bar need the Java insets, which are not read.
+- **`SafeArea`** (resource): what the status bar, the navigation bar and a cutout cover of the
+  window; `UiPlugin::inside_safe_area` lays the UI out inside it. Read from Java through JNI
+  (`getRootWindowInsets().getInsets(systemBars | displayCutout)`, Android 11 on; the system
+  window insets before), again when the window's size changes and every 30 frames. Seen on
+  the emulator (Pixel 7 profile, landscape, 2400 x 1080): left 136 (the camera cutout), top 74
+  (the status bar), bottom 63 (the gesture bar). Only when Java gives no answer: the
+  activity's content rectangle, and for an edge-to-edge window 24 dp at the bottom.
 
 Not done: moving the view when the
-keyboard covers a text field, pausing audio in the background, compressed textures (ASTC), and
+keyboard covers a text field, stopping the audio stream in the background (the sounds are
+paused, the stream stays open), compressed textures (ASTC), and
 `space3d build --target android` still builds arm64 only.
 
 ## iOS
@@ -183,6 +209,11 @@ What iOS needed from the engine (all in `space3d-platform` unless said):
   thirds of the bottom's). A guess until a device shows what UIKit answers there.
 - **`UiPlugin::short_side_points`**: a UI scale from the screen's short side, for a UI made for
   a laptop's window.
+
+The on-screen keyboard's Return arrives from winit as the text "
+" of an unidentified key;
+the runner makes it the Enter key, pressed and released (unit test in `runner.rs`; not tried
+in the Simulator).
 
 Not done or not seen: touches and the on-screen keyboard (the code paths are winit's; `simctl`
 cannot tap), rotation, audio, a device, signing, `space3d build --target ios`.

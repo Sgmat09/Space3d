@@ -61,6 +61,13 @@ pub(crate) struct WinitRunner {
     /// Whether the on-screen keyboard was last asked for (`TextInput`, phones).
     #[cfg(any(target_os = "android", target_os = "ios"))]
     keyboard_shown: bool,
+    /// Frames until the on-screen keyboard is asked for again (a finger lifted; see `Touch`).
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    keyboard_again: u8,
+    /// Android: the window's insets as Java gave them last, the window size they were asked
+    /// for and the frames since.
+    #[cfg(target_os = "android")]
+    insets: (Option<crate::window::SafeArea>, (u32, u32), u32),
     #[cfg(target_arch = "wasm32")]
     pending: std::rc::Rc<std::cell::RefCell<Option<Result<Renderer, space3d_render::RenderError>>>>,
 }
@@ -202,6 +209,10 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         touch_clock: Instant::now(),
         #[cfg(any(target_os = "android", target_os = "ios"))]
         keyboard_shown: false,
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        keyboard_again: 0,
+        #[cfg(target_os = "android")]
+        insets: (None, (0, 0), 0),
         #[cfg(target_arch = "wasm32")]
         pending: Default::default(),
     };
@@ -429,8 +440,23 @@ impl WinitRunner {
         self.apply_window_state();
         if self.app.should_exit() {
             self.exiting = true;
+            // Android: the activity is finished first, and the loop ends when it is destroyed
+            // (`about_to_wait`); a process that ended under a live activity would be started again.
+            #[cfg(target_os = "android")]
+            if crate::mobile::android_app().is_some_and(|a| crate::android::finish_activity(&a)) {
+                return;
+            }
             event_loop.exit();
         }
+    }
+
+    /// The app goes to the background or loses the focus: no key, button or finger stays held.
+    fn release_input(&mut self) {
+        self.input().release_all();
+        self.input().clear_touches();
+        let mut actions = Vec::new();
+        self.touch_pointer.reset(&mut actions);
+        self.apply_pointer(&actions);
     }
 
     /// `WindowPlugin::touch_as_mouse`: a touch goes through [`crate::touch_pointer`] to the mouse.
@@ -488,6 +514,15 @@ impl WinitRunner {
                 self.keyboard_shown = wanted;
                 window.set_ime_allowed(wanted);
             }
+            // A finger lifted a few frames ago and a text field (still) has the focus: the
+            // player may have put the keyboard away himself, which nothing tells the app.
+            // Asking for a keyboard that is up changes nothing.
+            if self.keyboard_again > 0 {
+                self.keyboard_again -= 1;
+                if self.keyboard_again == 0 && wanted {
+                    window.set_ime_allowed(true);
+                }
+            }
         }
         // iOS: the safe area, asked every frame (it changes with the rotation, after the resize).
         #[cfg(target_os = "ios")]
@@ -499,24 +534,39 @@ impl WinitRunner {
                 self.app.insert_resource(area);
             }
         }
-        // Android: what the system bars and a cutout leave of the window (the content rectangle).
+        // Android: what the system bars and a cutout cover of the window. Java's insets
+        // (`crate::android`), asked again when the window's size changes and every 30 frames
+        // (nothing tells a NativeActivity app that they changed).
         #[cfg(target_os = "android")]
         if let Some(android) = crate::mobile::android_app() {
-            let r = android.content_rect();
             let size = window.inner_size();
-            let mut area = crate::window::SafeArea::from_content_rect(
-                (r.left, r.top, r.right, r.bottom),
-                (size.width, size.height),
-            );
-            // An edge-to-edge window (every app from Android 15 on) is told its whole size: the
-            // bars' insets are Java's to give, which a NativeActivity app has no side for. Keep
-            // the UI off the navigation bar's pill at least.
-            if area == crate::window::SafeArea::default() {
-                area.bottom =
-                    (crate::window::SafeArea::ANDROID_NAVIGATION_POINTS * window.scale_factor()).round() as u32;
+            let key = (size.width, size.height);
+            self.insets.2 += 1;
+            if self.insets.1 != key || self.insets.2 >= 30 {
+                self.insets = (crate::android::window_insets(&android), key, 0);
             }
+            let r = android.content_rect();
+            let area = self.insets.0.unwrap_or_else(|| {
+                // No answer from Java: the content rectangle, which for an edge-to-edge window
+                // (every app from Android 15 on) is the whole window; then keep the UI off the
+                // navigation bar's pill at least.
+                let mut area = crate::window::SafeArea::from_content_rect(
+                    (r.left, r.top, r.right, r.bottom),
+                    (size.width, size.height),
+                );
+                if area == crate::window::SafeArea::default() {
+                    area.bottom =
+                        (crate::window::SafeArea::ANDROID_NAVIGATION_POINTS * window.scale_factor()).round() as u32;
+                }
+                area
+            });
             if self.app.resources.get::<crate::window::SafeArea>() != Some(&area) {
-                tracing::info!("Android: the safe area is {area:?} of {size:?} (content {r:?})");
+                let from = if self.insets.0.is_some() {
+                    "the window's insets"
+                } else {
+                    "a guess"
+                };
+                tracing::info!("Android: the safe area is {area:?} of {size:?} ({from}; content {r:?})");
                 self.app.insert_resource(area);
             }
         }
@@ -595,6 +645,7 @@ impl ApplicationHandler for WinitRunner {
         let size = drawable_size(&window);
         self.on_resize(UVec2::new(size.width, size.height));
         self.send(PlatformEvent::Resumed);
+        space3d_core::BackgroundHooks::run(&mut self.app.resources, false);
         // Avoid a huge dt after returning from background.
         self.last_frame = None;
         window.request_redraw();
@@ -607,8 +658,15 @@ impl ApplicationHandler for WinitRunner {
             r.remove_surface();
         }
         self.state().suspended = true;
-        self.input().release_all();
+        self.release_input();
+        // The system hides the on-screen keyboard with the app: ask again after the resume.
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            self.keyboard_shown = false;
+        }
         self.send(PlatformEvent::Suspended);
+        // No frame runs until the resume, so what must stop now (sound) hangs here.
+        space3d_core::BackgroundHooks::run(&mut self.app.resources, true);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -621,8 +679,13 @@ impl ApplicationHandler for WinitRunner {
                 }
             }
             WindowEvent::Resized(size) => {
-                // One source for the size on every path (iOS: the whole screen, `drawable_size`).
-                let size = self.window.as_deref().map_or(size, drawable_size);
+                // iOS: the whole screen (`drawable_size`), not the event's safe area. Elsewhere
+                // the event's own size, which is the one the system announced.
+                let size = if cfg!(target_os = "ios") {
+                    self.window.as_deref().map_or(size, drawable_size)
+                } else {
+                    size
+                };
                 self.on_resize(UVec2::new(size.width, size.height));
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -635,7 +698,7 @@ impl ApplicationHandler for WinitRunner {
                     // The layout may have been switched while another app had focus.
                     self.poll_layout(Instant::now(), true);
                 } else {
-                    self.input().release_all();
+                    self.release_input();
                 }
                 self.send(PlatformEvent::Focused(focused));
             }
@@ -666,7 +729,14 @@ impl ApplicationHandler for WinitRunner {
                     }
                     PhysicalKey::Unidentified(_) => {
                         if pressed && let Some(text) = &event.text {
-                            self.input().inject_text(text);
+                            // iOS: the on-screen keyboard's Return is the text "\n" of no key.
+                            if let Some(enter) = return_as_enter(text) {
+                                for key_event in enter {
+                                    self.input().inject_key_event(key_event);
+                                }
+                            } else {
+                                self.input().inject_text(text);
+                            }
                         }
                     }
                 }
@@ -702,8 +772,15 @@ impl ApplicationHandler for WinitRunner {
                     self.touch_to_mouse(t.id, phase, p);
                 }
                 self.input().inject_touch(t.id, phase, p);
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                if phase == TouchPhase::Ended {
+                    // Once the tap's click is through the UI (`touch_pointer`: three frames).
+                    self.keyboard_again = 5;
+                }
             }
-            // The on-screen keyboard's text (iOS, and Android keyboards that commit text).
+            // Text an input method commits. winit 0.30 sends it on desktop only (when the game
+            // allows IME): iOS's on-screen keyboard arrives as key events with text, and
+            // Android's only as far as the keyboard sends key events (ASCII; docs/platforms.md).
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => self.input().inject_text(&text),
             WindowEvent::RedrawRequested => self.frame(event_loop),
             _ => {}
@@ -729,6 +806,18 @@ impl ApplicationHandler for WinitRunner {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let suspended = self.state().suspended;
+            // Android: the activity was destroyed (`crate::android`). Java's `onDestroy` waits
+            // for this thread, so the loop ends here and `android_main_entry` ends the process.
+            #[cfg(target_os = "android")]
+            if (suspended || self.exiting)
+                && !_event_loop.exiting()
+                && crate::mobile::android_app().is_some_and(|a| crate::android::activity_destroyed(&a))
+            {
+                tracing::info!("Android: the activity is destroyed, leaving the event loop");
+                self.exiting = true;
+                _event_loop.exit();
+                return;
+            }
             _event_loop.set_control_flow(if suspended { ControlFlow::Wait } else { FRAME_FLOW });
             if suspended {
                 return;
@@ -738,6 +827,20 @@ impl ApplicationHandler for WinitRunner {
             w.request_redraw();
         }
     }
+}
+
+/// The Enter key's press and release for a key event that is only the text of Return. iOS's
+/// on-screen keyboard sends Return so (winit 0.30: `PhysicalKey::Unidentified`, text `"\n"`),
+/// and a UI drops control characters from text, so the form would never be sent.
+fn return_as_enter(text: &str) -> Option<[KeyEvent; 2]> {
+    use crate::layout::{LogicalKey, NamedKey};
+    matches!(text, "\n" | "\r" | "\r\n").then(|| {
+        let enter = LogicalKey::Named(NamedKey::Enter);
+        [
+            KeyEvent::press(winit::keyboard::KeyCode::Enter, enter.clone()).with_text(None),
+            KeyEvent::release(winit::keyboard::KeyCode::Enter, enter),
+        ]
+    })
 }
 
 /// winit's `key_without_modifiers` where the platform has it (Windows, macOS, X11, Wayland).
@@ -780,6 +883,33 @@ fn key_without_modifiers(_event: &winit::event::KeyEvent) -> Option<winit::keybo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// iOS's Return (the text "\n" of an unidentified key) is the Enter key, pressed and
+    /// released, with no text; any other text stays text.
+    #[test]
+    fn the_text_of_return_is_the_enter_key() {
+        use winit::keyboard::KeyCode;
+        for text in ["\n", "\r", "\r\n"] {
+            let [down, up] = return_as_enter(text).expect("Return");
+            assert_eq!(
+                (down.physical, down.pressed, down.text.as_deref()),
+                (KeyCode::Enter, true, None)
+            );
+            assert_eq!(
+                (up.physical, up.pressed, up.text.as_deref()),
+                (KeyCode::Enter, false, None)
+            );
+            let mut input = Input::default();
+            input.inject_key_event(down);
+            assert!(input.just_pressed(KeyCode::Enter));
+            assert_eq!(input.text(), "");
+            input.inject_key_event(up);
+            assert!(!input.pressed(KeyCode::Enter));
+        }
+        assert!(return_as_enter("a").is_none());
+        assert!(return_as_enter("\n\n").is_none());
+        assert!(return_as_enter("").is_none());
+    }
 
     #[test]
     fn surface_retry_needs_window_renderer_and_missing_surface() {

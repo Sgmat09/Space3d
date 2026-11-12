@@ -5138,6 +5138,7 @@ dependencies = [
  "console_error_panic_hook",
  "glam 0.33.9",
  "image",
+ "jni",
  "js-sys",
  "objc2 0.5.2",
  "pollster",

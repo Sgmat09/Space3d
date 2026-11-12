@@ -54,6 +54,8 @@
 //! assert_eq!(input.key_label(KeyCode::Space).as_deref(), Some("Space"));
 //! ```
 
+#[cfg(target_os = "android")]
+mod android;
 pub mod background;
 mod input;
 #[cfg(target_os = "ios")]

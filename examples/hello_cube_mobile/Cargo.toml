@@ -38,7 +38,7 @@ label = "Space3d hello cube"
 
 [package.metadata.android.application.activity]
 orientation = "landscape"
-config_changes = "orientation|screenSize|screenLayout|keyboardHidden|keyboard|density|uiMode"
+config_changes = "orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|touchscreen|density|uiMode|locale|layoutDirection|fontScale"
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"

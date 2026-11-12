@@ -812,6 +812,12 @@ impl Input {
         }
     }
 
+    /// Forget every active touch as cancelled (the app went to the background: the ends of
+    /// the touches that were down may never come). They are this frame's ended touches.
+    pub fn clear_touches(&mut self) {
+        self.ended_touches.append(&mut self.touches);
+    }
+
     /// Clear per-frame edges and deltas (runs in `Stage::Last`).
     pub fn end_frame(&mut self) {
         self.keys.end_frame();

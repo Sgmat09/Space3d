@@ -6,7 +6,7 @@
 //! | finger down | the pointer is there (a hover); the left button goes down on the **next frame** |
 //! | tap | left press and release, a frame each, then the pointer leaves |
 //! | drag | a left drag |
-//! | long press (still for [`TouchPointerConfig::long_press`]) | a right click where the finger is; the left button stays down |
+//! | long press (still for [`TouchPointerConfig::long_press`]) | a right click where the finger is; the left button stays down and is let go without a click when the finger lifts |
 //! | two fingers, pinch | the wheel: one line per [`TouchPointerConfig::pinch_step`] of spread (apart is up), the pointer between the fingers |
 //!
 //! The press waits a frame because a mouse hovers before it clicks and a finger does not: a UI
@@ -217,7 +217,9 @@ impl TouchPointer {
                                 self.release_due = Some(true);
                             }
                         } else {
-                            self.release_due = Some(false);
+                            // After a long press's right click the lift is no left click too.
+                            let long = matches!(self.state, State::One { long: true, .. });
+                            self.release_due = Some(long);
                         }
                         self.state = State::Idle;
                         self.leave_due = true;
@@ -272,6 +274,28 @@ impl TouchPointer {
         }
     }
 
+    /// Forget every finger (the app went to the background or lost the focus, and the ends of
+    /// the touches that were down may never come): held buttons are let go without a click
+    /// and the pointer leaves, now.
+    pub fn reset(&mut self, out: &mut Vec<PointerAction>) {
+        let was_active = self.active() || !self.fingers.is_empty();
+        if std::mem::take(&mut self.right_due) {
+            out.push(PointerAction::Up(MouseButton::Right));
+        }
+        if std::mem::take(&mut self.left) {
+            out.push(PointerAction::Cancel(MouseButton::Left));
+        }
+        if was_active {
+            out.push(PointerAction::Leave);
+        }
+        self.state = State::Idle;
+        self.fingers.clear();
+        self.last = None;
+        self.press_due = false;
+        self.release_due = None;
+        self.leave_due = false;
+    }
+
     /// Whether a finger is the pointer or a gesture is going on.
     pub fn active(&self) -> bool {
         self.state != State::Idle || self.press_due || self.release_due.is_some() || self.right_due || self.leave_due
@@ -314,8 +338,11 @@ mod tests {
 
     const P: Vec2 = Vec2::new(100.0, 200.0);
 
+    /// A time and what happens at it: a touch, or `None` for a frame.
+    type Step = (f64, Option<(u64, TouchPhase, Vec2)>);
+
     /// The actions of `steps` (a touch, or `None` for a frame at that time), one list per step.
-    fn run(t: &mut TouchPointer, steps: &[(f64, Option<(u64, TouchPhase, Vec2)>)]) -> Vec<Vec<PointerAction>> {
+    fn run(t: &mut TouchPointer, steps: &[Step]) -> Vec<Vec<PointerAction>> {
         steps
             .iter()
             .map(|(now, touch)| {
@@ -393,7 +420,8 @@ mod tests {
         );
     }
 
-    /// A still finger: one right click after the long-press time, the left button still down.
+    /// A still finger: one right click after the long-press time, the left button still down;
+    /// the lift lets it go without a left click.
     #[test]
     fn a_long_press_is_one_right_click() {
         let mut t = TouchPointer::default();
@@ -423,9 +451,56 @@ mod tests {
                 vec![Up(Right)],
                 vec![],
                 vec![Move(near)],
-                vec![Up(Left)]
+                vec![Cancel(Left)]
             ]
         );
+    }
+
+    /// The app is suspended with a finger down and its end never comes: after the reset
+    /// nothing is held, and the next finger (a new id, as on iOS) is a tap, not a pinch.
+    #[test]
+    fn a_reset_forgets_the_fingers_that_were_down() {
+        let mut t = TouchPointer::default();
+        let mut out = Vec::new();
+        t.touch(1, Started, P, 0.0, &mut out);
+        t.frame(0.016, &mut out);
+        out.clear();
+        t.reset(&mut out);
+        assert_eq!(out, vec![Cancel(Left), Leave]);
+        assert!(!t.active());
+        // Long after (the time in the background): no long press of the forgotten finger.
+        out.clear();
+        t.frame(60.0, &mut out);
+        assert_eq!(out, vec![]);
+        let got = run(
+            &mut t,
+            &[
+                (60.1, Some((2, Started, P))),
+                (60.101, Some((2, Ended, P))),
+                (60.116, None),
+                (60.133, None),
+                (60.15, None),
+            ],
+        );
+        assert_eq!(
+            got,
+            vec![
+                vec![Place(P)],
+                vec![Move(P)],
+                vec![Down(Left)],
+                vec![Up(Left)],
+                vec![Leave]
+            ]
+        );
+        // A reset in a pinch, and one with nothing down, which does nothing.
+        t.touch(3, Started, P, 61.0, &mut out);
+        t.touch(4, Started, P + Vec2::X * 100.0, 61.001, &mut out);
+        out.clear();
+        t.reset(&mut out);
+        assert_eq!(out, vec![Leave]);
+        out.clear();
+        t.reset(&mut out);
+        assert_eq!(out, vec![]);
     }
 
     /// Spreading two fingers turns the wheel up, closing them down; the first finger's press is
