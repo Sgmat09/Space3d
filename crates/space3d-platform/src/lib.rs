@@ -74,10 +74,12 @@ pub use layout::{
     is_writing_system_key, us_qwerty_label, writing_system_keys,
 };
 #[cfg(target_os = "android")]
-pub use mobile::{AndroidApp, android_main_entry};
+pub use mobile::{AndroidApp, android_app, android_main_entry};
 #[cfg(target_arch = "wasm32")]
 pub use web::{find_canvas, init_web_logging};
-pub use window::{AppliedCursor, CursorIcon, PlatformEvent, WindowCursor, WindowIcon, WindowPlugin, WindowState};
+pub use window::{
+    AppliedCursor, CursorIcon, PlatformEvent, TextInput, WindowCursor, WindowIcon, WindowPlugin, WindowState,
+};
 
 pub use winit;
 

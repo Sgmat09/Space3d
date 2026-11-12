@@ -29,6 +29,10 @@ pub struct WindowPlugin {
     pub canvas_id: Option<String>,
     /// Exit when the window is closed (otherwise only [`PlatformEvent::CloseRequested`] is sent).
     pub exit_on_close: bool,
+    /// Phones: the first finger on the screen is also the mouse (its position, and the left
+    /// button while it is down), for a game whose controls read the mouse. The finger still
+    /// arrives as a touch. The position stays where the finger was lifted. Default `false`.
+    pub touch_as_mouse: bool,
     /// Window icon (title bar, Alt-Tab) and, on Windows, the taskbar icon. `None` uses the
     /// platform default. Ignored on macOS (the Dock shows the app bundle's icon), the web and
     /// mobile.
@@ -115,6 +119,7 @@ impl Default for WindowPlugin {
             msaa_samples: 4,
             canvas_id: None,
             exit_on_close: true,
+            touch_as_mouse: false,
             icon: None,
         }
     }
@@ -168,6 +173,15 @@ pub struct WindowState {
     pub cursor_visible: bool,
     /// Grab/lock the cursor (FPS-style camera control).
     pub cursor_grab: bool,
+}
+
+/// Whether the game wants typed text now (resource). `space3d-ui` sets `wanted` while one of
+/// its text fields has the focus; on Android and iOS the runner shows the on-screen keyboard
+/// while it is set and hides it after. A game with text fields of its own writes it itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextInput {
+    /// A text field has the focus.
+    pub wanted: bool,
 }
 
 /// Window/application lifecycle events (`Events<PlatformEvent>`).

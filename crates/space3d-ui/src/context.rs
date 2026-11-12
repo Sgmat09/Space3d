@@ -430,6 +430,14 @@ pub(crate) fn begin_frame(
 /// `Stage::PostUpdate`: end the pass, tessellate and hand the frame to the render overlay.
 pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) {
     let natives = crate::textures::resolve_native_views(sys.resources);
+    // A focused text field asks the platform for typed text: on a phone, the on-screen
+    // keyboard (`space3d_platform::TextInput`; the last pass's answer, one frame late).
+    if let Some(wanted) = sys.resources.get::<EguiContext>().map(|e| e.wants_keyboard) {
+        let text_input = sys.resources.init::<space3d_platform::TextInput>();
+        if text_input.wanted != wanted {
+            text_input.wanted = wanted;
+        }
+    }
     let Some(e) = sys.resources.get_mut::<EguiContext>() else {
         return;
     };

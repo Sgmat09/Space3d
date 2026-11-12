@@ -55,6 +55,11 @@ pub(crate) struct WinitRunner {
     surface_retry: SurfaceRetry,
     layout_watch: LayoutWatch,
     buttons: ButtonReconciler,
+    /// The finger that is the mouse (`WindowPlugin::touch_as_mouse`).
+    mouse_touch: Option<u64>,
+    /// Whether the on-screen keyboard was last asked for (`TextInput`, phones).
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    keyboard_shown: bool,
     #[cfg(target_arch = "wasm32")]
     pending: std::rc::Rc<std::cell::RefCell<Option<Result<Renderer, space3d_render::RenderError>>>>,
 }
@@ -65,9 +70,8 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
         use winit::platform::android::EventLoopBuilderExtAndroid;
         let Some(android_app) = crate::mobile::android_app() else {
             tracing::error!("Android: start the app through space3d_platform::android_main_entry");
-            return Err(winit::error::EventLoopError::NotSupported(
-                winit::error::NotSupportedError::new(),
-            ));
+            // (winit's NotSupportedError has no public constructor.)
+            return Err(winit::error::EventLoopError::ExitFailure(1));
         };
         EventLoop::builder().with_android_app(android_app).build()
     }
@@ -166,6 +170,9 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         surface_retry: SurfaceRetry::default(),
         layout_watch: LayoutWatch::default(),
         buttons: ButtonReconciler::default(),
+        mouse_touch: None,
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        keyboard_shown: false,
         #[cfg(target_arch = "wasm32")]
         pending: Default::default(),
     };
@@ -392,11 +399,49 @@ impl WinitRunner {
         }
     }
 
+    /// `WindowPlugin::touch_as_mouse`: the first finger down moves the mouse and holds its left
+    /// button until it is lifted (a cancelled touch lets go without a click).
+    fn touch_to_mouse(&mut self, id: u64, phase: TouchPhase, p: Vec2) {
+        match phase {
+            TouchPhase::Started if self.mouse_touch.is_none() => {
+                self.mouse_touch = Some(id);
+                // No delta from wherever the last finger was lifted.
+                self.input().set_mouse_position(Some(p));
+                self.input().inject_mouse_button_down(MouseButton::Left);
+            }
+            TouchPhase::Moved if self.mouse_touch == Some(id) => self.input().inject_mouse_move(p),
+            TouchPhase::Ended | TouchPhase::Cancelled if self.mouse_touch == Some(id) => {
+                self.mouse_touch = None;
+                let input = self.input();
+                input.inject_mouse_move(p);
+                if phase == TouchPhase::Ended {
+                    input.inject_mouse_button_up(MouseButton::Left);
+                } else {
+                    input.release_mouse_button(MouseButton::Left, crate::input::MouseButtonCause::FocusLost);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Push game-side changes of [`WindowState`] to the OS window.
     fn apply_window_state(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // Phones: the on-screen keyboard is up while a text field wants text (`TextInput`).
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let wanted = self
+                .app
+                .resources
+                .get::<crate::window::TextInput>()
+                .is_some_and(|t| t.wanted);
+            if wanted != self.keyboard_shown {
+                self.keyboard_shown = wanted;
+                window.set_ime_allowed(wanted);
+            }
+        }
         let requested = self
             .app
             .resources
@@ -566,8 +611,15 @@ impl ApplicationHandler for WinitRunner {
             }
             WindowEvent::Touch(t) => {
                 let p = Vec2::new(t.location.x as f32, t.location.y as f32);
-                self.input().inject_touch(t.id, TouchPhase::from(t.phase), p);
+                let phase = TouchPhase::from(t.phase);
+                // The mouse first: the UI takes a finger for its pointer only while there is no mouse.
+                if self.settings.touch_as_mouse {
+                    self.touch_to_mouse(t.id, phase, p);
+                }
+                self.input().inject_touch(t.id, phase, p);
             }
+            // The on-screen keyboard's text (iOS, and Android keyboards that commit text).
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => self.input().inject_text(&text),
             WindowEvent::RedrawRequested => self.frame(event_loop),
             _ => {}
         }
@@ -586,6 +638,21 @@ impl ApplicationHandler for WinitRunner {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         #[cfg(target_arch = "wasm32")]
         self.poll_pending_renderer();
+        // A phone app in the background has no surface to draw to: sleep until the system
+        // wakes it (measured on the emulator: a whole core spent polling otherwise). Frames,
+        // and with them the game's systems, stand still until it is resumed.
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let suspended = self.state().suspended;
+            _event_loop.set_control_flow(if suspended {
+                ControlFlow::Wait
+            } else {
+                ControlFlow::Poll
+            });
+            if suspended {
+                return;
+            }
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }

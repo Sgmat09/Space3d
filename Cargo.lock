@@ -2005,6 +2005,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hello_cube_mobile"
+version = "0.1.0"
+dependencies = [
+ "hello_cube",
+ "space3d",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4934,6 +4942,7 @@ dependencies = [
  "gltf",
  "image",
  "js-sys",
+ "ndk",
  "notify",
  "parking_lot",
  "rayon",
@@ -5046,6 +5055,7 @@ dependencies = [
  "serde",
  "serde_json",
  "space3d-core",
+ "space3d-net",
  "space3d-tasks",
  "tempfile",
  "thiserror 2.0.21",
@@ -5087,6 +5097,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
