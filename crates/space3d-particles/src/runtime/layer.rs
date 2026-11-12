@@ -226,6 +226,8 @@ impl Reach {
                 }
                 Force::Vortex { strength, pull, .. } => strength.abs() + pull.abs(),
                 Force::Turbulence { strength, .. } => strength.abs() * 3f32.sqrt(),
+                // (each component of the curl is within 3: `cpu::curl_noise`)
+                Force::Curl { strength, .. } => strength.abs() * 3.0 * 3f32.sqrt(),
             };
         }
         let accel = if l.world_forces != 0 {

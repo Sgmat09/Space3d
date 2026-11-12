@@ -897,75 +897,143 @@ impl Renderer {
         self.gpu_errors.load(Ordering::Relaxed)
     }
 
-    /// Upload all pending meshes/textures now (normally done at the start of each frame).
+    /// Upload all pending meshes/textures now (normally done at the start of each frame),
+    /// whatever the [`crate::UploadBudget`]: tools and tests call it to have everything on the
+    /// GPU before a frame.
     pub fn upload_assets(&mut self, assets: &mut RenderAssets) {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("space3d asset upload"),
         });
-        self.upload_assets_into(&mut encoder, assets);
+        self.upload_assets_into(&mut encoder, assets, None);
         self.uploader.finish();
         self.queue.submit([encoder.finish()]);
         self.uploader.recall();
     }
 
-    /// Encode pending asset uploads (mesh arena + textures).
-    pub(crate) fn upload_assets_into(&mut self, encoder: &mut wgpu::CommandEncoder, assets: &mut RenderAssets) {
+    /// Encode pending asset uploads (textures, then the mesh arena): everything queued, or with a
+    /// `budget` in bytes the first of it (see [`crate::UploadBudget`]). What is left stays in
+    /// the queues in its order, and the stats say how much that is.
+    pub(crate) fn upload_assets_into(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        assets: &mut RenderAssets,
+        budget: Option<u64>,
+    ) {
+        let mut allowance = UploadAllowance::new(budget);
         // Free removed meshes first so their space can be reused this frame.
         for a in assets.freed_allocs.drain(..) {
             assets.arena.free(a);
         }
-        if !assets.pending_meshes.is_empty() {
-            self.upload_meshes(encoder, assets);
-        }
+        // Textures before meshes: an entity is drawn as soon as its mesh is uploaded, so a mesh
+        // must not arrive ahead of the maps queued with it (its material would draw without
+        // them meanwhile). The frame stops at the first item that does not fit, so no new mesh
+        // is uploaded while a texture still waits.
         if !assets.pending_textures.is_empty() {
-            let pending = std::mem::take(&mut assets.pending_textures);
-            for h in &pending {
-                let Some(entry) = assets.textures.get_mut(h.raw()) else {
-                    continue;
-                };
-                if entry.gpu.is_some() && entry.source.is_none() && !entry.render_target {
+            self.upload_textures(encoder, assets, &mut allowance);
+        }
+        if !assets.pending_meshes.is_empty() {
+            self.upload_meshes(encoder, assets, &mut allowance);
+        }
+        let (meshes, textures, bytes) = assets.pending_uploads();
+        self.stats.pending_meshes = meshes;
+        self.stats.pending_textures = textures;
+        self.stats.pending_upload_bytes = bytes;
+    }
+
+    /// Create the queued textures the frame's allowance admits, and every queued render target.
+    fn upload_textures(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        assets: &mut RenderAssets,
+        allowance: &mut UploadAllowance,
+    ) {
+        let mut pending = std::mem::take(&mut assets.pending_textures);
+        for h in &pending {
+            let Some(entry) = assets.textures.get_mut(h.raw()) else {
+                continue;
+            };
+            if entry.render_target {
+                // A render target holds no data, and cameras that draw into it are skipped
+                // until it exists: it never waits behind queued images.
+                entry.queued = false;
+                if entry.gpu.is_some() {
                     continue;
                 }
-                if entry.render_target && entry.gpu.is_some() {
+            } else {
+                // Until its turn the texture keeps what it has: nothing for a new one (its
+                // materials draw without it), the previous contents for a replaced one.
+                if entry.source.is_some() && !allowance.admit(entry.pending_bytes()) {
+                    assets.pending_textures.push(*h);
                     continue;
                 }
-                let targets = crate::texture::TargetCaps {
-                    hdr_format: self.frame_graphics.hdr_format,
-                    hdr_msaa: self.frame_graphics.hdr_msaa,
-                    max_msaa: self.caps.max_msaa,
-                    msaa_depth_binding: self.graphics.msaa_depth_resolve,
-                };
-                match create_gpu_texture(
-                    &self.adapter,
-                    &self.device,
-                    &self.queue,
-                    encoder,
-                    &mut self.pipelines,
-                    &mut self.samplers,
-                    targets,
-                    entry,
-                ) {
-                    Ok(bytes) => {
-                        self.uploader.bytes += bytes;
-                        self.stats.textures_uploaded += 1;
-                    }
-                    Err(e) => tracing::error!(texture = ?h, "texture upload failed: {e}"),
+                entry.queued = false;
+                if entry.source.is_none() {
+                    continue;
                 }
             }
+            let targets = crate::texture::TargetCaps {
+                hdr_format: self.frame_graphics.hdr_format,
+                hdr_msaa: self.frame_graphics.hdr_msaa,
+                max_msaa: self.caps.max_msaa,
+                msaa_depth_binding: self.graphics.msaa_depth_resolve,
+            };
+            match create_gpu_texture(
+                &self.adapter,
+                &self.device,
+                &self.queue,
+                encoder,
+                &mut self.pipelines,
+                &mut self.samplers,
+                targets,
+                entry,
+            ) {
+                Ok(bytes) => {
+                    self.uploader.bytes += bytes;
+                    self.stats.textures_uploaded += 1;
+                }
+                Err(e) => tracing::error!(texture = ?h, "texture upload failed: {e}"),
+            }
+        }
+        if assets.pending_textures.is_empty() {
+            // Nothing waits: keep the queue's memory for the next uploads.
+            pending.clear();
             assets.pending_textures = pending;
-            assets.pending_textures.clear();
         }
     }
 
-    fn upload_meshes(&mut self, encoder: &mut wgpu::CommandEncoder, assets: &mut RenderAssets) {
-        let pending = std::mem::take(&mut assets.pending_meshes);
+    /// Upload the queued meshes the frame's allowance admits, and every replaced mesh that has
+    /// a GPU copy.
+    fn upload_meshes(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        assets: &mut RenderAssets,
+        allowance: &mut UploadAllowance,
+    ) {
+        // The meshes uploaded in this call are moved to the front of `pending` (it then lists
+        // exactly them); the ones that wait go back into the queue in their order.
+        let mut pending = std::mem::take(&mut assets.pending_meshes);
+        let mut uploading = 0;
         // Convert; keep the existing placement when the size is unchanged.
         let scratch = &mut self.frame.mesh_scratch;
         scratch.clear();
-        for &h in &pending {
+        for k in 0..pending.len() {
+            let h = pending[k];
             let Some(entry) = assets.meshes.get_mut(h.raw()) else {
                 continue;
             };
+            // Decided from the data's size, before anything is converted or taken.
+            let bytes = entry.pending_bytes();
+            if entry.cpu.is_some() {
+                if entry.gpu.is_some() {
+                    // A replaced mesh that is being drawn: it shows its new data in this frame,
+                    // as it does without a budget. Its bytes still count against the frame.
+                    allowance.charge(bytes);
+                } else if !allowance.admit(bytes) {
+                    assets.pending_meshes.push(h);
+                    continue;
+                }
+            }
+            entry.queued = false;
             let Some(data) = entry.cpu.take() else {
                 continue;
             };
@@ -983,7 +1051,10 @@ impl Renderer {
                 None => None,
             };
             scratch.push((h, alloc, v, i, data));
+            pending[uploading] = h;
+            uploading += 1;
         }
+        pending.truncate(uploading);
 
         // Allocate, growing only the buffer(s) that are short, until everything fits or the
         // device's max_buffer_size is reached.
@@ -1059,7 +1130,9 @@ impl Renderer {
             });
             self.stats.meshes_uploaded += 1;
         }
-        // The extension stream (tangents, second UV set) of the meshes just placed.
+        // The extension stream (tangents, second UV set) of the meshes just placed, and of no
+        // other: a mesh placed in an earlier frame has given its extension vertices away, and
+        // would have its range of the stream cleared.
         assets.upload_extras(&self.device, encoder, &pending, &mut self.uploader);
     }
 
@@ -1424,6 +1497,47 @@ impl Renderer {
 /// Receives the result of a capture buffer's mapping.
 type MapReceiver = futures::channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>;
 
+/// What is left of a frame's [`crate::UploadBudget`] while its uploads are chosen.
+struct UploadAllowance {
+    /// Bytes left (`None`: no limit).
+    left: Option<u64>,
+    /// An item was admitted in this frame: the next ones have to fit.
+    any: bool,
+    /// An item did not fit: everything after it waits too, so the order is kept.
+    stopped: bool,
+}
+
+impl UploadAllowance {
+    fn new(budget: Option<u64>) -> Self {
+        Self {
+            left: budget,
+            any: false,
+            stopped: false,
+        }
+    }
+
+    /// Whether an item of `bytes` is uploaded in this frame: the first one always (an item
+    /// larger than the budget would otherwise never be), a later one while it fits in what is
+    /// left. After the first refusal everything is refused.
+    fn admit(&mut self, bytes: u64) -> bool {
+        let Some(left) = self.left else { return true };
+        if self.stopped || (self.any && bytes > left) {
+            self.stopped = true;
+            return false;
+        }
+        self.any = true;
+        self.left = Some(left.saturating_sub(bytes));
+        true
+    }
+
+    /// Count the bytes of an item that is uploaded whatever the budget.
+    fn charge(&mut self, bytes: u64) {
+        if let Some(left) = &mut self.left {
+            *left = left.saturating_sub(bytes);
+        }
+    }
+}
+
 /// A submitted capture copy: `MAP_READ` buffer with rows padded to `padded` bytes.
 struct CaptureReadback {
     buffer: wgpu::Buffer,
@@ -1552,6 +1666,29 @@ mod tests {
         let srgb = decode_texel(wgpu::TextureFormat::Rgba8UnormSrgb, &[255, 0, 188, 128]);
         assert!((srgb[0] - 1.0).abs() < 1e-6 && srgb[1] == 0.0 && (srgb[2] - 0.5).abs() < 0.01);
         assert!((srgb[3] - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_upload_allowance_admits_a_prefix_and_always_one_item() {
+        // no budget: everything
+        let mut all = UploadAllowance::new(None);
+        assert!(all.admit(u64::MAX) && all.admit(u64::MAX));
+        // 100 bytes: 60 fits, 50 does not, and nothing after it does either (the order is kept)
+        let mut a = UploadAllowance::new(Some(100));
+        assert_eq!([a.admit(60), a.admit(50), a.admit(10)], [true, false, false]);
+        // an item that fills the budget exactly fits; an empty one after it does too
+        let mut a = UploadAllowance::new(Some(100));
+        assert_eq!(
+            [a.admit(60), a.admit(40), a.admit(0), a.admit(1)],
+            [true, true, true, false]
+        );
+        // the first item goes whatever its size, alone
+        let mut a = UploadAllowance::new(Some(100));
+        assert_eq!([a.admit(5000), a.admit(1)], [true, false]);
+        // and so it does when exempt uploads have used the frame up
+        let mut a = UploadAllowance::new(Some(100));
+        a.charge(500);
+        assert_eq!([a.admit(70), a.admit(1)], [true, false]);
     }
 
     fn renderer() -> Option<Renderer> {

@@ -59,8 +59,9 @@ pub struct Parent(pub hecs::Entity);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Name(pub String);
 
-/// A child of the hierarchy: entity, parent, local matrix.
-type ChildEntry = (hecs::Entity, hecs::Entity, Mat4);
+/// A child of the hierarchy: entity, parent, local matrix, and whether the parent is itself a
+/// child (only those can need more than one pass).
+type ChildEntry = (hecs::Entity, hecs::Entity, Mat4, bool);
 
 thread_local! {
     /// Scratch of [`propagate_transforms`], kept between calls so a steady-state frame with
@@ -86,37 +87,67 @@ pub fn propagate_transforms(world: &mut hecs::World) {
     for (e, g) in missing.drain(..) {
         let _ = world.insert_one(e, g);
     }
-    // Children: resolve until fixed point (depth-bounded).
+    // Children. One pass settles every child of a root (the common case: the parts of a
+    // model under its root), the parent's matrix kept from one sibling to the next. Only children of children are resolved again, until nothing
+    // changes (depth-bounded).
     let mut children = CHILDREN.take();
     children.clear();
-    children.extend(
-        world
-            .query::<(hecs::Entity, &Parent, &Transform)>()
-            .iter()
-            .map(|(e, p, t)| (e, p.0, t.matrix())),
-    );
-    for _depth in 0..32 {
+    {
+        let mut last: Option<(hecs::Entity, bool)> = None;
+        children.extend(
+            world
+                .query::<(hecs::Entity, &Parent, &Transform)>()
+                .iter()
+                .map(|(e, p, t)| {
+                    let nested = match last {
+                        Some((parent, nested)) if parent == p.0 => nested,
+                        _ => {
+                            let nested = world.get::<&Parent>(p.0).is_ok();
+                            last = Some((p.0, nested));
+                            nested
+                        }
+                    };
+                    (e, p.0, t.matrix(), nested)
+                }),
+        );
+    }
+    let any_nested = children.iter().any(|c| c.3);
+    for depth in 0..32 {
         let mut changed = false;
-        for &(e, parent, local) in &children {
-            let Ok(pg) = world.get::<&GlobalTransform>(parent).map(|g| g.0) else {
-                continue;
-            };
-            let new = pg * local;
-            match world.get::<&mut GlobalTransform>(e) {
-                Ok(mut g) => {
-                    if g.0 != new {
-                        g.0 = new;
-                        changed = true;
-                    }
+        {
+            let mut last: Option<(hecs::Entity, Option<Mat4>)> = None;
+            for &(e, parent, local, nested) in &children {
+                if depth > 0 && !nested {
+                    continue;
                 }
-                Err(_) => missing.push((e, GlobalTransform(new))),
+                let pg = match last {
+                    Some((p, pg)) if p == parent => pg,
+                    _ => {
+                        let pg = world.get::<&GlobalTransform>(parent).ok().map(|g| g.0);
+                        last = Some((parent, pg));
+                        pg
+                    }
+                };
+                let Some(pg) = pg else {
+                    continue;
+                };
+                let new = pg * local;
+                match world.get::<&mut GlobalTransform>(e) {
+                    Ok(mut g) => {
+                        if g.0 != new {
+                            g.0 = new;
+                            changed = true;
+                        }
+                    }
+                    Err(_) => missing.push((e, GlobalTransform(new))),
+                }
             }
         }
         for (e, g) in missing.drain(..) {
             let _ = world.insert_one(e, g);
             changed = true;
         }
-        if !changed {
+        if !changed || !any_nested {
             break;
         }
     }

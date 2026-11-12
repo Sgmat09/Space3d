@@ -2701,3 +2701,282 @@ fn depth_views_are_never_replayed_and_share_view_bind_groups() {
     crate::render_to_image(&mut app).expect("capture");
     assert_eq!(app.resources.expect::<Renderer>().frame.depth_passes_encoded, 4);
 }
+
+/// The scene of the upload-budget tests: a cube that is drawn already, textured red, and five
+/// more cubes with three blue textures between them, queued after it. Returns the first cube's
+/// mesh and texture with its pixels, and the queued meshes and textures in their order.
+#[allow(clippy::type_complexity)]
+fn upload_queue_scene(
+    app: &mut space3d_core::App,
+) -> (
+    (MeshHandle, crate::TextureHandle, usize),
+    Vec<MeshHandle>,
+    Vec<crate::TextureHandle>,
+) {
+    use crate::{Camera3d, Mesh3d};
+    use space3d_core::{ImageData, MeshData, Transform};
+    app.world.spawn((
+        Transform::from_xyz(0.0, 0.0, 8.0),
+        Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 0.0, 1.0)),
+    ));
+    let assets = app.resources.expect_mut::<RenderAssets>();
+    let first = assets.add_mesh(MeshData::cube(0.6));
+    let red = assets.add_image(ImageData::filled(16, 16, [255, 0, 0, 255]));
+    app.world.spawn((
+        Transform::from_xyz(-4.0, 0.0, 0.0),
+        Mesh3d(first),
+        Material::unlit(Vec4::ONE).with_texture(red),
+    ));
+    let img = crate::render_to_image(app).expect("capture");
+    let drawn = count_px(&img, [255, 0, 0]);
+    assert!(drawn > 20, "the first cube is drawn: {drawn} px");
+    let assets = app.resources.expect_mut::<RenderAssets>();
+    let meshes: Vec<_> = (0..5).map(|_| assets.add_mesh(MeshData::cube(0.6))).collect();
+    let textures: Vec<_> = (0..3)
+        .map(|_| assets.add_image(ImageData::filled(16, 16, [0, 0, 255, 255])))
+        .collect();
+    for (i, mesh) in meshes.iter().enumerate() {
+        app.world.spawn((
+            Transform::from_xyz(-2.0 + i as f32, 0.0, 0.0),
+            Mesh3d(*mesh),
+            Material::unlit(Vec4::ONE).with_texture(textures[i % 3]),
+        ));
+    }
+    ((first, red, drawn), meshes, textures)
+}
+
+/// Under a budget the queued textures and then the queued meshes upload over several frames,
+/// the first queued first, and the picture is whole in every one of them: what was drawn stays
+/// drawn (a texture being replaced with its previous contents), a cube appears once its mesh is
+/// there, with its texture from its first frame (no mesh is uploaded while a texture waits), and
+/// no pixel shows anything else.
+#[test]
+fn a_budgeted_queue_drains_in_order_and_what_is_drawn_stays_drawn() {
+    use crate::{RenderStats, UploadBudget};
+    use space3d_core::ImageData;
+    let Some(mut app) = headless_app(192, 64) else { return };
+    let ((_, red, drawn), meshes, textures) = upload_queue_scene(&mut app);
+    // The red texture is replaced last of all: it waits behind the new ones.
+    let assets = app.resources.expect_mut::<RenderAssets>();
+    assert!(assets.update_image(red, ImageData::filled(16, 16, [0, 255, 0, 255])));
+    // A cube is 24 vertices of 36 bytes and 36 indices: 1008 bytes; a texture 1024. Two cubes
+    // fit a frame; a texture and a cube do not, and neither do two textures.
+    let (cube, texture) = (1008u64, 1024u64);
+    app.insert_resource(UploadBudget {
+        bytes: Some(2 * cube),
+        headless: true,
+    });
+    // Meshes and textures (the replaced one included) uploaded after each frame.
+    let frames: [(u32, u32); 7] = [(0, 1), (0, 2), (0, 3), (0, 4), (2, 4), (4, 4), (5, 4)];
+    let mut before = (0, 0);
+    for (frame, (done_meshes, done_textures)) in frames.into_iter().enumerate() {
+        let img = crate::render_to_image(&mut app).expect("capture");
+        let stats = app.resources.expect::<RenderStats>().clone();
+        let assets = app.resources.expect::<RenderAssets>();
+        let left = (5 - done_meshes) as u64 * cube + (4 - done_textures) as u64 * texture;
+        assert_eq!(
+            (stats.pending_meshes, stats.pending_textures, stats.pending_upload_bytes),
+            (5 - done_meshes, 4 - done_textures, left),
+            "frame {frame}"
+        );
+        assert_eq!(assets.pending_upload_bytes(), left, "frame {frame}");
+        assert_eq!(
+            (stats.meshes_uploaded, stats.textures_uploaded),
+            (done_meshes - before.0, done_textures - before.1),
+            "frame {frame}"
+        );
+        before = (done_meshes, done_textures);
+        // In the order they were queued: the first ones are there, the rest are not.
+        for (i, m) in meshes.iter().enumerate() {
+            assert_eq!(
+                assets.is_mesh_uploaded(*m),
+                i < done_meshes as usize,
+                "frame {frame}, mesh {i}"
+            );
+        }
+        for (i, t) in textures.iter().chain([&red]).enumerate() {
+            assert_eq!(
+                assets.is_texture_uploaded(*t),
+                i < done_textures as usize,
+                "frame {frame}, texture {i}"
+            );
+        }
+        // The first cube is drawn in every frame: red until its new texture is there, green
+        // from then on, and never anything between.
+        let (reds, greens) = (count_px(&img, [255, 0, 0]), count_px(&img, [0, 255, 0]));
+        let expected = if done_textures == 4 { (0, drawn) } else { (drawn, 0) };
+        assert_eq!((reds, greens), expected, "frame {frame}");
+        // A cube whose mesh is uploaded is drawn from that frame on.
+        assert_eq!(stats.instances, 1 + done_meshes as u64, "frame {frame}");
+        // Each of them is blue from its first frame, never white (the colour without the
+        // texture): the textures were all there before the first of the meshes, and no texel
+        // of a texture that is not wholly uploaded is ever sampled.
+        let (whites, blues) = (count_px(&img, [255, 255, 255]), count_px(&img, [0, 0, 255]));
+        assert_eq!(
+            (whites, blues > 0),
+            (0, done_meshes > 0),
+            "frame {frame}: {whites} white, {blues} blue"
+        );
+        let black = count_px(&img, [0, 0, 0]);
+        assert_eq!(
+            black + reds + greens + whites + blues,
+            192 * 64,
+            "frame {frame}: a pixel of another colour"
+        );
+    }
+    assert!(!app.resources.expect::<RenderAssets>().has_pending());
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+}
+
+/// Without a budget everything queued uploads in the next frame, as it always did; and a
+/// budget that does not ask for headless renderers leaves a headless one alone, so a capture
+/// shows the whole scene.
+#[test]
+fn without_a_budget_everything_uploads_in_one_frame() {
+    use crate::{RenderStats, UploadBudget};
+    for budget in [None, Some(UploadBudget::per_frame(1))] {
+        let Some(mut app) = headless_app(192, 64) else { return };
+        assert_eq!(*app.resources.expect::<UploadBudget>(), UploadBudget::default());
+        if let Some(budget) = budget {
+            app.insert_resource(budget);
+        }
+        let ((_, _, drawn), meshes, textures) = upload_queue_scene(&mut app);
+        let img = crate::render_to_image(&mut app).expect("capture");
+        let stats = app.resources.expect::<RenderStats>();
+        assert_eq!((stats.meshes_uploaded, stats.textures_uploaded), (5, 3), "{budget:?}");
+        assert_eq!(
+            (stats.pending_meshes, stats.pending_textures, stats.pending_upload_bytes),
+            (0, 0, 0),
+            "{budget:?}"
+        );
+        let assets = app.resources.expect::<RenderAssets>();
+        assert!(meshes.iter().all(|m| assets.is_mesh_uploaded(*m)));
+        assert!(textures.iter().all(|t| assets.is_texture_uploaded(*t)));
+        assert_eq!(assets.pending_upload_bytes(), 0);
+        assert_eq!(count_px(&img, [255, 0, 0]), drawn);
+        assert!(count_px(&img, [0, 0, 255]) > 3 * drawn && count_px(&img, [255, 255, 255]) == 0);
+    }
+}
+
+/// What must not wait does not: an update of a mesh that is being drawn shows in the next
+/// frame, and a render target is created in the next frame, however much is queued before them.
+/// An explicit flush then uploads all the rest at once.
+#[test]
+fn mesh_updates_and_render_targets_do_not_wait_behind_the_queue() {
+    use crate::{RenderStats, UploadBudget};
+    use space3d_core::{ImageData, MeshData};
+    let Some(mut app) = headless_app(192, 64) else { return };
+    let ((first, _, drawn), meshes, textures) = upload_queue_scene(&mut app);
+    app.insert_resource(UploadBudget {
+        bytes: Some(1),
+        headless: true,
+    });
+    let assets = app.resources.expect_mut::<RenderAssets>();
+    // Queued last of all: twice the cube, and a render target.
+    assert!(assets.update_mesh(first, MeshData::cube(1.2)));
+    let target = assets.add_render_target(32, 32);
+    assert!(!assets.is_mesh_uploaded(first) && !assets.is_texture_uploaded(target));
+    let img = crate::render_to_image(&mut app).expect("capture");
+    let stats = app.resources.expect::<RenderStats>().clone();
+    let assets = app.resources.expect_mut::<RenderAssets>();
+    // One new item a frame at this budget, the textures first: the first texture, and no new
+    // mesh yet. The replaced mesh and the render target come on top of it.
+    assert_eq!((stats.pending_meshes, stats.pending_textures), (5, 2));
+    assert_eq!((stats.meshes_uploaded, stats.textures_uploaded), (1, 2));
+    assert!(assets.is_mesh_uploaded(first) && assets.is_texture_uploaded(textures[0]));
+    assert!(!assets.is_mesh_uploaded(meshes[0]) && !assets.is_texture_uploaded(textures[1]));
+    assert!(assets.is_texture_uploaded(target));
+    let grown = count_px(&img, [255, 0, 0]);
+    assert!(
+        grown > 3 * drawn,
+        "the larger cube is drawn at once: {grown} px, {drawn} before"
+    );
+    // Resized, the target is created again in the next frame; replaced while it waits, a
+    // texture keeps its place in the queue.
+    assert!(assets.resize_render_target(target, 48, 48) && !assets.is_texture_uploaded(target));
+    assert!(assets.update_image(textures[2], ImageData::filled(16, 16, [0, 0, 255, 255])));
+    assert_eq!(assets.pending_textures, [textures[1], textures[2], target]);
+    crate::render_to_image(&mut app).expect("capture");
+    let stats = app.resources.expect::<RenderStats>().clone();
+    assert_eq!((stats.pending_meshes, stats.pending_textures), (5, 1));
+    let mut assets = std::mem::take(app.resources.expect_mut::<RenderAssets>());
+    assert!(assets.is_texture_uploaded(target) && assets.is_texture_uploaded(textures[1]));
+    assert_eq!(assets.pending_textures, [textures[2]]);
+    // The explicit flush is not budgeted.
+    app.resources.expect_mut::<Renderer>().upload_assets(&mut assets);
+    assert_eq!(assets.pending_uploads(), (0, 0, 0));
+    assert!(meshes.iter().all(|m| assets.is_mesh_uploaded(*m)));
+    assert!(textures.iter().all(|t| assets.is_texture_uploaded(*t)));
+    *app.resources.expect_mut::<RenderAssets>() = assets;
+    assert_eq!(app.resources.expect::<Renderer>().gpu_error_count(), 0);
+}
+
+/// A level of detail that is no mesh draws nothing, on every draw path and in the shadow maps:
+/// near, the part is drawn and casts, and its sibling with the merged mesh does neither; far,
+/// it is the other way round. Exactly one of the two is ever in a view.
+#[test]
+fn a_level_without_a_mesh_draws_nothing_in_any_view() {
+    use crate::{Camera3d, LodSettings, Mesh3d, MeshLod, RenderStats, ShadowMode};
+    use space3d_core::{MeshData, Transform};
+    let Some(probe) = headless_app(8, 8) else { return };
+    let best = probe.resources.expect::<Renderer>().capabilities().best_draw_path;
+    drop(probe);
+    // A light 10 units above the origin looking down, covering 8 × 8 units around it.
+    let light = glam::camera::rh::proj::directx::orthographic(-4.0, 4.0, -4.0, 4.0, 0.0, 20.0)
+        * glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 10.0, 0.0), Vec3::ZERO, Vec3::NEG_Z);
+    for path in paths_up_to(best) {
+        let mut app = headless_app(64, 64).expect("adapter");
+        set_path(&mut app, path);
+        crate::testing::add_depth_view(app.resources.expect_mut::<Renderer>(), light, 64, Default::default());
+        app.world.spawn((
+            Transform::from_xyz(0.0, 0.0, 6.0),
+            Camera3d::default().with_clear_color(Vec4::new(0.0, 0.0, 0.0, 1.0)),
+        ));
+        let assets = app.resources.expect_mut::<RenderAssets>();
+        let (full, merged) = (
+            assets.add_mesh(MeshData::cube(1.0)),
+            assets.add_mesh(MeshData::cube(1.0)),
+        );
+        let casting =
+            |rgb: [f32; 3]| Material::unlit(Vec4::new(rgb[0], rgb[1], rgb[2], 1.0)).with_shadows(ShadowMode::CastOnly);
+        app.world.spawn((
+            Transform::default(),
+            Mesh3d(full),
+            casting([1.0, 1.0, 1.0]),
+            MeshLod::from_levels(1.0, &[Some(full), None]),
+        ));
+        app.world.spawn((
+            Transform::default(),
+            Mesh3d(MeshHandle::NONE),
+            casting([1.0, 0.0, 0.0]),
+            MeshLod::from_levels(1.0, &[None, Some(merged)]),
+        ));
+        // An entity whose mesh is no mesh is not drawn without a `MeshLod` either.
+        app.world
+            .spawn((Transform::default(), Mesh3d(MeshHandle::NONE), casting([0.0, 1.0, 0.0])));
+        // The first frame uploads the meshes; the levels are picked from the second on.
+        crate::render_to_image(&mut app).expect("capture");
+        let frame = |app: &mut space3d_core::App, far: bool| {
+            // Every size is under the first threshold, or none is.
+            app.insert_resource(LodSettings {
+                pixels: [if far { 1e9 } else { 0.0 }, 0.0, 0.0],
+                ..LodSettings::default()
+            });
+            crate::lod::select_lods(&mut app.world, &app.resources);
+            let img = crate::render_to_image(app).expect("capture");
+            let ctx = format!("{path:?}, far {far}");
+            let (white, red) = (count_px(&img, [255, 255, 255]), count_px(&img, [255, 0, 0]));
+            assert_eq!((white > 50, red > 50), (!far, far), "{ctx}: {white} white, {red} red");
+            assert_eq!((white == 0, red == 0), (far, !far), "{ctx}: {white} white, {red} red");
+            assert_eq!(count_px(&img, [0, 255, 0]), 0, "{ctx}");
+            let stats = app.resources.expect::<RenderStats>();
+            assert_eq!((stats.depth_views, stats.shadow_casters), (1, 1), "{ctx}");
+            let renderer = app.resources.expect::<Renderer>();
+            assert_eq!(crate::testing::depth_view_instances(renderer, 0), 1, "{ctx}");
+            assert_eq!(renderer.gpu_error_count(), 0, "{ctx}");
+        };
+        for far in [false, true, false, true] {
+            frame(&mut app, far);
+        }
+    }
+}

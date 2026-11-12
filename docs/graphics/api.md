@@ -74,7 +74,7 @@ the game.
 
 | hub | area | contents |
 |---|---|---|
-| `settings.rs` | frame (F) | `FrameSettings`, `CameraFrame`, `HdrMode`, `DownlevelOverride`, `RenderTargetDesc`, `RenderTargetFormat` |
+| `settings.rs` | frame (F) | `FrameSettings`, `CameraFrame`, `HdrMode`, `DownlevelOverride`, `RenderTargetDesc`, `RenderTargetFormat`, `UploadBudget` |
 | `caps.rs` | F | `GraphicsCaps` |
 | `output.rs` | F | `OutputEncoding`, `Tonemapper`, `OUTPUT_WGSL` |
 | `node.rs` | F | the render-node API (`RenderNode`, `RenderNodes`, contexts, `PassTarget`, `FrameLayouts`, `VIEW_WGSL`, `scene_wgsl`, `FULLSCREEN_WGSL`) |
@@ -84,6 +84,8 @@ the game.
 | `material.rs` | P-MAT | `BlendMode`, `ShadowMode`, `MapMask`, `TextureTransform`, `MeshExtras` |
 | `lighting/api.rs` | P-MAT | cubemaps, `Skybox`, `EnvironmentLight`, `DirectionalShadow`, `LightingSettings` |
 | `post/api.rs` | P-POST | `PostProcess` and every post type, `DISTORTION_WGSL` |
+| `lod.rs` | F | `MeshLod`, `LodSettings`, the `lod` module (`simplify`, `simplify_to`, `UV_REACH`, `MAX_LOD_LEVELS`) |
+| `dynamic_resolution.rs` | F | `DynamicResolution` |
 
 Crate-internal contracts between the frame and the areas (spec §2.6) have fixed signatures:
 `lighting::Lighting` (+ `DepthViewRequest`, `ViewResources`, `LightingPrepare`),
@@ -195,6 +197,39 @@ Additions made by the foundation since F2 (additive):
   * `space3d-editor`: scene reprs and inspector sections for `CameraFrame`, `PostProcess`,
     `DirectionalShadow` (saved), `Skybox`, `EnvironmentLight` (snapshot-only: session-local
     cubemap handles); the `Material` repr gains the scalar map and blend fields.
+
+* Performance (all additive; nothing changes for an app that uses none of it):
+  * Levels of detail: the `MeshLod` component, the `LodSettings` resource (the defaults apply
+    without it) and the public module `space3d_render::lod` with `simplify(&MeshData,
+    &MeshExtras, cell)` and `simplify_to(&MeshData, &MeshExtras, ratio)`, both returning
+    `(MeshData, MeshExtras)`. `RenderPlugin` adds the system `render::select_lods` to the Render
+    stage before `render::render_frame`; it writes `Mesh3d` of entities that have a `MeshLod`
+    and of no other. `simplify` does not weld across texture seams or between vertices whose
+    normals face different ways, and keeps a triangle and its reverse as two.
+    ([frame.md](frame.md#levels-of-detail))
+  * Levels that draw nothing: `MeshHandle::NONE` (with `MeshHandle::is_none()`), the handle of no
+    mesh, which no view draws, and `MeshLod::from_levels(radius, &[Option<MeshHandle>])`.
+    `MeshLod` keeps the level last asked for, and its `PartialEq` compares the levels and the
+    sphere only. With a renderer, `render::select_lods` draws the nearest uploaded level in
+    place of one whose mesh is not on the GPU yet. `MeshLod::with_level_of(&other)` starts an
+    entity added later at the level a sibling was last asked for.
+    ([frame.md](frame.md#levels-that-draw-nothing))
+  * Upload budget: the `UploadBudget` resource (`bytes`, `headless`; `per_frame(bytes)`),
+    inserted by `RenderPlugin` with no limit; textures upload before meshes, so no new mesh
+    arrives while a texture waits. `RenderAssets::is_texture_uploaded(handle)` and
+    `pending_upload_bytes()` beside `is_mesh_uploaded`;
+    `RenderStats::{pending_meshes, pending_textures, pending_upload_bytes}`. Behaviour-only: the
+    ECS path draws an entity while its mesh has a GPU copy, the test the `InstancedMesh` path
+    already made; a mesh or texture replaced before its upload is queued once, at its first
+    place. ([frame.md](frame.md#asset-uploads-and-the-upload-budget))
+  * Dynamic resolution: the `DynamicResolution` resource (`enabled`, `target_fps`, `min_scale`,
+    `probe_secs`; `on(fps)`, `scale()`, `frame(ms)`), inserted by `RenderPlugin`, off by
+    default, with the system `render::dynamic_resolution` in the Render stage. On, it
+    multiplies `FrameSettings::render_scale` for the frame (the resource itself is not
+    written), so it reaches the Primary target's cameras only.
+    ([frame.md](frame.md#dynamic-resolution))
+  * The frame's CPU parts are `tracing` spans named `render.*`
+    ([frame.md](frame.md#cpu-spans)). No API.
 
 ## Ownership map (spec §3.6)
 

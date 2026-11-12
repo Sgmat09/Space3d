@@ -1114,10 +1114,13 @@ impl FrameState {
                 if visibility.as_ref().is_some_and(|v| v[row] == Visibility::Hidden) {
                     continue;
                 }
+                // Drawn while it has a GPU copy: a mesh whose update waits for upload keeps
+                // drawing its previous data (as an `InstancedMesh` does), and `MeshHandle::NONE`
+                // or a mesh not uploaded yet is skipped.
                 let uploaded = match last_mesh {
                     Some((m, uploaded)) if m == mesh.0 => uploaded,
                     _ => {
-                        let uploaded = assets.is_mesh_uploaded(mesh.0);
+                        let uploaded = assets.is_mesh_drawable(mesh.0);
                         last_mesh = Some((mesh.0, uploaded));
                         uploaded
                     }

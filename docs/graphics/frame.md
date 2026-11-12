@@ -137,6 +137,220 @@ The primary target's cameras render into a scene texture scaled by 0.25..=1 and 
 upscales it bilinearly (without post: a plain copy, "passthrough"). Overlays (egui) stay at full
 resolution.
 
+## Dynamic resolution
+
+```rust
+*app.resources.expect_mut::<DynamicResolution>() = DynamicResolution::on(60.0);
+// DynamicResolution { min_scale: 0.6, probe_secs: 8.0, ..DynamicResolution::on(60.0) }
+```
+
+`DynamicResolution` is a resource that `RenderPlugin` inserts, off by default. On, the renderer
+multiplies `FrameSettings::render_scale` by `DynamicResolution::scale()` each frame: one of the
+steps 1, 0.85, 0.72, 0.6, 0.5 (each about 0.72 of the pixels of the one before), never one under
+`min_scale` (default 0.5). The product is clamped to 0.25..=1 like any render scale. It changes
+only what `FrameSettings::render_scale` changes: the scene of the Primary target's cameras.
+A camera group with its own `CameraFrame::render_scale`, cameras that render to a texture, the
+overlays and the window keep their size. Off, `scale()` is 1.
+
+It reads nothing but the time from one Render stage to the next (the `render::dynamic_resolution`
+system), so it works on every backend, with or without vsync and without GPU timestamps. An app
+that paces frames itself can call `DynamicResolution::frame(ms)`.
+
+* **Windows.** Frame times are averaged over 750 ms, and the window after a change of scale is
+  left out (the scene targets are made anew). A frame of 250 ms or more is a hitch (a load, a
+  stall) and is left out, unless three or more of them follow one another: then the app runs
+  that slowly and they count.
+* **Down.** A window more than 12 % over the budget of `target_fps` starts a descent: the
+  scale goes down a step each judged window until a window is within budget or the lowest step
+  (`min_scale`) is reached. A single step is not judged by itself: under vsync a frame gets
+  shorter only when it crosses a whole refresh interval (25 ms of GPU work on a 60 Hz display
+  is shown every 33.3 ms at 1.0, 0.85 and 0.72, and every 16.7 ms at 0.6).
+* **At the floor.** A descent that reaches the lowest step still over budget stays there if the
+  frame takes at most three quarters of the time it took where the descent started (the
+  resolution is what costs, and this is the best that can be done). Otherwise the frame is not
+  waiting for the pixels (the CPU is the limit, the display is slower than the target, or the
+  slow pass does not scale with resolution): the scale goes back to where the descent started.
+* **Backing off.** After a descent that ended so, none is tried for 30 s, and twice as long
+  after every further one, up to 600 s: a frame rate that resolution cannot help costs one
+  descent to the lowest step and back (four steps down and one up, about six seconds below
+  full resolution, new scene targets at each step) every ten minutes at most. A descent that
+  ends within budget, a minute of windows within budget, or a frame time a fifth away from the
+  one the last descent failed at (another scene) ends the back-off.
+* **Probing up.** After `probe_secs` (default 8) of windows within budget the scale tries one
+  step up. If the window after it is over budget the step is taken back and the next probe
+  waits twice as long (at most 120 s); a probe that holds halves the wait again.
+* **Up while over budget.** A reduced scale whose windows are over budget where no descent may
+  start (in a back-off, or at the lowest step) tries a step up after `probe_secs` of such
+  windows. If the next window is no more than 5 % slower than the one before, the step is kept
+  (the resolution was not what cost the time) and the next follows after the same wait; if it
+  is slower, the step is taken back and the wait doubles (at most 120 s).
+
+Disabling it forgets all of this; only `target_fps`, `min_scale` and `probe_secs` are kept.
+
+## Levels of detail
+
+```rust
+use space3d::render::{MeshLod, lod};
+
+let (mid, mid_extras) = lod::simplify_to(&data, &extras, 0.25);   // a quarter of the triangles
+let (low, low_extras) = lod::simplify_to(&data, &extras, 0.06);
+let mid = assets.add_mesh_with(mid, mid_extras);
+let low = assets.add_mesh_with(low, low_extras);
+world.spawn((Transform::default(), Mesh3d(full), material, MeshLod::new(radius, &[full, mid, low])));
+```
+
+A model a few dozen pixels tall costs its full triangle count in the scene pass and again in
+every shadow map. `MeshLod` lists an entity's meshes from the full one down (at most four), and
+the `render::select_lods` system (Render stage, before the frame is extracted; it allocates
+nothing) sets the entity's `Mesh3d` to one of them each frame. Everything that draws the entity
+draws that mesh, the shadow maps included. An entity without `MeshLod` keeps its mesh.
+
+* **What picks the level.** The radius on screen, in physical pixels, of the sphere
+  `MeshLod::radius` (in the entity's units, scaled by its `GlobalTransform`; `with_center`
+  moves it): the largest it has in any active camera, by that camera's projection and the
+  height of its target and viewport. A model shown close up in a preview target keeps its
+  detail while the same model is far away in the world. For a model of several parts give
+  every part the whole model's radius, so the parts change together. Without an active camera,
+  or with more than 16, every entity draws its full mesh.
+* **`LodSettings`** (resource; the defaults apply without it): `pixels` are the thresholds,
+  `[56, 20, 0]` by default: the full mesh above 56 px, the second level down to 20 px, the third
+  below (a fourth is never picked unless the last threshold is raised). `bias` multiplies them
+  (above 1 simpler meshes come sooner); `enabled: false` draws every full mesh. An entity with
+  fewer meshes than the level asked for draws its last.
+* **Hysteresis.** A level changes only once the size is 10 % past its threshold, so a model
+  whose size sits on a threshold does not flicker between two meshes. The level last asked for
+  is kept in the `MeshLod` (it is not part of its equality).
+* **A level that is not uploaded yet.** With a renderer, a level whose mesh has no copy on the
+  GPU is not drawn while another level of the entity has one: the nearest such level is drawn
+  in its place (of two equally near, the simpler), and the level asked for from the frame after
+  its mesh arrives (the selection runs before the frame's uploads). The stand-in does not move
+  the hysteresis: it goes on from the level asked for. An entity none of whose meshes is
+  uploaded keeps the level asked for and is not drawn, as before. Without a renderer or
+  `RenderAssets` (simulation-only apps, tests) the level asked for is set as it is.
+
+### Levels that draw nothing
+
+```rust
+// every part of the model, with the model's radius and centre
+MeshLod::from_levels(radius, &[Some(full), Some(simpler), None]);
+// a part with no simpler mesh repeats its full one
+MeshLod::from_levels(radius, &[Some(full), Some(full), None]);
+// one more entity: the whole model merged into one mesh, with its own material
+world.spawn((transform, Mesh3d(MeshHandle::NONE), material,
+             MeshLod::from_levels(radius, &[None, None, Some(merged)])));
+```
+
+`MeshLod::from_levels` takes `Option<MeshHandle>` per level. At a `None` level the entity's
+`Mesh3d` is set to `MeshHandle::NONE`, the handle of no mesh, and the entity is not drawn: the
+extraction skips it as it skips a mesh that is not uploaded, so it is in no batch, on no draw
+path, in no camera view and in no shadow map. Its `Visibility` is not touched (an app's own
+`Hidden` still hides it at every level), and entities without `MeshLod` pay nothing for it.
+`MeshLod::meshes()` lists `MeshHandle::NONE` for such a level, and `Mesh3d(MeshHandle::NONE)`
+on any entity draws nothing.
+
+A model of P parts so costs one batch entry far away instead of P: the parts draw nothing at
+the far level and one sibling entity draws the merged mesh there and nothing nearer.
+
+* Give all of them the same `radius`, centre and number of levels, and spawn them in the same
+  frame, so they change level in the same frame: each picks its level from the same sphere and
+  keeps its own hysteresis state, which then stays the same for all. The state starts at the
+  level of the entity's `Mesh3d`. An entity added to the model later, or given a new `MeshLod`,
+  starts again: inside the 10 % band around a threshold it can be one level away from the
+  others (a part drawn together with the merged mesh, or neither drawn) until the model leaves
+  the band. `MeshLod::from_levels(..).with_level_of(&sibling_lod)` starts it at the level the
+  sibling was last asked for instead.
+* With levels of detail off, without an active camera or with more than 16, every entity is at
+  its first level: the parts are drawn and the merged mesh is not.
+* The renderer does not know that the entities belong together. A `None` level never stands in
+  for a mesh that is not uploaded, so with the merged mesh still on its way the parts draw
+  nothing at the far level and the whole model is not drawn until it arrives. Spawn the
+  entities only once `RenderAssets::is_mesh_uploaded` is true for every mesh of the model, the
+  merged one included.
+* The entity count is unchanged: every entity still passes through `select_lods` and transform
+  propagation. What shrinks is the batches' instances and the extraction's work.
+
+## Asset uploads and the upload budget
+
+```rust
+app.insert_resource(UploadBudget::per_frame(4 << 20));          // 4 MiB of meshes and textures a frame
+let ready = assets.is_mesh_uploaded(mesh) && assets.is_texture_uploaded(texture);
+let left = assets.pending_upload_bytes();                       // or RenderStats::pending_upload_bytes
+```
+
+`RenderAssets::add_mesh`, `add_texture` and their relatives only queue. The renderer uploads
+the queues at the start of each frame, on the frame's encoder, textures before meshes. Without
+a budget (`UploadBudget::default()`, which `RenderPlugin` inserts) everything queued uploads in
+that one frame.
+
+* **`UploadBudget { bytes, headless }`** (resource). `bytes: Some(n)` limits the mesh and
+  texture data uploaded in one frame. The queues are uploaded in the order they were filled,
+  as one sequence (the texture queue, then the mesh queue), and the frame stops at the first
+  item that does not fit in what is left of `n`; that item and everything after it wait for the
+  next frames. The first item of a frame is uploaded whatever its size, so an item larger than
+  the budget takes a frame alone. An item is a whole mesh (vertices, indices and its extension
+  vertices: 36 bytes a vertex, 4 an index, 16 an extension vertex) or a whole texture (the
+  bytes of its source, every provided mip and layer): it is uploaded entirely in one frame or
+  not at all, and its mip chain is generated in that same frame. So a texture is never sampled
+  half written, and a frame's uploads can exceed the budget only by a single item.
+* **Textures first.** An entity is drawn as soon as its mesh is uploaded, and a material draws
+  without a map that is not uploaded. Because the texture queue goes first and the frame stops
+  at the first item that does not fit, no new mesh is uploaded while a texture still waits: a
+  model whose textures were queued no later than the frame its meshes upload in is first drawn
+  with all of them. Textures queued after that frame (decoded later than the meshes) are not
+  covered: spawn such a model once `is_mesh_uploaded` is true for its meshes and
+  `is_texture_uploaded` for its maps. While textures keep being queued, new meshes wait.
+* **What does not wait.**
+  * Render targets hold no data and are created (or recreated after `resize_render_target`)
+    in the next frame.
+  * A mesh replaced with `update_mesh` while it has a GPU copy is uploaded in the next frame,
+    so geometry that is being drawn changes when it did before. Its bytes count against the
+    frame's budget, but the upload itself is not spread: to bring a full mesh in behind a
+    placeholder without a long frame, `add_mesh` it as a new mesh and switch the entity's
+    `Mesh3d` (or its `MeshLod`) to it once `is_mesh_uploaded` is true.
+* **What waits, and what is drawn meanwhile.**
+  * A new mesh: its entities are not drawn until it is uploaded.
+  * A new texture: materials draw without that map (the factor alone: base colour white, no
+    normal map, the emissive factor unmasked) until it is uploaded, then rebind by themselves.
+    This is seen only where the texture was queued after its mesh was uploaded (above).
+  * A texture replaced with `update_texture`: its previous contents stay bound until the new
+    ones are uploaded. A small texture can so be shown first and its full version queued behind.
+  * A mesh or texture replaced again while it waits keeps its place in the queue.
+* **Headless.** A headless renderer ignores the budget unless `headless: true`, so
+  `render_to_image` and captures show the whole scene.
+* **`Renderer::upload_assets`** uploads everything now, whatever the budget.
+* **Residency.** `RenderAssets::is_mesh_uploaded(handle)` and `is_texture_uploaded(handle)` are
+  true once the current data is on the GPU and nothing of it waits (for a render target: once
+  it is created). A new texture whose upload failed stays false; a replacement whose upload
+  failed is dropped, and the texture goes on reporting its previous contents as uploaded.
+  `pending_upload_bytes()` is the data still queued, in one pass over the
+  queues. `RenderStats::{pending_meshes, pending_textures, pending_upload_bytes}` are the same
+  counts as of the end of the last frame's uploads; all three are 0 without a budget.
+* **What is drawn.** An entity is drawn while its mesh has a GPU copy, on the ECS path as on
+  the `InstancedMesh` path; `is_mesh_uploaded` is the stricter test (false from `update_mesh`
+  until the upload).
+
+The budget bounds the copies the renderer makes. It does not bound what `add_mesh` itself
+does on the caller's thread (bounds, extension vertices), nor pipelines built at first draw
+(`Renderer::prewarm`).
+
+`lod::simplify(&data, &extras, cell)` makes the coarser mesh by vertex clustering: the vertices
+inside each cube of side `cell` become one (the one nearest their middle, with their normals
+averaged), collapsed triangles are dropped, and so are repeats of a triangle in the same
+winding. It needs no manifold mesh. `lod::simplify_to(&data, &extras, ratio)` finds the smallest
+cell that leaves at most `ratio` of the triangles. Not everything inside a cell is joined:
+
+* **Seams are not welded.** Vertices join only where their texture coordinates are close too
+  (within `lod::UV_REACH` cells' worth of texture), so no triangle reaches from one island of
+  the atlas to another.
+* **Opposite-facing sheets are not welded.** Vertices join only where their normals face the
+  same way (the largest component of the normal and its sign: six ways). The two sides of a
+  thin part (a wing made of a face and a reversed copy behind it) stay two sheets with their
+  own normals and windings, and a reversed copy of a triangle is kept, so the part does not
+  vanish from one side under back-face culling. A closed mesh with normals so never gets
+  simpler than one vertex for each way it faces.
+* A stream (normals, UVs, colours, tangents, second UVs) counts only when it has a value for
+  every position; one of another length is left out of the result.
+
 ## Several cameras
 
 Cameras render in `order`; cameras sharing a target form its *target group*:
@@ -553,6 +767,22 @@ nothing for it after the first timed frame (`tests/gpu_timings.rs`, `tests/alloc
 overlap and `total_ms` is a sum, not the frame's GPU time. Measure on a loaded GPU (frames back
 to back): an idle GPU drops to low clocks and every pass costs about 3× more. Off (the
 default), timing costs nothing.
+
+### CPU spans
+
+The CPU side of the frame is timed with `tracing` spans of the kind the schedule opens round
+every system (`"system"` with a `name`), so the F4 profiler lists them beside the systems. They
+cost nothing while no subscriber takes trace spans.
+
+| name | part of `render::render_frame` |
+|---|---|
+| `render.prepare` | extraction and everything uploaded for the frame; its parts are `render.prepare.extract`, `.views`, `.nodes`, `.upload`, `.bind_groups` |
+| `render.compute` | encoding the GPU culling compute pass |
+| `render.depth_views` | encoding the depth views (shadow maps) |
+| `render.views` | encoding the camera views and the post groups |
+| `render.overlays` | encoding the AfterTonemap overlays (egui) |
+| `render.submit` | finishing the uploads, submitting and presenting |
+| `render.pace` | keeping at most three frames in flight; with the GPU behind, this is where the frame waits for it |
 
 ## Capture and tools
 

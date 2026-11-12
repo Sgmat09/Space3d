@@ -21,7 +21,7 @@ here is additive to the API games already use ([`graphics/api.md`](graphics/api.
 |---|---|
 | this page | overview, the frame, a how-to per feature, WebGL2, budgets, quality presets, showcase |
 | [`graphics/migration.md`](graphics/migration.md) | adopting every feature in SpaceCorps2027, step by step, with code |
-| [`graphics/frame.md`](graphics/frame.md) | frame modes, HDR, tonemapping, render scale, several cameras, render nodes, overlay stages, depth views, GPU timings |
+| [`graphics/frame.md`](graphics/frame.md) | frame modes, HDR, tonemapping, render scale, dynamic resolution, levels of detail, several cameras, render nodes, overlay stages, depth views, GPU timings and CPU spans |
 | [`graphics/materials.md`](graphics/materials.md) | material maps, blend modes, glTF import, tangents, cubemaps, skybox, image-based lighting, the directional shadow, prewarm |
 | [`graphics/post.md`](graphics/post.md) | bloom, auto exposure, color grading and LUTs, FXAA, vignette, chromatic aberration, film grain, distortion |
 | [`graphics/particles.md`](graphics/particles.md) | emitters, effects, sprites, ribbons, beams, flipbooks, light flashes, the built-in library, budgets, LOD |
@@ -191,12 +191,24 @@ bloom and tonemapping (below). ([frame.md](graphics/frame.md#render-nodes-drawin
 **Render at a lower resolution.** `FrameSettings::render_scale` (or `CameraFrame::render_scale`
 per camera): the scene renders smaller and the composite upscales; egui stays sharp.
 
+**Hold the frame rate.** `DynamicResolution::on(60.0)` (a resource, off by default) multiplies
+`FrameSettings::render_scale` by a step of 1, 0.85, 0.72, 0.6 or 0.5, chosen from the frame time
+alone: down while frames are over budget and a lower resolution makes them faster, up again
+when there is room. ([frame.md](graphics/frame.md#dynamic-resolution))
+
+**Draw small models with fewer triangles.** `lod::simplify_to(&mesh, &extras, 0.25)` makes a
+coarser mesh; `MeshLod::new(radius, &[full, mid, low])` on the entity lets the renderer set its
+`Mesh3d` each frame from its size on screen (`LodSettings`). Shadow maps draw the same level.
+([frame.md](graphics/frame.md#levels-of-detail))
+
 **Preview a ship in the UI.** A render target (`add_render_target_with(w, h,
 RenderTargetDesc::default().with_samples(4))`), a camera with a transparent clear and
 `PostProcess` targeting it: the composite keeps alpha, egui shows it (`UiTextures`).
 
 **Measure.** `FrameSettings::gpu_timing` fills `GpuTimings` (per-pass GPU ms, labels in
 frame.md); `RenderStats` counts draws, passes, targets bytes; `ParticleStats` the particles.
+The frame's CPU parts are trace spans named `render.*`, which the F4 profiler lists beside the
+systems ([frame.md](graphics/frame.md#cpu-spans)).
 
 **Build pipelines on the loading screen.** WebGL2 links a program in 50–150 ms: render one frame
 of the loading scene, then `renderer.prewarm(&quality.prewarm_request(&materials))`.

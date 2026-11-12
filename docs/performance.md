@@ -102,7 +102,8 @@ overlay.
   `bytes_uploaded`, `instance_bytes_uploaded`, buffer reallocations, compute dispatches, draw
   path, meshes/textures uploaded.
 * **F3** debug overlay (FPS, frame-time graph, ticks, render stats) and **F4** profiler
-  (per-system timings from `tracing` spans) with the `ui` feature.
+  (per-system timings from `tracing` spans, and the renderer's `render.*` parts of the frame:
+  [graphics/frame.md](graphics/frame.md#cpu-spans)) with the `ui` feature.
 * In tests: `assert_frame_budget`, `RenderBudget` (max draw calls / bytes uploaded / …),
   `assert_max_allocations` — see [testing.md](testing.md).
 * Benchmarks: `space3d bench` (= `cargo bench`); the engine has criterion benches for the

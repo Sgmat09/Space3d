@@ -794,6 +794,22 @@ fn forces_pull_swirl_and_stir() {
     assert_eq!(a, b);
     let moved: f32 = a.iter().zip(&still).map(|(p, q)| (p.pos() - q.pos()).length()).sum();
     assert!(moved > 1.0, "{moved}");
+    // Curl noise stirs them too, deterministically: two runs agree and the particles have moved.
+    let curl = || {
+        run(
+            vec![Force::Curl {
+                strength: 30.0,
+                frequency: 0.5,
+                speed: 1.0,
+            }],
+            0,
+            1,
+        )
+    };
+    let (a, b) = (curl(), curl());
+    assert_eq!(a, b);
+    let moved: f32 = a.iter().zip(&still).map(|(p, q)| (p.pos() - q.pos()).length()).sum();
+    assert!(moved > 1.0, "{moved}");
     // A world attractor (entity at y = 10) acts on layers whose mask matches.
     assert!(mean(&run(vec![], 1, 1)).y > 1.0, "attracted up");
     assert!(mean(&run(vec![], 1, 2)).y.abs() < 0.5, "mask mismatch: no effect");

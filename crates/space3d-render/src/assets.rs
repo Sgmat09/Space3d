@@ -162,6 +162,26 @@ pub(crate) struct MeshEntry {
     /// Extension vertices waiting for upload with the mesh (`None`: none — the upload clears
     /// the mesh's range of the extension stream, if that exists).
     pub ext: Option<Vec<crate::arena::ExtVertex>>,
+    /// In `RenderAssets::pending_meshes` (once at most, at the place it was first queued).
+    pub queued: bool,
+}
+
+impl MeshEntry {
+    /// Bytes the upload of the waiting CPU data writes: vertices, indices and extension
+    /// vertices. Known without converting the mesh, so a frame's uploads are chosen first.
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        let Some(data) = &self.cpu else { return 0 };
+        let vertices = data.positions.len() as u64;
+        let indices = if data.indices.is_empty() {
+            vertices
+        } else {
+            data.indices.len() as u64
+        };
+        let ext = self.ext.as_ref().map_or(0, |e| e.len() as u64);
+        vertices * std::mem::size_of::<crate::arena::Vertex>() as u64
+            + indices * 4
+            + ext * crate::arena::EXT_VERTEX_SIZE
+    }
 }
 
 pub(crate) struct GpuTexture {
@@ -195,6 +215,15 @@ pub(crate) struct TextureEntry {
     pub sampler: SamplerSettings,
     /// Render targets: the description they were created with.
     pub target_desc: Option<crate::settings::RenderTargetDesc>,
+    /// In `RenderAssets::pending_textures` (once at most, at the place it was first queued).
+    pub queued: bool,
+}
+
+impl TextureEntry {
+    /// Bytes the upload of the waiting source writes (0 for render targets, which hold none).
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        self.source.as_ref().map_or(0, |s| s.data.len() as u64)
+    }
 }
 
 /// A registered [`CustomShader`]; `version` is bumped by every update (pipelines are rebuilt).
@@ -238,6 +267,7 @@ fn mesh_entry(data: MeshData, extras: Option<&crate::material::MeshExtras>) -> M
         cpu: Some(data),
         gpu: None,
         ext,
+        queued: false,
     }
 }
 
@@ -245,7 +275,7 @@ impl RenderAssets {
     /// Register a mesh; it is uploaded into the mesh arena on the next frame.
     pub fn add_mesh(&mut self, data: MeshData) -> MeshHandle {
         let h = MeshHandle::from_raw(self.meshes.insert(mesh_entry(data, None)));
-        self.pending_meshes.push(h);
+        self.queue_mesh(h);
         h
     }
 
@@ -256,7 +286,7 @@ impl RenderAssets {
     /// allocated only once some mesh has extras).
     pub fn add_mesh_with(&mut self, data: MeshData, extras: crate::material::MeshExtras) -> MeshHandle {
         let h = MeshHandle::from_raw(self.meshes.insert(mesh_entry(data, Some(&extras))));
-        self.pending_meshes.push(h);
+        self.queue_mesh(h);
         h
     }
 
@@ -285,11 +315,33 @@ impl RenderAssets {
         let Some(e) = self.meshes.get_mut(handle.raw()) else {
             return false;
         };
-        let gpu = e.gpu;
+        let (gpu, queued) = (e.gpu, e.queued);
         *e = mesh_entry(data, extras);
         e.gpu = gpu;
-        self.pending_meshes.push(handle);
+        e.queued = queued;
+        self.queue_mesh(handle);
         true
+    }
+
+    /// Queue a mesh for upload, unless it is queued already: a mesh replaced while it waits
+    /// keeps its place, and the queue never holds a handle twice.
+    fn queue_mesh(&mut self, handle: MeshHandle) {
+        if let Some(e) = self.meshes.get_mut(handle.raw())
+            && !e.queued
+        {
+            e.queued = true;
+            self.pending_meshes.push(handle);
+        }
+    }
+
+    /// As [`Self::queue_mesh`], for a texture.
+    fn queue_texture(&mut self, handle: TextureHandle) {
+        if let Some(e) = self.textures.get_mut(handle.raw())
+            && !e.queued
+        {
+            e.queued = true;
+            self.pending_textures.push(handle);
+        }
     }
 
     /// Write the extension stream of the meshes of `uploaded` that were just placed in the
@@ -363,11 +415,20 @@ impl RenderAssets {
         self.meshes.get(handle.raw()).map(|e| e.triangles)
     }
 
-    /// Whether the mesh is resident on the GPU.
+    /// Whether the mesh is resident on the GPU: its current data is uploaded and nothing of it
+    /// waits. False for a mesh still queued (it is not drawn yet), and for one replaced with
+    /// [`Self::update_mesh`] until the next frame (its previous data is drawn meanwhile).
     pub fn is_mesh_uploaded(&self, handle: MeshHandle) -> bool {
         self.meshes
             .get(handle.raw())
             .is_some_and(|e| e.gpu.is_some() && e.cpu.is_none())
+    }
+
+    /// Whether the mesh has a copy on the GPU that can be drawn: what the frame's extraction and
+    /// the level-of-detail selection ask. Unlike [`Self::is_mesh_uploaded`] it stays true while
+    /// an update of the mesh waits, because the previous data is still there to draw.
+    pub(crate) fn is_mesh_drawable(&self, handle: MeshHandle) -> bool {
+        self.meshes.get(handle.raw()).is_some_and(|e| e.gpu.is_some())
     }
 
     /// Number of live meshes.
@@ -392,8 +453,9 @@ impl RenderAssets {
             source: Some(source),
             gpu: None,
             target_desc: None,
+            queued: false,
         }));
-        self.pending_textures.push(h);
+        self.queue_texture(h);
         h
     }
 
@@ -431,8 +493,9 @@ impl RenderAssets {
             source: None,
             gpu: None,
             target_desc: Some(desc),
+            queued: false,
         }));
-        self.pending_textures.push(h);
+        self.queue_texture(h);
         h
     }
 
@@ -463,7 +526,7 @@ impl RenderAssets {
         e.height = source.height;
         e.sampler = source.sampler;
         e.source = Some(source);
-        self.pending_textures.push(handle);
+        self.queue_texture(handle);
         true
     }
 
@@ -488,7 +551,7 @@ impl RenderAssets {
             e.width = width;
             e.height = height;
             e.gpu = None;
-            self.pending_textures.push(handle);
+            self.queue_texture(handle);
         }
         true
     }
@@ -501,6 +564,19 @@ impl RenderAssets {
     /// Whether the handle refers to a live texture.
     pub fn contains_texture(&self, handle: TextureHandle) -> bool {
         self.textures.get(handle.raw()).is_some()
+    }
+
+    /// Whether the texture is resident on the GPU: its current contents are uploaded (for a
+    /// render target: it is created) and nothing of it waits. False for a texture still queued
+    /// (materials draw without it until it arrives), for one replaced with
+    /// [`Self::update_texture`] until the new contents are uploaded (the previous contents are
+    /// drawn meanwhile), and for a new texture whose upload failed (logged). A replacement whose
+    /// upload failed is dropped: the texture keeps its previous contents and reports them as
+    /// uploaded, while [`Self::texture_size`] already gives the size of the failed replacement.
+    pub fn is_texture_uploaded(&self, handle: TextureHandle) -> bool {
+        self.textures
+            .get(handle.raw())
+            .is_some_and(|e| e.gpu.is_some() && e.source.is_none())
     }
 
     /// Size of a texture.
@@ -548,6 +624,34 @@ impl RenderAssets {
     /// Anything waiting for upload.
     pub fn has_pending(&self) -> bool {
         !self.pending_meshes.is_empty() || !self.pending_textures.is_empty() || !self.freed_allocs.is_empty()
+    }
+
+    /// Bytes of mesh and texture data waiting for upload: what the renderer has left to copy
+    /// under an [`crate::UploadBudget`] (0 once everything queued is on the GPU). One pass over
+    /// the waiting items; `RenderStats::pending_upload_bytes` is the same figure as of the last
+    /// frame, for free.
+    pub fn pending_upload_bytes(&self) -> u64 {
+        self.pending_uploads().2
+    }
+
+    /// Meshes and textures waiting for upload, and their bytes. Handles of removed assets and
+    /// of assets with nothing left to upload are not counted (they leave the queues when the
+    /// renderer reaches them).
+    pub(crate) fn pending_uploads(&self) -> (u32, u32, u64) {
+        let (mut meshes, mut textures, mut bytes) = (0, 0, 0);
+        for e in self.pending_meshes.iter().filter_map(|h| self.meshes.get(h.raw())) {
+            if e.cpu.is_some() {
+                meshes += 1;
+                bytes += e.pending_bytes();
+            }
+        }
+        for e in self.pending_textures.iter().filter_map(|h| self.textures.get(h.raw())) {
+            if e.source.is_some() || (e.render_target && e.gpu.is_none()) {
+                textures += 1;
+                bytes += e.pending_bytes();
+            }
+        }
+        (meshes, textures, bytes)
     }
 
     /// Vertices / indices currently allocated in the mesh arena.
@@ -603,5 +707,38 @@ mod tests {
         assert_eq!(a.render_target_desc(lin), None);
         let m = a.add_mesh_with(MeshData::cube(1.0), crate::MeshExtras::new());
         assert!(a.update_mesh_with(m, MeshData::plane(1.0), crate::MeshExtras::new()));
+    }
+
+    #[test]
+    fn what_waits_for_upload_is_counted_once_and_keeps_its_place() {
+        let mut a = RenderAssets::default();
+        assert_eq!(a.pending_uploads(), (0, 0, 0));
+        // a cube: 24 vertices of 36 bytes and 36 indices of 4
+        let cube = 24 * 36 + 36 * 4;
+        let first = a.add_mesh(MeshData::cube(1.0));
+        let second = a.add_mesh(MeshData::cube(1.0));
+        assert_eq!(a.pending_uploads(), (2, 0, 2 * cube));
+        // tangents travel with the mesh: 16 bytes a vertex
+        let tangents = crate::MeshExtras::new().with_tangents(vec![[1.0, 0.0, 0.0, 1.0]; 24]);
+        assert!(a.update_mesh_with(first, MeshData::cube(2.0), tangents));
+        assert_eq!(a.pending_uploads(), (2, 0, 2 * cube + 24 * 16));
+        assert_eq!(
+            a.pending_meshes,
+            [first, second],
+            "replaced while waiting: not queued again"
+        );
+        // a texture counts its texels, a render target nothing; a replaced one counts once
+        let image = a.add_image(ImageData::filled(4, 4, [255; 4]));
+        let target = a.add_render_target(64, 64);
+        assert!(a.update_image(image, ImageData::filled(8, 8, [255; 4])));
+        assert!(a.resize_render_target(target, 32, 32));
+        assert_eq!(a.pending_textures, [image, target]);
+        assert_eq!(a.pending_uploads(), (2, 2, 2 * cube + 24 * 16 + 8 * 8 * 4));
+        assert_eq!(a.pending_upload_bytes(), 2 * cube + 24 * 16 + 8 * 8 * 4);
+        assert!(!a.is_texture_uploaded(image) && !a.is_texture_uploaded(target));
+        // what is removed while it waits no longer counts
+        assert!(a.remove_mesh(second) && a.remove_texture(image));
+        assert_eq!(a.pending_uploads(), (1, 1, cube + 24 * 16));
+        assert!(!a.is_texture_uploaded(image));
     }
 }
