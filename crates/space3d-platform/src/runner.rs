@@ -55,8 +55,9 @@ pub(crate) struct WinitRunner {
     surface_retry: SurfaceRetry,
     layout_watch: LayoutWatch,
     buttons: ButtonReconciler,
-    /// The finger that is the mouse (`WindowPlugin::touch_as_mouse`).
-    mouse_touch: Option<u64>,
+    /// Fingers as the mouse (`WindowPlugin::touch_as_mouse`), and the clock its times are on.
+    touch_pointer: crate::touch_pointer::TouchPointer,
+    touch_clock: Instant,
     /// Whether the on-screen keyboard was last asked for (`TextInput`, phones).
     #[cfg(any(target_os = "android", target_os = "ios"))]
     keyboard_shown: bool,
@@ -197,7 +198,8 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         surface_retry: SurfaceRetry::default(),
         layout_watch: LayoutWatch::default(),
         buttons: ButtonReconciler::default(),
-        mouse_touch: None,
+        touch_pointer: Default::default(),
+        touch_clock: Instant::now(),
         #[cfg(any(target_os = "android", target_os = "ios"))]
         keyboard_shown: false,
         #[cfg(target_arch = "wasm32")]
@@ -422,6 +424,7 @@ impl WinitRunner {
         if let Some(w) = &self.window {
             w.pre_present_notify();
         }
+        self.touch_pointer_frame();
         self.app.update(dt);
         self.apply_window_state();
         if self.app.should_exit() {
@@ -430,28 +433,41 @@ impl WinitRunner {
         }
     }
 
-    /// `WindowPlugin::touch_as_mouse`: the first finger down moves the mouse and holds its left
-    /// button until it is lifted (a cancelled touch lets go without a click).
+    /// `WindowPlugin::touch_as_mouse`: a touch goes through [`crate::touch_pointer`] to the mouse.
     fn touch_to_mouse(&mut self, id: u64, phase: TouchPhase, p: Vec2) {
-        match phase {
-            TouchPhase::Started if self.mouse_touch.is_none() => {
-                self.mouse_touch = Some(id);
-                // No delta from wherever the last finger was lifted.
-                self.input().set_mouse_position(Some(p));
-                self.input().inject_mouse_button_down(MouseButton::Left);
+        let mut actions = Vec::new();
+        self.touch_pointer.config.slop =
+            crate::touch_pointer::TouchPointerConfig::SLOP_POINTS * self.state().scale_factor.max(1.0) as f32;
+        let now = self.touch_clock.elapsed().as_secs_f64();
+        self.touch_pointer.touch(id, phase, p, now, &mut actions);
+        self.apply_pointer(&actions);
+    }
+
+    /// `WindowPlugin::touch_as_mouse`: what the fingers' mouse does this frame (a press a frame
+    /// after its hover, a long press's right click).
+    fn touch_pointer_frame(&mut self) {
+        if !self.settings.touch_as_mouse || !self.touch_pointer.active() {
+            return;
+        }
+        let mut actions = Vec::new();
+        let now = self.touch_clock.elapsed().as_secs_f64();
+        self.touch_pointer.frame(now, &mut actions);
+        self.apply_pointer(&actions);
+    }
+
+    fn apply_pointer(&mut self, actions: &[crate::touch_pointer::PointerAction]) {
+        use crate::touch_pointer::PointerAction as A;
+        let input = self.input();
+        for action in actions {
+            match *action {
+                A::Place(p) => input.set_mouse_position(Some(p)),
+                A::Move(p) => input.inject_mouse_move(p),
+                A::Leave => input.inject_mouse_left(),
+                A::Down(b) => input.inject_mouse_button_down(b),
+                A::Up(b) => input.inject_mouse_button_up(b),
+                A::Cancel(b) => input.release_mouse_button(b, crate::input::MouseButtonCause::FocusLost),
+                A::Wheel(lines) => input.inject_wheel(Vec2::new(0.0, lines)),
             }
-            TouchPhase::Moved if self.mouse_touch == Some(id) => self.input().inject_mouse_move(p),
-            TouchPhase::Ended | TouchPhase::Cancelled if self.mouse_touch == Some(id) => {
-                self.mouse_touch = None;
-                let input = self.input();
-                input.inject_mouse_move(p);
-                if phase == TouchPhase::Ended {
-                    input.inject_mouse_button_up(MouseButton::Left);
-                } else {
-                    input.release_mouse_button(MouseButton::Left, crate::input::MouseButtonCause::FocusLost);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -476,9 +492,24 @@ impl WinitRunner {
         // iOS: the safe area, asked every frame (it changes with the rotation, after the resize).
         #[cfg(target_os = "ios")]
         {
-            let area = crate::ios::safe_area(&window);
+            let size = window.outer_size();
+            let area = crate::ios::safe_area(&window).turned_for_landscape((size.width, size.height));
             if self.app.resources.get::<crate::window::SafeArea>() != Some(&area) {
-                tracing::info!("iOS: the safe area is {area:?} of {:?}", window.outer_size());
+                tracing::info!("iOS: the safe area is {area:?} of {size:?}");
+                self.app.insert_resource(area);
+            }
+        }
+        // Android: what the system bars and a cutout leave of the window (the content rectangle).
+        #[cfg(target_os = "android")]
+        if let Some(android) = crate::mobile::android_app() {
+            let r = android.content_rect();
+            let size = window.inner_size();
+            let area = crate::window::SafeArea::from_content_rect(
+                (r.left, r.top, r.right, r.bottom),
+                (size.width, size.height),
+            );
+            if self.app.resources.get::<crate::window::SafeArea>() != Some(&area) {
+                tracing::info!("Android: the safe area is {area:?} of {size:?} (content {r:?})");
                 self.app.insert_resource(area);
             }
         }

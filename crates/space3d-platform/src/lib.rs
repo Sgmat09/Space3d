@@ -62,6 +62,7 @@ pub mod layout;
 pub mod mobile;
 mod os_buttons;
 mod runner;
+pub mod touch_pointer;
 #[cfg(target_arch = "wasm32")]
 mod web;
 mod window;

@@ -113,8 +113,9 @@ pub struct UiPlugin {
     /// window then fits a phone, with small text. `None`: the window's own scale.
     pub short_side_points: Option<f32>,
     /// Lay the UI out inside `space3d_platform::SafeArea` (a phone's notch and home bar) and
-    /// not over the whole screen. Off by default: the insets are filled on iOS only, and in
-    /// landscape UIKit's values were not right in the Simulator (`space3d_platform::ios`).
+    /// not over the whole screen. Off by default. The insets are filled on Android and iOS (in
+    /// landscape UIKit's values were the portrait ones in the Simulator, and the runner turns
+    /// them: `space3d_platform::SafeArea::turned_for_landscape`).
     pub inside_safe_area: bool,
     /// UI size in physical pixels when there is neither a renderer nor a window.
     pub fallback_size: (u32, u32),

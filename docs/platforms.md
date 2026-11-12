@@ -120,12 +120,19 @@ on Android:
 - **Lifecycle**: in the background the surface is dropped and the loop sleeps (no frames, no
   systems); on resume the surface is recreated, meshes and textures survive.
 - **Input**: multi-touch `Touch`es, `Binding::TouchRegion`; `WindowPlugin::touch_as_mouse` makes
-  the first finger the mouse too, for controls written for one. While a `space3d-ui` text field
+  fingers the mouse too, for controls and a UI written for one (`platform::touch_pointer`): a
+  tap is a left click whose press comes a frame after the pointer (so a UI knows whose click it
+  is), a drag a left drag, a long press (0.5 s, still) a right click, a two-finger pinch the
+  wheel, and the pointer leaves when the finger lifts. While a `space3d-ui` text field
   has the focus (`TextInput::wanted`) the on-screen keyboard is up.
 - **HTTPS**: `space3d_net::http_client_builder()` checks certificates against the compiled-in
   Mozilla roots (reqwest's platform verifier needs a Java class a NativeActivity app has not).
 
-Not done: safe-area insets (UI under cutouts and the gesture bar), moving the view when the
+- **`SafeArea`** (resource): what the status bar, the navigation bar and a cutout leave of the
+  window, from the activity's content rectangle; `UiPlugin::inside_safe_area` lays the UI out
+  inside it.
+
+Not done: moving the view when the
 keyboard covers a text field, pausing audio in the background, compressed textures (ASTC), and
 `space3d build --target android` still builds arm64 only.
 
@@ -171,8 +178,9 @@ What iOS needed from the engine (all in `space3d-platform` unless said):
   `mobile::data_dir()` is `Library/Application Support` in the app's container.
 - **`SafeArea`** (resource): the view's `safeAreaInsets` in pixels; `UiPlugin::inside_safe_area`
   lays the UI out inside it (off by default). **Not right in landscape in the Simulator:**
-  UIKit answers the portrait insets (62 points top, 34 bottom) for a landscape scene. Unknown on
-  a device.
+  UIKit answers the portrait insets (62 points top, 34 bottom) for a landscape scene, so the
+  runner turns such insets (`SafeArea::turned_for_landscape`: the top's at both sides, two
+  thirds of the bottom's). A guess until a device shows what UIKit answers there.
 - **`UiPlugin::short_side_points`**: a UI scale from the screen's short side, for a UI made for
   a laptop's window.
 

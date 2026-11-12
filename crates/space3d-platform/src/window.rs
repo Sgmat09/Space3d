@@ -29,9 +29,11 @@ pub struct WindowPlugin {
     pub canvas_id: Option<String>,
     /// Exit when the window is closed (otherwise only [`PlatformEvent::CloseRequested`] is sent).
     pub exit_on_close: bool,
-    /// Phones: the first finger on the screen is also the mouse (its position, and the left
-    /// button while it is down), for a game whose controls read the mouse. The finger still
-    /// arrives as a touch. The position stays where the finger was lifted. Default `false`.
+    /// Phones: fingers are also the mouse, for a game whose controls and UI read the mouse
+    /// ([`crate::touch_pointer`]): a tap is a left click (pressed a frame after the pointer
+    /// arrives, so a UI knows whose click it is), a drag a left drag, a long press a right
+    /// click, a two-finger pinch the wheel; the pointer leaves when the finger lifts. The
+    /// fingers still arrive as touches. Default `false`.
     pub touch_as_mouse: bool,
     /// Window icon (title bar, Alt-Tab) and, on Windows, the taskbar icon. `None` uses the
     /// platform default. Ignored on macOS (the Dock shows the app bundle's icon), the web and
@@ -179,7 +181,8 @@ pub struct WindowState {
 /// The edges of the window the system keeps for itself, in physical pixels (resource): a
 /// phone's notch or camera island, rounded corners and the home bar. The picture covers them;
 /// what must stay readable and tappable keeps out of them (`space3d-ui` lays its UI out inside).
-/// Filled on iOS; zero everywhere else (Android's cutouts are not read yet).
+/// Filled on iOS (the view's insets) and on Android (the activity's content rectangle: what the
+/// status bar, the navigation bar and a cutout leave); zero everywhere else.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SafeArea {
     /// Kept at the left edge.
@@ -190,6 +193,45 @@ pub struct SafeArea {
     pub right: u32,
     /// Kept at the bottom edge.
     pub bottom: u32,
+}
+
+impl SafeArea {
+    /// The insets of a content rectangle `(left, top, right, bottom)` in a window of `size`
+    /// pixels (Android's `onContentRectChanged`). A rectangle that is empty or not inside the
+    /// window (not told yet, or of the other orientation during a rotation) gives no insets.
+    pub fn from_content_rect(rect: (i32, i32, i32, i32), size: (u32, u32)) -> Self {
+        let (left, top, right, bottom) = rect;
+        let (w, h) = (size.0 as i32, size.1 as i32);
+        if left < 0 || top < 0 || right <= left || bottom <= top || right > w || bottom > h {
+            return Self::default();
+        }
+        Self {
+            left: left as u32,
+            top: top as u32,
+            right: (w - right) as u32,
+            bottom: (h - bottom) as u32,
+        }
+    }
+
+    /// Insets that are a portrait screen's (something at the top, nothing at either side) on a
+    /// landscape window of `size` pixels, turned: the top's at **both** sides (which side the
+    /// notch is on is not known), nothing at the top, two thirds of the bottom's (a home bar is
+    /// thinner along the long edge). Anything else is returned as it is.
+    ///
+    /// UIKit answers so in the iOS 27 Simulator for a landscape scene (`crate::ios`); on a
+    /// device that answers right this changes nothing.
+    pub fn turned_for_landscape(self, size: (u32, u32)) -> Self {
+        if size.0 > size.1 && self.top > 0 && self.left == 0 && self.right == 0 {
+            Self {
+                left: self.top,
+                right: self.top,
+                top: 0,
+                bottom: self.bottom * 2 / 3,
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// Whether the game wants typed text now (resource). `space3d-ui` sets `wanted` while one of
@@ -216,4 +258,61 @@ pub enum PlatformEvent {
     Suspended,
     /// App returned to foreground — surface recreated.
     Resumed,
+}
+
+#[cfg(test)]
+mod safe_area_tests {
+    use super::SafeArea;
+
+    #[test]
+    fn a_content_rectangle_gives_the_insets() {
+        // A 2400 x 1080 landscape phone: a cutout of 136 px at the left, a gesture bar of 63 below.
+        let area = SafeArea::from_content_rect((136, 0, 2400, 1017), (2400, 1080));
+        assert_eq!(
+            area,
+            SafeArea {
+                left: 136,
+                top: 0,
+                right: 0,
+                bottom: 63
+            }
+        );
+        // Not told yet, or the portrait rectangle while the window is already landscape.
+        assert_eq!(
+            SafeArea::from_content_rect((0, 0, 0, 0), (2400, 1080)),
+            SafeArea::default()
+        );
+        assert_eq!(
+            SafeArea::from_content_rect((0, 136, 1080, 2337), (2400, 1080)),
+            SafeArea::default()
+        );
+    }
+
+    #[test]
+    fn portrait_insets_on_a_landscape_window_are_turned() {
+        let portrait = SafeArea {
+            left: 0,
+            top: 186,
+            right: 0,
+            bottom: 102,
+        };
+        assert_eq!(
+            portrait.turned_for_landscape((2622, 1206)),
+            SafeArea {
+                left: 186,
+                top: 0,
+                right: 186,
+                bottom: 68
+            }
+        );
+        // A portrait window keeps them, and so do insets that already name a side.
+        assert_eq!(portrait.turned_for_landscape((1206, 2622)), portrait);
+        let right = SafeArea {
+            left: 177,
+            top: 0,
+            right: 0,
+            bottom: 63,
+        };
+        assert_eq!(right.turned_for_landscape((2622, 1206)), right);
+    }
 }
