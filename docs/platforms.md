@@ -130,7 +130,7 @@ on Android:
 
 - **`SafeArea`** (resource): what the status bar, the navigation bar and a cutout leave of the
   window, from the activity's content rectangle; `UiPlugin::inside_safe_area` lays the UI out
-  inside it.
+  inside it. An edge-to-edge window (Android 15 on) is told its whole size, and then only 24 dp at the bottom are kept (the gesture bar): a cutout and the three-button bar need the Java insets, which are not read.
 
 Not done: moving the view when the
 keyboard covers a text field, pausing audio in the background, compressed textures (ASTC), and

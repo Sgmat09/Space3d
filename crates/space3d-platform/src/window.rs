@@ -182,7 +182,8 @@ pub struct WindowState {
 /// phone's notch or camera island, rounded corners and the home bar. The picture covers them;
 /// what must stay readable and tappable keeps out of them (`space3d-ui` lays its UI out inside).
 /// Filled on iOS (the view's insets) and on Android (the activity's content rectangle: what the
-/// status bar, the navigation bar and a cutout leave); zero everywhere else.
+/// status bar, the navigation bar and a cutout leave; for an edge-to-edge window, which is told
+/// no rectangle of its own, [`Self::ANDROID_NAVIGATION_POINTS`] at the bottom); zero everywhere else.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SafeArea {
     /// Kept at the left edge.
@@ -196,6 +197,11 @@ pub struct SafeArea {
 }
 
 impl SafeArea {
+    /// Android, when the content rectangle is the whole window (an edge-to-edge app is not told
+    /// the bars): the height kept at the bottom for the navigation bar, in dp. 24 is the gesture
+    /// bar's; the three-button bar (48) and a cutout are not covered.
+    pub const ANDROID_NAVIGATION_POINTS: f64 = 24.0;
+
     /// The insets of a content rectangle `(left, top, right, bottom)` in a window of `size`
     /// pixels (Android's `onContentRectChanged`). A rectangle that is empty or not inside the
     /// window (not told yet, or of the other orientation during a rotation) gives no insets.

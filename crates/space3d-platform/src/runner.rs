@@ -504,10 +504,17 @@ impl WinitRunner {
         if let Some(android) = crate::mobile::android_app() {
             let r = android.content_rect();
             let size = window.inner_size();
-            let area = crate::window::SafeArea::from_content_rect(
+            let mut area = crate::window::SafeArea::from_content_rect(
                 (r.left, r.top, r.right, r.bottom),
                 (size.width, size.height),
             );
+            // An edge-to-edge window (every app from Android 15 on) is told its whole size: the
+            // bars' insets are Java's to give, which a NativeActivity app has no side for. Keep
+            // the UI off the navigation bar's pill at least.
+            if area == crate::window::SafeArea::default() {
+                area.bottom =
+                    (crate::window::SafeArea::ANDROID_NAVIGATION_POINTS * window.scale_factor()).round() as u32;
+            }
             if self.app.resources.get::<crate::window::SafeArea>() != Some(&area) {
                 tracing::info!("Android: the safe area is {area:?} of {size:?} (content {r:?})");
                 self.app.insert_resource(area);
