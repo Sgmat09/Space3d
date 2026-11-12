@@ -325,6 +325,13 @@ fn screen_info(sys: &SystemCtx, settings: &UiPlugin) -> ([u32; 2], f32, bool, us
     (size, native_ppp, focused, max_texture_side)
 }
 
+/// A part of the UI's CPU work in a frame, timed while the returned guard lives: a trace span of the kind the schedule opens round every
+/// system (`"system"`, with a `name`), so a profiler lists it beside them ("ui::end_frame.tessellate"). Costs nothing while no
+/// subscriber takes trace spans.
+fn part(name: &'static str) -> tracing::span::EnteredSpan {
+    tracing::trace_span!("system", name = name).entered()
+}
+
 /// `Stage::PreUpdate`: translate input and begin the egui pass.
 pub(crate) fn begin_frame(
     sys: &mut SystemCtx,
@@ -400,7 +407,10 @@ pub(crate) fn begin_frame(
     // An inserted or changed `UiTheme` restyles egui once, between passes (no resource: the
     // style is never touched).
     theme.sync(&e.ctx, ui_theme.as_ref());
+    // (egui drops here what the last pass laid out and this one has not asked for yet: the galleys)
+    let span = part("ui::begin_frame.pass");
     e.ctx.begin_pass(raw);
+    drop(span);
     e.in_pass = true;
     // `run_ui`'s top-level ui, handed to the plugins' begin hooks now and end hooks in
     // `end_frame`. What they claim (a panel...) is not available to root-ui systems.
@@ -447,7 +457,9 @@ pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) 
     let any_down = e.ctx.input(|i| i.pointer.any_down());
     e.wants_pointer = e.ctx.egui_is_using_pointer() || (e.pointer_over && !any_down);
     e.wants_keyboard = e.ctx.egui_wants_keyboard_input();
+    let span = part("ui::end_frame.pass");
     let output = e.end_pass();
+    drop(span);
     for cmd in &output.platform_output.commands {
         if let egui::OutputCommand::CopyText(text) = cmd {
             e.clipboard.clone_from(text);
@@ -459,7 +471,9 @@ pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) 
     let cursor_changed = new_cursor != e.cursor_icon || !e.cursor_sent;
     e.cursor_icon = new_cursor;
     let ppp = output.pixels_per_point;
+    let span = part("ui::end_frame.tessellate");
     let primitives = e.ctx.tessellate(output.shapes, ppp);
+    drop(span);
     let (mut vertices, mut indices) = (0, 0);
     for p in &primitives {
         if let egui::epaint::Primitive::Mesh(m) = &p.primitive {

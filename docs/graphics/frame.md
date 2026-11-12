@@ -677,13 +677,17 @@ cost nothing while no subscriber takes trace spans.
 
 | name | part of `render::render_frame` |
 |---|---|
-| `render.prepare` | extraction and everything uploaded for the frame; its parts are `render.prepare.extract`, `.views`, `.nodes`, `.upload`, `.bind_groups` |
+| `render.prepare` | extraction and everything uploaded for the frame; its parts are `render.prepare.extract`, `.views`, `.nodes`, `.upload`, `.bind_groups`; the particles' share of the nodes is `render.prepare.nodes.particles` |
 | `render.compute` | encoding the GPU culling compute pass |
 | `render.depth_views` | encoding the depth views (shadow maps) |
 | `render.views` | encoding the camera views and the post groups |
 | `render.overlays` | encoding the AfterTonemap overlays (egui) |
-| `render.submit` | finishing the uploads, submitting and presenting |
+| `render.submit` | finishing the uploads, submitting and presenting; its parts are `render.submit.uploads` (the staging belt's buffers unmapped), `.encoder` (the frame's commands closed), `.queue` (handed to the driver) and `.present` |
 | `render.pace` | keeping at most three frames in flight; with the GPU behind, this is where the frame waits for it |
+
+The UI's two systems have parts too: `ui::begin_frame.pass` (egui's pass begun: it drops what the last pass laid out and this one
+has not asked for), `ui::end_frame.pass` (the pass ended) and `ui::end_frame.tessellate` (the frame's shapes made triangles, on the
+main thread).
 
 ## Capture and tools
 
