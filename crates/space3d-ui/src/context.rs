@@ -451,7 +451,8 @@ pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) 
     let natives = crate::textures::resolve_native_views(sys.resources);
     // A focused text field asks the platform for typed text: on a phone, the on-screen
     // keyboard (`space3d_platform::TextInput`; the last pass's answer, one frame late).
-    if let Some(wanted) = sys.resources.get::<EguiContext>().map(|e| e.wants_keyboard) {
+    // (a text field, not any focus: a focused button takes Enter and wants no keyboard on screen)
+    if let Some(wanted) = sys.resources.get::<EguiContext>().map(|e| e.ctx().text_edit_focused()) {
         let text_input = sys.resources.init::<space3d_platform::TextInput>();
         if text_input.wanted != wanted {
             text_input.wanted = wanted;
