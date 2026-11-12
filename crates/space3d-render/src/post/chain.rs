@@ -27,6 +27,8 @@ pub(crate) mod bits {
     pub const SCENE_ALPHA: u32 = 1024;
     pub const EXACT: u32 = 2048;
     pub const GRADE_LDR: u32 = 4096;
+    /// Bloom level 0 is read with one bilinear tap (`Bloom::fast`).
+    pub const BLOOM_BILINEAR: u32 = 8192;
 }
 
 /// Matches `PostParams` in composite.wgsl: one 256-byte uniform slot per post group. Nothing in
@@ -150,6 +152,9 @@ impl GpuPost {
         p.exposure = [exposure, 0.0, 0.0, 0.0];
         if bloom {
             flags |= bits::BLOOM;
+            if s.bloom.fast {
+                flags |= bits::BLOOM_BILINEAR;
+            }
             let energy = s.bloom.composite == BloomComposite::EnergyConserving;
             p.exposure[2] = if energy {
                 s.bloom.intensity.clamp(0.0, 1.0)
@@ -339,6 +344,7 @@ mod tests {
         assert_eq!(offset("frame"), std::mem::offset_of!(GpuPost, frame));
         for (name, bit) in [
             ("S3D_POST_BLOOM", bits::BLOOM),
+            ("S3D_POST_BLOOM_BILINEAR", bits::BLOOM_BILINEAR),
             ("S3D_POST_AUTO_EXPOSURE", bits::AUTO_EXPOSURE),
             ("S3D_POST_GRADE", bits::GRADE),
             ("S3D_POST_GRADE_LDR", bits::GRADE_LDR),

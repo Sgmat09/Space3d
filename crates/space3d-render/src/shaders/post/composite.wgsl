@@ -31,6 +31,7 @@ const S3D_POST_TRANSPARENT: u32 = 512u;
 const S3D_POST_SCENE_ALPHA: u32 = 1024u;
 const S3D_POST_EXACT: u32 = 2048u;
 const S3D_POST_GRADE_LDR: u32 = 4096u;
+const S3D_POST_BLOOM_BILINEAR: u32 = 8192u;
 
 // Matches `GpuPost` (post/chain.rs): one 256-byte slot per post group.
 struct PostParams {
@@ -162,10 +163,15 @@ fn post_grade_ldr(c: vec3<f32>) -> vec3<f32> {
 // block it stands for (bloom.wgsl `fs_prefilter`), so the lookup moves half a pixel on. Level 0
 // is magnified by a cubic B-spline (4 bilinear taps, Sigg & Hadwiger 2005) rather than bilinear:
 // smoother, and every texel adds the same light to the frame at any magnification (bilinear at
-// 2.67×, 720p and 1440p, weighed texels 3 % apart, so a small glow pulsed as it moved).
+// 2.67×, 720p and 1440p, weighed texels 3 % apart, so a small glow pulsed as it moved). The low
+// tiers (`Bloom::fast`, S3D_POST_BLOOM_BILINEAR) take the one bilinear tap: a third of this
+// pass on an integrated GPU.
 fn post_bloom(s: vec2<f32>) -> vec3<f32> {
     let clip = post_scene_clip();
     let uv = (s + 0.5 - clip.xy) / max(clip.zw - clip.xy, vec2<f32>(1.0));
+    if (post_has(S3D_POST_BLOOM_BILINEAR)) {
+        return textureSampleLevel(bloom_tex, post_sampler, uv, 0.0).rgb;
+    }
     let size = vec2<f32>(textureDimensions(bloom_tex));
     let t = uv * size - 0.5;
     let i = floor(t);

@@ -344,6 +344,7 @@ struct BloomRepr {
     mip_count: u32,
     max_mip_height: u32,
     min_rect_height: u32,
+    fast: bool,
 }
 
 impl Default for BloomRepr {
@@ -364,6 +365,7 @@ impl BloomRepr {
             mip_count: b.mip_count,
             max_mip_height: b.max_mip_height,
             min_rect_height: b.min_rect_height,
+            fast: b.fast,
         }
     }
     fn value(&self) -> Bloom {
@@ -377,6 +379,7 @@ impl BloomRepr {
             mip_count: self.mip_count,
             max_mip_height: self.max_mip_height,
             min_rect_height: self.min_rect_height,
+            fast: self.fast,
         }
     }
 }
