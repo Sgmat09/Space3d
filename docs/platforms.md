@@ -131,6 +131,56 @@ keyboard covers a text field, pausing audio in the background, compressed textur
 
 ## iOS
 
+**What was built and run (2026-11-12, Mac mini, Xcode 27.2, iPhone 18 Pro Simulator on iOS
+27.2):** `hello_cube_mobile` as a program bundled by `scripts/ios-bundle.sh`, no Xcode project.
+It draws the cube on Metal (`adapter=Apple iOS simulator GPU`), loads `assets/proof.png` from
+the bundle, and comes back from the background in the same process. `cargo build` for
+`aarch64-apple-ios` (a device) was not run for this example; nothing ran on a device. The
+XcodeGen route further down was **not** run (xcodegen is not installed on the Mac).
+
+```sh
+rustup target add aarch64-apple-ios-sim aarch64-apple-ios   # rust-toolchain.toml lists them
+# The mobile library built as a program: a Rust `main` runs the app (`space3d::main!` makes
+# one), and cargo links the frameworks itself.
+cargo rustc -p hello_cube_mobile --lib --crate-type bin --target aarch64-apple-ios-sim
+scripts/ios-bundle.sh target/aarch64-apple-ios-sim/debug/hello_cube_mobile HelloCube   org.spacecorps.space3d.hellocube target/ios examples/hello_cube_mobile/assets
+SIM="iPhone 18 Pro"                                         # a device name or UDID
+xcrun simctl boot "$SIM"; xcrun simctl bootstatus "$SIM"
+xcrun simctl install "$SIM" target/ios/HelloCube.app
+xcrun simctl launch --stdout=/tmp/hello.log --stderr=/tmp/hello.log "$SIM" org.spacecorps.space3d.hellocube
+xcrun simctl io "$SIM" screenshot hello.png
+```
+
+What iOS needed from the engine (all in `space3d-platform` unless said):
+
+- **Scenes.** An app linked with the iOS 27 SDK that has not adopted the scene life cycle is
+  stopped at launch (a trap in `UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption`;
+  winit 0.30 has no scenes). `src/ios.rs` registers a scene delegate class,
+  `Space3dSceneDelegate`, and puts winit's window into the scene when it connects; the app's
+  `Info.plist` must name that class in `UIApplicationSceneManifest` (the bundle script and the
+  template's `project.yml` do).
+- **The window is the screen.** `WindowPlugin`'s width and height are not passed to winit on
+  iOS (they made a 1280 x 720 point window, a third of it off screen), and the renderer and
+  `Input` take `outer_size` (winit's `inner_size` is the safe area only).
+- **The loop waits.** `ControlFlow::Wait` on iOS: a redraw request becomes `drawRect` at the
+  display's pace. With `Poll` the main run loop span hundreds of thousands of times a second.
+- **Log.** winit's iOS loop logs a warning and an info line of its own in every frame;
+  `LogPlugin`'s default filter silences that target on iOS (a game with its own filter adds
+  `winit::platform_impl::ios=error`).
+- **Assets** (`space3d-assets`): a relative root is the bundle's folder. **Files:**
+  `mobile::data_dir()` is `Library/Application Support` in the app's container.
+- **`SafeArea`** (resource): the view's `safeAreaInsets` in pixels; `UiPlugin::inside_safe_area`
+  lays the UI out inside it (off by default). **Not right in landscape in the Simulator:**
+  UIKit answers the portrait insets (62 points top, 34 bottom) for a landscape scene. Unknown on
+  a device.
+- **`UiPlugin::short_side_points`**: a UI scale from the screen's short side, for a UI made for
+  a laptop's window.
+
+Not done or not seen: touches and the on-screen keyboard (the code paths are winit's; `simctl`
+cannot tap), rotation, audio, a device, signing, `space3d build --target ios`.
+
+### The Xcode route (`space3d build --target ios`; not run)
+
 One-time setup (macOS only):
 
 ```sh

@@ -150,6 +150,7 @@ impl Plugin for WindowPlugin {
             cursor_grab: false,
         });
         app.init_resource::<WindowCursor>();
+        app.init_resource::<SafeArea>();
         let settings = self.clone();
         app.set_runner(move |app| crate::runner::run(app, settings));
     }
@@ -173,6 +174,22 @@ pub struct WindowState {
     pub cursor_visible: bool,
     /// Grab/lock the cursor (FPS-style camera control).
     pub cursor_grab: bool,
+}
+
+/// The edges of the window the system keeps for itself, in physical pixels (resource): a
+/// phone's notch or camera island, rounded corners and the home bar. The picture covers them;
+/// what must stay readable and tappable keeps out of them (`space3d-ui` lays its UI out inside).
+/// Filled on iOS; zero everywhere else (Android's cutouts are not read yet).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SafeArea {
+    /// Kept at the left edge.
+    pub left: u32,
+    /// Kept at the top edge.
+    pub top: u32,
+    /// Kept at the right edge.
+    pub right: u32,
+    /// Kept at the bottom edge.
+    pub bottom: u32,
 }
 
 /// Whether the game wants typed text now (resource). `space3d-ui` sets `wanted` while one of

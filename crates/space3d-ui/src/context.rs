@@ -318,6 +318,10 @@ fn screen_info(sys: &SystemCtx, settings: &UiPlugin) -> ([u32; 2], f32, bool, us
     };
     let native_ppp = settings
         .pixels_per_point
+        .or_else(|| {
+            let points = settings.short_side_points.filter(|p| *p > 0.0)?;
+            Some((size[0].min(size[1]) as f32 / points).max(1.0))
+        })
         .unwrap_or_else(|| window.map_or(1.0, |w| w.scale_factor as f32))
         .max(0.1);
     let focused = window.is_none_or(|w| w.focused);
@@ -371,8 +375,23 @@ pub(crate) fn begin_frame(
         o.set_scale_factor(ppp);
     }
 
+    // `UiPlugin::inside_safe_area`: the UI keeps out of a phone's notch and home bar.
+    let safe = sys
+        .resources
+        .get::<space3d_platform::SafeArea>()
+        .copied()
+        .filter(|_| settings.inside_safe_area)
+        .unwrap_or_default();
     let e = sys.resources.expect_mut::<EguiContext>();
-    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32 / ppp, size[1] as f32 / ppp));
+    let full = egui::vec2(size[0] as f32 / ppp, size[1] as f32 / ppp);
+    let (left, top) = (safe.left as f32 / ppp, safe.top as f32 / ppp);
+    let screen = egui::Rect::from_min_max(
+        egui::pos2(left, top),
+        egui::pos2(
+            (full.x - safe.right as f32 / ppp).max(left + 1.0),
+            (full.y - safe.bottom as f32 / ppp).max(top + 1.0),
+        ),
+    );
     let mut raw = egui::RawInput {
         screen_rect: Some(screen),
         max_texture_side: Some(max_texture_side),

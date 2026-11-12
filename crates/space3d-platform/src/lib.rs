@@ -56,6 +56,8 @@
 
 pub mod background;
 mod input;
+#[cfg(target_os = "ios")]
+pub mod ios;
 pub mod layout;
 pub mod mobile;
 mod os_buttons;
@@ -78,7 +80,7 @@ pub use mobile::{AndroidApp, android_app, android_main_entry};
 #[cfg(target_arch = "wasm32")]
 pub use web::{find_canvas, init_web_logging};
 pub use window::{
-    AppliedCursor, CursorIcon, PlatformEvent, TextInput, WindowCursor, WindowIcon, WindowPlugin, WindowState,
+    AppliedCursor, CursorIcon, PlatformEvent, SafeArea, TextInput, WindowCursor, WindowIcon, WindowPlugin, WindowState,
 };
 
 pub use winit;

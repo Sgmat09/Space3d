@@ -139,10 +139,34 @@ fn attach_surface(r: &mut Renderer, window: &Arc<Window>) -> Result<(), RenderEr
         Some(c) => r.set_surface(space3d_render::wgpu::SurfaceTarget::Canvas(c))?,
         None => return Err(RenderError::Surface("window has no canvas".into())),
     }
-    let size = window.inner_size();
+    let size = drawable_size(window);
     r.resize(size.width.max(1), size.height.max(1));
     Ok(())
 }
+
+/// The size of what the window draws to, in physical pixels. winit's `inner_size` everywhere
+/// but iOS: there it is the safe area only (the screen without the notch and the home bar),
+/// while the Metal layer and the touches cover the whole screen, which `outer_size` is.
+fn drawable_size(window: &Window) -> winit::dpi::PhysicalSize<u32> {
+    #[cfg(target_os = "ios")]
+    {
+        window.outer_size()
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        window.inner_size()
+    }
+}
+
+/// How the loop runs while frames are drawn. `Poll` (a frame as soon as the last is done; the
+/// surface's vsync paces it) everywhere but iOS: there a redraw request becomes the view's
+/// `drawRect` at the display's pace, and `Poll` only spins the main run loop between two of
+/// them (seen in the Simulator: hundreds of thousands of empty turns a second).
+const FRAME_FLOW: ControlFlow = if cfg!(target_os = "ios") {
+    ControlFlow::Wait
+} else {
+    ControlFlow::Poll
+};
 
 /// Runner installed by [`WindowPlugin`]. Falls back to the headless runner when no event loop
 /// can be created (e.g. CI without a display server).
@@ -155,7 +179,10 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
             return;
         }
     };
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(FRAME_FLOW);
+    // iOS: the scene delegate's class must exist before UIKit starts (`crate::ios`).
+    #[cfg(target_os = "ios")]
+    crate::ios::register();
     let runner = WinitRunner {
         applied_title: settings.title.clone(),
         app,
@@ -225,8 +252,12 @@ impl WinitRunner {
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
             .with_title(s.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(s.width as f64, s.height as f64))
             .with_resizable(s.resizable);
+        // iOS: the window is the screen. A size asked for makes a `UIWindow` of that size in
+        // points, which is not the screen's (seen: a 1280 x 720 window, a third of it off screen).
+        if !cfg!(target_os = "ios") {
+            attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(s.width as f64, s.height as f64));
+        }
         if crate::background::background_mode() {
             attrs = attrs.with_active(false);
         }
@@ -278,7 +309,7 @@ impl WinitRunner {
         if self.renderer_requested {
             return;
         }
-        let size = window.inner_size();
+        let size = drawable_size(window);
         let size = UVec2::new(size.width, size.height).max(UVec2::ONE);
         self.renderer_requested = true;
         let config = self.renderer_config(size);
@@ -442,6 +473,15 @@ impl WinitRunner {
                 window.set_ime_allowed(wanted);
             }
         }
+        // iOS: the safe area, asked every frame (it changes with the rotation, after the resize).
+        #[cfg(target_os = "ios")]
+        {
+            let area = crate::ios::safe_area(&window);
+            if self.app.resources.get::<crate::window::SafeArea>() != Some(&area) {
+                tracing::info!("iOS: the safe area is {area:?} of {:?}", window.outer_size());
+                self.app.insert_resource(area);
+            }
+        }
         let requested = self
             .app
             .resources
@@ -500,6 +540,9 @@ impl ApplicationHandler for WinitRunner {
                 event_loop.exit();
                 return;
             };
+            // iOS: the window joins the app's scene (`crate::ios`).
+            #[cfg(target_os = "ios")]
+            crate::ios::attach(&w);
             self.window = Some(w);
         }
         let window = self.window.clone().expect("window");
@@ -511,7 +554,7 @@ impl ApplicationHandler for WinitRunner {
         }
         self.ensure_renderer(event_loop, &window);
         self.poll_layout(Instant::now(), true);
-        let size = window.inner_size();
+        let size = drawable_size(&window);
         self.on_resize(UVec2::new(size.width, size.height));
         self.send(PlatformEvent::Resumed);
         // Avoid a huge dt after returning from background.
@@ -539,7 +582,11 @@ impl ApplicationHandler for WinitRunner {
                     event_loop.exit();
                 }
             }
-            WindowEvent::Resized(size) => self.on_resize(UVec2::new(size.width, size.height)),
+            WindowEvent::Resized(size) => {
+                // One source for the size on every path (iOS: the whole screen, `drawable_size`).
+                let size = self.window.as_deref().map_or(size, drawable_size);
+                self.on_resize(UVec2::new(size.width, size.height));
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.state().scale_factor = scale_factor;
                 self.send(PlatformEvent::ScaleFactorChanged(scale_factor));
@@ -644,11 +691,7 @@ impl ApplicationHandler for WinitRunner {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let suspended = self.state().suspended;
-            _event_loop.set_control_flow(if suspended {
-                ControlFlow::Wait
-            } else {
-                ControlFlow::Poll
-            });
+            _event_loop.set_control_flow(if suspended { ControlFlow::Wait } else { FRAME_FLOW });
             if suspended {
                 return;
             }
