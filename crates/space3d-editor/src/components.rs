@@ -633,6 +633,7 @@ struct DirectionalShadowRepr {
     slope_bias: f32,
     strength: f32,
     caster_depth: f32,
+    min_caster_pixels: f32,
 }
 
 impl Default for DirectionalShadowRepr {
@@ -666,6 +667,7 @@ impl DirectionalShadowRepr {
             slope_bias: s.slope_bias,
             strength: s.strength,
             caster_depth: s.caster_depth,
+            min_caster_pixels: s.min_caster_pixels,
         })
     }
     fn shadow(&self) -> DirectionalShadow {
@@ -689,6 +691,7 @@ impl DirectionalShadowRepr {
             slope_bias: self.slope_bias,
             strength: self.strength,
             caster_depth: self.caster_depth,
+            min_caster_pixels: self.min_caster_pixels,
         }
     }
 }
