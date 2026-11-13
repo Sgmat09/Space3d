@@ -21,8 +21,17 @@
 //! reason a tap's release comes a frame after its press, and the pointer leaves a frame after
 //! that, so nothing stays hovered where the finger was.
 //!
-//! A second finger ends the first one's press as a cancel (no click), and when one finger of a
-//! pinch lifts the other does nothing until it lifts too.
+//! A second finger ends the first one's press as a cancel (no click). When one finger of a
+//! pinch lifts the pointer leaves; the other finger does nothing alone, and a finger put down
+//! beside it begins a new gesture with it.
+//!
+//! `side_tap` is for a game played with two thumbs, one steering and one on the buttons: a
+//! second finger that lands on a [`TouchPointer::tap_zones`] rectangle, or anywhere while the
+//! first has been dragging for [`TouchPointerConfig::SIDE_TAP_AFTER`], is a tap of its own and
+//! no gesture. There is one mouse, so when it lifts the mouse goes there for three frames
+//! (the first finger's button is let go without a click, then hover, press, release) and comes
+//! back to the first finger, whose press is made again where the finger is by then. Outside a
+//! zone, a side finger that leaves the slop is a pinch with the first after all.
 //!
 //! [`TouchPointer`] is the state machine alone (no window, no clock). [`TouchMouse`] is the
 //! resource around it that the window runner feeds every finger through, and that a test or a
@@ -51,9 +60,17 @@ pub struct TouchPointerConfig {
     /// The left press waits until the finger leaves the slop or lifts. Default `false`: the
     /// press comes on the frame after the finger.
     pub press_on_move: bool,
+    /// A second finger can be a tap of its own while the first keeps its drag (see the
+    /// module). Default `false`: a second finger is always a gesture.
+    pub side_tap: bool,
 }
 
 impl TouchPointerConfig {
+    /// Seconds the first finger must have been down before a second one, off every
+    /// [`TouchPointer::tap_zones`], counts as a side tap and not as the second finger of a pinch
+    /// (the fingers of a pinch land together).
+    pub const SIDE_TAP_AFTER: f64 = 0.2;
+
     /// The slop in the window's own points (multiply by the scale factor for pixels).
     pub const SLOP_POINTS: f32 = 10.0;
 }
@@ -66,6 +83,7 @@ impl Default for TouchPointerConfig {
             pinch_step: 1.05,
             pinch_wheel: true,
             press_on_move: false,
+            side_tap: false,
         }
     }
 }
@@ -121,8 +139,27 @@ enum State {
     },
     /// Two fingers pinch.
     Pinch { a: (u64, Vec2), b: (u64, Vec2) },
-    /// A gesture is over but fingers are still down: nothing until all are lifted.
-    Lifting,
+    /// A gesture is over but fingers are still down: no pointer. `rest` is the finger of the
+    /// gesture that stayed, which a new finger makes a gesture with.
+    Lifting { rest: Option<(u64, Vec2)> },
+}
+
+/// A second finger that may be a tap of its own ([`TouchPointerConfig::side_tap`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Side {
+    id: u64,
+    start: Vec2,
+    /// It went down on a tap zone: a tap wherever it wanders.
+    zone: bool,
+}
+
+/// The mouse's visit to a side tap: `next` is 1 before the press, 2 before the release, 3
+/// before the way back to the first finger.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SideTap {
+    next: u8,
+    /// The first finger held the left button: it is pressed again afterwards.
+    resume: bool,
 }
 
 /// The state machine of fingers as a mouse (see the module).
@@ -130,6 +167,16 @@ enum State {
 pub struct TouchPointer {
     /// The thresholds.
     pub config: TouchPointerConfig,
+    /// With [`TouchPointerConfig::side_tap`]: rectangles (minimum and maximum corner, physical
+    /// pixels) where a second finger is always a tap, whatever the first one does. The game
+    /// keeps them at its buttons.
+    pub tap_zones: Vec<[Vec2; 2]>,
+    side: Option<Side>,
+    tap: Option<SideTap>,
+    /// The press that waits is the first finger's again after a side tap.
+    resume_due: bool,
+    /// This frame's press was that one ([`Self::press_resumed`]).
+    resumed: bool,
     state: State,
     /// Fingers down, whatever they do.
     fingers: Vec<u64>,
@@ -161,6 +208,11 @@ impl TouchPointer {
     pub fn new(config: TouchPointerConfig) -> Self {
         Self {
             config,
+            tap_zones: Vec::new(),
+            side: None,
+            tap: None,
+            resume_due: false,
+            resumed: false,
             state: State::Idle,
             fingers: Vec::new(),
             last: None,
@@ -184,6 +236,7 @@ impl TouchPointer {
                     State::Idle => {
                         // A tap right after a tap: the first one's press and release are not lost.
                         self.flush(out);
+                        self.resume_due = false;
                         self.leave_due = false;
                         out.push(PointerAction::Place(p));
                         self.press_due = !self.config.press_on_move;
@@ -195,86 +248,159 @@ impl TouchPointer {
                             long: false,
                         };
                     }
-                    State::One { id: first, start, .. } if first != id => {
-                        // The first finger was no click.
+                    State::One {
+                        id: first,
+                        start,
+                        since,
+                        moved,
+                        ..
+                    } if first != id => {
+                        if self.side.is_some() {
+                            // A third finger.
+                            return;
+                        }
+                        let zone = self.in_zone(p);
+                        let dragging = moved
+                            && (self.left || self.press_due || self.tap.is_some())
+                            && now - since >= TouchPointerConfig::SIDE_TAP_AFTER;
+                        if self.config.side_tap && (zone || dragging) {
+                            self.side = Some(Side { id, start: p, zone });
+                        } else {
+                            self.pinch((first, self.last.unwrap_or(start)), (id, p), out);
+                        }
+                    }
+                    State::Lifting { rest: Some(a) } if a.0 != id && self.fingers.len() == 2 => {
+                        self.pinch(a, (id, p), out);
+                    }
+                    _ => {}
+                }
+            }
+            TouchPhase::Moved => {
+                if let (Some(side), State::One { id: first, start, .. }) = (self.side, self.state)
+                    && side.id == id
+                {
+                    // Off the buttons a side finger that travels is a pinch after all.
+                    if !side.zone && side.start.distance(p) > self.config.slop {
+                        self.side = None;
+                        self.pinch((first, self.last.unwrap_or(start)), (id, p), out);
+                    }
+                    return;
+                }
+                let visiting = self.tap.is_some();
+                match &mut self.state {
+                    State::One {
+                        id: first,
+                        start,
+                        moved,
+                        ..
+                    } if *first == id => {
+                        let was_still = !*moved;
+                        if start.distance(p) > self.config.slop {
+                            *moved = true;
+                        }
+                        self.last = Some(p);
+                        if visiting {
+                            // The mouse is at a side tap: it comes back to where this finger is.
+                        } else if self.config.press_on_move && *moved && !self.left {
+                            // The held-back press: it lands where the finger went down, on the
+                            // next frame, and the pointer follows the finger from there.
+                            // (after a long press too: a finger that rested and then goes is a drag)
+                            if was_still {
+                                out.push(PointerAction::Move(*start));
+                                self.press_due = true;
+                            }
+                            self.after_press = Some(p);
+                        } else {
+                            out.push(PointerAction::Move(p));
+                        }
+                    }
+                    State::Pinch { a, b } if a.0 == id || b.0 == id => {
+                        let (line, middle) = (b.1 - a.1, (a.1 + b.1) * 0.5);
+                        let before = line.length();
+                        if a.0 == id {
+                            a.1 = p;
+                        } else {
+                            b.1 = p;
+                        }
+                        let (line_now, center) = (b.1 - a.1, (a.1 + b.1) * 0.5);
+                        let after = line_now.length();
+                        out.push(PointerAction::Place(center));
+                        let apart = before > 1.0 && after > 1.0;
+                        out.push(PointerAction::Gesture {
+                            zoom: if apart { after / before } else { 1.0 },
+                            // The angle between the two lines, the short way round.
+                            rotate: if apart {
+                                line.perp_dot(line_now).atan2(line.dot(line_now))
+                            } else {
+                                0.0
+                            },
+                            pan: center - middle,
+                            center,
+                        });
+                        if apart && self.config.pinch_wheel && self.config.pinch_step > 1.0 {
+                            let lines = (after / before).ln() / self.config.pinch_step.ln();
+                            if lines != 0.0 {
+                                out.push(PointerAction::Wheel(lines));
+                            }
+                        }
+                    }
+                    State::Lifting { rest: Some(rest) } if rest.0 == id => rest.1 = p,
+                    _ => {}
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.fingers.retain(|f| *f != id);
+                if let Some(side) = self.side.filter(|s| s.id == id) {
+                    self.side = None;
+                    if phase == TouchPhase::Ended {
+                        // The mouse leaves the first finger for the tap; a visit still under
+                        // way ends at once.
+                        let resume = self.finish_tap(out) || self.left || self.press_due;
                         self.press_due = false;
-                        self.release_due = None;
                         self.after_press = None;
                         if self.left {
                             self.left = false;
                             out.push(PointerAction::Cancel(MouseButton::Left));
                         }
-                        let a = (first, self.last.unwrap_or(start));
-                        self.state = State::Pinch { a, b: (id, p) };
-                        out.push(PointerAction::Place((a.1 + p) * 0.5));
-                        out.push(PointerAction::GestureStart((a.1 + p) * 0.5));
+                        out.push(PointerAction::Place(side.start));
+                        self.tap = Some(SideTap { next: 1, resume });
                     }
-                    _ => {}
+                    return;
                 }
-            }
-            TouchPhase::Moved => match &mut self.state {
-                State::One {
-                    id: first,
-                    start,
-                    moved,
-                    long,
-                    ..
-                } if *first == id => {
-                    let was_still = !*moved;
-                    if start.distance(p) > self.config.slop {
-                        *moved = true;
-                    }
-                    self.last = Some(p);
-                    if self.config.press_on_move && *moved && !*long && !self.left {
-                        // The held-back press: it lands where the finger went down, on the
-                        // next frame, and the pointer follows the finger from there.
-                        if was_still {
-                            out.push(PointerAction::Move(*start));
-                            self.press_due = true;
-                        }
-                        self.after_press = Some(p);
-                    } else {
-                        out.push(PointerAction::Move(p));
-                    }
-                }
-                State::Pinch { a, b } if a.0 == id || b.0 == id => {
-                    let (line, middle) = (b.1 - a.1, (a.1 + b.1) * 0.5);
-                    let before = line.length();
-                    if a.0 == id {
-                        a.1 = p;
-                    } else {
-                        b.1 = p;
-                    }
-                    let (line_now, center) = (b.1 - a.1, (a.1 + b.1) * 0.5);
-                    let after = line_now.length();
-                    out.push(PointerAction::Place(center));
-                    let apart = before > 1.0 && after > 1.0;
-                    out.push(PointerAction::Gesture {
-                        zoom: if apart { after / before } else { 1.0 },
-                        // The angle between the two lines, the short way round.
-                        rotate: if apart {
-                            line.perp_dot(line_now).atan2(line.dot(line_now))
-                        } else {
-                            0.0
-                        },
-                        pan: center - middle,
-                        center,
-                    });
-                    if apart && self.config.pinch_wheel && self.config.pinch_step > 1.0 {
-                        let lines = (after / before).ln() / self.config.pinch_step.ln();
-                        if lines != 0.0 {
-                            out.push(PointerAction::Wheel(lines));
-                        }
-                    }
-                }
-                _ => {}
-            },
-            TouchPhase::Ended | TouchPhase::Cancelled => {
-                self.fingers.retain(|f| *f != id);
                 match self.state {
-                    State::One { id: first, .. } if first == id => {
+                    State::One {
+                        id: first, moved, long, ..
+                    } if first == id => {
                         self.last = None;
-                        let long = matches!(self.state, State::One { long: true, .. });
+                        // A side tap's click is not lost; its way back is.
+                        self.finish_tap(out);
+                        // A drag after the long press's right click ends as a drag does.
+                        let long = long && !(self.config.press_on_move && moved);
+                        if let Some(side) = self.side.take() {
+                            // The side finger is still down: this one ends now, and the side
+                            // finger is the pointer from here.
+                            if self.press_due {
+                                self.press_due = false;
+                                if phase == TouchPhase::Ended {
+                                    self.left = true;
+                                    out.push(PointerAction::Down(MouseButton::Left));
+                                }
+                            }
+                            self.after_press = None;
+                            out.push(PointerAction::Move(p));
+                            self.release(phase == TouchPhase::Cancelled || long, out);
+                            out.push(PointerAction::Place(side.start));
+                            self.last = Some(side.start);
+                            self.press_due = !self.config.press_on_move;
+                            self.state = State::One {
+                                id: side.id,
+                                start: side.start,
+                                since: now,
+                                moved: false,
+                                long: false,
+                            };
+                            return;
+                        }
                         if self.press_due && self.after_press.is_some() {
                             // The held-back press has not happened yet: the lift's place
                             // comes after it.
@@ -286,6 +412,7 @@ impl TouchPointer {
                             && phase == TouchPhase::Ended
                             && !self.left
                             && !self.press_due
+                            && !moved
                             && !long
                         {
                             // A tap: the press it held back, then the release.
@@ -309,14 +436,20 @@ impl TouchPointer {
                     State::Pinch { a, b } if a.0 == id || b.0 == id => {
                         self.last = None;
                         out.push(PointerAction::GestureEnd);
+                        let rest = if a.0 == id { b } else { a };
                         self.state = if self.fingers.is_empty() {
                             State::Idle
                         } else {
-                            State::Lifting
+                            State::Lifting {
+                                rest: Some(rest).filter(|r| self.fingers.contains(&r.0)),
+                            }
                         };
                         self.leave_due = true;
                     }
-                    State::Lifting if self.fingers.is_empty() => self.state = State::Idle,
+                    State::Lifting { .. } if self.fingers.is_empty() => self.state = State::Idle,
+                    State::Lifting { rest: Some(rest) } if rest.0 == id => {
+                        self.state = State::Lifting { rest: None };
+                    }
                     _ => {}
                 }
             }
@@ -325,13 +458,35 @@ impl TouchPointer {
 
     /// Once a frame, before the game runs: what waited for this frame, and the long press.
     pub fn frame(&mut self, now: f64, out: &mut Vec<PointerAction>) {
+        self.resumed = false;
         if self.right_due {
             self.right_due = false;
             out.push(PointerAction::Up(MouseButton::Right));
         }
+        if let Some(tap) = &mut self.tap {
+            match tap.next {
+                1 => out.push(PointerAction::Down(MouseButton::Left)),
+                2 => out.push(PointerAction::Up(MouseButton::Left)),
+                _ => {
+                    // Back to the first finger: a hover where it is now, and its press again
+                    // on the next frame if it had one (or earned one meanwhile).
+                    let resume = tap.resume;
+                    self.tap = None;
+                    if let State::One { start, moved, .. } = self.state {
+                        out.push(PointerAction::Place(self.last.unwrap_or(start)));
+                        self.press_due = resume || (self.config.press_on_move && moved);
+                        self.resume_due = self.press_due;
+                    }
+                    return;
+                }
+            }
+            tap.next += 1;
+            return;
+        }
         if self.press_due {
             self.press_due = false;
             self.left = true;
+            self.resumed = std::mem::take(&mut self.resume_due);
             out.push(PointerAction::Down(MouseButton::Left));
             if let Some(p) = self.after_press.take() {
                 out.push(PointerAction::Move(p));
@@ -354,7 +509,8 @@ impl TouchPointer {
             out.push(PointerAction::Down(MouseButton::Right));
             return;
         }
-        if self.leave_due && self.state == State::Idle {
+        // (with fingers left over from a gesture too: the pointer is not parked between them)
+        if self.leave_due && matches!(self.state, State::Idle | State::Lifting { .. }) {
             self.leave_due = false;
             out.push(PointerAction::Leave);
         }
@@ -368,9 +524,13 @@ impl TouchPointer {
         if std::mem::take(&mut self.right_due) {
             out.push(PointerAction::Up(MouseButton::Right));
         }
-        if std::mem::take(&mut self.left) {
+        if std::mem::take(&mut self.left) || self.tap.is_some_and(|t| t.next == 2) {
             out.push(PointerAction::Cancel(MouseButton::Left));
         }
+        self.tap = None;
+        self.side = None;
+        self.resume_due = false;
+        self.resumed = false;
         if matches!(self.state, State::Pinch { .. }) {
             out.push(PointerAction::GestureEnd);
         }
@@ -386,9 +546,53 @@ impl TouchPointer {
         self.leave_due = false;
     }
 
+    /// Whether the left press of this frame ([`Self::frame`]) is the first finger's own, made
+    /// again after the mouse's visit to a side tap: the drag it had goes on, and a game does
+    /// not take it for a new click on what is under the finger.
+    pub fn press_resumed(&self) -> bool {
+        self.resumed
+    }
+
     /// Whether a finger is the pointer or a gesture is going on.
     pub fn active(&self) -> bool {
         self.state != State::Idle || self.press_due || self.release_due.is_some() || self.right_due || self.leave_due
+    }
+
+    fn in_zone(&self, p: Vec2) -> bool {
+        self.tap_zones
+            .iter()
+            .any(|[min, max]| p.x >= min.x && p.y >= min.y && p.x <= max.x && p.y <= max.y)
+    }
+
+    /// Two fingers become a gesture: whatever one of them pressed is no click.
+    fn pinch(&mut self, a: (u64, Vec2), b: (u64, Vec2), out: &mut Vec<PointerAction>) {
+        self.finish_tap(out);
+        self.resume_due = false;
+        self.press_due = false;
+        self.release_due = None;
+        self.after_press = None;
+        if self.left {
+            self.left = false;
+            out.push(PointerAction::Cancel(MouseButton::Left));
+        }
+        self.state = State::Pinch { a, b };
+        out.push(PointerAction::Place((a.1 + b.1) * 0.5));
+        out.push(PointerAction::GestureStart((a.1 + b.1) * 0.5));
+    }
+
+    /// The rest of a side tap's click, now, without the way back; whether the first finger's
+    /// press was to come again.
+    fn finish_tap(&mut self, out: &mut Vec<PointerAction>) -> bool {
+        let Some(tap) = self.tap.take() else {
+            return false;
+        };
+        if tap.next <= 1 {
+            out.push(PointerAction::Down(MouseButton::Left));
+        }
+        if tap.next <= 2 {
+            out.push(PointerAction::Up(MouseButton::Left));
+        }
+        tap.resume
     }
 
     fn release(&mut self, cancel: bool, out: &mut Vec<PointerAction>) {
@@ -916,9 +1120,6 @@ mod tests {
                 (0.4, None),
                 (0.52, None),
                 (0.54, None),
-                // Wandering off after the right click presses nothing either.
-                (0.8, Some((1, Moved, P + Vec2::X * 60.0))),
-                (0.816, None),
                 (1.5, None),
                 (1.6, Some((1, Ended, near))),
                 (1.62, None),
@@ -934,8 +1135,6 @@ mod tests {
                 vec![],
                 vec![Down(Right)],
                 vec![Up(Right)],
-                vec![Move(P + Vec2::X * 60.0)],
-                vec![],
                 vec![],
                 vec![Move(near)],
                 vec![],
@@ -1108,5 +1307,274 @@ mod tests {
         input.end_frame();
         assert_eq!(input.gesture(), None);
         assert!(input.touches().is_empty() && input.mouse_position().is_none());
+    }
+
+    /// `press_on_move`: a finger that rests through the long press and then goes is a drag
+    /// all the same (the right click came first): the press where it went down, the release
+    /// when it lifts.
+    #[test]
+    fn with_press_on_move_a_hold_and_then_a_drag_is_a_drag() {
+        let mut t = on_move();
+        let far = P + Vec2::X * 60.0;
+        let got = run(
+            &mut t,
+            &[
+                (0.0, Some((1, Started, P))),
+                (0.52, None),
+                (0.54, None),
+                (0.8, Some((1, Moved, far))),
+                (0.816, None),
+                (0.9, Some((1, Moved, P + Vec2::X * 90.0))),
+                (1.6, Some((1, Ended, far))),
+                (1.62, None),
+                (1.64, None),
+            ],
+        );
+        assert_eq!(
+            got,
+            vec![
+                vec![Place(P)],
+                vec![Down(Right)],
+                vec![Up(Right)],
+                vec![Move(P)],
+                vec![Down(Left), Move(far)],
+                vec![Move(P + Vec2::X * 90.0)],
+                vec![Move(far)],
+                vec![Up(Left)],
+                vec![Leave]
+            ]
+        );
+        assert!(!t.active());
+    }
+
+    fn two_thumbs() -> TouchPointer {
+        let mut t = TouchPointer::new(TouchPointerConfig {
+            press_on_move: true,
+            pinch_wheel: false,
+            side_tap: true,
+            ..Default::default()
+        });
+        t.tap_zones = vec![[Vec2::new(1400.0, 600.0), Vec2::new(1600.0, 700.0)]];
+        t
+    }
+
+    const BUTTON: Vec2 = Vec2::new(1500.0, 650.0);
+
+    /// One thumb steers (a drag), the other taps a button: the mouse lets go without a click,
+    /// clicks the button, and comes back to the steering thumb, pressed again where that thumb
+    /// is by then. No gesture, and the steering goes on.
+    #[test]
+    fn a_side_tap_clicks_and_the_first_fingers_drag_goes_on() {
+        let mut t = two_thumbs();
+        let (a, b, c, d) = (
+            Vec2::new(300.0, 400.0),
+            Vec2::new(400.0, 400.0),
+            Vec2::new(420.0, 380.0),
+            Vec2::new(450.0, 380.0),
+        );
+        let got = run(
+            &mut t,
+            &[
+                (0.0, Some((1, Started, a))),
+                (0.01, Some((1, Moved, b))),
+                (0.016, None),
+                (1.0, Some((2, Started, BUTTON))),
+                (1.01, Some((2, Moved, BUTTON + Vec2::splat(30.0)))),
+                (1.02, Some((1, Moved, c))),
+                (1.08, Some((2, Ended, BUTTON + Vec2::splat(30.0)))),
+                (1.09, Some((1, Moved, d))),
+                (1.1, None),
+                (1.116, None),
+                (1.133, None),
+                (1.14, Some((1, Moved, c))),
+                (1.15, None),
+            ],
+        );
+        assert!(t.press_resumed(), "the press after the visit is the old drag's");
+        let mut got = got;
+        got.extend(run(
+            &mut t,
+            &[
+                (1.2, Some((1, Moved, d))),
+                (2.0, Some((1, Ended, d))),
+                (2.016, None),
+                (2.033, None),
+            ],
+        ));
+        assert!(!t.press_resumed());
+        assert_eq!(
+            got,
+            vec![
+                vec![Place(a)],
+                vec![Move(a)],
+                vec![Down(Left), Move(b)],
+                vec![],
+                vec![],
+                vec![Move(c)],
+                vec![Cancel(Left), Place(BUTTON)],
+                vec![],
+                vec![Down(Left)],
+                vec![Up(Left)],
+                vec![Place(d)],
+                vec![],
+                vec![Down(Left), Move(c)],
+                vec![Move(d)],
+                vec![Move(d)],
+                vec![Up(Left)],
+                vec![Leave]
+            ]
+        );
+        assert!(!t.active());
+    }
+
+    /// Off the buttons: while the first finger drags, a second that taps is a click there (a
+    /// target picked while steering); one that travels is a pinch after all, and two fingers
+    /// that land together are a pinch as before.
+    #[test]
+    fn off_the_zones_a_side_finger_taps_only_while_the_first_drags() {
+        let world = Vec2::new(900.0, 300.0);
+        let (a, b) = (Vec2::new(300.0, 400.0), Vec2::new(400.0, 400.0));
+        let drag = |t: &mut TouchPointer| {
+            let mut out = Vec::new();
+            t.touch(1, Started, a, 0.0, &mut out);
+            t.touch(1, Moved, b, 0.01, &mut out);
+            t.frame(0.016, &mut out);
+        };
+        // A tap on the world.
+        let mut t = two_thumbs();
+        drag(&mut t);
+        let mut out = Vec::new();
+        t.touch(2, Started, world, 1.0, &mut out);
+        t.touch(2, Ended, world, 1.05, &mut out);
+        for frame in 1..=5 {
+            t.frame(1.05 + frame as f64 * 0.016, &mut out);
+        }
+        assert_eq!(
+            out,
+            vec![Cancel(Left), Place(world), Down(Left), Up(Left), Place(b), Down(Left)]
+        );
+        // It travels: a pinch.
+        let mut t = two_thumbs();
+        drag(&mut t);
+        let mut out = Vec::new();
+        t.touch(2, Started, world, 1.0, &mut out);
+        assert_eq!(out, vec![]);
+        t.touch(2, Moved, world + Vec2::X * 40.0, 1.02, &mut out);
+        let mid = (b + world + Vec2::X * 40.0) * 0.5;
+        assert_eq!(out, vec![Cancel(Left), Place(mid), GestureStart(mid)]);
+        // Together, the first one still: a pinch at once.
+        let mut t = two_thumbs();
+        let mut out = Vec::new();
+        t.touch(1, Started, a, 0.0, &mut out);
+        t.touch(2, Started, world, 0.03, &mut out);
+        assert_eq!(out.last(), Some(&GestureStart((a + world) * 0.5)));
+        // A still first finger and a second on a button: the button's click, and no press of
+        // the first.
+        let mut t = two_thumbs();
+        let mut out = Vec::new();
+        t.touch(1, Started, a, 0.0, &mut out);
+        t.frame(0.016, &mut out);
+        t.touch(2, Started, BUTTON, 0.1, &mut out);
+        t.touch(2, Ended, BUTTON, 0.15, &mut out);
+        for frame in 1..=5 {
+            t.frame(0.15 + frame as f64 * 0.016, &mut out);
+        }
+        assert_eq!(out, vec![Place(a), Place(BUTTON), Down(Left), Up(Left), Place(a)]);
+        // Without `side_tap` a second finger is a gesture wherever it lands.
+        let mut t = on_move();
+        t.tap_zones = vec![[Vec2::new(1400.0, 600.0), Vec2::new(1600.0, 700.0)]];
+        drag(&mut t);
+        let mut out = Vec::new();
+        t.touch(2, Started, BUTTON, 1.0, &mut out);
+        assert_eq!(out.last(), Some(&GestureStart((b + BUTTON) * 0.5)));
+    }
+
+    /// The ends of a side tap that come in another order: the first finger lifts while the
+    /// second is down (the second is the pointer from there and its lift a tap), the first
+    /// lifts while the mouse is at the tap (the click is made, nothing is pressed again, and
+    /// the lift of a drag is no click on the world), and a reset in the middle holds nothing.
+    #[test]
+    fn a_side_tap_survives_the_first_finger_lifting() {
+        let (a, b) = (Vec2::new(300.0, 400.0), Vec2::new(400.0, 400.0));
+        let mut t = two_thumbs();
+        let mut out = Vec::new();
+        t.touch(1, Started, a, 0.0, &mut out);
+        t.touch(1, Moved, b, 0.01, &mut out);
+        t.frame(0.016, &mut out);
+        t.touch(2, Started, BUTTON, 1.0, &mut out);
+        out.clear();
+        t.touch(1, Ended, b, 1.02, &mut out);
+        t.frame(1.033, &mut out);
+        t.touch(2, Ended, BUTTON, 1.05, &mut out);
+        for frame in 1..=3 {
+            t.frame(1.05 + frame as f64 * 0.016, &mut out);
+        }
+        assert_eq!(
+            out,
+            vec![
+                Move(b),
+                Up(Left),
+                Place(BUTTON),
+                Move(BUTTON),
+                Down(Left),
+                Up(Left),
+                Leave
+            ]
+        );
+        assert!(!t.active());
+
+        let mut out = Vec::new();
+        t.touch(1, Started, a, 2.0, &mut out);
+        t.touch(1, Moved, b, 2.01, &mut out);
+        t.frame(2.016, &mut out);
+        t.touch(2, Started, BUTTON, 3.0, &mut out);
+        t.touch(2, Ended, BUTTON, 3.05, &mut out);
+        out.clear();
+        t.touch(1, Ended, b, 3.06, &mut out);
+        for frame in 1..=3 {
+            t.frame(3.06 + frame as f64 * 0.016, &mut out);
+        }
+        assert_eq!(out, vec![Down(Left), Up(Left), Move(b), Leave]);
+        assert!(!t.active());
+
+        let mut out = Vec::new();
+        t.touch(1, Started, a, 4.0, &mut out);
+        t.touch(1, Moved, b, 4.01, &mut out);
+        t.frame(4.016, &mut out);
+        t.touch(2, Started, BUTTON, 5.0, &mut out);
+        t.touch(2, Ended, BUTTON, 5.05, &mut out);
+        t.frame(5.066, &mut out);
+        out.clear();
+        t.reset(&mut out);
+        assert_eq!(out, vec![Cancel(Left), Leave]);
+        out.clear();
+        t.frame(6.0, &mut out);
+        assert_eq!(out, vec![]);
+        assert!(!t.active());
+    }
+
+    /// One finger of a pinch lifts: the pointer leaves on the next frame though a finger is
+    /// still down, and a finger put down again makes a new gesture with the one that stayed,
+    /// from where that one is by now.
+    #[test]
+    fn a_finger_put_back_after_a_pinch_is_a_new_gesture() {
+        let mut t = TouchPointer::default();
+        let (a, b) = (Vec2::new(400.0, 300.0), Vec2::new(600.0, 300.0));
+        two_fingers(&mut t, a, b);
+        let mut out = Vec::new();
+        t.touch(2, Ended, b, 0.1, &mut out);
+        t.frame(0.116, &mut out);
+        assert_eq!(out, vec![GestureEnd, Leave]);
+        out.clear();
+        let moved = a + Vec2::Y * 50.0;
+        t.touch(1, Moved, moved, 0.2, &mut out);
+        t.touch(3, Started, b, 0.3, &mut out);
+        assert_eq!(out, vec![Place((moved + b) * 0.5), GestureStart((moved + b) * 0.5)]);
+        out.clear();
+        t.touch(1, Ended, moved, 0.4, &mut out);
+        t.touch(3, Ended, b, 0.41, &mut out);
+        t.frame(0.416, &mut out);
+        assert_eq!(out, vec![GestureEnd, Leave]);
+        assert!(!t.active());
     }
 }
