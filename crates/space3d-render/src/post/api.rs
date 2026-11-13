@@ -50,7 +50,22 @@ pub struct PostProcess {
     pub color_grading: ColorGrading,
     /// ±1 LSB triangular dither before 8-bit quantization. Default true.
     pub dither: bool,
+    /// Display gamma: the sRGB-encoded display color raised to `1 / display_gamma`, after the
+    /// tonemapper and the whole grading (a player's brightness calibration). Above 1 the
+    /// shadows and midtones are brighter, below 1 darker; black and white stay. Unlike
+    /// [`Self::exposure`] it changes nothing before the tonemapper, so the bloom is the same at
+    /// every setting. Clamped to [`DISPLAY_GAMMA_RANGE`]. Default 1: the composite is exactly
+    /// the one without it (a uniform bit; no pipeline is built when it moves). CPU mirror:
+    /// [`apply_display_gamma`].
+    pub display_gamma: f32,
 }
+
+/// The range [`PostProcess::display_gamma`] is clamped to (NaN and infinities count as 1).
+/// At any value but 1 the display color is clamped to 0..1 before the power, so a float output
+/// with [`Tonemapper::None`] loses its values above 1 (the LDR grading clamps the same way).
+pub const DISPLAY_GAMMA_RANGE: (f32, f32) = (0.25, 4.0);
+
+pub use crate::output::apply_display_gamma;
 
 impl Default for PostProcess {
     fn default() -> Self {
@@ -67,6 +82,7 @@ impl Default for PostProcess {
             distortion: Distortion::default(),
             color_grading: ColorGrading::default(),
             dither: true,
+            display_gamma: 1.0,
         }
     }
 }
@@ -138,6 +154,11 @@ impl PostProcess {
     /// Set [`Self::exposure`] (stops).
     pub fn with_exposure(mut self, stops: f32) -> Self {
         self.exposure = stops;
+        self
+    }
+    /// Set [`Self::display_gamma`] (1 = unchanged, above 1 brighter midtones).
+    pub fn with_display_gamma(mut self, gamma: f32) -> Self {
+        self.display_gamma = gamma;
         self
     }
     /// Enable auto exposure with these settings.

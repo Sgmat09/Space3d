@@ -557,6 +557,7 @@ struct PostProcessRepr {
     distortion: DistortionRepr,
     color_grading: ColorGradingRepr,
     dither: bool,
+    display_gamma: f32,
 }
 
 impl Default for PostProcessRepr {
@@ -588,6 +589,7 @@ impl PostProcessRepr {
             distortion: DistortionRepr::of(&p.distortion),
             color_grading: ColorGradingRepr::of(&p.color_grading),
             dither: p.dither,
+            display_gamma: p.display_gamma,
         })
     }
     fn post(&self) -> PostProcess {
@@ -607,6 +609,7 @@ impl PostProcessRepr {
             distortion: self.distortion.value(),
             color_grading: self.color_grading.value(),
             dither: self.dither,
+            display_gamma: self.display_gamma,
         }
     }
 }

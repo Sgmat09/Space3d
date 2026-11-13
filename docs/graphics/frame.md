@@ -104,6 +104,16 @@ CameraFrame::default().with_hdr(HdrMode::Compact)
 | `Ldr` | the Ldr fallback everywhere (cheapest post path) |
 | `Compact` | `Rg11b10Ufloat` (half the bandwidth, no alpha) on an opaque-cleared, single-sample primary target where the device renders it; `Auto` elsewhere |
 
+What `Compact` costs in the picture, measured (2026-11, SpaceCorps on an AMD Radeon integrated
+GPU, Vulkan, Medium, the game's brightest blue sector, the same frame captured with `Compact` and
+with `Auto`): no banding. The compact frame is a little darker, evenly: 0.18, 0.23 and 1.07 codes
+(R, G, B) on average over the frame, growing with brightness (blue 0.7 codes at codes 32 to 64,
+1.1 at 64 to 128, 1.7 at 128 to 200), because each write to the 6-bit (5 in blue) mantissa is
+rounded down and the scene blends many layers. 9 × 9 box means of the two frames, with their
+contrast raised six times, show the same smooth nebula with no contours in either. So the scene
+writes are not dithered: there are no bands to hide. (A bloom halo wide enough to judge was not
+in that scene; the chain's own loss is in post.md, "Chain format, memory and platforms".)
+
 **The Ldr fallback** (devices without float render targets — WebGL2 without
 `EXT_color_buffer_float` — or `HdrMode::Ldr`): the scene texture is `Rgba8UnormSrgb`, and every
 fragment and clear color is exposed and tonemapped with the camera's operator before it is
