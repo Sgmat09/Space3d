@@ -237,6 +237,11 @@ fn gl_grading_matches_formulas() {
 }
 
 #[test]
+fn gl_display_gamma_matches_formula() {
+    cases::display_gamma_matches_formula(gl_app);
+}
+
+#[test]
 fn gl_lut_identity_is_neutral() {
     cases::lut_identity_is_neutral(gl_app);
 }

@@ -1561,6 +1561,78 @@ pub mod cases {
 
     // ---- Color grading, LUTs, hooks (PO4) ----
 
+    /// `PostProcess::display_gamma` raises the sRGB-encoded display color to 1 / gamma, last in
+    /// the grading: the probe is `apply_display_gamma`'s value at 0.8, 1.2 and 1.5, black and
+    /// white stay where they are, and it works the same before FXAA and in the Ldr fallback. At
+    /// 1 (the default) the image is the one without the field, byte for byte, with the dither
+    /// on. It runs after the tonemapper: the bloom chain and exposure see nothing of it, and the
+    /// rest of the grading (lift/gamma/gain) comes before it.
+    pub fn display_gamma_matches_formula(make: MakeApp) {
+        let Some(mut app) = make(W, H) else { return };
+        let base = post(Bloom::glow()).without_bloom();
+        let cam = grading_scene(&mut app, base);
+        let c = GRADE_COLOR;
+        let shown = |g: f32, c: Vec3| {
+            let f = |v: f32| srgb_to_linear(apply_display_gamma(srgb_encode(v), g));
+            Vec3::new(f(c.x), f(c.y), f(c.z))
+        };
+        let probe = |app: &mut App, post: PostProcess| {
+            set_post(app, cam, post);
+            let img = render(app);
+            // The quad covers the middle half of the height; black above and below it.
+            (mean(&img, [56, 24, 16, 16]), img.get(64, 2), img)
+        };
+        let (plain, _, plain_img) = probe(&mut app, base);
+        assert_close(plain, c, 0.004, "no display gamma");
+        assert_eq!(probe(&mut app, base.with_display_gamma(1.0)).2, plain_img);
+        for g in [0.8f32, 1.2, 1.5] {
+            let (got, black, _) = probe(&mut app, base.with_display_gamma(g));
+            assert_close(got, shown(g, c), 0.005, &format!("display gamma {g}"));
+            assert_eq!(black, [0, 0, 0, 255], "black stays at {g}");
+            let (fxaa, _, _) = probe(&mut app, base.with_display_gamma(g).with_fxaa(FxaaQuality::Low));
+            assert_close(fxaa, shown(g, c), 0.005, &format!("display gamma {g} before FXAA"));
+        }
+        // 0.5 encoded at 1.2 is 0.5^(1 / 1.2) = 0.561, code 143.
+        assert_eq!((apply_display_gamma(0.5, 1.2) * 255.0).round(), 143.0);
+        let brighter = probe(&mut app, base.with_display_gamma(1.2)).0;
+        assert!(brighter.min_element() > c.min_element() * 1.2, "{brighter} vs {c}");
+        // White stays (a quad of 1.0 over the probe).
+        let white = quad(&mut app, Vec3::ONE, Vec2::new(0.0, 0.0), Vec2::new(0.5, 0.5));
+        {
+            let mut t = app.world.get::<&mut Transform>(white).unwrap();
+            t.translation.z = 1.0;
+        }
+        assert_eq!(
+            probe(&mut app, base.with_display_gamma(1.5)).2.get(64, 32),
+            [255, 255, 255, 255]
+        );
+        app.world.despawn(white).unwrap();
+        // After the grading's own gamma: (e^(1/2))^(1/1.5).
+        let both = probe(
+            &mut app,
+            base.with_display_gamma(1.5).with_color_grading(ColorGrading {
+                gamma: Vec3::splat(2.0),
+                ..Default::default()
+            }),
+        )
+        .0;
+        let f = |v: f32| srgb_to_linear(srgb_encode(v).powf(0.5).powf(1.0 / 1.5));
+        assert_close(
+            both,
+            Vec3::new(f(c.x), f(c.y), f(c.z)),
+            0.006,
+            "grading gamma, then display gamma",
+        );
+        // The default with every default effect and the dither on: byte-identical at 1.
+        let full = probe(&mut app, PostProcess::default()).2;
+        assert_eq!(probe(&mut app, PostProcess::default().with_display_gamma(1.0)).2, full);
+        assert_ne!(probe(&mut app, PostProcess::default().with_display_gamma(1.3)).2, full);
+        // The Ldr fallback composites the tonemapped scene: the display gamma applies there too.
+        frame_settings(&mut app).downlevel = DownlevelOverride::webgl2();
+        let (ldr, _, _) = probe(&mut app, base.with_display_gamma(1.2));
+        assert_close(ldr, shown(1.2, c), 0.01, "Ldr fallback");
+    }
+
     /// Radiance of the grading probe quad (every channel different, all below 1).
     const GRADE_COLOR: Vec3 = Vec3::new(0.4, 0.2, 0.08);
 

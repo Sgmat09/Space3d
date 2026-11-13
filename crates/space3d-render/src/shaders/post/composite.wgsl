@@ -10,7 +10,8 @@
 // groups) → exposure (manual, or 2^(E + compensation) with auto exposure) → bloom (at the same
 // offset) → vignette →
 // white balance × saturation, contrast → `post_hdr_hook` → tonemap → lift/gamma/gain, LUT (in
-// the sRGB-encoded display space) → `post_ldr_hook` → in the last pass: grain → dither → encode
+// the sRGB-encoded display space) → `post_ldr_hook` → display gamma (`PostProcess::display_gamma`,
+// on the encoded value) → in the last pass: grain → dither → encode
 // (before FXAA: the dither of the 8-bit intermediate) → re-premultiply. The grading hooks (`ColorGrading::shader`, spliced at the HOOKS marker at
 // the end) are identity functions unless a hook shader defines them.
 
@@ -32,13 +33,14 @@ const S3D_POST_SCENE_ALPHA: u32 = 1024u;
 const S3D_POST_EXACT: u32 = 2048u;
 const S3D_POST_GRADE_LDR: u32 = 4096u;
 const S3D_POST_BLOOM_BILINEAR: u32 = 8192u;
+const S3D_POST_DISPLAY_GAMMA: u32 = 16384u;
 
 // Matches `GpuPost` (post/chain.rs): one 256-byte slot per post group.
 struct PostParams {
     out_rect: vec4<f32>,        // the group's rect in D pixels (x, y, w, h), unclipped
     src_rect: vec4<f32>,        // its rect in S pixels, unclipped
     src_texel: vec4<f32>,       // 1/S.w, 1/S.h, rect aspect (w/h), D height
-    exposure: vec4<f32>,        // linear multiplier (the compensation with auto exposure), -, bloom intensity, bloom mode (0 add, 1 mix)
+    exposure: vec4<f32>,        // linear multiplier (the compensation with auto exposure), 1 / display gamma, bloom intensity, bloom mode (0 add, 1 mix)
     vignette: vec4<f32>,        // intensity, smoothness, roundness, center.x
     vignette_color: vec4<f32>,  // linear multiplier at full vignette (rgb), center.y
     lens: vec4<f32>,            // chromatic aberration scale (S px⁻²), -, distortion scale (view heights per encoded unit), distortion chromatic split
@@ -156,6 +158,15 @@ fn post_grade_ldr(c: vec3<f32>) -> vec3<f32> {
         e = mix(e, post_lut(e), post.gamma_lut.w);
     }
     return s3d_srgb_to_linear(clamp(e, vec3<f32>(0.0), vec3<f32>(1.0)));
+}
+
+// The display gamma (`PostProcess::display_gamma`, a player's brightness calibration): the
+// sRGB-encoded display color raised to 1 / gamma, the last step of the grading. Black and white
+// stay, the midtones move; nothing before the tonemapper sees it, so exposure, bloom and the
+// grading are what they were. Display-linear in and out. CPU mirror: `apply_display_gamma`.
+fn post_display_gamma(c: vec3<f32>) -> vec3<f32> {
+    let e = s3d_linear_to_srgb(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
+    return s3d_srgb_to_linear(pow(e, vec3<f32>(post.exposure.y)));
 }
 
 // Bloom level 0 at S position `s` (already exposed and thresholded). The chain covers the
@@ -373,6 +384,9 @@ fn fs_composite(in: FullscreenOut) -> @location(0) vec4<f32> {
         rgb = post_grade_ldr(rgb);
     }
     rgb = post_ldr_hook(rgb, uv);
+    if (post_has(S3D_POST_DISPLAY_GAMMA)) {
+        rgb = post_display_gamma(rgb);
+    }
     if (post.flags.z != 0u) {
         rgb = post_finish(rgb, in.pos.xy);
     } else if (post_has(S3D_POST_DITHER)) {

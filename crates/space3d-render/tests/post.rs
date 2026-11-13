@@ -164,6 +164,11 @@ fn grading_matches_formulas() {
 }
 
 #[test]
+fn display_gamma_matches_formula() {
+    cases::display_gamma_matches_formula(headless_app);
+}
+
+#[test]
 fn lut_identity_is_neutral() {
     cases::lut_identity_is_neutral(headless_app);
 }

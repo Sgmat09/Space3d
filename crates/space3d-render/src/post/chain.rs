@@ -29,6 +29,8 @@ pub(crate) mod bits {
     pub const GRADE_LDR: u32 = 4096;
     /// Bloom level 0 is read with one bilinear tap (`Bloom::fast`).
     pub const BLOOM_BILINEAR: u32 = 8192;
+    /// The display gamma is not 1 (`PostProcess::display_gamma`).
+    pub const DISPLAY_GAMMA: u32 = 16384;
 }
 
 /// Matches `PostParams` in composite.wgsl: one 256-byte uniform slot per post group. Nothing in
@@ -44,8 +46,8 @@ pub(crate) struct GpuPost {
     pub src_rect: [f32; 4],
     /// 1/S.w, 1/S.h, rect aspect (w/h), D height in pixels.
     pub src_texel: [f32; 4],
-    /// Linear exposure multiplier (the compensation with auto exposure), -, bloom intensity,
-    /// bloom mode (0 additive, 1 energy).
+    /// Linear exposure multiplier (the compensation with auto exposure), 1 / display gamma,
+    /// bloom intensity, bloom mode (0 additive, 1 energy).
     pub exposure: [f32; 4],
     pub vignette: [f32; 4],
     pub vignette_color: [f32; 4],
@@ -165,7 +167,16 @@ impl GpuPost {
         p.out_rect = out;
         p.src_rect = src;
         p.src_texel = [1.0 / sw, 1.0 / sh, out[2] / out[3].max(1.0), plan.output_size.1 as f32];
-        p.exposure = [exposure, 0.0, 0.0, 0.0];
+        // The display gamma: a uniform bit, so moving it never builds a pipeline; 1 leaves the
+        // composite exactly as it was (the passthrough group copies, and gets none).
+        let display_gamma = crate::output::display_gamma_of(s.display_gamma);
+        let inverse_display_gamma = if effects && display_gamma != 1.0 {
+            flags |= bits::DISPLAY_GAMMA;
+            1.0 / display_gamma
+        } else {
+            1.0
+        };
+        p.exposure = [exposure, inverse_display_gamma, 0.0, 0.0];
         if bloom {
             flags |= bits::BLOOM;
             if s.bloom.fast {
@@ -373,10 +384,66 @@ mod tests {
             ("S3D_POST_VIGNETTE", bits::VIGNETTE),
             ("S3D_POST_CA", bits::CA),
             ("S3D_POST_GRAIN", bits::GRAIN),
+            ("S3D_POST_DISPLAY_GAMMA", bits::DISPLAY_GAMMA),
         ] {
             assert!(src.contains(&format!("const {name}: u32 = {bit}u;")), "{name}");
         }
         crate::pipeline::validate_wgsl(&src).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// The display gamma is a uniform bit and `1 / gamma`: at 1 (the default), with NaN, and
+    /// in the passthrough group the composite's parameters are exactly those without it.
+    #[test]
+    fn display_gamma_is_off_at_one() {
+        use super::super::api::PostProcess;
+        let plan = |settings: PostProcess, passthrough: bool| PostGroupPlan {
+            camera: space3d_core::World::new().spawn(()),
+            settings,
+            mode: FrameMode::Hdr,
+            scene_rect: [0, 0, 64, 64],
+            output_rect: [0, 0, 64, 64],
+            scene_size: (64, 64),
+            output_size: (64, 64),
+            scene_alpha: true,
+            transparent: false,
+            passthrough,
+            distortion: false,
+        };
+        let c = || CompositePlan {
+            bloom: true,
+            fxaa: false,
+            auto_exposure: false,
+            lut: None,
+        };
+        let params = |gamma: f32, passthrough: bool| {
+            GpuPost::new(
+                &plan(PostProcess::default().with_display_gamma(gamma), passthrough),
+                c(),
+            )
+        };
+        let plain = GpuPost::new(&plan(PostProcess::default(), false), c());
+        assert_eq!(PostProcess::default().display_gamma, 1.0);
+        assert_eq!((plain.flags[0] & bits::DISPLAY_GAMMA, plain.exposure[1]), (0, 1.0));
+        assert_eq!(params(1.0, false), plain);
+        assert_eq!(params(f32::NAN, false), plain);
+        assert_eq!(params(f32::INFINITY, false), plain);
+        let moved = params(1.25, false);
+        assert_eq!(
+            (moved.flags[0] & bits::DISPLAY_GAMMA, moved.exposure[1]),
+            (bits::DISPLAY_GAMMA, 0.8)
+        );
+        // Nothing else moves: the exposure, the bloom and the grading are as they were.
+        let mut same = moved;
+        same.flags[0] &= !bits::DISPLAY_GAMMA;
+        same.exposure[1] = 1.0;
+        assert_eq!(same, plain);
+        // Clamped to the range; the passthrough group copies and gets none.
+        assert_eq!(
+            (params(100.0, false).exposure[1], params(0.0, false).exposure[1]),
+            (0.25, 4.0)
+        );
+        assert_eq!(params(1.25, true).flags[0] & bits::DISPLAY_GAMMA, 0);
+        assert_eq!(params(1.25, true).exposure[1], 1.0);
     }
 
     /// The shader hashes pre-hashed seeds (`post_hash01(p, pcg(seed))`): the same numbers as
