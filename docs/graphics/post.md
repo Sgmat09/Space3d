@@ -30,7 +30,8 @@ metering → bloom chain] → composite: the distortion offset → scene (+ chro
 distortion split taps) → exposure (manual, or 2^(E + compensation)) → bloom (at the same
 offset) → vignette → white balance × saturation, contrast → `post_hdr_hook` → tonemapper →
 lift/gamma/gain, LUT → `post_ldr_hook` → **last pass**: grain → dither → output encoding. The
-last pass is the composite, or the FXAA pass when FXAA is on.
+last pass is the composite, or the FXAA pass when FXAA is on (the composite then dithers the
+8-bit intermediate it writes: "FXAA").
 
 ## Bloom
 
@@ -550,6 +551,22 @@ together, and grain and dither are weighted by alpha. `PostProcess::with_quality
 FXAA quality to the tier's (Low, Medium, High) when FXAA is on; the Low tier (WebGL2) uses FXAA
 Low instead of MSAA (spec §4.4). Cost: one pass, and `L` (8.3 MB at 1080p).
 
+**`L` is dithered.** `L` has 8 bits, so the composite dithers what it writes there (triangular,
+±1 LSB in the encoded space, `PostProcess::dither`, with its own hash of the frame's seeds:
+`post_dither_intermediate`). Until 2026-11 it did not: the composite rounded a smooth dark
+gradient into bands, and the last pass's dither only added noise to values that were whole codes
+already, so every tier with FXAA (Low and Medium, and the higher ones without 4× MSAA) showed
+the bands the tiers without it do not. Where FXAA finds no edge it copies the pixel of `L`, and
+the FXAA pass leaves that pixel as it is (no second dither: it would add nothing but noise, σ 0.5
+to 0.7 codes); where it blends, the pixel is fractional again and is dithered as before, and so
+is everything under film grain and in a transparent group. ±1/255 of noise is far under FXAA's
+edge thresholds (the lowest is 1/8 of the local maximum, with a floor of 0.03 in √luma), so it
+finds the same edges. `fxaa_intermediate_is_dithered`: a ramp over 8 dark codes across 256 px in
+16-px column blocks, each within 0.023 codes of the ramp with the dither (up to 0.19 without),
+and a flat field between two codes has σ 0.498 codes with FXAA against 0.499 without (one dither
+either way). Pure black keeps the sparkle any ±1 LSB dither gives it (one pixel in eight at code
+1), as much as without FXAA.
+
 ## Vignette
 
 `Vignette` darkens (or tints) toward the corners, in HDR before the tonemapper:
@@ -862,7 +879,7 @@ still a pure function of that frame.
   `auto_exposure_feeds_bloom`, `auto_exposure_per_post_group`,
   `auto_exposure_history_and_steady_state` (both paths); grading — `grading_matches_formulas`,
   `lut_identity_is_neutral`, `lut_changes_colors`, `invalid_grading_hook_falls_back`; FXAA and
-  lens effects — `fxaa_softens_edges`, `film_grain_is_seeded`, `grain_after_fxaa`,
+  lens effects — `fxaa_softens_edges`, `fxaa_intermediate_is_dithered`, `film_grain_is_seeded`, `grain_after_fxaa`,
   `after_tonemap_overlays_untouched_by_grain_ca_vignette`, `vignette_darkens_corners`,
   `chromatic_aberration_splits_toward_corners`, `lens_effects_do_not_bleed_across_viewports`,
   `fxaa_ldr_fallback_and_steady_state`, `transparent_rt_lens_effects_keep_alpha`;

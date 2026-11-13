@@ -124,6 +124,11 @@ fn gl_fxaa_softens_edges() {
 }
 
 #[test]
+fn gl_fxaa_intermediate_is_dithered() {
+    cases::fxaa_intermediate_is_dithered(gl_app);
+}
+
+#[test]
 fn gl_film_grain_is_seeded() {
     cases::film_grain_is_seeded(gl_app);
 }

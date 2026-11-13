@@ -856,6 +856,103 @@ pub mod cases {
         assert!(img.pixels.chunks(4).all(|p| p[..3] == [255, 255, 255]));
     }
 
+    /// A dark ramp over 8 display codes, 1 to 9 (a grading hook draws it across the frame; at
+    /// black the clamp keeps only the upper half of any dither's noise): how far the mean code of
+    /// each 16-px column block is from the ramp's own value there, and the number of different
+    /// codes in the image.
+    fn dark_ramp(app: &mut App, cam: Entity, post: PostProcess) -> (Vec<f64>, usize) {
+        let ramp = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+            "dark ramp",
+            // Code c is c / 255 / 12.92 linear (the sRGB curve's linear part, up to code 10).
+            "fn post_hdr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> { return vec3<f32>((1.0 + uv.x * 8.0) / 255.0 / 12.92); }",
+        ));
+        set_post(
+            app,
+            cam,
+            post.with_color_grading(ColorGrading {
+                shader: Some(ramp),
+                ..Default::default()
+            }),
+        );
+        let img = render(app);
+        assert_eq!(app.resources.expect::<Renderer>().shader_error(ramp), None);
+        let mut codes = std::collections::BTreeSet::new();
+        let errors = (0..img.width / 16)
+            .map(|b| {
+                let mut sum = 0.0;
+                for x in b * 16..b * 16 + 16 {
+                    for y in 0..img.height {
+                        let p = img.get(x, y);
+                        assert!(p[0] == p[1] && p[1] == p[2], "grey: {p:?}");
+                        codes.insert(p[0]);
+                        sum += f64::from(p[0]);
+                    }
+                }
+                sum / f64::from(16 * img.height) - (1.0 + 8.0 * (f64::from(b) * 16.0 + 8.0) / f64::from(img.width))
+            })
+            .collect();
+        (errors, codes.len())
+    }
+
+    /// With FXAA the composite writes an 8-bit intermediate: it is dithered there, or a smooth
+    /// dark gradient reaches the display in bands (the last pass's dither only adds noise to
+    /// values that are quantized already). A ramp over 8 codes, 256 px wide, in 16-px column
+    /// blocks (half a code each): without any dither the blocks sit up to a quarter of a code above
+    /// and below the ramp in turn; with the dither every block is on it within 0.08 codes. (All
+    /// of them may sit up to 0.15 codes beside it, the same everywhere: the GPU's own sRGB
+    /// encoding rounds dark values a little early: 0.08 codes on the PC this was written on.) The same ramp
+    /// without FXAA (one dither, in the composite) is as accurate, and the FXAA path is no
+    /// noisier than it: where FXAA copies a pixel it is not dithered twice.
+    pub fn fxaa_intermediate_is_dithered(make: MakeApp) {
+        let Some(mut app) = make(256, 64) else { return };
+        let cam = camera(&mut app, 0.0, BLACK, Some(plain()));
+        // The offset every block shares, and the largest distance from it.
+        let spread = |errors: &[f64]| {
+            let bias = errors.iter().sum::<f64>() / errors.len() as f64;
+            (bias, errors.iter().map(|e| (e - bias).abs()).fold(0.0, f64::max))
+        };
+        let noise = |app: &mut App, post: PostProcess| {
+            // A flat field between two codes (3.5): the standard deviation of the output.
+            let flat = app.resources.expect_mut::<RenderAssets>().add_shader(CustomShader::new(
+                "flat",
+                "fn post_hdr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> { return vec3<f32>(3.5 / 255.0 / 12.92); }",
+            ));
+            set_post(
+                app,
+                cam,
+                post.with_color_grading(ColorGrading {
+                    shader: Some(flat),
+                    ..Default::default()
+                }),
+            );
+            red_std(&render(app))
+        };
+        let dithered = PostProcess {
+            dither: true,
+            ..plain()
+        };
+        let (banded, codes) = dark_ramp(&mut app, cam, plain().with_fxaa(FxaaQuality::Low));
+        assert!(codes <= 9, "{codes} codes");
+        assert!(spread(&banded).1 > 0.15, "no dither: {banded:?}");
+        for q in [FxaaQuality::Low, FxaaQuality::Ultra] {
+            let (errors, _) = dark_ramp(&mut app, cam, dithered.with_fxaa(q));
+            assert_eq!(stats(&app).post_passes, 2, "{q:?}: composite + FXAA");
+            let (bias, off) = spread(&errors);
+            eprintln!("{q:?}: every block {bias:.3} codes beside the ramp, the worst {off:.3} from that");
+            assert!(bias.abs() < 0.15 && off < 0.08, "{q:?}: {errors:?}");
+            // Half a code from block to block: the means rise all the way.
+            assert!(errors.windows(2).all(|w| w[1] - w[0] > -0.5), "{q:?}: {errors:?}");
+        }
+        let (direct, _) = dark_ramp(&mut app, cam, dithered);
+        assert_eq!(stats(&app).post_passes, 1);
+        let (bias, off) = spread(&direct);
+        assert!(bias.abs() < 0.15 && off < 0.08, "no FXAA: {direct:?}");
+        let one = noise(&mut app, dithered);
+        let two = noise(&mut app, dithered.with_fxaa(FxaaQuality::Low));
+        eprintln!("σ of a flat 3.5: {one:.3} codes with one dither, {two:.3} with FXAA");
+        assert!(one > 0.4 && two < one * 1.1, "σ {two} with FXAA, {one} without");
+    }
+
     /// Grain, dither and encoding run in the last pass: with FXAA that is the FXAA pass, so the
     /// grain is not smoothed by it. A flat scene with strong 1-pixel grain looks the same with
     /// and without FXAA (within 1 level: FXAA reads the 8-bit intermediate).

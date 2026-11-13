@@ -11,7 +11,7 @@
 // offset) → vignette →
 // white balance × saturation, contrast → `post_hdr_hook` → tonemap → lift/gamma/gain, LUT (in
 // the sRGB-encoded display space) → `post_ldr_hook` → in the last pass: grain → dither → encode
-// → re-premultiply. The grading hooks (`ColorGrading::shader`, spliced at the HOOKS marker at
+// (before FXAA: the dither of the 8-bit intermediate) → re-premultiply. The grading hooks (`ColorGrading::shader`, spliced at the HOOKS marker at
 // the end) are identity functions unless a hook shader defines them.
 
 // 0: D has an sRGB format (hardware encodes), 1: 8-bit D without one (encode here),
@@ -276,12 +276,33 @@ fn post_grain(e: vec3<f32>, px: vec2<f32>) -> vec3<f32> {
     return e + vec3<f32>(n * amp);
 }
 
+// Decorrelates the dither of the LDR intermediate L from the last pass's (both are hashed from
+// the frame's two dither seeds at the same pixel).
+const S3D_POST_DITHER_L: u32 = 0xA511E9B3u;
+
+// The dither of the 8-bit LDR intermediate L (the composite's output when FXAA follows):
+// triangular, ±1 LSB in the encoded space, before the sRGB target quantizes. Without it L holds
+// the bands of a smooth dark gradient and the last pass's dither only adds noise to them.
+// `rgb_in` is display-linear, and so is the result (L's format encodes).
+fn post_dither_intermediate(rgb_in: vec3<f32>, px_f: vec2<f32>) -> vec3<f32> {
+    let px = vec2<u32>(px_f);
+    let n = post_hash01(px, post_seeds.y ^ S3D_POST_DITHER_L) - post_hash01(px, post_seeds.z ^ S3D_POST_DITHER_L);
+    let e = s3d_linear_to_srgb(clamp(rgb_in, vec3<f32>(0.0), vec3<f32>(1.0))) + vec3<f32>(n / 255.0);
+    return s3d_srgb_to_linear(clamp(e, vec3<f32>(0.0), vec3<f32>(1.0)));
+}
+
 // Last-pass finish: grain and dither (triangular, ±1 LSB) in the encoded space, and the encoding
 // for D. `rgb_in` is display-linear.
 fn post_finish(rgb_in: vec3<f32>, px_f: vec2<f32>) -> vec3<f32> {
+    return post_finish_with(rgb_in, px_f, true);
+}
+
+// `post_finish`, with the dither only where `may_dither` (the FXAA pass leaves it out where it
+// copied an already dithered pixel of L).
+fn post_finish_with(rgb_in: vec3<f32>, px_f: vec2<f32>, may_dither: bool) -> vec3<f32> {
     let grain = post_has(S3D_POST_GRAIN);
     // Float D keeps linear values and gets no dither.
-    let dither = post_has(S3D_POST_DITHER) && S3D_POST_OUT != 2u;
+    let dither = may_dither && post_has(S3D_POST_DITHER) && S3D_POST_OUT != 2u;
     if (!grain && !dither) {
         if (S3D_POST_OUT == 1u) {
             return s3d_linear_to_srgb(clamp(rgb_in, vec3<f32>(0.0), vec3<f32>(1.0)));
@@ -354,6 +375,8 @@ fn fs_composite(in: FullscreenOut) -> @location(0) vec4<f32> {
     rgb = post_ldr_hook(rgb, uv);
     if (post.flags.z != 0u) {
         rgb = post_finish(rgb, in.pos.xy);
+    } else if (post_has(S3D_POST_DITHER)) {
+        rgb = post_dither_intermediate(rgb, in.pos.xy);
     }
     if (transparent) {
         rgb = rgb * a;
