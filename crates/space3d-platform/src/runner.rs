@@ -698,7 +698,13 @@ impl ApplicationHandler for WinitRunner {
                         self.input().inject_key_event(key_event);
                     }
                     PhysicalKey::Unidentified(_) => {
-                        if pressed && let Some(text) = &event.text {
+                        // Android: Back is a key of no place (winit 0.30: `Unidentified`, logical
+                        // `BrowserBack`).
+                        if let Some(keys) = back_as_escape(&event.logical_key, pressed) {
+                            for key_event in keys {
+                                self.input().inject_key_event(key_event);
+                            }
+                        } else if pressed && let Some(text) = &event.text {
                             // iOS: the on-screen keyboard's Return is the text "\n" of no key.
                             if let Some(enter) = return_as_enter(text) {
                                 for key_event in enter {
@@ -809,6 +815,31 @@ fn return_as_enter(text: &str) -> Option<[KeyEvent; 2]> {
     })
 }
 
+/// Android's Back as two keys an app can read: `BrowserBack` (it was Back) and `Escape` (what
+/// Back means in a UI: close what is open), pressed or released as Back is. winit 0.30 gives
+/// Back as a key of no place (`PhysicalKey::Unidentified`) whose logical key is
+/// `NamedKey::BrowserBack`, and reports it as handled, so the system does nothing more with
+/// it: leaving the app on Back is the app's to do. (An app that targets Android 16 is not sent
+/// the key at all unless its manifest opts out of the predictive back gesture.)
+fn back_as_escape(logical: &winit::keyboard::Key, pressed: bool) -> Option<[KeyEvent; 2]> {
+    use crate::layout::{LogicalKey, NamedKey};
+    use winit::keyboard::KeyCode;
+    (*logical == LogicalKey::Named(NamedKey::BrowserBack)).then(|| {
+        let of = |code: KeyCode, named: NamedKey| {
+            let key = LogicalKey::Named(named);
+            if pressed {
+                KeyEvent::press(code, key).with_text(None)
+            } else {
+                KeyEvent::release(code, key)
+            }
+        };
+        [
+            of(KeyCode::BrowserBack, NamedKey::BrowserBack),
+            of(KeyCode::Escape, NamedKey::Escape),
+        ]
+    })
+}
+
 /// winit's `key_without_modifiers` where the platform has it (Windows, macOS, X11, Wayland).
 #[cfg(any(
     target_os = "windows",
@@ -875,6 +906,28 @@ mod tests {
         assert!(return_as_enter("a").is_none());
         assert!(return_as_enter("\n\n").is_none());
         assert!(return_as_enter("").is_none());
+    }
+
+    /// Android's Back is the Back key and the Escape key, down with it and up with it; no
+    /// other key of no place is.
+    #[test]
+    fn back_is_also_escape() {
+        use crate::layout::{LogicalKey, NamedKey};
+        use winit::keyboard::KeyCode;
+        let back = LogicalKey::Named(NamedKey::BrowserBack);
+        let mut input = Input::default();
+        for key_event in back_as_escape(&back, true).expect("Back") {
+            assert_eq!(key_event.text, None);
+            input.inject_key_event(key_event);
+        }
+        assert!(input.just_pressed(KeyCode::BrowserBack) && input.just_pressed(KeyCode::Escape));
+        assert_eq!(input.text(), "");
+        for key_event in back_as_escape(&back, false).expect("Back") {
+            input.inject_key_event(key_event);
+        }
+        assert!(!input.pressed(KeyCode::BrowserBack) && !input.pressed(KeyCode::Escape));
+        assert!(back_as_escape(&LogicalKey::Named(NamedKey::BrowserForward), true).is_none());
+        assert!(back_as_escape(&LogicalKey::Character("a".into()), true).is_none());
     }
 
     #[test]
