@@ -351,6 +351,53 @@ cell that leaves at most `ratio` of the triangles. Not everything inside a cell 
 * A stream (normals, UVs, colours, tangents, second UVs) counts only when it has a value for
   every position; one of another length is left out of the result.
 
+Clustering cannot make a **thin part** simpler: a fin a few cells wide falls apart into scattered
+triangles before it has lost many, and a model of many small parts (each a fin, a plate, a strut)
+either keeps nearly all its triangles or shows holes. For those there is edge collapse:
+
+```rust
+use space3d::render::lod::{EdgeCollapse, simplify_edges};
+// three tenths of the triangles, and no collapse that moves the surface more than 1 % of the mesh's size
+let settings = EdgeCollapse::to_ratio(&data, 0.3).with_max_error(0.01);
+let (mid, mid_extras) = simplify_edges(&data, &extras, &settings);
+```
+
+`lod::simplify_edges(&data, &extras, &EdgeCollapse)` takes out one edge at a time, the one whose
+loss moves the surface least by the quadric error metric (the summed squared distance to the
+planes of the faces a vertex has stood for), one end moving onto the other, until
+`EdgeCollapse::triangles` are left or no allowed collapse is (`EdgeCollapse::to(count)`,
+`EdgeCollapse::to_ratio(&data, ratio)`; `max_error` is a share of the mesh's largest side and
+infinite by default). Pure Rust, no dependency, the same result on every platform and every run
+(ties are broken by the vertices' order).
+
+* **No new vertices.** Every vertex of the result is a vertex of the mesh given, with its own
+  normal, UVs, colour, tangent and second UVs, in the old order: no attribute is blended or
+  made up, and a triangle is textured from one island as before.
+* **Seams and hard edges stay.** Vertices at one position with different attributes (the two
+  sides of a texture seam, of a hard edge, of a sheet whose back is a reversed copy) are one
+  place with several vertices. A place moves only where each of its vertices finds its own side
+  at the other end of the edge: along a seam and not off it, so both sides stay attached and no
+  triangle spans two islands; a corner where three sides meet stays. A flat-shaded mesh (a
+  vertex for every corner of every face) is joined by position, and a moved corner takes the
+  vertex there that has the same UVs and colour and faces nearest its own way (within 60
+  degrees; else the collapse is not made).
+* **Borders and knife edges keep the outline.** An edge with one face, and an edge whose faces
+  fold back on each other more sharply than 60 degrees (the rim of a thin fin, the border of a
+  two-sided sheet), weighs `EdgeCollapse::border_weight` (10) times a face against moving
+  sideways: it is made simpler along itself and not eaten into.
+* **No face turns over**, in space (its normal turns by less than about 78 degrees) or in the
+  texture; none becomes a line; none comes to lie on another; the surface is not pinched. A
+  closed mesh stays closed. The last triangle of a piece is never taken.
+* A mesh that cannot reach the target under these rules comes back with what it could: check
+  `triangle_count()` and fall back to the mesh given, or to `simplify_to`, as fits.
+
+What it does not do: it places no vertex at a new, better position (the result is a subset of
+the vertices, so a smooth ball shrinks a little: under 6 % of its volume at three tenths of
+the triangles of a sphere of 24 rings, which a test holds it to), it does not weigh the texture's detail in the cost, and it joins
+nothing that does not share an edge (clustering does: for a mesh drawn at a few pixels, where
+separate pieces should fuse, `simplify_to` is still the tool). The cost is about `n log n`:
+call it when a model is loaded, not in a frame.
+
 ## Several cameras
 
 Cameras render in `order`; cameras sharing a target form its *target group*:
