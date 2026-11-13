@@ -14,11 +14,19 @@ use std::collections::{BinaryHeap, HashMap};
 /// What [`simplify_edges`] aims at and what it may not do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EdgeCollapse {
-    /// Stop at this many triangles (or sooner, when no collapse is left that is allowed).
+    /// Stop when no more than this many triangles are left (or sooner, when no collapse is
+    /// left that is allowed). A collapse takes two triangles as a rule (one at a border, four
+    /// on a sheet with a reversed copy for its back), so the result can be up to three under.
     pub triangles: usize,
-    /// No collapse may move the surface further than this, as a share of the mesh's largest
-    /// side (0.01: a hundredth of it; the distance is the root mean square distance to the
-    /// planes of the faces the collapsed vertex stood for). `f32::INFINITY`: no limit.
+    /// No collapse is made whose error is over this, as a share of the mesh's largest side
+    /// (0.01: a hundredth of it). `f32::INFINITY`: no limit. The error is a mean and a loose
+    /// measure, not a bound on how far the surface moves: the root mean square distance from
+    /// the place the vertex moves to, to the planes of all the faces the two places have
+    /// stood for, weighted by area. It is taken at each step and thinned by every plane
+    /// gathered, so the surface given can end several times further from the result than the
+    /// limit (measured on a sheet bent over an arc and taken as far down as the limit lets it:
+    /// 1.6 to 6.2 times the limit). Set it with that margin, and measure the result where the
+    /// distance matters.
     pub max_error: f32,
     /// How much heavier than a face an open border or a knife edge weighs, so that the outline
     /// of an open sheet or of a thin fin stays where it is.
@@ -147,8 +155,13 @@ struct Work<'a> {
     /// The triangles at each place (collapsed ones are dropped as they are met).
     around: Vec<Vec<u32>>,
     quadric: Vec<Quadric>,
-    /// Counts the changes around a place: a queued collapse made before the last is stale.
+    /// Counts the changes of a place's quadric: a queued collapse made before the last is stale
+    /// (its cost is no longer the one it was queued with), and so is every one of a place gone.
     stamp: Vec<u32>,
+    /// The collapses refused at each place ([`Work::plan`] said no), by their number in
+    /// `refused`: one is tried again when the triangles at either of its ends have changed.
+    parked: Vec<Vec<u32>>,
+    refused: Vec<Option<(u32, u32)>>,
     alive: usize,
 }
 
@@ -161,6 +174,11 @@ struct Streams {
 }
 
 const DEAD: [u32; 3] = [u32::MAX; 3];
+
+/// The kinds of an edge, the one that holds the outline hardest first.
+const BORDER: u8 = 0;
+const KNIFE: u8 = 1;
+const SMOOTH: u8 = 2;
 
 impl Work<'_> {
     fn corners(&self, t: u32) -> [u32; 3] {
@@ -181,6 +199,47 @@ impl Work<'_> {
         out.dedup();
         out
     }
+    /// What the edge these triangles lie on is: [`BORDER`] (one triangle), [`KNIFE`] (one of
+    /// them has no other that continues it over the edge, as where the planes that hold the
+    /// outline are set) or [`SMOOTH`].
+    fn edge_kind(&self, on: &[u32]) -> u8 {
+        let unit = |t: u32| {
+            self.normal(self.corners(t).map(|q| self.at[q as usize]))
+                .normalize_or_zero()
+        };
+        if on.len() == 1 {
+            BORDER
+        } else if on.iter().any(|t| {
+            let normal = unit(*t);
+            !on.iter().any(|o| o != t && unit(*o).dot(normal) > KNIFE_DOT)
+        }) {
+            KNIFE
+        } else {
+            SMOOTH
+        }
+    }
+    /// The least kind of the edges at a place: whether a border runs through it, or a knife
+    /// edge, or neither.
+    fn place_kind(&self, p: u32) -> u8 {
+        let mut edges: Vec<(u32, u32)> = self.around[p as usize]
+            .iter()
+            .filter(|t| self.tris[**t as usize] != DEAD)
+            .flat_map(|t| self.corners(*t).map(|q| (q, *t)))
+            .filter(|e| e.0 != p)
+            .collect();
+        edges.sort_unstable();
+        let mut on: Vec<u32> = Vec::new();
+        let mut least = SMOOTH;
+        for edge in edges.chunk_by(|a, b| a.0 == b.0) {
+            on.clear();
+            on.extend(edge.iter().map(|e| e.1));
+            least = least.min(self.edge_kind(&on));
+            if least == BORDER {
+                break;
+            }
+        }
+        least
+    }
     /// Whether two vertices at one place lie at one place in the textures and the colours too
     /// (they differ in their normals at the most).
     fn same_paint(&self, a: u32, b: u32) -> bool {
@@ -198,7 +257,8 @@ impl Work<'_> {
         );
         q.at(p) + LENGTH_COST * len2 * len2
     }
-    /// The root mean square distance the collapse moves the surface.
+    /// The root mean square distance from the place the collapse leaves, to the planes the two
+    /// places have gathered (see [`EdgeCollapse::max_error`]: a mean, not a bound).
     fn error(&self, from: u32, to: u32) -> f64 {
         let mut q = self.quadric[from as usize];
         q.add(&self.quadric[to as usize]);
@@ -224,19 +284,28 @@ impl Work<'_> {
         // The triangles on the edge go; each gives a pair of vertices, one at each end.
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         let mut thirds: Vec<u32> = Vec::new();
+        let mut on: Vec<u32> = Vec::new();
         for t in self.around[from as usize].iter().filter(live) {
             let (tri, places) = (self.tris[*t as usize], self.corners(*t));
             if let Some(j) = places.iter().position(|p| *p == to) {
                 let i = places.iter().position(|p| *p == from)?;
                 pairs.push((tri[i], tri[j]));
                 thirds.push(places[3 - i - j]);
+                on.push(*t);
             }
         }
         if pairs.is_empty() {
             return None;
         }
+        // Two places of the outline (a border runs through each, or a knife edge) join only
+        // along it: over an edge across the surface (a rung of a ribbon, a chord of a fin) the
+        // outline would be drawn together to a point and the surface cut in two there.
+        let kind = self.edge_kind(&on);
+        if kind != BORDER && self.place_kind(from) < kind && self.place_kind(to) < kind {
+            return None;
+        }
         // The two places may share no neighbour but the third corners of the triangles between
-        // them: the surface would be pinched into a sheet of two triangles back to back.
+        // them: the surface would be pinched into a fin of two triangles back to back.
         let near = self.neighbours(to);
         if self
             .neighbours(from)
@@ -245,16 +314,18 @@ impl Work<'_> {
         {
             return None;
         }
+        // (by their places whichever way they wind: a triangle landing on the back of another
+        // is a closed piece gone flat)
         let rotated = |mut k: [u32; 3]| {
-            let least = (0..3).min_by_key(|i| k[*i]).unwrap_or(0);
-            k.rotate_left(least);
+            k.sort_unstable();
             k
         };
-        let there: Vec<[u32; 3]> = self.around[to as usize]
+        let mut there: Vec<[u32; 3]> = self.around[to as usize]
             .iter()
             .filter(live)
             .map(|t| rotated(self.corners(*t)))
             .collect();
+        there.sort_unstable();
         let mut map: Vec<(u32, u32)> = Vec::new();
         for t in self.around[from as usize].iter().filter(live) {
             let (tri, places) = (self.tris[*t as usize], self.corners(*t));
@@ -270,10 +341,11 @@ impl Work<'_> {
             if n1.length_squared() <= n0.length_squared() * 1e-12 || n0.dot(n1) < FLIP_DOT * n0.length() * n1.length() {
                 return None;
             }
-            // And no triangle may come to lie on one that is there already.
+            // And no triangle may come to lie on one that is there already, face to face or back
+            // to back.
             let mut moved = places;
             moved[i] = to;
-            if there.contains(&rotated(moved)) {
+            if there.binary_search(&rotated(moved)).is_ok() {
                 return None;
             }
             // The vertex at `to` this corner takes.
@@ -365,6 +437,63 @@ impl Work<'_> {
         let q = self.quadric[from as usize];
         self.quadric[to as usize].add(&q);
     }
+
+    /// The mesh as it stands: the vertices still used, in their old order.
+    fn result(&self, extras: &MeshExtras) -> (MeshData, MeshExtras) {
+        let n = self.data.positions.len();
+        let mut used = vec![false; n];
+        for t in self.tris.iter().filter(|t| **t != DEAD) {
+            for v in t {
+                used[*v as usize] = true;
+            }
+        }
+        let mut index = vec![u32::MAX; n];
+        let mut count = 0u32;
+        for (i, u) in used.iter().enumerate() {
+            if *u {
+                index[i] = count;
+                count += 1;
+            }
+        }
+        fn kept<T: Copy>(used: &[bool], from: &[T]) -> Vec<T> {
+            if from.len() == used.len() {
+                from.iter().zip(used).filter(|(_, u)| **u).map(|(v, _)| *v).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        let out = MeshData {
+            positions: kept(&used, &self.data.positions),
+            normals: kept(&used, &self.data.normals),
+            uvs: kept(&used, &self.data.uvs),
+            colors: kept(&used, &self.data.colors),
+            indices: self
+                .tris
+                .iter()
+                .filter(|t| **t != DEAD)
+                .flat_map(|t| t.map(|v| index[v as usize]))
+                .collect(),
+        };
+        let mut out_extras = MeshExtras::new();
+        out_extras.tangents = kept(&used, &extras.tangents);
+        out_extras.uvs1 = kept(&used, &extras.uvs1);
+        (out, out_extras)
+    }
+
+    /// Sets a refused collapse aside at both its ends.
+    fn park(&mut self, from: u32, to: u32) {
+        let id = self.refused.len() as u32;
+        self.refused.push(Some((from, to)));
+        self.parked[from as usize].push(id);
+        self.parked[to as usize].push(id);
+    }
+    /// Takes the collapses set aside at `p` (those not taken from their other end already).
+    fn unpark(&mut self, p: u32) -> Vec<(u32, u32)> {
+        let ids = std::mem::take(&mut self.parked[p as usize]);
+        ids.into_iter()
+            .filter_map(|id| self.refused[id as usize].take())
+            .collect()
+    }
 }
 
 /// A simpler copy of a mesh by edge collapse: again and again the edge whose loss moves the
@@ -390,8 +519,11 @@ impl Work<'_> {
 ///   sheet whose other side is a reversed copy of it), weighs [`EdgeCollapse::border_weight`]
 ///   times a face against moving sideways: it is made simpler along itself, not eaten into.
 /// - **No face turns over**, in space (its normal may not turn more than about 78 degrees) or
-///   in the texture, none collapses to a line, none comes to lie on another, and the surface is
-///   never pinched: a closed mesh stays closed.
+///   in the texture, none collapses to a line, none comes to lie on another (face to face or
+///   back to back: a tetrahedron is not flattened, it stays), and the surface is not pinched: a
+///   closed mesh stays closed, and two places of the outline (of a border; or of a knife edge,
+///   where no border runs through either) join only along it, so a ribbon is not cut through
+///   across a rung.
 /// - **The same mesh every time**: ties are broken by the vertices' order, nothing by chance.
 ///
 /// The result's vertices are those still used, in their old order. A stream (normals, UVs,
@@ -399,9 +531,37 @@ impl Work<'_> {
 /// [`super::simplify`]. Triangles that are a line or a point in the mesh given are dropped. A
 /// mesh at or under the target comes back with its triangles as they are.
 ///
-/// The cost is about `n log n` in the triangles: some tens of milliseconds for a hundred
-/// thousand. Use it when a model is loaded, not in a frame.
+/// The cost grows a little faster than the triangles (a queue of the edges, and after each
+/// collapse only the edges of the place that stayed are costed again): measured on one core of
+/// a loaded PC, 20 to 50 ms for 5,000 triangles, 0.1 to 0.3 s for 20,000, 0.9 to 2.6 s for
+/// 100,000, and 14 ms for a fan of 4,000 round one vertex. Use it when a model is loaded, off
+/// the frame's thread, not in a frame.
 pub fn simplify_edges(data: &MeshData, extras: &MeshExtras, settings: &EdgeCollapse) -> (MeshData, MeshExtras) {
+    simplify_edges_steps(data, extras, settings, &[settings.triangles])
+        .pop()
+        .unwrap_or_default()
+}
+
+/// [`simplify_edges`] to several triangle counts in one go: the mesh at each of `triangles`, in
+/// the order given, each the very mesh `simplify_edges` makes for that count
+/// ([`EdgeCollapse::triangles`] of `settings` is not looked at). The collapses are made in one
+/// order whatever the count, so the mesh at a count is the mesh on the way to every lower one:
+/// one run to the lowest, with a copy taken at each count passed, costs about what the lowest
+/// alone does. For a caller that tries several counts and keeps the coarsest that will do.
+pub fn simplify_edges_steps(
+    data: &MeshData,
+    extras: &MeshExtras,
+    settings: &EdgeCollapse,
+    triangles: &[usize],
+) -> Vec<(MeshData, MeshExtras)> {
+    // The counts from the highest down, each with its place in the result.
+    let mut order: Vec<usize> = (0..triangles.len()).collect();
+    order.sort_by_key(|i| Reverse(triangles[*i]));
+    let mut made: Vec<(MeshData, MeshExtras)> = vec![Default::default(); triangles.len()];
+    let Some(lowest) = triangles.iter().copied().min() else {
+        return made;
+    };
+    let mut next = 0;
     let n = data.positions.len();
     let has = Streams {
         normals: data.normals.len() == n,
@@ -433,6 +593,8 @@ pub fn simplify_edges(data: &MeshData, extras: &MeshExtras, settings: &EdgeColla
         around: vec![Vec::new(); places],
         quadric: vec![Quadric::default(); places],
         stamp: vec![0; places],
+        parked: vec![Vec::new(); places],
+        refused: Vec::new(),
         alive: 0,
     };
     for t in data.indices.as_chunks::<3>().0 {
@@ -451,7 +613,12 @@ pub fn simplify_edges(data: &MeshData, extras: &MeshExtras, settings: &EdgeColla
     }
     work.alive = work.tris.len();
 
-    if work.alive > settings.triangles {
+    // The counts the mesh given is at or under already.
+    while next < order.len() && work.alive <= triangles[order[next]] {
+        made[order[next]] = work.result(extras);
+        next += 1;
+    }
+    if work.alive > lowest {
         // Each face's plane, weighted by its area, at its three places.
         let mut edges: HashMap<(u32, u32), Vec<u32>> = HashMap::with_capacity(work.tris.len() * 2);
         for t in 0..work.tris.len() as u32 {
@@ -508,7 +675,7 @@ pub fn simplify_edges(data: &MeshData, extras: &MeshExtras, settings: &EdgeColla
             work.push(&mut heap, *b, *a);
         }
         drop(edges);
-        while work.alive > settings.triangles {
+        while work.alive > lowest {
             let Some(Reverse(c)) = heap.pop() else {
                 break;
             };
@@ -517,66 +684,42 @@ pub fn simplify_edges(data: &MeshData, extras: &MeshExtras, settings: &EdgeColla
                 continue;
             }
             let Some(map) = work.plan(c.from, c.to) else {
+                work.park(c.from, c.to);
                 continue;
             };
             work.collapse(c.from, c.to, &map);
-            // Everything around the place that stayed is to be looked at again.
+            // The place that stayed has another quadric: its edges cost something else now. The
+            // other edges near cost what they did, and stay queued as they are.
             let ring = work.neighbours(c.to);
+            work.stamp[c.from as usize] += 1;
             work.stamp[c.to as usize] += 1;
             for p in &ring {
-                work.stamp[*p as usize] += 1;
+                work.push(&mut heap, c.to, *p);
+                work.push(&mut heap, *p, c.to);
             }
+            // The triangles at the place and at its neighbours have changed: a collapse refused
+            // there may be allowed now. (Those of the two places themselves are gone or queued.)
+            work.unpark(c.from);
+            work.unpark(c.to);
             for p in &ring {
-                for q in work.neighbours(*p) {
-                    // (an edge between two of the ring is pushed from its lower end only)
-                    if q != c.to && ring.binary_search(&q).is_ok() && q < *p {
-                        continue;
-                    }
-                    work.push(&mut heap, *p, q);
-                    work.push(&mut heap, q, *p);
+                for (a, b) in work.unpark(*p) {
+                    work.push(&mut heap, a, b);
                 }
             }
+            while next < order.len() && work.alive <= triangles[order[next]] {
+                made[order[next]] = work.result(extras);
+                next += 1;
+            }
         }
     }
-
-    // The vertices still used, in their old order.
-    let mut used = vec![false; n];
-    for t in work.tris.iter().filter(|t| **t != DEAD) {
-        for v in t {
-            used[*v as usize] = true;
+    // The counts no allowed collapse led to: what there is.
+    if next < order.len() {
+        let last = work.result(extras);
+        for i in &order[next..] {
+            made[*i] = last.clone();
         }
     }
-    let mut index = vec![u32::MAX; n];
-    let mut count = 0u32;
-    for (i, u) in used.iter().enumerate() {
-        if *u {
-            index[i] = count;
-            count += 1;
-        }
-    }
-    fn kept<T: Copy>(used: &[bool], from: &[T]) -> Vec<T> {
-        if from.len() == used.len() {
-            from.iter().zip(used).filter(|(_, u)| **u).map(|(v, _)| *v).collect()
-        } else {
-            Vec::new()
-        }
-    }
-    let out = MeshData {
-        positions: kept(&used, &data.positions),
-        normals: kept(&used, &data.normals),
-        uvs: kept(&used, &data.uvs),
-        colors: kept(&used, &data.colors),
-        indices: work
-            .tris
-            .iter()
-            .filter(|t| **t != DEAD)
-            .flat_map(|t| t.map(|v| index[v as usize]))
-            .collect(),
-    };
-    let mut out_extras = MeshExtras::new();
-    out_extras.tangents = kept(&used, &extras.tangents);
-    out_extras.uvs1 = kept(&used, &extras.uvs1);
-    (out, out_extras)
+    made
 }
 
 #[cfg(test)]

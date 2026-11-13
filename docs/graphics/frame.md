@@ -357,7 +357,7 @@ either keeps nearly all its triangles or shows holes. For those there is edge co
 
 ```rust
 use space3d::render::lod::{EdgeCollapse, simplify_edges};
-// three tenths of the triangles, and no collapse that moves the surface more than 1 % of the mesh's size
+// three tenths of the triangles, and no collapse whose mean error is over 1 % of the mesh's size
 let settings = EdgeCollapse::to_ratio(&data, 0.3).with_max_error(0.01);
 let (mid, mid_extras) = simplify_edges(&data, &extras, &settings);
 ```
@@ -366,8 +366,12 @@ let (mid, mid_extras) = simplify_edges(&data, &extras, &settings);
 loss moves the surface least by the quadric error metric (the summed squared distance to the
 planes of the faces a vertex has stood for), one end moving onto the other, until
 `EdgeCollapse::triangles` are left or no allowed collapse is (`EdgeCollapse::to(count)`,
-`EdgeCollapse::to_ratio(&data, ratio)`; `max_error` is a share of the mesh's largest side and
-infinite by default). Pure Rust, no dependency, the same result on every platform and every run
+`EdgeCollapse::to_ratio(&data, ratio)`; the result can be up to three triangles under the
+count, as a collapse takes two as a rule, one at a border, four on a two-sided sheet).
+`max_error` is a share of the mesh's largest side and infinite by default; it limits a mean
+(the root mean square distance to the planes the two places have gathered, taken at each
+step), not the distance the surface moves in the end, which was 1.6 to 6.2 times the limit on
+a sheet bent over an arc: leave that margin. Pure Rust, no dependency, the same result on every platform and every run
 (ties are broken by the vertices' order).
 
 * **No new vertices.** Every vertex of the result is a vertex of the mesh given, with its own
@@ -386,8 +390,11 @@ infinite by default). Pure Rust, no dependency, the same result on every platfor
   two-sided sheet), weighs `EdgeCollapse::border_weight` (10) times a face against moving
   sideways: it is made simpler along itself and not eaten into.
 * **No face turns over**, in space (its normal turns by less than about 78 degrees) or in the
-  texture; none becomes a line; none comes to lie on another; the surface is not pinched. A
-  closed mesh stays closed. The last triangle of a piece is never taken.
+  texture; none becomes a line; none comes to lie on another, face to face or back to back (a
+  tetrahedron stays as it is); the surface is not pinched. A closed mesh stays closed; two
+  places of the outline (a border, or a knife edge where there is no border) join only along
+  it, so a ribbon is not cut through across a rung. The last triangle of a piece is never
+  taken.
 * A mesh that cannot reach the target under these rules comes back with what it could: check
   `triangle_count()` and fall back to the mesh given, or to `simplify_to`, as fits.
 
@@ -395,8 +402,12 @@ What it does not do: it places no vertex at a new, better position (the result i
 the vertices, so a smooth ball shrinks a little: under 6 % of its volume at three tenths of
 the triangles of a sphere of 24 rings, which a test holds it to), it does not weigh the texture's detail in the cost, and it joins
 nothing that does not share an edge (clustering does: for a mesh drawn at a few pixels, where
-separate pieces should fuse, `simplify_to` is still the tool). The cost is about `n log n`:
-call it when a model is loaded, not in a frame.
+separate pieces should fuse, `simplify_to` is still the tool). The cost grows a little faster
+than the triangles: on one core of a loaded PC, 20 to 50 ms for 5,000 triangles, 0.1 to 0.3 s
+for 20,000, 1 to 2.6 s for 100,000 (it was 3 to 24 s, and 27 s for a fan of 4,000 triangles
+round one vertex, now 14 ms). To try several counts, `simplify_edges_steps` gives the mesh at
+each of them from one run (the collapses come in one order whatever the count). Call it when
+a model is loaded, off the frame's thread.
 
 ## Several cameras
 

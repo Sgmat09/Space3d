@@ -386,3 +386,197 @@ fn meshes_that_are_nothing_much_come_back_sound() {
     let (made, extras) = simplify_edges(&bad, &none, &EdgeCollapse::to(8));
     sound(&made, &extras);
 }
+
+/// How many places have triangles that hang together at the place only (two fans that share no edge there).
+fn pinched(m: &MeshData) -> usize {
+    let key = |i: u32| m.positions[i as usize].map(|c| (c + 0.0).to_bits());
+    let mut at: HashMap<[u32; 3], Vec<[[u32; 3]; 2]>> = HashMap::new();
+    for t in m.indices.as_chunks::<3>().0 {
+        let k = t.map(key);
+        for i in 0..3 {
+            at.entry(k[i]).or_default().push([k[(i + 1) % 3], k[(i + 2) % 3]]);
+        }
+    }
+    let mut bad = 0;
+    for fans in at.values() {
+        // (grow one piece from the first triangle over shared neighbours)
+        let mut reached = vec![false; fans.len()];
+        reached[0] = true;
+        let mut grown = true;
+        while grown {
+            grown = false;
+            for i in 0..fans.len() {
+                if !reached[i] && (0..fans.len()).any(|j| reached[j] && fans[i].iter().any(|p| fans[j].contains(p))) {
+                    reached[i] = true;
+                    grown = true;
+                }
+            }
+        }
+        bad += usize::from(reached.contains(&false));
+    }
+    bad
+}
+
+/// A ribbon of `n` quads, `width` wide, wound `turns` times round a radius of 10 and drifting along the axis; positions only.
+fn ribbon(n: u32, width: f32, turns: f32) -> MeshData {
+    let mut m = MeshData::default();
+    for y in 0..2 {
+        for x in 0..=n {
+            let a = x as f32 / n as f32 * turns * std::f32::consts::TAU;
+            m.positions
+                .push([10.0 * a.cos(), y as f32 * width, 10.0 * a.sin() + x as f32 * 0.05]);
+        }
+    }
+    for x in 0..n {
+        let (a, w) = (x, n + 1);
+        m.indices.extend([a, a + 1, a + w + 1, a, a + w + 1, a + w]);
+    }
+    m
+}
+
+#[test]
+fn a_ribbon_is_not_cut_through_across_a_rung() {
+    // (width 1, one turn, down to 4 was two pieces joined at a point; so were two turns at 12, where the bends are knife edges)
+    for (width, turns) in [(1.0, 0.5), (1.0, 1.0), (1.0, 2.0), (0.3, 2.0), (0.1, 1.0)] {
+        let mesh = ribbon(40, width, turns);
+        for target in [40, 30, 20, 12, 8, 4, 1] {
+            let (made, extras) = simplify_edges(&mesh, &MeshExtras::new(), &EdgeCollapse::to(target));
+            sound(&made, &extras);
+            assert_eq!(pinched(&made), 0, "width {width}, {turns} turns, to {target}");
+            // one piece with one outline: a ribbon of t triangles has t + 2 border edges
+            let borders = edge_counts(&made).values().filter(|c| **c == 1).count();
+            assert_eq!(
+                borders,
+                made.triangle_count() + 2,
+                "width {width}, {turns} turns, to {target}"
+            );
+        }
+        // and with a reversed copy for its back
+        let both = two_sided(&MeshData {
+            normals: vec![[0.0, 1.0, 0.0]; mesh.positions.len()],
+            uvs: vec![[0.0, 0.0]; mesh.positions.len()],
+            ..mesh.clone()
+        });
+        for target in [40, 16, 4] {
+            let (made, extras) = simplify_edges(&both, &MeshExtras::new(), &EdgeCollapse::to(target));
+            sound(&made, &extras);
+            assert_eq!(
+                pinched(&made),
+                0,
+                "two-sided, width {width}, {turns} turns, to {target}"
+            );
+        }
+    }
+    // a flat strip still goes down to its two triangles, along its borders
+    let strip = ribbon(40, 1.0, 0.0);
+    let made = simplify_edges(&strip, &MeshExtras::new(), &EdgeCollapse::to(2)).0;
+    assert_eq!(made.triangle_count(), 2);
+}
+
+#[test]
+fn a_small_closed_piece_is_not_flattened() {
+    let back_to_back = |m: &MeshData| {
+        let mut seen = std::collections::HashSet::new();
+        m.indices.as_chunks::<3>().0.iter().any(|t| {
+            let mut k = *t;
+            k.sort_unstable();
+            !seen.insert(k)
+        })
+    };
+    let tetrahedron = MeshData {
+        positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.9, 0.0], [0.5, 0.3, 0.8]],
+        indices: vec![0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3],
+        ..MeshData::default()
+    };
+    let bipyramid = MeshData {
+        positions: vec![
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [-0.5, 0.8, 0.0],
+            [-0.5, -0.8, 0.0],
+            [0.0, 0.0, -1.0],
+        ],
+        indices: vec![0, 1, 2, 0, 2, 3, 0, 3, 1, 4, 2, 1, 4, 3, 2, 4, 1, 3],
+        ..MeshData::default()
+    };
+    // (asked for 3, the tetrahedron came back as 2 triangles on the same three vertices; the bipyramid asked for 2 likewise)
+    for (mesh, least) in [(&tetrahedron, 4), (&bipyramid, 4)] {
+        for target in [3, 2, 1, 0] {
+            let made = simplify_edges(mesh, &MeshExtras::new(), &EdgeCollapse::to(target)).0;
+            assert!(!back_to_back(&made), "to {target}: {:?}", made.indices);
+            assert_eq!(made.triangle_count(), least, "to {target}");
+            assert!(edge_counts(&made).values().all(|c| *c == 2), "to {target}: opened");
+        }
+    }
+}
+
+#[test]
+fn a_fan_round_one_vertex_and_a_flat_sheet_do_not_take_long() {
+    // The whole neighbourhood of a collapse used to be queued again: a fan of 4,000 took 27 s and a flat sheet of 20,000 a
+    // second (optimized). Generous limits (a loaded PC, a debug build): they catch the old growth, not a slow day.
+    let mut fan = MeshData::default();
+    let n = 4000u32;
+    fan.positions.push([0.0, 0.0, 0.0]);
+    for i in 0..n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        fan.positions.push([a.cos(), a.sin(), 0.0]);
+        fan.indices.extend([0, 1 + i, 1 + (i + 1) % n]);
+    }
+    let start = std::time::Instant::now();
+    let made = simplify_edges(&fan, &MeshExtras::new(), &EdgeCollapse::to(8)).0;
+    assert!((5..=8).contains(&made.triangle_count()), "{}", made.triangle_count());
+    assert!(
+        start.elapsed().as_secs_f32() < 5.0,
+        "a fan of {n}: {:?}",
+        start.elapsed()
+    );
+    let plate = sheet(100, |_, _| 0.0);
+    let start = std::time::Instant::now();
+    let made = simplify_edges(&plate, &MeshExtras::new(), &EdgeCollapse::to_ratio(&plate, 0.3)).0;
+    assert!(made.triangle_count() <= 6000, "{}", made.triangle_count());
+    assert!(
+        start.elapsed().as_secs_f32() < 10.0,
+        "a sheet of 20,000: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn several_counts_in_one_go_are_the_meshes_of_each_alone() {
+    let same = |a: &(MeshData, MeshExtras), b: &(MeshData, MeshExtras)| {
+        a.0.positions == b.0.positions
+            && a.0.normals == b.0.normals
+            && a.0.uvs == b.0.uvs
+            && a.0.indices == b.0.indices
+            && a.1.tangents == b.1.tangents
+    };
+    let mut extras = MeshExtras::new();
+    let ball = sphere(12);
+    extras.tangents = vec![[1.0, 0.0, 0.0, 1.0]; ball.positions.len()];
+    for (mesh, extras) in [
+        (ball, extras),
+        (
+            two_sided(&sheet(8, |u, v| (u * 9.0).sin() * (v * 7.0).cos() * 0.1)),
+            MeshExtras::new(),
+        ),
+        (fin(8, 0.02), MeshExtras::new()),
+        (ribbon(40, 1.0, 2.0), MeshExtras::new()),
+    ] {
+        let full = mesh.triangle_count();
+        // (not in order, one twice, one over the mesh, some that no allowed collapse reaches)
+        let counts = [full / 2, full + 5, 3, full / 5, full / 2, full - 1, 0, full / 3];
+        let together = simplify_edges_steps(&mesh, &extras, &EdgeCollapse::to(0), &counts);
+        assert_eq!(together.len(), counts.len());
+        for (count, made) in counts.iter().zip(&together) {
+            sound(&made.0, &made.1);
+            let alone = simplify_edges(&mesh, &extras, &EdgeCollapse::to(*count));
+            assert!(
+                same(made, &alone),
+                "to {count} of {full}: {} against {}",
+                made.0.triangle_count(),
+                alone.0.triangle_count()
+            );
+        }
+    }
+    assert!(simplify_edges_steps(&sheet(4, |_, _| 0.0), &MeshExtras::new(), &EdgeCollapse::to(8), &[]).is_empty());
+}

@@ -27,7 +27,7 @@ use space3d_core::{GlobalTransform, MeshData, Resources, World};
 use std::collections::{HashMap, HashSet};
 
 mod collapse;
-pub use collapse::{EdgeCollapse, simplify_edges};
+pub use collapse::{EdgeCollapse, simplify_edges, simplify_edges_steps};
 
 /// The most levels a [`MeshLod`] holds, the full mesh included.
 pub const MAX_LOD_LEVELS: usize = 4;
