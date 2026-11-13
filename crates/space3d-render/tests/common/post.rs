@@ -1623,7 +1623,9 @@ pub mod cases {
             0.006,
             "grading gamma, then display gamma",
         );
-        // The default with every default effect and the dither on: byte-identical at 1.
+        // Setting 1 explicitly is the default (the same settings value, so this shows only that
+        // the two renders agree, not that the picture is the one from before the field: that was
+        // compared across commits by hand, docs/graphics/post.md "Free at 1"); 1.3 is not.
         let full = probe(&mut app, PostProcess::default()).2;
         assert_eq!(probe(&mut app, PostProcess::default().with_display_gamma(1.0)).2, full);
         assert_ne!(probe(&mut app, PostProcess::default().with_display_gamma(1.3)).2, full);

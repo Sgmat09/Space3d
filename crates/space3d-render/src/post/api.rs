@@ -61,6 +61,8 @@ pub struct PostProcess {
 }
 
 /// The range [`PostProcess::display_gamma`] is clamped to (NaN and infinities count as 1).
+/// At any value but 1 the display color is clamped to 0..1 before the power, so a float output
+/// with [`Tonemapper::None`] loses its values above 1 (the LDR grading clamps the same way).
 pub const DISPLAY_GAMMA_RANGE: (f32, f32) = (0.25, 4.0);
 
 pub use crate::output::apply_display_gamma;

@@ -544,13 +544,21 @@ player as "Brightness":
   applied to what the tonemapper produced: the glow, the highlights and the grading are the same
   at every setting.
 * **Free at 1.** It is a uniform bit (`S3D_POST_DISPLAY_GAMMA`) and one float in the group's
-  parameters: at 1 (the default) the parameters, the shader path and the image are exactly those
-  without the field (`display_gamma_is_off_at_one`, and `display_gamma_matches_formula` compares
-  the bytes), and dragging a slider builds no pipeline. Moved, it costs one sRGB encode, a `pow`
-  and a decode per pixel in the composite: 2.21 ms at 1 against 2.61 ms at 1.3 on an AMD Radeon
-  integrated GPU at 1920 × 1080 (SpaceCorps, Medium, one pair of runs on a busy PC; a second
-  pair was spoiled by another program on the GPU), so about 0.4 ms there (not measured on a discrete
-  GPU). It is not fused with the finish's own encode: with FXAA the two are in
+  parameters: at 1 (the default) the bit is not set and the composite takes the path it took
+  before the field existed (`display_gamma_is_off_at_one`; `display_gamma_matches_formula` only
+  shows that setting 1 explicitly equals the default). That the picture did not change was
+  checked once across commits: four composites without FXAA (the default, no effects, bloom
+  without dither, graded; a dark ramp, a mid quad and a blooming quad at 256 × 128, DX12)
+  rendered on the commit before the field and on the one with it are the same bytes. With FXAA
+  the default picture differs on purpose (the intermediate's dither, above). Dragging a slider
+  builds no pipeline. Moved, it costs one sRGB encode, a `pow`
+  and a decode per pixel in the composite. One pair of runs on an AMD Radeon integrated GPU at
+  1920 × 1080 (SpaceCorps, Medium, a busy PC): composite 2.21 ms at 1 against 2.61 ms at 1.3,
+  composite + FXAA 3.54 against 4.13 ms, the whole GPU frame 7.51 against 7.98 ms. So roughly
+  0.4 to 0.6 ms of post time there, n = 1: the other pair (frame p50 24 ms, another program on
+  the GPU) pointed the other way (4.21 + 3.12 at 1, 3.71 + 2.33 at 1.3), and the FXAA pass does
+  nothing different at 1.3, so part of the 0.6 is spread. Measure again on a quiet PC before
+  quoting it; not measured on a discrete GPU. It is not fused with the finish's own encode: with FXAA the two are in
   different passes.
 * **The scene only.** It belongs to a camera's post settings: UI drawn after post (egui, overlays
   after the tonemapper) is not touched, and a camera without it (a preview in a UI panel) keeps
@@ -560,7 +568,10 @@ player as "Brightness":
   patches (codes 4, 8, 16 on black) with it beside the slider and ask for the darkest to be barely
   visible. They are 1, 2, 5 at 0.7 and 16, 25, 40 at 1.5 (`display_gamma_golden_values`).
 
-Values outside `DISPLAY_GAMMA_RANGE` (0.25 to 4) are clamped, NaN and infinities count as 1. A
+Values outside `DISPLAY_GAMMA_RANGE` (0.25 to 4) are clamped, NaN and infinities count as 1.
+The step works on display colors in 0 to 1 and clamps to that range first, as the LDR grading
+does: on a float output with `Tonemapper::None`, values above 1 pass through at 1 and are
+clipped at any other setting (no test covers that combination). A
 lifted gamma shows what 8 bits hold in the shadows (an 8-bit sky texture's own steps become two
 or three codes apart at 1.5); the dither covers the composite's rounding, not the source's.
 
