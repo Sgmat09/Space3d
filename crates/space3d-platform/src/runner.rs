@@ -56,9 +56,6 @@ pub(crate) struct WinitRunner {
     surface_retry: SurfaceRetry,
     layout_watch: LayoutWatch,
     buttons: ButtonReconciler,
-    /// Fingers as the mouse (`WindowPlugin::touch_as_mouse`), and the clock its times are on.
-    touch_pointer: crate::touch_pointer::TouchPointer,
-    touch_clock: Instant,
     /// Whether the on-screen keyboard was last asked for (`TextInput`, phones).
     #[cfg(any(target_os = "android", target_os = "ios"))]
     keyboard_shown: bool,
@@ -206,8 +203,6 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         surface_retry: SurfaceRetry::default(),
         layout_watch: LayoutWatch::default(),
         buttons: ButtonReconciler::default(),
-        touch_pointer: Default::default(),
-        touch_clock: Instant::now(),
         #[cfg(any(target_os = "android", target_os = "ios"))]
         keyboard_shown: false,
         #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -438,7 +433,6 @@ impl WinitRunner {
         if let Some(w) = &self.window {
             w.pre_present_notify();
         }
-        self.touch_pointer_frame();
         self.app.update(dt);
         self.apply_window_state();
         if self.app.should_exit() {
@@ -456,48 +450,21 @@ impl WinitRunner {
     /// The app goes to the background or loses the focus: no key, button or finger stays held.
     fn release_input(&mut self) {
         self.input().release_all();
-        self.input().clear_touches();
-        let mut actions = Vec::new();
-        self.touch_pointer.reset(&mut actions);
-        self.apply_pointer(&actions);
+        self.app
+            .resources
+            .scope::<crate::touch_pointer::TouchMouse, _>(|res, mouse| mouse.reset(res.init::<Input>()));
     }
 
-    /// `WindowPlugin::touch_as_mouse`: a touch goes through [`crate::touch_pointer`] to the mouse.
-    fn touch_to_mouse(&mut self, id: u64, phase: TouchPhase, p: Vec2) {
-        let mut actions = Vec::new();
-        self.touch_pointer.config.slop =
-            crate::touch_pointer::TouchPointerConfig::SLOP_POINTS * self.state().scale_factor.max(1.0) as f32;
-        let now = self.touch_clock.elapsed().as_secs_f64();
-        self.touch_pointer.touch(id, phase, p, now, &mut actions);
-        self.apply_pointer(&actions);
-    }
-
-    /// `WindowPlugin::touch_as_mouse`: what the fingers' mouse does this frame (a press a frame
-    /// after its hover, a long press's right click).
-    fn touch_pointer_frame(&mut self) {
-        if !self.settings.touch_as_mouse || !self.touch_pointer.active() {
-            return;
-        }
-        let mut actions = Vec::new();
-        let now = self.touch_clock.elapsed().as_secs_f64();
-        self.touch_pointer.frame(now, &mut actions);
-        self.apply_pointer(&actions);
-    }
-
-    fn apply_pointer(&mut self, actions: &[crate::touch_pointer::PointerAction]) {
-        use crate::touch_pointer::PointerAction as A;
-        let input = self.input();
-        for action in actions {
-            match *action {
-                A::Place(p) => input.set_mouse_position(Some(p)),
-                A::Move(p) => input.inject_mouse_move(p),
-                A::Leave => input.inject_mouse_left(),
-                A::Down(b) => input.inject_mouse_button_down(b),
-                A::Up(b) => input.inject_mouse_button_up(b),
-                A::Cancel(b) => input.release_mouse_button(b, crate::input::MouseButtonCause::FocusLost),
-                A::Wheel(lines) => input.inject_wheel(Vec2::new(0.0, lines)),
-            }
-        }
+    /// A finger: through [`crate::touch_pointer::TouchMouse`] to the mouse, the gesture and
+    /// the touches of [`Input`] (the path a scripted touch takes too).
+    fn touch(&mut self, id: u64, phase: TouchPhase, p: Vec2) {
+        let scale = self.state().scale_factor.max(1.0) as f32;
+        self.app
+            .resources
+            .scope::<crate::touch_pointer::TouchMouse, _>(|res, mouse| {
+                mouse.scale = scale;
+                mouse.touch(res.init::<Input>(), id, phase, p);
+            });
     }
 
     /// Push game-side changes of [`WindowState`] to the OS window.
@@ -770,11 +737,7 @@ impl ApplicationHandler for WinitRunner {
             WindowEvent::Touch(t) => {
                 let p = Vec2::new(t.location.x as f32, t.location.y as f32);
                 let phase = TouchPhase::from(t.phase);
-                // The mouse first: the UI takes a finger for its pointer only while there is no mouse.
-                if self.settings.touch_as_mouse {
-                    self.touch_to_mouse(t.id, phase, p);
-                }
-                self.input().inject_touch(t.id, phase, p);
+                self.touch(t.id, phase, p);
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 if phase == TouchPhase::Ended {
                     // Once the tap's click is through the UI (`touch_pointer`: three frames).

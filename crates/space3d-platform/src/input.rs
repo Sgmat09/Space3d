@@ -307,6 +307,25 @@ pub struct Touch {
     pub delta: Vec2,
 }
 
+/// Two fingers on the screen ([`Input::gesture`]): where they are and what they did this frame.
+/// The window runner fills it from the fingers when [`crate::touch_pointer::TouchMouse`] is on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TouchGesture {
+    /// The point between the fingers when the second one came down (physical pixels).
+    pub start: Vec2,
+    /// The point between the fingers now.
+    pub center: Vec2,
+    /// This frame: the fingers' distance over what it was (1.0: unchanged, above: apart).
+    pub zoom: f32,
+    /// This frame: how far the line between the fingers turned, in radians. Positive is
+    /// clockwise as seen on the screen (y points down).
+    pub rotate: f32,
+    /// This frame: how far the point between the fingers moved, in physical pixels.
+    pub pan: Vec2,
+    /// The gesture began this frame.
+    pub just_started: bool,
+}
+
 /// Gamepad buttons (stub layout; no backend is wired yet — inject for tests).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GamepadButton {
@@ -444,6 +463,9 @@ pub struct Input {
     started_touches: Vec<u64>,
     ended_touches: Vec<Touch>,
     cancelled_touches: Vec<Touch>,
+    gesture: Option<TouchGesture>,
+    /// The gesture's fingers lifted: it is this frame's last.
+    gesture_over: bool,
     text: String,
     gamepads: HashMap<u32, Gamepad>,
     window_size: Vec2,
@@ -543,6 +565,12 @@ impl Input {
     /// click). Cleared in `end_frame`.
     pub fn just_cancelled_touches(&self) -> &[Touch] {
         &self.cancelled_touches
+    }
+    /// The two-finger gesture going on, with this frame's zoom, turn and pan (`None`: no two
+    /// fingers, or nothing turns fingers into gestures). The frame the fingers lift it is
+    /// still there, with what they did last.
+    pub fn gesture(&self) -> Option<&TouchGesture> {
+        self.gesture.as_ref()
     }
     /// Text typed this frame.
     pub fn text(&self) -> &str {
@@ -806,6 +834,35 @@ impl Input {
             }
         }
     }
+    /// A two-finger gesture begins with `center` between the fingers.
+    pub fn inject_gesture_start(&mut self, center: Vec2) {
+        self.gesture_over = false;
+        self.gesture = Some(TouchGesture {
+            start: center,
+            center,
+            zoom: 1.0,
+            rotate: 0.0,
+            pan: Vec2::ZERO,
+            just_started: true,
+        });
+    }
+    /// The fingers of a gesture moved: `zoom` multiplies this frame's, `rotate` and `pan` add
+    /// to it. Without a gesture going on, one begins at `center`.
+    pub fn inject_gesture(&mut self, zoom: f32, rotate: f32, pan: Vec2, center: Vec2) {
+        if self.gesture.is_none() || self.gesture_over {
+            self.inject_gesture_start(center - pan);
+        }
+        if let Some(g) = &mut self.gesture {
+            g.zoom *= zoom;
+            g.rotate += rotate;
+            g.pan += pan;
+            g.center = center;
+        }
+    }
+    /// The gesture's fingers lifted: it is gone after this frame.
+    pub fn inject_gesture_end(&mut self) {
+        self.gesture_over = self.gesture.is_some();
+    }
     /// Typed text (IME/committed characters).
     pub fn inject_text(&mut self, text: &str) {
         self.text.push_str(text);
@@ -864,6 +921,15 @@ impl Input {
         self.started_touches.clear();
         self.ended_touches.clear();
         self.cancelled_touches.clear();
+        if std::mem::take(&mut self.gesture_over) {
+            self.gesture = None;
+        }
+        if let Some(g) = &mut self.gesture {
+            g.zoom = 1.0;
+            g.rotate = 0.0;
+            g.pan = Vec2::ZERO;
+            g.just_started = false;
+        }
         self.text.clear();
         self.key_events.clear();
         self.mouse_button_events.clear();
@@ -1070,6 +1136,19 @@ impl Plugin for InputPlugin {
         app.init_resource::<Input>()
             .init_resource::<ActionMap>()
             .init_resource::<ActionState>();
+        // Fingers as the mouse: off until a window or the game turns it on.
+        app.init_resource::<crate::touch_pointer::TouchMouse>();
+        app.add_system_ordered(
+            Stage::PreUpdate,
+            crate::touch_pointer::TouchMouse::ORDER,
+            "input::touch_mouse",
+            |ctx| {
+                ctx.resources
+                    .scope::<crate::touch_pointer::TouchMouse, _>(|res, mouse| {
+                        mouse.frame(res.expect_mut::<Input>());
+                    });
+            },
+        );
         app.add_system_named(Stage::PreUpdate, "input::update_actions", |ctx| {
             ctx.resources.scope::<ActionState, _>(|res, state| {
                 state.update(res.expect::<ActionMap>(), res.expect::<Input>());

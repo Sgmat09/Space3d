@@ -153,6 +153,9 @@ impl Plugin for WindowPlugin {
         });
         app.init_resource::<WindowCursor>();
         app.init_resource::<SafeArea>();
+        if self.touch_as_mouse {
+            app.resources.init::<crate::touch_pointer::TouchMouse>().enabled = true;
+        }
         let settings = self.clone();
         app.set_runner(move |app| crate::runner::run(app, settings));
     }

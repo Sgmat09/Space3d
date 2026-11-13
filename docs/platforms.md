@@ -140,6 +140,16 @@ on Android:
   has the focus (`TextInput::wanted`) the on-screen keyboard is up; it is asked for again a
   few frames after every finger lift and after a resume, because nothing tells the app that
   the player put it away.
+  Two fingers are also a gesture, `Input::gesture()`: this frame's zoom (the ratio of the
+  fingers' distance), turn (radians, clockwise on the screen positive) and pan (pixels), with
+  the point between the fingers. The machine is the resource `touch_pointer::TouchMouse`
+  (`InputPlugin` adds it, off; `touch_as_mouse` turns it on): the window runner sends every
+  finger through `TouchMouse::touch`, and a test or a scripted run calls the same, so it works
+  without a window. Its per-frame step is a `PreUpdate` system at `TouchMouse::ORDER`. Two
+  options in `TouchMouse::pointer.config`: `press_on_move` holds the left press back until
+  the finger leaves the slop (the press lands where the finger went down) or lifts (a tap),
+  so a still finger presses nothing and a long press is the right click alone, for a game
+  that steers by holding the button; `pinch_wheel = false` leaves two fingers to the gesture.
 - **Typing is ASCII only.** A NativeActivity has no `InputConnection`, and winit 0.30's
   Android backend sends no `Ime` events: text arrives only as key events, which is what a
   keyboard sends for Latin letters, digits and punctuation. Cyrillic, CJK, swipe typing and
