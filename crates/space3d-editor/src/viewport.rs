@@ -40,10 +40,8 @@ impl ViewCamera {
     /// World-space ray through screen position `pos` of a `size` screen.
     pub fn ray(&self, pos: Vec2, size: Vec2) -> (Vec3, Vec3) {
         let ndc = Vec2::new(pos.x / size.x * 2.0 - 1.0, 1.0 - pos.y / size.y * 2.0);
-        let inv = self.view_proj().inverse();
-        let near = inv.project_point3(ndc.extend(0.0));
-        let far = inv.project_point3(ndc.extend(1.0));
-        (near, (far - near).normalize_or_zero())
+        // (Not `view_proj().inverse()` in f32: it is off by units far from the origin.)
+        space3d_render::unproject_ray(self.view, self.proj, ndc)
     }
 }
 
@@ -335,5 +333,32 @@ mod tests {
         assert_eq!(pick(&app.world, Some(&assets), o, d).map(|p| p.0), Some(light));
         let center = cam.project(Vec3::ZERO, Vec2::new(100.0, 100.0)).unwrap();
         assert!((center - Vec2::new(50.0, 50.0)).length() < 1e-3);
+    }
+
+    /// A viewport ray far from the origin: the direction is exact (the `f32` inverse of
+    /// `proj * view` was off by degrees at 85 000 units) and the origin sits on the near plane.
+    #[test]
+    fn ray_far_from_the_origin() {
+        let eye = Vec3::new(85_000.0, 0.0, 85_000.0);
+        let rotation = space3d_core::glam::Quat::from_rotation_y(0.4);
+        let cam = ViewCamera {
+            view: Mat4::from_rotation_translation(rotation, eye).inverse(),
+            proj: space3d_render::Projection::Perspective {
+                fov_y: 1.0,
+                near: 2.0,
+                far: 300_000.0,
+            }
+            .matrix(1.0),
+            eye,
+        };
+        let size = Vec2::new(100.0, 100.0);
+        let (o, d) = cam.ray(Vec2::new(50.0, 50.0), size);
+        assert!((d - rotation * Vec3::NEG_Z).length() < 1e-6, "{d}");
+        assert!((o - (eye + d * 2.0)).length() < 0.05, "{o}");
+        // A pixel off the axis: ndc (-0.8, 0.6), through tan(fov_y / 2).
+        let (_, d) = cam.ray(Vec2::new(10.0, 20.0), size);
+        let t = 0.5f32.tan();
+        let expected = (rotation * Vec3::new(-0.8 * t, 0.6 * t, -1.0)).normalize();
+        assert!((d - expected).length() < 1e-6, "{d} vs {expected}");
     }
 }

@@ -14,10 +14,11 @@ use space3d_net::ReconnectPolicy;
 use space3d_replication::bots::{install_bot, scripted};
 use space3d_replication::client::{ConnectionState, FailReason, Mispredicted, RemoteDespawned};
 use space3d_replication::harness::{ClientHandle, ClientSpec, HarnessConfig, NetHarness};
+use space3d_replication::mapping::{DecodeCtx, EncodeCtx};
 use space3d_replication::prelude::*;
 use space3d_replication::protocol::handshake::DisconnectCode;
 use space3d_replication::server::inputs::brain;
-use space3d_replication::server::{InterestPolicy, SlotState};
+use space3d_replication::server::{InterestPolicy, SlotState, Visibility};
 use space3d_replication::transport::conditioner::{LinkConditions, LinkProfile, Semantics};
 use space3d_replication::{InterestSource, Owner};
 use std::time::Duration;
@@ -1171,6 +1172,250 @@ proptest! {
     ) {
         let semantics = if datagram { Semantics::Datagram } else { Semantics::Stream };
         let result = replay_ops(&ops, semantics, lossy, seed);
+        prop_assert!(result.is_ok(), "{:?} ({semantics:?}, lossy {lossy})", result);
+    }
+}
+
+// --- Property test: entity references follow their targets through scope changes ------------
+
+/// A reference to another entity (`ComponentRule::mapped`; `core.parent` is one too).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Aim(Entity);
+
+struct RefProtocol;
+
+impl Plugin for RefProtocol {
+    fn build(&self, app: &mut App) {
+        app.add_plugin(TestProtocol).replicate_with::<Aim>(
+            "test.aim",
+            ComponentRule::mapped(
+                |a: &Aim, ctx: &EncodeCtx<'_>| ctx.net_id(a.0).map_or(0, |n| n.0),
+                |id: u32, ctx: &mut DecodeCtx<'_>| ctx.entity(NetId(id)).map(Aim),
+            ),
+        );
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RefOp {
+    Spawn {
+        x: i8,
+    },
+    SetAim {
+        which: u8,
+        target: u8,
+    },
+    ClearAim {
+        which: u8,
+    },
+    SetParent {
+        which: u8,
+        parent: u8,
+    },
+    ClearParent {
+        which: u8,
+    },
+    /// Hide an entity from the client (it leaves the client's scope).
+    Hide {
+        which: u8,
+    },
+    /// Clear the override (it comes back; hidden hierarchy roots take their children along).
+    Show {
+        which: u8,
+    },
+    Despawn {
+        which: u8,
+    },
+    Wait {
+        ticks: u8,
+    },
+}
+
+fn ref_op_strategy() -> impl Strategy<Value = RefOp> {
+    prop_oneof![
+        3 => any::<i8>().prop_map(|x| RefOp::Spawn { x }),
+        4 => (any::<u8>(), any::<u8>()).prop_map(|(which, target)| RefOp::SetAim { which, target }),
+        1 => any::<u8>().prop_map(|which| RefOp::ClearAim { which }),
+        1 => (any::<u8>(), any::<u8>()).prop_map(|(which, parent)| RefOp::SetParent { which, parent }),
+        1 => any::<u8>().prop_map(|which| RefOp::ClearParent { which }),
+        4 => any::<u8>().prop_map(|which| RefOp::Hide { which }),
+        4 => any::<u8>().prop_map(|which| RefOp::Show { which }),
+        1 => any::<u8>().prop_map(|which| RefOp::Despawn { which }),
+        3 => (1u8..40).prop_map(|ticks| RefOp::Wait { ticks }),
+    ]
+}
+
+fn apply_ref_op(h: &mut NetHarness, op: &RefOp, player: PlayerId) {
+    let mut things: Vec<Entity> = h
+        .server()
+        .world
+        .query::<(Entity, &Health)>()
+        .without::<&space3d_replication::ControlledBy>()
+        .iter()
+        .map(|(e, _)| e)
+        .collect();
+    things.sort();
+    let pick = |i: u8| (!things.is_empty()).then(|| things[usize::from(i) % things.len()]);
+    match *op {
+        RefOp::Spawn { x } => {
+            h.server_mut()
+                .world
+                .spawn((Replicated, Transform::from_xyz(f32::from(x), 0.0, 0.0), Health(1)));
+        }
+        RefOp::SetAim { which, target } => {
+            if let (Some(e), Some(t)) = (pick(which), pick(target)) {
+                let _ = h.server_mut().world.insert_one(e, Aim(t));
+            }
+        }
+        RefOp::ClearAim { which } => {
+            if let Some(e) = pick(which) {
+                let _ = h.server_mut().world.remove_one::<Aim>(e);
+            }
+        }
+        RefOp::SetParent { which, parent } => {
+            if let (Some(e), Some(p)) = (pick(which), pick(parent))
+                && e != p
+                // No cycles: the server's hierarchy is a forest.
+                && !ancestors(&h.server().world, p).contains(&e)
+            {
+                let _ = h.server_mut().world.insert_one(e, Parent(p));
+            }
+        }
+        RefOp::ClearParent { which } => {
+            if let Some(e) = pick(which) {
+                let _ = h.server_mut().world.remove_one::<Parent>(e);
+            }
+        }
+        RefOp::Hide { which } | RefOp::Show { which } => {
+            if let Some(e) = pick(which) {
+                let v = if matches!(op, RefOp::Hide { .. }) {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Default
+                };
+                h.server_mut()
+                    .resources
+                    .expect_mut::<NetServer>()
+                    .set_visibility(player, e, v);
+            }
+        }
+        RefOp::Despawn { which } => {
+            if let Some(e) = pick(which) {
+                // Nothing keeps a reference to it on the server.
+                let world = &mut h.server_mut().world;
+                let holders: Vec<Entity> = world
+                    .query::<(Entity, &Aim)>()
+                    .iter()
+                    .filter(|(_, a)| a.0 == e)
+                    .map(|(c, _)| c)
+                    .collect();
+                for c in holders {
+                    let _ = world.remove_one::<Aim>(c);
+                }
+                let children: Vec<Entity> = world
+                    .query::<(Entity, &Parent)>()
+                    .iter()
+                    .filter(|(_, p)| p.0 == e)
+                    .map(|(c, _)| c)
+                    .collect();
+                for c in children {
+                    let _ = world.remove_one::<Parent>(c);
+                }
+                let _ = world.despawn(e);
+            }
+        }
+        RefOp::Wait { .. } => {}
+    }
+    let ticks = match op {
+        RefOp::Wait { ticks } => u64::from(*ticks),
+        _ => 1,
+    };
+    h.step_ticks(ticks);
+}
+
+fn ancestors(world: &World, mut e: Entity) -> Vec<Entity> {
+    let mut out = vec![e];
+    while let Ok(p) = world.get::<&Parent>(e) {
+        e = p.0;
+        if out.contains(&e) {
+            break;
+        }
+        out.push(e);
+    }
+    out
+}
+
+fn replay_ref_ops(ops: &[RefOp], semantics: Semantics, lossy: bool, seed: u64) -> Result<(), String> {
+    let conditions = if lossy {
+        LinkConditions::bad_wifi()
+    } else {
+        LinkConditions::lan()
+    };
+    let mut h = NetHarness::new(
+        HarnessConfig {
+            seed,
+            semantics,
+            link: LinkProfile::symmetric(conditions),
+            ..Default::default()
+        },
+        |app| {
+            app.add_plugin(RefProtocol).add_plugin(TestRules);
+        },
+    );
+    let a = h.add_client(ClientSpec::named("alice"), |app| {
+        app.add_plugin(RefProtocol);
+    });
+    if !h.run_until(900, |h| h.client_net(a).is_connected()) {
+        return Err(format!("never connected: {:?}", h.client_net(a).state()));
+    }
+    let player = h.player(a);
+    for op in ops {
+        apply_ref_op(&mut h, op, player);
+    }
+    // Everything hidden comes back: whatever the client kept for references must resolve.
+    let all: Vec<Entity> = h
+        .server()
+        .world
+        .query::<(Entity, &Health)>()
+        .iter()
+        .map(|(e, _)| e)
+        .collect();
+    for e in all {
+        h.server_mut()
+            .resources
+            .expect_mut::<NetServer>()
+            .set_visibility(player, e, Visibility::Default);
+    }
+    if h.run_until(1800, |h| {
+        h.assert_converged(a).is_ok() && h.client_net(a).reference_stats().parked == 0
+    }) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{:?}, {:?}",
+            h.assert_converged(a),
+            h.client_net(a).reference_stats()
+        ))
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: prop_cases(), ..ProptestConfig::default() })]
+
+    /// Random spawns, references (`Aim` and `core.parent`), visibility flips, despawns: once
+    /// everything is visible again the client holds every reference resolved to the entity it
+    /// has for the target now (byte-identical encodings, nothing left waiting), over streams
+    /// and datagrams, with or without loss. A reference whose target left the client's scope
+    /// and came back used to keep pointing at the despawned local entity.
+    #[test]
+    fn prop_references_follow_their_targets_through_scope_changes(
+        ops in proptest::collection::vec(ref_op_strategy(), 1..64),
+        datagram in any::<bool>(),
+        lossy in any::<bool>(),
+        seed in 0u64..1000,
+    ) {
+        let semantics = if datagram { Semantics::Datagram } else { Semantics::Stream };
+        let result = replay_ref_ops(&ops, semantics, lossy, seed);
         prop_assert!(result.is_ok(), "{:?} ({semantics:?}, lossy {lossy})", result);
     }
 }

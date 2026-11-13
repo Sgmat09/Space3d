@@ -22,7 +22,7 @@ use crate::keys::ALL_KEYS;
 use serde::{Deserialize, Serialize};
 use space3d_core::glam::Vec2;
 use space3d_core::{App, Plugin, Stage, Time};
-use space3d_platform::{GamepadAxis, GamepadButton, Input, KeyCode, MouseButton, TouchPhase};
+use space3d_platform::{GamepadAxis, GamepadButton, Input, KeyCode, MouseButton, MouseButtonCause, TouchPhase};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -35,6 +35,39 @@ enum MouseButtonDef {
     Back,
     Forward,
     Other(u16),
+}
+
+/// Wire form of a [`MouseButtonCause`] (a foreign `#[non_exhaustive]` enum: serde's remote
+/// derive cannot cover it). A cause this version does not know is written as the nearest one.
+#[derive(Serialize, Deserialize)]
+enum MouseButtonCauseWire {
+    Device,
+    FocusLost,
+    OsReconciled,
+}
+
+mod mouse_button_cause {
+    use super::{MouseButtonCause, MouseButtonCauseWire};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(cause: &MouseButtonCause, s: S) -> Result<S::Ok, S::Error> {
+        match cause {
+            MouseButtonCause::Device => MouseButtonCauseWire::Device,
+            MouseButtonCause::OsReconciled => MouseButtonCauseWire::OsReconciled,
+            // `FocusLost`, and any cancel added later.
+            _ if cause.is_cancel() => MouseButtonCauseWire::FocusLost,
+            _ => MouseButtonCauseWire::Device,
+        }
+        .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MouseButtonCause, D::Error> {
+        Ok(match MouseButtonCauseWire::deserialize(d)? {
+            MouseButtonCauseWire::Device => MouseButtonCause::Device,
+            MouseButtonCauseWire::FocusLost => MouseButtonCause::FocusLost,
+            MouseButtonCauseWire::OsReconciled => MouseButtonCause::OsReconciled,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -107,7 +140,11 @@ const GAMEPAD_AXES: [GamepadAxis; 6] = [
 ];
 
 /// One input injection. Positions are physical pixels (origin top-left).
+///
+/// `#[non_exhaustive]`: variants get added ([`InputEvent::MouseCancel`] was), so a `match` needs
+/// a wildcard arm. Scripts written before still load and play as they did.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum InputEvent {
     /// Key goes down.
     KeyDown(KeyCode),
@@ -127,6 +164,21 @@ pub enum InputEvent {
     MouseDown(#[serde(with = "MouseButtonDef")] MouseButton),
     /// Mouse button goes up.
     MouseUp(#[serde(with = "MouseButtonDef")] MouseButton),
+    /// Mouse button is released *without a release event of the device*: the window lost the
+    /// focus ([`MouseButtonCause::FocusLost`]) or the OS showed the button up
+    /// ([`MouseButtonCause::OsReconciled`]). What [`InputRecorder`] records for such a release
+    /// instead of a plain [`InputEvent::MouseUp`], and what a script plays back with
+    /// `Input::release_mouse_button`: the UI registers no click and no drop, and
+    /// `MouseButtonEvent::cancelled()` is `true`. With [`MouseButtonCause::Device`] it is a plain
+    /// release.
+    MouseCancel {
+        /// The button.
+        #[serde(with = "MouseButtonDef")]
+        button: MouseButton,
+        /// Why it was released.
+        #[serde(with = "mouse_button_cause")]
+        cause: MouseButtonCause,
+    },
     /// Scroll in lines.
     Wheel(Vec2),
     /// Touch event for one finger.
@@ -182,6 +234,7 @@ impl InputEvent {
             InputEvent::MouseLeft => input.inject_mouse_left(),
             InputEvent::MouseDown(b) => input.inject_mouse_button_down(*b),
             InputEvent::MouseUp(b) => input.inject_mouse_button_up(*b),
+            InputEvent::MouseCancel { button, cause } => input.release_mouse_button(*button, *cause),
             InputEvent::Wheel(d) => input.inject_wheel(*d),
             InputEvent::Touch { id, phase, position } => input.inject_touch(*id, *phase, *position),
             InputEvent::GamepadConnected(id) => input.inject_gamepad_connected(*id),
@@ -329,6 +382,12 @@ impl InputScript {
     /// Mouse button up at `tick`.
     pub fn mouse_up(self, tick: u64, button: MouseButton) -> Self {
         self.at(tick, InputEvent::MouseUp(button))
+    }
+
+    /// Mouse button released as a cancel at `tick` ([`InputEvent::MouseCancel`]): no click, no
+    /// drop.
+    pub fn mouse_cancel(self, tick: u64, button: MouseButton, cause: MouseButtonCause) -> Self {
+        self.at(tick, InputEvent::MouseCancel { button, cause })
     }
 
     /// Move to `position` and press at `tick`, release at `tick + 1`.
@@ -601,6 +660,7 @@ impl InputRecorder {
             .chain(self.mouse.iter().copied())
             .filter(|b| input.mouse_pressed(*b))
             .collect();
+        let mouse_from = out.len();
         diff_buttons(
             &self.mouse,
             &mouse,
@@ -611,6 +671,7 @@ impl InputRecorder {
             InputEvent::MouseUp,
             |b| vec![InputEvent::MouseDown(b), InputEvent::MouseUp(b)],
         );
+        cancel_releases(&mut out[mouse_from..], input);
         self.mouse = mouse;
         if input.wheel_delta() != Vec2::ZERO {
             out.push(InputEvent::Wheel(input.wheel_delta()));
@@ -651,9 +712,15 @@ impl InputRecorder {
             }
         }
         for t in input.just_ended_touches() {
+            // A touch the system cancelled is no tap: it replays as cancelled.
+            let cancelled = input.just_cancelled_touches().iter().any(|c| c.id == t.id);
             out.push(InputEvent::Touch {
                 id: t.id,
-                phase: TouchPhase::Ended,
+                phase: if cancelled {
+                    TouchPhase::Cancelled
+                } else {
+                    TouchPhase::Ended
+                },
                 position: t.position,
             });
         }
@@ -725,6 +792,44 @@ impl InputRecorder {
 
         for e in out {
             self.script.push(t, e);
+        }
+    }
+}
+
+/// Turn the `MouseUp`s of a frame's diff whose release was a cancel (the cause in
+/// [`Input::mouse_button_events`]: focus loss, OS state) into [`InputEvent::MouseCancel`]s. A
+/// button's last `MouseUp`s pair with its last release events, so what leaves the button up is
+/// what is recorded; a `MouseUp` without a release event (state changed behind `Input`'s back)
+/// stays one.
+fn cancel_releases(events: &mut [InputEvent], input: &Input) {
+    let mut buttons: Vec<MouseButton> = Vec::new();
+    for e in events.iter() {
+        if let InputEvent::MouseUp(b) = e
+            && !buttons.contains(b)
+        {
+            buttons.push(*b);
+        }
+    }
+    for b in buttons {
+        let is_up = |e: &InputEvent| matches!(e, InputEvent::MouseUp(x) if *x == b);
+        let ups = events.iter().filter(|e| is_up(e)).count();
+        let causes: Vec<MouseButtonCause> = input
+            .mouse_button_events()
+            .iter()
+            .filter(|e| !e.pressed && e.button == b)
+            .map(|e| e.cause)
+            .collect();
+        let unpaired = ups.saturating_sub(causes.len());
+        let mut causes = causes[causes.len().saturating_sub(ups)..].iter();
+        for (n, e) in events.iter_mut().filter(|e| is_up(e)).enumerate() {
+            if n < unpaired {
+                continue;
+            }
+            if let Some(&cause) = causes.next()
+                && cause.is_cancel()
+            {
+                *e = InputEvent::MouseCancel { button: b, cause };
+            }
         }
     }
 }
@@ -973,5 +1078,186 @@ mod tests {
                 InputEvent::GamepadDisconnected(0),
             ]
         );
+    }
+
+    /// A release the device did not report (focus loss, OS state) is recorded as a cancel with
+    /// its cause, replays as one (RON included), and device releases stay plain `MouseUp`s.
+    #[test]
+    fn recorder_keeps_the_cause_of_a_cancelled_release() {
+        let (l, r, m) = (MouseButton::Left, MouseButton::Right, MouseButton::Middle);
+        let mut input = Input::default();
+        let mut rec = InputRecorder::default();
+        rec.start(0);
+        input.inject_mouse_move(Vec2::new(5.0, 6.0));
+        input.inject_mouse_button_down(l);
+        input.inject_mouse_button_down(r);
+        input.inject_mouse_button_down(m);
+        rec.observe(0, &input);
+        input.end_frame();
+        input.inject_mouse_button_up(l);
+        input.release_mouse_button(r, MouseButtonCause::OsReconciled);
+        input.release_mouse_button(m, MouseButtonCause::FocusLost);
+        rec.observe(1, &input);
+        input.end_frame();
+        // A press and its cancel within one frame, and a cancel followed by a device press.
+        input.inject_mouse_button_down(l);
+        input.release_mouse_button(l, MouseButtonCause::FocusLost);
+        input.inject_mouse_button_down(r);
+        rec.observe(2, &input);
+        input.end_frame();
+        input.release_all();
+        rec.observe(3, &input);
+        let script = rec.stop();
+        let at = |t| script.events_at(t).cloned().collect::<Vec<_>>();
+        // Released buttons come sorted by name (Left, Middle, Right); a press comes before a tap.
+        assert_eq!(
+            at(1),
+            [
+                InputEvent::MouseUp(l),
+                InputEvent::MouseCancel {
+                    button: m,
+                    cause: MouseButtonCause::FocusLost
+                },
+                InputEvent::MouseCancel {
+                    button: r,
+                    cause: MouseButtonCause::OsReconciled
+                },
+            ]
+        );
+        assert_eq!(
+            at(2),
+            [
+                InputEvent::MouseDown(r),
+                InputEvent::MouseDown(l),
+                InputEvent::MouseCancel {
+                    button: l,
+                    cause: MouseButtonCause::FocusLost
+                },
+            ]
+        );
+        assert_eq!(
+            at(3),
+            [InputEvent::MouseCancel {
+                button: r,
+                cause: MouseButtonCause::FocusLost
+            }]
+        );
+
+        // Through RON, into a fresh `Input`: the same releases with the same causes.
+        let script = InputScript::from_ron(&script.to_ron().unwrap()).unwrap();
+        let mut replay = Input::default();
+        for tick in 0..=3 {
+            replay.end_frame();
+            for e in script.events_at(tick) {
+                e.apply(&mut replay);
+            }
+            let events: Vec<(MouseButton, bool, MouseButtonCause)> = replay
+                .mouse_button_events()
+                .iter()
+                .map(|e| (e.button, e.pressed, e.cause))
+                .collect();
+            match tick {
+                1 => assert_eq!(
+                    events,
+                    [
+                        (l, false, MouseButtonCause::Device),
+                        (m, false, MouseButtonCause::FocusLost),
+                        (r, false, MouseButtonCause::OsReconciled),
+                    ]
+                ),
+                3 => assert_eq!(events, [(r, false, MouseButtonCause::FocusLost)]),
+                _ => {}
+            }
+        }
+        assert!(!replay.mouse_pressed(r) && !replay.mouse_pressed(l));
+    }
+
+    /// The old wire format (plain `MouseUp`) still loads, and a recorded cancel round-trips
+    /// through RON and JSON.
+    #[test]
+    fn mouse_cancel_serializes_and_old_scripts_load() {
+        let old = r#"(events: [(tick: 0, event: MouseDown(Left)), (tick: 1, event: MouseUp(Left))])"#;
+        let s = InputScript::from_ron(old).unwrap();
+        assert_eq!(s.events()[1].event, InputEvent::MouseUp(MouseButton::Left));
+        let s = InputScript::new()
+            .mouse_down(0, MouseButton::Left)
+            .mouse_cancel(1, MouseButton::Left, MouseButtonCause::FocusLost)
+            .mouse_cancel(2, MouseButton::Other(7), MouseButtonCause::OsReconciled);
+        let ron = s.to_ron().unwrap();
+        assert!(ron.contains("MouseCancel") && ron.contains("FocusLost"), "{ron}");
+        assert_eq!(InputScript::from_ron(&ron).unwrap(), s);
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<InputScript>(&json).unwrap(), s);
+        // A device cause is a plain release.
+        let mut input = Input::default();
+        input.inject_mouse_button_down(MouseButton::Left);
+        InputEvent::MouseCancel {
+            button: MouseButton::Left,
+            cause: MouseButtonCause::Device,
+        }
+        .apply(&mut input);
+        assert!(!input.mouse_pressed(MouseButton::Left));
+        assert!(!input.mouse_button_events().last().unwrap().cancelled());
+    }
+
+    /// A system-cancelled touch is recorded as cancelled, so a replay is no tap either.
+    #[test]
+    fn recorder_keeps_a_cancelled_touch_cancelled() {
+        let mut input = Input::default();
+        let mut rec = InputRecorder::default();
+        rec.start(0);
+        input.inject_touch(1, TouchPhase::Started, Vec2::new(4.0, 4.0));
+        input.inject_touch(2, TouchPhase::Started, Vec2::new(9.0, 9.0));
+        rec.observe(0, &input);
+        input.end_frame();
+        input.inject_touch(1, TouchPhase::Cancelled, Vec2::new(4.0, 4.0));
+        input.inject_touch(2, TouchPhase::Ended, Vec2::new(9.0, 9.0));
+        rec.observe(1, &input);
+        let script = rec.stop();
+        let phases: Vec<TouchPhase> = script
+            .events_at(1)
+            .filter_map(|e| match e {
+                InputEvent::Touch { phase, .. } => Some(*phase),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(phases, [TouchPhase::Cancelled, TouchPhase::Ended]);
+        let mut replay = Input::default();
+        for tick in 0..=1 {
+            replay.end_frame();
+            script.events_at(tick).for_each(|e| e.apply(&mut replay));
+        }
+        assert_eq!(replay.just_ended_touches().len(), 2);
+        assert_eq!(replay.just_cancelled_touches().len(), 1);
+    }
+
+    /// End to end, with nothing but what the crate always had: a session with a cancelled
+    /// release is recorded, saved, loaded and replayed, and the replayed release is still a
+    /// cancel (not a plain device release, which the UI would count as a click).
+    #[test]
+    fn a_recorded_cancel_replays_as_a_cancel() {
+        let mut input = Input::default();
+        let mut rec = InputRecorder::default();
+        rec.start(0);
+        input.inject_mouse_move(Vec2::new(8.0, 8.0));
+        input.inject_mouse_button_down(MouseButton::Left);
+        rec.observe(0, &input);
+        input.end_frame();
+        input.release_mouse_button(MouseButton::Left, MouseButtonCause::OsReconciled);
+        rec.observe(1, &input);
+        let script = InputScript::from_ron(&rec.stop().to_ron().unwrap()).unwrap();
+
+        let mut replay = Input::default();
+        for tick in 0..=1 {
+            replay.end_frame();
+            script.events_at(tick).for_each(|e| e.apply(&mut replay));
+        }
+        let release = replay
+            .mouse_button_events()
+            .last()
+            .copied()
+            .expect("the release replayed");
+        assert!(!release.pressed && release.button == MouseButton::Left);
+        assert!(release.cancelled(), "replayed as {:?}", release.cause);
     }
 }

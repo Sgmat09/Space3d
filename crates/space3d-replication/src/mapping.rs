@@ -4,12 +4,15 @@
 //!   a room epoch (a restored room starts a new epoch and clients fully resync).
 //! * Client: [`EntityMap`] — filled by snapshot `Spawn` ops, emptied by `Despawn`/`Leave`.
 //! * Entity references inside components/messages are encoded through [`EncodeCtx`] and
-//!   decoded through [`DecodeCtx`]; a reference to a `NetId` the client does not know yet makes
-//!   the value *pending* (retried after each snapshot; dropped with a warning after 1 s or when
-//!   the holder despawns).
+//!   decoded through [`DecodeCtx`]; a reference to a `NetId` the client does not know makes the
+//!   value *pending*. The client keeps the newest value of every component that holds
+//!   references (`client::receive::PendingRefs`) and decodes it again whenever a referenced
+//!   entity is spawned: a target that shows up late, or that left the client's scope and came
+//!   back as a new local entity, is picked up again without the server resending anything.
 
 use crate::FastMap as HashMap;
 use crate::NetId;
+use smallvec::SmallVec;
 use space3d_core::Entity;
 
 /// Server-side bidirectional map (resource owned by `NetServer`).
@@ -209,6 +212,8 @@ enum DecodeMap<'a> {
 pub struct DecodeCtx<'a> {
     map: DecodeMap<'a>,
     unresolved: bool,
+    /// Every id asked for (resolved or not), when the context tracks them.
+    requested: Option<SmallVec<[NetId; 2]>>,
 }
 
 impl<'a> DecodeCtx<'a> {
@@ -217,6 +222,17 @@ impl<'a> DecodeCtx<'a> {
         Self {
             map: DecodeMap::Client(map),
             unresolved: false,
+            requested: None,
+        }
+    }
+
+    /// Context over a client map that also remembers every `NetId` a decoder asked for
+    /// ([`Self::requested`]): the client keeps values that hold references and decodes them
+    /// again when one of those entities is spawned.
+    pub fn tracking(map: &'a EntityMap) -> Self {
+        Self {
+            requested: Some(SmallVec::new()),
+            ..Self::new(map)
         }
     }
 
@@ -225,6 +241,7 @@ impl<'a> DecodeCtx<'a> {
         Self {
             map: DecodeMap::Server(map),
             unresolved: false,
+            requested: None,
         }
     }
 
@@ -233,11 +250,17 @@ impl<'a> DecodeCtx<'a> {
         DecodeCtx {
             map: DecodeMap::None,
             unresolved: false,
+            requested: None,
         }
     }
 
     /// Local entity for `id`; marks the decode as unresolved when unknown.
     pub fn entity(&mut self, id: NetId) -> Option<Entity> {
+        if let Some(requested) = &mut self.requested
+            && !requested.contains(&id)
+        {
+            requested.push(id);
+        }
         let e = match self.map {
             DecodeMap::None => None,
             DecodeMap::Client(m) => m.entity(id),
@@ -254,9 +277,19 @@ impl<'a> DecodeCtx<'a> {
         self.unresolved
     }
 
-    /// Clear the unresolved flag (reuse the context for the next value).
+    /// The ids decoders asked for since the last [`Self::reset`], in request order. Empty unless
+    /// the context was made with [`Self::tracking`]. A decoder that stops at the first unknown
+    /// entity never asks for the ones after it.
+    pub fn requested(&self) -> &[NetId] {
+        self.requested.as_deref().unwrap_or(&[])
+    }
+
+    /// Clear the unresolved flag and the requested ids (reuse the context for the next value).
     pub fn reset(&mut self) {
         self.unresolved = false;
+        if let Some(requested) = &mut self.requested {
+            requested.clear();
+        }
     }
 }
 
@@ -294,6 +327,15 @@ mod tests {
         assert!(!ctx.has_unresolved());
         assert_eq!(ctx.entity(NetId(4)), None);
         assert!(ctx.has_unresolved());
+        assert!(ctx.requested().is_empty(), "a plain context does not track");
+        // A tracking context remembers what was asked for (resolved or not), without repeats.
+        let mut ctx = DecodeCtx::tracking(&map);
+        assert_eq!(ctx.entity(NetId(4)), None);
+        assert_eq!(ctx.entity(NetId(3)), Some(e));
+        assert_eq!(ctx.entity(NetId(4)), None);
+        assert_eq!(ctx.requested(), &[NetId(4), NetId(3)]);
+        ctx.reset();
+        assert!(ctx.requested().is_empty() && !ctx.has_unresolved());
         assert_eq!(EncodeCtx::client(&map).net_id(e), Some(NetId(3)));
         assert_eq!(map.remove(NetId(3)), Some(e));
         assert!(map.is_empty());

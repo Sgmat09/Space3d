@@ -1,0 +1,104 @@
+# EXAMPLE (not in kustomization.yaml): how clients reach the stack. Assumes the ingress-nginx
+# controller, cert-manager and DNS records for api.play.example.com and *.play.example.com; adapt
+# the class, annotations, hosts and TLS to your cluster.
+#
+# 1. Player service: only /v1 is published. /internal/v1/* (the fleet link) is for game servers
+#    and stays inside the cluster.
+# 2. Game servers: clients connect to the pod the player service assigned them, at
+#    wss://<pod name>.play.example.com/play (game.public_url in game-server.yaml). Each pod gets
+#    its own Service (selected by the StatefulSet's pod-name label) and its own host. Repeat the
+#    Service + rule for every replica (or generate them with your templating), or give the pods
+#    hostPort / a LoadBalancer each instead.
+#    These Services set publishNotReadyAddresses: true, on purpose. A draining game server is
+#    NotReady (/readyz answers 503) and then Terminating for up to drain_timeout, and Kubernetes
+#    drops such a pod from a Service's endpoints, so the ingress would answer 503 to every new
+#    WebSocket. But a draining server still serves the players it has: it accepts a resume after
+#    a link blip (resume_window, 20 s) and a rejoin into a match that finishes there (docs/server.md
+#    §6). Keeping the pod routable costs nothing else: the player service stops allocating to it
+#    at once, and the server answers a ticket that would open a new room with Reject(ServerDraining).
+#    Do the same for a LoadBalancer or hostPort front.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: space3d-players
+  namespace: space3d
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["api.play.example.com"]
+      secretName: space3d-players-tls
+  rules:
+    - host: api.play.example.com
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service: { name: space3d-players, port: { name: http } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: space3d-gs-0
+  namespace: space3d
+  labels:
+    app.kubernetes.io/name: space3d-gs
+    app.kubernetes.io/component: game-server
+    app.kubernetes.io/part-of: space3d
+spec:
+  # Keep the pod routable while it drains (see the note at the top of this file).
+  publishNotReadyAddresses: true
+  selector:
+    statefulset.kubernetes.io/pod-name: space3d-gs-0
+  ports:
+    - { name: play, port: 7777, targetPort: play, protocol: TCP }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: space3d-gs-1
+  namespace: space3d
+  labels:
+    app.kubernetes.io/name: space3d-gs
+    app.kubernetes.io/component: game-server
+    app.kubernetes.io/part-of: space3d
+spec:
+  # Keep the pod routable while it drains (see the note at the top of this file).
+  publishNotReadyAddresses: true
+  selector:
+    statefulset.kubernetes.io/pod-name: space3d-gs-1
+  ports:
+    - { name: play, port: 7777, targetPort: play, protocol: TCP }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: space3d-gs
+  namespace: space3d
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    # Long-lived WebSockets: the game server closes idle links itself (limits.idle_timeout).
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["space3d-gs-0.play.example.com", "space3d-gs-1.play.example.com"]
+      secretName: space3d-gs-tls
+  rules:
+    - host: space3d-gs-0.play.example.com
+      http:
+        paths:
+          - path: /play
+            pathType: Prefix
+            backend:
+              service: { name: space3d-gs-0, port: { name: play } }
+    - host: space3d-gs-1.play.example.com
+      http:
+        paths:
+          - path: /play
+            pathType: Prefix
+            backend:
+              service: { name: space3d-gs-1, port: { name: play } }

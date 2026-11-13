@@ -17,7 +17,8 @@
 //!
 //! Held mouse buttons are checked against the OS before each frame (macOS, Windows; one OS
 //! call per frame, none while no button is held): a button whose release event never arrived is
-//! released as a cancel once the OS has shown it up for a moment (`crate::os_buttons`). A focus
+//! released as a cancel once the OS has shown it up for a moment (`crate::os_buttons`; only presses
+//! the window itself received, and only while it has the focus outside background mode). A focus
 //! loss or suspension releases every held key and button ([`Input::release_all`]; mouse buttons
 //! as cancels).
 
@@ -429,9 +430,11 @@ impl WinitRunner {
         self.last_frame = Some(now);
         self.recover_surface(now);
         self.poll_layout(now, false);
-        // Held buttons the OS has let go of without a release event (see `os_buttons`).
+        // Held buttons the OS has let go of without a release event (see `os_buttons`); only
+        // while this window has the focus and the run is not a background (unattended) one.
+        let active = ButtonReconciler::active(self.state().focused, crate::background::background_mode());
         let input = self.app.resources.init::<Input>();
-        self.buttons.reconcile(input, now, crate::os_buttons::query);
+        self.buttons.frame(active, input, now, crate::os_buttons::query);
         if let Some(w) = &self.window {
             w.pre_present_notify();
         }
@@ -744,8 +747,8 @@ impl ApplicationHandler for WinitRunner {
             WindowEvent::MouseInput { state, button, .. } => {
                 let b = MouseButton::from(button);
                 match state {
-                    ElementState::Pressed => self.input().inject_mouse_button_down(b),
-                    ElementState::Released => self.input().inject_mouse_button_up(b),
+                    ElementState::Pressed => self.input().os_mouse_button(b, true),
+                    ElementState::Released => self.input().os_mouse_button(b, false),
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {

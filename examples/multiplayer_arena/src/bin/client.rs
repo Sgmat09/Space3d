@@ -10,6 +10,10 @@
 //! client --headless --bot --ps http://127.0.0.1:7777 --name bot-1 --seconds 10
 //! ```
 //!
+//! `client --help` prints the options. An option the client does not know, or one without its
+//! value, prints them with the reason and exits with code 2, before anything is initialised (a
+//! mistyped command line never opens a window or a connection).
+//!
 //! On the web the same options come from the page URL: `index.html?ps=https://…&name=alice`
 //! (or `server=wss://…/play`, `bot`).
 //!
@@ -35,6 +39,30 @@ use space3d_replication::{Controlled, NetEntity};
 use space3d_tasks::Task;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+
+/// What `--help` prints.
+#[cfg(not(target_arch = "wasm32"))]
+const USAGE: &str = "\
+usage: client [--ps URL | --server WS_URL] [--name NAME] [--headless] [--bot] [--frames N] [--seconds S]
+
+  --ps URL        player service (guest login, quick play, signed join ticket)
+  --server URL    a dev game server's /play URL (default ws://127.0.0.1:7777/play; ignored with --ps)
+  --name NAME     display name (default player)
+  --headless      no window and no renderer
+  --bot           play by wandering (tests, smoke runs)
+  --frames N      exit after N frames (also SPACE3D_EXIT_AFTER_FRAMES)
+  --seconds S     exit after S seconds (also SPACE3D_EXIT_AFTER_SECS)
+  -h, --help      this text";
+
+/// What the command line asks for.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+enum Cli {
+    /// Run the client with these options.
+    Run(Options),
+    /// Print the usage and exit.
+    Help,
+}
 
 /// Command-line / URL options.
 #[derive(Clone, Debug)]
@@ -69,35 +97,77 @@ impl Default for Options {
 }
 
 impl Options {
-    fn apply(&mut self, key: &str, value: Option<String>) {
+    /// Set one option. An option the client does not know, one that lacks its value or one whose
+    /// value is unusable is an error: silently carrying on would run a different client than the
+    /// one asked for (an unbounded windowed run for `--seconds abc`).
+    fn apply(&mut self, key: &str, value: Option<String>) -> Result<(), String> {
         match (key, value) {
             ("server", Some(v)) => self.server = v,
             ("ps", Some(v)) => self.ps = Some(v.trim_end_matches('/').to_owned()),
             ("name", Some(v)) => self.name = v,
-            ("frames", Some(v)) => self.frames = v.parse().ok(),
-            ("seconds", Some(v)) => self.seconds = v.parse().ok(),
+            ("frames", Some(v)) => {
+                self.frames = Some(
+                    v.parse()
+                        .map_err(|_| format!("--frames wants a whole number, got {v:?}"))?,
+                );
+            }
+            ("seconds", Some(v)) => {
+                self.seconds = Some(
+                    v.parse::<f64>()
+                        .ok()
+                        .filter(|s| s.is_finite() && *s >= 0.0)
+                        .ok_or_else(|| format!("--seconds wants a number of seconds, got {v:?}"))?,
+                );
+            }
             ("bot", v) => self.bot = v.is_none_or(|v| v != "0"),
             ("headless", v) => self.headless = v.is_none_or(|v| v != "0"),
-            (other, _) => eprintln!("client: unknown option {other:?}"),
+            (option @ ("server" | "ps" | "name" | "frames" | "seconds"), None) => {
+                return Err(format!("--{option} needs a value"));
+            }
+            (other, _) => return Err(format!("unknown option {other:?}")),
         }
+        Ok(())
     }
 
+    /// The command line (arguments after the program name). `--help` wins over everything else
+    /// on the line.
     #[cfg(not(target_arch = "wasm32"))]
-    fn parse() -> Self {
+    fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
+        let args: Vec<String> = args.into_iter().collect();
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            return Ok(Cli::Help);
+        }
         let mut o = Self::default();
-        let mut args = std::env::args().skip(1);
+        let mut args = args.into_iter();
         while let Some(a) = args.next() {
             let Some(key) = a.strip_prefix("--") else {
-                eprintln!("client: unexpected argument {a:?}");
-                continue;
+                return Err(format!("unexpected argument {a:?}"));
             };
             let value = match key {
                 "bot" | "headless" => None,
                 _ => args.next(),
             };
-            o.apply(key, value);
+            o.apply(key, value)?;
         }
-        o
+        Ok(Cli::Run(o))
+    }
+
+    /// The options of this process. `--help` prints the usage and an option that makes no sense
+    /// prints it with the reason (exit code 2): both leave before anything is initialised, so
+    /// a mistyped command line never opens a window or a connection.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn parse() -> Self {
+        match Self::parse_args(std::env::args().skip(1)) {
+            Ok(Cli::Run(o)) => o,
+            Ok(Cli::Help) => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            Err(why) => {
+                eprintln!("client: {why}\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -110,7 +180,9 @@ impl Options {
             let (k, v) = pair
                 .split_once('=')
                 .map_or((pair, None), |(k, v)| (k, Some(v.to_owned())));
-            o.apply(k, v);
+            // A page URL carries other parameters too (`utm_source=...`): what does not apply
+            // is ignored there.
+            let _ = o.apply(k, v);
         }
         o
     }
@@ -685,5 +757,95 @@ fn hud(ctx: &mut SystemCtx) {
     );
     if let Some(w) = ctx.resources.get_mut::<WindowState>() {
         w.title = title;
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, String> {
+        Options::parse_args(args.iter().map(|a| (*a).to_owned()))
+    }
+
+    fn run(args: &[&str]) -> Options {
+        match parse(args) {
+            Ok(Cli::Run(o)) => o,
+            other => panic!("{args:?}: expected a run, got {other:?}"),
+        }
+    }
+
+    /// Regression: `client --help` printed `unknown option "help"` (and swallowed the next
+    /// argument) and then started the windowed client, renderer and connection included.
+    #[test]
+    fn help_is_answered_not_run() {
+        for args in [
+            &["--help"][..],
+            &["-h"],
+            &["--headless", "--help"],
+            &["--name", "--help"],
+        ] {
+            assert!(matches!(parse(args), Ok(Cli::Help)), "{args:?}");
+        }
+        assert!(USAGE.contains("--ps") && USAGE.contains("--headless"));
+    }
+
+    /// Regression: an option nobody knows was reported and ignored, and the client went on.
+    #[test]
+    fn what_makes_no_sense_is_an_error_not_a_default() {
+        for (args, why) in [
+            (&["--bogus"][..], "unknown option"),
+            (&["--headless", "--bogus", "x"], "unknown option"),
+            (&["stray"], "unexpected argument"),
+            (&["--ps"], "needs a value"),
+            (&["--name"], "needs a value"),
+            (&["--seconds", "abc"], "--seconds"),
+            (&["--seconds", "-1"], "--seconds"),
+            (&["--seconds", "NaN"], "--seconds"),
+            (&["--frames", "1.5"], "--frames"),
+        ] {
+            let err = parse(args).expect_err(&format!("{args:?}"));
+            assert!(err.contains(why), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_documented_command_lines_parse() {
+        let o = run(&[
+            "--headless",
+            "--bot",
+            "--ps",
+            "http://127.0.0.1:7777/",
+            "--name",
+            "bot-1",
+            "--seconds",
+            "10",
+        ]);
+        assert!(o.headless && o.bot);
+        assert_eq!(o.ps.as_deref(), Some("http://127.0.0.1:7777"), "trailing slash trimmed");
+        assert_eq!((o.name.as_str(), o.seconds), ("bot-1", Some(10.0)));
+        let o = run(&[
+            "--server",
+            "ws://127.0.0.1:7777/play",
+            "--name",
+            "bob",
+            "--frames",
+            "30",
+        ]);
+        assert_eq!(
+            (o.server.as_str(), o.frames, o.ps),
+            ("ws://127.0.0.1:7777/play", Some(30), None)
+        );
+        assert!(!o.headless && !o.bot);
+    }
+
+    /// A page URL carries parameters that are not the client's; the web build ignores them, but
+    /// `apply` still reports them.
+    #[test]
+    fn apply_reports_what_it_did_not_apply() {
+        let mut o = Options::default();
+        assert!(o.apply("bot", None).is_ok() && o.bot);
+        assert!(o.apply("bot", Some("0".into())).is_ok() && !o.bot);
+        assert!(o.apply("utm_source", Some("x".into())).is_err());
     }
 }

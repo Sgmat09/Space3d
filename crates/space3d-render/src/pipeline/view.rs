@@ -24,9 +24,11 @@ pub(crate) struct GpuPointLight {
     pub color: [f32; 4],
 }
 
-/// Matches `View` in `shaders/common/view.wgsl` (std140-compatible, 1312 bytes; a WGSL
-/// `mat3x3<f32>` is three 16-byte columns). The first 752 bytes are the original forward view.
-/// It holds no per-frame-varying data: a still camera with static lights uploads nothing.
+/// Matches `View` in `shaders/common/view.wgsl` (std140-compatible, 1376 bytes; a WGSL
+/// `mat3x3<f32>` is three 16-byte columns). The first 752 bytes are the original forward view,
+/// the first 1312 the layout frozen at graphics milestone F3; later fields are appended
+/// (`inv_proj_rot`). It holds no per-frame-varying data: a still camera with static lights
+/// uploads nothing.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GpuView {
@@ -40,6 +42,8 @@ pub(crate) struct GpuView {
     pub view: [[f32; 4]; 4],
     /// The projection as drawn (including the viewport fit, see `ViewportRect::fitted`).
     pub proj: [[f32; 4]; 4],
+    /// The `f32` inverse of `view_proj`, kept as it was: its translation column is the camera
+    /// position and it is off by pixels far from the origin. Directions use `inv_proj_rot`.
     pub inv_view_proj: [[f32; 4]; 4],
     pub inv_proj: [[f32; 4]; 4],
     /// x, y, w, h in pixels of the texture the view renders into.
@@ -63,4 +67,9 @@ pub(crate) struct GpuView {
     pub sky_rotation: [[f32; 4]; 3],
     /// Intensity, enabled, 0, 0.
     pub sky_params: [f32; 4],
+    /// `(proj · view rotation)⁻¹`, clip → the world-space offset from the camera, computed in
+    /// `f64` without the camera's translation (see [`crate::inverse_proj_rot`]). Unlike
+    /// `inv_view_proj` (the `f32` inverse of `view_proj`, kept for compatibility) it is exact
+    /// at any distance from the origin; the sky derives every pixel's direction from it.
+    pub inv_proj_rot: [[f32; 4]; 4],
 }

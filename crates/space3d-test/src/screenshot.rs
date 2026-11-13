@@ -400,6 +400,8 @@ fn write_golden(root: &Path, path: &Path, image: &ImageData) -> Result<(), Strin
 /// Compare `captured` with the golden `name` in `golden` without panicking.
 ///
 /// Also appends a record to the `SPACE3D_TEST_REPORT` report when that is set.
+// `ScreenshotFailure` carries both images for the report; it is only built on the failure path.
+#[allow(clippy::result_large_err)]
 pub fn check_screenshot(
     golden: &GoldenDir,
     name: &str,

@@ -599,6 +599,13 @@ impl NetClient {
         self.last_snapshot_tick
     }
 
+    /// Counts of the component values that hold entity references: those waiting for an entity
+    /// the client does not have, and those decoded again when a referenced entity is spawned
+    /// (see `receive::PendingRefs`). Bounded by the holders in view.
+    pub fn reference_stats(&self) -> receive::ReferenceStats {
+        self.pending_refs.stats()
+    }
+
     /// All mapped `NetId`s, ascending.
     pub fn net_ids(&self) -> Vec<NetId> {
         self.map.net_ids()
@@ -624,7 +631,7 @@ impl NetClient {
             }
             self.metas.clear();
             self.tombstones.clear();
-            self.pending_refs.entries.clear();
+            self.pending_refs.clear();
         }
         self.reset_seen = None;
         self.timed_messages.clear();

@@ -16,8 +16,15 @@
 //! ([`MouseButtonCause::OsReconciled`]): the UI registers neither a click nor a drop. It never
 //! presses anything.
 //!
-//! * A press the OS never showed held (a click shorter than a frame, a synthetic or injected
-//!   press, a button the OS does not report) is left to its own release event.
+//! * Only a press the window itself received (an event of the OS window: [`Input::os_mouse_button`])
+//!   is checked. A press a test, a replay or a script injected ([`Input::inject_mouse_button_down`])
+//!   was never held by the OS: the developer's own physical button, held in another window and
+//!   let go later, must not release it.
+//! * No check while the window has no focus, or in background mode (windowed runs of tests, CI and
+//!   agents: [`crate::background`]): the OS's buttons then belong to another app, and what was
+//!   seen of a press is forgotten ([`ButtonReconciler::active`]).
+//! * A press the OS never showed held (a click shorter than a frame, a synthetic press, a button
+//!   the OS does not report) is left to its own release event.
 //! * The OS state can be ahead of the event queue (a release event still on its way): requiring
 //!   two checks, with the events of a frame delivered between them, and [`GRACE`] keeps a real
 //!   release a real one (a click).
@@ -108,6 +115,29 @@ pub(crate) struct ButtonReconciler {
 }
 
 impl ButtonReconciler {
+    /// Whether the OS's buttons say anything about this window's: it has the focus and the run
+    /// is not a background one.
+    pub(crate) fn active(focused: bool, background: bool) -> bool {
+        focused && !background
+    }
+
+    /// One frame's check when `active` ([`Self::active`]); otherwise nothing is asked and what
+    /// the OS showed of the current presses is forgotten (it was about another app's buttons).
+    /// Returns how many buttons were released.
+    pub(crate) fn frame(
+        &mut self,
+        active: bool,
+        input: &mut Input,
+        now: Instant,
+        os: impl FnOnce() -> Option<OsButtons>,
+    ) -> usize {
+        if !active {
+            self.slots = Default::default();
+            return 0;
+        }
+        self.reconcile(input, now, os)
+    }
+
     /// One check, before the frame's update: `os` reads the OS's buttons (`None`: unknown) and
     /// is only called while `input` holds a watched button. Returns how many were released.
     pub(crate) fn reconcile(
@@ -121,7 +151,8 @@ impl ButtonReconciler {
         let mut released = 0;
         for (i, &button) in BUTTONS.iter().enumerate() {
             let slot = &mut self.slots[i];
-            let held = input.mouse_pressed(button);
+            // Only a press the window received counts: the OS never held an injected one.
+            let held = input.mouse_press_from_os(button);
             if !held || input.mouse_just_pressed(button) {
                 // Up, or a new press since the last check: nothing seen of it yet.
                 *slot = Slot::default();
@@ -245,7 +276,7 @@ mod tests {
         let mut r = ButtonReconciler::default();
         let mut input = Input::default();
         input.inject_mouse_move(Vec2::new(5.0, 5.0));
-        input.inject_mouse_button_down(MouseButton::Left);
+        input.os_mouse_button(MouseButton::Left, true);
         assert_eq!(frame(&mut r, &mut input, t0, Some(LEFT)), 0);
         assert_eq!(frame(&mut r, &mut input, t0 + ms(16), Some(LEFT)), 0);
         // The release went elsewhere: up for the OS, no event.
@@ -267,21 +298,43 @@ mod tests {
         assert_eq!(frame(&mut r, &mut input, t0 + ms(100), Some(NONE)), 0, "released once");
     }
 
+    /// A press a test (or a replay, or a script) injected is not the OS's: the developer's own
+    /// physical button, held in another window and let go later, must not release it.
+    #[test]
+    fn an_injected_press_is_never_released_by_the_os_check() {
+        let t0 = Instant::now();
+        let mut r = ButtonReconciler::default();
+        let mut input = Input::default();
+        input.inject_mouse_move(Vec2::new(5.0, 5.0));
+        input.inject_mouse_button_down(MouseButton::Left);
+        // The OS shows a button held (the developer's, elsewhere), then up.
+        assert_eq!(frame(&mut r, &mut input, t0, Some(LEFT)), 0);
+        assert_eq!(frame(&mut r, &mut input, t0 + ms(16), Some(LEFT)), 0);
+        for k in 2..20 {
+            assert_eq!(
+                frame(&mut r, &mut input, t0 + ms(16 * k), Some(NONE)),
+                0,
+                "check {k}: released a press the OS never had"
+            );
+        }
+        assert!(input.mouse_pressed(MouseButton::Left));
+    }
+
     #[test]
     fn a_long_frame_still_needs_two_checks() {
         let t0 = Instant::now();
         let mut r = ButtonReconciler::default();
         let mut input = Input::default();
-        input.inject_mouse_button_down(MouseButton::Right);
+        input.os_mouse_button(MouseButton::Right, true);
         frame(&mut r, &mut input, t0, Some(OsButtons(0b10)));
         // A long frame: the OS shows the button up before its release event was delivered.
         assert_eq!(frame(&mut r, &mut input, t0 + ms(500), Some(NONE)), 0);
         // The event arrives before the next check: a real release.
-        input.inject_mouse_button_up(MouseButton::Right);
+        input.os_mouse_button(MouseButton::Right, false);
         assert_eq!(frame(&mut r, &mut input, t0 + ms(516), Some(NONE)), 0);
         assert!(!input.mouse_pressed(MouseButton::Right));
         // Held again after being up: the up streak starts over.
-        input.inject_mouse_button_down(MouseButton::Right);
+        input.os_mouse_button(MouseButton::Right, true);
         frame(&mut r, &mut input, t0 + ms(600), Some(OsButtons(0b10)));
         frame(&mut r, &mut input, t0 + ms(700), Some(NONE));
         frame(&mut r, &mut input, t0 + ms(716), Some(OsButtons(0b10)));
@@ -294,8 +347,8 @@ mod tests {
         let t0 = Instant::now();
         let mut r = ButtonReconciler::default();
         let mut input = Input::default();
-        // Injected (or synthetic, or shorter than a frame): the OS never holds it.
-        input.inject_mouse_button_down(MouseButton::Left);
+        // Shorter than a frame or synthetic: the window got it, the OS never shows it held.
+        input.os_mouse_button(MouseButton::Left, true);
         for k in 0..20 {
             assert_eq!(frame(&mut r, &mut input, t0 + ms(100 * k), Some(NONE)), 0);
         }
@@ -310,8 +363,8 @@ mod tests {
         // A new press forgets what the OS showed of the previous one.
         let mut r = ButtonReconciler::default();
         frame(&mut r, &mut input, t0, Some(LEFT));
-        input.inject_mouse_button_up(MouseButton::Left);
-        input.inject_mouse_button_down(MouseButton::Left);
+        input.os_mouse_button(MouseButton::Left, false);
+        input.os_mouse_button(MouseButton::Left, true);
         for k in 1..20 {
             assert_eq!(frame(&mut r, &mut input, t0 + ms(100 * k), Some(NONE)), 0);
         }
@@ -333,10 +386,56 @@ mod tests {
         input.inject_mouse_button_down(MouseButton::Other(9));
         r.reconcile(&mut input, t0, || ask(NONE));
         assert_eq!(asked.get(), 0, "unwatched button");
-        input.inject_mouse_button_down(MouseButton::Middle);
-        input.inject_mouse_button_down(MouseButton::Forward);
+        input.inject_mouse_button_down(MouseButton::Left);
+        r.reconcile(&mut input, t0, || ask(NONE));
+        assert_eq!(asked.get(), 0, "an injected press is not the OS's");
+        input.os_mouse_button(MouseButton::Middle, true);
+        input.os_mouse_button(MouseButton::Forward, true);
         r.reconcile(&mut input, t0, || ask(OsButtons(0b1_0100)));
         assert_eq!(asked.get(), 1, "once per check");
+    }
+
+    /// The OS's buttons say nothing about this window's while it has no focus or the run is a
+    /// background one: no check, and nothing seen then counts for the next one.
+    #[test]
+    fn no_check_while_the_window_is_unfocused_or_in_background_mode() {
+        assert!(ButtonReconciler::active(true, false));
+        assert!(!ButtonReconciler::active(false, false), "unfocused");
+        assert!(!ButtonReconciler::active(true, true), "background mode");
+        assert!(!ButtonReconciler::active(false, true));
+
+        let t0 = Instant::now();
+        let mut r = ButtonReconciler::default();
+        let mut input = Input::default();
+        input.os_mouse_button(MouseButton::Left, true);
+        let check = |r: &mut ButtonReconciler, input: &mut Input, active, at, os| {
+            let asked = Cell::new(false);
+            let n = r.frame(active, input, t0 + ms(at), || {
+                asked.set(true);
+                Some(os)
+            });
+            input.end_frame();
+            (n, asked.get())
+        };
+        assert_eq!(check(&mut r, &mut input, true, 0, LEFT), (0, true), "seen held");
+        // Unfocused: the OS is not even asked, however long the button shows up.
+        for k in 1..20 {
+            assert_eq!(check(&mut r, &mut input, false, 100 * k, NONE), (0, false));
+        }
+        assert!(input.mouse_pressed(MouseButton::Left));
+        // Focused again: what the OS showed before is forgotten, it must show the press held again.
+        for k in 20..40 {
+            assert_eq!(check(&mut r, &mut input, true, 100 * k, NONE), (0, true));
+        }
+        assert!(input.mouse_pressed(MouseButton::Left));
+        assert_eq!(check(&mut r, &mut input, true, 4000, LEFT), (0, true));
+        assert_eq!(check(&mut r, &mut input, true, 4100, NONE), (0, true));
+        assert_eq!(
+            check(&mut r, &mut input, true, 4200, NONE),
+            (1, true),
+            "a real lost release"
+        );
+        assert!(!input.mouse_pressed(MouseButton::Left));
     }
 
     /// The real query answers (reads the window server's state; synthesizes nothing).

@@ -406,9 +406,14 @@ more things release it, as **cancels** (`MouseButtonEvent::cancelled()`,
   and releases a button the OS showed held during this press and has shown up since, on
   consecutive checks spanning at least 50 ms (two at least, with a frame's events delivered in
   between: the OS state can be ahead of the event queue, and a real release event still on its
-  way stays a real release). A press the OS never showed held (a click
-  shorter than a frame, a synthetic or injected press) is left to its own release. It never
-  presses anything.
+  way stays a real release). Only a press the window itself received (an event of the OS window)
+  is checked: a press a test, a replay or a script injected (`Input::inject_mouse_button_down`)
+  was never held by the OS, so the developer's own physical button — held in another window
+  and let go later — cannot release it. There is no check either while the window has no focus
+  or in background mode (windowed runs of tests, CI and agents: `space3d_platform::background`):
+  the OS's buttons then belong to another app, and what was seen of a press is forgotten. A
+  press the OS never showed held (a click shorter than a frame, a synthetic press) is left to
+  its own release. It never presses anything.
 
 | platform | OS button state | a lost release |
 |---|---|---|
@@ -425,6 +430,32 @@ distance is no click), then the cursor's current position. A button event while 
 outside the window goes to the last position egui saw, and the pointer is gone again right after
 (`PointerGone`), so nothing at the window's corner gets hovered. `Event::WindowFocused` is sent
 when `WindowState::focused` changes (egui then forgets the keys and modifiers it held).
+
+* **A release outside the window is not a click on a widget at the window's edge**, even in
+  the frame the pointer leaves: it is delivered at the last position egui saw, after egui's
+  pointer detoured off-screen (as for a cancel), so the widget under that position sees a
+  release but no click. A drag-and-drop payload is dropped nowhere. (The one exception is the
+  case described under "A cancel only concerns its own button": when egui has no press in
+  progress for the button, it has nothing to withhold a click from.)
+* **No pointer position yet.** A button event before any pointer position is known (nothing has
+  moved the cursor into the window; a test that presses first) is *dropped*, not sent to
+  (0, 0): the press is ignored and so is its release, whenever it comes (a release after the
+  cursor moved in is not delivered to a press egui never saw). Buttons work as soon as one
+  position was seen; `Input` itself still records them (`mouse_pressed`, `mouse_button_events`).
+* **A cancel only concerns its own button.** egui follows one press at a time and any release
+  ends the click in progress, so a cancel between another button's press and release would
+  swallow that click. The UI therefore sends a cancel as early as it can: ahead of the presses
+  and clicks of the other buttons in its frame (after its own button's earlier events, after
+  other cancels, and after the release that ends a click begun in an earlier frame).
+  A right click that starts and ends in the frame the held left button is cancelled is a
+  right click. (When a click begun earlier ends in the same frame as another button's cancel,
+  egui has no press in progress when the cancel comes and judges it alone: the click of the
+  other button is kept, and the cancelled release may count as a click there.)
+* **Touches.** `TouchPhase::Cancelled` (an incoming call, a rejected palm, a system gesture
+  that took the finger) ends the touch like `Ended` but is no tap: `Input::just_ended_touches`
+  lists it, `Input::just_cancelled_touches` tells which of those were cancelled, egui gets
+  `TouchPhase::Cancel`, and the pointer touch's release is a cancelled release of the primary
+  button (no click). Games should not fire on the release of a cancelled touch.
 
 A cancelled release registers **neither a click nor a drop** in egui — like switching away from
 a native app mid-drag. Drags end (`Response::drag_stopped`), a dragged slider keeps its value,
@@ -445,6 +476,47 @@ for e in ctx.resources.expect::<Input>().mouse_button_events() {
 }
 ```
 
+**Deciding drops and commits from egui.** egui has no notion of a cancel: a cancelled release
+still ends the press, so `Response::drag_stopped()`, `PointerState::button_released` and
+`any_released()` are `true` in that frame, and "drop here" logic written as `hovered()` (or
+`contains_pointer()`) with `any_released()` would act on a focus loss. Ask whether the release
+was a cancel:
+`EguiContext::pointer_cancelled_this_frame()` (any button) and
+`EguiContext::button_cancelled_this_frame(button)`, or, when only an `egui::Context` is at
+hand, the free functions `space3d_ui::pointer_cancelled_this_frame(ctx)` and
+`space3d_ui::pointer_cancel_cause(ctx, button)` (the `MouseButtonCause`: `FocusLost` or
+`OsReconciled`; a cancelled touch is the primary button's, `FocusLost`). They describe the
+frame's pass, from `Stage::PreUpdate` (`ui::begin_frame`) until the next frame's, and are
+`false` without a running `UiPlugin` or while the UI is disabled.
+
+```rust
+app.add_root_ui_system(|ui: &mut egui::Ui, sys: &mut SystemCtx| {
+    let cancelled = sys
+        .resources
+        .expect::<EguiContext>()
+        .button_cancelled_this_frame(egui::PointerButton::Primary);
+    let (_, zone) = ui.allocate_exact_size(egui::vec2(60.0, 30.0), egui::Sense::hover());
+    let released = ui.input(|i| i.pointer.any_released());
+    if zone.contains_pointer() && released {
+        if cancelled {
+            put_it_back();           // focus lost / a release only the OS saw: no drop
+        } else {
+            drop_here();             // a real release
+        }
+    }
+});
+```
+
+egui's own drag-and-drop (`Response::dnd_release_payload`) needs none of this: the engine drops
+the payload before the pass on a cancel. Code that runs outside the UI systems (a game
+system reading `Input`) uses `MouseButtonEvent::cancelled()` as above.
+
+**Sub-apps in the editor.** A `LiveView` (the editor's sub-app viewport, the storybook's story
+view) forwards its host UI's pointer to the sub-app's `Input`: a press as a device press, a
+release as a device release — or, when the host cancelled it (`pointer_cancel_cause`), as
+`Input::release_mouse_button(button, cause)` with the host's cause, so the story or sub-app's
+own `MouseButtonEvent::cancelled()` and UI behave as in a window of their own.
+
 **egui plugins.** egui 0.36 runs its plugins' pass hooks (`Plugin::on_begin_pass` /
 `on_end_pass`) only from `Context::run_ui`; the engine's pass spans `Stage::PreUpdate` to
 `Stage::PostUpdate` (`begin_pass` / `end_pass`), so the engine runs the hooks itself, in
@@ -459,7 +531,9 @@ does not know about do not run, and `egui::Context::on_begin_pass` / `on_end_pas
 
 **Tests** drive all of this headless: `WindowState::focused = false` plus `Input::release_all()`
 is what the runner does on a focus loss, and `Input::release_mouse_button(b,
-MouseButtonCause::OsReconciled)` is what the OS check does.
+MouseButtonCause::OsReconciled)` is what the OS check does. Injected presses
+(`inject_mouse_button_down`) are never subject to the OS check; only the runner's own window
+events are (crate-internal `Input::os_mouse_button`).
 
 ## The mouse cursor and the window icon
 

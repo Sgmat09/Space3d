@@ -1,0 +1,178 @@
+# Game servers: a StatefulSet, so every pod keeps its name (server_id = the pod name; join tickets
+# are bound to it) and its volume (the durable outbox and the local checkpoint rescue store).
+# A game server needs no inbound internal port: it dials the player service (docs/server.md §1.1).
+# Clients connect to it directly, so every pod needs its own public URL: ingress.example.yaml.
+#
+# Drain (docs/server.md §6, "Draining and upgrades"). A pod that is deleted (rollout, scale-in,
+# node drain) gets, in this order:
+#   1. preStop: sleep 5 s, so whatever routes through a Service that honours readiness (the
+#      headless Service below, a shared Service you add) sees the pod leave before SIGTERM. The
+#      per-pod Services of ingress.example.yaml deliberately keep routing to a draining pod
+#      (publishNotReadyAddresses): it still serves resumes and rejoins into its matches;
+#   2. SIGTERM: /readyz turns 503, the player service stops allocating to the pod, new tickets get
+#      Reject(ServerDraining) (resumes are still accepted), matches run to completion within
+#      drain_timeout (game.drain_timeout in configmap.yaml), persistent rooms hand off, the final
+#      checkpoints are uploaded, the process exits 0;
+#   3. SIGKILL when terminationGracePeriodSeconds is over.
+# The grace period includes the preStop sleep, so it must be drain_timeout + 5 s + 30 s, plus slack
+# (crates/space3d-server/tests/deploy.rs checks that the numbers stay consistent).
+apiVersion: v1
+kind: Service
+metadata:
+  name: space3d-gs
+  namespace: space3d
+  labels:
+    app.kubernetes.io/name: space3d-gs
+    app.kubernetes.io/component: game-server
+    app.kubernetes.io/part-of: space3d
+spec:
+  # Headless: stable per-pod DNS names (space3d-gs-0.space3d-gs.space3d.svc). Players do not
+  # reach a game server through this Service, only through its public URL.
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: space3d-gs
+  ports:
+    - { name: play, port: 7777, targetPort: play, protocol: TCP }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: space3d-gs
+  namespace: space3d
+  labels:
+    app.kubernetes.io/name: space3d-gs
+    app.kubernetes.io/component: game-server
+    app.kubernetes.io/part-of: space3d
+spec:
+  serviceName: space3d-gs
+  replicas: 2
+  # No ordering between game servers: start and stop them in parallel.
+  podManagementPolicy: Parallel
+  minReadySeconds: 10
+  updateStrategy:
+    # One pod at a time (each waits for its drain), highest ordinal first.
+    type: RollingUpdate
+  # A scaled-down pod's volume may still hold un-flushed results: keep it for the next scale-up.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space3d-gs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: space3d-gs
+        app.kubernetes.io/component: game-server
+        app.kubernetes.io/part-of: space3d
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      # 900 s drain_timeout + 5 s preStop + 30 s (final checkpoints, outbox flush, deregister) + 25 s slack.
+      terminationGracePeriodSeconds: 960
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: space3d-gs
+      containers:
+        - name: server
+          # The game's server binary (crates/space3d-server/deploy/Dockerfile, BIN=<your server bin>).
+          image: registry.example.com/space3d/game-server:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: SPACE3D__ROLE, value: game-server }
+            # Stable id: the pod name. Join tickets are bound to it.
+            - name: SPACE3D__SERVER_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            # The URL clients get in their assignment. One host per pod: see ingress.example.yaml.
+            - { name: SPACE3D__GAME__PUBLIC_URL, value: "wss://{server_id}.play.example.com/play" }
+            - name: SPACE3D_KEYS
+              valueFrom: { secretKeyRef: { name: space3d-server-secrets, key: SPACE3D_KEYS } }
+            - name: SPACE3D_FLEET_TOKEN
+              valueFrom: { secretKeyRef: { name: space3d-server-secrets, key: SPACE3D_FLEET_TOKEN } }
+            - name: SPACE3D_ADMIN_TOKENS
+              valueFrom: { secretKeyRef: { name: space3d-server-secrets, key: SPACE3D_ADMIN_TOKENS } }
+          ports:
+            - { name: play, containerPort: 7777 }
+            - { name: admin, containerPort: 9090 }
+          # /healthz fails when a shard stops ticking. /readyz is 503 until the pod registered with
+          # the player service, and again as soon as it drains.
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              # Native sleep action (Kubernetes 1.30+): the image has no shell to `sleep` in.
+              sleep: { seconds: 5 }
+          resources:
+            # No CPU limit: throttling a tick loop shows up as skipped ticks. Size by measuring
+            # space3d_tick_seconds (docs/server.md §6); a 200-player load-test node used ~55 MB.
+            requests: { cpu: "1", memory: 256Mi }
+            limits: { memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: config, mountPath: /etc/space3d/server.toml, subPath: server.toml, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: space3d-server-config }
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 64Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: space3d-gs
+          app.kubernetes.io/component: game-server
+          app.kubernetes.io/part-of: space3d
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+# Voluntary disruptions (node drains, cluster upgrades) evict one game server at a time; each
+# eviction is a full drain (up to the grace period), so a second one only starts after it.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: space3d-gs
+  namespace: space3d
+  labels:
+    app.kubernetes.io/name: space3d-gs
+    app.kubernetes.io/component: game-server
+    app.kubernetes.io/part-of: space3d
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space3d-gs

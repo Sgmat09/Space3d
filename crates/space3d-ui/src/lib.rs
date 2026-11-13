@@ -17,7 +17,10 @@
 //!   `egui::Event::WindowFocused` follows the window's focus. A release that no device event
 //!   reported — the window lost the focus, or the OS shows the button up with no release event —
 //!   is a cancel: egui registers neither a click nor a drop (see `docs/platforms.md`, "Mouse
-//!   buttons, focus and the UI").
+//!   buttons, focus and the UI"); a system-cancelled touch is no tap either.
+//!   [`EguiContext::pointer_cancelled_this_frame`] / [`pointer_cancelled_this_frame`] tell game
+//!   code that decides drops from `Response::drag_stopped` / `any_released` to skip such a frame.
+//!   Buttons before any pointer position is known are dropped (not sent to (0, 0)).
 //! * egui plugins get their pass hooks (`on_begin_pass` before the UI systems, `on_end_pass`
 //!   after them), which egui itself only runs from `Context::run_ui`: the built-in ones (label
 //!   text selection, drag-and-drop, `egui::debug_text`) and those added with
@@ -84,7 +87,10 @@ pub use context::{EguiContext, UiFrameStats, winit_cursor};
 pub use debug::DebugOverlay;
 pub use egui;
 pub use egui_wgpu;
-pub use input::{REPEAT_DELAY, REPEAT_INTERVAL, REPEAT_KEYS, egui_key, egui_logical_key, physical_key_for_egui_key};
+pub use input::{
+    REPEAT_DELAY, REPEAT_INTERVAL, REPEAT_KEYS, egui_key, egui_logical_key, physical_key_for_egui_key,
+    pointer_cancel_cause, pointer_cancelled_this_frame,
+};
 pub use profiler::{FrameTimeline, Profiler, ProfilerLayer, SystemStats, TimelineSpan};
 pub use textures::UiTextures;
 pub use theme::{

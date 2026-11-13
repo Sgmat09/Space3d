@@ -182,7 +182,7 @@ engine_goldens_are_exact` checks them with tolerance 0.
 
 ### F3 / F4 — output tail, `GpuView`, HDR frame modes
 
-`GpuView` grew to its frozen 1312 bytes (1536-byte stride); forward modules no longer depend on the
+`GpuView` grew to its frozen 1312 bytes (1536-byte stride; 1376 bytes since `inv_proj_rot` was appended, the same stride); forward modules no longer depend on the
 output encoding (an override). Direct mode is unchanged: the engine goldens are bit-exact, and the
 steady-state allocations of `tests/alloc.rs` are identical to F0 (82–86 CPU path, 191–195 GPU
 paths, 314.6 with two viewport cameras).

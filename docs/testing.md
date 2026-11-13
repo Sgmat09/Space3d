@@ -75,8 +75,15 @@ A focus loss is `WindowState::focused = false` plus `Input::release_all()` (what
 runner does); its releases are cancels, like a release only the OS saw
 (`Input::release_mouse_button(b, MouseButtonCause::OsReconciled)`): the UI registers no click
 and no drop for them ([Mouse buttons, focus and the UI](platforms.md#mouse-buttons-focus-and-the-ui)).
-The recorder (`InputRecorderPlugin`) keeps per-frame edges: a recorded cancel replays as a plain
-release.
+A release the runner's OS check makes never touches a press a test injected: only presses of
+the window's own events are checked against the OS, and only while the window has the focus
+outside background mode, so a developer's physical button cannot release a scripted press.
+The recorder (`InputRecorderPlugin`) records a cancelled release as `InputEvent::MouseCancel
+{ button, cause }` (script builder `mouse_cancel`; `MouseUp` stays a device release) and replays
+it through `Input::release_mouse_button`, so a replay's UI sees the same cancel. A touch the
+system cancelled (`TouchPhase::Cancelled`, `Input::just_cancelled_touches`) is recorded as
+cancelled too and is no tap. `InputEvent` is `#[non_exhaustive]`: a `match` on it needs a
+wildcard arm (scripts written before load as they did).
 
 Tests on libtest threads never read the developer's own layout on macOS (Text Input Sources
 are main-thread only), so learned labels keep them deterministic. The OS tables themselves are

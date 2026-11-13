@@ -78,6 +78,7 @@ the game.
 | `caps.rs` | F | `GraphicsCaps` |
 | `output.rs` | F | `OutputEncoding`, `Tonemapper`, `OUTPUT_WGSL` |
 | `node.rs` | F | the render-node API (`RenderNode`, `RenderNodes`, contexts, `PassTarget`, `FrameLayouts`, `VIEW_WGSL`, `scene_wgsl`, `FULLSCREEN_WGSL`) |
+| `unproject.rs` | F | `inverse_proj_rot`, `unproject_ray`: directions and rays from the `f64` inverse projection and view rotation, exact at any distance from the origin (`View::inv_proj_rot`, [`frame.md`](frame.md#the-sky-does-not-depend-on-the-cameras-position)). Added after F3 without touching any existing item |
 | `overlay.rs` | F | `OverlayStage`, `OverlayScene`, `RenderOverlay` provided methods |
 | `timing.rs`, `quality.rs` | F (quality: I) | `GpuTimings`, `GpuScope`, `GraphicsQuality` |
 | `material.rs` | P-MAT | `BlendMode`, `ShadowMode`, `MapMask`, `TextureTransform`, `MeshExtras` |
