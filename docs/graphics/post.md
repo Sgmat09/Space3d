@@ -527,6 +527,43 @@ fn post_ldr_hook(c: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
 PostProcess::default().with_color_grading(ColorGrading { shader: Some(hook), ..Default::default() });
 ```
 
+### Display gamma: a brightness setting for players
+
+```rust
+PostProcess::default().with_display_gamma(1.2) // shadows and midtones brighter; 1.0 = off
+```
+
+`PostProcess::display_gamma` raises the sRGB-encoded display color to `1 / display_gamma` as the
+last step of the grading (after lift/gamma/gain, the LUT and `post_ldr_hook`; before FXAA and the
+finish, so the anti-aliasing and the dither see the picture that is shown). Black and white stay
+where they are; 0.5 encoded becomes 0.561 at 1.2 and 0.420 at 0.8. It is the control to give a
+player as "Brightness":
+
+* **Not exposure.** Exposure is applied before the bloom threshold and the tonemapper, so it
+  changes how much of the scene blooms and where highlights roll off. The display gamma is
+  applied to what the tonemapper produced: the glow, the highlights and the grading are the same
+  at every setting.
+* **Free at 1.** It is a uniform bit (`S3D_POST_DISPLAY_GAMMA`) and one float in the group's
+  parameters: at 1 (the default) the parameters, the shader path and the image are exactly those
+  without the field (`display_gamma_is_off_at_one`, and `display_gamma_matches_formula` compares
+  the bytes), and dragging a slider builds no pipeline. Moved, it costs one sRGB encode, a `pow`
+  and a decode per pixel in the composite: 2.21 ms at 1 against 2.61 ms at 1.3 on an AMD Radeon
+  integrated GPU at 1920 × 1080 (SpaceCorps, Medium, one pair of runs on a busy PC; a second
+  pair was spoiled by another program on the GPU), so about 0.4 ms there (not measured on a discrete
+  GPU). It is not fused with the finish's own encode: with FXAA the two are in
+  different passes.
+* **The scene only.** It belongs to a camera's post settings: UI drawn after post (egui, overlays
+  after the tonemapper) is not touched, and a camera without it (a preview in a UI panel) keeps
+  the UI's brightness. In Direct mode (no post) there is nothing to apply it, as with every other
+  post effect; the Ldr fallback applies it.
+* **Calibration UI.** `apply_display_gamma(encoded, gamma)` is the CPU mirror: paint a few dark
+  patches (codes 4, 8, 16 on black) with it beside the slider and ask for the darkest to be barely
+  visible. They are 1, 2, 5 at 0.7 and 16, 25, 40 at 1.5 (`display_gamma_golden_values`).
+
+Values outside `DISPLAY_GAMMA_RANGE` (0.25 to 4) are clamped, NaN and infinities count as 1. A
+lifted gamma shows what 8 bits hold in the shadows (an 8-bit sky texture's own steps become two
+or three codes apart at 1.5); the dither covers the composite's rounding, not the source's.
+
 ## FXAA
 
 `PostProcess::with_fxaa(FxaaQuality)` (or `anti_aliasing: AntiAliasing::Fxaa(q)`): FXAA 3.11
@@ -566,6 +603,17 @@ finds the same edges. `fxaa_intermediate_is_dithered`: a ramp over 8 dark codes 
 and a flat field between two codes has σ 0.498 codes with FXAA against 0.499 without (one dither
 either way). Pure black keeps the sparkle any ±1 LSB dither gives it (one pixel in eight at code
 1), as much as without FXAA.
+
+Cost, measured in SpaceCorps on an AMD Radeon integrated GPU (Vulkan, Medium tier: FXAA Medium,
+1920 × 1080, an empty sector, per-pass GPU timestamps, two interleaved pairs on a PC whose CPU
+was at 100 % from other builds): the composite 1.59 and 1.92 ms before, 2.24 and 2.20 after (it
+now encodes, hashes twice and decodes for every pixel); the FXAA pass 1.85 and 1.87 ms before,
+1.36 and 1.33 after (it no longer does that for the pixels it copies, which is most of them).
+Together 3.44 and 3.79 ms before, 3.60 and 3.53 after: the difference is inside the spread of
+the two runs of one build. In that game's own picture the fix cannot be seen: its skies carry
+star dust and grain of several codes everywhere, so no 8-px block of a dark sector is smooth
+enough to band (a 4×-amplified before/after pair of its darkest sector shows no difference). It
+shows on smooth dark content: a fog, a vignette over black, a UI-less fade.
 
 ## Vignette
 
@@ -852,6 +900,29 @@ overlays get them, `AfterTonemap` overlays (egui, 249c874-era overlays) and disp
 `after_tonemap_overlays_untouched_by_grain_ca_vignette`). The passthrough group (render scale
 without post) never applies them.
 
+## The transfer function
+
+sRGB is written down three times: on the CPU (`linear_to_srgb`, `srgb_to_linear`), in WGSL
+(`s3d_linear_to_srgb`, `s3d_srgb_to_linear` in `OUTPUT_WGSL`, which the forward tail, the
+overlays and the composite share) and in the GPU's own encoding of an sRGB-format target.
+`tests/transfer.rs` holds them together: the constants and well-known greys (0.0031308 ↔ 0.04045,
+0.18 → 118, 0.5 → 188, every code a round trip), the WGSL pair against the CPU pair over 256
+entries within 1 LSB, and one grey ramp through every way a pass writes its output
+(`OutputEncoding::Linear` into an sRGB target, `ManualSrgb` into an 8-bit target without one,
+`Linear` into a float target encoded on the CPU): the same bytes. The composite's three output
+kinds (`S3D_POST_OUT`) end in those same writes.
+
+Which of them a display gets is decided once, from what the surface reports
+(`surface_formats` in renderer.rs), the same on every platform: an sRGB surface format where
+there is one (the GPU encodes, the UI and overlays blend in linear light); else an sRGB view of
+the surface where the device has `SURFACE_VIEW_FORMATS` (browser WebGPU); else the shader
+encodes and blending happens on encoded values. Read from wgpu-hal 30 (not run on a device):
+Metal lists `Bgra8UnormSrgb` (iOS and macOS take the first path); Vulkan lists what the driver
+does, which on Android includes an sRGB format in practice; GLES lists `Rgba8UnormSrgb` when
+EGL is 1.5 or has `EGL_KHR_gl_colorspace` (WebGL2 always lists it), and only then: an Android
+device on GLES with an older EGL takes the third path, where translucent UI and additive
+overlays blend in gamma space and so look slightly different from every other device.
+
 ## Determinism
 
 Distortion meshes are extracted in a fixed order (texture, mesh, entity) and scroll by render
@@ -868,6 +939,9 @@ still a pure function of that frame.
 
 ## Tests and stories
 
+* `tests/transfer.rs`: `srgb_golden_values`, `every_output_kind_writes_the_same_bytes`,
+  `wgsl_transfer_functions_match_the_cpu` ("The transfer function").
+
 * `tests/post.rs` (and `tests/gl_post.rs` on GL/ANGLE): bloom — `bloom_only_above_threshold`,
   `bloom_is_in_exposed_units`, `energy_conserving_preserves_mean`,
   `bloom_does_not_bleed_across_viewports`, `hdr_scene_overlays_feed_bloom`,
@@ -878,7 +952,8 @@ still a pure function of that frame.
   `instant_converges_frame_1`, `render_to_image_is_idempotent_with_ae_and_grain`,
   `auto_exposure_feeds_bloom`, `auto_exposure_per_post_group`,
   `auto_exposure_history_and_steady_state` (both paths); grading — `grading_matches_formulas`,
-  `lut_identity_is_neutral`, `lut_changes_colors`, `invalid_grading_hook_falls_back`; FXAA and
+  `lut_identity_is_neutral`, `lut_changes_colors`, `invalid_grading_hook_falls_back`,
+  `display_gamma_matches_formula`; FXAA and
   lens effects — `fxaa_softens_edges`, `fxaa_intermediate_is_dithered`, `film_grain_is_seeded`, `grain_after_fxaa`,
   `after_tonemap_overlays_untouched_by_grain_ca_vignette`, `vignette_darkens_corners`,
   `chromatic_aberration_splits_toward_corners`, `lens_effects_do_not_bleed_across_viewports`,
