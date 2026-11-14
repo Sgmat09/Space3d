@@ -8,9 +8,9 @@ through `[patch.crates-io]` in the root `Cargo.toml`. They are not workspace mem
 
 | crate | what Space3d changes | patch |
 |---|---|---|
-| [`epaint`](epaint) | kinsoku (禁則処理) line breaking for Chinese and Japanese | [`epaint.kinsoku.patch`](epaint.kinsoku.patch) |
+| [`epaint`](epaint) | kinsoku (禁則処理) line breaking for Chinese and Japanese, and two rules of Unicode line breaking (UAX #14) for every script: no break before a no-break space, none after an ASCII opening bracket | [`epaint.kinsoku.patch`](epaint.kinsoku.patch) |
 
-## epaint: kinsoku line breaking
+## epaint: kinsoku line breaking (and two UAX #14 rules)
 
 Vendored version: **epaint 0.36.2** (egui commit `49682f8baa058bf49e011035cfbd6e825f88a5ef`, `crates/epaint`).
 
@@ -34,6 +34,15 @@ breaking, so the rules live in a patched epaint. The Space3d test corpus
 (`space3d-ui/tests/kinsoku.rs`, 3603 layouts) has 2636 such violations with upstream epaint,
 0 with the patch.
 
+Two rules of Unicode line breaking (UAX #14) matter outside Chinese and Japanese, in ordinary
+Latin text, and egui lacks them: no break just before a no-break space U+00A0 (class GL), and
+no break after an ASCII opening bracket `(` `[` `{` (class OP). A chat line "19:42  [T]\u{a0}Name:"
+whose company tag is joined to the name with a no-break space wrapped as "[T]" | "\u{a0}Name:"
+with upstream epaint (the break after the mark, before the no-break space), and a name longer
+than a row as "[" | "T] Wwww…" (egui breaks after any ASCII mark when a row has no space).
+The rules were found by the SpaceCorps chat (SpaceCorps2027 commit 016464c, its
+`a_wrapped_sender_keeps_its_company_tag` test) and are ported here.
+
 The patch started as the one the SpaceCorps game carried in its own `third_party/epaint`
 (SpaceCorps2027 commits b8af874, "kinsoku line breaking for Chinese and Japanese", and e531f10,
 "kinsoku around Latin words and numbers, and none of it in German"), which Space3d now owns so
@@ -41,7 +50,8 @@ that games don't maintain a copy. It was reviewed and rewritten as a self-contai
 
 * **`src/text/kinsoku.rs`** (new, public as `epaint::text::kinsoku`, also
   `egui::epaint::text::kinsoku`): the character classes and `line_break(before, after)`, which
-  answers `Prohibited`, `Allowed` or `Upstream` for every position between two characters;
+  answers `Prohibited`, `Allowed` or `Upstream` for every position between two characters (the
+  two UAX #14 rules are pair rules of it, `is_unicode_glue`, so the hook needed no change);
   crate-private, the glyph-level part the hook uses (`Scan`, which walks a paragraph and also
   looks past spaces and into clusters, with a shortcut for the most common pairs; the fit
   checks of the fallbacks; `may_leave_row_empty`, below); the unit tests.
@@ -58,7 +68,8 @@ that games don't maintain a copy. It was reviewed and rewritten as a self-contai
   below) asks `kinsoku::may_leave_row_empty` too.
 * **`src/text/mod.rs`**: `pub mod kinsoku;` (one line).
 
-`font.rs` (egui's `is_cjk_break_allowed` list) is untouched: kinsoku's list is a superset.
+`font.rs` (egui's `is_cjk_break_allowed` list) is untouched: kinsoku's list is a superset. The
+rules' revision is `kinsoku::VERSION` (4 with the UAX #14 rules; 3 before).
 
 ### The rules
 
@@ -66,7 +77,8 @@ Kinsoku applies to a position when a character next to it is Chinese or Japanese
 Han characters in all planes, kana, Bopomofo, CJK symbols and punctuation, full-width forms,
 half-width katakana; not Hangul — Korean breaks at spaces, as upstream). A space breaks as
 egui decides, except next to a bracket (below). Classes follow JIS X 4051 and the W3C
-JLREQ/CLREQ ("strict" line breaking):
+JLREQ/CLREQ ("strict" line breaking). Two more rules hold in every script, with or without
+Chinese or Japanese text next to the position (UAX #14, listed after the table):
 
 | rule | characters |
 |---|---|
@@ -76,6 +88,19 @@ JLREQ/CLREQ ("strict" line breaking):
 | also kept together | a Chinese or Japanese character and its combining mark or variation selector (か + ゙, 葛 + VS17, 字 + U+FE0F) — as characters, and as glyphs: the shaper gives a selector the font has no glyph for the base's character and no width, and no row starts with such a glyph, even in a row narrower than one glyph; word joiners; a straight quote `"` `'` with the CJK text on both sides (it may open or close a quote, Unicode class QU) |
 | across spaces | spaces between a bracket and its text (「　重要　」, （ 注意 ）): no line ends with the opening bracket and its spaces or starts with the spaces and the closing mark (as Unicode's `OP SP* ×` and `× CL` after spaces) |
 | a word boundary egui lacked | after CJK punctuation before a Latin word or number (「、」\|「Thulium」, 「。」\|「4-2」), before an opening bracket after a Latin word, number or mark (「Skylab」\|「「」, 「！」\|「（」), between any other pair with a CJK character that isn't prohibited (after ASCII marks: 「!」\|「中」) |
+
+**In every script (UAX #14).**
+
+| rule | characters |
+|---|---|
+| no break after an opening bracket (class OP, LB14) | the ASCII `(` `[` `{`, before any character: "[" \| "T]" and "(" \| "x" are gone, also across the spaces after it (`OP SP* ×`: "( x" never ends a row with "( ", as for the brackets of Chinese and Japanese text). Closing brackets, the typographic quotes “ ‘ « (German closes quotes with them) and every other mark are egui's. |
+| no break before a no-break space (class GL, LB12a) | U+00A0 after any character but a space: a letter, digit, mark, closing bracket, hyphen, Chinese or Japanese character, or another no-break space. After a space the break stays egui's (the space breaks after itself: "a " \| "\u{a0}b"). Only the break before it is ruled on: after it egui decides as before (a break after it stays a last resort, or before Chinese or Japanese). Unlike UAX #14 a hyphen before it doesn't lift the rule: no row starts with the blank. |
+
+A run these rules keep together (a bracket and its first character, "[T]\u{a0}" and the letter
+after it) moves to the next row whole when it fits there, like the runs of the CJK rules; where
+it doesn't (a name wider than a row), the row breaks at the last position the rules allow,
+inside the name, not after the bracket: "abc[Wwww…" breaks "abc" \| "[Wwww…", never "abc[" \|
+"Wwww…" (`any_allowed`, above). A run wider than the row still breaks where the row is full.
 
 Latin words and numbers inside CJK text stay whole (egui's own rules: no break inside them),
 get breaks before and after them, and an ASCII mark never breaks before a CJK closing one
@@ -89,7 +114,14 @@ kinsoku chooses or rules out makes a row of Chinese or Japanese text wider than 
 (plus the half point egui's rounding allows) unless one glyph is wider; the unit test
 `cjk_rows_never_overflow` checks paragraphs at every half point from 1 to 240 pt, with and
 without a first-row indentation. As with upstream egui, the rest of a Latin word can still
-overflow a row by less than a glyph in columns only two or three characters wide.
+overflow a row in columns only two or three characters wide (by up to about two glyphs below ~45 pt, as upstream does; fewer layouts overflow than upstream).
+
+One consequence of "no break after `(` `[` `{`, not even across the spaces after it": in a
+`horizontal_wrapped` label that starts after another widget (first-row indentation), a row
+whose only word boundary was a space after an opening bracket now gets egui's empty row
+(egui inserts one when a row has no acceptable break) where upstream would have broken after
+the bracket. It only shows for text like "( x" placed at the end of a row; the alternative is
+a row ending in an opening bracket, which the rule exists to prevent.
 
 A first-row indentation (egui's `leading_space`: a label after another widget in a
 `horizontal_wrapped` layout starts on that widget's row) gets egui's answer for a row without
@@ -100,11 +132,21 @@ by the indentation; its own rules rarely leave a row without a word boundary (a 
 wider than the row), kinsoku often (a run it keeps together, in a narrow column). Paragraphs
 without Chinese or Japanese keep egui's behaviour.
 
-**Text without Chinese or Japanese characters lays out as with upstream egui**: every such
-pair gets `Upstream`, so `RowBreakCandidates` behaves as before (the unit test
-`text_without_cjk_is_left_to_egui` checks over a million pairs of Latin, Greek, Cyrillic,
-Arabic, Hangul, punctuation, currency and emoji characters; the fallbacks and fit checks only
-act on Chinese or Japanese glyphs). The exception, in every script as in Unicode line breaking
+**Text without Chinese or Japanese characters lays out as with upstream egui, except for the
+two UAX #14 rules above** (no break after an ASCII opening bracket, none before a no-break
+space) **and the ellipses and doubled dashes below**: every other such pair gets `Upstream`, so
+`RowBreakCandidates` behaves as before (the unit test `text_without_cjk_is_left_to_egui` checks
+over a million pairs of Latin, Greek, Cyrillic, Arabic, Hangul, punctuation, currency and emoji
+characters, and lists the exceptions; `text_without_the_rules_characters_keeps_its_rows`
+compares wrapped rows with those recorded from upstream epaint 0.36.2; the fallbacks and fit
+checks only act where the rules do). When the UAX #14 rules were added, a one-off differential
+run laid out random paragraphs with upstream epaint 0.36.2 and with the patch at 90 widths
+from 6 to 330 pt: 540,000 layouts of paragraphs without brackets, no-break spaces, ellipses
+or doubled dashes (letters, digits, spaces, marks, dashes, quotes, closing brackets) had 0
+differences; of 720,000 with brackets and no-break spaces 136,000 differed, and in every one
+the first row break that differs is one upstream made at a position the rules prohibit. The
+patch leaves such a break only where the run kept together is wider than the row (rows
+narrower than about 60 pt). The exception, in every script as in Unicode line breaking
 (UAX #14), is ellipses and doubled dashes: no line starts with "…" "‥" "⋯" after a non-space
 ("wait…"), and "——" "――" "……" "‥‥" "⋯⋯" are not split while the pair fits on a row. Text
 with them can wrap differently from upstream at narrow widths: where "over……" doesn't fit
@@ -113,6 +155,18 @@ wider than the row) instead of before the ellipsis ("over" \| "……"); upstrea
 at the row's end ("d—" \| "—th") where the patch moves it whole. In particular “ ‘ « count
 as opening brackets only next to Chinese or Japanese characters, because they close quotes in
 German („Verwaltung“): an earlier version of the game's patch started German lines with “.
+
+The UAX #14 rules are the game's (commit 016464c), restated as pair rules of `line_break`. On
+paragraphs without brackets and no-break spaces the two patches lay Latin text out identically
+(a one-off differential run: 360,000 random layouts of letters, digits, spaces and marks other
+than closing brackets, quotes and stops, which the game's patch also keeps off a row start in
+Latin text and this one doesn't, 0 differences), and the differences with brackets and
+no-break spaces are deliberate: the bracket rule also holds across the spaces after it ("x [ y": the game's
+patch let a row end with "[ ", the engine's keeps "[ y" together, as UAX #14 and the brackets of
+Chinese and Japanese text), and the last-resort fallbacks skip a prohibited position when an
+allowed one fits (the game's patch broke "abc[" \| "Wwww…", or before a no-break space, when the
+row filled up right there). In the same run, all 64,606 layouts that differ from the game's
+patch (of 360,000 with brackets and no-break spaces) are one of these three cases.
 
 Improvements over the game's patch: prefixed signs (「￥」\|「1,200」), a Latin word before
 「。」 or 「、」 and 「Q」\|「」」 in the last-resort fallback, doubled dashes and ellipses,
@@ -127,13 +181,17 @@ common pairs (two characters below U+2000, a Han character or kana after one) wi
 full rules, and nothing allocates. A whole `epaint::text::layout` call (release build, warm
 glyph cache, 400 pt wide, Apple M4 Max) takes about 5 % longer than with upstream epaint for
 40 kB of English or Latin and Cyrillic text and 8–11 % for 20,000 characters of Chinese or
-Japanese: 0.1–0.2 ms more. Text that doesn't wrap costs the same. egui caches laid-out text,
+Japanese: 0.1–0.2 ms more. Text that doesn't wrap costs the same. The two UAX #14 rules add nothing measurable to
+that (one comparison per position in the shortcut; re-measured against the patch without them:
+within ±2 %, and 4–6 % over upstream for 40 kB of English). egui caches laid-out text,
 so this is paid only when a text or its width changes.
 
 ### Tests
 
 * `epaint/src/text/kinsoku.rs` unit tests (in the vendored crate; CI runs them): every class
-  and rule, egui's list included, Latin words and numbers, Chinese and straight quotes, spaces
+  and rule, egui's list included, the UAX #14 rules (character pairs; paragraphs with nested,
+  adjacent and spaced brackets at every width; a company tag and its name at every width; the
+  typographic quotes untouched), Latin words and numbers, Chinese and straight quotes, spaces
   next to brackets (pairs, and paragraphs at every width), the million-pair "no CJK, no change"
   check, German quotes at every width, runs of prohibited marks, a word wider than the row,
   rows that never overflow (also after a first-row indentation, where only the first row may
@@ -143,6 +201,11 @@ so this is paid only when a text or its width changes.
   tests. Run:
   `cargo test --manifest-path third_party/epaint/Cargo.toml --target-dir target/third_party --lib text::`
   (all of epaint's own tests pass too).
+* `crates/space3d-ui/tests/line_breaks.rs`: chat lines "12:04  [T]\u{a0}Name: text" (sections
+  as in the SpaceCorps chat) at every width from 140 to 600 pt: the tag's row holds the start of
+  the name, no row starts with the no-break space, "[T]\u{a0}nova:" stays whole, and no row ends
+  with an opening bracket, in messages with brackets of every kind and in tokens wider than a
+  row (a link, a formula). It fails without either rule (upstream fails it at most widths).
 * `crates/space3d-ui/tests/kinsoku.rs`: Japanese, Traditional and Simplified Chinese paragraphs
   (and one with spaces around brackets) with a CJK test font (a Noto Sans JP subset,
   `crates/space3d-ui/tests/fonts/`) at three sizes and every fourth width, checked against the

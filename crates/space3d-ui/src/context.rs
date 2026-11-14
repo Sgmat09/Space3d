@@ -237,6 +237,26 @@ impl EguiContext {
         self.pointer_over
     }
 
+    /// Whether a pointer release in this frame's pass was a **cancel**: the window lost the
+    /// focus mid-press, the OS showed the button up with no release event, or the system
+    /// cancelled a touch (see `docs/platforms.md`, "Mouse buttons, focus and the UI"). egui
+    /// registers no click and no drop for it, but it still ends the press, so
+    /// `Response::drag_stopped()` and `hovered()` + `any_released()` are `true` in that frame:
+    /// code that decides a drop or a commit from them should skip a frame for which this is
+    /// `true` (or [`Self::button_cancelled_this_frame`] for its button) and undo instead.
+    /// Valid from `Stage::PreUpdate` of the frame (the pass begins) until the next frame's.
+    /// [`crate::pointer_cancelled_this_frame`] is the same for code with only an
+    /// [`egui::Context`].
+    pub fn pointer_cancelled_this_frame(&self) -> bool {
+        crate::input::pointer_cancelled_this_frame(&self.ctx)
+    }
+
+    /// Like [`Self::pointer_cancelled_this_frame`] for one pointer button (a cancelled touch is
+    /// the primary button's).
+    pub fn button_cancelled_this_frame(&self, button: egui::PointerButton) -> bool {
+        crate::input::pointer_cancel_cause(&self.ctx, button).is_some()
+    }
+
     /// Queue a raw egui event for the next pass (tests, custom platforms, IME...).
     pub fn push_event(&mut self, event: egui::Event) {
         self.injected.push(event);
@@ -318,6 +338,10 @@ fn screen_info(sys: &SystemCtx, settings: &UiPlugin) -> ([u32; 2], f32, bool, us
     };
     let native_ppp = settings
         .pixels_per_point
+        .or_else(|| {
+            let points = settings.short_side_points.filter(|p| *p > 0.0)?;
+            Some((size[0].min(size[1]) as f32 / points).max(1.0))
+        })
         .unwrap_or_else(|| window.map_or(1.0, |w| w.scale_factor as f32))
         .max(0.1);
     let focused = window.is_none_or(|w| w.focused);
@@ -354,6 +378,8 @@ pub(crate) fn begin_frame(
         let _ = e.end_pass();
     }
     if !e.enabled {
+        // No pass, so no release is a cancel of this frame's.
+        crate::input::publish_pointer_cancels(&e.ctx, Default::default());
         return;
     }
     let ppp = native_ppp * e.ctx.zoom_factor();
@@ -362,17 +388,35 @@ pub(crate) fn begin_frame(
 
     let mut events = Vec::new();
     translator.focus(focused, &mut events);
-    let cancelled = sys
-        .resources
-        .get::<Input>()
-        .is_some_and(|input| translator.translate(input, ppp, time, &clipboard, &mut events));
+    let (cancelled, cancels) = match sys.resources.get::<Input>() {
+        Some(input) => {
+            let cancelled = translator.translate(input, ppp, time, &clipboard, &mut events);
+            (cancelled, translator.cancelled_buttons())
+        }
+        None => (false, Default::default()),
+    };
     events.extend(injected);
     if let Some(o) = sys.resources.get_mut::<RenderOverlays>() {
         o.set_scale_factor(ppp);
     }
 
+    // `UiPlugin::inside_safe_area`: the UI keeps out of a phone's notch and home bar.
+    let safe = sys
+        .resources
+        .get::<space3d_platform::SafeArea>()
+        .copied()
+        .filter(|_| settings.inside_safe_area)
+        .unwrap_or_default();
     let e = sys.resources.expect_mut::<EguiContext>();
-    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32 / ppp, size[1] as f32 / ppp));
+    let full = egui::vec2(size[0] as f32 / ppp, size[1] as f32 / ppp);
+    let (left, top) = (safe.left as f32 / ppp, safe.top as f32 / ppp);
+    let screen = egui::Rect::from_min_max(
+        egui::pos2(left, top),
+        egui::pos2(
+            (full.x - safe.right as f32 / ppp).max(left + 1.0),
+            (full.y - safe.bottom as f32 / ppp).max(top + 1.0),
+        ),
+    );
     let mut raw = egui::RawInput {
         screen_rect: Some(screen),
         max_texture_side: Some(max_texture_side),
@@ -395,6 +439,7 @@ pub(crate) fn begin_frame(
             ..Default::default()
         },
     );
+    crate::input::publish_pointer_cancels(&e.ctx, cancels);
     e.pixels_per_point = ppp;
     e.screen_size_px = size;
     e.available_rect = screen;
@@ -430,6 +475,15 @@ pub(crate) fn begin_frame(
 /// `Stage::PostUpdate`: end the pass, tessellate and hand the frame to the render overlay.
 pub(crate) fn end_frame(sys: &mut SystemCtx, overlay: &Arc<Mutex<EguiOverlay>>) {
     let natives = crate::textures::resolve_native_views(sys.resources);
+    // A focused text field asks the platform for typed text: on a phone, the on-screen
+    // keyboard (`space3d_platform::TextInput`; the last pass's answer, one frame late).
+    // (a text field, not any focus: a focused button takes Enter and wants no keyboard on screen)
+    if let Some(wanted) = sys.resources.get::<EguiContext>().map(|e| e.ctx().text_edit_focused()) {
+        let text_input = sys.resources.init::<space3d_platform::TextInput>();
+        if text_input.wanted != wanted {
+            text_input.wanted = wanted;
+        }
+    }
     let Some(e) = sys.resources.get_mut::<EguiContext>() else {
         return;
     };

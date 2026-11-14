@@ -19,6 +19,7 @@ use crate::pipeline::{
 };
 use crate::renderer::Renderer;
 use crate::stats::{DrawPath, RenderStats};
+use crate::unproject::inverse_proj_rot;
 use bytemuck::Zeroable;
 use glam::{Mat4, Vec3, Vec4};
 use space3d_core::{GlobalTransform, World};
@@ -294,8 +295,11 @@ pub(super) fn write_view_info(
     let (w, h) = (size.0.max(1) as f32, size.1.max(1) as f32);
     gv.view = view.to_cols_array_2d();
     gv.proj = proj.to_cols_array_2d();
+    // Kept for compatibility: the f32 inverse carries the camera position and is badly
+    // conditioned far from the origin. Directions (the sky) use `inv_proj_rot` instead.
     gv.inv_view_proj = (proj * view).inverse().to_cols_array_2d();
     gv.inv_proj = proj.inverse().to_cols_array_2d();
+    gv.inv_proj_rot = inverse_proj_rot(view, proj).to_cols_array_2d();
     gv.viewport = viewport;
     gv.target_size = [w, h, 1.0 / w, 1.0 / h];
     gv.depth = [near, far, ortho, 0.0];

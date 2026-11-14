@@ -77,14 +77,15 @@ program when a pipeline is first built (50–150 ms): prewarm on loading screens
 
 ## Android
 
-One-time setup:
+One-time setup (the exact commands for a Windows PC without Android Studio are in
+SpaceCorps2027's `docs/MOBILE.md`):
 
 ```sh
-# Android Studio → SDK Manager → SDK Tools → NDK (Side by side)
+# SDK: platform-tools, a platform, build-tools, the NDK (sdkmanager or Android Studio)
 export ANDROID_HOME="$HOME/Library/Android/sdk"        # Linux: $HOME/Android/Sdk
 export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/<version>"
 cargo install cargo-apk --locked
-rustup target add aarch64-linux-android
+# rust-toolchain.toml already lists aarch64-linux-android (phones) and x86_64-linux-android (PC emulators)
 ```
 
 Build and install:
@@ -95,13 +96,139 @@ adb install -r dist/android/<game>.apk
 adb logcat -s RustStdoutStderr
 ```
 
+The engine's own proof is `examples/hello_cube_mobile` (first run on a device: 2026-11-12, the
+Android 16 x86_64 emulator, cargo-apk 0.10.0, NDK 30):
+
+```sh
+cargo apk build -p hello_cube_mobile --lib --target x86_64-linux-android
+adb install -r target/debug/apk/hello_cube.apk
+adb shell am start -n org.spacecorps.space3d.hellocube/android.app.NativeActivity
+```
+
 Packaging metadata (application id, SDK levels, orientation, permissions, bundled `assets/`)
-lives in `[package.metadata.android]` of `mobile/Cargo.toml`. Rendering uses Vulkan (GLES
-fallback); touch input arrives as multi-touch `Touch`es and `Binding::TouchRegion` maps screen
-areas to actions. When the app is backgrounded the surface is dropped and recreated on resume —
-meshes and textures survive.
+lives in `[package.metadata.android]` of `mobile/Cargo.toml`; add `strip = "strip"` there, or a
+debug build's library carries hundreds of MB of debug info into the APK. What the engine does
+on Android:
+
+- **Entry**: `space3d::main!` generates `android_main` (NativeActivity; no Java code).
+  `space3d::platform::android_app()` is the activity's handle from the game's `build` on, and
+  `space3d::platform::mobile::data_dir()` the folder the app may write in.
+- **Assets**: the default asset source is `AndroidAssetSource`, the APK's `assets/` read through
+  the activity's asset manager (they are zip entries, not files). Hot reload is off.
+- **Rendering**: Vulkan (GLES fallback). wgpu's debug flags are off even in a debug build: the
+  emulator's Vulkan driver crashes when objects are named (set `WGPU_DEBUG=1` to ask for them).
+- **Lifecycle**: in the background the surface is dropped and the loop sleeps (no frames, no
+  systems); on resume the surface is recreated, meshes and textures survive. What must stop at
+  once hangs on `space3d_core::BackgroundHooks` (no frame runs to read an event):
+  `AudioPlugin` pauses everything that plays there and resumes it on return.
+- **The activity's end**: when the activity is destroyed (Back, the task swiped away, a
+  re-creation `configChanges` does not cover) the runner leaves the loop and
+  `android_main_entry` ends the process with `_exit`. winit 0.30 only logs `onDestroy`, whose
+  Java side waits for `android_main` to return: without this the process stayed and the next
+  start hung (seen on the emulator; `platform/src/android.rs` asks `Activity.isDestroyed()`
+  through JNI while the app is in the background). A game that exits by itself finishes the
+  activity first (`Activity.finish()`), then the same happens. List every change the game
+  handles itself in the manifest's `configChanges` (the example's `Cargo.toml` has the list),
+  or a split screen, a keyboard plugged in or a new system language restarts the process.
+- **Input**: multi-touch `Touch`es, `Binding::TouchRegion`; `WindowPlugin::touch_as_mouse` makes
+  fingers the mouse too, for controls and a UI written for one (`platform::touch_pointer`): a
+  tap is a left click whose press comes a frame after the pointer (so a UI knows whose click it
+  is), a drag a left drag, a long press (0.5 s, still) a right click, a two-finger pinch the
+  wheel, and the pointer leaves when the finger lifts. The lift after a long press is no left
+  click. Going to the background or losing the focus forgets every finger
+  (`TouchPointer::reset`, `Input::clear_touches`). While a `space3d-ui` text field
+  has the focus (`TextInput::wanted`) the on-screen keyboard is up; it is asked for again a
+  few frames after every finger lift and after a resume, because nothing tells the app that
+  the player put it away.
+  Two fingers are also a gesture, `Input::gesture()`: this frame's zoom (the ratio of the
+  fingers' distance), turn (radians, clockwise on the screen positive) and pan (pixels), with
+  the point between the fingers. The machine is the resource `touch_pointer::TouchMouse`
+  (`InputPlugin` adds it, off; `touch_as_mouse` turns it on): the window runner sends every
+  finger through `TouchMouse::touch`, and a test or a scripted run calls the same, so it works
+  without a window. Its per-frame step is a `PreUpdate` system at `TouchMouse::ORDER`. Two
+  options in `TouchMouse::pointer.config`: `press_on_move` holds the left press back until
+  the finger leaves the slop (the press lands where the finger went down) or lifts (a tap),
+  so a still finger presses nothing and a long press is the right click alone, for a game
+  that steers by holding the button; `pinch_wheel = false` leaves two fingers to the gesture.
+- **Typing is ASCII only.** A NativeActivity has no `InputConnection`, and winit 0.30's
+  Android backend sends no `Ime` events: text arrives only as key events, which is what a
+  keyboard sends for Latin letters, digits and punctuation. Cyrillic, CJK, swipe typing and
+  autocorrect text do not arrive (read in winit's and android-activity's source; only ASCII
+  was typed on the emulator). The way out is GameActivity (winit's `android-game-activity`,
+  which has GameTextInput) and a Gradle build, or a Java activity with an `InputConnection`.
+- **HTTPS**: `space3d_net::http_client_builder()` checks certificates against the compiled-in
+  Mozilla roots (reqwest's platform verifier needs a Java class a NativeActivity app has not).
+
+- **`SafeArea`** (resource): what the status bar, the navigation bar and a cutout cover of the
+  window; `UiPlugin::inside_safe_area` lays the UI out inside it. Read from Java through JNI
+  (`getRootWindowInsets().getInsets(systemBars | displayCutout)`, Android 11 on; the system
+  window insets before), again when the window's size changes and every 30 frames. Seen on
+  the emulator (Pixel 7 profile, landscape, 2400 x 1080): left 136 (the camera cutout), top 74
+  (the status bar), bottom 63 (the gesture bar). Only when Java gives no answer: the
+  activity's content rectangle, and for an edge-to-edge window 24 dp at the bottom.
+
+Not done: moving the view when the
+keyboard covers a text field, stopping the audio stream in the background (the sounds are
+paused, the stream stays open), compressed textures (ASTC), and
+`space3d build --target android` still builds arm64 only.
 
 ## iOS
+
+**What was built and run (2026-11-12, Mac mini, Xcode 27.2, iPhone 18 Pro Simulator on iOS
+27.2):** `hello_cube_mobile` as a program bundled by `scripts/ios-bundle.sh`, no Xcode project.
+It draws the cube on Metal (`adapter=Apple iOS simulator GPU`), loads `assets/proof.png` from
+the bundle, and comes back from the background in the same process. `cargo build` for
+`aarch64-apple-ios` (a device) was not run for this example; nothing ran on a device. The
+XcodeGen route further down was **not** run (xcodegen is not installed on the Mac).
+
+```sh
+rustup target add aarch64-apple-ios-sim aarch64-apple-ios   # rust-toolchain.toml lists them
+# The mobile library built as a program: a Rust `main` runs the app (`space3d::main!` makes
+# one), and cargo links the frameworks itself.
+cargo rustc -p hello_cube_mobile --lib --crate-type bin --target aarch64-apple-ios-sim
+scripts/ios-bundle.sh target/aarch64-apple-ios-sim/debug/hello_cube_mobile HelloCube   org.spacecorps.space3d.hellocube target/ios examples/hello_cube_mobile/assets
+SIM="iPhone 18 Pro"                                         # a device name or UDID
+xcrun simctl boot "$SIM"; xcrun simctl bootstatus "$SIM"
+xcrun simctl install "$SIM" target/ios/HelloCube.app
+xcrun simctl launch --stdout=/tmp/hello.log --stderr=/tmp/hello.log "$SIM" org.spacecorps.space3d.hellocube
+xcrun simctl io "$SIM" screenshot hello.png
+```
+
+What iOS needed from the engine (all in `space3d-platform` unless said):
+
+- **Scenes.** An app linked with the iOS 27 SDK that has not adopted the scene life cycle is
+  stopped at launch (a trap in `UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption`;
+  winit 0.30 has no scenes). `src/ios.rs` registers a scene delegate class,
+  `Space3dSceneDelegate`, and puts winit's window into the scene when it connects; the app's
+  `Info.plist` must name that class in `UIApplicationSceneManifest` (the bundle script and the
+  template's `project.yml` do).
+- **The window is the screen.** `WindowPlugin`'s width and height are not passed to winit on
+  iOS (they made a 1280 x 720 point window, a third of it off screen), and the renderer and
+  `Input` take `outer_size` (winit's `inner_size` is the safe area only).
+- **The loop waits.** `ControlFlow::Wait` on iOS: a redraw request becomes `drawRect` at the
+  display's pace. With `Poll` the main run loop span hundreds of thousands of times a second.
+- **Log.** winit's iOS loop logs a warning and an info line of its own in every frame;
+  `LogPlugin`'s default filter silences that target on iOS (a game with its own filter adds
+  `winit::platform_impl::ios=error`).
+- **Assets** (`space3d-assets`): a relative root is the bundle's folder. **Files:**
+  `mobile::data_dir()` is `Library/Application Support` in the app's container.
+- **`SafeArea`** (resource): the view's `safeAreaInsets` in pixels; `UiPlugin::inside_safe_area`
+  lays the UI out inside it (off by default). **Not right in landscape in the Simulator:**
+  UIKit answers the portrait insets (62 points top, 34 bottom) for a landscape scene, so the
+  runner turns such insets (`SafeArea::turned_for_landscape`: the top's at both sides, two
+  thirds of the bottom's). A guess until a device shows what UIKit answers there.
+- **`UiPlugin::short_side_points`**: a UI scale from the screen's short side, for a UI made for
+  a laptop's window.
+
+The on-screen keyboard's Return arrives from winit as the text "
+" of an unidentified key;
+the runner makes it the Enter key, pressed and released (unit test in `runner.rs`; not tried
+in the Simulator).
+
+Not done or not seen: touches and the on-screen keyboard (the code paths are winit's; `simctl`
+cannot tap), rotation, audio, a device, signing, `space3d build --target ios`.
+
+### The Xcode route (`space3d build --target ios`; not run)
 
 One-time setup (macOS only):
 
@@ -289,9 +416,14 @@ more things release it, as **cancels** (`MouseButtonEvent::cancelled()`,
   and releases a button the OS showed held during this press and has shown up since, on
   consecutive checks spanning at least 50 ms (two at least, with a frame's events delivered in
   between: the OS state can be ahead of the event queue, and a real release event still on its
-  way stays a real release). A press the OS never showed held (a click
-  shorter than a frame, a synthetic or injected press) is left to its own release. It never
-  presses anything.
+  way stays a real release). Only a press the window itself received (an event of the OS window)
+  is checked: a press a test, a replay or a script injected (`Input::inject_mouse_button_down`)
+  was never held by the OS, so the developer's own physical button — held in another window
+  and let go later — cannot release it. There is no check either while the window has no focus
+  or in background mode (windowed runs of tests, CI and agents: `space3d_platform::background`):
+  the OS's buttons then belong to another app, and what was seen of a press is forgotten. A
+  press the OS never showed held (a click shorter than a frame, a synthetic press) is left to
+  its own release. It never presses anything.
 
 | platform | OS button state | a lost release |
 |---|---|---|
@@ -308,6 +440,32 @@ distance is no click), then the cursor's current position. A button event while 
 outside the window goes to the last position egui saw, and the pointer is gone again right after
 (`PointerGone`), so nothing at the window's corner gets hovered. `Event::WindowFocused` is sent
 when `WindowState::focused` changes (egui then forgets the keys and modifiers it held).
+
+* **A release outside the window is not a click on a widget at the window's edge**, even in
+  the frame the pointer leaves: it is delivered at the last position egui saw, after egui's
+  pointer detoured off-screen (as for a cancel), so the widget under that position sees a
+  release but no click. A drag-and-drop payload is dropped nowhere. (The one exception is the
+  case described under "A cancel only concerns its own button": when egui has no press in
+  progress for the button, it has nothing to withhold a click from.)
+* **No pointer position yet.** A button event before any pointer position is known (nothing has
+  moved the cursor into the window; a test that presses first) is *dropped*, not sent to
+  (0, 0): the press is ignored and so is its release, whenever it comes (a release after the
+  cursor moved in is not delivered to a press egui never saw). Buttons work as soon as one
+  position was seen; `Input` itself still records them (`mouse_pressed`, `mouse_button_events`).
+* **A cancel only concerns its own button.** egui follows one press at a time and any release
+  ends the click in progress, so a cancel between another button's press and release would
+  swallow that click. The UI therefore sends a cancel as early as it can: ahead of the presses
+  and clicks of the other buttons in its frame (after its own button's earlier events, after
+  other cancels, and after the release that ends a click begun in an earlier frame).
+  A right click that starts and ends in the frame the held left button is cancelled is a
+  right click. (When a click begun earlier ends in the same frame as another button's cancel,
+  egui has no press in progress when the cancel comes and judges it alone: the click of the
+  other button is kept, and the cancelled release may count as a click there.)
+* **Touches.** `TouchPhase::Cancelled` (an incoming call, a rejected palm, a system gesture
+  that took the finger) ends the touch like `Ended` but is no tap: `Input::just_ended_touches`
+  lists it, `Input::just_cancelled_touches` tells which of those were cancelled, egui gets
+  `TouchPhase::Cancel`, and the pointer touch's release is a cancelled release of the primary
+  button (no click). Games should not fire on the release of a cancelled touch.
 
 A cancelled release registers **neither a click nor a drop** in egui — like switching away from
 a native app mid-drag. Drags end (`Response::drag_stopped`), a dragged slider keeps its value,
@@ -328,6 +486,47 @@ for e in ctx.resources.expect::<Input>().mouse_button_events() {
 }
 ```
 
+**Deciding drops and commits from egui.** egui has no notion of a cancel: a cancelled release
+still ends the press, so `Response::drag_stopped()`, `PointerState::button_released` and
+`any_released()` are `true` in that frame, and "drop here" logic written as `hovered()` (or
+`contains_pointer()`) with `any_released()` would act on a focus loss. Ask whether the release
+was a cancel:
+`EguiContext::pointer_cancelled_this_frame()` (any button) and
+`EguiContext::button_cancelled_this_frame(button)`, or, when only an `egui::Context` is at
+hand, the free functions `space3d_ui::pointer_cancelled_this_frame(ctx)` and
+`space3d_ui::pointer_cancel_cause(ctx, button)` (the `MouseButtonCause`: `FocusLost` or
+`OsReconciled`; a cancelled touch is the primary button's, `FocusLost`). They describe the
+frame's pass, from `Stage::PreUpdate` (`ui::begin_frame`) until the next frame's, and are
+`false` without a running `UiPlugin` or while the UI is disabled.
+
+```rust
+app.add_root_ui_system(|ui: &mut egui::Ui, sys: &mut SystemCtx| {
+    let cancelled = sys
+        .resources
+        .expect::<EguiContext>()
+        .button_cancelled_this_frame(egui::PointerButton::Primary);
+    let (_, zone) = ui.allocate_exact_size(egui::vec2(60.0, 30.0), egui::Sense::hover());
+    let released = ui.input(|i| i.pointer.any_released());
+    if zone.contains_pointer() && released {
+        if cancelled {
+            put_it_back();           // focus lost / a release only the OS saw: no drop
+        } else {
+            drop_here();             // a real release
+        }
+    }
+});
+```
+
+egui's own drag-and-drop (`Response::dnd_release_payload`) needs none of this: the engine drops
+the payload before the pass on a cancel. Code that runs outside the UI systems (a game
+system reading `Input`) uses `MouseButtonEvent::cancelled()` as above.
+
+**Sub-apps in the editor.** A `LiveView` (the editor's sub-app viewport, the storybook's story
+view) forwards its host UI's pointer to the sub-app's `Input`: a press as a device press, a
+release as a device release — or, when the host cancelled it (`pointer_cancel_cause`), as
+`Input::release_mouse_button(button, cause)` with the host's cause, so the story or sub-app's
+own `MouseButtonEvent::cancelled()` and UI behave as in a window of their own.
+
 **egui plugins.** egui 0.36 runs its plugins' pass hooks (`Plugin::on_begin_pass` /
 `on_end_pass`) only from `Context::run_ui`; the engine's pass spans `Stage::PreUpdate` to
 `Stage::PostUpdate` (`begin_pass` / `end_pass`), so the engine runs the hooks itself, in
@@ -342,7 +541,9 @@ does not know about do not run, and `egui::Context::on_begin_pass` / `on_end_pas
 
 **Tests** drive all of this headless: `WindowState::focused = false` plus `Input::release_all()`
 is what the runner does on a focus loss, and `Input::release_mouse_button(b,
-MouseButtonCause::OsReconciled)` is what the OS check does.
+MouseButtonCause::OsReconciled)` is what the OS check does. Injected presses
+(`inject_mouse_button_down`) are never subject to the OS check; only the runner's own window
+events are (crate-internal `Input::os_mouse_button`).
 
 ## The mouse cursor and the window icon
 

@@ -17,7 +17,10 @@
 //!   `egui::Event::WindowFocused` follows the window's focus. A release that no device event
 //!   reported — the window lost the focus, or the OS shows the button up with no release event —
 //!   is a cancel: egui registers neither a click nor a drop (see `docs/platforms.md`, "Mouse
-//!   buttons, focus and the UI").
+//!   buttons, focus and the UI"); a system-cancelled touch is no tap either.
+//!   [`EguiContext::pointer_cancelled_this_frame`] / [`pointer_cancelled_this_frame`] tell game
+//!   code that decides drops from `Response::drag_stopped` / `any_released` to skip such a frame.
+//!   Buttons before any pointer position is known are dropped (not sent to (0, 0)).
 //! * egui plugins get their pass hooks (`on_begin_pass` before the UI systems, `on_end_pass`
 //!   after them), which egui itself only runs from `Context::run_ui`: the built-in ones (label
 //!   text selection, drag-and-drop, `egui::debug_text`) and those added with
@@ -84,7 +87,10 @@ pub use context::{EguiContext, UiFrameStats, winit_cursor};
 pub use debug::DebugOverlay;
 pub use egui;
 pub use egui_wgpu;
-pub use input::{REPEAT_DELAY, REPEAT_INTERVAL, REPEAT_KEYS, egui_key, egui_logical_key, physical_key_for_egui_key};
+pub use input::{
+    REPEAT_DELAY, REPEAT_INTERVAL, REPEAT_KEYS, egui_key, egui_logical_key, physical_key_for_egui_key,
+    pointer_cancel_cause, pointer_cancelled_this_frame,
+};
 pub use profiler::{FrameTimeline, Profiler, ProfilerLayer, SystemStats, TimelineSpan};
 pub use textures::UiTextures;
 pub use theme::{
@@ -108,6 +114,15 @@ pub struct UiPlugin {
     /// Fixed physical pixels per egui point. `None` follows
     /// `space3d_platform::WindowState::scale_factor` (1.0 without a window).
     pub pixels_per_point: Option<f32>,
+    /// A phone's rule for the scale, used while `pixels_per_point` is `None`: the scale at which
+    /// the screen's short side is this many points (never below 1.0). A UI made for a laptop's
+    /// window then fits a phone, with small text. `None`: the window's own scale.
+    pub short_side_points: Option<f32>,
+    /// Lay the UI out inside `space3d_platform::SafeArea` (a phone's notch and home bar) and
+    /// not over the whole screen. Off by default. The insets are filled on Android and iOS (in
+    /// landscape UIKit's values were the portrait ones in the Simulator, and the runner turns
+    /// them: `space3d_platform::SafeArea::turned_for_landscape`).
+    pub inside_safe_area: bool,
     /// UI size in physical pixels when there is neither a renderer nor a window.
     pub fallback_size: (u32, u32),
     /// Dither egui's output to reduce banding (position-based, so still deterministic).
@@ -135,6 +150,8 @@ impl Default for UiPlugin {
     fn default() -> Self {
         Self {
             pixels_per_point: None,
+            short_side_points: None,
+            inside_safe_area: false,
             fallback_size: (1280, 720),
             dithering: true,
             animations: true,

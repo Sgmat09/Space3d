@@ -25,8 +25,14 @@ struct Page {
     button: egui::Rect,
     clicks: u32,
     double_clicks: u32,
+    secondary_clicks: u32,
     corner: egui::Rect,
     corner_hovered: bool,
+    corner_clicks: u32,
+    /// Releases over the drop zone by egui's own view (`contains_pointer()` and `any_released()`), and
+    /// those that were not cancels ([`pointer_cancelled_this_frame`]).
+    zone_releases: u32,
+    zone_real_releases: u32,
 }
 
 impl Default for Page {
@@ -44,8 +50,12 @@ impl Default for Page {
             button: none,
             clicks: 0,
             double_clicks: 0,
+            secondary_clicks: 0,
             corner: none,
             corner_hovered: false,
+            corner_clicks: 0,
+            zone_releases: 0,
+            zone_real_releases: 0,
         }
     }
 }
@@ -95,6 +105,12 @@ fn page_app() -> App {
                 if drop.dnd_release_payload::<u32>().is_some() {
                     page.dropped += 1;
                 }
+                if drop.contains_pointer() && ui.input(|i| i.pointer.any_released()) {
+                    page.zone_releases += 1;
+                    if !pointer_cancelled_this_frame(ui.ctx()) {
+                        page.zone_real_releases += 1;
+                    }
+                }
                 page.zone = zone;
                 let button = ui.button("Button");
                 page.button = button.rect;
@@ -103,6 +119,9 @@ fn page_app() -> App {
                 }
                 if button.double_clicked() {
                     page.double_clicks += 1;
+                }
+                if button.secondary_clicked() {
+                    page.secondary_clicks += 1;
                 }
             });
         page.primary_down = ui.input(|i| i.pointer.primary_down());
@@ -115,6 +134,9 @@ fn page_app() -> App {
                 let r = ui.add(egui::Button::new("Corner").min_size(egui::vec2(80.0, 40.0)));
                 page.corner = r.rect;
                 page.corner_hovered = r.hovered();
+                if r.clicked() {
+                    page.corner_clicks += 1;
+                }
             });
     });
     // Before `ui::end_frame` (order 0): the rows painted with the selection background.
@@ -662,4 +684,226 @@ fn a_release_while_the_ui_is_disabled_does_not_stick() {
     assert_eq!(page(&app).highlighted, 0);
     click(&mut app, button);
     assert_eq!(page(&app).clicks, 1);
+}
+
+// ---- edge cases: one cancel among other buttons, releases outside, no position, touches -------
+
+/// A cancelled release belongs to its own button: another button's click is not lost with it,
+/// whether the click's release comes in the frame of the cancel or in the next one. (egui
+/// tracks one press at a time and ends it on any release, so the cancel must not land between
+/// the other button's press and release.)
+#[test]
+fn a_cancel_does_not_swallow_another_buttons_click() {
+    use space3d_platform::MouseButtonCause;
+    for release_in_the_same_frame in [true, false] {
+        let mut app = page_app();
+        let button = page(&app).button.center();
+        // The primary button is held over empty page, then over the button.
+        to(&mut app, egui::pos2(900.0, 600.0));
+        down(&mut app, MouseButton::Left);
+        to(&mut app, button);
+        // One frame: the secondary button goes down on the button, the OS shows the primary one up.
+        let i = input(&mut app);
+        i.inject_mouse_button_down(MouseButton::Right);
+        i.release_mouse_button(MouseButton::Left, MouseButtonCause::OsReconciled);
+        if release_in_the_same_frame {
+            i.inject_mouse_button_up(MouseButton::Right);
+        }
+        app.step_ticks(1);
+        if !release_in_the_same_frame {
+            up(&mut app, MouseButton::Right);
+        }
+        assert_eq!(
+            page(&app).secondary_clicks,
+            1,
+            "the secondary click survived the cancel (release in the same frame: {release_in_the_same_frame})"
+        );
+        assert_eq!(page(&app).clicks, 0, "the cancelled primary press is no click");
+        assert!(!page(&app).primary_down);
+    }
+}
+
+/// The frame's order still holds where the cancel splits nothing: a click that completes
+/// before the cancel (a release of a button held from an earlier frame, or a whole click) is
+/// a click. The cancelled button's press is no click after a whole click. After the release of
+/// a click begun in an earlier frame, egui's one shared press is already over, and its own
+/// judgement of the cancelled release stands (the click stays the other button's: what is
+/// kept is that nothing swallows it).
+#[test]
+fn clicks_that_finish_before_a_cancel_stay_clicks() {
+    use space3d_platform::MouseButtonCause;
+    let mut app = page_app();
+    let button = page(&app).button.center();
+    to(&mut app, egui::pos2(900.0, 600.0));
+    down(&mut app, MouseButton::Left);
+    to(&mut app, button);
+    down(&mut app, MouseButton::Right);
+    // Released, then the OS check cancels the primary button: both in one frame.
+    let i = input(&mut app);
+    i.inject_mouse_button_up(MouseButton::Right);
+    i.release_mouse_button(MouseButton::Left, MouseButtonCause::OsReconciled);
+    app.step_ticks(1);
+    assert_eq!(page(&app).secondary_clicks, 1, "release before the cancel");
+    assert!(!page(&app).primary_down);
+    // A whole click before a cancel.
+    let clicks_before = page(&app).clicks;
+    down(&mut app, MouseButton::Left);
+    let i = input(&mut app);
+    i.inject_mouse_button_down(MouseButton::Right);
+    i.inject_mouse_button_up(MouseButton::Right);
+    i.release_mouse_button(MouseButton::Left, MouseButtonCause::OsReconciled);
+    app.step_ticks(1);
+    assert_eq!(page(&app).secondary_clicks, 2, "a whole click before the cancel");
+    assert_eq!(
+        page(&app).clicks,
+        clicks_before,
+        "the cancelled press is still no click"
+    );
+    assert!(!page(&app).primary_down);
+}
+
+/// A release outside the window is no click, even on a widget at the window's edge: the press
+/// on the corner button, then the pointer leaves the window and the button comes up outside
+/// (in the frame of the pointer leaving, or a frame later).
+#[test]
+fn a_release_outside_the_window_is_no_click_on_a_widget_at_the_edge() {
+    for same_frame in [true, false] {
+        let mut app = page_app();
+        to(&mut app, egui::pos2(4.0, 20.0));
+        down(&mut app, MouseButton::Left);
+        let i = input(&mut app);
+        i.inject_mouse_move(Vec2::new(1.0, 20.0));
+        i.inject_mouse_left();
+        if same_frame {
+            i.inject_mouse_button_up(MouseButton::Left);
+        }
+        app.step_ticks(1);
+        if !same_frame {
+            up(&mut app, MouseButton::Left);
+        }
+        assert_eq!(
+            page(&app).corner_clicks,
+            0,
+            "released outside (same frame: {same_frame})"
+        );
+        assert!(!page(&app).primary_down);
+        // Released inside, the same widget is a click.
+        let corner = page(&app).corner.center();
+        click(&mut app, corner);
+        assert_eq!(page(&app).corner_clicks, 1, "a click inside still is one");
+    }
+}
+
+/// Before any pointer position is known, button events are dropped (with their release): they
+/// do not go to (0, 0), where the corner window sits.
+#[test]
+fn buttons_before_the_pointer_is_known_are_dropped() {
+    let mut app = page_app();
+    assert_eq!(input(&mut app).mouse_position(), None);
+    down(&mut app, MouseButton::Left);
+    up(&mut app, MouseButton::Left);
+    assert_eq!(page(&app).corner_clicks, 0, "no click at (0, 0)");
+    assert!(!page(&app).corner_hovered);
+    // A press before the pointer is known, the release after it moved in: dropped as a pair.
+    down(&mut app, MouseButton::Left);
+    let corner = page(&app).corner.center();
+    to(&mut app, corner);
+    up(&mut app, MouseButton::Left);
+    assert_eq!(page(&app).corner_clicks, 0, "the release of a dropped press is dropped");
+    assert!(!page(&app).primary_down);
+    // Once known, buttons work.
+    click(&mut app, corner);
+    assert_eq!(page(&app).corner_clicks, 1);
+}
+
+/// A touch the system cancelled is no tap: egui gets no click (the pointer touch is a cancelled
+/// release), while a touch that ends is one.
+#[test]
+fn a_cancelled_touch_is_no_tap() {
+    use space3d_platform::TouchPhase;
+    for (phase, clicks) in [(TouchPhase::Ended, 1), (TouchPhase::Cancelled, 0)] {
+        let mut app = page_app();
+        let corner = page(&app).corner.center();
+        let at = Vec2::new(corner.x, corner.y);
+        input(&mut app).inject_touch(1, TouchPhase::Started, at);
+        app.step_ticks(1);
+        input(&mut app).inject_touch(1, phase, at);
+        app.step_ticks(1);
+        assert_eq!(page(&app).corner_clicks, clicks, "{phase:?}");
+        assert!(!page(&app).primary_down, "{phase:?}");
+        app.step_ticks(1);
+        assert!(!page(&app).primary_down);
+    }
+}
+
+// ---- telling a cancel from a real release ------------------------------------------------------
+
+/// egui ends the press on a cancelled release like on a real one (`hovered()` with
+/// `any_released()` is true), so game code needs to ask: `pointer_cancelled_this_frame`,
+/// `EguiContext::{pointer,button}_cancelled_this_frame` and `pointer_cancel_cause`.
+#[test]
+fn game_code_can_tell_a_cancelled_release_from_a_real_one() {
+    use space3d_platform::MouseButtonCause;
+    let flags = |app: &App| {
+        let e = app.resources.expect::<EguiContext>();
+        let c = ctx(app);
+        (
+            e.pointer_cancelled_this_frame(),
+            e.button_cancelled_this_frame(egui::PointerButton::Primary),
+            e.button_cancelled_this_frame(egui::PointerButton::Secondary),
+            pointer_cancelled_this_frame(&c),
+            pointer_cancel_cause(&c, egui::PointerButton::Primary),
+        )
+    };
+    let none = (false, false, false, false, None);
+    let mut app = page_app();
+    let source = page(&app).source.center();
+    let zone = page(&app).zone.center();
+    let drag_to_zone = |app: &mut App| {
+        to(app, source);
+        down(app, MouseButton::Left);
+        for k in 1..=4 {
+            to(app, source + (zone - source) * (k as f32 / 4.0));
+        }
+    };
+    assert_eq!(flags(&app), none);
+    // A real drop: a release over the zone, not a cancel.
+    drag_to_zone(&mut app);
+    up(&mut app, MouseButton::Left);
+    assert_eq!((page(&app).zone_releases, page(&app).zone_real_releases), (1, 1));
+    assert_eq!(flags(&app), none);
+    // A cancel by the OS's state: egui sees a release over the zone (the naive check acts), the
+    // helper says it was a cancel; only the primary button, with the cause.
+    drag_to_zone(&mut app);
+    input(&mut app).release_mouse_button(MouseButton::Left, MouseButtonCause::OsReconciled);
+    app.step_ticks(1);
+    assert_eq!((page(&app).zone_releases, page(&app).zone_real_releases), (2, 1));
+    assert_eq!(page(&app).dropped, 1, "and egui's own drop did not happen");
+    assert_eq!(
+        flags(&app),
+        (true, true, false, true, Some(MouseButtonCause::OsReconciled))
+    );
+    app.step_ticks(1);
+    assert_eq!(flags(&app), none, "this frame's only");
+    // A focus loss.
+    drag_to_zone(&mut app);
+    blur(&mut app);
+    assert_eq!((page(&app).zone_releases, page(&app).zone_real_releases), (3, 1));
+    assert_eq!(flags(&app).4, Some(MouseButtonCause::FocusLost));
+    refocus(&mut app);
+    assert_eq!(flags(&app), none);
+    // A cancel of another button is not the primary's.
+    to(&mut app, zone);
+    down(&mut app, MouseButton::Right);
+    input(&mut app).release_mouse_button(MouseButton::Right, MouseButtonCause::FocusLost);
+    app.step_ticks(1);
+    let (any, primary, secondary, ..) = flags(&app);
+    assert!(any && secondary && !primary);
+    // While the UI is disabled nothing is a cancel of the frame.
+    app.step_ticks(1);
+    down(&mut app, MouseButton::Left);
+    input(&mut app).release_mouse_button(MouseButton::Left, MouseButtonCause::FocusLost);
+    app.resources.expect_mut::<EguiContext>().set_enabled(false);
+    app.step_ticks(1);
+    assert_eq!(flags(&app), none, "no pass, no cancel");
 }

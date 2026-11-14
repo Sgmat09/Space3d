@@ -80,7 +80,7 @@ fn nebula(d: Vec3) -> Vec3 {
 
 /// The nebula's clouds, core and dark sky (smooth: evaluated on a coarse grid and
 /// interpolated by the generators).
-fn nebula_clouds(d: Vec3) -> Vec3 {
+pub(super) fn nebula_clouds(d: Vec3) -> Vec3 {
     // Clouds concentrate in a tilted band (a galactic plane) and around a bright core.
     let band = Vec3::new(0.25, 1.0, 0.35).normalize();
     let core = Vec3::new(0.55, 0.2, -0.8).normalize();
@@ -105,7 +105,7 @@ fn nebula_clouds(d: Vec3) -> Vec3 {
 /// about one texel of a 1024² face, so a star is a soft dot of a few texels instead of a
 /// magnified square), up to 8× white. A star sits in the middle of its cell, so its gaussian has
 /// faded out (below 1 %) before the cell's edge.
-fn nebula_stars(d: Vec3) -> Vec3 {
+pub(super) fn nebula_stars(d: Vec3) -> Vec3 {
     let g = 70.0;
     let cell = (d * g).floor();
     let h = hash(cell.x as i32, cell.y as i32, cell.z as i32, 99);
@@ -202,7 +202,7 @@ fn panorama_split(width: u32, step: u32, smooth: fn(Vec3) -> Vec3, sharp: fn(Vec
 
 /// Six `size`² `Rgba16Float` faces in wgpu order (the cube-map face table) of `smooth`, evaluated
 /// on a quarter-resolution grid and interpolated, plus `sharp` at every texel.
-fn faces(size: u32, smooth: fn(Vec3) -> Vec3, sharp: fn(Vec3) -> Vec3) -> CubemapSource {
+pub(super) fn faces(size: u32, smooth: fn(Vec3) -> Vec3, sharp: fn(Vec3) -> Vec3) -> CubemapSource {
     let dir = |face: usize, s: f32, t: f32| {
         match face {
             0 => Vec3::new(1.0, -t, -s),
@@ -271,7 +271,7 @@ fn studio_panorama() -> &'static HdrImageData {
     PANO.get_or_init(|| panorama(512, studio))
 }
 
-fn cubemap(app: &mut App, source: CubemapSource) -> CubemapHandle {
+pub(super) fn cubemap(app: &mut App, source: CubemapSource) -> CubemapHandle {
     app.resources.init::<RenderAssets>().add_cubemap(source)
 }
 

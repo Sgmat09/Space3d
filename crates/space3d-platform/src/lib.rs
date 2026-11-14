@@ -9,7 +9,8 @@
 //!   Mouse buttons keep their order within a frame ([`Input::mouse_button_events`]); releases
 //!   that no release event reported — a focus loss, or (macOS, Windows) the OS showing a held
 //!   button up once per frame — are cancels ([`MouseButtonCause`]): the UI registers no click
-//!   and no drop for them.
+//!   and no drop for them. A touch the system cancelled ([`TouchPhase::Cancelled`]) is no tap
+//!   either ([`Input::just_cancelled_touches`]).
 //! * [Keyboard layouts](#keyboard-layouts) — logical keys ([`KeyEvent`]) and key labels
 //!   ([`Input::key_label`]) that follow the player's layout; see [`layout`].
 //! * Web: `init_web_logging()` (wasm32 only), canvas attachment via [`WindowPlugin::canvas_id`].
@@ -54,12 +55,17 @@
 //! assert_eq!(input.key_label(KeyCode::Space).as_deref(), Some("Space"));
 //! ```
 
+#[cfg(target_os = "android")]
+mod android;
 pub mod background;
 mod input;
+#[cfg(target_os = "ios")]
+pub mod ios;
 pub mod layout;
 pub mod mobile;
 mod os_buttons;
 mod runner;
+pub mod touch_pointer;
 #[cfg(target_arch = "wasm32")]
 mod web;
 mod window;
@@ -67,17 +73,20 @@ mod window;
 pub use background::{background_mode, set_background_mode};
 pub use input::{
     ActionMap, ActionState, ActionValue, Binding, ButtonState, Gamepad, GamepadAxis, GamepadButton, Input, InputPlugin,
-    KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchPhase,
+    KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchGesture, TouchPhase,
 };
 pub use layout::{
     KeyLabel, KeyLabelSource, KeyLocation, KeyboardLayout, LogicalKey, NamedKey, english_key_name,
     is_writing_system_key, us_qwerty_label, writing_system_keys,
 };
 #[cfg(target_os = "android")]
-pub use mobile::{AndroidApp, android_main_entry};
+pub use mobile::{AndroidApp, android_app, android_main_entry};
 #[cfg(target_arch = "wasm32")]
 pub use web::{find_canvas, init_web_logging};
-pub use window::{AppliedCursor, CursorIcon, PlatformEvent, WindowCursor, WindowIcon, WindowPlugin, WindowState};
+pub use window::{
+    AppliedCursor, CursorIcon, KeyboardInset, PlatformEvent, SafeArea, TextInput, WindowCursor, WindowIcon,
+    WindowPlugin, WindowState,
+};
 
 pub use winit;
 

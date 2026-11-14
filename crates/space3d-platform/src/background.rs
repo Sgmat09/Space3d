@@ -43,9 +43,12 @@ pub fn background_mode() -> bool {
     match OVERRIDE.load(Ordering::Relaxed) {
         ON => true,
         OFF => false,
-        _ => resolve(|k| std::env::var(k).ok()),
+        // The environment is read once: this is called every frame by the runner.
+        _ => *ENV_MODE.get_or_init(|| resolve(|k| std::env::var(k).ok())),
     }
 }
+
+static ENV_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn resolve(get: impl Fn(&str) -> Option<String>) -> bool {
     if let Some(v) = get(ENV_BACKGROUND) {

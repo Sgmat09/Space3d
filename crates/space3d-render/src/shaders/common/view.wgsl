@@ -1,6 +1,7 @@
 // Space3d view uniform (`VIEW_WGSL` appends `@group(0) @binding(0) var<uniform> view: View;`).
-// Exactly the forward shader's `View` (std140-compatible, 1312 bytes). Node and overlay
-// shaders must not redefine `DirLight`, `PointLight`, `View` or `view`.
+// Exactly the forward shader's `View` (std140-compatible, 1376 bytes; the first 1312 are the
+// layout frozen at graphics milestone F3, later members are appended). Node and overlay shaders
+// must not redefine `DirLight`, `PointLight`, `View` or `view`.
 
 struct DirLight {
     direction: vec4<f32>,   // xyz: direction the light travels (normalized)
@@ -35,4 +36,10 @@ struct View {
     env_rotation: mat3x3<f32>,
     sky_rotation: mat3x3<f32>,
     sky_params: vec4<f32>,      // intensity, enabled, 0, 0
+    // (proj * view rotation)^-1, computed in f64 on the CPU: clip -> world-space offset from the
+    // camera (no camera position in it, so it is exact at any distance from the origin).
+    // `unproject(ndc, 1) - unproject(ndc, 0)` (each divided by w) is the pixel's world direction.
+    // `inv_view_proj` is the f32 inverse of `view_proj`: it carries the camera position and is
+    // badly conditioned far from the origin; prefer this for directions.
+    inv_proj_rot: mat4x4<f32>,
 }

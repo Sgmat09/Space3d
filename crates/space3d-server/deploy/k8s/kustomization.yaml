@@ -1,0 +1,17 @@
+# kubectl apply -k crates/space3d-server/deploy/k8s
+# Create the Secret first (secret.example.yaml); pods do not start without it. Point the images at your
+# registry with `images:` below (or `kustomize edit set image`). networkpolicy.yaml, ingress.example.yaml
+# and secret.example.yaml are optional / templates and are not listed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: space3d
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - player-service.yaml
+  - game-server.yaml
+images:
+  - name: registry.example.com/space3d/player-service
+    newTag: "0.1.0"
+  - name: registry.example.com/space3d/game-server
+    newTag: "0.1.0"

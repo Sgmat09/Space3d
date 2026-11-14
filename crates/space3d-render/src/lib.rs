@@ -61,6 +61,7 @@ mod stats;
 pub mod testing;
 mod texture;
 mod timing;
+mod unproject;
 
 pub use assets::{AddressMode, FilterMode, RenderAssets, SamplerSettings, TextureSource};
 pub use components::{
@@ -103,6 +104,7 @@ pub use post::api::*;
 pub use quality::GraphicsQuality;
 pub use settings::*;
 pub use timing::{GpuScope, GpuTimings};
+pub use unproject::{inverse_proj_rot, unproject_ray};
 
 pub use glam;
 pub use wgpu;

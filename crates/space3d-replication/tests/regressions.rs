@@ -164,6 +164,416 @@ fn parked_reference_resolves_when_the_target_arrives() {
     assert_eq!(client_aim(&h, a, holder), Some(cx));
 }
 
+// ---- 1b. references across scope changes -------------------------------------------------------
+//
+// An entity reference names the target's `NetId`. When the target leaves the client's scope its
+// local entity is despawned, and when it returns it is a new local entity: the referencing
+// component (which did not change, so the server sends nothing) has to be pointed at it again,
+// and a reference to a target the client never had (or that arrives long after the value)
+// resolves whenever the target shows up. The client keeps the newest value of every component
+// that holds references for that (`PendingRefs`), so it holds for streams and datagrams,
+// lossless or not.
+
+/// Two references at once: `Pair(a, b)` resolves only when both are known.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pair(Entity, Entity);
+
+struct PairProtocol;
+
+impl Plugin for PairProtocol {
+    fn build(&self, app: &mut App) {
+        app.add_plugin(AimProtocol).replicate_with::<Pair>(
+            "test.pair",
+            ComponentRule::mapped(
+                |p: &Pair, ctx: &EncodeCtx<'_>| {
+                    (ctx.net_id(p.0).map_or(0, |n| n.0), ctx.net_id(p.1).map_or(0, |n| n.0))
+                },
+                |(a, b): (u32, u32), ctx: &mut DecodeCtx<'_>| Some(Pair(ctx.entity(NetId(a))?, ctx.entity(NetId(b))?)),
+            ),
+        );
+    }
+}
+
+fn client_pair(h: &NetHarness, c: ClientHandle, holder: Entity) -> Option<(Entity, Entity)> {
+    let ce = h.client_entity(c, holder)?;
+    h.client(c).world.get::<&Pair>(ce).ok().map(|p| (p.0, p.1))
+}
+
+const TRANSPORTS: [(Semantics, bool); 4] = [
+    (Semantics::Stream, false),
+    (Semantics::Stream, true),
+    (Semantics::Datagram, false),
+    (Semantics::Datagram, true),
+];
+
+/// A connected client and a room with a `holder` and two targets, all in scope.
+struct Scope {
+    h: NetHarness,
+    a: ClientHandle,
+    holder: Entity,
+    x: Entity,
+    y: Entity,
+}
+
+fn scope_scene(semantics: Semantics, lossy: bool, seed: u64) -> Scope {
+    let conditions = if lossy {
+        LinkConditions::bad_wifi()
+    } else {
+        LinkConditions::lan()
+    };
+    let mut h = NetHarness::new(
+        HarnessConfig {
+            seed,
+            semantics,
+            link: LinkProfile::symmetric(conditions),
+            ..Default::default()
+        },
+        |app| {
+            app.add_plugin(PairProtocol);
+        },
+    );
+    let a = h.add_client(ClientSpec::named("alice"), |app| {
+        app.add_plugin(PairProtocol);
+    });
+    assert!(h.run_until(900, |h| h.client_net(a).is_connected()));
+    let (holder, x, y) = {
+        let w = &mut h.server_mut().world;
+        (
+            w.spawn((Replicated, Transform::default())),
+            w.spawn((Replicated, Transform::from_xyz(1.0, 0.0, 0.0))),
+            w.spawn((Replicated, Transform::from_xyz(2.0, 0.0, 0.0))),
+        )
+    };
+    assert!(h.run_until(900, |h| [holder, x, y].iter().all(|e| h.client_entity(a, *e).is_some())));
+    Scope { h, a, holder, x, y }
+}
+
+impl Scope {
+    fn set_visible(&mut self, e: Entity, visible: bool) {
+        let player = self.h.player(self.a);
+        let v = if visible {
+            Visibility::Default
+        } else {
+            Visibility::Hidden
+        };
+        self.h
+            .server_mut()
+            .resources
+            .expect_mut::<NetServer>()
+            .set_visibility(player, e, v);
+    }
+
+    fn wait_for(&mut self, what: &str, mut pred: impl FnMut(&NetHarness, ClientHandle) -> bool) {
+        let a = self.a;
+        assert!(self.h.run_until(1800, |h| pred(h, a)), "timed out: {what}");
+    }
+
+    fn hide(&mut self, e: Entity) {
+        self.set_visible(e, false);
+        self.wait_for("target gone from the client", |h, a| h.client_entity(a, e).is_none());
+    }
+
+    fn reveal(&mut self, e: Entity) {
+        self.set_visible(e, true);
+        self.wait_for("target back on the client", |h, a| h.client_entity(a, e).is_some());
+    }
+
+    /// Wait until the holder's `Aim` is the client entity of `target`.
+    fn expect_aim(&mut self, holder: Entity, target: Entity) {
+        self.wait_for("Aim resolved to the target's current client entity", |h, a| {
+            client_aim(h, a, holder).is_some() && client_aim(h, a, holder) == h.client_entity(a, target)
+        });
+    }
+}
+
+/// The bug: a reference whose target left the client's scope and came back kept pointing at the
+/// despawned local entity for good (the server never resent the unchanged component).
+#[test]
+fn reference_follows_its_target_back_into_scope() {
+    for (semantics, lossy) in TRANSPORTS {
+        let mut s = scope_scene(semantics, lossy, 7);
+        let (a, holder, x) = (s.a, s.holder, s.x);
+        s.h.server_mut().world.insert_one(holder, Aim(x)).unwrap();
+        s.expect_aim(holder, x);
+        let old = s.h.client_entity(a, x).unwrap();
+        s.hide(x);
+        s.reveal(x);
+        s.expect_aim(holder, x);
+        let new = s.h.client_entity(a, x).unwrap();
+        // (A datagram respawn may reuse the entity when the despawn was never applied; either
+        // way the reference names the entity the client has now.)
+        assert!(
+            new != old || semantics == Semantics::Datagram,
+            "{semantics:?}: same local entity"
+        );
+        s.h.step_ticks(120);
+        assert!(
+            s.h.assert_converged(a).is_ok(),
+            "{semantics:?}: {:?}",
+            s.h.assert_converged(a)
+        );
+    }
+}
+
+/// A target that keeps flapping in and out of scope: the reference always ends on the entity the
+/// client has now (no leftover kept values either).
+#[test]
+fn reference_survives_a_target_that_flaps() {
+    for (semantics, lossy) in TRANSPORTS {
+        let mut s = scope_scene(semantics, lossy, 21);
+        let (a, holder, x) = (s.a, s.holder, s.x);
+        s.h.server_mut().world.insert_one(holder, Aim(x)).unwrap();
+        s.expect_aim(holder, x);
+        for _ in 0..4 {
+            s.hide(x);
+            s.h.step_ticks(7);
+            s.reveal(x);
+        }
+        s.expect_aim(holder, x);
+        s.h.step_ticks(120);
+        assert_eq!(client_aim(&s.h, a, holder), s.h.client_entity(a, x), "{semantics:?}");
+        assert_eq!(
+            s.h.client_net(a).reference_stats(),
+            space3d_replication::client::receive::ReferenceStats { parked: 0, bound: 1 }
+        );
+    }
+}
+
+/// A reference to a target the client only gets long after the value arrived (the old 1 s
+/// pending window dropped the value, and the server never resent it).
+#[test]
+fn reference_to_a_late_target_resolves_however_late_it_arrives() {
+    for (semantics, lossy) in TRANSPORTS {
+        let mut s = scope_scene(semantics, lossy, 33);
+        let (a, holder, x) = (s.a, s.holder, s.x);
+        s.hide(x);
+        s.h.server_mut().world.insert_one(holder, Aim(x)).unwrap();
+        s.h.step_ticks(600); // 10 s: far beyond any pending window
+        assert_eq!(client_aim(&s.h, a, holder), None, "x is not there yet");
+        assert_eq!(s.h.client_net(a).reference_stats().parked, 1);
+        s.reveal(x);
+        s.expect_aim(holder, x);
+        assert_eq!(s.h.client_net(a).reference_stats().parked, 0);
+    }
+}
+
+/// A value replaced while its old target was away must not come back with the target.
+#[test]
+fn a_newer_reference_is_not_overwritten_when_the_old_target_returns() {
+    for (semantics, lossy) in TRANSPORTS {
+        let mut s = scope_scene(semantics, lossy, 5);
+        let (a, holder, x, y) = (s.a, s.holder, s.x, s.y);
+        s.h.server_mut().world.insert_one(holder, Aim(x)).unwrap();
+        s.expect_aim(holder, x);
+        s.hide(x);
+        *s.h.server_mut().world.get::<&mut Aim>(holder).unwrap() = Aim(y);
+        s.expect_aim(holder, y);
+        s.reveal(x);
+        s.h.step_ticks(180);
+        assert_eq!(client_aim(&s.h, a, holder), s.h.client_entity(a, y), "{semantics:?}");
+    }
+}
+
+/// A component removed while its target was away must not come back with the target.
+#[test]
+fn a_removed_reference_does_not_return_with_its_old_target() {
+    for (semantics, lossy) in TRANSPORTS {
+        let mut s = scope_scene(semantics, lossy, 9);
+        let (a, holder, x) = (s.a, s.holder, s.x);
+        s.h.server_mut().world.insert_one(holder, Aim(x)).unwrap();
+        s.expect_aim(holder, x);
+        s.hide(x);
+        s.h.server_mut().world.remove_one::<Aim>(holder).unwrap();
+        s.wait_for("Aim removed on the client", |h, a| client_aim(h, a, holder).is_none());
+        s.reveal(x);
+        s.h.step_ticks(180);
+        assert_eq!(
+            client_aim(&s.h, a, holder),
+            None,
+            "{semantics:?}: removed component came back"
+        );
+        assert_eq!(
+            s.h.client_net(a).reference_stats(),
+            space3d_replication::client::receive::ReferenceStats::default()
+        );
+    }
+}
+
+/// Kept values never outlive their holder.
+#[test]
+fn kept_references_are_dropped_with_their_holder() {
+    for (semantics, lossy) in TRANSPORTS {
+        let mut s = scope_scene(semantics, lossy, 13);
+        let (holder, x, y) = (s.holder, s.x, s.y);
+        let holder2 = s.h.server_mut().world.spawn((Replicated, Transform::default()));
+        s.wait_for("second holder", |h, a| h.client_entity(a, holder2).is_some());
+        s.h.server_mut().world.insert_one(holder, Aim(x)).unwrap();
+        s.expect_aim(holder, x);
+        s.hide(y);
+        s.h.server_mut().world.insert_one(holder2, Aim(y)).unwrap(); // parked (y hidden)
+        s.wait_for("one bound, one parked", |h, a| {
+            h.client_net(a).reference_stats()
+                == space3d_replication::client::receive::ReferenceStats { parked: 1, bound: 1 }
+        });
+        s.h.server_mut().world.despawn(holder2).unwrap();
+        s.h.server_mut().world.despawn(holder).unwrap();
+        s.wait_for("holders gone", |h, a| {
+            h.client_net(a).reference_stats() == space3d_replication::client::receive::ReferenceStats::default()
+        });
+    }
+}
+
+/// A value with two references waits for both, whichever order they come back in.
+#[test]
+fn a_value_with_two_references_resolves_when_both_are_back() {
+    for (semantics, lossy) in TRANSPORTS {
+        for x_first in [true, false] {
+            let mut s = scope_scene(semantics, lossy, 17);
+            let (holder, x, y) = (s.holder, s.x, s.y);
+            s.h.server_mut().world.insert_one(holder, Pair(x, y)).unwrap();
+            s.wait_for("Pair resolved", |h, a| client_pair(h, a, holder).is_some());
+            s.hide(x);
+            s.hide(y);
+            let (first, second) = if x_first { (x, y) } else { (y, x) };
+            s.reveal(first);
+            s.h.step_ticks(90);
+            s.reveal(second);
+            s.wait_for("Pair points at the new entities", |h, a| {
+                client_pair(h, a, holder) == h.client_entity(a, x).zip(h.client_entity(a, y))
+            });
+        }
+    }
+}
+
+/// The built-in `core.parent` is an entity reference like any other.
+#[test]
+fn a_parent_follows_its_parent_back_into_scope() {
+    for (semantics, lossy) in TRANSPORTS {
+        let mut s = scope_scene(semantics, lossy, 3);
+        let (a, holder, x) = (s.a, s.holder, s.x);
+        // The child keeps its own visibility while the parent (its hierarchy root) is hidden.
+        let player = s.h.player(a);
+        s.h.server_mut()
+            .resources
+            .expect_mut::<NetServer>()
+            .set_visibility(player, holder, Visibility::Visible);
+        s.h.server_mut().world.insert_one(holder, Parent(x)).unwrap();
+        let parent_of = |h: &NetHarness, a: ClientHandle| {
+            let ce = h.client_entity(a, holder)?;
+            h.client(a).world.get::<&Parent>(ce).ok().map(|p| p.0)
+        };
+        s.wait_for("Parent resolved", |h, a| {
+            parent_of(h, a).is_some() && parent_of(h, a) == h.client_entity(a, x)
+        });
+        s.hide(x);
+        s.reveal(x);
+        s.wait_for("Parent points at the returned entity", |h, a| {
+            parent_of(h, a).is_some() && parent_of(h, a) == h.client_entity(a, x)
+        });
+    }
+}
+
+/// Decodes of `Watch` values, an `Aim` that counts them (for the cost test below only: no other
+/// test uses `Watch`, so nothing else moves the counter).
+static WATCH_DECODES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Watch(Entity);
+
+struct WatchProtocol;
+
+impl Plugin for WatchProtocol {
+    fn build(&self, app: &mut App) {
+        app.add_plugin(ReplicationPlugin::default()).replicate_with::<Watch>(
+            "test.watch",
+            ComponentRule::mapped(
+                |w: &Watch, ctx: &EncodeCtx<'_>| ctx.net_id(w.0).map_or(0, |n| n.0),
+                |id: u32, ctx: &mut DecodeCtx<'_>| {
+                    WATCH_DECODES.fetch_add(1, Ordering::Relaxed);
+                    ctx.entity(NetId(id)).map(Watch)
+                },
+            ),
+        );
+    }
+}
+
+/// Cost regression: the client decoded every parked value again in each snapshot that spawned
+/// anything (and applying a newer reference value scanned all of them), so the work per snapshot
+/// grew with the number of parked values, whatever was spawned. A parked value is now indexed by
+/// the entities it asked for: spawning something else decodes nothing, and the target's arrival
+/// decodes each value that waited for it once.
+#[test]
+fn unrelated_spawns_do_not_decode_parked_references() {
+    const HOLDERS: usize = 40;
+    let mut h = NetHarness::new(HarnessConfig::default(), |app| {
+        app.add_plugin(WatchProtocol);
+    });
+    let a = h.add_client(ClientSpec::named("alice"), |app| {
+        app.add_plugin(WatchProtocol);
+    });
+    assert!(h.run_until(600, |h| h.client_net(a).is_connected()));
+    let player = h.player(a);
+    let (target, holders) = {
+        let w = &mut h.server_mut().world;
+        let target = w.spawn((Replicated, Transform::default()));
+        let holders: Vec<Entity> = (0..HOLDERS)
+            .map(|_| w.spawn((Replicated, Transform::default())))
+            .collect();
+        (target, holders)
+    };
+    h.server_mut()
+        .resources
+        .expect_mut::<NetServer>()
+        .set_visibility(player, target, Visibility::Hidden);
+    assert!(h.run_until(900, |h| holders.iter().all(|e| h.client_entity(a, *e).is_some())));
+    assert!(h.client_entity(a, target).is_none(), "the target is hidden");
+    for e in &holders {
+        h.server_mut().world.insert_one(*e, Watch(target)).unwrap();
+    }
+    assert!(h.run_until(900, |h| h.client_net(a).reference_stats().parked == HOLDERS));
+    h.step_ticks(30);
+
+    let before = WATCH_DECODES.load(Ordering::Relaxed);
+    for i in 0..10 {
+        h.server_mut()
+            .world
+            .spawn((Replicated, Transform::from_xyz(i as f32, 0.0, 0.0)));
+        h.step_ticks(6);
+    }
+    let unrelated = WATCH_DECODES.load(Ordering::Relaxed) - before;
+    assert_eq!(unrelated, 0, "10 unrelated spawns decoded {unrelated} parked values");
+    assert_eq!(h.client_net(a).reference_stats().parked, HOLDERS);
+
+    // The target arrives: every value that waited for it resolves, each decoded about once.
+    h.server_mut()
+        .resources
+        .expect_mut::<NetServer>()
+        .set_visibility(player, target, Visibility::Default);
+    let watch_of = |h: &NetHarness, e: Entity| {
+        let ce = h.client_entity(a, e)?;
+        h.client(a).world.get::<&Watch>(ce).ok().map(|w| w.0)
+    };
+    assert!(
+        h.run_until(900, |h| {
+            let t = h.client_entity(a, target);
+            t.is_some() && holders.iter().all(|e| watch_of(h, *e) == t)
+        }),
+        "every parked value resolved"
+    );
+    let resolving = WATCH_DECODES.load(Ordering::Relaxed) - before;
+    assert!(
+        (HOLDERS..=2 * HOLDERS).contains(&resolving),
+        "resolving {HOLDERS} values decoded {resolving} times"
+    );
+    assert_eq!(
+        h.client_net(a).reference_stats(),
+        space3d_replication::client::receive::ReferenceStats {
+            parked: 0,
+            bound: HOLDERS
+        }
+    );
+}
+
 // ---- 2. room-level enforcement (fake link) ---------------------------------------------------
 
 #[derive(Default)]

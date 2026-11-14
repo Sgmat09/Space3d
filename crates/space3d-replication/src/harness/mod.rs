@@ -141,6 +141,26 @@ pub enum ConvergenceError {
     },
 }
 
+/// Whether the client cannot decode a component value because it names an entity that is
+/// outside its scope (an entity in scope must have arrived, so a value that names one is
+/// expected to decode).
+fn references_unseen(
+    entry: &crate::registry::ComponentEntry,
+    bytes: &[u8],
+    net: &crate::client::NetClient,
+    scope: &[NetId],
+) -> bool {
+    let mut ctx = crate::mapping::DecodeCtx::tracking(&net.map);
+    matches!(
+        entry.ops.check(bytes, &mut ctx),
+        Err(crate::wire::DecodeError::Unresolved)
+    ) && ctx
+        .requested()
+        .iter()
+        .filter(|id| net.entity(**id).is_none())
+        .all(|id| scope.binary_search(id).is_err())
+}
+
 struct ClientSlot {
     app: App,
     spec: ClientSpec,
@@ -436,6 +456,14 @@ impl NetHarness {
                     _ => false,
                 };
                 if !same {
+                    // A value that names an entity outside the client's scope cannot be
+                    // decoded there (the client keeps it parked, or still points at the
+                    // entity that left): not a divergence.
+                    if let Some(s) = server_slot
+                        && references_unseen(entry, s.bytes.as_slice(), net, &scope)
+                    {
+                        continue;
+                    }
                     return Err(ConvergenceError::Differs {
                         net_id: id,
                         component: entry.name.to_owned(),
