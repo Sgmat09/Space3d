@@ -243,6 +243,24 @@ impl SafeArea {
     }
 }
 
+/// What the on-screen keyboard covers of the window, measured from its bottom edge, in pixels
+/// (resource; the runner keeps it on Android 11 and later, asking Java's `WindowInsets` while a
+/// text field wants text). 0: no keyboard is up, or the platform does not say (iOS, a desktop).
+/// A window that is not resized for the keyboard (a NativeActivity's is not) moves what is
+/// being typed in above this line itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyboardInset {
+    /// Pixels of the window's bottom under the keyboard.
+    pub bottom: u32,
+}
+
+/// Whether a touch that went down at `down` and lifted at `up` (pixels) was a tap: it stayed
+/// within `slop` pixels. A finger that scrolled or dragged is none.
+#[cfg_attr(not(any(target_os = "android", target_os = "ios", test)), allow(dead_code))]
+pub(crate) fn lift_is_a_tap(down: glam::Vec2, up: glam::Vec2, slop: f32) -> bool {
+    down.distance(up) <= slop
+}
+
 /// Whether the game wants typed text now (resource). `space3d-ui` sets `wanted` while one of
 /// its text fields has the focus; on Android and iOS the runner shows the on-screen keyboard
 /// while it is set and hides it after. A game with text fields of its own writes it itself.
@@ -323,5 +341,20 @@ mod safe_area_tests {
             bottom: 63,
         };
         assert_eq!(right.turned_for_landscape((2622, 1206)), right);
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+
+    /// Only a finger that stayed where it went down brings the on-screen keyboard back.
+    #[test]
+    fn a_lift_within_the_slop_is_a_tap() {
+        let down = glam::Vec2::new(400.0, 300.0);
+        assert!(lift_is_a_tap(down, down, 26.0));
+        assert!(lift_is_a_tap(down, glam::Vec2::new(410.0, 320.0), 26.0));
+        assert!(!lift_is_a_tap(down, glam::Vec2::new(400.0, 500.0), 26.0));
+        assert_eq!(KeyboardInset::default().bottom, 0);
     }
 }

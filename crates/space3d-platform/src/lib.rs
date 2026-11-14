@@ -84,7 +84,8 @@ pub use mobile::{AndroidApp, android_app, android_main_entry};
 #[cfg(target_arch = "wasm32")]
 pub use web::{find_canvas, init_web_logging};
 pub use window::{
-    AppliedCursor, CursorIcon, PlatformEvent, SafeArea, TextInput, WindowCursor, WindowIcon, WindowPlugin, WindowState,
+    AppliedCursor, CursorIcon, KeyboardInset, PlatformEvent, SafeArea, TextInput, WindowCursor, WindowIcon,
+    WindowPlugin, WindowState,
 };
 
 pub use winit;

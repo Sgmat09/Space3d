@@ -9,6 +9,9 @@
 //! * **The window's insets** (system bars and display cutout): an edge-to-edge window's content
 //!   rectangle is the whole window, the insets are Java's to give.
 //!
+//! * **The on-screen keyboard's height** (`WindowInsets.Type.ime()`, Android 11 on): a
+//!   NativeActivity's window is not resized for the keyboard and nothing tells it that one is up.
+//!
 //! Every call attaches the calling thread to the VM (cheap once attached) and treats a Java
 //! exception as "no answer".
 
@@ -51,6 +54,64 @@ pub(crate) fn finish_activity(app: &AndroidApp) -> bool {
         Ok(())
     })
     .is_some()
+}
+
+/// What the on-screen keyboard covers of the window's bottom, in pixels
+/// (`getRootWindowInsets().getInsets(ime()).bottom`; 0 while it is hidden). `None`: before
+/// Android 11, no insets yet, or Java threw.
+pub(crate) fn keyboard_inset(app: &AndroidApp) -> Option<u32> {
+    if AndroidApp::sdk_version() < 30 {
+        return None;
+    }
+    with_activity(app, |env, activity| {
+        let window = env
+            .call_method(
+                activity,
+                jni_str!("getWindow"),
+                jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )?
+            .l()?;
+        let decor = env
+            .call_method(
+                &window,
+                jni_str!("getDecorView"),
+                jni_sig!("()Landroid/view/View;"),
+                &[],
+            )?
+            .l()?;
+        let insets = env
+            .call_method(
+                &decor,
+                jni_str!("getRootWindowInsets"),
+                jni_sig!("()Landroid/view/WindowInsets;"),
+                &[],
+            )?
+            .l()?;
+        if insets.is_null() {
+            return Ok(None);
+        }
+        let ime = env
+            .call_static_method(
+                jni_str!("android/view/WindowInsets$Type"),
+                jni_str!("ime"),
+                jni_sig!("()I"),
+                &[],
+            )?
+            .i()?;
+        let covered = env
+            .call_method(
+                &insets,
+                jni_str!("getInsets"),
+                jni_sig!("(I)Landroid/graphics/Insets;"),
+                &[JValue::Int(ime)],
+            )?
+            .l()?;
+        Ok(Some(
+            env.get_field(&covered, jni_str!("bottom"), jni_sig!(jint))?.i()?.max(0) as u32,
+        ))
+    })
+    .flatten()
 }
 
 /// What the system bars that are shown and the display cutout cover of the window, in pixels

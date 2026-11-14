@@ -62,6 +62,12 @@ pub(crate) struct WinitRunner {
     /// Frames until the on-screen keyboard is asked for again (a finger lifted; see `Touch`).
     #[cfg(any(target_os = "android", target_os = "ios"))]
     keyboard_again: u8,
+    /// Where the finger that may bring the keyboard back went down (`Touch`).
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    touch_down: Option<(u64, Vec2)>,
+    /// Android: frames since the keyboard's height was asked (`KeyboardInset`).
+    #[cfg(target_os = "android")]
+    keyboard_asked: u32,
     /// Android: the window's insets as Java gave them last, the window size they were asked
     /// for and the frames since.
     #[cfg(target_os = "android")]
@@ -207,6 +213,10 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         keyboard_shown: false,
         #[cfg(any(target_os = "android", target_os = "ios"))]
         keyboard_again: 0,
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        touch_down: None,
+        #[cfg(target_os = "android")]
+        keyboard_asked: 0,
         #[cfg(target_os = "android")]
         insets: (None, (0, 0), 0),
         #[cfg(target_arch = "wasm32")]
@@ -494,6 +504,30 @@ impl WinitRunner {
                 }
             }
         }
+        // Android: how much of the window the keyboard covers, asked every few frames while a
+        // text field wants text (the keyboard slides in over some), and 0 otherwise.
+        #[cfg(target_os = "android")]
+        {
+            let wanted = self.keyboard_shown;
+            self.keyboard_asked += 1;
+            let known = self.app.resources.get::<crate::window::KeyboardInset>().copied();
+            let now = if !wanted {
+                Some(crate::window::KeyboardInset::default())
+            } else if self.keyboard_asked >= 6 {
+                self.keyboard_asked = 0;
+                crate::mobile::android_app()
+                    .and_then(|android| crate::android::keyboard_inset(&android))
+                    .map(|bottom| crate::window::KeyboardInset { bottom })
+            } else {
+                None
+            };
+            if let Some(now) = now
+                && known != Some(now)
+            {
+                tracing::info!("Android: the on-screen keyboard covers {} px", now.bottom);
+                self.app.insert_resource(now);
+            }
+        }
         // iOS: the safe area, asked every frame (it changes with the rotation, after the resize).
         #[cfg(target_os = "ios")]
         {
@@ -745,9 +779,24 @@ impl ApplicationHandler for WinitRunner {
                 let phase = TouchPhase::from(t.phase);
                 self.touch(t.id, phase, p);
                 #[cfg(any(target_os = "android", target_os = "ios"))]
-                if phase == TouchPhase::Ended {
-                    // Once the tap's click is through the UI (`touch_pointer`: three frames).
-                    self.keyboard_again = 5;
+                match phase {
+                    TouchPhase::Started => self.touch_down = Some((t.id, p)),
+                    TouchPhase::Ended => {
+                        // Once the tap's click is through the UI (`touch_pointer`: three
+                        // frames). Only a tap asks: a finger that scrolled a list or dragged a
+                        // window beside a focused field does not bring back the keyboard the
+                        // player put away.
+                        let slop = crate::touch_pointer::TouchPointerConfig::SLOP_POINTS
+                            * self.state().scale_factor.max(1.0) as f32;
+                        if self
+                            .touch_down
+                            .take()
+                            .is_some_and(|(id, down)| id == t.id && crate::window::lift_is_a_tap(down, p, slop))
+                        {
+                            self.keyboard_again = 5;
+                        }
+                    }
+                    _ => {}
                 }
             }
             // Text an input method commits. winit 0.30 sends it on desktop only (when the game
