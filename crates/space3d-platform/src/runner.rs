@@ -62,9 +62,10 @@ pub(crate) struct WinitRunner {
     /// Frames until the on-screen keyboard is asked for again (a finger lifted; see `Touch`).
     #[cfg(any(target_os = "android", target_os = "ios"))]
     keyboard_again: u8,
-    /// Where the finger that may bring the keyboard back went down (`Touch`).
+    /// Where each finger on the screen went down, any of which may bring the keyboard back
+    /// (`Touch`): one slot per finger, so a second finger does not lose the first one's tap.
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    touch_down: Option<(u64, Vec2)>,
+    touch_down: Vec<(u64, Vec2)>,
     /// Android: frames since the keyboard's height was asked (`KeyboardInset`).
     #[cfg(target_os = "android")]
     keyboard_asked: u32,
@@ -214,7 +215,7 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         keyboard_again: 0,
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        touch_down: None,
+        touch_down: Vec::new(),
         #[cfg(target_os = "android")]
         keyboard_asked: 0,
         #[cfg(target_os = "android")]
@@ -780,7 +781,11 @@ impl ApplicationHandler for WinitRunner {
                 self.touch(t.id, phase, p);
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 match phase {
-                    TouchPhase::Started => self.touch_down = Some((t.id, p)),
+                    TouchPhase::Started => {
+                        self.touch_down.retain(|(id, _)| *id != t.id);
+                        self.touch_down.push((t.id, p));
+                    }
+                    TouchPhase::Cancelled => self.touch_down.retain(|(id, _)| *id != t.id),
                     TouchPhase::Ended => {
                         // Once the tap's click is through the UI (`touch_pointer`: three
                         // frames). Only a tap asks: a finger that scrolled a list or dragged a
@@ -788,10 +793,10 @@ impl ApplicationHandler for WinitRunner {
                         // player put away.
                         let slop = crate::touch_pointer::TouchPointerConfig::SLOP_POINTS
                             * self.state().scale_factor.max(1.0) as f32;
-                        if self
-                            .touch_down
-                            .take()
-                            .is_some_and(|(id, down)| id == t.id && crate::window::lift_is_a_tap(down, p, slop))
+                        let down = self.touch_down.iter().position(|(id, _)| *id == t.id);
+                        if down
+                            .map(|i| self.touch_down.swap_remove(i).1)
+                            .is_some_and(|down| crate::window::lift_is_a_tap(down, p, slop))
                         {
                             self.keyboard_again = 5;
                         }
