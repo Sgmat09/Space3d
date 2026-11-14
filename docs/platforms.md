@@ -138,8 +138,10 @@ on Android:
   click. Going to the background or losing the focus forgets every finger
   (`TouchPointer::reset`, `Input::clear_touches`). While a `space3d-ui` text field
   has the focus (`TextInput::wanted`) the on-screen keyboard is up; it is asked for again a
-  few frames after every finger lift and after a resume, because nothing tells the app that
-  the player put it away.
+  few frames after every tap (a lift within the slop; a finger that scrolled or dragged does
+  not bring it back, and each finger has its own slot, so a second finger does not lose the
+  first one's tap) and after a resume, because nothing tells the app that the player put it
+  away.
   Two fingers are also a gesture, `Input::gesture()`: this frame's zoom (the ratio of the
   fingers' distance), turn (radians, clockwise on the screen positive) and pan (pixels), with
   the point between the fingers. The machine is the resource `touch_pointer::TouchMouse`
@@ -167,10 +169,16 @@ on Android:
   (the status bar), bottom 63 (the gesture bar). Only when Java gives no answer: the
   activity's content rectangle, and for an edge-to-edge window 24 dp at the bottom.
 
-Not done: moving the view when the
-keyboard covers a text field, stopping the audio stream in the background (the sounds are
-paused, the stream stays open), compressed textures (ASTC), and
-`space3d build --target android` still builds arm64 only.
+- **`KeyboardInset`** (resource): how many pixels of the window's bottom the on-screen
+  keyboard covers (`bottom`), measured from Java (`getRootWindowInsets().getInsets(ime())`,
+  Android 11 on) every few frames while a text field wants text, and 0 when none does. A
+  NativeActivity's window is not resized for the keyboard, so the game moves what is being
+  typed in above that line itself. iOS and the desktop do not report it (always 0).
+
+Not done: the engine does not move the view when the keyboard covers a text field (it only
+measures the keyboard, `KeyboardInset`, and only on Android), stopping the audio stream
+in the background (the sounds are paused, the stream stays open), compressed textures (ASTC),
+and `space3d build --target android` still builds arm64 only.
 
 ## iOS
 
