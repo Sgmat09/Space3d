@@ -15,12 +15,16 @@
 //! * **The system bars hidden** (sticky immersive, [`crate::set_immersive`]): asked on Java's
 //!   main thread, since a view's methods throw on any other.
 //!
+//! * **The gamepads connected** ([`gamepads`]): winit has no event for a pad that went away (and
+//!   hides the device number of the events it does pass on), so the runner asks
+//!   `InputDevice.getDeviceIds()` once a second ([`crate::gamepad::AndroidPads::os_pads`]).
+//!
 //! Every call attaches the calling thread to the VM (cheap once attached) and treats a Java
 //! exception as "no answer".
 
 use crate::mobile::AndroidApp;
 use crate::window::SafeArea;
-use jni::objects::JObject;
+use jni::objects::{JIntArray, JObject, JString};
 use jni::refs::Global;
 use jni::{JValue, JavaVM, jni_sig, jni_str};
 
@@ -325,4 +329,59 @@ pub(crate) fn hide_system_bars(app: &AndroidApp) {
             _ => tracing::warn!("Android: the system bars could not be hidden (API {sdk})"),
         }
     }));
+}
+
+/// `InputDevice.SOURCE_GAMEPAD`: the device has gamepad buttons.
+const SOURCE_GAMEPAD: i32 = 0x0000_0401;
+
+/// The gamepads Android has now: the device number and name of every input device that is not
+/// virtual and has gamepad buttons (`InputDevice.getSources() & SOURCE_GAMEPAD`). `None`: no VM,
+/// or Java threw. Compiled for Android, **not yet run on a device**.
+pub(crate) fn gamepads(app: &AndroidApp) -> Option<Vec<(i32, String)>> {
+    with_activity(app, |env, _activity| {
+        let class = jni_str!("android/view/InputDevice");
+        let ids = env
+            .call_static_method(class, jni_str!("getDeviceIds"), jni_sig!("()[I"), &[])?
+            .l()?;
+        if ids.is_null() {
+            return Ok(Vec::new());
+        }
+        let ids = JIntArray::cast_local(env, ids)?;
+        let mut numbers = vec![0i32; ids.len(env)?];
+        ids.get_region(env, 0, &mut numbers)?;
+        let mut pads = Vec::new();
+        for number in numbers {
+            let device = env
+                .call_static_method(
+                    class,
+                    jni_str!("getDevice"),
+                    jni_sig!("(I)Landroid/view/InputDevice;"),
+                    &[JValue::Int(number)],
+                )?
+                .l()?;
+            // (gone between the two calls)
+            if device.is_null() {
+                continue;
+            }
+            let sources = env
+                .call_method(&device, jni_str!("getSources"), jni_sig!("()I"), &[])?
+                .i()?;
+            let is_virtual = env
+                .call_method(&device, jni_str!("isVirtual"), jni_sig!("()Z"), &[])?
+                .z()?;
+            if is_virtual || sources & SOURCE_GAMEPAD != SOURCE_GAMEPAD {
+                continue;
+            }
+            let name = env
+                .call_method(&device, jni_str!("getName"), jni_sig!("()Ljava/lang/String;"), &[])?
+                .l()?;
+            let name = if name.is_null() {
+                String::new()
+            } else {
+                env.cast_local::<JString>(name)?.try_to_string(env)?
+            };
+            pads.push((number, name));
+        }
+        Ok(pads)
+    })
 }

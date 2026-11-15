@@ -62,6 +62,9 @@ pub(crate) struct WinitRunner {
     /// Android: pads by the input device their key and motion events name.
     #[cfg(target_os = "android")]
     pads: crate::gamepad::AndroidPads<DeviceId>,
+    /// Android: when the OS was last asked for its gamepads.
+    #[cfg(target_os = "android")]
+    pads_asked: Option<Instant>,
     /// Whether the on-screen keyboard was last asked for (`TextInput`, phones).
     #[cfg(any(target_os = "android", target_os = "ios"))]
     keyboard_shown: bool,
@@ -223,6 +226,8 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
             target_os = "android"
         ))]
         pads: Default::default(),
+        #[cfg(target_os = "android")]
+        pads_asked: None,
         #[cfg(any(target_os = "android", target_os = "ios"))]
         keyboard_shown: false,
         #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -467,7 +472,20 @@ impl WinitRunner {
         self.buttons.frame(active, input, now, crate::os_buttons::query);
         // What the pads did since the last frame (desktop; Android's come as window events).
         #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-        self.pads.poll(input);
+        self.pads.poll(input, active);
+        // Android: winit says nothing of a pad that went away; Android is asked once a second.
+        #[cfg(target_os = "android")]
+        if self
+            .pads_asked
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
+        {
+            self.pads_asked = Some(now);
+            if let Some(listed) = crate::mobile::android_app().and_then(|a| crate::android::gamepads(&a))
+                && self.pads.os_pads(listed, input)
+            {
+                tracing::info!(target: "gamepad", "a gamepad went away: every pad is disconnected");
+            }
+        }
         if let Some(w) = &self.window {
             w.pre_present_notify();
         }

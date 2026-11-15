@@ -581,8 +581,8 @@ reads them from `Input` (`space3d_platform::gamepad` has the whole story in its 
 let input = ctx.resources.expect::<Input>();
 for change in input.gamepad_changes() { /* GamepadChange::Connected(id) / Disconnected(id), this frame */ }
 if input.any_gamepad_just_pressed(GamepadButton::South) { /* A / Cross on any pad */ }
-let x = input.any_gamepad_axis(GamepadAxis::LeftStickX);   // -1..1, right positive
-let y = input.any_gamepad_axis(GamepadAxis::LeftStickY);   // -1..1, UP positive
+let stick = input.any_gamepad_stick(GamepadAxis::LeftStickX, GamepadAxis::LeftStickY); // the pad pushed furthest, whole; x right, y UP
+let lt = input.any_gamepad_axis(GamepadAxis::LeftTrigger); // one axis: 0..1 (a stick's: -1..1)
 let name = input.gamepad(id).map(|p| p.name());            // "Xbox 360 Controller"; may be empty
 ```
 
@@ -596,12 +596,26 @@ have a radial dead zone of 0.15 taken out and the rest stretched to 0..1 (`gamep
 
 | Platform | Backend | What works | Notes |
 |---|---|---|---|
-| Windows | `gilrs` 0.11 (Windows.Gaming.Input) | everything, hot plug: as built and unit-tested; **not yet seen with a pad, real or virtual** (below) | Input only reaches the **focused** window: a focus loss releases every pad button and rests the axes (`Input::release_all`). A headless or background run gets nothing from a real pad. |
-| macOS | `gilrs` (IOKit) | compiles in the dependency graph; **not built or run on a Mac yet** | |
-| Linux | `gilrs` (evdev) | **not built or run on Linux yet** | Needs `libudev` at run time and `libudev-dev` + `pkg-config` to build (the game's CI images must have them). |
-| Android | winit key events (`runner.rs`, `gamepad::AndroidPads`) | A B X Y, L1 R1, L3 R3, Start, Select, Mode; L2 R2 and the d-pad on pads that send them as keys (PlayStation type); the **left stick** | winit 0.30 has no gamepad events. A stick arrives as a "touch" move from a device no finger went down on, at (`AXIS_X`, `AXIS_Y`); it is taken as the left stick and kept away from the fingers. The right stick, analog triggers and a hat d-pad (Xbox type) are lost until winit is patched (third_party). The pad has no name (winit hides the device number). Compiles for both Android targets; **not run on a device**. |
+| Windows | `gilrs` 0.11 (Windows.Gaming.Input) | everything, hot plug: as built and unit-tested; **not yet seen with a pad, real or virtual** (below) | Windows gives pad input to the **focused** window only. |
+| macOS | `gilrs` (IOKit) | compiles in the dependency graph; **not built or run on a Mac yet** | IOKit gives pad input to every process: the runner holds it back while the window has no focus (below). |
+| Linux | `gilrs` (evdev) | **not built or run on Linux yet** | evdev gives pad input to every process, as IOKit. Needs `libudev` at run time and `libudev-dev` + `pkg-config` to build (the game's build images must have them). |
+| Android | winit key events (`runner.rs`, `gamepad::AndroidPads`), `InputDevice` over JNI (`android::gamepads`) | **The left stick and the face buttons**: A B X Y, L1 R1, L3 R3, Start, Select, Mode, and the left stick once a button was pressed. L2 R2 only where the pad sends them as keys too (PlayStation pads are said to; Xbox pads send axes only). **Not**: the d-pad of an Xbox or PlayStation pad (a hat axis), the right stick, analog triggers. Unplug: seen within a second. | winit 0.30 has no gamepad events and marks every motion event handled, so Android's own stick-to-d-pad fallback never runs. A stick arrives as a "touch" move from a device no finger went down on, at (`AXIS_X`, `AXIS_Y`); from a device already known as a pad **by a button** it is the left stick, from any other it is dropped (a sensor with axes is no controller), and none reaches the fingers. A d-pad works only on a pad that sends arrow keys. The rest needs winit patched (third_party). winit has no device-removed event and hides the device number, so the runner asks `InputDevice.getDeviceIds()` once a second: when a listed gamepad is gone, **every** pad known is disconnected with what it held (one still there is a pad again from its next button), and a pad has the OS's name only while Android lists exactly one. Compiles for both Android targets; **not run on a device** (the JNI calls included). |
 | iOS | none | nothing | `GCController` through objc2: not done. |
 | Web | none | nothing | gilrs has a `navigator.getGamepads` backend; the dependency is desktop-only for now. |
+
+**Focus.** Only the focused window obeys a pad, on every desktop OS: a focus loss releases every
+pad button and rests the axes (`Input::release_all`), and while the window has no focus, or the
+run is a background one, the runner takes only a pad's coming and going from gilrs
+(`Pads::apply_unfocused`; a stick's raw place is still remembered, so its first move after the
+focus is back is right). Without this a pad used in another game or a browser would fly the ship
+of a window in the background on Linux and macOS.
+
+**The backend's cost and its switch.** gilrs's Windows backend is a thread that asks the OS for
+the controllers every 8 ms for the whole run, pad or no pad (Linux and macOS start a thread each
+too). It is **not started in a background run** (`background_mode()`: tests, smoke runs, headless
+QA clients; a scripted pad through `Input::inject_gamepad_*` still works there), and
+`SPACE3D_GAMEPAD=off` (or `0`, `false`, `no`) leaves it unstarted in any run. Its cost in a
+focused game was not measured.
 
 `cargo run -p space3d-platform --example virtual_pad` (Windows) checks the real backend
 without a pad: it plugs a virtual Xbox 360 pad in through the ViGEmBus driver, drives every

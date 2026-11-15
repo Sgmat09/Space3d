@@ -11,17 +11,28 @@
 //!
 //! * **Windows, macOS, Linux**: the `gilrs` crate, polled by the window runner before every
 //!   frame (Windows.Gaming.Input, IOKit, evdev). Xbox, PlayStation and most other pads come
-//!   with the standard layout (gilrs's SDL mapping table). Windows delivers pad input only to
-//!   the **focused** window: on a focus loss every held pad button is released and the axes
-//!   go to rest ([`Input::release_all`]). Linux needs `libudev` (and `pkg-config` to build).
+//!   with the standard layout (gilrs's SDL mapping table). Only the **focused** window obeys
+//!   a pad: on a focus loss every held pad button is released and the axes go to rest
+//!   ([`Input::release_all`]), and while the window has no focus (or the run is a background
+//!   one) only a pad's coming and going is taken ([`Pads::apply_unfocused`]). Windows itself
+//!   gives pad input to the focused window only; evdev and IOKit give it to every process, so
+//!   the runner holds it back. gilrs is not started at all in a background run
+//!   (`background_mode`) or with `SPACE3D_GAMEPAD=off` ([`ENV_GAMEPAD`]): its Windows
+//!   backend is a thread that asks the OS for the pads every 8 ms. Linux needs `libudev` (and
+//!   `pkg-config` to build).
 //! * **Android**: winit 0.30 has no gamepad events. A pad's buttons arrive as key events of no
-//!   place and are mapped here ([`AndroidPads::key`]): A B X Y, L1 R1, L2 R2 (pads that send
-//!   them as keys: PlayStation type), L3 R3, Start, Select, Mode, and the d-pad of pads that
-//!   send it as keys. winit reports every motion event as a touch, so a stick arrives as a
-//!   "finger" that never went down, at the place (`AXIS_X`, `AXIS_Y`): [`AndroidPads::touch`]
-//!   takes those as the **left stick** and keeps them away from the fingers. The right stick,
-//!   analog triggers and a d-pad sent as a hat axis (Xbox type) are lost until winit is
-//!   patched. Read from winit's source; not yet run on a device.
+//!   place and are mapped here ([`AndroidPads::key`]): A B X Y, L1 R1, L3 R3, Start, Select,
+//!   Mode; L2 R2 where the pad sends them as keys too (PlayStation pads are said to, Xbox
+//!   pads send them as axes only); the d-pad only of a pad that sends it as arrow keys (Xbox
+//!   and PlayStation pads send a hat axis, so theirs does nothing). A device is a pad from
+//!   its first **button**. winit reports every motion event as a touch, so a stick arrives as
+//!   a "finger" that never went down, at the place (`AXIS_X`, `AXIS_Y`):
+//!   [`AndroidPads::touch`] takes those of a known pad as the **left stick** and keeps every
+//!   such move away from the fingers. The right stick, analog triggers and a hat d-pad are
+//!   lost until winit is patched. winit has no event for a pad that went away either: the
+//!   runner asks Android for its gamepads once a second ([`AndroidPads::os_pads`]), which
+//!   also gives the pad its name while it is the only one. Read from winit's source; not yet
+//!   run on a device.
 //! * **iOS, the web**: nothing yet (`GCController`, `navigator.getGamepads`).
 //!
 //! Every backend goes through [`Pads`], which owns the filtering: a radial dead zone on each
@@ -40,6 +51,14 @@ pub const STICK_DEAD_ZONE: f32 = 0.15;
 pub const TRIGGER_PRESS: f32 = 0.5;
 /// A trigger that was down is up again once it is let go this far.
 pub const TRIGGER_RELEASE: f32 = 0.4;
+/// Env var: `off` (or `0`, `false`, `no`) leaves the desktop backend (gilrs and its thread)
+/// unstarted: no pads.
+pub const ENV_GAMEPAD: &str = "SPACE3D_GAMEPAD";
+
+/// Whether [`ENV_GAMEPAD`]'s `value` turns the pads off.
+pub fn env_turns_off(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+}
 
 /// A stick with the radial dead zone taken out: inside `dead` it is at rest, outside the rest
 /// of the way is stretched to 0..1, so the stick still reaches every value and does not jump
@@ -139,6 +158,18 @@ impl Pads {
         }
     }
 
+    /// `event` of the pad `id` while the window does not have the focus: a pad still comes
+    /// and goes, and a stick's raw place is remembered (its next event after the focus is
+    /// back needs both axes), but nothing it holds or pushes reaches `input`.
+    pub fn apply_unfocused(&mut self, id: u32, event: PadEvent, input: &mut Input) {
+        match event {
+            PadEvent::Connected(_) | PadEvent::Disconnected => self.apply(id, event, input),
+            PadEvent::StickX(stick, v) => self.raw.entry(id).or_default()[stick as usize].x = v,
+            PadEvent::StickY(stick, v) => self.raw.entry(id).or_default()[stick as usize].y = v,
+            PadEvent::Button(..) | PadEvent::Trigger(..) => {}
+        }
+    }
+
     fn stick(&mut self, id: u32, stick: Stick, input: &mut Input, set: impl FnOnce(&mut Vec2)) {
         let raw = &mut self.raw.entry(id).or_default()[stick as usize];
         set(raw);
@@ -175,14 +206,19 @@ pub fn android_button(keycode: u32) -> Option<GamepadButton> {
 }
 
 /// The pads of an Android device, told apart by the input device `D` their events name
-/// (winit's `DeviceId`). A device is a pad from its first pad button or stick event; the id
-/// it gets then is the pad's id in [`Input`].
+/// (winit's `DeviceId`). A device is a pad from its first pad **button**; the id it gets then
+/// is the pad's id in [`Input`]. (Not from a stick: winit shows every motion event as a touch
+/// without its source, and Android has other devices with absolute axes.)
 #[derive(Debug)]
 pub struct AndroidPads<D> {
     pads: Pads,
     ids: HashMap<D, u32>,
+    /// The next pad's id: never one given before, so a pad that comes back is a new pad.
+    next_id: u32,
     /// Devices a finger went down on: touch screens (and mice), never pads.
     fingers: HashSet<D>,
+    /// The gamepads Android itself listed last ([`Self::os_pads`]): device number and name.
+    os: Vec<(i32, String)>,
 }
 
 impl<D> Default for AndroidPads<D> {
@@ -190,7 +226,9 @@ impl<D> Default for AndroidPads<D> {
         Self {
             pads: Pads::default(),
             ids: HashMap::new(),
+            next_id: 0,
             fingers: HashSet::new(),
+            os: Vec::new(),
         }
     }
 }
@@ -200,11 +238,34 @@ impl<D: Copy + Eq + Hash> AndroidPads<D> {
         if let Some(id) = self.ids.get(&device) {
             return *id;
         }
-        let id = self.ids.len() as u32;
+        let id = self.next_id;
+        self.next_id += 1;
         self.ids.insert(device, id);
-        // winit hides the device's number, so the OS cannot be asked for its name.
-        self.pads.apply(id, PadEvent::Connected(String::new()), input);
+        // winit hides the device's number, so which of Android's pads this is cannot be asked:
+        // it has a name only while Android lists one pad.
+        let name = match self.os.as_slice() {
+            [(_, name)] => name.clone(),
+            _ => String::new(),
+        };
+        self.pads.apply(id, PadEvent::Connected(name), input);
         id
+    }
+
+    /// The gamepads Android lists now (device number and name; the runner asks once a
+    /// second). When one that was listed is gone, a pad went away: winit does not say which
+    /// device an event is from in Android's numbers, so **every** pad known here is
+    /// disconnected with what it held (no stick stays pushed), and one still there is a pad
+    /// again from its next button. Returns whether pads were disconnected.
+    pub fn os_pads(&mut self, now: Vec<(i32, String)>, input: &mut Input) -> bool {
+        let gone = self.os.iter().any(|(was, _)| !now.iter().any(|(n, _)| n == was));
+        self.os = now;
+        if !gone || self.ids.is_empty() {
+            return false;
+        }
+        for (_, id) in self.ids.drain() {
+            self.pads.apply(id, PadEvent::Disconnected, input);
+        }
+        true
     }
 
     /// A key event of no place with Android key code `keycode` from `device`: `true` when it
@@ -228,10 +289,12 @@ impl<D: Copy + Eq + Hash> AndroidPads<D> {
         true
     }
 
-    /// A touch event as winit reports it. `true`: it was no finger but a pad's motion event
-    /// (a move from a device no finger ever went down on) and must not reach the touches;
-    /// its place, when within -1..1, is the left stick (`AXIS_X`, `AXIS_Y`; Android's y
-    /// points down, [`Input`]'s up).
+    /// A touch event as winit reports it. `true`: it was no finger but a motion event of a pad
+    /// or another device with axes (a move from a device no finger ever went down on) and
+    /// must not reach the touches. From a device already known as a pad by a button
+    /// ([`Self::key`]) its place, when within -1..1, is the left stick (`AXIS_X`, `AXIS_Y`;
+    /// Android's y points down, [`Input`]'s up); from any other device it is dropped: a
+    /// sensor that reports axes must not become a controller that steers.
     pub fn touch(&mut self, device: D, phase: TouchPhase, position: Vec2, input: &mut Input) -> bool {
         match phase {
             TouchPhase::Started => {
@@ -239,8 +302,10 @@ impl<D: Copy + Eq + Hash> AndroidPads<D> {
                 false
             }
             TouchPhase::Moved if !self.fingers.contains(&device) => {
-                if position.x.abs() <= 1.0 && position.y.abs() <= 1.0 {
-                    let id = self.id(device, input);
+                if let Some(&id) = self.ids.get(&device)
+                    && position.x.abs() <= 1.0
+                    && position.y.abs() <= 1.0
+                {
                     self.pads.apply(id, PadEvent::StickX(Stick::Left, position.x), input);
                     self.pads.apply(id, PadEvent::StickY(Stick::Left, -position.y), input);
                 }
@@ -272,10 +337,17 @@ mod desktop {
     }
 
     impl Backend {
-        /// Everything the pads did since the last call, into `input`.
-        pub(crate) fn poll(&mut self, input: &mut Input) {
-            if !self.tried {
+        /// Everything the pads did since the last call, into `input`. `active`: the window
+        /// has the focus and the run is not a background one; otherwise only a pad's coming
+        /// and going is taken (evdev and IOKit give a pad's input to every process, focused
+        /// or not). gilrs is started at the first poll outside a background run.
+        pub(crate) fn poll(&mut self, input: &mut Input, active: bool) {
+            if !self.tried && !crate::background::background_mode() {
                 self.tried = true;
+                if super::env_turns_off(std::env::var(super::ENV_GAMEPAD).ok().as_deref()) {
+                    tracing::info!(target: "gamepad", "{}: gamepads are off", super::ENV_GAMEPAD);
+                    return;
+                }
                 // gilrs's own per-axis dead zone is left out: `Pads` takes a radial one.
                 match GilrsBuilder::new().with_default_filters(false).build() {
                     Ok(gilrs) => {
@@ -311,8 +383,10 @@ mod desktop {
                     }
                     other => pad_event(&other),
                 };
-                if let Some(event) = event {
-                    self.pads.apply(id, event, input);
+                match event {
+                    Some(event) if active => self.pads.apply(id, event, input),
+                    Some(event) => self.pads.apply_unfocused(id, event, input),
+                    None => {}
                 }
             }
         }
@@ -578,6 +652,138 @@ mod tests {
         assert!(input.gamepad(0).is_some(), "still connected");
     }
 
+    /// A window without the focus: the pad's buttons, triggers and sticks do nothing (Linux
+    /// and macOS deliver them all the same), it still comes and goes, and the stick's place
+    /// is not stale when the focus is back.
+    #[test]
+    fn an_unfocused_window_does_not_obey_the_pad() {
+        let mut pads = Pads::default();
+        let mut input = Input::default();
+        pads.apply_unfocused(2, PadEvent::Connected("Pad".into()), &mut input);
+        assert_eq!(input.gamepad_changes(), &[GamepadChange::Connected(2)]);
+        pads.apply(2, PadEvent::StickX(Stick::Left, 1.0), &mut input);
+        // The focus goes: everything rests, and what the pad does now is not taken.
+        input.release_all();
+        pads.apply_unfocused(2, PadEvent::Button(GamepadButton::South, true), &mut input);
+        pads.apply_unfocused(2, PadEvent::Trigger(Trigger::Right, 1.0), &mut input);
+        pads.apply_unfocused(2, PadEvent::StickY(Stick::Right, 1.0), &mut input);
+        pads.apply_unfocused(2, PadEvent::StickX(Stick::Left, 0.0), &mut input);
+        let pad = input.gamepad(2).expect("still connected");
+        assert!(pad.buttons.iter_pressed().next().is_none());
+        for axis in [
+            GamepadAxis::LeftStickX,
+            GamepadAxis::RightStickY,
+            GamepadAxis::RightTrigger,
+        ] {
+            assert_eq!(pad.axis(axis), 0.0, "{axis:?}");
+        }
+        // The focus is back and the left stick goes up: x was let go meanwhile, so it is 0.
+        pads.apply(2, PadEvent::StickY(Stick::Left, 1.0), &mut input);
+        let pad = input.gamepad(2).expect("pad");
+        assert_eq!(
+            pad.axis(GamepadAxis::LeftStickX),
+            0.0,
+            "not the x of before the focus loss"
+        );
+        assert!(close(pad.axis(GamepadAxis::LeftStickY), 1.0));
+        // Pulled out while unfocused: gone.
+        pads.apply_unfocused(2, PadEvent::Disconnected, &mut input);
+        assert!(input.gamepad(2).is_none());
+    }
+
+    /// Two pads off their rest: the stick read is one pad's, whole.
+    #[test]
+    fn the_stick_of_the_pad_pushed_furthest_is_whole() {
+        let mut input = Input::default();
+        let (x, y) = (GamepadAxis::LeftStickX, GamepadAxis::LeftStickY);
+        assert_eq!(input.any_gamepad_stick(x, y), Vec2::ZERO);
+        input.inject_gamepad_axis(0, x, 0.9);
+        input.inject_gamepad_axis(0, y, 0.1);
+        input.inject_gamepad_axis(1, x, -0.2);
+        input.inject_gamepad_axis(1, y, -0.6);
+        assert_eq!(
+            input.any_gamepad_stick(x, y),
+            Vec2::new(0.9, 0.1),
+            "pad 0's, not (0.9, -0.6)"
+        );
+        input.inject_gamepad_axis(0, x, 0.0);
+        assert_eq!(input.any_gamepad_stick(x, y), Vec2::new(-0.2, -0.6));
+    }
+
+    #[test]
+    fn the_env_switch() {
+        for off in ["off", "0", "false", "no", " OFF "] {
+            assert!(env_turns_off(Some(off)), "{off:?}");
+        }
+        for on in ["", "1", "on", "yes"] {
+            assert!(!env_turns_off(Some(on)), "{on:?}");
+        }
+        assert!(!env_turns_off(None));
+    }
+
+    /// Android lists its gamepads once a second: a pad that is no longer listed takes every
+    /// pad known with it (a stick held when a Bluetooth pad dropped does not fly on), the pad
+    /// has the OS's name while it is the only one, and a pad that comes back is a new one.
+    #[test]
+    fn android_a_pad_that_went_away_is_disconnected() {
+        let mut pads = AndroidPads::<i32>::default();
+        let mut input = Input::default();
+        assert!(!pads.os_pads(vec![(41, "Xbox Wireless Controller".into())], &mut input));
+        assert_eq!(
+            input.gamepad_ids().count(),
+            0,
+            "listed is not yet a pad: a button makes it one"
+        );
+        assert!(pads.key(7, 96, true, &mut input));
+        assert_eq!(input.gamepad(0).expect("pad").name(), "Xbox Wireless Controller");
+        assert!(pads.touch(7, TouchPhase::Moved, Vec2::new(1.0, 0.0), &mut input));
+        assert!(close(input.any_gamepad_axis(GamepadAxis::LeftStickX), 1.0));
+        input.end_frame();
+        // Still listed (and another device came): nothing changes.
+        assert!(!pads.os_pads(
+            vec![(41, "Xbox Wireless Controller".into()), (52, "Other".into())],
+            &mut input
+        ));
+        assert!(close(input.any_gamepad_axis(GamepadAxis::LeftStickX), 1.0));
+        // The pad drops with the stick held.
+        assert!(pads.os_pads(vec![(52, "Other".into())], &mut input));
+        assert_eq!(input.gamepad_changes(), &[GamepadChange::Disconnected(0)]);
+        assert_eq!(input.gamepad_ids().count(), 0);
+        assert_eq!(input.any_gamepad_axis(GamepadAxis::LeftStickX), 0.0);
+        assert!(!input.any_gamepad_pressed(GamepadButton::South));
+        input.end_frame();
+        // Its late stick moves are no pad's; it is a pad again from a button, with a new id.
+        assert!(pads.touch(7, TouchPhase::Moved, Vec2::new(1.0, 0.0), &mut input));
+        assert_eq!(input.gamepad_ids().count(), 0);
+        assert!(!pads.os_pads(vec![(52, "Other".into()), (60, "Pad".into())], &mut input));
+        assert!(pads.key(8, 97, true, &mut input));
+        assert_eq!(input.gamepad_changes(), &[GamepadChange::Connected(1)]);
+        assert_eq!(
+            input.gamepad(1).expect("pad").name(),
+            "",
+            "two listed: which one is not known"
+        );
+        // The other device goes: the pad known goes with it (which went is not known) ...
+        assert!(pads.os_pads(vec![(60, "Pad".into())], &mut input));
+        // ... and with no pad known, a device going away changes nothing.
+        assert!(!pads.os_pads(Vec::new(), &mut input));
+    }
+
+    /// A motion event within -1..1 from a device that never sent a pad button (a sensor with
+    /// axes) is no controller: it connects nothing and steers nothing, and is no finger.
+    #[test]
+    fn android_axes_alone_are_no_pad() {
+        let mut pads = AndroidPads::<i32>::default();
+        let mut input = Input::default();
+        assert!(
+            pads.touch(3, TouchPhase::Moved, Vec2::new(0.6, -0.4), &mut input),
+            "kept from the touches"
+        );
+        assert_eq!(input.gamepad_ids().count(), 0);
+        assert!(input.gamepad_changes().is_empty());
+        assert_eq!(input.any_gamepad_axis(GamepadAxis::LeftStickX), 0.0);
+    }
+
     #[test]
     fn android_key_codes() {
         assert_eq!(android_button(96), Some(GamepadButton::South));
@@ -659,6 +865,10 @@ mod tests {
         );
         assert_eq!(input.touch(0).expect("finger").position, Vec2::new(410.0, 300.0));
         assert_eq!(input.gamepad_ids().count(), 0);
+        // The pad is a pad from its first button.
+        assert!(pads.key(PAD, 96, true, &mut input));
+        assert!(pads.key(PAD, 96, false, &mut input));
+        assert_eq!(input.gamepad_changes(), &[GamepadChange::Connected(0)]);
         // The stick moves: right and up (Android's y points down).
         touch(&mut pads, &mut input, PAD, TouchPhase::Moved, Vec2::new(1.0, -0.0));
         assert_eq!(
@@ -666,7 +876,6 @@ mod tests {
             Vec2::new(410.0, 300.0),
             "the finger stays where it is"
         );
-        assert_eq!(input.gamepad_changes(), &[GamepadChange::Connected(0)]);
         assert!(close(input.any_gamepad_axis(GamepadAxis::LeftStickX), 1.0));
         touch(&mut pads, &mut input, PAD, TouchPhase::Moved, Vec2::new(0.0, -0.8));
         assert!(input.any_gamepad_axis(GamepadAxis::LeftStickY) > 0.7, "up is positive");

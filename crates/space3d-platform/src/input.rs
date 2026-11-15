@@ -630,6 +630,21 @@ impl Input {
             .map(|p| p.axis(axis))
             .fold(0.0, |best: f32, v| if v.abs() > best.abs() { v } else { best })
     }
+    /// The stick (`x`, `y`: its two axes) of the pad that pushes it furthest, whole: with two
+    /// pads off their rest the answer is one pad's stick, never one pad's x beside the
+    /// other's y (which [`Self::any_gamepad_axis`] asked twice would give). Zero without a pad.
+    pub fn any_gamepad_stick(&self, x: GamepadAxis, y: GamepadAxis) -> Vec2 {
+        self.gamepads
+            .values()
+            .map(|p| Vec2::new(p.axis(x), p.axis(y)))
+            .fold(Vec2::ZERO, |best, v| {
+                if v.length_squared() > best.length_squared() {
+                    v
+                } else {
+                    best
+                }
+            })
+    }
     /// Window size in physical pixels (for normalized touch regions).
     pub fn window_size(&self) -> Vec2 {
         self.window_size
