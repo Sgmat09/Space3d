@@ -596,7 +596,7 @@ have a radial dead zone of 0.15 taken out and the rest stretched to 0..1 (`gamep
 
 | Platform | Backend | What works | Notes |
 |---|---|---|---|
-| Windows | `gilrs` 0.11 (Windows.Gaming.Input) | everything, hot plug | Input only reaches the **focused** window: a focus loss releases every pad button and rests the axes (`Input::release_all`). A headless or background run gets nothing from a real pad. |
+| Windows | `gilrs` 0.11 (Windows.Gaming.Input) | everything, hot plug: as built and unit-tested; **not yet seen with a pad, real or virtual** (below) | Input only reaches the **focused** window: a focus loss releases every pad button and rests the axes (`Input::release_all`). A headless or background run gets nothing from a real pad. |
 | macOS | `gilrs` (IOKit) | compiles in the dependency graph; **not built or run on a Mac yet** | |
 | Linux | `gilrs` (evdev) | **not built or run on Linux yet** | Needs `libudev` at run time and `libudev-dev` + `pkg-config` to build (the game's CI images must have them). |
 | Android | winit key events (`runner.rs`, `gamepad::AndroidPads`) | A B X Y, L1 R1, L3 R3, Start, Select, Mode; L2 R2 and the d-pad on pads that send them as keys (PlayStation type); the **left stick** | winit 0.30 has no gamepad events. A stick arrives as a "touch" move from a device no finger went down on, at (`AXIS_X`, `AXIS_Y`); it is taken as the left stick and kept away from the fingers. The right stick, analog triggers and a hat d-pad (Xbox type) are lost until winit is patched (third_party). The pad has no name (winit hides the device number). Compiles for both Android targets; **not run on a device**. |
@@ -608,6 +608,11 @@ without a pad: it plugs a virtual Xbox 360 pad in through the ViGEmBus driver, d
 button, both sticks and the triggers, pulls it out mid-hold and plugs it in again, and compares
 each step with `Input` (exit code 0 / 1; 2 without the driver or the focus). `--log-only`
 prints what any real pad does.
+
+On the build PC (2026-11-15) the example exited 2: the `ViGEmBus` driver service runs, but there is
+no ViGEm bus device for the client to open (`BusNotFound`), and no pad was connected (`--log-only`:
+"no pad"). So the gilrs path has compiled and its mapping is unit-tested, and a real or virtual pad
+has not driven it yet.
 
 ## CI and releases
 
