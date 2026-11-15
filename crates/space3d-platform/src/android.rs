@@ -157,14 +157,22 @@ pub(crate) fn window_insets(app: &AndroidApp) -> Option<SafeArea> {
             let cutout = env
                 .call_static_method(class, jni_str!("displayCutout"), jni_sig!("()I"), &[])?
                 .i()?;
-            let covered = env
-                .call_method(
-                    &insets,
+            // (immersive: the bars are hidden, and one an edge swipe shows for a while covers
+            // nothing the UI should move for; a cutout always covers, seen or not)
+            let (method, sig, mask) = if crate::mobile::immersive() {
+                (
+                    jni_str!("getInsetsIgnoringVisibility"),
+                    jni_sig!("(I)Landroid/graphics/Insets;"),
+                    cutout,
+                )
+            } else {
+                (
                     jni_str!("getInsets"),
                     jni_sig!("(I)Landroid/graphics/Insets;"),
-                    &[JValue::Int(bars | cutout)],
-                )?
-                .l()?;
+                    bars | cutout,
+                )
+            };
+            let covered = env.call_method(&insets, method, sig, &[JValue::Int(mask)])?.l()?;
             let mut side = |name| -> jni::errors::Result<u32> {
                 Ok(env.get_field(&covered, name, jni_sig!(jint))?.i()?.max(0) as u32)
             };
@@ -173,6 +181,32 @@ pub(crate) fn window_insets(app: &AndroidApp) -> Option<SafeArea> {
                 top: side(jni_str!("top"))?,
                 right: side(jni_str!("right"))?,
                 bottom: side(jni_str!("bottom"))?,
+            }))
+        } else if crate::mobile::immersive() {
+            // Immersive before Android 11: the cutout's safe insets (Android 9 and 10), none
+            // before that (no cutouts)
+            if AndroidApp::sdk_version() < 28 {
+                return Ok(Some(SafeArea::default()));
+            }
+            let cutout = env
+                .call_method(
+                    &insets,
+                    jni_str!("getDisplayCutout"),
+                    jni_sig!("()Landroid/view/DisplayCutout;"),
+                    &[],
+                )?
+                .l()?;
+            if cutout.is_null() {
+                return Ok(Some(SafeArea::default()));
+            }
+            let mut side = |name| -> jni::errors::Result<u32> {
+                Ok(env.call_method(&cutout, name, jni_sig!("()I"), &[])?.i()?.max(0) as u32)
+            };
+            Ok(Some(SafeArea {
+                left: side(jni_str!("getSafeInsetLeft"))?,
+                top: side(jni_str!("getSafeInsetTop"))?,
+                right: side(jni_str!("getSafeInsetRight"))?,
+                bottom: side(jni_str!("getSafeInsetBottom"))?,
             }))
         } else {
             let mut side = |name| -> jni::errors::Result<u32> {

@@ -285,10 +285,12 @@ impl WinitRunner {
         // ([`crate::set_immersive`]).
         #[cfg(target_os = "ios")]
         if crate::mobile::immersive() {
-            use winit::platform::ios::WindowAttributesExtIOS;
+            use winit::platform::ios::{ScreenEdge, WindowAttributesExtIOS};
+            // (and the bottom edge's swipe home asks twice: the stick and the fire button sit on it)
             attrs = attrs
                 .with_prefers_status_bar_hidden(true)
-                .with_prefers_home_indicator_hidden(true);
+                .with_prefers_home_indicator_hidden(true)
+                .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::BOTTOM);
         }
         if let Some(icon) = &s.icon {
             match winit::window::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height) {
@@ -535,6 +537,15 @@ impl WinitRunner {
                 && known != Some(now)
             {
                 tracing::info!("Android: the on-screen keyboard covers {} px", now.bottom);
+                // The keyboard gone: it may have brought the navigation bar back, and nothing
+                // else (no focus change, no resume) hides it again.
+                if now.bottom == 0
+                    && known.is_some_and(|k| k.bottom > 0)
+                    && crate::mobile::immersive()
+                    && let Some(android) = crate::mobile::android_app()
+                {
+                    crate::android::hide_system_bars(&android);
+                }
                 self.app.insert_resource(now);
             }
         }
