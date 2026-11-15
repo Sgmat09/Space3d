@@ -12,6 +12,9 @@
 //! * **The on-screen keyboard's height** (`WindowInsets.Type.ime()`, Android 11 on): a
 //!   NativeActivity's window is not resized for the keyboard and nothing tells it that one is up.
 //!
+//! * **The system bars hidden** (sticky immersive, [`crate::set_immersive`]): asked on Java's
+//!   main thread, since a view's methods throw on any other.
+//!
 //! Every call attaches the calling thread to the VM (cheap once attached) and treats a Java
 //! exception as "no answer".
 
@@ -184,4 +187,108 @@ pub(crate) fn window_insets(app: &AndroidApp) -> Option<SafeArea> {
         }
     })
     .flatten()
+}
+
+/// Hide the status and navigation bars, sticky (an edge swipe shows them for a while), and let
+/// the window draw into a display cutout on the short edges. Posted to Java's main thread
+/// (`AndroidApp::run_on_java_main_thread`): `View` and `WindowInsetsController` throw
+/// `CalledFromWrongThreadException` on the game's thread. A Java exception is logged, not raised.
+pub(crate) fn hide_system_bars(app: &AndroidApp) {
+    let posted = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let sdk = AndroidApp::sdk_version();
+        let done = with_activity(&posted, |env, activity| {
+            let window = env
+                .call_method(
+                    activity,
+                    jni_str!("getWindow"),
+                    jni_sig!("()Landroid/view/Window;"),
+                    &[],
+                )?
+                .l()?;
+            // Android 9 on: draw under a cutout on the short edges (landscape: the side the
+            // camera is on); the safe area keeps the UI clear of it.
+            if sdk >= 28 {
+                let attrs = env
+                    .call_method(
+                        &window,
+                        jni_str!("getAttributes"),
+                        jni_sig!("()Landroid/view/WindowManager$LayoutParams;"),
+                        &[],
+                    )?
+                    .l()?;
+                // LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                env.set_field(
+                    &attrs,
+                    jni_str!("layoutInDisplayCutoutMode"),
+                    jni_sig!(jint),
+                    JValue::Int(1),
+                )?;
+                env.call_method(
+                    &window,
+                    jni_str!("setAttributes"),
+                    jni_sig!("(Landroid/view/WindowManager$LayoutParams;)V"),
+                    &[JValue::Object(&attrs)],
+                )?;
+            }
+            if sdk >= 30 {
+                env.call_method(
+                    &window,
+                    jni_str!("setDecorFitsSystemWindows"),
+                    jni_sig!("(Z)V"),
+                    &[JValue::Bool(false)],
+                )?;
+                let controller = env
+                    .call_method(
+                        &window,
+                        jni_str!("getInsetsController"),
+                        jni_sig!("()Landroid/view/WindowInsetsController;"),
+                        &[],
+                    )?
+                    .l()?;
+                if controller.is_null() {
+                    return Ok(false);
+                }
+                // BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                env.call_method(
+                    &controller,
+                    jni_str!("setSystemBarsBehavior"),
+                    jni_sig!("(I)V"),
+                    &[JValue::Int(2)],
+                )?;
+                let bars = env
+                    .call_static_method(
+                        jni_str!("android/view/WindowInsets$Type"),
+                        jni_str!("systemBars"),
+                        jni_sig!("()I"),
+                        &[],
+                    )?
+                    .i()?;
+                env.call_method(&controller, jni_str!("hide"), jni_sig!("(I)V"), &[JValue::Int(bars)])?;
+            } else {
+                let decor = env
+                    .call_method(
+                        &window,
+                        jni_str!("getDecorView"),
+                        jni_sig!("()Landroid/view/View;"),
+                        &[],
+                    )?
+                    .l()?;
+                // IMMERSIVE_STICKY | FULLSCREEN | HIDE_NAVIGATION | LAYOUT_FULLSCREEN
+                // | LAYOUT_HIDE_NAVIGATION | LAYOUT_STABLE
+                let flags = 0x1000 | 0x4 | 0x2 | 0x400 | 0x200 | 0x100;
+                env.call_method(
+                    &decor,
+                    jni_str!("setSystemUiVisibility"),
+                    jni_sig!("(I)V"),
+                    &[JValue::Int(flags)],
+                )?;
+            }
+            Ok(true)
+        });
+        match done {
+            Some(true) => tracing::info!("Android: the system bars are hidden (sticky immersive, API {sdk})"),
+            _ => tracing::warn!("Android: the system bars could not be hidden (API {sdk})"),
+        }
+    }));
 }

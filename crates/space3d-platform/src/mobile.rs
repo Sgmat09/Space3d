@@ -39,6 +39,25 @@
 #[cfg(target_os = "android")]
 pub use winit::platform::android::activity::AndroidApp;
 
+/// Whether a phone's app is drawn over the whole screen, the system's bars hidden
+/// ("sticky immersive" on Android: an edge swipe shows them for a while and they hide
+/// again; on iOS the status bar hidden and the home indicator faded). On by default; set it
+/// before the runner starts. Android 11 and on hides them with
+/// `WindowInsetsController.hide(systemBars())` and `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`,
+/// older ones with `setSystemUiVisibility`'s immersive-sticky flags; the runner asks again
+/// whenever the app comes back or takes the focus, and the [`crate::SafeArea`] follows
+/// (a hidden bar covers nothing; a display cutout still does).
+pub fn set_immersive(on: bool) {
+    IMMERSIVE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_immersive`].
+pub fn immersive() -> bool {
+    IMMERSIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static IMMERSIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 #[cfg(target_os = "android")]
 static ANDROID_APP: std::sync::OnceLock<AndroidApp> = std::sync::OnceLock::new();
 

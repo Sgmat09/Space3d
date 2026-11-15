@@ -81,6 +81,7 @@ pub use layout::{
 };
 #[cfg(target_os = "android")]
 pub use mobile::{AndroidApp, android_app, android_main_entry};
+pub use mobile::{immersive, set_immersive};
 #[cfg(target_arch = "wasm32")]
 pub use web::{find_canvas, init_web_logging};
 pub use window::{

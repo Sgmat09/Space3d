@@ -281,6 +281,15 @@ impl WinitRunner {
         if crate::background::background_mode() {
             attrs = attrs.with_active(false);
         }
+        // iOS: the status bar hidden and the home indicator faded until touched
+        // ([`crate::set_immersive`]).
+        #[cfg(target_os = "ios")]
+        if crate::mobile::immersive() {
+            use winit::platform::ios::WindowAttributesExtIOS;
+            attrs = attrs
+                .with_prefers_status_bar_hidden(true)
+                .with_prefers_home_indicator_hidden(true);
+        }
         if let Some(icon) = &s.icon {
             match winit::window::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height) {
                 Ok(icon) => {
@@ -650,6 +659,13 @@ impl ApplicationHandler for WinitRunner {
         let size = drawable_size(&window);
         self.on_resize(UVec2::new(size.width, size.height));
         self.send(PlatformEvent::Resumed);
+        // Android: the system bars hidden again (the system shows them while the app is away).
+        #[cfg(target_os = "android")]
+        if crate::mobile::immersive()
+            && let Some(android) = crate::mobile::android_app()
+        {
+            crate::android::hide_system_bars(&android);
+        }
         space3d_core::BackgroundHooks::run(&mut self.app.resources, false);
         // Avoid a huge dt after returning from background.
         self.last_frame = None;
@@ -702,6 +718,14 @@ impl ApplicationHandler for WinitRunner {
                 if focused {
                     // The layout may have been switched while another app had focus.
                     self.poll_layout(Instant::now(), true);
+                    // Android: a dialog or the notification shade that took the focus may have
+                    // shown the bars; hide them again.
+                    #[cfg(target_os = "android")]
+                    if crate::mobile::immersive()
+                        && let Some(android) = crate::mobile::android_app()
+                    {
+                        crate::android::hide_system_bars(&android);
+                    }
                 } else {
                     self.release_input();
                 }
