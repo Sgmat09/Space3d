@@ -56,6 +56,12 @@ pub(crate) struct WinitRunner {
     surface_retry: SurfaceRetry,
     layout_watch: LayoutWatch,
     buttons: ButtonReconciler,
+    /// The pads of the OS (`crate::gamepad`), polled before every frame.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    pads: crate::gamepad::Backend,
+    /// Android: pads by the input device their key and motion events name.
+    #[cfg(target_os = "android")]
+    pads: crate::gamepad::AndroidPads<DeviceId>,
     /// Whether the on-screen keyboard was last asked for (`TextInput`, phones).
     #[cfg(any(target_os = "android", target_os = "ios"))]
     keyboard_shown: bool,
@@ -210,6 +216,13 @@ pub(crate) fn run(app: App, settings: WindowPlugin) {
         surface_retry: SurfaceRetry::default(),
         layout_watch: LayoutWatch::default(),
         buttons: ButtonReconciler::default(),
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "android"
+        ))]
+        pads: Default::default(),
         #[cfg(any(target_os = "android", target_os = "ios"))]
         keyboard_shown: false,
         #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -452,6 +465,9 @@ impl WinitRunner {
         let active = ButtonReconciler::active(self.state().focused, crate::background::background_mode());
         let input = self.app.resources.init::<Input>();
         self.buttons.frame(active, input, now, crate::os_buttons::query);
+        // What the pads did since the last frame (desktop; Android's come as window events).
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        self.pads.poll(input);
         if let Some(w) = &self.window {
             w.pre_present_notify();
         }
@@ -466,6 +482,27 @@ impl WinitRunner {
                 return;
             }
             event_loop.exit();
+        }
+    }
+
+    /// A key event of a gamepad (Android): `true` when it went to the pad and is no key.
+    #[cfg(target_os = "android")]
+    fn android_pad_key(&mut self, device: DeviceId, key: &PhysicalKey, pressed: bool) -> bool {
+        use winit::keyboard::{KeyCode, NativeKeyCode};
+        let input = self.app.resources.init::<Input>();
+        match *key {
+            PhysicalKey::Unidentified(NativeKeyCode::Android(code)) => self.pads.key(device, code, pressed, input),
+            PhysicalKey::Code(code) => {
+                let button = match code {
+                    KeyCode::ArrowUp => crate::input::GamepadButton::DPadUp,
+                    KeyCode::ArrowDown => crate::input::GamepadButton::DPadDown,
+                    KeyCode::ArrowLeft => crate::input::GamepadButton::DPadLeft,
+                    KeyCode::ArrowRight => crate::input::GamepadButton::DPadRight,
+                    _ => return false,
+                };
+                self.pads.dpad_key(device, button, pressed, input)
+            }
+            _ => false,
         }
     }
 
@@ -742,8 +779,19 @@ impl ApplicationHandler for WinitRunner {
                 }
                 self.send(PlatformEvent::Focused(focused));
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                #[cfg(target_os = "android")]
+                device_id,
+                ..
+            } => {
                 let pressed = event.state == ElementState::Pressed;
+                // Android: a gamepad's buttons are keys of no place, and a known pad's arrow
+                // keys are its d-pad (`crate::gamepad`).
+                #[cfg(target_os = "android")]
+                if self.android_pad_key(device_id, &event.physical_key, pressed) {
+                    return;
+                }
                 // winit 0.30 leaves some keys unidentified or reports two keys as one (macOS
                 // ISO and JIS keys): see `layout::physical_key`.
                 match crate::layout::physical_key(event.physical_key) {
@@ -813,6 +861,15 @@ impl ApplicationHandler for WinitRunner {
             WindowEvent::Touch(t) => {
                 let p = Vec2::new(t.location.x as f32, t.location.y as f32);
                 let phase = TouchPhase::from(t.phase);
+                // Android: a pad's stick comes as a "touch" that never went down; it is the
+                // stick, not a finger (`crate::gamepad::AndroidPads::touch`).
+                #[cfg(target_os = "android")]
+                {
+                    let input = self.app.resources.init::<Input>();
+                    if self.pads.touch(t.device_id, phase, p, input) {
+                        return;
+                    }
+                }
                 self.touch(t.id, phase, p);
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 match phase {

@@ -4,7 +4,7 @@
 //! * [`PlatformPlugin`] / [`WindowPlugin`] — open a window, create the renderer surface and
 //!   run the frame loop (`App::run()`), handling resize, DPI, focus and mobile
 //!   suspend/resume (surface recreation).
-//! * [`Input`] — keyboard, mouse, multi-touch and (stub) gamepads, fully injectable for tests
+//! * [`Input`] — keyboard, mouse, multi-touch and gamepads ([`gamepad`]), fully injectable for tests
 //!   (`Input::inject_*`); [`ActionMap`] + [`ActionState`] map named actions to bindings.
 //!   Mouse buttons keep their order within a frame ([`Input::mouse_button_events`]); releases
 //!   that no release event reported — a focus loss, or (macOS, Windows) the OS showing a held
@@ -58,6 +58,7 @@
 #[cfg(target_os = "android")]
 mod android;
 pub mod background;
+pub mod gamepad;
 mod input;
 #[cfg(target_os = "ios")]
 pub mod ios;
@@ -72,8 +73,9 @@ mod window;
 
 pub use background::{background_mode, set_background_mode};
 pub use input::{
-    ActionMap, ActionState, ActionValue, Binding, ButtonState, Gamepad, GamepadAxis, GamepadButton, Input, InputPlugin,
-    KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchGesture, TouchPhase,
+    ActionMap, ActionState, ActionValue, Binding, ButtonState, Gamepad, GamepadAxis, GamepadButton, GamepadChange,
+    Input, InputPlugin, KeyCode, KeyEvent, MouseButton, MouseButtonCause, MouseButtonEvent, Touch, TouchGesture,
+    TouchPhase,
 };
 pub use layout::{
     KeyLabel, KeyLabelSource, KeyLocation, KeyboardLayout, LogicalKey, NamedKey, english_key_name,
