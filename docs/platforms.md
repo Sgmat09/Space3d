@@ -572,6 +572,43 @@ mode.
 taskbar icon, which Windows 11 otherwise shows blank for an exe without an embedded icon. macOS
 ignores it (the Dock shows the app bundle's icon); the web and mobile use their own manifests.
 
+## Gamepads
+
+Xbox, PlayStation and other USB or Bluetooth controllers (not HOTAS flight sticks). A game
+reads them from `Input` (`space3d_platform::gamepad` has the whole story in its module docs):
+
+```rust
+let input = ctx.resources.expect::<Input>();
+for change in input.gamepad_changes() { /* GamepadChange::Connected(id) / Disconnected(id), this frame */ }
+if input.any_gamepad_just_pressed(GamepadButton::South) { /* A / Cross on any pad */ }
+let x = input.any_gamepad_axis(GamepadAxis::LeftStickX);   // -1..1, right positive
+let y = input.any_gamepad_axis(GamepadAxis::LeftStickY);   // -1..1, UP positive
+let name = input.gamepad(id).map(|p| p.name());            // "Xbox 360 Controller"; may be empty
+```
+
+Buttons are named by their place (`South` = A / Cross, `East` = B / Circle, `West` = X / Square,
+`North` = Y / Triangle, `LeftShoulder`, `LeftTrigger`, `LeftThumb`, `Start`, `Select`, `Mode`,
+the d-pad). A trigger is an axis 0..1 and a button (down from 0.5, up again below 0.4). Sticks
+have a radial dead zone of 0.15 taken out and the rest stretched to 0..1 (`gamepad::dead_zone`).
+`Binding::GamepadButton` / `Binding::GamepadAxis` bind actions. Tests and scripts inject:
+`Input::inject_gamepad_connected_named`, `inject_gamepad_button`, `inject_gamepad_axis`,
+`inject_gamepad_disconnected` (and `space3d-test`'s `InputEvent::Gamepad*`).
+
+| Platform | Backend | What works | Notes |
+|---|---|---|---|
+| Windows | `gilrs` 0.11 (Windows.Gaming.Input) | everything, hot plug | Input only reaches the **focused** window: a focus loss releases every pad button and rests the axes (`Input::release_all`). A headless or background run gets nothing from a real pad. |
+| macOS | `gilrs` (IOKit) | compiles in the dependency graph; **not built or run on a Mac yet** | |
+| Linux | `gilrs` (evdev) | **not built or run on Linux yet** | Needs `libudev` at run time and `libudev-dev` + `pkg-config` to build (the game's CI images must have them). |
+| Android | winit key events (`runner.rs`, `gamepad::AndroidPads`) | A B X Y, L1 R1, L3 R3, Start, Select, Mode; L2 R2 and the d-pad on pads that send them as keys (PlayStation type); the **left stick** | winit 0.30 has no gamepad events. A stick arrives as a "touch" move from a device no finger went down on, at (`AXIS_X`, `AXIS_Y`); it is taken as the left stick and kept away from the fingers. The right stick, analog triggers and a hat d-pad (Xbox type) are lost until winit is patched (third_party). The pad has no name (winit hides the device number). Compiles for both Android targets; **not run on a device**. |
+| iOS | none | nothing | `GCController` through objc2: not done. |
+| Web | none | nothing | gilrs has a `navigator.getGamepads` backend; the dependency is desktop-only for now. |
+
+`cargo run -p space3d-platform --example virtual_pad` (Windows) checks the real backend
+without a pad: it plugs a virtual Xbox 360 pad in through the ViGEmBus driver, drives every
+button, both sticks and the triggers, pulls it out mid-hold and plugs it in again, and compares
+each step with `Input` (exit code 0 / 1; 2 without the driver or the focus). `--log-only`
+prints what any real pad does.
+
 ## CI and releases
 
 `space3d ci init --targets desktop,web,android,ios` (also run by `space3d new`) writes
