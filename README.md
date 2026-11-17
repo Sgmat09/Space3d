@@ -334,5 +334,8 @@ cargo test --workspace
 
 ## License
 
-Proprietary and confidential — all rights reserved. See [LICENSE](LICENSE). Space3d is closed
-source: it is not published to any package registry and its source is not distributed.
+Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE) for the
+copyright line and the third-party code kept in this repository.
+
+Unless you say otherwise, any contribution you submit for inclusion in Space3d is licensed
+under the same terms, without additional conditions.

@@ -1,0 +1,14 @@
+Space3d
+Copyright 2026 SpaceCorps
+
+This product includes software developed by SpaceCorps
+(https://github.com/SpaceCorps/Space3d).
+
+third_party/epaint is a patched copy of the epaint crate from the egui
+project (https://github.com/emilk/egui), copyright Emil Ernerfeldt and the
+egui contributors, used under its "MIT OR Apache-2.0" licence. Its licence
+files are in third_party/epaint, and the changes are described in
+third_party/README.md and third_party/epaint.kinsoku.patch.
+
+crates/space3d-ui/tests/fonts/Space3dTestCJK-Regular.otf is a test font
+under the SIL Open Font License 1.1; see OFL.txt and README.md beside it.
