@@ -8,8 +8,8 @@ exclude = ["target", "third_party"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
-license = "LicenseRef-SpaceCorps-Proprietary"
-# Closed source: never published to any registry.
+license = "Apache-2.0"
+# Not published to any registry (yet); the source is public under Apache-2.0.
 publish = false
 repository = "https://github.com/SpaceCorps/Space3d"
 authors = ["SpaceCorps"]
