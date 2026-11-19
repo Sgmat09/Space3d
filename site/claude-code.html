@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en" data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Space3d + Claude Code</title><meta name="description" content="Ready-to-use Claude Code integration for Space3d: plugin, skill and AGENTS.md template."><link rel="icon" href="/favicon.svg">
+<link rel="stylesheet" href="/src/site.css"></head><body>
+<header class="nav"><div class="wrap"><a class="brand" href="/">Space<b>3d</b></a>
+<a class="l" href="/claude-code.html" aria-current="page">Claude Code</a><a class="l" href="/examples.html">Examples</a><a class="l" href="/docs.html">Docs</a><a class="l" href="https://github.com/SpaceCorps/Space3d">GitHub</a></div></header>
+<main class="wrap"><section class="hero"><h1>Space3d for <em>Claude Code</em></h1>
+<p class="lead">Give Claude the engine's rules and the build–test–look loop, and let it build the game. Everything lives in the repo under <code>integrations/claude-code/</code>.</p></section>
+<h2>1. Install the plugin</h2><pre>/plugin marketplace add SpaceCorps/Space3d
+/plugin install space3d@space3d</pre>
+<p>Adds the <code>space3d-game</code> skill: scaffold, the edit → test → screenshot loop, and the engine's hard rules (fixed tick, never block the frame, wasm-clean).</p>
+<h2>2. Drop in the AGENTS.md</h2>
+<pre>curl -fsSL https://space3d.dev/claude/AGENTS.md -o AGENTS.md
+echo '@AGENTS.md' &gt; CLAUDE.md</pre>
+<p><a href="/claude/AGENTS.md">View the template</a> · <a href="/claude/SKILL.md">View the skill</a></p>
+<h2>3. Ask</h2>
+<pre>space3d new asteroids --template 3d
+claude "Make a top-down asteroid shooter. Add tests, run space3d test, show me a screenshot."</pre>
+<p>Claude can run, test and screenshot headless, so no window pops up. There is no MCP server yet; the <code>space3d</code> CLI is the tool surface.</p>
+<h2>For other agents</h2><p><a href="/llms.txt">llms.txt</a> indexes the docs; <a href="/llms-full.txt">llms-full.txt</a> is the README plus all docs in one file.</p></main>
+<footer><div class="wrap">Space3d is Apache-2.0 · <a href="https://github.com/SpaceCorps/Space3d">SpaceCorps/Space3d</a> · <a href="/llms.txt">llms.txt</a> · <a href="https://spacecorps.tech">SpaceCorps</a></div></footer>
+</body></html>

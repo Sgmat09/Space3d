@@ -1,0 +1,70 @@
+name: Release
+# Push a tag `vX.Y.Z` -> CLI binaries for Windows/macOS/Linux, a GitHub Release with generated
+# changelog, and the site image. Crates are NOT published (workspace has `publish = false`).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: tar.gz }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: tar.gz }
+          - { os: macos-latest, target: x86_64-apple-darwin, ext: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: zip }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+      - name: System deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev
+      - run: cargo build --release --locked -p space3d-cli --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="space3d-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp LICENSE NOTICE README.md "$name/"
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp "target/${{ matrix.target }}/release/space3d.exe" "$name/"
+            7z a "$name.zip" "$name" >/dev/null
+          else
+            cp "target/${{ matrix.target }}/release/space3d" "$name/"
+            tar czf "$name.tar.gz" "$name"
+          fi
+          echo "ASSET=$name.${{ matrix.ext }}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with: { name: "${{ matrix.target }}", path: "${{ env.ASSET }}" }
+
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with: { path: dist, merge-multiple: true }
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - name: GitHub Release (changelog generated from merged PRs)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          flags=""; case "$GITHUB_REF_NAME" in *-*) flags="--prerelease";; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes $flags
+
+  site-image:
+    uses: ./.github/workflows/site.yml
+    with: { version_tag: "${{ github.ref_name }}" }
+    permissions: { contents: read, packages: write }

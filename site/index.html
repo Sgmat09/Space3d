@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en" data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Space3d — build games with Claude Code</title><meta name="description" content="Space3d is a cross-platform 3D game engine in Rust (desktop, web, Android, iOS) with testing built in, made to be driven by Claude Code."><link rel="icon" href="/favicon.svg">
+<link rel="stylesheet" href="/src/site.css"></head><body>
+<header class="nav"><div class="wrap"><a class="brand" href="/">Space<b>3d</b></a>
+<a class="l" href="/claude-code.html">Claude Code</a><a class="l" href="/examples.html">Examples</a><a class="l" href="/docs.html">Docs</a><a class="l" href="https://github.com/SpaceCorps/Space3d">GitHub</a></div></header>
+<main class="wrap"><section class="hero">
+<h1>Build games with <em>Claude Code</em>.</h1>
+<p class="lead">Space3d is a cross-platform 3D game engine in Rust — one codebase for desktop, the web, Android and iOS. Deterministic simulation, headless rendering and golden-screenshot tests make it a loop an AI agent can actually verify.</p>
+<div class="cta"><a class="btn" href="#quickstart">Quickstart</a><a class="btn o" href="/claude-code.html">Claude Code setup</a><a class="btn o" href="https://github.com/SpaceCorps/Space3d">GitHub</a></div></section>
+<section id="quickstart"><h2>Quickstart</h2>
+<ol class="steps"><li><strong>Install</strong> (Rust 1.98+; no releases yet, so build from source):
+<pre>cargo install --git https://github.com/SpaceCorps/Space3d space3d-cli
+space3d doctor   # lists what is missing per platform and how to fix it</pre></li>
+<li><strong>Scaffold</strong>:<pre>space3d new my_game                      # a cube you move around
+space3d new arena --template 3d          # physics playground
+space3d new party --template multiplayer # server-authoritative netcode</pre></li>
+<li><strong>Run</strong>:<pre>cd my_game
+space3d run          # desktop
+space3d serve        # web, http://localhost:8080
+space3d test         # input simulation + golden screenshots</pre></li></ol></section>
+<section><h2>Why it works with agents</h2><div class="grid">
+<div class="card"><h3>Verifiable</h3><p>Tests drive time with <code>step_ticks(n)</code> and input by simulation; visuals are checked against golden screenshots, headless.</p></div>
+<div class="card"><h3>Never steals focus</h3><p>Agent and CI runs go to background/headless mode automatically — your desktop stays yours.</p></div>
+<div class="card"><h3>One <code>build(app)</code></h3><p>The same function runs on Windows, macOS, Linux, web, Android and iOS. Everything is a <code>Plugin</code>.</p></div>
+<div class="card"><h3>Fast renderer</h3><p>wgpu, HDR and post effects, GPU particles, a million instances in a handful of draw calls.</p></div>
+<div class="card"><h3>Multiplayer built in</h3><p>Prediction, interpolation, delta snapshots, a dedicated server and player service.</p></div>
+<div class="card"><h3>Never blocks the frame</h3><p>I/O through <code>space3d_tasks</code>: tokio natively, wasm-bindgen-futures on the web.</p></div>
+</div></section></main>
+<footer><div class="wrap">Space3d is Apache-2.0 · <a href="https://github.com/SpaceCorps/Space3d">SpaceCorps/Space3d</a> · <a href="/llms.txt">llms.txt</a> · <a href="https://spacecorps.tech">SpaceCorps</a></div></footer>
+</body></html>
