@@ -1,0 +1,11 @@
+{
+  "name": "space3d",
+  "owner": { "name": "SpaceCorps" },
+  "plugins": [
+    {
+      "name": "space3d",
+      "source": "./integrations/claude-code",
+      "description": "Build, run, test and ship Space3d (Rust) games with Claude Code."
+    }
+  ]
+}

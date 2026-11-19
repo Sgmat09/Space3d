@@ -1,0 +1,16 @@
+{
+  "name": "space3d-site",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "prebuild": "node scripts/sync.mjs",
+    "dev": "vp dev",
+    "build": "vp build",
+    "preview": "vp preview",
+    "check": "vp check"
+  },
+  "devDependencies": {
+    "vite-plus": "^1.7.0"
+  }
+}
