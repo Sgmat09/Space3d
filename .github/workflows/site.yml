@@ -50,4 +50,5 @@ jobs:
       - name: Redeploy on Sliplane
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env: { HOOK: "${{ secrets.SLIPLANE_DEPLOY_HOOK }}" }
-        run: '[ -z "$HOOK" ] && echo "SLIPLANE_DEPLOY_HOOK not set; skipping" || curl -fsS -X POST "$HOOK"'
+        run: |
+          if [ -z "$HOOK" ]; then echo "SLIPLANE_DEPLOY_HOOK not set; skipping"; else curl -fsS -X POST "$HOOK"; fi
