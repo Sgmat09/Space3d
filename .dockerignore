@@ -26,6 +26,7 @@ pkg
 docs
 scripts
 **/__screenshots__
+examples/shield_demo/assets
 AGENTS.md
 README.md
 LICENSE

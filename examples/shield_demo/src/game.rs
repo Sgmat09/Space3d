@@ -259,8 +259,7 @@ pub enum Slot {
     Failed(String),
 }
 
-/// The engine's small test ship: what every hull falls back to when the SpaceCorps models are
-/// not installed (CI, a fresh clone).
+/// The engine's small test ship: what a hull falls back to when its model can't be read or built.
 const FALLBACK_GLB: &[u8] = include_bytes!("../../../crates/space3d-stories/assets/ship.glb");
 
 /// The game sounds looked up in `<assets>/sfx/` (optional: without them the demo is silent).
@@ -298,9 +297,14 @@ const SFX_NAMES: [&str; 31] = [
     "shield_buff_on",
 ];
 
+/// The models committed with the example (`examples/shield_demo/assets`).
+#[cfg(not(target_arch = "wasm32"))]
+const COMMITTED_ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
+
 /// Where the SpaceCorps models (`<name>.glb`, `<name>.sbe`) and sounds (`sfx/*.mp3`) live:
 /// `SPACE3D_SHIELD_DEMO_ASSETS` (a URL parameter on the web), else an `assets/` folder next to
-/// the executable (`../assets` next to the page on the web).
+/// the executable, else the example's own `assets/` folder (`../assets` next to the page on the
+/// web).
 fn asset_root() -> String {
     if let Some(dir) = config("SPACE3D_SHIELD_DEMO_ASSETS") {
         return dir;
@@ -315,7 +319,8 @@ fn asset_root() -> String {
         std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|p| p.join("assets")))
-            .unwrap_or_else(|| "assets".into())
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(|| COMMITTED_ASSETS.into())
             .to_string_lossy()
             .into_owned()
     }
@@ -3160,4 +3165,26 @@ pub fn update(ctx: &mut SystemCtx) {
     g.update_camera(ctx);
     g.publish(ctx);
     ctx.resources.insert(g);
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// Every hull of the catalog is committed, loads, and comes with a readable baked envelope.
+    #[test]
+    fn the_committed_models_load_with_their_envelopes() {
+        let dir = std::path::Path::new(COMMITTED_ASSETS);
+        for h in &HULLS {
+            let glb =
+                std::fs::read(dir.join(format!("{}.glb", h.file))).unwrap_or_else(|e| panic!("{}.glb: {e}", h.file));
+            let sbe_bytes =
+                std::fs::read(dir.join(format!("{}.sbe", h.file))).unwrap_or_else(|e| panic!("{}.sbe: {e}", h.file));
+            if let Err(e) = sbe::decode(&sbe_bytes) {
+                panic!("{}.sbe: {e}", h.file);
+            }
+            let hull = build_hull(h.file, glb, Some(sbe_bytes)).unwrap_or_else(|e| panic!("{e}"));
+            assert!(!hull.shell_tris.is_empty() && !hull.ship_tris.is_empty(), "{}", h.file);
+        }
+    }
 }

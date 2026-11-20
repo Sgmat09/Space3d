@@ -2,7 +2,7 @@
 
 A 3D shield for SpaceCorps 2027, as a Space3d example. Every ship gets a shield that hugs its hull. Each bolt makes a wave on it. The share of a hit that the shield doesn't absorb pierces it, and the shield breaks into fragments when it runs out. A group shield, the Aegis, stretches the carrier's shield into a bubble over its allies. Issue #57 records the design decisions.
 
-![The demo with the engine's test ship: hull shields on three ships, the panel, a bolt in flight](screenshot.jpg)
+![The demo: hull shields on Nomad, Storm and a Seeker, the panel, bolts in flight](screenshot.jpg)
 
 ## What it shows
 
@@ -38,9 +38,10 @@ In the browser:
 cargo build -p shield_demo --release --target wasm32-unknown-unknown
 wasm-bindgen --target web --no-typescript --out-name shield_demo --out-dir examples/shield_demo/dist/web target/wasm32-unknown-unknown/release/shield_demo.wasm
 cp examples/shield_demo/web/index.html examples/shield_demo/dist/web/
+cp -r examples/shield_demo/assets examples/shield_demo/dist/
 ```
 
-Serve `examples/shield_demo/dist/` with any static server and open `/web/`. Add `?webgl2` to the URL to take the WebGL2 path. If you have the SpaceCorps assets, put them in `dist/assets/`; the page looks for them in `../assets`.
+Serve `examples/shield_demo/dist/` with any static server and open `/web/`. Add `?webgl2` to the URL to take the WebGL2 path. The page looks for the models in `../assets`.
 
 | Input | Action |
 |---|---|
@@ -52,11 +53,9 @@ Serve `examples/shield_demo/dist/` with any static server and open `/web/`. Add 
 | `1`–`4` | Low, Medium, High, Ultra |
 | `Esc` | Quit (desktop) |
 
-## The SpaceCorps assets (optional)
+## The SpaceCorps assets
 
-The game's models and sounds are not in this repository. Without them, every hull is the engine's test ship (`crates/space3d-stories/assets/ship.glb`), and the demo is silent.
-
-To see the real ships, put the files in an `assets/` folder next to the executable (`dist/assets/` on the web). You can also set `SPACE3D_SHIELD_DEMO_ASSETS` to another folder; on the web it is a URL parameter.
+The game's ship models are committed in `assets/`: one `.glb` per hull and its baked envelope (`.sbe`). The game's sounds are not in this repository, so the demo is silent unless you add them.
 
 ```text
 assets/
@@ -64,11 +63,16 @@ assets/
   sfx/hit_shield_1.mp3  laser_x1_1.mp3 …  optional, names in SFX_NAMES (src/game.rs)
 ```
 
+- **Where they are read from:**
+  - `SPACE3D_SHIELD_DEMO_ASSETS`, a folder (a URL parameter on the web);
+  - otherwise an `assets/` folder next to the executable;
+  - otherwise this example's `assets/` folder, natively, and `../assets` next to the page on the web.
 - **Hull names:** they are listed in `src/catalog.rs`:
   - Protos, Kitefin, Ostirion, Nomad, Paragon, Miyuki, Storm, Wraith, Ironclad;
   - seeker, goombah, facet, void, phantasm, bulwark, crystalys, tesseract, inert-mass, unwakened;
   - turret, excavator.
-- **Envelopes:** a `.sbe` file is a baked envelope (88 cells, smoother). Without one, the envelope is computed when the model loads.
+- **Envelopes:** a `.sbe` file is a baked envelope (88 cells, smoother). Without one, the envelope is computed when the model loads (48 cells).
+- **Fallback:** if a model can't be read, its hull is the engine's test ship (`crates/space3d-stories/assets/ship.glb`).
 
 ## Scripted runs
 
@@ -91,12 +95,14 @@ SPACE3D_HEADLESS=1 SHIELD_SHOT=out.png SHIELD_SHOT_FRAME=300 cargo run -p shield
 
 `cargo test -p shield_demo`
 
-The tests load the test ship synchronously, then drive the simulation with `App::step_ticks`. They need no GPU. They cover:
+The simulation tests load the test ship synchronously, then drive the simulation with `App::step_ticks`. They need no GPU. They cover:
 
 - a volley making waves;
 - wear down to a break, and restoring;
 - the Aegis taking hits and ending;
 - determinism.
+
+Another test checks that every committed model loads with its baked envelope.
 
 ## Known limits
 

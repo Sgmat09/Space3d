@@ -2,9 +2,10 @@
 //! a `RenderNode` (WGSL), with the game's weapons, gun positions and sounds, the engine's quality
 //! tiers, and the Aegis: the carrier's shield stretched into a bubble over its group.
 //!
-//! The SpaceCorps models and sounds are not in this repository. Put them in an `assets/` folder
-//! next to the executable (or point `SPACE3D_SHIELD_DEMO_ASSETS` at them); without them every
-//! hull is the engine's test ship and the demo is silent. See `README.md`.
+//! The SpaceCorps ship models are committed in `assets/`; the game's sounds are not, so the demo
+//! is silent unless they are added in `assets/sfx/`. `SPACE3D_SHIELD_DEMO_ASSETS`, or an `assets/`
+//! folder next to the executable, takes precedence. A model that can't be read falls back to the
+//! engine's test ship. See `README.md`.
 //!
 //! ```text
 //! cargo run -p shield_demo --release
