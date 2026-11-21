@@ -4837,6 +4837,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shield_demo"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "space3d",
+ "web-sys",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

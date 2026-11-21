@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Space3d — bouclier 3D</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05050a; color: #ccd; font: 14px system-ui, sans-serif; overflow: hidden; }
+    /* `!important`: the runner sets the canvas' CSS size from the window size; the page decides. */
+    canvas#space3d { display: block; width: 100vw !important; height: 100vh !important; touch-action: none; outline: none; }
+    #status { position: fixed; right: 12px; bottom: 10px; opacity: .7; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <canvas id="space3d" tabindex="0"></canvas>
+  <div id="status">chargement… / loading…</div>
+  <script type="module">
+    // The ship models are fetched from ../assets: serve dist/, the folder that holds web/ and assets/.
+    // `?webgl2`: hide WebGPU so wgpu falls back to WebGL2 (the Low tier's path)
+    if (new URLSearchParams(location.search).has("webgl2")) {
+      Object.defineProperty(navigator, "gpu", { value: undefined, configurable: true });
+    }
+    const status = document.getElementById("status");
+    try {
+      const { default: init } = await import("./shield_demo.js");
+      const api = navigator.gpu ? "WebGPU" : "WebGL2";
+      const ok = navigator.gpu ? await navigator.gpu.requestAdapter() : document.createElement("canvas").getContext("webgl2");
+      if (!ok) throw new Error("aucun adaptateur / no adapter: " + api);
+      await init();
+      status.textContent = `Space3d · ${api} · clic / Espace : tirer · F : Égide · B : casser · R : restaurer · 1–4 : qualité`;
+    } catch (e) {
+      status.textContent = "échec / failed: " + e;
+      console.error(e);
+    }
+  </script>
+</body>
+</html>
